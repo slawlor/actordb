@@ -9,6 +9,13 @@ A rust actor-based distributed database based on *RocksDb*
 * [![codecov](https://codecov.io/gh/slawlor/actordb/branch/main/graph/badge.svg?token=61AGYYPWBA)](https://codecov.io/gh/slawlor/actordb)
 * `actordb`: ![actordb Downloads](https://img.shields.io/crates/d/actordb.svg)
 
+## TODO List
+
+1. Make generic input(recv)/output(send) service definitions.
+2. Leave network-level protocols up to implementer (gRPC, raw TCP, Thrift etc doesn't matter)
+3. Test lib can implement a basic TCP version without auth/TLS etc on a docker cluster for automated tests
+4. Decide consensus models we want to implement and then do we (a) use an existing lib or (b) build it/them ourself?
+
 ## Contributors
 
 To learn more about contributing to `actordb` please see [CONTRIBUTING.md](https://github.com/slawlor/actordb/blob/main/CONTRIBUTING.md).
