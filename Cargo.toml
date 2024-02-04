@@ -1,0 +1,6 @@
+[workspace]
+members = [
+    "actordb",
+    "xtask"
+]
+resolver = "2"

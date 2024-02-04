@@ -1,0 +1,44 @@
+[package]
+name = "actordb"
+version = "0.1.0"
+authors = ["Sean Lawlor"]
+description = "An actor-first distributed database"
+documentation = "https://docs.rs/actordb"
+license = "MIT"
+edition = "2021"
+keywords = ["actor", "ractor", "db", "database"]
+repository = "https://github.com/slawlor/actordb"
+readme = "../README.md"
+homepage = "https://github.com/slawlor/actordb"
+categories = ["actor", "erlang"]
+build = "src/build.rs"
+rust-version = "1.64"
+
+# [features]
+# filewatcher = ["notify"]
+# net = ["tokio/net", "tokio/io-util", "tokio/macros", "tokio-rustls"]
+# time = ["chrono", "cron"]
+# streams = ["tokio-stream"]
+# sync = []
+
+# default = ["filewatcher", "net", "time", "streams", "sync"]
+
+[build-dependencies]
+protobuf-src = "1"
+prost-build = { version = "0.12" }
+
+[dependencies]
+# Required dependencies
+bytes = { version = "1" }
+prost = { version = "0.12" }
+prost-types = { version = "0.12" }
+ractor = { version = "0.9" }
+tokio = { version = "1", features = ["sync", "time"] }
+tracing = "0.1"
+# Optional dependencies
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "time", "sync", "macros", "rt-multi-thread", "signal"] }
+tracing-glog = "0.3"
+tracing-subscriber = { version = "0.3", features = ["env-filter"]}
+tracing-test = "0.2"

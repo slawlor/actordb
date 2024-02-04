@@ -1,0 +1,20 @@
+// Copyright (c) Sean Lawlor
+//
+// This source code is licensed under both the MIT license found in the
+// LICENSE-MIT file in the root directory of this source tree.
+
+// ============================================================
+// Protobuf protocol specification. This is the top-level "meta" API
+// and inner APIs will be included here
+// ============================================================
+
+syntax = "proto3";
+
+// import "auth.proto";
+// import "node.proto";
+// import "control.proto";
+
+package meta;
+
+// Howdy
+message Hello {}
