@@ -24,7 +24,7 @@ rust-version = "1.64"
 # default = ["filewatcher", "net", "time", "streams", "sync"]
 
 [build-dependencies]
-protobuf-src = "1"
+protobuf-src = "2"
 prost-build = { version = "0.12" }
 
 [dependencies]
