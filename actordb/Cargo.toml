@@ -31,7 +31,7 @@ prost-build = { version = "0.12" }
 # Required dependencies
 bytes = { version = "1" }
 prost = { version = "0.12" }
-prost-types = { version = "0.12" }
+prost-types = { version = "0.13" }
 ractor = { version = "0.10" }
 tokio = { version = "1", features = ["sync", "time"] }
 tracing = "0.1"
