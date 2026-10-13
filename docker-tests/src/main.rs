@@ -9,7 +9,14 @@
 //! - `replicate-writer` / `replicate-reader`: 3-node convergence.
 //! - `restart-crashing` / `restart-survivor`: SIGKILL a node mid-cluster,
 //!   restart it, assert it reconverges (exercises redial + `boot_id`).
+//!
+//! Observability: every line is `[<elapsed>s <node-id>] <message>` on
+//! stdout, so `docker compose logs` shows an interleaved, attributable
+//! timeline across containers. The bare marker lines `READY`,
+//! `SCENARIO_OK` and `SCENARIO_FAILED` are intentionally unprefixed —
+//! the driver scripts grep for them.
 
+use std::future::Future;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -97,61 +104,131 @@ enum Command {
 
 type TestResult = Result<(), String>;
 
-fn fail(msg: impl Into<String>) -> TestResult {
-    Err(msg.into())
+/// Per-role context: the node, its id for log prefixes, and the role's
+/// start time for elapsed timestamps.
+struct Ctx {
+    id: String,
+    node: Node,
+    t0: Instant,
 }
 
-async fn wait_for_peers(node: &Node, n: usize) -> TestResult {
-    tokio::time::timeout(PEER_TIMEOUT, async {
-        while node.peer_count().await < n {
+impl Ctx {
+    async fn start(node_id: String, port: u16) -> Result<Self, String> {
+        let node = Node::start(node_id.clone(), bind(port))
+            .await
+            .map_err(|e| format!("start failed: {e}"))?;
+        Ok(Self {
+            id: node_id,
+            node,
+            t0: Instant::now(),
+        })
+    }
+
+    fn elapsed(&self) -> f64 {
+        self.t0.elapsed().as_secs_f64()
+    }
+
+    fn log(&self, msg: &str) {
+        println!("[{:>7.1}s {}] {}", self.elapsed(), self.id, msg);
+    }
+
+    fn warn(&self, msg: &str) {
+        eprintln!("[{:>7.1}s {}] WARN: {}", self.elapsed(), self.id, msg);
+    }
+
+    /// One-line snapshot of replica state, for failure diagnostics.
+    async fn describe_state(&self) -> String {
+        let peers = self.node.peer_count().await;
+        let keys = match self.node.get_all().await {
+            Ok(m) => {
+                let mut ks: Vec<_> = m.keys().cloned().collect();
+                ks.sort();
+                format!("{ks:?}")
+            }
+            Err(e) => format!("<get_all failed: {e}>"),
+        };
+        format!("peers={peers} keys={keys}")
+    }
+}
+
+/// Run one named phase of a scenario, logging start/end with its duration.
+async fn phase<T>(
+    ctx: &Ctx,
+    name: &str,
+    f: impl Future<Output = Result<T, String>>,
+) -> Result<T, String> {
+    ctx.log(&format!("phase start: {name}"));
+    let t = Instant::now();
+    let r = f.await;
+    let dt = t.elapsed().as_secs_f64();
+    match &r {
+        Ok(_) => ctx.log(&format!("phase done: {name} ({dt:.1}s)")),
+        Err(e) => ctx.warn(&format!("phase FAILED: {name} ({dt:.1}s): {e}")),
+    }
+    r
+}
+
+async fn wait_for_peers(ctx: &Ctx, n: usize) -> TestResult {
+    let r = tokio::time::timeout(PEER_TIMEOUT, async {
+        while ctx.node.peer_count().await < n {
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
     })
-    .await
-    .map_err(|_| format!("timed out waiting for {n} peers"))?;
-    println!("peers: {}", node.peer_count().await);
+    .await;
+    if r.is_err() {
+        return Err(format!(
+            "timed out waiting for {n} peers [{}]",
+            ctx.describe_state().await
+        ));
+    }
+    ctx.log(&format!("peers: {}", ctx.node.peer_count().await));
     Ok(())
 }
 
 /// Dial `peer` (`host:port`, DNS allowed), retrying until it answers.
-async fn dial_with_retry(node: &Node, peer: &str) -> TestResult {
+async fn dial_with_retry(ctx: &Ctx, peer: &str) -> TestResult {
     let start = Instant::now();
     loop {
         match tokio::net::lookup_host(peer).await {
             Ok(addrs) => {
                 for addr in addrs {
-                    match node.connect(addr).await {
+                    match ctx.node.connect(addr).await {
                         Ok(()) => {
-                            println!("dialed {addr}");
+                            ctx.log(&format!("dialed {addr}"));
                             return Ok(());
                         }
-                        Err(e) => eprintln!("dial {addr} failed: {e}"),
+                        Err(e) => ctx.warn(&format!("dial {addr} failed: {e}")),
                     }
                 }
             }
-            Err(e) => eprintln!("DNS lookup for {peer} failed: {e}"),
+            Err(e) => ctx.warn(&format!("DNS lookup for {peer} failed: {e}")),
         }
         if start.elapsed() > DIAL_TIMEOUT {
-            return fail(format!("timed out dialing {peer}"));
+            return Err(format!("timed out dialing {peer}"));
         }
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
 }
 
-async fn wait_for_value(node: &Node, key: &str, value: &[u8], timeout: Duration) -> TestResult {
-    tokio::time::timeout(timeout, async {
+async fn wait_for_value(ctx: &Ctx, key: &str, value: &[u8], timeout: Duration) -> TestResult {
+    let r = tokio::time::timeout(timeout, async {
         loop {
-            match node.get(key.to_string()).await {
+            match ctx.node.get(key.to_string()).await {
                 Ok(Some(v)) if v.value == value => break,
                 Ok(_) => {}
-                Err(e) => eprintln!("get failed: {e}"),
+                Err(e) => ctx.warn(&format!("get failed: {e}")),
             }
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
     })
-    .await
-    .map_err(|_| format!("timed out waiting for key {key:?}"))?;
-    println!("converged: {key:?}");
+    .await;
+    if r.is_err() {
+        return Err(format!(
+            "timed out waiting for key {key:?} [{}]",
+            ctx.describe_state().await
+        ));
+    }
+    ctx.log(&format!("converged: {key:?}"));
     Ok(())
 }
 
@@ -166,17 +243,31 @@ async fn replicate_writer(
     key: String,
     value: String,
 ) -> TestResult {
-    let node = Node::start(node_id, bind(port))
-        .await
-        .map_err(|e| format!("start failed: {e}"))?;
-    wait_for_peers(&node, expect_peers).await?;
-    node.put(key.clone(), value.clone().into_bytes())
-        .await
-        .map_err(|e| format!("put failed: {e}"))?;
-    println!("WRITER_DONE key={key:?}");
+    let ctx = Ctx::start(node_id, port).await?;
+    ctx.log(&format!(
+        "role=replicate-writer port={port} expect_peers={expect_peers} key={key:?}"
+    ));
+    phase(&ctx, "wait-peers", wait_for_peers(&ctx, expect_peers)).await?;
+    phase(
+        &ctx,
+        "put",
+        put_key(&ctx, key.clone(), value.clone().into_bytes()),
+    )
+    .await?;
+    ctx.log("WRITER_DONE: letting gossip settle before exit");
     // let gossip settle before this container exits
     tokio::time::sleep(Duration::from_secs(5)).await;
-    node.shutdown().await;
+    ctx.node.shutdown().await;
+    ctx.log(&format!("done in {:.1}s", ctx.elapsed()));
+    Ok(())
+}
+
+async fn put_key(ctx: &Ctx, key: String, value: Vec<u8>) -> TestResult {
+    ctx.node
+        .put(key.clone(), value)
+        .await
+        .map_err(|e| format!("put failed: {e}"))?;
+    ctx.log(&format!("put {key:?}"));
     Ok(())
 }
 
@@ -188,21 +279,27 @@ async fn replicate_reader(
     value: String,
     timeout_secs: u64,
 ) -> TestResult {
-    let node = Node::start(node_id, bind(port))
-        .await
-        .map_err(|e| format!("start failed: {e}"))?;
+    let ctx = Ctx::start(node_id, port).await?;
+    ctx.log(&format!(
+        "role=replicate-reader port={port} peers={peers:?} key={key:?} timeout={timeout_secs}s"
+    ));
     for peer in &peers {
-        dial_with_retry(&node, peer).await?;
+        phase(&ctx, &format!("dial {peer}"), dial_with_retry(&ctx, peer)).await?;
     }
-    wait_for_value(
-        &node,
-        &key,
-        value.as_bytes(),
-        Duration::from_secs(timeout_secs),
+    phase(
+        &ctx,
+        "wait-value",
+        wait_for_value(
+            &ctx,
+            &key,
+            value.as_bytes(),
+            Duration::from_secs(timeout_secs),
+        ),
     )
     .await?;
-    println!("READER_OK key={key:?}");
-    node.shutdown().await;
+    ctx.log("READER_OK");
+    ctx.node.shutdown().await;
+    ctx.log(&format!("done in {:.1}s", ctx.elapsed()));
     Ok(())
 }
 
@@ -215,29 +312,41 @@ async fn restart_crashing(
     expect_value: String,
     sentinel: PathBuf,
 ) -> TestResult {
-    let node = Node::start(node_id, bind(port))
-        .await
-        .map_err(|e| format!("start failed: {e}"))?;
-    dial_with_retry(&node, &peer).await?;
-    wait_for_peers(&node, 1).await?;
+    let ctx = Ctx::start(node_id, port).await?;
+    ctx.log(&format!(
+        "role=restart-crashing port={port} peer={peer:?} key={key:?} sentinel={sentinel:?}"
+    ));
+    phase(&ctx, &format!("dial {peer}"), dial_with_retry(&ctx, &peer)).await?;
+    phase(&ctx, "wait-peers", wait_for_peers(&ctx, 1)).await?;
 
     if sentinel.exists() {
         // rebooted after the SIGKILL: the survivor should have written
         // expect_value while we were gone; sync on handshake delivers it
-        println!("REBOOTED, waiting for convergence");
-        wait_for_value(&node, &key, expect_value.as_bytes(), VALUE_TIMEOUT).await?;
-        println!("CRASH_TEST_OK key={key:?}");
-        node.shutdown().await;
+        ctx.log("REBOOTED: this container was SIGKILLed and restarted");
+        phase(
+            &ctx,
+            "wait-reconverge",
+            wait_for_value(&ctx, &key, expect_value.as_bytes(), VALUE_TIMEOUT),
+        )
+        .await?;
+        ctx.log("CRASH_TEST_OK");
+        ctx.node.shutdown().await;
+        ctx.log(&format!("done in {:.1}s", ctx.elapsed()));
         return Ok(());
     }
 
-    node.put(key.clone(), put_value.into_bytes())
-        .await
-        .map_err(|e| format!("put failed: {e}"))?;
+    phase(
+        &ctx,
+        "put",
+        put_key(&ctx, key.clone(), put_value.into_bytes()),
+    )
+    .await?;
     // make sure the survivor has it before we die
     tokio::time::sleep(Duration::from_secs(3)).await;
     std::fs::write(&sentinel, b"1").map_err(|e| format!("sentinel write failed: {e}"))?;
+    // bare marker line for the driver script (grep ^READY$)
     println!("READY");
+    ctx.log("waiting for SIGKILL from the driver (sleeping)");
     // the driver SIGKILLs this container now; wait forever if run by hand
     std::future::pending::<()>().await;
     #[allow(unreachable_code)]
@@ -251,28 +360,48 @@ async fn restart_survivor(
     put_value: String,
     expect_value: String,
 ) -> TestResult {
-    let node = Node::start(node_id, bind(port))
-        .await
-        .map_err(|e| format!("start failed: {e}"))?;
+    let ctx = Ctx::start(node_id, port).await?;
+    ctx.log(&format!(
+        "role=restart-survivor port={port} key={key:?} (waits to be dialed)"
+    ));
     // the crasher dials us; its write arrives via gossip
-    wait_for_value(&node, &key, put_value.as_bytes(), VALUE_TIMEOUT).await?;
-    node.put(key.clone(), expect_value.into_bytes())
-        .await
-        .map_err(|e| format!("put failed: {e}"))?;
-    println!("wrote {key:?}, waiting for peer to die");
-    tokio::time::timeout(PEER_TIMEOUT, async {
-        while node.peer_count().await > 0 {
+    phase(
+        &ctx,
+        "wait-value",
+        wait_for_value(&ctx, &key, put_value.as_bytes(), VALUE_TIMEOUT),
+    )
+    .await?;
+    phase(
+        &ctx,
+        "put",
+        put_key(&ctx, key.clone(), expect_value.into_bytes()),
+    )
+    .await?;
+    ctx.log("waiting for peer to die (SIGKILL)");
+    phase(&ctx, "wait-peer-death", wait_for_peer_death(&ctx)).await?;
+    ctx.log("PEER_DIED: waiting for it to return");
+    phase(&ctx, "wait-peer-return", wait_for_peers(&ctx, 1)).await?;
+    ctx.log("PEER_RETURNED: letting post-restart sync settle");
+    // let the rebooted node's handshake sync settle before we exit
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    ctx.node.shutdown().await;
+    ctx.log(&format!("done in {:.1}s", ctx.elapsed()));
+    Ok(())
+}
+
+async fn wait_for_peer_death(ctx: &Ctx) -> TestResult {
+    let r = tokio::time::timeout(PEER_TIMEOUT, async {
+        while ctx.node.peer_count().await > 0 {
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
     })
-    .await
-    .map_err(|_| "timed out waiting for peer to die".to_string())?;
-    println!("PEER_DIED, waiting for it to return");
-    wait_for_peers(&node, 1).await?;
-    println!("PEER_RETURNED");
-    // let the rebooted node's handshake sync settle before we exit
-    tokio::time::sleep(Duration::from_secs(10)).await;
-    node.shutdown().await;
+    .await;
+    if r.is_err() {
+        return Err(format!(
+            "timed out waiting for peer to die [{}]",
+            ctx.describe_state().await
+        ));
+    }
     Ok(())
 }
 
@@ -312,9 +441,12 @@ async fn main() {
             expect_value,
         } => restart_survivor(node_id, port, key, put_value, expect_value).await,
     };
-    if let Err(e) = result {
-        eprintln!("SCENARIO_FAILED: {e}");
-        std::process::exit(1);
+    match result {
+        Ok(()) => println!("SCENARIO_OK"),
+        Err(e) => {
+            // bare marker line for CI log grepping
+            println!("SCENARIO_FAILED: {e}");
+            std::process::exit(1);
+        }
     }
-    println!("SCENARIO_OK");
 }

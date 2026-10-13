@@ -14,11 +14,19 @@ cleanup() {
 }
 trap cleanup EXIT
 
+echo "=== scenario: $ENV_FILE ($(date -u +%H:%M:%S) UTC) ==="
 docker compose --env-file "$ENV_FILE" up -d
 FAIL=0
 for svc in $SERVICES; do
     code=$(docker wait "$svc")
-    echo "$svc exited with code $code"
+    echo "--- $svc exited with code $code"
     [ "$code" = "0" ] || FAIL=1
 done
+
+if [ "$FAIL" != "0" ]; then
+    echo "=== FAILED: container logs ==="
+    docker compose --env-file "$ENV_FILE" logs --no-color --tail 300
+else
+    echo "=== scenario OK ==="
+fi
 exit $FAIL
