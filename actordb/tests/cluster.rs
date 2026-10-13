@@ -577,3 +577,51 @@ async fn replica_fanout_reaches_other_holder() {
     a.shutdown().await;
     b.shutdown().await;
 }
+
+/// Phase 3: the worker pool handles concurrent keys; per-key ordering
+/// is preserved by sticky dispatch.
+#[tokio::test]
+async fn worker_pool_concurrent_keys_and_ordering() {
+    use std::sync::Arc;
+
+    let config = NodeConfig {
+        worker_count: 8,
+        ..NodeConfig::default()
+    };
+    let a = Arc::new(
+        Node::start("a".to_string(), "127.0.0.1:0".parse().unwrap(), config)
+            .await
+            .unwrap(),
+    );
+
+    // 50 concurrent puts to distinct keys.
+    let mut handles = Vec::new();
+    for i in 0..50 {
+        let a_clone = a.clone();
+        handles.push(tokio::spawn(async move {
+            a_clone
+                .put(format!("ck-{i}"), format!("v{i}").into_bytes())
+                .await
+                .unwrap();
+        }));
+    }
+    for h in handles {
+        h.await.unwrap();
+    }
+    for i in 0..50 {
+        let got = a.get(format!("ck-{i}")).await.unwrap().unwrap();
+        assert_eq!(got.value, format!("v{i}").into_bytes());
+    }
+
+    // Sequential puts to one key land in order (distinct timestamps).
+    for i in 0..10 {
+        a.put("ordered".to_string(), format!("w{i}").into_bytes())
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    let got = a.get("ordered".to_string()).await.unwrap().unwrap();
+    assert_eq!(got.value, b"w9".to_vec());
+
+    a.shutdown().await;
+}
