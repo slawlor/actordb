@@ -456,3 +456,124 @@ async fn fragments_route_and_isolate() {
     assert_eq!(all.len(), 50);
     a.shutdown().await;
 }
+
+/// Phase 2: disjoint fragments. Each node serves 2 of 6 fragments.
+/// A put for a key owned by another node routes there in one hop.
+#[tokio::test]
+async fn disjoint_fragments_route_to_owner() {
+    use actordb::shard::{fragment_of, FragmentId};
+    use std::collections::HashMap;
+
+    let frag_count: usize = 6;
+    // Node a: frags 0,1. Node b: frags 2,3. Node c: frags 4,5.
+    let mut fmap: HashMap<FragmentId, Vec<String>> = HashMap::new();
+    for i in 0..frag_count {
+        let owner = match i as u32 {
+            0 | 1 => "a",
+            2 | 3 => "b",
+            _ => "c",
+        };
+        fmap.insert(FragmentId(i as u32), vec![owner.to_string()]);
+    }
+
+    let mk = || NodeConfig {
+        fragment_count: frag_count,
+        fragment_map: fmap.clone(),
+        ..NodeConfig::default()
+    };
+    let a = Node::start("a".to_string(), "127.0.0.1:0".parse().unwrap(), mk())
+        .await
+        .unwrap();
+    let b = Node::start("b".to_string(), "127.0.0.1:0".parse().unwrap(), mk())
+        .await
+        .unwrap();
+    let c = Node::start("c".to_string(), "127.0.0.1:0".parse().unwrap(), mk())
+        .await
+        .unwrap();
+    // Full mesh (nodes started without members; connect manually).
+    a.connect(b.addr()).await.unwrap();
+    a.connect(c.addr()).await.unwrap();
+    b.connect(c.addr()).await.unwrap();
+    common::wait_for(
+        || async {
+            a.peer_count().await == 2 && b.peer_count().await == 2 && c.peer_count().await == 2
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    // Find a key owned by c (frags 4,5), put it via a.
+    let key_c = (0..1000)
+        .map(|i| format!("k{i}"))
+        .find(|k| matches!(fragment_of(k, frag_count).0, 4 | 5))
+        .unwrap();
+    a.put(key_c.clone(), b"via-a".to_vec()).await.unwrap();
+
+    // c (the owner) has it; a does NOT (it doesn't serve that fragment).
+    common::wait_for(
+        || async {
+            c.get(key_c.clone()).await.unwrap().map(|v| v.value) == Some(b"via-a".to_vec())
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+    // a doesn't hold it locally (not the owner)...
+    assert!(!a.get_all().await.unwrap().contains_key(&key_c));
+
+    // ...but a can READ it via forwarded get.
+    let v = a.get(key_c.clone()).await.unwrap().unwrap();
+    assert_eq!(v.value, b"via-a".to_vec());
+
+    a.shutdown().await;
+    b.shutdown().await;
+    c.shutdown().await;
+}
+
+/// Phase 2: replicated fragment. A put on one replica fans out to the
+/// other holder.
+#[tokio::test]
+async fn replica_fanout_reaches_other_holder() {
+    use actordb::shard::{fragment_of, FragmentId};
+    use std::collections::HashMap;
+
+    let frag_count: usize = 4;
+    let mut fmap: HashMap<FragmentId, Vec<String>> = HashMap::new();
+    // Frag 0 replicated on a and b; others single-homed.
+    fmap.insert(FragmentId(0), vec!["a".to_string(), "b".to_string()]);
+    fmap.insert(FragmentId(1), vec!["a".to_string()]);
+    fmap.insert(FragmentId(2), vec!["b".to_string()]);
+    fmap.insert(FragmentId(3), vec!["c".to_string()]);
+
+    let mk = || NodeConfig {
+        fragment_count: frag_count,
+        fragment_map: fmap.clone(),
+        ..NodeConfig::default()
+    };
+    let a = Node::start("a".to_string(), "127.0.0.1:0".parse().unwrap(), mk())
+        .await
+        .unwrap();
+    let b = Node::start("b".to_string(), "127.0.0.1:0".parse().unwrap(), mk())
+        .await
+        .unwrap();
+    a.connect(b.addr()).await.unwrap();
+    common::wait_for(
+        || async { a.peer_count().await == 1 && b.peer_count().await == 1 },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    // Key in frag 0, put via a. Both replicas should converge.
+    let key = (0..1000)
+        .map(|i| format!("r{i}"))
+        .find(|k| fragment_of(k, frag_count) == FragmentId(0))
+        .unwrap();
+    a.put(key.clone(), b"rep".to_vec()).await.unwrap();
+    common::wait_for(
+        || async { b.get(key.clone()).await.unwrap().map(|v| v.value) == Some(b"rep".to_vec()) },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    a.shutdown().await;
+    b.shutdown().await;
+}

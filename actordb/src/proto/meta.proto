@@ -21,10 +21,10 @@ message Hello {
   string node_id = 1;
 }
 
-// A single replicated write, disseminated between nodes with epidemic
-// broadcast. Delivery is at-least-once; receivers merge with
-// last-writer-wins on (timestamp_ms, node_id). `seq` is a per-origin-node
-// sequence number used to suppress re-broadcast storms.
+// A single replicated write, sent from a fragment's coordinator to the
+// other replica holders. Delivery is at-least-once; receivers merge with
+// last-writer-wins on (timestamp_ms, node_id) and do NOT re-forward.
+// `seq`/`boot_id` are propagation metadata.
 message ReplicateOp {
   string key = 1;
   bytes value = 2;
@@ -37,8 +37,37 @@ message ReplicateOp {
   uint64 boot_id = 6;
 }
 
-// Ask a peer for its full local state (anti-entropy when a node joins)
-message SyncRequest {}
+// A client-routed write: "you own this key's fragment — apply it as
+// coordinator and replicate to the other holders." One network hop.
+message ForwardedPut {
+  string key = 1;
+  bytes value = 2;
+  uint64 timestamp_ms = 3;
+  string node_id = 4;
+  uint64 seq = 5;
+  uint64 boot_id = 6;
+}
+
+// A client-routed read: "you own this key's fragment — read it and
+// reply." One network hop.
+message ForwardedGet {
+  string key = 1;
+  uint64 req_id = 2;
+}
+
+message GetResponse {
+  uint64 req_id = 1;
+  bool found = 2;
+  bytes value = 3;
+  uint64 timestamp_ms = 4;
+  string node_id = 5;
+}
+
+// Ask a peer for the fragments listed (anti-entropy when a node joins
+// or a peer returns). Empty = all fragments the peer holds.
+message SyncRequest {
+  repeated uint32 fragments = 1;
+}
 
 // A peer's full local state
 message SyncResponse {
@@ -59,5 +88,8 @@ message Envelope {
     ReplicateOp replicate = 2;
     SyncRequest sync_request = 3;
     SyncResponse sync_response = 4;
+    ForwardedPut forwarded_put = 5;
+    ForwardedGet forwarded_get = 6;
+    GetResponse get_response = 7;
   }
 }

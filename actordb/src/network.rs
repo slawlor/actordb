@@ -5,10 +5,10 @@
 
 //! Pluggable network transport for the peer mesh.
 //!
-//! A [`Network`] binds a listen address and dials peers, producing
+//! A [`Network`](crate::network::Network) binds a listen address and dials peers, producing
 //! byte streams. Everything above — framing, handshake, gossip —
-//! operates on those streams generically. The default is [`TcpNetwork`]
-//! (plain TCP); implement [`Network`] to run the mesh over TLS, a
+//! operates on those streams generically. The default is [`TcpNetwork`](crate::network::TcpNetwork)
+//! (plain TCP); implement [`Network`](crate::network::Network) to run the mesh over TLS, a
 //! Meta-internal transport, or anything else that moves bytes.
 
 use std::fmt;
