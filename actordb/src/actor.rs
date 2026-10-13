@@ -15,8 +15,12 @@
 //! replicas converge without coordination.
 
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use ractor::{Actor, ActorProcessingErr, ActorRef, RpcReplyPort};
+
+use crate::store::KvStore;
 
 /// A value stamped with its last-writer-wins version.
 ///
@@ -76,26 +80,82 @@ pub enum KvMessage {
 }
 
 /// The actor's exclusive state: this node's local copy of the keyspace.
+///
+/// Applied writes are buffered and flushed to the [`KvStore`] in
+/// batches (see `NodeConfig` flush knobs); the copy is reloaded from
+/// the store on boot, so a restarted node keeps its dataset. A crash
+/// can lose the unflushed tail of the write buffer; the handshake sync
+/// on reconnect reconciles it from peers.
 pub struct KvState {
+    /// In-memory cache of the local copy: the fast path for all reads.
     store: HashMap<String, VersionedValue>,
+    /// Optional durable layer behind the cache. `None` = no persistence.
+    kvstore: Option<Arc<dyn KvStore>>,
+    pending: Vec<(String, VersionedValue)>,
+    last_flush: Instant,
+    flush_batch_size: usize,
+    flush_interval: Duration,
 }
 
 impl KvState {
     /// Merge an op into the local copy, keeping whichever version wins.
-    fn apply(&mut self, op: ReplicatedOp) {
+    /// Returns `true` if the op replaced the stored version.
+    fn apply(&mut self, op: &ReplicatedOp) -> bool {
         let replace = match self.store.get(&op.key) {
             Some(existing) => op.value.wins_over(existing),
             None => true,
         };
         if replace {
-            self.store.insert(op.key, op.value);
+            self.store.insert(op.key.clone(), op.value.clone());
         }
+        replace
+    }
+
+    /// Buffer an applied write, flushing to the store when the batch is
+    /// full or the flush interval has elapsed. Called only for ops that
+    /// won the merge. Memory is always updated first, so reads never
+    /// wait for a flush. No-op when no store is configured.
+    fn buffer(&mut self, key: &str, value: &VersionedValue) -> Result<(), ActorProcessingErr> {
+        if self.kvstore.is_none() {
+            return Ok(());
+        }
+        self.pending.push((key.to_string(), value.clone()));
+        if self.pending.len() >= self.flush_batch_size
+            || self.last_flush.elapsed() >= self.flush_interval
+        {
+            self.flush()?;
+        }
+        Ok(())
+    }
+
+    /// Write the buffered batch to the store in one batch.
+    fn flush(&mut self) -> Result<(), ActorProcessingErr> {
+        if self.pending.is_empty() {
+            return Ok(());
+        }
+        if let Some(kvstore) = &self.kvstore {
+            kvstore
+                .write_batch(&self.pending)
+                .map_err(|e| ActorProcessingErr::from(e.to_string()))?;
+            self.pending.clear();
+            self.last_flush = Instant::now();
+        }
+        Ok(())
     }
 }
 
-/// Arguments to spawn a [KvActor]. Kept for future use (e.g. persistence
-/// directory); the node id currently travels on each operation instead.
-pub struct KvArgs {}
+/// Arguments to spawn a [KvActor].
+#[derive(Clone)]
+pub struct KvArgs {
+    /// Optional durable storage behind the in-memory cache. `None`
+    /// (default) = no persistence; the node is purely in-memory.
+    pub store: Option<Arc<dyn KvStore>>,
+    /// Flush the write buffer after this many buffered ops.
+    pub flush_batch_size: usize,
+    /// Flush the write buffer after this long, even if the batch isn't
+    /// full. Checked on each applied write.
+    pub flush_interval: Duration,
+}
 
 /// The key-value actor. One runs per node and owns that node's local copy.
 pub struct KvActor;
@@ -108,11 +168,35 @@ impl Actor for KvActor {
     async fn pre_start(
         &self,
         _myself: ActorRef<Self::Msg>,
-        _args: Self::Arguments,
+        args: Self::Arguments,
     ) -> Result<Self::State, ActorProcessingErr> {
+        // Reload the in-memory cache from the store, if any. A corrupt
+        // store fails the boot loudly rather than silently dropping data.
+        let store = match &args.store {
+            Some(kvstore) => kvstore
+                .load()
+                .map_err(|e| ActorProcessingErr::from(e.to_string()))?,
+            None => HashMap::new(),
+        };
         Ok(KvState {
-            store: HashMap::new(),
+            store,
+            kvstore: args.store,
+            pending: Vec::new(),
+            last_flush: Instant::now(),
+            flush_batch_size: args.flush_batch_size,
+            flush_interval: args.flush_interval,
         })
+    }
+
+    async fn post_stop(
+        &self,
+        _myself: ActorRef<Self::Msg>,
+        state: &mut Self::State,
+    ) -> Result<(), ActorProcessingErr> {
+        // Clean shutdown: don't leave buffered writes behind.
+        // (A kill -9 skips this; the unflushed tail is recovered via
+        // peer sync on reconnect.)
+        state.flush()
     }
 
     async fn handle(
@@ -123,7 +207,12 @@ impl Actor for KvActor {
     ) -> Result<(), ActorProcessingErr> {
         match message {
             KvMessage::ApplyOp(op) => {
-                state.apply(op);
+                // Memory first (read-your-write never waits for disk),
+                // then buffer for the next batched flush. A DB error
+                // fails the actor loudly rather than diverging silently.
+                if state.apply(&op) {
+                    state.buffer(&op.key, &op.value)?;
+                }
                 Ok(())
             }
             KvMessage::Get { key, reply } => {

@@ -38,14 +38,15 @@ use prost::Message as ProstMessage;
 use ractor::rpc::CallResult;
 use ractor::{Actor, ActorRef};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, Mutex};
 use tokio::task::AbortHandle;
 
 use crate::actor::{now_ms, KvActor, KvArgs, KvMessage, ReplicatedOp, VersionedValue};
+use crate::network::{BoxStream, Network, TcpNetwork};
 use crate::proto::{
     Envelope, EnvelopeMsg, Hello, ReplicateOp as ProtoReplicateOp, SyncEntry, SyncResponse,
 };
+use crate::store::KvStore;
 
 /// Maximum wire frame size (16 MiB). Anything larger is treated as a
 /// corrupt stream and the connection is dropped.
@@ -67,6 +68,7 @@ pub enum NodeError {
     Io(std::io::Error),
     Codec(String),
     Actor(String),
+    Network(String),
 }
 
 impl std::fmt::Display for NodeError {
@@ -75,6 +77,7 @@ impl std::fmt::Display for NodeError {
             NodeError::Io(e) => write!(f, "io error: {e}"),
             NodeError::Codec(e) => write!(f, "codec error: {e}"),
             NodeError::Actor(e) => write!(f, "actor error: {e}"),
+            NodeError::Network(e) => write!(f, "network error: {e}"),
         }
     }
 }
@@ -109,6 +112,7 @@ pub struct Node {
     /// Per-node sequence number for locally originated ops.
     next_seq: Arc<Mutex<u64>>,
     tasks: Arc<Mutex<Vec<AbortHandle>>>,
+    network: Arc<dyn Network>,
 }
 
 /// Mint a fresh boot id. Wall-clock nanos mixed with the pid: two boots
@@ -123,17 +127,84 @@ fn fresh_boot_id() -> u64 {
     nanos ^ ((std::process::id() as u64) << 32)
 }
 
+/// Configuration for a [Node]. Start with `NodeConfig::default()` and
+/// set the fields you need. This is the seed of the operator-facing
+/// configuration surface (see the `NodeConfig` productionization issue).
+#[derive(Clone)]
+pub struct NodeConfig {
+    /// Optional durable storage behind the node's in-memory cache.
+    /// `None` (default) = no persistence; the node is purely in-memory.
+    /// With the `rocksdb` feature, [`NodeConfig::with_rocksdb`] builds a
+    /// config with the preferred RocksDB implementation, or bring your
+    /// own [`KvStore`].
+    pub store: Option<Arc<dyn KvStore>>,
+    /// Network transport for the peer mesh. Defaults to plain TCP;
+    /// see [`Network`].
+    pub network: Arc<dyn Network>,
+    /// Flush the store write buffer after this many buffered ops.
+    /// Ignored when `store` is `None`.
+    pub flush_batch_size: usize,
+    /// Flush the store write buffer after this long, even if the batch
+    /// isn't full (checked on each applied write). Ignored when `store`
+    /// is `None`.
+    ///
+    /// Crash window: a `kill -9` can lose the unflushed tail, which is
+    /// then recovered via peer sync on reconnect. Clean shutdowns
+    /// always flush.
+    pub flush_interval: Duration,
+}
+
+impl Default for NodeConfig {
+    fn default() -> Self {
+        Self {
+            store: None,
+            network: Arc::new(TcpNetwork),
+            flush_batch_size: 1000,
+            flush_interval: Duration::from_millis(100),
+        }
+    }
+}
+
+#[cfg(feature = "rocksdb")]
+impl NodeConfig {
+    /// Convenience: a config persisting to RocksDB at `path`, the
+    /// preferred durable implementation.
+    pub fn with_rocksdb(
+        path: impl AsRef<std::path::Path>,
+    ) -> Result<Self, crate::store::StoreError> {
+        Ok(Self {
+            store: Some(Arc::new(crate::store::RocksDbStore::open(path)?)),
+            ..Self::default()
+        })
+    }
+}
+
 impl Node {
     /// Start a node: spawn its [crate::actor::KvActor] and begin
     /// listening for peer connections. Binds `listen_addr` (use port 0
     /// for an ephemeral port) and returns the bound address via [Node::addr].
-    pub async fn start(node_id: String, listen_addr: SocketAddr) -> Result<Self, NodeError> {
-        let (actor, _actor_handle) = KvActor::spawn(None, KvActor, KvArgs {})
-            .await
-            .map_err(|e| NodeError::Actor(e.to_string()))?;
+    pub async fn start(
+        node_id: String,
+        listen_addr: SocketAddr,
+        config: NodeConfig,
+    ) -> Result<Self, NodeError> {
+        let (actor, _actor_handle) = KvActor::spawn(
+            None,
+            KvActor,
+            KvArgs {
+                store: config.store,
+                flush_batch_size: config.flush_batch_size,
+                flush_interval: config.flush_interval,
+            },
+        )
+        .await
+        .map_err(|e| NodeError::Actor(e.to_string()))?;
 
-        let listener = TcpListener::bind(listen_addr).await?;
-        let bound_addr = listener.local_addr()?;
+        let (bound_addr, mut acceptor) = config
+            .network
+            .bind(listen_addr)
+            .await
+            .map_err(|e| NodeError::Network(e.to_string()))?;
 
         let node = Self {
             node_id: node_id.clone(),
@@ -144,6 +215,7 @@ impl Node {
             seen_ops: Arc::new(Mutex::new(HashSet::new())),
             next_seq: Arc::new(Mutex::new(0)),
             tasks: Arc::new(Mutex::new(Vec::new())),
+            network: config.network.clone(),
         };
 
         // Accept loop: every inbound connection gets a handler task.
@@ -155,7 +227,7 @@ impl Node {
             node.tasks.clone(),
         );
         let accept_task = tokio::spawn(async move {
-            while let Ok((stream, _)) = listener.accept().await {
+            while let Ok(stream) = acceptor.accept().await {
                 let h = tokio::spawn(handle_connection(
                     nid.clone(),
                     act.clone(),
@@ -181,13 +253,18 @@ impl Node {
     /// drops, it is redialed with exponential backoff until
     /// [Node::shutdown].
     pub async fn connect(&self, peer_addr: SocketAddr) -> Result<(), NodeError> {
-        let stream = TcpStream::connect(peer_addr).await?;
-        let (node_id, actor, peers, seen_ops, tasks) = (
+        let stream = self
+            .network
+            .connect(peer_addr)
+            .await
+            .map_err(|e| NodeError::Network(e.to_string()))?;
+        let (node_id, actor, peers, seen_ops, tasks, network) = (
             self.node_id.clone(),
             self.actor.clone(),
             self.peers.clone(),
             self.seen_ops.clone(),
             self.tasks.clone(),
+            self.network.clone(),
         );
         let h = tokio::spawn(async move {
             // Run the initial connection to completion...
@@ -204,13 +281,17 @@ impl Node {
             // ...then redial forever. Only the dialer side redials; the
             // listener side just waits for the next inbound connection.
             // This task is aborted by shutdown() with all the rest.
-            reconnect_loop(node_id, actor, peers, seen_ops, tasks, peer_addr).await;
+            reconnect_loop(node_id, actor, peers, seen_ops, tasks, network, peer_addr).await;
         });
         self.tasks.lock().await.push(h.abort_handle());
         Ok(())
     }
 
     /// Write a key locally and gossip it to all peers.
+    ///
+    /// This is read-your-write: when `put` returns, the op has been
+    /// applied to the local copy (and, with persistence enabled,
+    /// written to disk). The gossip to peers is fire-and-forget.
     pub async fn put(&self, key: String, value: Vec<u8>) -> Result<(), NodeError> {
         let seq = {
             let mut guard = self.next_seq.lock().await;
@@ -218,7 +299,7 @@ impl Node {
             *guard
         };
         let op = ReplicatedOp {
-            key,
+            key: key.clone(),
             value: VersionedValue::new(value, now_ms(), self.node_id.clone()),
             seq,
             boot_id: self.boot_id,
@@ -232,6 +313,22 @@ impl Node {
         self.actor
             .send_message(KvMessage::ApplyOp(op.clone()))
             .map_err(|e| NodeError::Actor(e.to_string()))?;
+
+        // Barrier: the actor drains its mailbox in FIFO order, so this
+        // `call` returns only after the ApplyOp above has been applied.
+        // (A `get` on the same key doubles as the read-your-write check.)
+        match self
+            .actor
+            .call(|reply| KvMessage::Get { key, reply }, None)
+            .await
+            .map_err(|e| NodeError::Actor(e.to_string()))?
+        {
+            CallResult::Success(_) => {}
+            CallResult::Timeout => return Err(NodeError::Actor("put timed out".to_string())),
+            CallResult::SenderError => {
+                return Err(NodeError::Actor("put reply channel dropped".to_string()))
+            }
+        }
 
         self.broadcast(op).await;
         Ok(())
@@ -287,11 +384,18 @@ impl Node {
 
     /// Stop all networking tasks. The actor is left running; dropping the
     /// process ends it.
+    /// Shut the node down: abort all connection tasks and stop the
+    /// actor. Stopping the actor drops its state, which releases the
+    /// RocksDB lock (when persistence is enabled) so the database can
+    /// be reopened — e.g. by a restarted node on the same path.
     pub async fn shutdown(&self) {
         let mut tasks = self.tasks.lock().await;
         for t in tasks.drain(..) {
             t.abort();
         }
+        // The handlers never block, so this returns promptly. Failures
+        // just mean the actor was already dead.
+        let _ = self.actor.stop_and_wait(None, None).await;
     }
 
     /// Gossip an op to every connected peer. Fire-and-forget: a dead peer
@@ -348,7 +452,7 @@ async fn handle_connection(
     peers: PeerMap,
     seen_ops: Arc<Mutex<HashSet<(String, u64, u64)>>>,
     tasks: Arc<Mutex<Vec<AbortHandle>>>,
-    stream: TcpStream,
+    stream: BoxStream,
     we_dialed: bool,
 ) {
     let (mut reader, writer) = tokio::io::split(stream);
@@ -487,12 +591,13 @@ async fn reconnect_loop(
     peers: PeerMap,
     seen_ops: Arc<Mutex<HashSet<(String, u64, u64)>>>,
     tasks: Arc<Mutex<Vec<AbortHandle>>>,
+    network: Arc<dyn Network>,
     addr: SocketAddr,
 ) {
     let mut backoff = RECONNECT_BASE;
     loop {
         tokio::time::sleep(backoff + jitter(backoff)).await;
-        match TcpStream::connect(addr).await {
+        match network.connect(addr).await {
             Ok(stream) => {
                 backoff = RECONNECT_BASE;
                 handle_connection(

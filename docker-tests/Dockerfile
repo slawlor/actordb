@@ -8,7 +8,9 @@
 
 FROM rust:latest
 WORKDIR /usr/src/app
-RUN apt-get update && apt-get install -y cmake build-essential
+# clang: librocksdb-sys runs bindgen at build time, which needs libclang
+# with working system-header search paths
+RUN apt-get update && apt-get install -y cmake build-essential clang
 COPY . .
 RUN cargo install --path docker-tests
 RUN mv /usr/local/cargo/bin/actordb-docker-test /usr/local/bin/actordb-docker-test

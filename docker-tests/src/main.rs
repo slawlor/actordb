@@ -21,7 +21,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use actordb::node::Node;
+use actordb::node::{Node, NodeConfig};
 use clap::{Parser, Subcommand};
 
 /// generous per-step timeouts: CI runners and cold docker builds are slow
@@ -47,6 +47,9 @@ enum Command {
         node_id: String,
         #[arg(long)]
         port: u16,
+        /// optional RocksDB path for the node's local copy
+        #[arg(long)]
+        db_path: Option<PathBuf>,
         #[arg(long)]
         expect_peers: usize,
         #[arg(long)]
@@ -60,6 +63,9 @@ enum Command {
         node_id: String,
         #[arg(long)]
         port: u16,
+        /// optional RocksDB path for the node's local copy
+        #[arg(long)]
+        db_path: Option<PathBuf>,
         #[arg(long)]
         peer: Vec<String>,
         #[arg(long)]
@@ -75,6 +81,9 @@ enum Command {
         node_id: String,
         #[arg(long)]
         port: u16,
+        /// optional RocksDB path for the node's local copy
+        #[arg(long)]
+        db_path: Option<PathBuf>,
         #[arg(long)]
         peer: String,
         #[arg(long)]
@@ -93,6 +102,9 @@ enum Command {
         node_id: String,
         #[arg(long)]
         port: u16,
+        /// optional RocksDB path for the node's local copy
+        #[arg(long)]
+        db_path: Option<PathBuf>,
         #[arg(long)]
         key: String,
         #[arg(long)]
@@ -113,8 +125,12 @@ struct Ctx {
 }
 
 impl Ctx {
-    async fn start(node_id: String, port: u16) -> Result<Self, String> {
-        let node = Node::start(node_id.clone(), bind(port))
+    async fn start(node_id: String, port: u16, db_path: Option<PathBuf>) -> Result<Self, String> {
+        let config = match db_path {
+            Some(path) => NodeConfig::with_rocksdb(path).map_err(|e| format!("open db: {e}"))?,
+            None => NodeConfig::default(),
+        };
+        let node = Node::start(node_id.clone(), bind(port), config)
             .await
             .map_err(|e| format!("start failed: {e}"))?;
         Ok(Self {
@@ -239,11 +255,12 @@ fn bind(port: u16) -> SocketAddr {
 async fn replicate_writer(
     node_id: String,
     port: u16,
+    db_path: Option<PathBuf>,
     expect_peers: usize,
     key: String,
     value: String,
 ) -> TestResult {
-    let ctx = Ctx::start(node_id, port).await?;
+    let ctx = Ctx::start(node_id, port, db_path).await?;
     ctx.log(&format!(
         "role=replicate-writer port={port} expect_peers={expect_peers} key={key:?}"
     ));
@@ -274,12 +291,13 @@ async fn put_key(ctx: &Ctx, key: String, value: Vec<u8>) -> TestResult {
 async fn replicate_reader(
     node_id: String,
     port: u16,
+    db_path: Option<PathBuf>,
     peers: Vec<String>,
     key: String,
     value: String,
     timeout_secs: u64,
 ) -> TestResult {
-    let ctx = Ctx::start(node_id, port).await?;
+    let ctx = Ctx::start(node_id, port, db_path).await?;
     ctx.log(&format!(
         "role=replicate-reader port={port} peers={peers:?} key={key:?} timeout={timeout_secs}s"
     ));
@@ -303,16 +321,20 @@ async fn replicate_reader(
     Ok(())
 }
 
+// Role handlers take one arg per CLI flag; allow the arity lint here —
+// this is a scripted test driver, not library API.
+#[allow(clippy::too_many_arguments)]
 async fn restart_crashing(
     node_id: String,
     port: u16,
+    db_path: Option<PathBuf>,
     peer: String,
     key: String,
     put_value: String,
     expect_value: String,
     sentinel: PathBuf,
 ) -> TestResult {
-    let ctx = Ctx::start(node_id, port).await?;
+    let ctx = Ctx::start(node_id, port, db_path).await?;
     ctx.log(&format!(
         "role=restart-crashing port={port} peer={peer:?} key={key:?} sentinel={sentinel:?}"
     ));
@@ -356,11 +378,12 @@ async fn restart_crashing(
 async fn restart_survivor(
     node_id: String,
     port: u16,
+    db_path: Option<PathBuf>,
     key: String,
     put_value: String,
     expect_value: String,
 ) -> TestResult {
-    let ctx = Ctx::start(node_id, port).await?;
+    let ctx = Ctx::start(node_id, port, db_path).await?;
     ctx.log(&format!(
         "role=restart-survivor port={port} key={key:?} (waits to be dialed)"
     ));
@@ -412,34 +435,50 @@ async fn main() {
         Command::ReplicateWriter {
             node_id,
             port,
+            db_path,
             expect_peers,
             key,
             value,
-        } => replicate_writer(node_id, port, expect_peers, key, value).await,
+        } => replicate_writer(node_id, port, db_path, expect_peers, key, value).await,
         Command::ReplicateReader {
             node_id,
             port,
+            db_path,
             peer,
             key,
             value,
             timeout_secs,
-        } => replicate_reader(node_id, port, peer, key, value, timeout_secs).await,
+        } => replicate_reader(node_id, port, db_path, peer, key, value, timeout_secs).await,
         Command::RestartCrashing {
             node_id,
             port,
+            db_path,
             peer,
             key,
             put_value,
             expect_value,
             sentinel,
-        } => restart_crashing(node_id, port, peer, key, put_value, expect_value, sentinel).await,
+        } => {
+            restart_crashing(
+                node_id,
+                port,
+                db_path,
+                peer,
+                key,
+                put_value,
+                expect_value,
+                sentinel,
+            )
+            .await
+        }
         Command::RestartSurvivor {
             node_id,
             port,
+            db_path,
             key,
             put_value,
             expect_value,
-        } => restart_survivor(node_id, port, key, put_value, expect_value).await,
+        } => restart_survivor(node_id, port, db_path, key, put_value, expect_value).await,
     };
     match result {
         Ok(()) => println!("SCENARIO_OK"),

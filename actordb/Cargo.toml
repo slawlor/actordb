@@ -27,18 +27,27 @@ rust-version = "1.64"
 protobuf-src = "2"
 prost-build = { version = "0.14" }
 
+[features]
+default = ["rocksdb"]
+# RocksDB-backed durable storage. Disable with --no-default-features for
+# a lean build (the in-memory store remains); note librocksdb-sys runs
+# bindgen at build time and needs libclang with working header paths.
+rocksdb = ["dep:rocksdb"]
+
 [dependencies]
 # Required dependencies
 bytes = { version = "1" }
 prost = { version = "0.14" }
 prost-types = { version = "0.14" }
 ractor = { version = "0.16" }
+rocksdb = { version = "0.23", optional = true }
 tokio = { version = "1", features = ["sync", "time", "net", "io-util"] }
 tracing = "0.1"
 # Optional dependencies
 
 [dev-dependencies]
+tempfile = "3"
 tokio = { version = "1", features = ["rt", "time", "sync", "macros", "rt-multi-thread", "signal"] }
-tracing-glog = "0.4"
+tracing-glog = "0.3"
 tracing-subscriber = { version = "0.3", features = ["env-filter"]}
 tracing-test = "0.2"
