@@ -9,6 +9,13 @@ set -u
 
 ENV_FILE="docker/envs/restart.env"
 
+# Always tear the cluster down, even if a step below fails.
+cleanup() {
+    docker compose --env-file "$ENV_FILE" down --volumes >/dev/null 2>&1 || true
+}
+trap cleanup EXIT
+
+echo "=== scenario: SIGKILL + restart ($(date -u +%H:%M:%S) UTC) ==="
 docker compose --env-file "$ENV_FILE" up -d
 
 echo "waiting for node-a to become ready..."
@@ -22,7 +29,8 @@ for _ in $(seq 1 90); do
 done
 if [ "$READY" != "1" ]; then
     echo "node-a never became ready"
-    docker compose --env-file "$ENV_FILE" down --volumes
+    echo "=== FAILED: container logs ==="
+    docker compose --env-file "$ENV_FILE" logs --no-color --tail 300
     exit 1
 fi
 
@@ -34,8 +42,14 @@ docker start node-a >/dev/null
 FAIL=0
 for svc in node-a node-b node-c; do
     code=$(docker wait "$svc")
-    echo "$svc exited with code $code"
+    echo "--- $svc exited with code $code"
     [ "$code" = "0" ] || FAIL=1
 done
-docker compose --env-file "$ENV_FILE" down --volumes
+
+if [ "$FAIL" != "0" ]; then
+    echo "=== FAILED: container logs ==="
+    docker compose --env-file "$ENV_FILE" logs --no-color --tail 300
+else
+    echo "=== scenario OK ==="
+fi
 exit $FAIL
