@@ -127,13 +127,34 @@ fn fresh_boot_id() -> u64 {
 /// Configuration for a [Node]. Start with `NodeConfig::default()` and
 /// set the fields you need. This is the seed of the operator-facing
 /// configuration surface (see the `NodeConfig` productionization issue).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct NodeConfig {
     /// If set, the node's local copy is persisted to RocksDB at this
-    /// path: every applied write goes to disk write-through, and the
-    /// dataset is reloaded on boot. `None` (default) keeps the node
+    /// path: applied writes are buffered and flushed in batches, and
+    /// the dataset is reloaded on boot. `None` (default) keeps the node
     /// purely in-memory.
     pub db_path: Option<PathBuf>,
+    /// Flush the RocksDB write buffer after this many buffered ops.
+    /// Ignored when `db_path` is `None`.
+    pub flush_batch_size: usize,
+    /// Flush the RocksDB write buffer after this long, even if the
+    /// batch isn't full (checked on each applied write). Ignored when
+    /// `db_path` is `None`.
+    ///
+    /// Crash window: a `kill -9` can lose the unflushed tail, which is
+    /// then recovered via peer sync on reconnect. Clean shutdowns
+    /// always flush.
+    pub flush_interval: Duration,
+}
+
+impl Default for NodeConfig {
+    fn default() -> Self {
+        Self {
+            db_path: None,
+            flush_batch_size: 1000,
+            flush_interval: Duration::from_millis(100),
+        }
+    }
 }
 
 impl Node {
@@ -150,6 +171,8 @@ impl Node {
             KvActor,
             KvArgs {
                 db_path: config.db_path,
+                flush_batch_size: config.flush_batch_size,
+                flush_interval: config.flush_interval,
             },
         )
         .await

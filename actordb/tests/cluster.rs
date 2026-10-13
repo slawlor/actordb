@@ -269,6 +269,7 @@ async fn persistence_roundtrip() {
         "127.0.0.1:0".parse().unwrap(),
         NodeConfig {
             db_path: Some(db_path.clone()),
+            ..NodeConfig::default()
         },
     )
     .await
@@ -283,6 +284,7 @@ async fn persistence_roundtrip() {
         "127.0.0.1:0".parse().unwrap(),
         NodeConfig {
             db_path: Some(db_path),
+            ..NodeConfig::default()
         },
     )
     .await
@@ -313,6 +315,7 @@ async fn persistence_keeps_gossiped_winner() {
         "127.0.0.1:0".parse().unwrap(),
         NodeConfig {
             db_path: Some(db_path.clone()),
+            ..NodeConfig::default()
         },
     )
     .await
@@ -347,6 +350,7 @@ async fn persistence_keeps_gossiped_winner() {
         "127.0.0.1:0".parse().unwrap(),
         NodeConfig {
             db_path: Some(db_path),
+            ..NodeConfig::default()
         },
     )
     .await
@@ -371,4 +375,34 @@ async fn persistence_keeps_gossiped_winner() {
 
     a2.shutdown().await;
     b.shutdown().await;
+}
+
+#[tokio::test]
+async fn persistence_flushes_on_shutdown() {
+    // With a batch size and interval that never trigger mid-test, the
+    // shutdown flush is the only thing persisting these writes.
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("actordb");
+    let config = || NodeConfig {
+        db_path: Some(db_path.clone()),
+        flush_batch_size: 1_000_000,
+        flush_interval: Duration::from_secs(3600),
+    };
+
+    let a = Node::start("a".to_string(), "127.0.0.1:0".parse().unwrap(), config())
+        .await
+        .expect("node failed to start");
+    a.put("k".to_string(), b"v".to_vec()).await.unwrap();
+    a.shutdown().await;
+
+    let a2 = Node::start("a".to_string(), "127.0.0.1:0".parse().unwrap(), config())
+        .await
+        .expect("node failed to restart");
+    let got = a2
+        .get("k".to_string())
+        .await
+        .unwrap()
+        .expect("k missing after restart");
+    assert_eq!(got.value, b"v");
+    a2.shutdown().await;
 }

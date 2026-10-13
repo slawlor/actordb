@@ -16,9 +16,10 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use ractor::{Actor, ActorProcessingErr, ActorRef, RpcReplyPort};
-use rocksdb::{IteratorMode, DB};
+use rocksdb::{IteratorMode, WriteBatch, DB};
 
 /// A value stamped with its last-writer-wins version.
 ///
@@ -81,10 +82,16 @@ pub enum KvMessage {
 ///
 /// When a `db` is present, every applied write is also persisted to
 /// RocksDB (write-through) and the copy is reloaded from disk on boot,
-/// so a restarted node keeps its dataset.
+/// so a restarted node keeps its dataset. A crash can lose the
+/// unflushed tail of the write buffer; the handshake sync on reconnect
+/// reconciles it from peers.
 pub struct KvState {
     store: HashMap<String, VersionedValue>,
     db: Option<DB>,
+    pending: Vec<(Vec<u8>, Vec<u8>)>,
+    last_flush: Instant,
+    flush_batch_size: usize,
+    flush_interval: Duration,
 }
 
 impl KvState {
@@ -101,23 +108,54 @@ impl KvState {
         replace
     }
 
-    /// Persist an applied write. Called only for ops that won the merge.
-    fn persist(&self, key: &str, value: &VersionedValue) -> Result<(), ActorProcessingErr> {
+    /// Buffer an applied write, flushing to RocksDB when the batch is
+    /// full or the flush interval has elapsed. Called only for ops that
+    /// won the merge. Memory is always updated first, so reads never
+    /// wait for a flush.
+    fn buffer(&mut self, key: &str, value: &VersionedValue) -> Result<(), ActorProcessingErr> {
+        if self.db.is_none() {
+            return Ok(());
+        }
+        self.pending
+            .push((key.as_bytes().to_vec(), encode_value(value)));
+        if self.pending.len() >= self.flush_batch_size
+            || self.last_flush.elapsed() >= self.flush_interval
+        {
+            self.flush()?;
+        }
+        Ok(())
+    }
+
+    /// Write the buffered batch to RocksDB in one `WriteBatch`.
+    fn flush(&mut self) -> Result<(), ActorProcessingErr> {
+        if self.pending.is_empty() {
+            return Ok(());
+        }
         if let Some(db) = &self.db {
-            db.put(key.as_bytes(), encode_value(value))
+            let mut batch = WriteBatch::default();
+            for (k, v) in self.pending.drain(..) {
+                batch.put(k, v);
+            }
+            db.write(batch)
                 .map_err(|e| ActorProcessingErr::from(e.to_string()))?;
+            self.last_flush = Instant::now();
         }
         Ok(())
     }
 }
 
 /// Arguments to spawn a [KvActor].
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct KvArgs {
-    /// If set, persist every applied write to RocksDB at this path
-    /// (created if missing) and reload it on boot. `None` (default)
-    /// keeps the node purely in-memory.
+    /// If set, persist applied writes to RocksDB at this path (created
+    /// if missing) and reload them on boot. `None` keeps the node
+    /// purely in-memory.
     pub db_path: Option<PathBuf>,
+    /// Flush the write buffer after this many buffered ops.
+    pub flush_batch_size: usize,
+    /// Flush the write buffer after this long, even if the batch isn't
+    /// full. Checked on each applied write.
+    pub flush_interval: Duration,
 }
 
 /// The key-value actor. One runs per node and owns that node's local copy.
@@ -153,7 +191,25 @@ impl Actor for KvActor {
             }
             None => None,
         };
-        Ok(KvState { store, db })
+        Ok(KvState {
+            store,
+            db,
+            pending: Vec::new(),
+            last_flush: Instant::now(),
+            flush_batch_size: args.flush_batch_size,
+            flush_interval: args.flush_interval,
+        })
+    }
+
+    async fn post_stop(
+        &self,
+        _myself: ActorRef<Self::Msg>,
+        state: &mut Self::State,
+    ) -> Result<(), ActorProcessingErr> {
+        // Clean shutdown: don't leave buffered writes behind.
+        // (A kill -9 skips this; the unflushed tail is recovered via
+        // peer sync on reconnect.)
+        state.flush()
     }
 
     async fn handle(
@@ -164,11 +220,11 @@ impl Actor for KvActor {
     ) -> Result<(), ActorProcessingErr> {
         match message {
             KvMessage::ApplyOp(op) => {
-                // Write-through: durable first, then memory. If the DB
-                // write fails the actor errors out rather than diverging
-                // silently from disk.
+                // Memory first (read-your-write never waits for disk),
+                // then buffer for the next batched flush. A DB error
+                // fails the actor loudly rather than diverging silently.
                 if state.apply(&op) {
-                    state.persist(&op.key, &op.value)?;
+                    state.buffer(&op.key, &op.value)?;
                 }
                 Ok(())
             }
