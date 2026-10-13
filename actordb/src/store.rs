@@ -13,10 +13,11 @@
 //! test double for exercising the persistence plumbing without a
 //! database.
 
-use std::collections::HashMap;
 use std::fmt;
+use std::sync::Arc;
 
 use crate::actor::VersionedValue;
+use crate::shard::FragmentId;
 
 /// Error from a [`KvStore`] operation.
 #[derive(Debug)]
@@ -35,11 +36,15 @@ impl std::error::Error for StoreError {}
 /// Implementors must be thread-safe: the actor calls these from its
 /// message handler. `load` runs once at actor boot; `write_batch` runs
 /// on every flush (see `NodeConfig` flush knobs).
+///
+/// Keys are raw bytes. The actor works with `String` keys and converts
+/// at the boundary (failing boot loudly on non-UTF-8 data); the store
+/// itself never interprets key bytes.
 pub trait KvStore: Send + Sync + 'static {
     /// Load the full dataset. Called once at actor boot.
-    fn load(&self) -> Result<HashMap<String, VersionedValue>, StoreError>;
+    fn load(&self) -> Result<Vec<(Vec<u8>, VersionedValue)>, StoreError>;
     /// Persist a batch of winning writes.
-    fn write_batch(&self, writes: &[(String, VersionedValue)]) -> Result<(), StoreError>;
+    fn write_batch(&self, writes: &[(Vec<u8>, VersionedValue)]) -> Result<(), StoreError>;
 }
 
 /// Test double for [`KvStore`]: records nothing, loads nothing.
@@ -52,12 +57,59 @@ pub trait KvStore: Send + Sync + 'static {
 pub struct MemoryStore;
 
 impl KvStore for MemoryStore {
-    fn load(&self) -> Result<HashMap<String, VersionedValue>, StoreError> {
-        Ok(HashMap::new())
+    fn load(&self) -> Result<Vec<(Vec<u8>, VersionedValue)>, StoreError> {
+        Ok(Vec::new())
     }
 
-    fn write_batch(&self, _writes: &[(String, VersionedValue)]) -> Result<(), StoreError> {
+    fn write_batch(&self, _writes: &[(Vec<u8>, VersionedValue)]) -> Result<(), StoreError> {
         Ok(())
+    }
+}
+
+/// A [`KvStore`] view namespaced to one fragment.
+///
+/// Keys are prefixed with the fragment id (`frag_id` as big-endian
+/// u32) before hitting the inner store, and the prefix is stripped on
+/// load. Lets N fragment actors share one underlying store (e.g. one
+/// RocksDB) without key collisions, and makes per-fragment operations
+/// (drop, migrate) possible later via prefix scans.
+pub struct PrefixedStore {
+    inner: Arc<dyn KvStore>,
+    prefix: [u8; 4],
+}
+
+impl PrefixedStore {
+    /// Wrap `inner`, namespacing all keys to `fragment`.
+    pub fn new(inner: Arc<dyn KvStore>, fragment: FragmentId) -> Self {
+        Self {
+            inner,
+            prefix: fragment.0.to_be_bytes(),
+        }
+    }
+}
+
+impl KvStore for PrefixedStore {
+    fn load(&self) -> Result<Vec<(Vec<u8>, VersionedValue)>, StoreError> {
+        let mut out = Vec::new();
+        for (key, value) in self.inner.load()? {
+            if let Some(stripped) = key.strip_prefix(self.prefix.as_slice()) {
+                out.push((stripped.to_vec(), value));
+            }
+        }
+        Ok(out)
+    }
+
+    fn write_batch(&self, writes: &[(Vec<u8>, VersionedValue)]) -> Result<(), StoreError> {
+        let prefixed: Vec<(Vec<u8>, VersionedValue)> = writes
+            .iter()
+            .map(|(k, v)| {
+                let mut buf = Vec::with_capacity(4 + k.len());
+                buf.extend_from_slice(&self.prefix);
+                buf.extend_from_slice(k);
+                (buf, v.clone())
+            })
+            .collect();
+        self.inner.write_batch(&prefixed)
     }
 }
 
@@ -113,23 +165,22 @@ impl RocksDbStore {
 
 #[cfg(feature = "rocksdb")]
 impl KvStore for RocksDbStore {
-    fn load(&self) -> Result<HashMap<String, VersionedValue>, StoreError> {
-        let mut store = HashMap::new();
+    fn load(&self) -> Result<Vec<(Vec<u8>, VersionedValue)>, StoreError> {
+        let mut out = Vec::new();
         // Corrupt or unreadable entries fail the boot loudly rather
         // than silently dropping data.
         for item in self.db.iterator(rocksdb::IteratorMode::Start) {
             let (k, v) = item.map_err(|e| StoreError(e.to_string()))?;
-            let key = String::from_utf8(k.to_vec()).map_err(|e| StoreError(e.to_string()))?;
             let value = Self::decode(&v).map_err(StoreError)?;
-            store.insert(key, value);
+            out.push((k.to_vec(), value));
         }
-        Ok(store)
+        Ok(out)
     }
 
-    fn write_batch(&self, writes: &[(String, VersionedValue)]) -> Result<(), StoreError> {
+    fn write_batch(&self, writes: &[(Vec<u8>, VersionedValue)]) -> Result<(), StoreError> {
         let mut batch = rocksdb::WriteBatch::default();
         for (key, value) in writes {
-            batch.put(key.as_bytes(), Self::encode(value));
+            batch.put(key, Self::encode(value));
         }
         self.db.write(batch).map_err(|e| StoreError(e.to_string()))
     }
@@ -140,11 +191,58 @@ mod tests {
     use super::*;
 
     #[test]
+    fn prefixed_store_isolates_fragments() {
+        use crate::shard::FragmentId;
+        use std::sync::Arc;
+
+        // A recording inner store: captures what the wrapper writes.
+        struct Rec {
+            written: std::sync::Mutex<Vec<(Vec<u8>, VersionedValue)>>,
+        }
+        impl KvStore for Rec {
+            fn load(&self) -> Result<Vec<(Vec<u8>, VersionedValue)>, StoreError> {
+                Ok(self.written.lock().unwrap().clone())
+            }
+            fn write_batch(&self, writes: &[(Vec<u8>, VersionedValue)]) -> Result<(), StoreError> {
+                self.written
+                    .lock()
+                    .unwrap()
+                    .extend(writes.iter().map(|(k, v)| (k.clone(), v.clone())));
+                Ok(())
+            }
+        }
+
+        let inner = Arc::new(Rec {
+            written: std::sync::Mutex::new(Vec::new()),
+        });
+        let f0 = PrefixedStore::new(inner.clone(), FragmentId(0));
+        let f1 = PrefixedStore::new(inner.clone(), FragmentId(1));
+
+        let v = VersionedValue::new(b"x".to_vec(), 1, "n".to_string());
+        f0.write_batch(&[(b"key".to_vec(), v.clone())]).unwrap();
+        f1.write_batch(&[(b"key".to_vec(), v.clone())]).unwrap();
+
+        // Same logical key, different fragments -> different stored keys.
+        let written = inner.written.lock().unwrap();
+        assert_eq!(written.len(), 2);
+        assert_ne!(written[0].0, written[1].0);
+        assert!(written[0].0.starts_with(&0u32.to_be_bytes()));
+        assert!(written[1].0.starts_with(&1u32.to_be_bytes()));
+        drop(written);
+
+        // Each fragment loads only its own keys, prefix stripped.
+        assert_eq!(f0.load().unwrap().len(), 1);
+        assert_eq!(f0.load().unwrap()[0].0, b"key");
+        assert_eq!(f1.load().unwrap().len(), 1);
+        assert_eq!(f1.load().unwrap()[0].0, b"key");
+    }
+
+    #[test]
     fn memory_store_is_a_noop() {
         let s = MemoryStore;
         assert!(s.load().unwrap().is_empty());
         s.write_batch(&[(
-            "k".to_string(),
+            b"k".to_vec(),
             VersionedValue::new(vec![1], 1, "n".to_string()),
         )])
         .unwrap();

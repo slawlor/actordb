@@ -30,5 +30,8 @@ pub mod proto;
 /// an in-memory no-op; enable the `rocksdb` feature for RocksDB.
 pub mod store;
 
+/// Sharding: deterministic key → fragment mapping.
+pub mod shard;
+
 #[cfg(test)]
 pub(crate) mod common_test;
