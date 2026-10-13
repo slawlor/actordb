@@ -30,7 +30,7 @@ distributed database vision:
   (`Hello`, `ReplicateOp`, `SyncRequest`, `SyncResponse`),
   length-delimited over TCP.
 
-Run the tests (5 cluster integration tests over real localhost TCP, plus
+Run the tests (7 cluster integration tests over real localhost TCP, plus
 a unit test for the LWW ordering):
 
 ```bash
@@ -43,6 +43,34 @@ converged local copy):
 ```bash
 cargo run --example three_node_demo
 ```
+
+## Docker integration tests
+
+Modeled on
+[ractor's cluster integration tests](https://github.com/slawlor/ractor/tree/main/ractor_cluster_integration_tests):
+three nodes on a private compose network (`test-net`), each container
+running one scripted role from the `actordb-docker-test` binary
+(`docker-tests/` crate). Unlike the in-process tests, these exercise
+real multi-host networking — DNS peer addresses, container death, and
+true `SIGKILL` crashes.
+
+Scenarios live in `docker/envs/`:
+
+* **replication** — node-a writes one key; node-b and node-c must
+  converge on it.
+* **restart** — `SIGKILL` node-a mid-cluster (a real kill -9, delivered
+  by the driver script), restart it, and require all three nodes to
+  reconverge. Exercises the redial supervisor, handshake sync, and
+  `boot_id` dedup across process death.
+
+```bash
+docker compose build
+bash docker/run-scenario.sh docker/envs/replication.env
+bash docker/restart-test.sh
+```
+
+CI runs both scenarios on every push/PR touching the relevant paths
+(`.github/workflows/docker-integration.yaml`).
 
 ## TODO List
 
