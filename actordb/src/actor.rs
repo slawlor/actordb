@@ -20,6 +20,7 @@ use std::time::{Duration, Instant};
 
 use ractor::{Actor, ActorProcessingErr, ActorRef, RpcReplyPort};
 
+use crate::shard::FragmentId;
 use crate::store::KvStore;
 
 /// A value stamped with its last-writer-wins version.
@@ -134,8 +135,13 @@ impl KvState {
             return Ok(());
         }
         if let Some(kvstore) = &self.kvstore {
+            let batch: Vec<(Vec<u8>, VersionedValue)> = self
+                .pending
+                .iter()
+                .map(|(k, v)| (k.as_bytes().to_vec(), v.clone()))
+                .collect();
             kvstore
-                .write_batch(&self.pending)
+                .write_batch(&batch)
                 .map_err(|e| ActorProcessingErr::from(e.to_string()))?;
             self.pending.clear();
             self.last_flush = Instant::now();
@@ -150,6 +156,9 @@ pub struct KvArgs {
     /// Optional durable storage behind the in-memory cache. `None`
     /// (default) = no persistence; the node is purely in-memory.
     pub store: Option<Arc<dyn KvStore>>,
+    /// Which fragment this actor serves. Used for store namespacing
+    /// and debug output.
+    pub fragment: FragmentId,
     /// Flush the write buffer after this many buffered ops.
     pub flush_batch_size: usize,
     /// Flush the write buffer after this long, even if the batch isn't
@@ -172,10 +181,19 @@ impl Actor for KvActor {
     ) -> Result<Self::State, ActorProcessingErr> {
         // Reload the in-memory cache from the store, if any. A corrupt
         // store fails the boot loudly rather than silently dropping data.
-        let store = match &args.store {
-            Some(kvstore) => kvstore
-                .load()
-                .map_err(|e| ActorProcessingErr::from(e.to_string()))?,
+        let store: HashMap<String, VersionedValue> = match &args.store {
+            Some(kvstore) => {
+                let mut map = HashMap::new();
+                for (k, v) in kvstore
+                    .load()
+                    .map_err(|e| ActorProcessingErr::from(e.to_string()))?
+                {
+                    let key = String::from_utf8(k)
+                        .map_err(|e| ActorProcessingErr::from(e.to_string()))?;
+                    map.insert(key, v);
+                }
+                map
+            }
             None => HashMap::new(),
         };
         Ok(KvState {
