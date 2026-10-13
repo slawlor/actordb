@@ -72,6 +72,69 @@ bash docker/restart-test.sh
 CI runs both scenarios on every push/PR touching the relevant paths
 (`.github/workflows/docker-integration.yaml`).
 
+## Public API
+
+Three modules:
+
+### `actordb::node` — the main entry point
+
+`Node` pairs a `KvActor` with the Tokio TCP replication mesh. This is
+what most users interact with:
+
+```rust
+use actordb::node::Node;
+
+let node = Node::start("node-a".to_string(), "0.0.0.0:7447".parse().unwrap()).await?;
+// port 0 picks an ephemeral port; the bound address is available via `node.addr()`
+
+node.connect("127.0.0.1:7447".parse().unwrap()).await?;
+// handshake runs a full-state sync, so a joining node converges immediately.
+// The dialer side owns the connection and redials with backoff if it drops.
+
+node.put("key".to_string(), b"value".to_vec()).await?;
+let value = node.get("key".to_string()).await?;  // local-only read, Option<VersionedValue>
+let all = node.get_all().await?;                  // full local copy
+let peers = node.peer_count().await;
+
+node.shutdown().await;
+```
+
+- Writes are applied to the local actor and gossiped to peers with
+  epidemic broadcast; reads never touch the network.
+- Conflicts resolve with last-writer-wins on `(timestamp_ms, node_id)`.
+- Failures surface as `NodeError::{Io, Codec, Actor}`.
+
+### `actordb::actor` — the storage core
+
+- `KvActor` — the [ractor](https://github.com/slawlor/ractor) actor
+  owning one node's local copy. Its message handler is the only code
+  that mutates state: no locks, no shared mutability.
+- `VersionedValue { value, timestamp_ms, node_id }` — a value plus its
+  LWW version; `wins_over` implements the conflict rule.
+- `KvMessage::{ApplyOp, Get, GetAll}` — for embedders driving the actor
+  directly instead of through `Node`.
+
+### `actordb::proto` — wire protocol
+
+Prost-generated protobuf types (`Envelope`, `Hello`, `ReplicateOp`,
+`SyncRequest`, `SyncResponse`), sent as 4-byte length-prefixed frames
+over TCP. Mostly of interest if you're implementing a compatible peer.
+
+### Current limitations
+
+This is a working prototype, not production-ready. Known gaps, tracked
+as issues in the [issue tracker](https://github.com/slawlor/actordb/issues):
+
+- **No persistence** — the dataset lives in memory; a restart wipes it
+  (recoverable only via peer sync).
+- **No TLS/authentication** — plaintext, unauthenticated TCP.
+- **No deletes** — keys live forever.
+- **Wall-clock LWW** — no hybrid logical clocks yet; skewed clocks can
+  lose writes.
+- **Silent drops under extreme load** — the per-peer queue is bounded
+  and overflow is currently silent.
+- **Full-state anti-entropy** — every handshake ships the whole dataset.
+
 ## TODO List
 
 1. Make generic input(recv)/output(send) service definitions.
