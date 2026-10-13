@@ -199,7 +199,7 @@ fn fresh_boot_id() -> u64 {
 pub struct NodeConfig {
     /// Optional durable storage behind the node's in-memory cache.
     /// `None` (default) = no persistence; the node is purely in-memory.
-    /// With the `rocksdb` feature, [`NodeConfig::with_rocksdb`] builds a
+    /// With the `rocksdb` feature, `NodeConfig::with_rocksdb` builds a
     /// config with the preferred RocksDB implementation, or bring your
     /// own [`KvStore`].
     pub store: Option<Arc<dyn KvStore>>,

@@ -5,11 +5,11 @@
 
 //! Pluggable durable storage for a node's local copy.
 //!
-//! A [`KvStore`] persists the batches the [`KvActor`](crate::actor::KvActor)
+//! A [`KvStore`](crate::store::KvStore) persists the batches the [`KvActor`](crate::actor::KvActor)
 //! flushes and reloads them on boot. Persistence itself is optional:
 //! `NodeConfig.store` is `None` by default (a pure in-memory node).
-//! Enable the `rocksdb` cargo feature for [`RocksDbStore`], the
-//! preferred implementation, or bring your own. [`MemoryStore`] is a
+//! Enable the `rocksdb` cargo feature for `RocksDbStore`, the
+//! preferred implementation, or bring your own. [`MemoryStore`](crate::store::MemoryStore) is a
 //! test double for exercising the persistence plumbing without a
 //! database.
 
