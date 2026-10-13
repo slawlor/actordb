@@ -8,6 +8,12 @@ set -u
 ENV_FILE="${1:?usage: run-scenario.sh <env-file>}"
 SERVICES="node-a node-b node-c"
 
+# Always tear the cluster down, even if a step above fails.
+cleanup() {
+    docker compose --env-file "$ENV_FILE" down --volumes >/dev/null 2>&1 || true
+}
+trap cleanup EXIT
+
 docker compose --env-file "$ENV_FILE" up -d
 FAIL=0
 for svc in $SERVICES; do
@@ -15,5 +21,4 @@ for svc in $SERVICES; do
     echo "$svc exited with code $code"
     [ "$code" = "0" ] || FAIL=1
 done
-docker compose --env-file "$ENV_FILE" down --volumes
 exit $FAIL

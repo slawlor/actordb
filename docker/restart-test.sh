@@ -9,6 +9,12 @@ set -u
 
 ENV_FILE="docker/envs/restart.env"
 
+# Always tear the cluster down, even if a step below fails.
+cleanup() {
+    docker compose --env-file "$ENV_FILE" down --volumes >/dev/null 2>&1 || true
+}
+trap cleanup EXIT
+
 docker compose --env-file "$ENV_FILE" up -d
 
 echo "waiting for node-a to become ready..."
@@ -22,7 +28,6 @@ for _ in $(seq 1 90); do
 done
 if [ "$READY" != "1" ]; then
     echo "node-a never became ready"
-    docker compose --env-file "$ENV_FILE" down --volumes
     exit 1
 fi
 
@@ -37,5 +42,4 @@ for svc in node-a node-b node-c; do
     echo "$svc exited with code $code"
     [ "$code" = "0" ] || FAIL=1
 done
-docker compose --env-file "$ENV_FILE" down --volumes
 exit $FAIL
