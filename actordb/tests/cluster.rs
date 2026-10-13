@@ -419,3 +419,40 @@ async fn memory_store_exercises_persistence_plumbing() {
     assert_eq!(got.value, b"v");
     a.shutdown().await;
 }
+
+#[tokio::test]
+async fn fragments_route_and_isolate() {
+    // Phase 1: one node, 4 fragments. Keys hash to their fragments;
+    // every key stays retrievable and get_all sees the union.
+    use actordb::shard::fragment_of;
+    use std::collections::HashSet;
+
+    let config = NodeConfig {
+        fragment_count: 4,
+        ..NodeConfig::default()
+    };
+    let a = Node::start("a".to_string(), "127.0.0.1:0".parse().unwrap(), config)
+        .await
+        .expect("node failed to start");
+
+    let mut frags_seen = HashSet::new();
+    for i in 0..50 {
+        let key = format!("key-{i}");
+        frags_seen.insert(fragment_of(&key, 4).0);
+        a.put(key.clone(), format!("v{i}").into_bytes())
+            .await
+            .unwrap();
+    }
+    // 50 keys over 4 fragments: all fragments should be hit.
+    assert_eq!(frags_seen.len(), 4, "not all fragments hit");
+
+    for i in 0..50 {
+        let key = format!("key-{i}");
+        let got = a.get(key).await.unwrap().expect("key missing");
+        assert_eq!(got.value, format!("v{i}").into_bytes());
+    }
+
+    let all = a.get_all().await.unwrap();
+    assert_eq!(all.len(), 50);
+    a.shutdown().await;
+}

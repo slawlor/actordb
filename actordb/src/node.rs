@@ -46,7 +46,8 @@ use crate::network::{BoxStream, Network, TcpNetwork};
 use crate::proto::{
     Envelope, EnvelopeMsg, Hello, ReplicateOp as ProtoReplicateOp, SyncEntry, SyncResponse,
 };
-use crate::store::KvStore;
+use crate::shard::{fragment_of, FragmentId};
+use crate::store::{KvStore, PrefixedStore};
 
 /// Maximum wire frame size (16 MiB). Anything larger is treated as a
 /// corrupt stream and the connection is dropped.
@@ -61,6 +62,42 @@ const RECONNECT_MAX: Duration = Duration::from_secs(30);
 
 /// peer node_id -> outbound frame queue
 type PeerMap = Arc<Mutex<HashMap<String, mpsc::Sender<Vec<u8>>>>>;
+
+/// Routes keys to their fragment actors. Cloned into every connection
+/// task so inbound ops land on the right fragment.
+#[derive(Clone)]
+struct FragmentRouter {
+    fragments: Vec<ActorRef<KvMessage>>,
+    fragment_count: usize,
+}
+
+impl FragmentRouter {
+    fn route(&self, key: &str) -> &ActorRef<KvMessage> {
+        &self.fragments[fragment_of(key, self.fragment_count).0 as usize]
+    }
+
+    async fn get_all(&self) -> Result<HashMap<String, VersionedValue>, NodeError> {
+        let mut all = HashMap::new();
+        for actor in &self.fragments {
+            let res = actor
+                .call(|reply| KvMessage::GetAll { reply }, None)
+                .await
+                .map_err(|e| NodeError::Actor(e.to_string()))?;
+            match res {
+                CallResult::Success(map) => all.extend(map),
+                CallResult::Timeout => {
+                    return Err(NodeError::Actor("get_all timed out".to_string()))
+                }
+                CallResult::SenderError => {
+                    return Err(NodeError::Actor(
+                        "get_all reply channel dropped".to_string(),
+                    ))
+                }
+            }
+        }
+        Ok(all)
+    }
+}
 
 /// Errors produced by [Node] operations.
 #[derive(Debug)]
@@ -103,7 +140,8 @@ pub struct Node {
     /// dedup key so a restarted node is not mistaken for a replay.
     boot_id: u64,
     listen_addr: SocketAddr,
-    actor: ActorRef<KvMessage>,
+    /// Routes keys to their fragment actors.
+    router: FragmentRouter,
     peers: PeerMap,
     /// (origin node_id, boot_id, seq) of every op already applied, to
     /// stop re-broadcast storms. The actor's LWW merge is idempotent,
@@ -152,6 +190,13 @@ pub struct NodeConfig {
     /// then recovered via peer sync on reconnect. Clean shutdowns
     /// always flush.
     pub flush_interval: Duration,
+    /// Number of fragments the keyspace is partitioned into. Each
+    /// fragment gets its own actor (and, with persistence, its own
+    /// key namespace in the store). Default 1 = no sharding.
+    ///
+    /// Must be identical on every node: all nodes must agree on
+    /// `fragment_of(key)`, or keys become unreachable.
+    pub fragment_count: usize,
 }
 
 impl Default for NodeConfig {
@@ -161,6 +206,7 @@ impl Default for NodeConfig {
             network: Arc::new(TcpNetwork),
             flush_batch_size: 1000,
             flush_interval: Duration::from_millis(100),
+            fragment_count: 1,
         }
     }
 }
@@ -188,17 +234,36 @@ impl Node {
         listen_addr: SocketAddr,
         config: NodeConfig,
     ) -> Result<Self, NodeError> {
-        let (actor, _actor_handle) = KvActor::spawn(
-            None,
-            KvActor,
-            KvArgs {
-                store: config.store,
-                flush_batch_size: config.flush_batch_size,
-                flush_interval: config.flush_interval,
-            },
-        )
-        .await
-        .map_err(|e| NodeError::Actor(e.to_string()))?;
+        if config.fragment_count == 0 {
+            return Err(NodeError::Actor(
+                "fragment_count must be non-zero".to_string(),
+            ));
+        }
+
+        // One actor per fragment. With persistence, each fragment gets
+        // its own key namespace via PrefixedStore, sharing the one
+        // underlying store.
+        let mut fragments = Vec::with_capacity(config.fragment_count);
+        for i in 0..config.fragment_count {
+            let fragment = FragmentId(i as u32);
+            let store = config
+                .store
+                .clone()
+                .map(|inner| Arc::new(PrefixedStore::new(inner, fragment)) as Arc<dyn KvStore>);
+            let (actor, _actor_handle) = KvActor::spawn(
+                None,
+                KvActor,
+                KvArgs {
+                    store,
+                    fragment,
+                    flush_batch_size: config.flush_batch_size,
+                    flush_interval: config.flush_interval,
+                },
+            )
+            .await
+            .map_err(|e| NodeError::Actor(e.to_string()))?;
+            fragments.push(actor);
+        }
 
         let (bound_addr, mut acceptor) = config
             .network
@@ -206,11 +271,15 @@ impl Node {
             .await
             .map_err(|e| NodeError::Network(e.to_string()))?;
 
+        let router = FragmentRouter {
+            fragments,
+            fragment_count: config.fragment_count,
+        };
         let node = Self {
             node_id: node_id.clone(),
             boot_id: fresh_boot_id(),
             listen_addr: bound_addr,
-            actor: actor.clone(),
+            router: router.clone(),
             peers: Arc::new(Mutex::new(HashMap::new())),
             seen_ops: Arc::new(Mutex::new(HashSet::new())),
             next_seq: Arc::new(Mutex::new(0)),
@@ -219,9 +288,9 @@ impl Node {
         };
 
         // Accept loop: every inbound connection gets a handler task.
-        let (nid, act, peers, seen, tasks) = (
+        let (nid, router, peers, seen, tasks) = (
             node.node_id.clone(),
-            node.actor.clone(),
+            node.router.clone(),
             node.peers.clone(),
             node.seen_ops.clone(),
             node.tasks.clone(),
@@ -230,7 +299,7 @@ impl Node {
             while let Ok(stream) = acceptor.accept().await {
                 let h = tokio::spawn(handle_connection(
                     nid.clone(),
-                    act.clone(),
+                    router.clone(),
                     peers.clone(),
                     seen.clone(),
                     tasks.clone(),
@@ -258,9 +327,9 @@ impl Node {
             .connect(peer_addr)
             .await
             .map_err(|e| NodeError::Network(e.to_string()))?;
-        let (node_id, actor, peers, seen_ops, tasks, network) = (
+        let (node_id, router, peers, seen_ops, tasks, network) = (
             self.node_id.clone(),
-            self.actor.clone(),
+            self.router.clone(),
             self.peers.clone(),
             self.seen_ops.clone(),
             self.tasks.clone(),
@@ -270,7 +339,7 @@ impl Node {
             // Run the initial connection to completion...
             handle_connection(
                 node_id.clone(),
-                actor.clone(),
+                router.clone(),
                 peers.clone(),
                 seen_ops.clone(),
                 tasks.clone(),
@@ -281,10 +350,15 @@ impl Node {
             // ...then redial forever. Only the dialer side redials; the
             // listener side just waits for the next inbound connection.
             // This task is aborted by shutdown() with all the rest.
-            reconnect_loop(node_id, actor, peers, seen_ops, tasks, network, peer_addr).await;
+            reconnect_loop(node_id, router, peers, seen_ops, tasks, network, peer_addr).await;
         });
         self.tasks.lock().await.push(h.abort_handle());
         Ok(())
+    }
+
+    /// The fragment actor serving `key`.
+    fn fragment_actor(&self, key: &str) -> &ActorRef<KvMessage> {
+        self.router.route(key)
     }
 
     /// Write a key locally and gossip it to all peers.
@@ -310,15 +384,15 @@ impl Node {
             .await
             .insert((self.node_id.clone(), self.boot_id, seq));
 
-        self.actor
+        let actor = self.fragment_actor(&op.key);
+        actor
             .send_message(KvMessage::ApplyOp(op.clone()))
             .map_err(|e| NodeError::Actor(e.to_string()))?;
 
         // Barrier: the actor drains its mailbox in FIFO order, so this
         // `call` returns only after the ApplyOp above has been applied.
         // (A `get` on the same key doubles as the read-your-write check.)
-        match self
-            .actor
+        match actor
             .call(|reply| KvMessage::Get { key, reply }, None)
             .await
             .map_err(|e| NodeError::Actor(e.to_string()))?
@@ -338,7 +412,7 @@ impl Node {
     /// whatever has converged here so far (eventual consistency).
     pub async fn get(&self, key: String) -> Result<Option<VersionedValue>, NodeError> {
         let res = self
-            .actor
+            .fragment_actor(&key)
             .call(|reply| KvMessage::Get { key, reply }, None)
             .await
             .map_err(|e| NodeError::Actor(e.to_string()))?;
@@ -351,20 +425,9 @@ impl Node {
         }
     }
 
-    /// Read the full local copy (debugging / tests).
+    /// Read the full local copy across all fragments (debugging / tests).
     pub async fn get_all(&self) -> Result<HashMap<String, VersionedValue>, NodeError> {
-        let res = self
-            .actor
-            .call(|reply| KvMessage::GetAll { reply }, None)
-            .await
-            .map_err(|e| NodeError::Actor(e.to_string()))?;
-        match res {
-            CallResult::Success(all) => Ok(all),
-            CallResult::Timeout => Err(NodeError::Actor("get_all timed out".to_string())),
-            CallResult::SenderError => Err(NodeError::Actor(
-                "get_all reply channel dropped".to_string(),
-            )),
-        }
+        self.router.get_all().await
     }
 
     /// This node's id.
@@ -394,8 +457,10 @@ impl Node {
             t.abort();
         }
         // The handlers never block, so this returns promptly. Failures
-        // just mean the actor was already dead.
-        let _ = self.actor.stop_and_wait(None, None).await;
+        // just mean an actor was already dead.
+        for actor in &self.router.fragments {
+            let _ = actor.stop_and_wait(None, None).await;
+        }
     }
 
     /// Gossip an op to every connected peer. Fire-and-forget: a dead peer
@@ -448,7 +513,7 @@ impl Node {
 /// write half stays open and the peer never observes the disconnect.
 async fn handle_connection(
     node_id: String,
-    actor: ActorRef<KvMessage>,
+    router: FragmentRouter,
     peers: PeerMap,
     seen_ops: Arc<Mutex<HashSet<(String, u64, u64)>>>,
     tasks: Arc<Mutex<Vec<AbortHandle>>>,
@@ -520,7 +585,8 @@ async fn handle_connection(
                     seq: op.seq,
                     boot_id: op.boot_id,
                 };
-                if actor
+                if router
+                    .route(&replicated.key)
                     .send_message(KvMessage::ApplyOp(replicated.clone()))
                     .is_ok()
                 {
@@ -529,8 +595,7 @@ async fn handle_connection(
                 }
             }
             Some(EnvelopeMsg::SyncRequest(_)) => {
-                if let Ok(CallResult::Success(all)) =
-                    actor.call(|reply| KvMessage::GetAll { reply }, None).await
+                let all = router.get_all().await.unwrap_or_default();
                 {
                     let entries = all
                         .into_iter()
@@ -561,7 +626,7 @@ async fn handle_connection(
                         seq: 0,     // seq/boot_id are propagation concerns;
                         boot_id: 0, // sync is not gossip
                     };
-                    let _ = actor.send_message(KvMessage::ApplyOp(op));
+                    let _ = router.route(&op.key).send_message(KvMessage::ApplyOp(op));
                 }
             }
             None => {}
@@ -587,7 +652,7 @@ async fn handle_connection(
 /// then the loop redials. Runs until the task is aborted by shutdown.
 async fn reconnect_loop(
     node_id: String,
-    actor: ActorRef<KvMessage>,
+    router: FragmentRouter,
     peers: PeerMap,
     seen_ops: Arc<Mutex<HashSet<(String, u64, u64)>>>,
     tasks: Arc<Mutex<Vec<AbortHandle>>>,
@@ -602,7 +667,7 @@ async fn reconnect_loop(
                 backoff = RECONNECT_BASE;
                 handle_connection(
                     node_id.clone(),
-                    actor.clone(),
+                    router.clone(),
                     peers.clone(),
                     seen_ops.clone(),
                     tasks.clone(),
