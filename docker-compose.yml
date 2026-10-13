@@ -1,0 +1,43 @@
+# Three actordb nodes on a private network. Each service runs one
+# scenario role from the actordb-docker-test image; the role is chosen
+# per scenario via the env files in docker/envs/, e.g.
+#
+#   docker compose --env-file docker/envs/replication.env up
+
+services:
+  node-a:
+    container_name: "node-a"
+    build:
+      context: .
+      dockerfile: docker-tests/Dockerfile
+    image: actordb-docker-test:latest
+    networks:
+      - test-net
+    command: ${A_TEST}
+
+  node-b:
+    depends_on:
+      - node-a
+    container_name: "node-b"
+    build:
+      context: .
+      dockerfile: docker-tests/Dockerfile
+    image: actordb-docker-test:latest
+    networks:
+      - test-net
+    command: ${B_TEST}
+
+  node-c:
+    depends_on:
+      - node-b
+    container_name: "node-c"
+    build:
+      context: .
+      dockerfile: docker-tests/Dockerfile
+    image: actordb-docker-test:latest
+    networks:
+      - test-net
+    command: ${C_TEST}
+
+networks:
+  test-net:

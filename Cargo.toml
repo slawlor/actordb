@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "actordb",
+    "docker-tests",
     "xtask"
 ]
 resolver = "2"
