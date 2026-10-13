@@ -398,3 +398,24 @@ async fn persistence_flushes_on_shutdown() {
     assert_eq!(got.value, b"v");
     a2.shutdown().await;
 }
+
+#[tokio::test]
+async fn memory_store_exercises_persistence_plumbing() {
+    // The MemoryStore test double runs the full store path (load,
+    // buffer, batch flush, shutdown flush) without a database.
+    use actordb::store::MemoryStore;
+    use std::sync::Arc;
+
+    let config = NodeConfig {
+        store: Some(Arc::new(MemoryStore)),
+        flush_batch_size: 1,
+        ..NodeConfig::default()
+    };
+    let a = Node::start("a".to_string(), "127.0.0.1:0".parse().unwrap(), config)
+        .await
+        .expect("node failed to start");
+    a.put("k".to_string(), b"v".to_vec()).await.unwrap();
+    let got = a.get("k".to_string()).await.unwrap().expect("k missing");
+    assert_eq!(got.value, b"v");
+    a.shutdown().await;
+}

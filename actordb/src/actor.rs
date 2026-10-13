@@ -87,8 +87,10 @@ pub enum KvMessage {
 /// can lose the unflushed tail of the write buffer; the handshake sync
 /// on reconnect reconciles it from peers.
 pub struct KvState {
+    /// In-memory cache of the local copy: the fast path for all reads.
     store: HashMap<String, VersionedValue>,
-    kvstore: Arc<dyn KvStore>,
+    /// Optional durable layer behind the cache. `None` = no persistence.
+    kvstore: Option<Arc<dyn KvStore>>,
     pending: Vec<(String, VersionedValue)>,
     last_flush: Instant,
     flush_batch_size: usize,
@@ -112,8 +114,11 @@ impl KvState {
     /// Buffer an applied write, flushing to the store when the batch is
     /// full or the flush interval has elapsed. Called only for ops that
     /// won the merge. Memory is always updated first, so reads never
-    /// wait for a flush.
+    /// wait for a flush. No-op when no store is configured.
     fn buffer(&mut self, key: &str, value: &VersionedValue) -> Result<(), ActorProcessingErr> {
+        if self.kvstore.is_none() {
+            return Ok(());
+        }
         self.pending.push((key.to_string(), value.clone()));
         if self.pending.len() >= self.flush_batch_size
             || self.last_flush.elapsed() >= self.flush_interval
@@ -128,11 +133,13 @@ impl KvState {
         if self.pending.is_empty() {
             return Ok(());
         }
-        self.kvstore
-            .write_batch(&self.pending)
-            .map_err(|e| ActorProcessingErr::from(e.to_string()))?;
-        self.pending.clear();
-        self.last_flush = Instant::now();
+        if let Some(kvstore) = &self.kvstore {
+            kvstore
+                .write_batch(&self.pending)
+                .map_err(|e| ActorProcessingErr::from(e.to_string()))?;
+            self.pending.clear();
+            self.last_flush = Instant::now();
+        }
         Ok(())
     }
 }
@@ -140,9 +147,9 @@ impl KvState {
 /// Arguments to spawn a [KvActor].
 #[derive(Clone)]
 pub struct KvArgs {
-    /// Durable storage for the local copy. Defaults to a no-op
-    /// in-memory store; see [`KvStore`].
-    pub store: Arc<dyn KvStore>,
+    /// Optional durable storage behind the in-memory cache. `None`
+    /// (default) = no persistence; the node is purely in-memory.
+    pub store: Option<Arc<dyn KvStore>>,
     /// Flush the write buffer after this many buffered ops.
     pub flush_batch_size: usize,
     /// Flush the write buffer after this long, even if the batch isn't
@@ -163,12 +170,14 @@ impl Actor for KvActor {
         _myself: ActorRef<Self::Msg>,
         args: Self::Arguments,
     ) -> Result<Self::State, ActorProcessingErr> {
-        // Reload the local copy from the store. A corrupt store fails
-        // the boot loudly rather than silently dropping data.
-        let store = args
-            .store
-            .load()
-            .map_err(|e| ActorProcessingErr::from(e.to_string()))?;
+        // Reload the in-memory cache from the store, if any. A corrupt
+        // store fails the boot loudly rather than silently dropping data.
+        let store = match &args.store {
+            Some(kvstore) => kvstore
+                .load()
+                .map_err(|e| ActorProcessingErr::from(e.to_string()))?,
+            None => HashMap::new(),
+        };
         Ok(KvState {
             store,
             kvstore: args.store,

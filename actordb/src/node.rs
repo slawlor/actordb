@@ -46,7 +46,7 @@ use crate::network::{BoxStream, Network, TcpNetwork};
 use crate::proto::{
     Envelope, EnvelopeMsg, Hello, ReplicateOp as ProtoReplicateOp, SyncEntry, SyncResponse,
 };
-use crate::store::{KvStore, MemoryStore};
+use crate::store::KvStore;
 
 /// Maximum wire frame size (16 MiB). Anything larger is treated as a
 /// corrupt stream and the connection is dropped.
@@ -132,19 +132,21 @@ fn fresh_boot_id() -> u64 {
 /// configuration surface (see the `NodeConfig` productionization issue).
 #[derive(Clone)]
 pub struct NodeConfig {
-    /// Durable storage for the node's local copy. Defaults to a no-op
-    /// in-memory store; see [`KvStore`]. With the `rocksdb` feature,
-    /// use [`NodeConfig::with_rocksdb`] for RocksDB persistence.
-    pub store: Arc<dyn KvStore>,
+    /// Optional durable storage behind the node's in-memory cache.
+    /// `None` (default) = no persistence; the node is purely in-memory.
+    /// With the `rocksdb` feature, [`NodeConfig::with_rocksdb`] builds a
+    /// config with the preferred RocksDB implementation, or bring your
+    /// own [`KvStore`].
+    pub store: Option<Arc<dyn KvStore>>,
     /// Network transport for the peer mesh. Defaults to plain TCP;
     /// see [`Network`].
     pub network: Arc<dyn Network>,
     /// Flush the store write buffer after this many buffered ops.
-    /// Ignored by the in-memory store.
+    /// Ignored when `store` is `None`.
     pub flush_batch_size: usize,
     /// Flush the store write buffer after this long, even if the batch
-    /// isn't full (checked on each applied write). Ignored by the
-    /// in-memory store.
+    /// isn't full (checked on each applied write). Ignored when `store`
+    /// is `None`.
     ///
     /// Crash window: a `kill -9` can lose the unflushed tail, which is
     /// then recovered via peer sync on reconnect. Clean shutdowns
@@ -155,7 +157,7 @@ pub struct NodeConfig {
 impl Default for NodeConfig {
     fn default() -> Self {
         Self {
-            store: Arc::new(MemoryStore),
+            store: None,
             network: Arc::new(TcpNetwork),
             flush_batch_size: 1000,
             flush_interval: Duration::from_millis(100),
@@ -165,12 +167,13 @@ impl Default for NodeConfig {
 
 #[cfg(feature = "rocksdb")]
 impl NodeConfig {
-    /// Convenience: a config persisting to RocksDB at `path`.
+    /// Convenience: a config persisting to RocksDB at `path`, the
+    /// preferred durable implementation.
     pub fn with_rocksdb(
         path: impl AsRef<std::path::Path>,
     ) -> Result<Self, crate::store::StoreError> {
         Ok(Self {
-            store: Arc::new(crate::store::RocksDbStore::open(path)?),
+            store: Some(Arc::new(crate::store::RocksDbStore::open(path)?)),
             ..Self::default()
         })
     }

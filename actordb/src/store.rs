@@ -6,10 +6,12 @@
 //! Pluggable durable storage for a node's local copy.
 //!
 //! A [`KvStore`] persists the batches the [`KvActor`](crate::actor::KvActor)
-//! flushes and reloads them on boot. The default is [`MemoryStore`], a
-//! no-op dummy that keeps the node purely in-memory. Enable the
-//! `rocksdb` cargo feature for [`RocksDbStore`], or implement the
-//! trait for your own engine.
+//! flushes and reloads them on boot. Persistence itself is optional:
+//! `NodeConfig.store` is `None` by default (a pure in-memory node).
+//! Enable the `rocksdb` cargo feature for [`RocksDbStore`], the
+//! preferred implementation, or bring your own. [`MemoryStore`] is a
+//! test double for exercising the persistence plumbing without a
+//! database.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -40,8 +42,12 @@ pub trait KvStore: Send + Sync + 'static {
     fn write_batch(&self, writes: &[(String, VersionedValue)]) -> Result<(), StoreError>;
 }
 
-/// No-op store: the node is purely in-memory. This is the default when
-/// no store implementation is configured.
+/// Test double for [`KvStore`]: records nothing, loads nothing.
+///
+/// Exists so tests can exercise the actor's persistence plumbing
+/// (buffering, batching, flush-on-shutdown) without a database.
+/// Not for production use — a node that doesn't need durability
+/// should use `store: None`.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct MemoryStore;
 
