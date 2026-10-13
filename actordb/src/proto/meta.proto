@@ -16,5 +16,44 @@ syntax = "proto3";
 
 package meta;
 
-// Howdy
-message Hello {}
+// Handshake: identifies the connecting node
+message Hello {
+  string node_id = 1;
+}
+
+// A single replicated write, disseminated between nodes with epidemic
+// broadcast. Delivery is at-least-once; receivers merge with
+// last-writer-wins on (timestamp_ms, node_id). `seq` is a per-origin-node
+// sequence number used to suppress re-broadcast storms.
+message ReplicateOp {
+  string key = 1;
+  bytes value = 2;
+  uint64 timestamp_ms = 3;
+  string node_id = 4;
+  uint64 seq = 5;
+}
+
+// Ask a peer for its full local state (anti-entropy when a node joins)
+message SyncRequest {}
+
+// A peer's full local state
+message SyncResponse {
+  repeated SyncEntry entries = 1;
+}
+
+message SyncEntry {
+  string key = 1;
+  bytes value = 2;
+  uint64 timestamp_ms = 3;
+  string node_id = 4;
+}
+
+// Top-level wire envelope, length-delimited on the wire
+message Envelope {
+  oneof msg {
+    Hello hello = 1;
+    ReplicateOp replicate = 2;
+    SyncRequest sync_request = 3;
+    SyncResponse sync_response = 4;
+  }
+}

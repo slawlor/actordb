@@ -11,4 +11,5 @@ pub mod meta {
     include!(concat!(env!("OUT_DIR"), "/meta.rs"));
 }
 
-pub use meta::Hello;
+pub use meta::envelope::Msg as EnvelopeMsg;
+pub use meta::{Envelope, Hello, ReplicateOp, SyncEntry, SyncRequest, SyncResponse};

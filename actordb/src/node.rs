@@ -1,0 +1,466 @@
+// Copyright (c) Sean Lawlor
+//
+// This source code is licensed under both the MIT license found in the
+// LICENSE-MIT file in the root directory of this source tree.
+
+//! A database node.
+//!
+//! Each node runs one [KvActor](crate::actor::KvActor) holding the node's
+//! *local copy* of the keyspace, plus a Tokio TCP mesh to its peers.
+//! Writes are disseminated with **epidemic broadcast**: a local write is
+//! applied to the local actor and gossiped to every peer; each peer
+//! applies it and re-gossips it once, tracked by `(origin node_id, seq)`
+//! so the flood terminates. Inbound writes merge into the local copy
+//! with last-writer-wins, which is idempotent and commutative — so all
+//! replicas converge without any coordination, even across restarts and
+//! late joiners (a joining node pulls full state with a sync exchange
+//! during the handshake).
+//!
+//! Wire format: prost-encoded [`Envelope`](crate::proto::Envelope)
+//! frames, each prefixed with a 4-byte big-endian length.
+
+use std::collections::{HashMap, HashSet};
+use std::net::SocketAddr;
+use std::sync::Arc;
+
+use prost::Message as ProstMessage;
+use ractor::rpc::CallResult;
+use ractor::{Actor, ActorRef};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::{mpsc, Mutex};
+use tokio::task::JoinHandle;
+
+use crate::actor::{now_ms, KvActor, KvArgs, KvMessage, ReplicatedOp, VersionedValue};
+use crate::proto::{
+    Envelope, EnvelopeMsg, Hello, ReplicateOp as ProtoReplicateOp, SyncEntry, SyncResponse,
+};
+
+/// Maximum wire frame size (16 MiB). Anything larger is treated as a
+/// corrupt stream and the connection is dropped.
+const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
+
+/// Outbound queue depth per peer connection.
+const PEER_CHANNEL_DEPTH: usize = 256;
+
+/// peer node_id -> outbound frame queue
+type PeerMap = Arc<Mutex<HashMap<String, mpsc::Sender<Vec<u8>>>>>;
+
+/// Errors produced by [Node] operations.
+#[derive(Debug)]
+pub enum NodeError {
+    Io(std::io::Error),
+    Codec(String),
+    Actor(String),
+}
+
+impl std::fmt::Display for NodeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            NodeError::Io(e) => write!(f, "io error: {e}"),
+            NodeError::Codec(e) => write!(f, "codec error: {e}"),
+            NodeError::Actor(e) => write!(f, "actor error: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for NodeError {}
+
+impl From<std::io::Error> for NodeError {
+    fn from(e: std::io::Error) -> Self {
+        NodeError::Io(e)
+    }
+}
+
+impl From<prost::DecodeError> for NodeError {
+    fn from(e: prost::DecodeError) -> Self {
+        NodeError::Codec(e.to_string())
+    }
+}
+
+/// A node in the database cluster.
+pub struct Node {
+    node_id: String,
+    listen_addr: SocketAddr,
+    actor: ActorRef<KvMessage>,
+    peers: PeerMap,
+    /// (origin node_id, seq) of every op already applied, to stop
+    /// re-broadcast storms. The actor's LWW merge is idempotent, so this
+    /// is purely a propagation concern.
+    seen_ops: Arc<Mutex<HashSet<(String, u64)>>>,
+    /// Per-node sequence number for locally originated ops.
+    next_seq: Arc<Mutex<u64>>,
+    tasks: Arc<Mutex<Vec<JoinHandle<()>>>>,
+}
+
+impl Node {
+    /// Start a node: spawn its [KvActor](crate::actor::KvActor) and begin
+    /// listening for peer connections. Binds `listen_addr` (use port 0
+    /// for an ephemeral port) and returns the bound address via [Node::addr].
+    pub async fn start(node_id: String, listen_addr: SocketAddr) -> Result<Self, NodeError> {
+        let (actor, _actor_handle) = KvActor::spawn(None, KvActor, KvArgs {})
+            .await
+            .map_err(|e| NodeError::Actor(e.to_string()))?;
+
+        let listener = TcpListener::bind(listen_addr).await?;
+        let bound_addr = listener.local_addr()?;
+
+        let node = Self {
+            node_id: node_id.clone(),
+            listen_addr: bound_addr,
+            actor: actor.clone(),
+            peers: Arc::new(Mutex::new(HashMap::new())),
+            seen_ops: Arc::new(Mutex::new(HashSet::new())),
+            next_seq: Arc::new(Mutex::new(0)),
+            tasks: Arc::new(Mutex::new(Vec::new())),
+        };
+
+        // Accept loop: every inbound connection gets a handler task.
+        let (nid, act, peers, seen, tasks) = (
+            node.node_id.clone(),
+            node.actor.clone(),
+            node.peers.clone(),
+            node.seen_ops.clone(),
+            node.tasks.clone(),
+        );
+        let accept_task = tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let h = tokio::spawn(handle_connection(
+                    nid.clone(),
+                    act.clone(),
+                    peers.clone(),
+                    seen.clone(),
+                    stream,
+                    /* we_dialed = */ false,
+                ));
+                tasks.lock().await.push(h);
+            }
+        });
+        node.tasks.lock().await.push(accept_task);
+
+        Ok(node)
+    }
+
+    /// Dial a peer and run the handshake. After the handshake both sides
+    /// exchange full state, so a late joiner converges immediately.
+    pub async fn connect(&self, peer_addr: SocketAddr) -> Result<(), NodeError> {
+        let stream = TcpStream::connect(peer_addr).await?;
+        let h = tokio::spawn(handle_connection(
+            self.node_id.clone(),
+            self.actor.clone(),
+            self.peers.clone(),
+            self.seen_ops.clone(),
+            stream,
+            /* we_dialed = */ true,
+        ));
+        self.tasks.lock().await.push(h);
+        Ok(())
+    }
+
+    /// Write a key locally and gossip it to all peers.
+    pub async fn put(&self, key: String, value: Vec<u8>) -> Result<(), NodeError> {
+        let seq = {
+            let mut guard = self.next_seq.lock().await;
+            *guard += 1;
+            *guard
+        };
+        let op = ReplicatedOp {
+            key,
+            value: VersionedValue::new(value, now_ms(), self.node_id.clone()),
+            seq,
+        };
+        // Mark locally originated ops as seen so inbound echoes terminate.
+        self.seen_ops
+            .lock()
+            .await
+            .insert((self.node_id.clone(), seq));
+
+        self.actor
+            .send_message(KvMessage::ApplyOp(op.clone()))
+            .map_err(|e| NodeError::Actor(e.to_string()))?;
+
+        self.broadcast(op).await;
+        Ok(())
+    }
+
+    /// Read a key from the local copy. This is a local read — it reflects
+    /// whatever has converged here so far (eventual consistency).
+    pub async fn get(&self, key: String) -> Result<Option<VersionedValue>, NodeError> {
+        let res = self
+            .actor
+            .call(|reply| KvMessage::Get { key, reply }, None)
+            .await
+            .map_err(|e| NodeError::Actor(e.to_string()))?;
+        match res {
+            CallResult::Success(value) => Ok(value),
+            CallResult::Timeout => Err(NodeError::Actor("get timed out".to_string())),
+            CallResult::SenderError => {
+                Err(NodeError::Actor("get reply channel dropped".to_string()))
+            }
+        }
+    }
+
+    /// Read the full local copy (debugging / tests).
+    pub async fn get_all(&self) -> Result<HashMap<String, VersionedValue>, NodeError> {
+        let res = self
+            .actor
+            .call(|reply| KvMessage::GetAll { reply }, None)
+            .await
+            .map_err(|e| NodeError::Actor(e.to_string()))?;
+        match res {
+            CallResult::Success(all) => Ok(all),
+            CallResult::Timeout => Err(NodeError::Actor("get_all timed out".to_string())),
+            CallResult::SenderError => Err(NodeError::Actor(
+                "get_all reply channel dropped".to_string(),
+            )),
+        }
+    }
+
+    /// This node's id.
+    pub fn id(&self) -> &str {
+        &self.node_id
+    }
+
+    /// The address this node is listening on.
+    pub fn addr(&self) -> SocketAddr {
+        self.listen_addr
+    }
+
+    /// Number of currently connected peers.
+    pub async fn peer_count(&self) -> usize {
+        self.peers.lock().await.len()
+    }
+
+    /// Stop all networking tasks. The actor is left running; dropping the
+    /// process ends it.
+    pub async fn shutdown(&self) {
+        let mut tasks = self.tasks.lock().await;
+        for t in tasks.drain(..) {
+            t.abort();
+        }
+    }
+
+    /// Gossip an op to every connected peer. Fire-and-forget: a dead peer
+    /// is dropped from the set.
+    async fn broadcast(&self, op: ReplicatedOp) {
+        let proto_op = ProtoReplicateOp {
+            key: op.key,
+            value: op.value.value,
+            timestamp_ms: op.value.timestamp_ms,
+            node_id: op.value.node_id,
+            seq: op.seq,
+        };
+        let mut frame = Vec::new();
+        // Encoding into a Vec cannot realistically fail; skip on error.
+        if (Envelope {
+            msg: Some(EnvelopeMsg::Replicate(proto_op)),
+        })
+        .encode(&mut frame)
+        .is_err()
+        {
+            return;
+        }
+
+        let mut dead = Vec::new();
+        {
+            let peers = self.peers.lock().await;
+            for (peer_id, tx) in peers.iter() {
+                if tx.send(frame.clone()).await.is_err() {
+                    dead.push(peer_id.clone());
+                }
+            }
+        }
+        if !dead.is_empty() {
+            let mut peers = self.peers.lock().await;
+            for peer_id in dead {
+                peers.remove(&peer_id);
+            }
+        }
+    }
+}
+
+/// Drive one peer connection: handshake, then a read loop.
+///
+/// `we_dialed` distinguishes the dialer (sends `Hello` immediately) from
+/// the listener (replies to the dialer's `Hello`).
+async fn handle_connection(
+    node_id: String,
+    actor: ActorRef<KvMessage>,
+    peers: PeerMap,
+    seen_ops: Arc<Mutex<HashSet<(String, u64)>>>,
+    stream: TcpStream,
+    we_dialed: bool,
+) {
+    let (mut reader, writer) = tokio::io::split(stream);
+    let (tx, mut rx) = mpsc::channel::<Vec<u8>>(PEER_CHANNEL_DEPTH);
+
+    // Writer task: owns the socket's write half, drains the queue.
+    let writer_task = tokio::spawn(async move {
+        let mut w = writer;
+        while let Some(frame) = rx.recv().await {
+            if w.write_u32(frame.len() as u32).await.is_err() {
+                break;
+            }
+            if w.write_all(&frame).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    // The dialer introduces itself first.
+    if we_dialed {
+        send_hello(&tx, &node_id).await;
+    }
+
+    let mut peer_node_id: Option<String> = None;
+    // Length-delimited framing: 4-byte big-endian length prefix.
+    while let Ok(n) = reader.read_u32().await {
+        let len = n as usize;
+        if len > MAX_FRAME_BYTES {
+            break; // corrupt stream; drop the connection
+        }
+        let mut buf = vec![0u8; len];
+        if reader.read_exact(&mut buf).await.is_err() {
+            break;
+        }
+        let envelope = match Envelope::decode(&buf[..]) {
+            Ok(e) => e,
+            Err(_) => break,
+        };
+
+        match envelope.msg {
+            Some(EnvelopeMsg::Hello(Hello { node_id: peer })) => {
+                peer_node_id = Some(peer.clone());
+                peers.lock().await.insert(peer, tx.clone());
+                if !we_dialed {
+                    // The listener answers the handshake...
+                    send_hello(&tx, &node_id).await;
+                }
+                // ...and both sides then pull full state for anti-entropy.
+                send_sync_request(&tx).await;
+            }
+            Some(EnvelopeMsg::Replicate(op)) => {
+                let id = (op.node_id.clone(), op.seq);
+                let is_new = seen_ops.lock().await.insert(id);
+                if !is_new {
+                    continue; // already applied; kills re-broadcast storms
+                }
+                let replicated = ReplicatedOp {
+                    key: op.key.clone(),
+                    value: VersionedValue::new(
+                        op.value.clone(),
+                        op.timestamp_ms,
+                        op.node_id.clone(),
+                    ),
+                    seq: op.seq,
+                };
+                if actor
+                    .send_message(KvMessage::ApplyOp(replicated.clone()))
+                    .is_ok()
+                {
+                    // Epidemic step: pass it on to our other peers.
+                    rebroadcast(&peers, &tx, &op).await;
+                }
+            }
+            Some(EnvelopeMsg::SyncRequest(_)) => {
+                if let Ok(CallResult::Success(all)) =
+                    actor.call(|reply| KvMessage::GetAll { reply }, None).await
+                {
+                    let entries = all
+                        .into_iter()
+                        .map(|(key, v)| SyncEntry {
+                            key,
+                            value: v.value,
+                            timestamp_ms: v.timestamp_ms,
+                            node_id: v.node_id,
+                        })
+                        .collect();
+                    send_envelope(
+                        &tx,
+                        Envelope {
+                            msg: Some(EnvelopeMsg::SyncResponse(SyncResponse { entries })),
+                        },
+                    )
+                    .await;
+                }
+            }
+            Some(EnvelopeMsg::SyncResponse(resp)) => {
+                // Merge-only: sync never re-broadcasts (the gossiper
+                // already has these ops; everyone else will get them
+                // through normal gossip or their own sync).
+                for e in resp.entries {
+                    let op = ReplicatedOp {
+                        key: e.key,
+                        value: VersionedValue::new(e.value, e.timestamp_ms, e.node_id),
+                        seq: 0, // seq is a propagation concern; sync is not gossip
+                    };
+                    let _ = actor.send_message(KvMessage::ApplyOp(op));
+                }
+            }
+            None => {}
+        }
+    }
+
+    // Connection dropped: forget the peer and stop the writer.
+    if let Some(peer) = peer_node_id {
+        let mut guard = peers.lock().await;
+        // Only remove if it's still our entry (a newer connection may
+        // have replaced it).
+        if let Some(tx_existing) = guard.get(&peer) {
+            if tx_existing.same_channel(&tx) {
+                guard.remove(&peer);
+            }
+        }
+    }
+    writer_task.abort();
+}
+
+/// Re-gossip an op to all peers except the connection it arrived on.
+/// (Sending it back too would be harmless — dedup terminates the flood —
+/// but there's no point paying for the bytes.)
+async fn rebroadcast(peers: &PeerMap, arrived_on: &mpsc::Sender<Vec<u8>>, op: &ProtoReplicateOp) {
+    let mut frame = Vec::new();
+    if (Envelope {
+        msg: Some(EnvelopeMsg::Replicate(op.clone())),
+    })
+    .encode(&mut frame)
+    .is_err()
+    {
+        return;
+    }
+    let peers = peers.lock().await;
+    for tx in peers.values() {
+        if !tx.same_channel(arrived_on) {
+            let _ = tx.send(frame.clone()).await;
+        }
+    }
+}
+
+async fn send_hello(tx: &mpsc::Sender<Vec<u8>>, node_id: &str) {
+    send_envelope(
+        tx,
+        Envelope {
+            msg: Some(EnvelopeMsg::Hello(Hello {
+                node_id: node_id.to_string(),
+            })),
+        },
+    )
+    .await;
+}
+
+async fn send_sync_request(tx: &mpsc::Sender<Vec<u8>>) {
+    send_envelope(
+        tx,
+        Envelope {
+            msg: Some(EnvelopeMsg::SyncRequest(crate::proto::SyncRequest {})),
+        },
+    )
+    .await;
+}
+
+async fn send_envelope(tx: &mpsc::Sender<Vec<u8>>, envelope: Envelope) {
+    let mut frame = Vec::new();
+    if envelope.encode(&mut frame).is_ok() {
+        let _ = tx.send(frame).await;
+    }
+}
