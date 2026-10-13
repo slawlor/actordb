@@ -15,12 +15,20 @@
 /// actor's message handler.
 pub mod actor;
 
-/// A database node: a `KvActor` plus the Tokio TCP mesh that replicates
+/// A database node: a `KvActor` plus the peer mesh that replicates
 /// writes between nodes with epidemic broadcast + last-writer-wins merge.
 pub mod node;
 
+/// Pluggable network transport for the peer mesh. The default is plain
+/// TCP; implement `Network` for TLS or other transports.
+pub mod network;
+
 /// Protobuf wire protocol (generated via [prost])
 pub mod proto;
+
+/// Pluggable durable storage for a node's local copy. The default is
+/// an in-memory no-op; enable the `rocksdb` feature for RocksDB.
+pub mod store;
 
 #[cfg(test)]
 pub(crate) mod common_test;
