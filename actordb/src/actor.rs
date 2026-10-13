@@ -15,11 +15,12 @@
 //! replicas converge without coordination.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use ractor::{Actor, ActorProcessingErr, ActorRef, RpcReplyPort};
-use rocksdb::{IteratorMode, WriteBatch, DB};
+
+use crate::store::KvStore;
 
 /// A value stamped with its last-writer-wins version.
 ///
@@ -80,15 +81,15 @@ pub enum KvMessage {
 
 /// The actor's exclusive state: this node's local copy of the keyspace.
 ///
-/// When a `db` is present, every applied write is also persisted to
-/// RocksDB (write-through) and the copy is reloaded from disk on boot,
-/// so a restarted node keeps its dataset. A crash can lose the
-/// unflushed tail of the write buffer; the handshake sync on reconnect
-/// reconciles it from peers.
+/// Applied writes are buffered and flushed to the [`KvStore`] in
+/// batches (see `NodeConfig` flush knobs); the copy is reloaded from
+/// the store on boot, so a restarted node keeps its dataset. A crash
+/// can lose the unflushed tail of the write buffer; the handshake sync
+/// on reconnect reconciles it from peers.
 pub struct KvState {
     store: HashMap<String, VersionedValue>,
-    db: Option<DB>,
-    pending: Vec<(Vec<u8>, Vec<u8>)>,
+    kvstore: Arc<dyn KvStore>,
+    pending: Vec<(String, VersionedValue)>,
     last_flush: Instant,
     flush_batch_size: usize,
     flush_interval: Duration,
@@ -108,16 +109,12 @@ impl KvState {
         replace
     }
 
-    /// Buffer an applied write, flushing to RocksDB when the batch is
+    /// Buffer an applied write, flushing to the store when the batch is
     /// full or the flush interval has elapsed. Called only for ops that
     /// won the merge. Memory is always updated first, so reads never
     /// wait for a flush.
     fn buffer(&mut self, key: &str, value: &VersionedValue) -> Result<(), ActorProcessingErr> {
-        if self.db.is_none() {
-            return Ok(());
-        }
-        self.pending
-            .push((key.as_bytes().to_vec(), encode_value(value)));
+        self.pending.push((key.to_string(), value.clone()));
         if self.pending.len() >= self.flush_batch_size
             || self.last_flush.elapsed() >= self.flush_interval
         {
@@ -126,31 +123,26 @@ impl KvState {
         Ok(())
     }
 
-    /// Write the buffered batch to RocksDB in one `WriteBatch`.
+    /// Write the buffered batch to the store in one batch.
     fn flush(&mut self) -> Result<(), ActorProcessingErr> {
         if self.pending.is_empty() {
             return Ok(());
         }
-        if let Some(db) = &self.db {
-            let mut batch = WriteBatch::default();
-            for (k, v) in self.pending.drain(..) {
-                batch.put(k, v);
-            }
-            db.write(batch)
-                .map_err(|e| ActorProcessingErr::from(e.to_string()))?;
-            self.last_flush = Instant::now();
-        }
+        self.kvstore
+            .write_batch(&self.pending)
+            .map_err(|e| ActorProcessingErr::from(e.to_string()))?;
+        self.pending.clear();
+        self.last_flush = Instant::now();
         Ok(())
     }
 }
 
 /// Arguments to spawn a [KvActor].
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct KvArgs {
-    /// If set, persist applied writes to RocksDB at this path (created
-    /// if missing) and reload them on boot. `None` keeps the node
-    /// purely in-memory.
-    pub db_path: Option<PathBuf>,
+    /// Durable storage for the local copy. Defaults to a no-op
+    /// in-memory store; see [`KvStore`].
+    pub store: Arc<dyn KvStore>,
     /// Flush the write buffer after this many buffered ops.
     pub flush_batch_size: usize,
     /// Flush the write buffer after this long, even if the batch isn't
@@ -171,29 +163,15 @@ impl Actor for KvActor {
         _myself: ActorRef<Self::Msg>,
         args: Self::Arguments,
     ) -> Result<Self::State, ActorProcessingErr> {
-        let mut store = HashMap::new();
-        let db = match args.db_path {
-            Some(path) => {
-                std::fs::create_dir_all(&path)
-                    .map_err(|e| ActorProcessingErr::from(e.to_string()))?;
-                let db =
-                    DB::open_default(&path).map_err(|e| ActorProcessingErr::from(e.to_string()))?;
-                // Reload the local copy. Corrupt or unreadable entries
-                // fail the boot loudly rather than silently dropping data.
-                for item in db.iterator(IteratorMode::Start) {
-                    let (k, v) = item.map_err(|e| ActorProcessingErr::from(e.to_string()))?;
-                    let key = String::from_utf8(k.to_vec())
-                        .map_err(|e| ActorProcessingErr::from(e.to_string()))?;
-                    let value = decode_value(&v).map_err(ActorProcessingErr::from)?;
-                    store.insert(key, value);
-                }
-                Some(db)
-            }
-            None => None,
-        };
+        // Reload the local copy from the store. A corrupt store fails
+        // the boot loudly rather than silently dropping data.
+        let store = args
+            .store
+            .load()
+            .map_err(|e| ActorProcessingErr::from(e.to_string()))?;
         Ok(KvState {
             store,
-            db,
+            kvstore: args.store,
             pending: Vec::new(),
             last_flush: Instant::now(),
             flush_batch_size: args.flush_batch_size,
@@ -249,63 +227,9 @@ pub fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// On-disk encoding of a [VersionedValue]:
-/// `[timestamp_ms: u64 BE][node_id_len: u32 BE][node_id][value]`.
-fn encode_value(v: &VersionedValue) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(12 + v.node_id.len() + v.value.len());
-    buf.extend_from_slice(&v.timestamp_ms.to_be_bytes());
-    buf.extend_from_slice(&(v.node_id.len() as u32).to_be_bytes());
-    buf.extend_from_slice(v.node_id.as_bytes());
-    buf.extend_from_slice(&v.value);
-    buf
-}
-
-fn decode_value(bytes: &[u8]) -> Result<VersionedValue, String> {
-    if bytes.len() < 12 {
-        return Err(format!("value too short: {} bytes", bytes.len()));
-    }
-    let timestamp_ms = u64::from_be_bytes(bytes[0..8].try_into().unwrap());
-    let id_len = u32::from_be_bytes(bytes[8..12].try_into().unwrap()) as usize;
-    if bytes.len() < 12 + id_len {
-        return Err(format!(
-            "node_id overruns value: id_len={id_len} total={}",
-            bytes.len()
-        ));
-    }
-    let node_id = String::from_utf8(bytes[12..12 + id_len].to_vec())
-        .map_err(|e| format!("node_id not UTF-8: {e}"))?;
-    let value = bytes[12 + id_len..].to_vec();
-    Ok(VersionedValue {
-        value,
-        timestamp_ms,
-        node_id,
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn value_encoding_roundtrip() {
-        let v = VersionedValue::new(vec![1, 2, 3], 123456789, "node-a".to_string());
-        let bytes = encode_value(&v);
-        assert_eq!(decode_value(&bytes).unwrap(), v);
-        // empty value and empty node id
-        let v = VersionedValue::new(vec![], 0, String::new());
-        assert_eq!(decode_value(&encode_value(&v)).unwrap(), v);
-    }
-
-    #[test]
-    fn value_decoding_rejects_garbage() {
-        assert!(decode_value(&[]).is_err());
-        assert!(decode_value(&[0; 11]).is_err());
-        // claims a 10-byte node id but only has 3
-        let mut bad = vec![0u8; 12];
-        bad[8..12].copy_from_slice(&10u32.to_be_bytes());
-        bad.extend_from_slice(b"abc");
-        assert!(decode_value(&bad).is_err());
-    }
 
     #[test]
     fn lww_orders_by_timestamp_then_node_id() {

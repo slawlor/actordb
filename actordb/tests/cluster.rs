@@ -257,6 +257,7 @@ async fn late_joiner_receives_full_state() {
     c.shutdown().await;
 }
 
+#[cfg(feature = "rocksdb")]
 #[tokio::test]
 async fn persistence_roundtrip() {
     let dir = tempfile::tempdir().unwrap();
@@ -267,10 +268,7 @@ async fn persistence_roundtrip() {
     let a = Node::start(
         "a".to_string(),
         "127.0.0.1:0".parse().unwrap(),
-        NodeConfig {
-            db_path: Some(db_path.clone()),
-            ..NodeConfig::default()
-        },
+        NodeConfig::with_rocksdb(db_path.clone()).unwrap(),
     )
     .await
     .expect("node failed to start");
@@ -282,10 +280,7 @@ async fn persistence_roundtrip() {
     let a2 = Node::start(
         "a".to_string(),
         "127.0.0.1:0".parse().unwrap(),
-        NodeConfig {
-            db_path: Some(db_path),
-            ..NodeConfig::default()
-        },
+        NodeConfig::with_rocksdb(db_path).unwrap(),
     )
     .await
     .expect("node failed to restart");
@@ -302,6 +297,7 @@ async fn persistence_roundtrip() {
     a2.shutdown().await;
 }
 
+#[cfg(feature = "rocksdb")]
 #[tokio::test]
 async fn persistence_keeps_gossiped_winner() {
     // The write-through path must persist gossip-received ops too, and
@@ -313,10 +309,7 @@ async fn persistence_keeps_gossiped_winner() {
     let a = Node::start(
         "a".to_string(),
         "127.0.0.1:0".parse().unwrap(),
-        NodeConfig {
-            db_path: Some(db_path.clone()),
-            ..NodeConfig::default()
-        },
+        NodeConfig::with_rocksdb(db_path.clone()).unwrap(),
     )
     .await
     .expect("node failed to start");
@@ -348,10 +341,7 @@ async fn persistence_keeps_gossiped_winner() {
     let a2 = Node::start(
         "a".to_string(),
         "127.0.0.1:0".parse().unwrap(),
-        NodeConfig {
-            db_path: Some(db_path),
-            ..NodeConfig::default()
-        },
+        NodeConfig::with_rocksdb(db_path).unwrap(),
     )
     .await
     .expect("node failed to restart");
@@ -377,16 +367,18 @@ async fn persistence_keeps_gossiped_winner() {
     b.shutdown().await;
 }
 
+#[cfg(feature = "rocksdb")]
 #[tokio::test]
 async fn persistence_flushes_on_shutdown() {
     // With a batch size and interval that never trigger mid-test, the
     // shutdown flush is the only thing persisting these writes.
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("actordb");
-    let config = || NodeConfig {
-        db_path: Some(db_path.clone()),
-        flush_batch_size: 1_000_000,
-        flush_interval: Duration::from_secs(3600),
+    let config = || {
+        let mut cfg = NodeConfig::with_rocksdb(db_path.clone()).unwrap();
+        cfg.flush_batch_size = 1_000_000;
+        cfg.flush_interval = Duration::from_secs(3600);
+        cfg
     };
 
     let a = Node::start("a".to_string(), "127.0.0.1:0".parse().unwrap(), config())

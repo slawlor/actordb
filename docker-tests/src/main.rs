@@ -126,16 +126,13 @@ struct Ctx {
 
 impl Ctx {
     async fn start(node_id: String, port: u16, db_path: Option<PathBuf>) -> Result<Self, String> {
-        let node = Node::start(
-            node_id.clone(),
-            bind(port),
-            NodeConfig {
-                db_path,
-                ..NodeConfig::default()
-            },
-        )
-        .await
-        .map_err(|e| format!("start failed: {e}"))?;
+        let config = match db_path {
+            Some(path) => NodeConfig::with_rocksdb(path).map_err(|e| format!("open db: {e}"))?,
+            None => NodeConfig::default(),
+        };
+        let node = Node::start(node_id.clone(), bind(port), config)
+            .await
+            .map_err(|e| format!("start failed: {e}"))?;
         Ok(Self {
             id: node_id,
             node,
