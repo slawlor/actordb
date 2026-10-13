@@ -1,0 +1,38 @@
+name: Docker integration tests
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'actordb/**'
+      - 'docker-tests/**'
+      - 'docker/**'
+      - 'docker-compose.yml'
+      - '.dockerignore'
+      - '.github/workflows/docker-integration.yaml'
+  pull_request:
+    types: [opened, reopened, synchronize]
+    paths:
+      - 'actordb/**'
+      - 'docker-tests/**'
+      - 'docker/**'
+      - 'docker-compose.yml'
+      - '.dockerignore'
+      - '.github/workflows/docker-integration.yaml'
+
+jobs:
+  docker-tests:
+    name: Dockerized multi-node scenarios
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@main
+
+      - name: Build the test image
+        run: docker compose build
+
+      - name: Replication across 3 nodes
+        run: bash docker/run-scenario.sh docker/envs/replication.env
+
+      - name: SIGKILL + restart reconvergence
+        run: bash docker/restart-test.sh
