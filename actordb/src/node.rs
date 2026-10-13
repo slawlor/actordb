@@ -9,12 +9,18 @@
 //! *local copy* of the keyspace, plus a Tokio TCP mesh to its peers.
 //! Writes are disseminated with **epidemic broadcast**: a local write is
 //! applied to the local actor and gossiped to every peer; each peer
-//! applies it and re-gossips it once, tracked by `(origin node_id, seq)`
+//! applies it and re-gossips it once, tracked by
+//! `(origin node_id, boot_id, seq)`
 //! so the flood terminates. Inbound writes merge into the local copy
 //! with last-writer-wins, which is idempotent and commutative — so all
 //! replicas converge without any coordination, even across restarts and
 //! late joiners (a joining node pulls full state with a sync exchange
 //! during the handshake).
+//!
+//! `boot_id` is minted fresh at every process start: a restarted node
+//! reuses its `node_id` but its sequence counter starts back at zero,
+//! so without it peers would mistake the new boot's first writes for
+//! replays of pre-restart ops and silently drop them.
 //!
 //! Wire format: prost-encoded [`crate::proto::Envelope`]
 //! frames, each prefixed with a 4-byte big-endian length.
@@ -22,6 +28,7 @@
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use prost::Message as ProstMessage;
 use ractor::rpc::CallResult;
@@ -81,16 +88,31 @@ impl From<prost::DecodeError> for NodeError {
 /// A node in the database cluster.
 pub struct Node {
     node_id: String,
+    /// Random identifier minted at process start; joins the gossip
+    /// dedup key so a restarted node is not mistaken for a replay.
+    boot_id: u64,
     listen_addr: SocketAddr,
     actor: ActorRef<KvMessage>,
     peers: PeerMap,
-    /// (origin node_id, seq) of every op already applied, to stop
-    /// re-broadcast storms. The actor's LWW merge is idempotent, so this
-    /// is purely a propagation concern.
-    seen_ops: Arc<Mutex<HashSet<(String, u64)>>>,
+    /// (origin node_id, boot_id, seq) of every op already applied, to
+    /// stop re-broadcast storms. The actor's LWW merge is idempotent,
+    /// so this is purely a propagation concern.
+    seen_ops: Arc<Mutex<HashSet<(String, u64, u64)>>>,
     /// Per-node sequence number for locally originated ops.
     next_seq: Arc<Mutex<u64>>,
     tasks: Arc<Mutex<Vec<JoinHandle<()>>>>,
+}
+
+/// Mint a fresh boot id. Wall-clock nanos mixed with the pid: two boots
+/// can never share a nanosecond on the same machine, so collisions are
+/// not a practical concern (and a collision would only risk a dropped
+/// duplicate, never corruption — LWW still guards the merge).
+fn fresh_boot_id() -> u64 {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    nanos ^ ((std::process::id() as u64) << 32)
 }
 
 impl Node {
@@ -107,6 +129,7 @@ impl Node {
 
         let node = Self {
             node_id: node_id.clone(),
+            boot_id: fresh_boot_id(),
             listen_addr: bound_addr,
             actor: actor.clone(),
             peers: Arc::new(Mutex::new(HashMap::new())),
@@ -168,12 +191,13 @@ impl Node {
             key,
             value: VersionedValue::new(value, now_ms(), self.node_id.clone()),
             seq,
+            boot_id: self.boot_id,
         };
         // Mark locally originated ops as seen so inbound echoes terminate.
         self.seen_ops
             .lock()
             .await
-            .insert((self.node_id.clone(), seq));
+            .insert((self.node_id.clone(), self.boot_id, seq));
 
         self.actor
             .send_message(KvMessage::ApplyOp(op.clone()))
@@ -249,6 +273,7 @@ impl Node {
             timestamp_ms: op.value.timestamp_ms,
             node_id: op.value.node_id,
             seq: op.seq,
+            boot_id: op.boot_id,
         };
         let mut frame = Vec::new();
         // Encoding into a Vec cannot realistically fail; skip on error.
@@ -287,7 +312,7 @@ async fn handle_connection(
     node_id: String,
     actor: ActorRef<KvMessage>,
     peers: PeerMap,
-    seen_ops: Arc<Mutex<HashSet<(String, u64)>>>,
+    seen_ops: Arc<Mutex<HashSet<(String, u64, u64)>>>,
     stream: TcpStream,
     we_dialed: bool,
 ) {
@@ -340,7 +365,7 @@ async fn handle_connection(
                 send_sync_request(&tx).await;
             }
             Some(EnvelopeMsg::Replicate(op)) => {
-                let id = (op.node_id.clone(), op.seq);
+                let id = (op.node_id.clone(), op.boot_id, op.seq);
                 let is_new = seen_ops.lock().await.insert(id);
                 if !is_new {
                     continue; // already applied; kills re-broadcast storms
@@ -353,6 +378,7 @@ async fn handle_connection(
                         op.node_id.clone(),
                     ),
                     seq: op.seq,
+                    boot_id: op.boot_id,
                 };
                 if actor
                     .send_message(KvMessage::ApplyOp(replicated.clone()))
@@ -392,7 +418,8 @@ async fn handle_connection(
                     let op = ReplicatedOp {
                         key: e.key,
                         value: VersionedValue::new(e.value, e.timestamp_ms, e.node_id),
-                        seq: 0, // seq is a propagation concern; sync is not gossip
+                        seq: 0,     // seq/boot_id are propagation concerns;
+                        boot_id: 0, // sync is not gossip
                     };
                     let _ = actor.send_message(KvMessage::ApplyOp(op));
                 }

@@ -31,6 +31,10 @@ message ReplicateOp {
   uint64 timestamp_ms = 3;
   string node_id = 4;
   uint64 seq = 5;
+  // Random per process start; joins the dedup key so a restarted node
+  // (same node_id, sequence counter back at zero) is not mistaken for
+  // a replay of its pre-restart ops.
+  uint64 boot_id = 6;
 }
 
 // Ask a peer for its full local state (anti-entropy when a node joins)

@@ -131,6 +131,48 @@ async fn lww_last_write_wins_everywhere() {
 }
 
 #[tokio::test]
+async fn restarted_node_writes_are_accepted() {
+    let a = test_node("a").await;
+    let b = test_node("b").await;
+    b.connect(a.addr()).await.unwrap();
+    wait_for_peers(&a, &b).await;
+
+    a.put("k".to_string(), b"v1".to_vec()).await.unwrap();
+    common::wait_for(
+        || async { b.get("k".to_string()).await.unwrap().map(|v| v.value) == Some(b"v1".to_vec()) },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    // Simulate a restart of a: same node_id, but fresh process state —
+    // the sequence counter is back at zero.
+    a.shutdown().await;
+    let a2 = test_node("a").await;
+    a2.connect(b.addr()).await.unwrap();
+    common::wait_for(
+        || async { a2.peer_count().await == 1 && b.peer_count().await == 1 },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    // Ensure the post-restart write gets a strictly later timestamp.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    a2.put("k".to_string(), b"v2".to_vec()).await.unwrap();
+
+    // b must accept the new boot's writes. With the old (node_id, seq)
+    // dedup key, b would have dropped this as a replay of the
+    // pre-restart op and the cluster would have silently diverged.
+    common::wait_for(
+        || async { b.get("k".to_string()).await.unwrap().map(|v| v.value) == Some(b"v2".to_vec()) },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    a2.shutdown().await;
+    b.shutdown().await;
+}
+
+#[tokio::test]
 async fn late_joiner_receives_full_state() {
     let a = test_node("a").await;
     let b = test_node("b").await;

@@ -47,14 +47,16 @@ impl VersionedValue {
 
 /// A single replicated write operation.
 ///
-/// `seq` is a per-origin-node sequence number used by the transport layer
-/// to suppress re-broadcast storms; it plays no role in conflict
-/// resolution.
+/// `seq` is a per-origin-node sequence number and `boot_id` a random
+/// identifier minted at process start; together with the origin node id
+/// they form the transport layer's dedup key to suppress re-broadcast
+/// storms. Neither plays a role in conflict resolution.
 #[derive(Debug, Clone)]
 pub struct ReplicatedOp {
     pub key: String,
     pub value: VersionedValue,
     pub seq: u64,
+    pub boot_id: u64,
 }
 
 /// Messages handled by the [KvActor].
