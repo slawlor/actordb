@@ -82,10 +82,16 @@ Three modules:
 what most users interact with:
 
 ```rust
-use actordb::node::Node;
+use actordb::node::{Node, NodeConfig};
 
-let node = Node::start("node-a".to_string(), "0.0.0.0:7447".parse().unwrap()).await?;
+let node = Node::start(
+    "node-a".to_string(),
+    "0.0.0.0:7447".parse().unwrap(),
+    NodeConfig::default(),
+)
+.await?;
 // port 0 picks an ephemeral port; the bound address is available via `node.addr()`
+// NodeConfig { db_path: Some(path) } enables RocksDB write-through persistence
 
 node.connect("127.0.0.1:7447".parse().unwrap()).await?;
 // handshake runs a full-state sync, so a joining node converges immediately.
@@ -125,8 +131,9 @@ over TCP. Mostly of interest if you're implementing a compatible peer.
 This is a working prototype, not production-ready. Known gaps, tracked
 as issues in the [issue tracker](https://github.com/slawlor/actordb/issues):
 
-- **No persistence** — the dataset lives in memory; a restart wipes it
-  (recoverable only via peer sync).
+- **Persistence is opt-in** — pass `db_path` in `NodeConfig` for
+  RocksDB write-through persistence; without it the dataset lives in
+  memory and a restart wipes it (recoverable only via peer sync).
 - **No TLS/authentication** — plaintext, unauthenticated TCP.
 - **No deletes** — keys live forever.
 - **Wall-clock LWW** — no hybrid logical clocks yet; skewed clocks can
