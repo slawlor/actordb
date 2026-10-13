@@ -15,8 +15,10 @@
 //! replicas converge without coordination.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 
 use ractor::{Actor, ActorProcessingErr, ActorRef, RpcReplyPort};
+use rocksdb::{IteratorMode, DB};
 
 /// A value stamped with its last-writer-wins version.
 ///
@@ -76,26 +78,47 @@ pub enum KvMessage {
 }
 
 /// The actor's exclusive state: this node's local copy of the keyspace.
+///
+/// When a `db` is present, every applied write is also persisted to
+/// RocksDB (write-through) and the copy is reloaded from disk on boot,
+/// so a restarted node keeps its dataset.
 pub struct KvState {
     store: HashMap<String, VersionedValue>,
+    db: Option<DB>,
 }
 
 impl KvState {
     /// Merge an op into the local copy, keeping whichever version wins.
-    fn apply(&mut self, op: ReplicatedOp) {
+    /// Returns `true` if the op replaced the stored version.
+    fn apply(&mut self, op: &ReplicatedOp) -> bool {
         let replace = match self.store.get(&op.key) {
             Some(existing) => op.value.wins_over(existing),
             None => true,
         };
         if replace {
-            self.store.insert(op.key, op.value);
+            self.store.insert(op.key.clone(), op.value.clone());
         }
+        replace
+    }
+
+    /// Persist an applied write. Called only for ops that won the merge.
+    fn persist(&self, key: &str, value: &VersionedValue) -> Result<(), ActorProcessingErr> {
+        if let Some(db) = &self.db {
+            db.put(key.as_bytes(), encode_value(value))
+                .map_err(|e| ActorProcessingErr::from(e.to_string()))?;
+        }
+        Ok(())
     }
 }
 
-/// Arguments to spawn a [KvActor]. Kept for future use (e.g. persistence
-/// directory); the node id currently travels on each operation instead.
-pub struct KvArgs {}
+/// Arguments to spawn a [KvActor].
+#[derive(Debug, Clone, Default)]
+pub struct KvArgs {
+    /// If set, persist every applied write to RocksDB at this path
+    /// (created if missing) and reload it on boot. `None` (default)
+    /// keeps the node purely in-memory.
+    pub db_path: Option<PathBuf>,
+}
 
 /// The key-value actor. One runs per node and owns that node's local copy.
 pub struct KvActor;
@@ -108,11 +131,29 @@ impl Actor for KvActor {
     async fn pre_start(
         &self,
         _myself: ActorRef<Self::Msg>,
-        _args: Self::Arguments,
+        args: Self::Arguments,
     ) -> Result<Self::State, ActorProcessingErr> {
-        Ok(KvState {
-            store: HashMap::new(),
-        })
+        let mut store = HashMap::new();
+        let db = match args.db_path {
+            Some(path) => {
+                std::fs::create_dir_all(&path)
+                    .map_err(|e| ActorProcessingErr::from(e.to_string()))?;
+                let db =
+                    DB::open_default(&path).map_err(|e| ActorProcessingErr::from(e.to_string()))?;
+                // Reload the local copy. Corrupt or unreadable entries
+                // fail the boot loudly rather than silently dropping data.
+                for item in db.iterator(IteratorMode::Start) {
+                    let (k, v) = item.map_err(|e| ActorProcessingErr::from(e.to_string()))?;
+                    let key = String::from_utf8(k.to_vec())
+                        .map_err(|e| ActorProcessingErr::from(e.to_string()))?;
+                    let value = decode_value(&v).map_err(ActorProcessingErr::from)?;
+                    store.insert(key, value);
+                }
+                Some(db)
+            }
+            None => None,
+        };
+        Ok(KvState { store, db })
     }
 
     async fn handle(
@@ -123,7 +164,12 @@ impl Actor for KvActor {
     ) -> Result<(), ActorProcessingErr> {
         match message {
             KvMessage::ApplyOp(op) => {
-                state.apply(op);
+                // Write-through: durable first, then memory. If the DB
+                // write fails the actor errors out rather than diverging
+                // silently from disk.
+                if state.apply(&op) {
+                    state.persist(&op.key, &op.value)?;
+                }
                 Ok(())
             }
             KvMessage::Get { key, reply } => {
@@ -147,9 +193,63 @@ pub fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// On-disk encoding of a [VersionedValue]:
+/// `[timestamp_ms: u64 BE][node_id_len: u32 BE][node_id][value]`.
+fn encode_value(v: &VersionedValue) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(12 + v.node_id.len() + v.value.len());
+    buf.extend_from_slice(&v.timestamp_ms.to_be_bytes());
+    buf.extend_from_slice(&(v.node_id.len() as u32).to_be_bytes());
+    buf.extend_from_slice(v.node_id.as_bytes());
+    buf.extend_from_slice(&v.value);
+    buf
+}
+
+fn decode_value(bytes: &[u8]) -> Result<VersionedValue, String> {
+    if bytes.len() < 12 {
+        return Err(format!("value too short: {} bytes", bytes.len()));
+    }
+    let timestamp_ms = u64::from_be_bytes(bytes[0..8].try_into().unwrap());
+    let id_len = u32::from_be_bytes(bytes[8..12].try_into().unwrap()) as usize;
+    if bytes.len() < 12 + id_len {
+        return Err(format!(
+            "node_id overruns value: id_len={id_len} total={}",
+            bytes.len()
+        ));
+    }
+    let node_id = String::from_utf8(bytes[12..12 + id_len].to_vec())
+        .map_err(|e| format!("node_id not UTF-8: {e}"))?;
+    let value = bytes[12 + id_len..].to_vec();
+    Ok(VersionedValue {
+        value,
+        timestamp_ms,
+        node_id,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn value_encoding_roundtrip() {
+        let v = VersionedValue::new(vec![1, 2, 3], 123456789, "node-a".to_string());
+        let bytes = encode_value(&v);
+        assert_eq!(decode_value(&bytes).unwrap(), v);
+        // empty value and empty node id
+        let v = VersionedValue::new(vec![], 0, String::new());
+        assert_eq!(decode_value(&encode_value(&v)).unwrap(), v);
+    }
+
+    #[test]
+    fn value_decoding_rejects_garbage() {
+        assert!(decode_value(&[]).is_err());
+        assert!(decode_value(&[0; 11]).is_err());
+        // claims a 10-byte node id but only has 3
+        let mut bad = vec![0u8; 12];
+        bad[8..12].copy_from_slice(&10u32.to_be_bytes());
+        bad.extend_from_slice(b"abc");
+        assert!(decode_value(&bad).is_err());
+    }
 
     #[test]
     fn lww_orders_by_timestamp_then_node_id() {

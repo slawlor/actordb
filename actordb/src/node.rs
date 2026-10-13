@@ -31,6 +31,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -123,14 +124,36 @@ fn fresh_boot_id() -> u64 {
     nanos ^ ((std::process::id() as u64) << 32)
 }
 
+/// Configuration for a [Node]. Start with `NodeConfig::default()` and
+/// set the fields you need. This is the seed of the operator-facing
+/// configuration surface (see the `NodeConfig` productionization issue).
+#[derive(Debug, Clone, Default)]
+pub struct NodeConfig {
+    /// If set, the node's local copy is persisted to RocksDB at this
+    /// path: every applied write goes to disk write-through, and the
+    /// dataset is reloaded on boot. `None` (default) keeps the node
+    /// purely in-memory.
+    pub db_path: Option<PathBuf>,
+}
+
 impl Node {
     /// Start a node: spawn its [crate::actor::KvActor] and begin
     /// listening for peer connections. Binds `listen_addr` (use port 0
     /// for an ephemeral port) and returns the bound address via [Node::addr].
-    pub async fn start(node_id: String, listen_addr: SocketAddr) -> Result<Self, NodeError> {
-        let (actor, _actor_handle) = KvActor::spawn(None, KvActor, KvArgs {})
-            .await
-            .map_err(|e| NodeError::Actor(e.to_string()))?;
+    pub async fn start(
+        node_id: String,
+        listen_addr: SocketAddr,
+        config: NodeConfig,
+    ) -> Result<Self, NodeError> {
+        let (actor, _actor_handle) = KvActor::spawn(
+            None,
+            KvActor,
+            KvArgs {
+                db_path: config.db_path,
+            },
+        )
+        .await
+        .map_err(|e| NodeError::Actor(e.to_string()))?;
 
         let listener = TcpListener::bind(listen_addr).await?;
         let bound_addr = listener.local_addr()?;
@@ -211,6 +234,10 @@ impl Node {
     }
 
     /// Write a key locally and gossip it to all peers.
+    ///
+    /// This is read-your-write: when `put` returns, the op has been
+    /// applied to the local copy (and, with persistence enabled,
+    /// written to disk). The gossip to peers is fire-and-forget.
     pub async fn put(&self, key: String, value: Vec<u8>) -> Result<(), NodeError> {
         let seq = {
             let mut guard = self.next_seq.lock().await;
@@ -218,7 +245,7 @@ impl Node {
             *guard
         };
         let op = ReplicatedOp {
-            key,
+            key: key.clone(),
             value: VersionedValue::new(value, now_ms(), self.node_id.clone()),
             seq,
             boot_id: self.boot_id,
@@ -232,6 +259,22 @@ impl Node {
         self.actor
             .send_message(KvMessage::ApplyOp(op.clone()))
             .map_err(|e| NodeError::Actor(e.to_string()))?;
+
+        // Barrier: the actor drains its mailbox in FIFO order, so this
+        // `call` returns only after the ApplyOp above has been applied.
+        // (A `get` on the same key doubles as the read-your-write check.)
+        match self
+            .actor
+            .call(|reply| KvMessage::Get { key, reply }, None)
+            .await
+            .map_err(|e| NodeError::Actor(e.to_string()))?
+        {
+            CallResult::Success(_) => {}
+            CallResult::Timeout => return Err(NodeError::Actor("put timed out".to_string())),
+            CallResult::SenderError => {
+                return Err(NodeError::Actor("put reply channel dropped".to_string()))
+            }
+        }
 
         self.broadcast(op).await;
         Ok(())
@@ -287,11 +330,18 @@ impl Node {
 
     /// Stop all networking tasks. The actor is left running; dropping the
     /// process ends it.
+    /// Shut the node down: abort all connection tasks and stop the
+    /// actor. Stopping the actor drops its state, which releases the
+    /// RocksDB lock (when persistence is enabled) so the database can
+    /// be reopened — e.g. by a restarted node on the same path.
     pub async fn shutdown(&self) {
         let mut tasks = self.tasks.lock().await;
         for t in tasks.drain(..) {
             t.abort();
         }
+        // The handlers never block, so this returns promptly. Failures
+        // just mean the actor was already dead.
+        let _ = self.actor.stop_and_wait(None, None).await;
     }
 
     /// Gossip an op to every connected peer. Fire-and-forget: a dead peer

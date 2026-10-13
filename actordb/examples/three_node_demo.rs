@@ -5,19 +5,31 @@
 
 use std::time::Duration;
 
-use actordb::node::Node;
+use actordb::node::{Node, NodeConfig};
 
 #[tokio::main]
 async fn main() {
-    let a = Node::start("node-a".to_string(), "127.0.0.1:0".parse().unwrap())
-        .await
-        .unwrap();
-    let b = Node::start("node-b".to_string(), "127.0.0.1:0".parse().unwrap())
-        .await
-        .unwrap();
-    let c = Node::start("node-c".to_string(), "127.0.0.1:0".parse().unwrap())
-        .await
-        .unwrap();
+    let a = Node::start(
+        "node-a".to_string(),
+        "127.0.0.1:0".parse().unwrap(),
+        NodeConfig::default(),
+    )
+    .await
+    .unwrap();
+    let b = Node::start(
+        "node-b".to_string(),
+        "127.0.0.1:0".parse().unwrap(),
+        NodeConfig::default(),
+    )
+    .await
+    .unwrap();
+    let c = Node::start(
+        "node-c".to_string(),
+        "127.0.0.1:0".parse().unwrap(),
+        NodeConfig::default(),
+    )
+    .await
+    .unwrap();
 
     // Star topology: b and c dial a. There is no direct b<->c link;
     // epidemic broadcast still converges everything everywhere.
