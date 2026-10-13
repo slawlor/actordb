@@ -300,15 +300,62 @@ fn worker_idx(key: &str, worker_count: usize) -> usize {
     hash_key(key.as_bytes()) as usize % worker_count
 }
 
+/// Factory and lifecycle owner for a fragment's worker pool.
+///
+/// The pool spawns the workers, routes keys to them by sticky hash, and
+/// drains them on shutdown. The dispatcher holds a pool and does nothing
+/// else with worker lifecycle — this is the seam Phase 4's supervision
+/// (health checks, restarts) will build on.
+pub struct WorkerPool {
+    workers: Vec<ActorRef<KvMessage>>,
+}
+
+impl WorkerPool {
+    /// Spawn `worker_count` workers sharing `shared` state.
+    pub async fn spawn(
+        worker_count: usize,
+        shared: Arc<FragmentState>,
+    ) -> Result<Self, ActorProcessingErr> {
+        let worker_count = worker_count.max(1);
+        let mut workers = Vec::with_capacity(worker_count);
+        for _ in 0..worker_count {
+            let (worker, _handle) = KvWorker::spawn(
+                None,
+                KvWorker,
+                KvWorkerArgs {
+                    shared: shared.clone(),
+                },
+            )
+            .await
+            .map_err(|e| ActorProcessingErr::from(e.to_string()))?;
+            workers.push(worker);
+        }
+        Ok(Self { workers })
+    }
+
+    /// The worker serving `key` (sticky: `hash(key) % worker_count`).
+    pub fn route(&self, key: &str) -> &ActorRef<KvMessage> {
+        &self.workers[worker_idx(key, self.workers.len())]
+    }
+
+    /// Stop every worker, waiting for each. Call before flushing shared
+    /// state so no new writes land mid-flush.
+    pub async fn shutdown(&self) {
+        for worker in &self.workers {
+            let _ = worker.stop_and_wait(None, None).await;
+        }
+    }
+}
+
 /// The per-fragment dispatcher. One runs per fragment this node serves:
-/// it owns the [`FragmentState`], spawns the worker pool, and routes
-/// every operation to a worker by sticky key hash. `GetAll` is served
-/// directly from shared state.
+/// it owns the [`FragmentState`] and a [`WorkerPool`], and routes every
+/// operation to a worker by sticky key hash. `GetAll` is served directly
+/// from shared state.
 pub struct KvActor;
 
 /// The dispatcher's state: the worker pool and the state they share.
 pub struct KvState {
-    workers: Vec<ActorRef<KvMessage>>,
+    pool: WorkerPool,
     shared: Arc<FragmentState>,
 }
 
@@ -345,21 +392,8 @@ impl Actor for KvActor {
             args.flush_batch_size,
             args.flush_interval,
         ));
-        let worker_count = args.worker_count.max(1);
-        let mut workers = Vec::with_capacity(worker_count);
-        for _ in 0..worker_count {
-            let (worker, _handle) = KvWorker::spawn(
-                None,
-                KvWorker,
-                KvWorkerArgs {
-                    shared: shared.clone(),
-                },
-            )
-            .await
-            .map_err(|e| ActorProcessingErr::from(e.to_string()))?;
-            workers.push(worker);
-        }
-        Ok(KvState { workers, shared })
+        let pool = WorkerPool::spawn(args.worker_count, shared.clone()).await?;
+        Ok(KvState { pool, shared })
     }
 
     async fn post_stop(
@@ -367,12 +401,10 @@ impl Actor for KvActor {
         _myself: ActorRef<Self::Msg>,
         state: &mut Self::State,
     ) -> Result<(), ActorProcessingErr> {
-        // Stop workers first so no new writes land mid-flush, then don't
+        // Drain workers first so no new writes land mid-flush, then don't
         // leave buffered writes behind. (A kill -9 skips this; the
         // unflushed tail is recovered via peer sync on reconnect.)
-        for worker in &state.workers {
-            let _ = worker.stop_and_wait(None, None).await;
-        }
+        state.pool.shutdown().await;
         state.shared.flush().await
     }
 
@@ -384,8 +416,9 @@ impl Actor for KvActor {
     ) -> Result<(), ActorProcessingErr> {
         match message {
             KvMessage::ApplyOp(op) => {
-                let worker = &state.workers[worker_idx(&op.key, state.workers.len())];
-                worker
+                state
+                    .pool
+                    .route(&op.key)
                     .send_message(KvMessage::ApplyOp(op))
                     .map_err(|e| ActorProcessingErr::from(e.to_string()))?;
                 Ok(())
@@ -397,7 +430,7 @@ impl Actor for KvActor {
                 // The worker replies through the caller's reply channel
                 // directly. On worker timeout/error the reply is dropped
                 // and the caller sees a SenderError.
-                let worker = &state.workers[worker_idx(&key, state.workers.len())];
+                let worker = state.pool.route(&key);
                 if let Ok(CallResult::Success(value)) = worker
                     .call(|r| KvMessage::Get { key, reply: r }, None)
                     .await
