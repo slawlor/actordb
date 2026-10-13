@@ -5,7 +5,7 @@
 
 //! A database node.
 //!
-//! Each node runs one [KvActor](crate::actor::KvActor) holding the node's
+//! Each node runs one [crate::actor::KvActor] holding the node's
 //! *local copy* of the keyspace, plus a Tokio TCP mesh to its peers.
 //! Writes are disseminated with **epidemic broadcast**: a local write is
 //! applied to the local actor and gossiped to every peer; each peer
@@ -16,7 +16,7 @@
 //! late joiners (a joining node pulls full state with a sync exchange
 //! during the handshake).
 //!
-//! Wire format: prost-encoded [`Envelope`](crate::proto::Envelope)
+//! Wire format: prost-encoded [`crate::proto::Envelope`]
 //! frames, each prefixed with a 4-byte big-endian length.
 
 use std::collections::{HashMap, HashSet};
@@ -94,7 +94,7 @@ pub struct Node {
 }
 
 impl Node {
-    /// Start a node: spawn its [KvActor](crate::actor::KvActor) and begin
+    /// Start a node: spawn its [crate::actor::KvActor] and begin
     /// listening for peer connections. Binds `listen_addr` (use port 0
     /// for an ephemeral port) and returns the bound address via [Node::addr].
     pub async fn start(node_id: String, listen_addr: SocketAddr) -> Result<Self, NodeError> {
