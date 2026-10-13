@@ -22,13 +22,17 @@
 //! so without it peers would mistake the new boot's first writes for
 //! replays of pre-restart ops and silently drop them.
 //!
+//! The dialer side of each connection owns it: if the TCP stream drops,
+//! it is redialed with exponential backoff until the node shuts down,
+//! so transient network blips heal without operator intervention.
+//!
 //! Wire format: prost-encoded [`crate::proto::Envelope`]
 //! frames, each prefixed with a 4-byte big-endian length.
 
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use prost::Message as ProstMessage;
 use ractor::rpc::CallResult;
@@ -36,7 +40,7 @@ use ractor::{Actor, ActorRef};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, Mutex};
-use tokio::task::JoinHandle;
+use tokio::task::AbortHandle;
 
 use crate::actor::{now_ms, KvActor, KvArgs, KvMessage, ReplicatedOp, VersionedValue};
 use crate::proto::{
@@ -49,6 +53,10 @@ const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 
 /// Outbound queue depth per peer connection.
 const PEER_CHANNEL_DEPTH: usize = 256;
+
+/// Reconnect backoff: first retry after this, doubling to the cap.
+const RECONNECT_BASE: Duration = Duration::from_millis(100);
+const RECONNECT_MAX: Duration = Duration::from_secs(30);
 
 /// peer node_id -> outbound frame queue
 type PeerMap = Arc<Mutex<HashMap<String, mpsc::Sender<Vec<u8>>>>>;
@@ -100,7 +108,7 @@ pub struct Node {
     seen_ops: Arc<Mutex<HashSet<(String, u64, u64)>>>,
     /// Per-node sequence number for locally originated ops.
     next_seq: Arc<Mutex<u64>>,
-    tasks: Arc<Mutex<Vec<JoinHandle<()>>>>,
+    tasks: Arc<Mutex<Vec<AbortHandle>>>,
 }
 
 /// Mint a fresh boot id. Wall-clock nanos mixed with the pid: two boots
@@ -153,30 +161,52 @@ impl Node {
                     act.clone(),
                     peers.clone(),
                     seen.clone(),
+                    tasks.clone(),
                     stream,
                     /* we_dialed = */ false,
                 ));
-                tasks.lock().await.push(h);
+                tasks.lock().await.push(h.abort_handle());
             }
         });
-        node.tasks.lock().await.push(accept_task);
+        node.tasks.lock().await.push(accept_task.abort_handle());
 
         Ok(node)
     }
 
     /// Dial a peer and run the handshake. After the handshake both sides
     /// exchange full state, so a late joiner converges immediately.
+    ///
+    /// The dial is tried once: an unreachable peer returns an error.
+    /// Once connected, the dialer side owns the connection — if it
+    /// drops, it is redialed with exponential backoff until
+    /// [Node::shutdown].
     pub async fn connect(&self, peer_addr: SocketAddr) -> Result<(), NodeError> {
         let stream = TcpStream::connect(peer_addr).await?;
-        let h = tokio::spawn(handle_connection(
+        let (node_id, actor, peers, seen_ops, tasks) = (
             self.node_id.clone(),
             self.actor.clone(),
             self.peers.clone(),
             self.seen_ops.clone(),
-            stream,
-            /* we_dialed = */ true,
-        ));
-        self.tasks.lock().await.push(h);
+            self.tasks.clone(),
+        );
+        let h = tokio::spawn(async move {
+            // Run the initial connection to completion...
+            handle_connection(
+                node_id.clone(),
+                actor.clone(),
+                peers.clone(),
+                seen_ops.clone(),
+                tasks.clone(),
+                stream,
+                /* we_dialed = */ true,
+            )
+            .await;
+            // ...then redial forever. Only the dialer side redials; the
+            // listener side just waits for the next inbound connection.
+            // This task is aborted by shutdown() with all the rest.
+            reconnect_loop(node_id, actor, peers, seen_ops, tasks, peer_addr).await;
+        });
+        self.tasks.lock().await.push(h.abort_handle());
         Ok(())
     }
 
@@ -308,11 +338,16 @@ impl Node {
 ///
 /// `we_dialed` distinguishes the dialer (sends `Hello` immediately) from
 /// the listener (replies to the dialer's `Hello`).
+///
+/// The writer task is registered in `tasks` alongside everything else:
+/// aborting the read loop alone must not orphan it, or the socket's
+/// write half stays open and the peer never observes the disconnect.
 async fn handle_connection(
     node_id: String,
     actor: ActorRef<KvMessage>,
     peers: PeerMap,
     seen_ops: Arc<Mutex<HashSet<(String, u64, u64)>>>,
+    tasks: Arc<Mutex<Vec<AbortHandle>>>,
     stream: TcpStream,
     we_dialed: bool,
 ) {
@@ -331,6 +366,7 @@ async fn handle_connection(
             }
         }
     });
+    tasks.lock().await.push(writer_task.abort_handle());
 
     // The dialer introduces itself first.
     if we_dialed {
@@ -440,6 +476,56 @@ async fn handle_connection(
         }
     }
     writer_task.abort();
+}
+
+/// Redial `addr` until a connection sticks, with exponential backoff.
+/// Each successful dial is run to completion (i.e. until it drops),
+/// then the loop redials. Runs until the task is aborted by shutdown.
+async fn reconnect_loop(
+    node_id: String,
+    actor: ActorRef<KvMessage>,
+    peers: PeerMap,
+    seen_ops: Arc<Mutex<HashSet<(String, u64, u64)>>>,
+    tasks: Arc<Mutex<Vec<AbortHandle>>>,
+    addr: SocketAddr,
+) {
+    let mut backoff = RECONNECT_BASE;
+    loop {
+        tokio::time::sleep(backoff + jitter(backoff)).await;
+        match TcpStream::connect(addr).await {
+            Ok(stream) => {
+                backoff = RECONNECT_BASE;
+                handle_connection(
+                    node_id.clone(),
+                    actor.clone(),
+                    peers.clone(),
+                    seen_ops.clone(),
+                    tasks.clone(),
+                    stream,
+                    /* we_dialed = */ true,
+                )
+                .await;
+                // Dropped: loop around and redial.
+            }
+            Err(_) => {
+                backoff = (backoff * 2).min(RECONNECT_MAX);
+            }
+        }
+    }
+}
+
+/// Up to 50% jitter from clock nanos (no rng dependency for this),
+/// so a network-wide blip doesn't make every node redial in lockstep.
+fn jitter(backoff: Duration) -> Duration {
+    let half_ms = backoff.as_millis() as u64 / 2;
+    if half_ms == 0 {
+        return Duration::ZERO;
+    }
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() as u64)
+        .unwrap_or(0);
+    Duration::from_millis(nanos % (half_ms + 1))
 }
 
 /// Re-gossip an op to all peers except the connection it arrived on.
