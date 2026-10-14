@@ -11,9 +11,11 @@ pub mod meta {
     include!(concat!(env!("OUT_DIR"), "/meta.rs"));
 }
 
+pub use meta::batch_get_response::KeyValue as BatchKeyValue;
 pub use meta::envelope::Msg as EnvelopeMsg;
 pub use meta::{
-    BatchAck, Envelope, ForwardedGet, ForwardedPut, GetResponse, Hello, KeySummary, ReconcileData,
-    ReconcileFetch, ReconcileRequest, ReconcileResponse, ReplicateBatch, ReplicateOp, SessionStart,
-    SyncEntry, SyncRequest, SyncResponse,
+    BatchAck, BatchGet, BatchGetResponse, BatchPut, Envelope, ForwardedGet, ForwardedPut,
+    GetResponse, Hello, KeySummary, ReconcileData, ReconcileFetch, ReconcileRequest,
+    ReconcileResponse, ReplicateBatch, ReplicateOp, SessionStart, SyncEntry, SyncRequest,
+    SyncResponse,
 };

@@ -1014,3 +1014,173 @@ async fn stale_session_batches_discarded() {
     a.shutdown().await;
     b.shutdown().await;
 }
+
+/// Phase 6: multi-key put/get spanning fragments and nodes.
+#[tokio::test]
+async fn multi_key_fanout() {
+    let a = test_node("a").await;
+    let b = test_node("b").await;
+    b.connect(a.addr()).await.unwrap();
+    wait_for_peers(&a, &b).await;
+
+    // Put 20 keys via a; they hash across the (single) fragment and
+    // replicate to b via the async sender.
+    let kvs: Vec<(String, Vec<u8>)> = (0..20)
+        .map(|i| (format!("mk{i}"), format!("mv{i}").into_bytes()))
+        .collect();
+    let results = a.put_multi(kvs.clone()).await;
+    assert!(results.iter().all(|r| r.is_ok()));
+
+    // All keys readable from b via get_multi (tests remote batch path).
+    let keys: Vec<String> = kvs.iter().map(|(k, _)| k.clone()).collect();
+    common::wait_for(
+        || async {
+            let res = b.get_multi(keys.clone()).await;
+            res.iter().all(|r| matches!(r, Ok(Some(_))))
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+    let res = b.get_multi(keys.clone()).await;
+    for ((k, v), r) in kvs.iter().zip(res) {
+        match r {
+            Ok(Some(got)) => {
+                assert_eq!(&got.value, v, "key {k}");
+            }
+            other => panic!("key {k}: unexpected {other:?}"),
+        }
+    }
+
+    // Results are in input order.
+    let res = a.get_multi(keys).await;
+    assert_eq!(res.len(), 20);
+
+    a.shutdown().await;
+    b.shutdown().await;
+}
+
+/// Phase 6: partial failure + replica failover — one replica down,
+/// reads fail over to the surviving replica; errors are reported
+/// per-key only when all replicas are unreachable.
+#[tokio::test]
+async fn multi_key_partial_failure() {
+    use actordb::shard::{fragment_of, FragmentId};
+
+    // Two fragments; a serves fragment 0, b+c serve fragment 1 (b
+    // preferred).
+    let mut fragment_map = std::collections::HashMap::new();
+    fragment_map.insert(FragmentId(0), vec!["a".to_string()]);
+    fragment_map.insert(FragmentId(1), vec!["b".to_string(), "c".to_string()]);
+    let mk_config = |map: std::collections::HashMap<FragmentId, Vec<String>>| NodeConfig {
+        fragment_count: 2,
+        fragment_map: map,
+        ..NodeConfig::default()
+    };
+    let a = Node::start(
+        "a".to_string(),
+        "127.0.0.1:0".parse().unwrap(),
+        mk_config(fragment_map.clone()),
+    )
+    .await
+    .unwrap();
+    let b = Node::start(
+        "b".to_string(),
+        "127.0.0.1:0".parse().unwrap(),
+        mk_config(fragment_map.clone()),
+    )
+    .await
+    .unwrap();
+    let c = Node::start(
+        "c".to_string(),
+        "127.0.0.1:0".parse().unwrap(),
+        mk_config(fragment_map),
+    )
+    .await
+    .unwrap();
+    b.connect(a.addr()).await.unwrap();
+    c.connect(a.addr()).await.unwrap();
+    // b and c replicate fragment 1 to each other; connect them directly.
+    c.connect(b.addr()).await.unwrap();
+    common::wait_for(
+        || async { a.peer_count().await == 2 },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    // Find keys for each fragment.
+    let mut keys_f0 = Vec::new();
+    let mut keys_f1 = Vec::new();
+    for i in 0..50 {
+        let k = format!("pk{i}");
+        if fragment_of(&k, 2) == FragmentId(0) {
+            keys_f0.push(k);
+        } else {
+            keys_f1.push(k);
+        }
+        if keys_f0.len() >= 3 && keys_f1.len() >= 3 {
+            break;
+        }
+    }
+    assert!(!keys_f0.is_empty() && !keys_f1.is_empty());
+
+    // Put all keys via a. Fragment-1 keys go to b (preferred owner)
+    // and replicate to c via the async sender.
+    let mut all_keys = keys_f0.clone();
+    all_keys.extend(keys_f1.clone());
+    let kvs: Vec<(String, Vec<u8>)> = all_keys
+        .iter()
+        .map(|k| (k.clone(), format!("v{k}").into_bytes()))
+        .collect();
+    let results = a.put_multi(kvs).await;
+    assert!(results.iter().all(|r| r.is_ok()));
+    // Wait until c has the fragment-1 keys via replication.
+    common::wait_for(
+        || async {
+            let res = c.get_multi(keys_f1.clone()).await;
+            res.iter().all(|r| matches!(r, Ok(Some(_))))
+        },
+        Duration::from_secs(10),
+    )
+    .await;
+
+    // Kill b (preferred owner). Fragment-1 reads must fail over to c
+    // and still succeed; fragment-0 keys stay local.
+    b.shutdown().await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let results = a.get_multi(all_keys.clone()).await;
+    assert_eq!(results.len(), all_keys.len());
+    for (i, k) in keys_f0.iter().enumerate() {
+        assert!(results[i].is_ok(), "local key {k} should not error");
+    }
+    for (j, k) in keys_f1.iter().enumerate() {
+        let i = keys_f0.len() + j;
+        match &results[i] {
+            Ok(Some(v)) => assert_eq!(
+                v.value,
+                format!("v{k}").into_bytes(),
+                "failover read of {k} returned wrong value"
+            ),
+            other => panic!("remote key {k} should fail over to c, got {other:?}"),
+        }
+    }
+
+    // Kill c too. Now no replica of fragment 1 is reachable: its keys
+    // must error per-key while fragment-0 keys still succeed.
+    c.shutdown().await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let results = a.get_multi(all_keys.clone()).await;
+    for (i, k) in keys_f0.iter().enumerate() {
+        assert!(results[i].is_ok(), "local key {k} should not error");
+    }
+    for (j, k) in keys_f1.iter().enumerate() {
+        let i = keys_f0.len() + j;
+        assert!(
+            results[i].is_err(),
+            "remote key {k} should error when all replicas are down"
+        );
+    }
+
+    a.shutdown().await;
+}

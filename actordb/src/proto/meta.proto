@@ -148,6 +148,30 @@ message ReconcileData {
   repeated SyncEntry entries = 2;
 }
 
+// Phase 6: multi-key fan-out. One message per destination node.
+message BatchPut {
+  repeated ForwardedPut puts = 1;
+}
+
+message BatchGet {
+  uint64 req_id = 1;
+  repeated string keys = 2;
+}
+
+message BatchGetResponse {
+  uint64 req_id = 1;
+  message KeyValue {
+    string key = 1;
+    bool found = 2;
+    bytes value = 3;
+    uint64 timestamp_ms = 4;
+    string node_id = 5;
+    uint64 expires_at_ms = 6;
+    bool is_tombstone = 7;
+  }
+  repeated KeyValue results = 2;
+}
+
 message Envelope {
   oneof msg {
     Hello hello = 1;
@@ -164,5 +188,8 @@ message Envelope {
     ReconcileResponse reconcile_response = 12;
     ReconcileFetch reconcile_fetch = 13;
     ReconcileData reconcile_data = 14;
+    BatchPut batch_put = 15;
+    BatchGet batch_get = 16;
+    BatchGetResponse batch_get_response = 17;
   }
 }
