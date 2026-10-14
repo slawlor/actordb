@@ -184,21 +184,34 @@ message KeySummary {
 
 message ReconcileRequest {
   uint32 fragment = 1;
+  // Correlates the request to the active SessionStart on this connection.
+  uint64 session_id = 2;
+  // Monotonic within a sender session. Responses from older rounds are stale.
+  uint64 round_id = 3;
 }
 
 message ReconcileResponse {
   uint32 fragment = 1;
   repeated KeySummary summaries = 2;
+  uint64 session_id = 3;
+  uint64 round_id = 4;
 }
 
 message ReconcileFetch {
   uint32 fragment = 1;
   repeated string keys = 2;
+  uint64 session_id = 3;
+  uint64 round_id = 4;
+  // Identifies the requested page within the round.
+  uint64 chunk_seq = 5;
 }
 
 message ReconcileData {
   uint32 fragment = 1;
   repeated SyncEntry entries = 2;
+  uint64 session_id = 3;
+  uint64 round_id = 4;
+  uint64 chunk_seq = 5;
 }
 
 // Phase 6: multi-key fan-out. One message per remote fragment/owner attempt.

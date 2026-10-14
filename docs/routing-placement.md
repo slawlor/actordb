@@ -95,7 +95,9 @@ authoritative and tears down local state for revoked fragments.
    fire one on-demand reconcile round (`ReconcileNow`), and wait for the
    sender's completed-round counter to advance. Bootstrap transfers a
    **chunked delta reconcile** (500 keys per `ReconcileFetch` chunk), not a
-   monolithic snapshot. On timeout the fragment goes Serving anyway —
+   monolithic snapshot. If it fetches remote winners, their barrier is followed
+   by a fresh correlated no-fetch verification round before the counter can
+   advance. On timeout the fragment goes Serving anyway —
    **availability over consistency**; LWW plus periodic reconcile converge it
    later.
 5. Mark `Serving`, add to the serving set, call
@@ -107,8 +109,11 @@ authoritative and tears down local state for revoked fragments.
 1. Remove from the serving set first — new local ops forward to the new owner.
    State becomes `Draining`.
 2. Ensure senders to the current replicas so queued ops drain out.
-3. Wait (bounded by `DRAIN_TIMEOUT` = 10 s) until every sender report for the
-   fragment shows `buffered == 0 && in_flight == 0`.
+3. Wait until every sender report for the fragment shows
+   `buffered == 0 && in_flight == 0` and is not in `BufferReset`. There is no
+   destructive timeout: warnings repeat at `placement_drain_warn_interval`,
+   and a placement reversal restores `Serving` instead of allowing stale
+   teardown.
 4. Stop the supervisor subtree (dispatcher drains its pools and flushes),
    remove the router entry, drop all sender state. State becomes `Stopped`.
 

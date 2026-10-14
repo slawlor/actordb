@@ -10,7 +10,10 @@ use std::time::Duration;
 
 use actordb::actor::{now_ms, VersionedValue};
 use actordb::node::{Node, NodeConfig};
+use actordb::proto::Envelope;
 use actordb::store::{KvStore, StoreError};
+use prost::Message;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[derive(Default)]
 struct PreloadedStore {
@@ -149,6 +152,25 @@ async fn wait_for_peers(a: &Node, b: &Node) {
     .await;
 }
 
+async fn send_frame(stream: &mut tokio::net::TcpStream, envelope: Envelope) {
+    let mut encoded = Vec::new();
+    envelope.encode(&mut encoded).unwrap();
+    stream.write_u32(encoded.len() as u32).await.unwrap();
+    stream.write_all(&encoded).await.unwrap();
+    stream.flush().await.unwrap();
+}
+
+async fn recv_frame(stream: &mut tokio::net::TcpStream) -> Envelope {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let len = stream.read_u32().await.unwrap() as usize;
+        let mut encoded = vec![0; len];
+        stream.read_exact(&mut encoded).await.unwrap();
+        Envelope::decode(encoded.as_slice()).unwrap()
+    })
+    .await
+    .expect("timed out waiting for protocol frame")
+}
+
 #[tokio::test]
 async fn single_node_put_get() {
     let n = test_node("solo").await;
@@ -165,6 +187,50 @@ async fn single_node_put_get() {
     assert!(n.get("missing".to_string()).await.unwrap().is_none());
 
     n.shutdown().await;
+}
+
+#[tokio::test]
+async fn invalid_zero_sized_replication_and_placement_config_is_rejected() {
+    use actordb::node::NodeError;
+    use actordb::placement::ManualPlacement;
+    use actordb::shard::FragmentId;
+
+    let mut batch_zero = NodeConfig::default();
+    batch_zero.replication.batch_size = 0;
+    let mut in_flight_zero = NodeConfig::default();
+    in_flight_zero.replication.max_in_flight = 0;
+    let mut reconcile_zero = NodeConfig::default();
+    reconcile_zero.replication.reconcile_timeout = Duration::ZERO;
+
+    for (id, config) in [
+        ("invalid-batch", batch_zero),
+        ("invalid-in-flight", in_flight_zero),
+        ("invalid-reconcile", reconcile_zero),
+    ] {
+        assert!(matches!(
+            Node::start(id.to_string(), "127.0.0.1:0".parse().unwrap(), config).await,
+            Err(NodeError::Actor(_))
+        ));
+    }
+
+    let controller = Arc::new(ManualPlacement::new(HashMap::from([(
+        FragmentId(0),
+        vec!["invalid-placement".to_string()],
+    )])));
+    let placement_zero = NodeConfig {
+        placement_controller: Some(controller),
+        placement_poll_interval: Duration::ZERO,
+        ..NodeConfig::default()
+    };
+    assert!(matches!(
+        Node::start(
+            "invalid-placement".to_string(),
+            "127.0.0.1:0".parse().unwrap(),
+            placement_zero,
+        )
+        .await,
+        Err(NodeError::Actor(_))
+    ));
 }
 
 #[tokio::test]
@@ -1205,6 +1271,7 @@ async fn sender_buffer_reset_and_reconcile() {
             max_in_flight: 2,
             buffer_capacity: 10, // small: overflow quickly
             consistency_interval: Duration::from_secs(3600), // disable periodic
+            reconcile_timeout: Duration::from_secs(30),
             required_ack_durability: actordb::replication::ReplicationAckDurability::MemoryApplied,
         },
         ..NodeConfig::default()
@@ -1270,6 +1337,1007 @@ async fn sender_buffer_reset_and_reconcile() {
     b2.shutdown().await;
 }
 
+/// A live transport must recover immediately after sender-buffer overflow.
+/// The old implementation entered `buffer_reset` but only started
+/// reconciliation after a future reconnect, so a static topology diverged
+/// forever while both peers remained healthy.
+#[tokio::test]
+async fn live_connected_overflow_reconciles_without_reconnect() {
+    use actordb::replication::SenderConfig;
+    use actordb::shard::FragmentId;
+
+    let config = NodeConfig {
+        replication: SenderConfig {
+            batch_size: 100,
+            batch_interval: Duration::from_secs(3600),
+            max_in_flight: 1,
+            buffer_capacity: 2,
+            consistency_interval: Duration::from_secs(3600),
+            reconcile_timeout: Duration::from_secs(30),
+            required_ack_durability: actordb::replication::ReplicationAckDurability::MemoryApplied,
+        },
+        ..NodeConfig::default()
+    };
+    let a = Node::start(
+        "live-reset-a".to_string(),
+        "127.0.0.1:0".parse().unwrap(),
+        config,
+    )
+    .await
+    .unwrap();
+    let b = test_node("live-reset-b").await;
+    b.connect(a.addr()).await.unwrap();
+    wait_for_peers(&a, &b).await;
+
+    let original_session = a
+        .sender_report(FragmentId(0), "live-reset-b")
+        .await
+        .expect("sender should exist")
+        .session_id;
+    assert_ne!(original_session, 0);
+
+    let writes: Vec<_> = (0..30)
+        .map(|i| (format!("live-reset-{i}"), format!("value-{i}").into_bytes()))
+        .collect();
+    let results = a.put_multi(writes.clone()).await;
+    assert!(results.iter().all(Result::is_ok));
+
+    common::wait_for(
+        || async {
+            let report = a.sender_report(FragmentId(0), "live-reset-b").await;
+            let all = b.get_all().await.unwrap();
+            let converged = writes.iter().all(|(key, value)| {
+                all.get(key).map(|v| v.value.as_slice()) == Some(value.as_slice())
+            });
+            report
+                .map(|r| {
+                    r.state == "connected"
+                        && r.reconcile_rounds >= 1
+                        && r.session_id != original_session
+                        && converged
+                })
+                .unwrap_or(false)
+        },
+        Duration::from_secs(10),
+    )
+    .await;
+
+    assert_eq!(a.peer_count().await, 1);
+    assert_eq!(b.peer_count().await, 1);
+    a.shutdown().await;
+    b.shutdown().await;
+}
+
+/// Unchanged dynamic-placement polls reuse the current peer channel. They
+/// must not mint a new replication session and invalidate slow in-flight
+/// batches on every poll.
+#[tokio::test]
+async fn unchanged_placement_polls_preserve_sender_session() {
+    use actordb::placement::ManualPlacement;
+    use actordb::replication::SenderConfig;
+    use actordb::shard::FragmentId;
+
+    let mut placement = HashMap::new();
+    placement.insert(
+        FragmentId(0),
+        vec!["stable-a".to_string(), "stable-b".to_string()],
+    );
+    let controller = Arc::new(ManualPlacement::new(placement));
+    let make_config = || NodeConfig {
+        placement_controller: Some(controller.clone()),
+        placement_poll_interval: Duration::from_millis(25),
+        replication: SenderConfig {
+            consistency_interval: Duration::from_secs(3600),
+            ..SenderConfig::default()
+        },
+        ..NodeConfig::default()
+    };
+    let a = Node::start(
+        "stable-a".to_string(),
+        "127.0.0.1:0".parse().unwrap(),
+        make_config(),
+    )
+    .await
+    .unwrap();
+    let b = Node::start(
+        "stable-b".to_string(),
+        "127.0.0.1:0".parse().unwrap(),
+        make_config(),
+    )
+    .await
+    .unwrap();
+    b.connect(a.addr()).await.unwrap();
+    wait_for_peers(&a, &b).await;
+
+    common::wait_for(
+        || async {
+            a.sender_report(FragmentId(0), "stable-b")
+                .await
+                .map(|report| report.session_id != 0)
+                .unwrap_or(false)
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+    let session = a
+        .sender_report(FragmentId(0), "stable-b")
+        .await
+        .unwrap()
+        .session_id;
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    assert_eq!(
+        a.sender_report(FragmentId(0), "stable-b")
+            .await
+            .unwrap()
+            .session_id,
+        session,
+        "steady placement polls rotated a live sender session"
+    );
+
+    a.shutdown().await;
+    b.shutdown().await;
+}
+
+/// A response from an older or fabricated reconcile round must not complete
+/// a newer buffer reset. Completion requires the exact round and a tracked
+/// ACK fence after outbound repair frames.
+#[tokio::test]
+async fn stale_reconcile_round_cannot_complete_live_reset() {
+    use actordb::proto::{
+        BatchAck, Envelope, EnvelopeMsg, Hello, KeySummary, ReconcileResponse, ReplicationAckLevel,
+    };
+    use actordb::replication::SenderConfig;
+    use actordb::shard::FragmentId;
+
+    let mut fragment_map = HashMap::new();
+    fragment_map.insert(
+        FragmentId(0),
+        vec!["reset-sender".to_string(), "raw-reset-peer".to_string()],
+    );
+    let node = Node::start(
+        "reset-sender".to_string(),
+        "127.0.0.1:0".parse().unwrap(),
+        NodeConfig {
+            fragment_map,
+            replication: SenderConfig {
+                batch_size: 100,
+                batch_interval: Duration::from_secs(3600),
+                max_in_flight: 1,
+                buffer_capacity: 1,
+                consistency_interval: Duration::from_secs(3600),
+                reconcile_timeout: Duration::from_secs(30),
+                required_ack_durability:
+                    actordb::replication::ReplicationAckDurability::MemoryApplied,
+            },
+            ..NodeConfig::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    let mut stream = tokio::net::TcpStream::connect(node.addr()).await.unwrap();
+    send_frame(
+        &mut stream,
+        Envelope {
+            msg: Some(EnvelopeMsg::Hello(Hello {
+                node_id: "raw-reset-peer".to_string(),
+                auth_tag: Vec::new(),
+            })),
+        },
+    )
+    .await;
+
+    // Drain handshake/sync frames through the initial SessionStart.
+    loop {
+        if matches!(
+            recv_frame(&mut stream).await.msg,
+            Some(EnvelopeMsg::SessionStart(_))
+        ) {
+            break;
+        }
+    }
+
+    for i in 0..4 {
+        node.put(
+            format!("round-key-{i}"),
+            format!("round-value-{i}").into_bytes(),
+        )
+        .await
+        .unwrap();
+    }
+
+    let (session_id, round_id) = loop {
+        if let Some(EnvelopeMsg::ReconcileRequest(request)) = recv_frame(&mut stream).await.msg {
+            break (request.session_id, request.round_id);
+        }
+    };
+    assert_ne!(session_id, 0);
+    assert_ne!(round_id, 0);
+
+    send_frame(
+        &mut stream,
+        Envelope {
+            msg: Some(EnvelopeMsg::ReconcileResponse(ReconcileResponse {
+                fragment: 0,
+                // If the stale round were accepted, this remote-only winner
+                // would immediately produce a ReconcileFetch. The valid
+                // response below is deliberately different.
+                summaries: vec![KeySummary {
+                    key: "stale-round-only".to_string(),
+                    // A stale frame must be discarded before HLC validation;
+                    // this value would close the connection if observed.
+                    timestamp_ms: u64::MAX,
+                    node_id: "raw-reset-peer".to_string(),
+                    is_tombstone: false,
+                }],
+                session_id,
+                round_id: round_id.saturating_add(1),
+            })),
+        },
+    )
+    .await;
+    if let Ok(unexpected) =
+        tokio::time::timeout(Duration::from_millis(100), recv_frame(&mut stream)).await
+    {
+        panic!("stale response triggered protocol output: {unexpected:?}");
+    }
+    let report = node
+        .sender_report(FragmentId(0), "raw-reset-peer")
+        .await
+        .unwrap();
+    assert_eq!(report.state, "buffer_reset");
+    assert_eq!(report.reconcile_rounds, 0);
+
+    send_frame(
+        &mut stream,
+        Envelope {
+            msg: Some(EnvelopeMsg::ReconcileResponse(ReconcileResponse {
+                fragment: 0,
+                summaries: Vec::new(),
+                session_id,
+                round_id,
+            })),
+        },
+    )
+    .await;
+
+    let mut saw_repair = false;
+    let barrier = loop {
+        if let Some(EnvelopeMsg::ReplicateBatch(batch)) = recv_frame(&mut stream).await.msg {
+            if batch.batch_seq == u64::MAX {
+                saw_repair = true;
+            } else {
+                break batch;
+            }
+        }
+    };
+    assert!(saw_repair, "expected local winners before the barrier");
+    assert!(barrier.ops.is_empty(), "completion fence must be empty");
+    assert_eq!(barrier.session_id, session_id);
+    send_frame(
+        &mut stream,
+        Envelope {
+            msg: Some(EnvelopeMsg::BatchAck(BatchAck {
+                session_id,
+                batch_seq: barrier.batch_seq,
+                fragment: 0,
+                level: ReplicationAckLevel::Applied as i32,
+            })),
+        },
+    )
+    .await;
+
+    // The first snapshot started at the initial overflow. Later Enqueue
+    // messages advanced the reset epoch, so even a valid barrier cannot clear
+    // the guard; the sender must run a second correlated round.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let report = node
+        .sender_report(FragmentId(0), "raw-reset-peer")
+        .await
+        .unwrap();
+    assert_eq!(report.state, "buffer_reset");
+    assert_eq!(report.reconcile_rounds, 0);
+
+    let second_round_id = loop {
+        if let Some(EnvelopeMsg::ReconcileRequest(request)) = recv_frame(&mut stream).await.msg {
+            assert_eq!(request.session_id, session_id);
+            break request.round_id;
+        }
+    };
+    assert_ne!(second_round_id, round_id);
+    send_frame(
+        &mut stream,
+        Envelope {
+            msg: Some(EnvelopeMsg::ReconcileResponse(ReconcileResponse {
+                fragment: 0,
+                summaries: Vec::new(),
+                session_id,
+                round_id: second_round_id,
+            })),
+        },
+    )
+    .await;
+    let second_barrier = loop {
+        if let Some(EnvelopeMsg::ReplicateBatch(batch)) = recv_frame(&mut stream).await.msg {
+            if batch.batch_seq != u64::MAX {
+                break batch;
+            }
+        }
+    };
+    assert!(second_barrier.ops.is_empty());
+    send_frame(
+        &mut stream,
+        Envelope {
+            msg: Some(EnvelopeMsg::BatchAck(BatchAck {
+                session_id,
+                batch_seq: second_barrier.batch_seq,
+                fragment: 0,
+                level: ReplicationAckLevel::Applied as i32,
+            })),
+        },
+    )
+    .await;
+
+    common::wait_for(
+        || async {
+            node.sender_report(FragmentId(0), "raw-reset-peer")
+                .await
+                .map(|report| report.state == "connected" && report.reconcile_rounds == 1)
+                .unwrap_or(false)
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    node.shutdown().await;
+}
+
+/// A bootstrap round that fetched remote winners has only fenced those
+/// writes when its first barrier is acknowledged. It must run one fresh
+/// no-fetch comparison before placement may advertise the fragment as
+/// Serving.
+#[tokio::test]
+async fn placement_bootstrap_fetch_requires_verification_round() {
+    use actordb::placement::{FragmentPlacementState, ManualPlacement};
+    use actordb::proto::{
+        BatchAck, Envelope, EnvelopeMsg, Hello, KeySummary, ReconcileData, ReconcileResponse,
+        ReplicationAckLevel, SyncEntry,
+    };
+    use actordb::replication::{ReplicationAckDurability, SenderConfig};
+    use actordb::shard::FragmentId;
+
+    let controller = Arc::new(ManualPlacement::new(HashMap::from([(
+        FragmentId(0),
+        vec!["raw-bootstrap-source".to_string()],
+    )])));
+    let node = Node::start(
+        "bootstrap-target".to_string(),
+        "127.0.0.1:0".parse().unwrap(),
+        NodeConfig {
+            placement_controller: Some(controller.clone()),
+            placement_poll_interval: Duration::from_millis(25),
+            replication: SenderConfig {
+                consistency_interval: Duration::from_secs(3600),
+                reconcile_timeout: Duration::from_secs(5),
+                // This node is deliberately storeless. StoreCommitted is a
+                // requirement on remote batch receivers; fetching a winner
+                // locally must remain a valid in-memory bootstrap.
+                required_ack_durability: ReplicationAckDurability::StoreCommitted,
+                ..SenderConfig::default()
+            },
+            ..NodeConfig::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    let mut stream = tokio::net::TcpStream::connect(node.addr()).await.unwrap();
+    send_frame(
+        &mut stream,
+        Envelope {
+            msg: Some(EnvelopeMsg::Hello(Hello {
+                node_id: "raw-bootstrap-source".to_string(),
+                auth_tag: Vec::new(),
+            })),
+        },
+    )
+    .await;
+
+    common::wait_for(
+        || async { node.peer_count().await == 1 },
+        Duration::from_secs(5),
+    )
+    .await;
+    controller.set_placement(HashMap::from([(
+        FragmentId(0),
+        vec![
+            "bootstrap-target".to_string(),
+            "raw-bootstrap-source".to_string(),
+        ],
+    )]));
+
+    let first = loop {
+        if let Some(EnvelopeMsg::ReconcileRequest(request)) = recv_frame(&mut stream).await.msg {
+            break request;
+        }
+    };
+    assert_eq!(
+        node.placement_report().await.states.get(&FragmentId(0)),
+        Some(&FragmentPlacementState::Bootstrapping)
+    );
+
+    let summary = KeySummary {
+        key: "bootstrap-fetched".to_string(),
+        timestamp_ms: now_ms(),
+        node_id: "raw-bootstrap-source".to_string(),
+        is_tombstone: false,
+    };
+    send_frame(
+        &mut stream,
+        Envelope {
+            msg: Some(EnvelopeMsg::ReconcileResponse(ReconcileResponse {
+                fragment: 0,
+                summaries: vec![summary.clone()],
+                session_id: first.session_id,
+                round_id: first.round_id,
+            })),
+        },
+    )
+    .await;
+    let fetch = loop {
+        if let Some(EnvelopeMsg::ReconcileFetch(fetch)) = recv_frame(&mut stream).await.msg {
+            break fetch;
+        }
+    };
+    assert_eq!(fetch.keys, vec![summary.key.clone()]);
+    send_frame(
+        &mut stream,
+        Envelope {
+            msg: Some(EnvelopeMsg::ReconcileData(ReconcileData {
+                fragment: 0,
+                entries: vec![SyncEntry {
+                    key: summary.key.clone(),
+                    value: b"fetched".to_vec(),
+                    timestamp_ms: summary.timestamp_ms,
+                    node_id: summary.node_id.clone(),
+                    expires_at_ms: 0,
+                    is_tombstone: false,
+                }],
+                session_id: first.session_id,
+                round_id: first.round_id,
+                chunk_seq: fetch.chunk_seq,
+            })),
+        },
+    )
+    .await;
+    let first_barrier = loop {
+        if let Some(EnvelopeMsg::ReplicateBatch(batch)) = recv_frame(&mut stream).await.msg {
+            if batch.batch_seq != u64::MAX {
+                break batch;
+            }
+        }
+    };
+    send_frame(
+        &mut stream,
+        Envelope {
+            msg: Some(EnvelopeMsg::BatchAck(BatchAck {
+                session_id: first.session_id,
+                batch_seq: first_barrier.batch_seq,
+                fragment: 0,
+                level: ReplicationAckLevel::StoreCommitted as i32,
+            })),
+        },
+    )
+    .await;
+
+    let second = loop {
+        if let Some(EnvelopeMsg::ReconcileRequest(request)) = recv_frame(&mut stream).await.msg {
+            break request;
+        }
+    };
+    assert_ne!(second.round_id, first.round_id);
+    assert_eq!(
+        node.sender_report(FragmentId(0), "raw-bootstrap-source")
+            .await
+            .unwrap()
+            .reconcile_rounds,
+        0,
+        "the fetched-data barrier was reported as completed bootstrap"
+    );
+    assert_eq!(
+        node.placement_report().await.states.get(&FragmentId(0)),
+        Some(&FragmentPlacementState::Bootstrapping)
+    );
+
+    send_frame(
+        &mut stream,
+        Envelope {
+            msg: Some(EnvelopeMsg::ReconcileResponse(ReconcileResponse {
+                fragment: 0,
+                summaries: vec![summary],
+                session_id: second.session_id,
+                round_id: second.round_id,
+            })),
+        },
+    )
+    .await;
+    let second_barrier = loop {
+        if let Some(EnvelopeMsg::ReplicateBatch(batch)) = recv_frame(&mut stream).await.msg {
+            if batch.batch_seq != u64::MAX {
+                break batch;
+            }
+        }
+    };
+    send_frame(
+        &mut stream,
+        Envelope {
+            msg: Some(EnvelopeMsg::BatchAck(BatchAck {
+                session_id: second.session_id,
+                batch_seq: second_barrier.batch_seq,
+                fragment: 0,
+                level: ReplicationAckLevel::StoreCommitted as i32,
+            })),
+        },
+    )
+    .await;
+    common::wait_for(
+        || async {
+            node.placement_report().await.states.get(&FragmentId(0))
+                == Some(&FragmentPlacementState::Serving)
+                && node
+                    .sender_report(FragmentId(0), "raw-bootstrap-source")
+                    .await
+                    .map(|report| report.reconcile_rounds == 1)
+                    .unwrap_or(false)
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    node.shutdown().await;
+}
+
+/// Reconciliation liveness is independent of the normal batch timer. A live
+/// peer that silently withholds a phase response must cause a session rotation
+/// and a fresh correlated round within the configured phase timeout.
+#[tokio::test]
+async fn silent_reconcile_phase_times_out_and_retries() {
+    use actordb::proto::{Envelope, EnvelopeMsg, Hello};
+    use actordb::replication::SenderConfig;
+    use actordb::shard::FragmentId;
+
+    let mut fragment_map = HashMap::new();
+    fragment_map.insert(
+        FragmentId(0),
+        vec!["timeout-sender".to_string(), "raw-timeout-peer".to_string()],
+    );
+    let node = Node::start(
+        "timeout-sender".to_string(),
+        "127.0.0.1:0".parse().unwrap(),
+        NodeConfig {
+            fragment_map,
+            replication: SenderConfig {
+                batch_size: 100,
+                batch_interval: Duration::from_secs(3600),
+                max_in_flight: 1,
+                buffer_capacity: 1,
+                consistency_interval: Duration::from_secs(3600),
+                reconcile_timeout: Duration::from_millis(100),
+                required_ack_durability:
+                    actordb::replication::ReplicationAckDurability::MemoryApplied,
+            },
+            ..NodeConfig::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    let mut stream = tokio::net::TcpStream::connect(node.addr()).await.unwrap();
+    send_frame(
+        &mut stream,
+        Envelope {
+            msg: Some(EnvelopeMsg::Hello(Hello {
+                node_id: "raw-timeout-peer".to_string(),
+                auth_tag: Vec::new(),
+            })),
+        },
+    )
+    .await;
+    loop {
+        if matches!(
+            recv_frame(&mut stream).await.msg,
+            Some(EnvelopeMsg::SessionStart(_))
+        ) {
+            break;
+        }
+    }
+
+    node.put("timeout-a".to_string(), b"a".to_vec())
+        .await
+        .unwrap();
+    node.put("timeout-b".to_string(), b"b".to_vec())
+        .await
+        .unwrap();
+
+    let first = loop {
+        if let Some(EnvelopeMsg::ReconcileRequest(request)) = recv_frame(&mut stream).await.msg {
+            break request;
+        }
+    };
+    let rotated_session = loop {
+        if let Some(EnvelopeMsg::SessionStart(session)) = recv_frame(&mut stream).await.msg {
+            if session.session_id != first.session_id {
+                break session.session_id;
+            }
+        }
+    };
+    let retry = loop {
+        if let Some(EnvelopeMsg::ReconcileRequest(request)) = recv_frame(&mut stream).await.msg {
+            if request.session_id == rotated_session {
+                break request;
+            }
+        }
+    };
+    assert_ne!(retry.round_id, first.round_id);
+    assert_eq!(retry.fragment, 0);
+    assert_eq!(
+        node.sender_report(FragmentId(0), "raw-timeout-peer")
+            .await
+            .unwrap()
+            .state,
+        "buffer_reset"
+    );
+
+    node.shutdown().await;
+}
+
+/// Reset completion is fenced by the fragment-wide mutation revision, not
+/// only by local sender Enqueue events. An inbound replicated write racing
+/// after the snapshot must force another verification round.
+#[tokio::test]
+async fn inbound_mutation_after_snapshot_invalidates_reset_completion() {
+    use actordb::proto::{
+        BatchAck, Envelope, EnvelopeMsg, Hello, ReconcileResponse, ReplicateBatch, ReplicateOp,
+        ReplicationAckLevel,
+    };
+    use actordb::replication::SenderConfig;
+    use actordb::shard::FragmentId;
+
+    let mut fragment_map = HashMap::new();
+    fragment_map.insert(
+        FragmentId(0),
+        vec![
+            "revision-sender".to_string(),
+            "raw-revision-peer".to_string(),
+        ],
+    );
+    let node = Node::start(
+        "revision-sender".to_string(),
+        "127.0.0.1:0".parse().unwrap(),
+        NodeConfig {
+            fragment_map,
+            replication: SenderConfig {
+                batch_size: 100,
+                batch_interval: Duration::from_secs(3600),
+                max_in_flight: 1,
+                buffer_capacity: 1,
+                consistency_interval: Duration::from_secs(3600),
+                reconcile_timeout: Duration::from_secs(5),
+                required_ack_durability:
+                    actordb::replication::ReplicationAckDurability::MemoryApplied,
+            },
+            ..NodeConfig::default()
+        },
+    )
+    .await
+    .unwrap();
+    let mut stream = tokio::net::TcpStream::connect(node.addr()).await.unwrap();
+    send_frame(
+        &mut stream,
+        Envelope {
+            msg: Some(EnvelopeMsg::Hello(Hello {
+                node_id: "raw-revision-peer".to_string(),
+                auth_tag: Vec::new(),
+            })),
+        },
+    )
+    .await;
+    loop {
+        if matches!(
+            recv_frame(&mut stream).await.msg,
+            Some(EnvelopeMsg::SessionStart(_))
+        ) {
+            break;
+        }
+    }
+
+    node.put("revision-a".to_string(), b"a".to_vec())
+        .await
+        .unwrap();
+    node.put("revision-b".to_string(), b"b".to_vec())
+        .await
+        .unwrap();
+    let request = loop {
+        if let Some(EnvelopeMsg::ReconcileRequest(request)) = recv_frame(&mut stream).await.msg {
+            break request;
+        }
+    };
+    send_frame(
+        &mut stream,
+        Envelope {
+            msg: Some(EnvelopeMsg::ReconcileResponse(ReconcileResponse {
+                fragment: 0,
+                summaries: Vec::new(),
+                session_id: request.session_id,
+                round_id: request.round_id,
+            })),
+        },
+    )
+    .await;
+    let barrier = loop {
+        if let Some(EnvelopeMsg::ReplicateBatch(batch)) = recv_frame(&mut stream).await.msg {
+            if batch.batch_seq != u64::MAX {
+                break batch;
+            }
+        }
+    };
+
+    // Mutate the fragment through the inbound replication path. That path
+    // does not enqueue into this outbound sender, so only the fragment
+    // revision fence can detect the race.
+    let inbound_session = 4242;
+    send_frame(
+        &mut stream,
+        Envelope {
+            msg: Some(EnvelopeMsg::SessionStart(actordb::proto::SessionStart {
+                session_id: inbound_session,
+                fragment: 0,
+            })),
+        },
+    )
+    .await;
+    send_frame(
+        &mut stream,
+        Envelope {
+            msg: Some(EnvelopeMsg::ReplicateBatch(ReplicateBatch {
+                session_id: inbound_session,
+                batch_seq: 7,
+                fragment: 0,
+                ops: vec![ReplicateOp {
+                    key: "inbound-race".to_string(),
+                    value: b"new".to_vec(),
+                    timestamp_ms: now_ms(),
+                    node_id: "raw-revision-peer".to_string(),
+                    seq: 1,
+                    boot_id: 1,
+                    expires_at_ms: 0,
+                    is_tombstone: false,
+                }],
+                required_ack_level: ReplicationAckLevel::Applied as i32,
+            })),
+        },
+    )
+    .await;
+    loop {
+        if matches!(
+            recv_frame(&mut stream).await.msg,
+            Some(EnvelopeMsg::BatchAck(BatchAck {
+                session_id,
+                batch_seq: 7,
+                ..
+            })) if session_id == inbound_session
+        ) {
+            break;
+        }
+    }
+
+    send_frame(
+        &mut stream,
+        Envelope {
+            msg: Some(EnvelopeMsg::BatchAck(BatchAck {
+                session_id: request.session_id,
+                batch_seq: barrier.batch_seq,
+                fragment: 0,
+                level: ReplicationAckLevel::Applied as i32,
+            })),
+        },
+    )
+    .await;
+    let verification = loop {
+        if let Some(EnvelopeMsg::ReconcileRequest(next)) = recv_frame(&mut stream).await.msg {
+            if next.session_id == request.session_id && next.round_id != request.round_id {
+                break next;
+            }
+        }
+    };
+    assert_ne!(verification.round_id, request.round_id);
+    let report = node
+        .sender_report(FragmentId(0), "raw-revision-peer")
+        .await
+        .unwrap();
+    assert_eq!(report.state, "buffer_reset");
+    assert_eq!(report.reconcile_rounds, 0);
+
+    node.shutdown().await;
+}
+
+/// Fetched reconciliation data is an exact response contract: missing or
+/// unrequested entries cannot be partially applied and then certified by a
+/// barrier. Each malformed chunk aborts the round and schedules a retry.
+#[tokio::test]
+async fn malformed_reconcile_data_is_rejected_and_retried() {
+    use actordb::proto::{
+        Envelope, EnvelopeMsg, Hello, KeySummary, ReconcileData, ReconcileResponse, SyncEntry,
+    };
+    use actordb::replication::SenderConfig;
+    use actordb::shard::FragmentId;
+
+    let mut fragment_map = HashMap::new();
+    fragment_map.insert(
+        FragmentId(0),
+        vec!["data-sender".to_string(), "raw-data-peer".to_string()],
+    );
+    let node = Node::start(
+        "data-sender".to_string(),
+        "127.0.0.1:0".parse().unwrap(),
+        NodeConfig {
+            fragment_map,
+            replication: SenderConfig {
+                batch_size: 100,
+                batch_interval: Duration::from_secs(3600),
+                max_in_flight: 1,
+                buffer_capacity: 1,
+                consistency_interval: Duration::from_secs(3600),
+                reconcile_timeout: Duration::from_secs(5),
+                required_ack_durability:
+                    actordb::replication::ReplicationAckDurability::MemoryApplied,
+            },
+            ..NodeConfig::default()
+        },
+    )
+    .await
+    .unwrap();
+    let mut stream = tokio::net::TcpStream::connect(node.addr()).await.unwrap();
+    send_frame(
+        &mut stream,
+        Envelope {
+            msg: Some(EnvelopeMsg::Hello(Hello {
+                node_id: "raw-data-peer".to_string(),
+                auth_tag: Vec::new(),
+            })),
+        },
+    )
+    .await;
+    loop {
+        if matches!(
+            recv_frame(&mut stream).await.msg,
+            Some(EnvelopeMsg::SessionStart(_))
+        ) {
+            break;
+        }
+    }
+    node.put("data-a".to_string(), b"a".to_vec()).await.unwrap();
+    node.put("data-b".to_string(), b"b".to_vec()).await.unwrap();
+
+    let remote_timestamp = now_ms();
+    let summary = KeySummary {
+        key: "remote-fetch".to_string(),
+        timestamp_ms: remote_timestamp,
+        node_id: "raw-data-peer".to_string(),
+        is_tombstone: false,
+    };
+    let first = loop {
+        if let Some(EnvelopeMsg::ReconcileRequest(request)) = recv_frame(&mut stream).await.msg {
+            break request;
+        }
+    };
+    send_frame(
+        &mut stream,
+        Envelope {
+            msg: Some(EnvelopeMsg::ReconcileResponse(ReconcileResponse {
+                fragment: 0,
+                summaries: vec![summary.clone()],
+                session_id: first.session_id,
+                round_id: first.round_id,
+            })),
+        },
+    )
+    .await;
+    let first_fetch = loop {
+        if let Some(EnvelopeMsg::ReconcileFetch(fetch)) = recv_frame(&mut stream).await.msg {
+            break fetch;
+        }
+    };
+    assert_eq!(first_fetch.keys, ["remote-fetch"]);
+    send_frame(
+        &mut stream,
+        Envelope {
+            msg: Some(EnvelopeMsg::ReconcileData(ReconcileData {
+                fragment: 0,
+                entries: Vec::new(),
+                session_id: first.session_id,
+                round_id: first.round_id,
+                chunk_seq: first_fetch.chunk_seq,
+            })),
+        },
+    )
+    .await;
+
+    let second = loop {
+        if let Some(EnvelopeMsg::ReconcileRequest(request)) = recv_frame(&mut stream).await.msg {
+            if request.round_id != first.round_id {
+                break request;
+            }
+        }
+    };
+    send_frame(
+        &mut stream,
+        Envelope {
+            msg: Some(EnvelopeMsg::ReconcileResponse(ReconcileResponse {
+                fragment: 0,
+                summaries: vec![summary],
+                session_id: second.session_id,
+                round_id: second.round_id,
+            })),
+        },
+    )
+    .await;
+    let second_fetch = loop {
+        if let Some(EnvelopeMsg::ReconcileFetch(fetch)) = recv_frame(&mut stream).await.msg {
+            break fetch;
+        }
+    };
+    send_frame(
+        &mut stream,
+        Envelope {
+            msg: Some(EnvelopeMsg::ReconcileData(ReconcileData {
+                fragment: 0,
+                entries: vec![SyncEntry {
+                    key: "unrequested-key".to_string(),
+                    value: b"bad".to_vec(),
+                    // Malformed/unrequested data is rejected before HLC
+                    // observation, so it cannot poison or tear down the live
+                    // connection with an otherwise invalid timestamp.
+                    timestamp_ms: u64::MAX,
+                    node_id: "raw-data-peer".to_string(),
+                    expires_at_ms: 0,
+                    is_tombstone: false,
+                }],
+                session_id: second.session_id,
+                round_id: second.round_id,
+                chunk_seq: second_fetch.chunk_seq,
+            })),
+        },
+    )
+    .await;
+    let third = loop {
+        if let Some(EnvelopeMsg::ReconcileRequest(request)) = recv_frame(&mut stream).await.msg {
+            if request.round_id != second.round_id {
+                break request;
+            }
+        }
+    };
+    assert_eq!(third.session_id, first.session_id);
+    assert!(node
+        .get("remote-fetch".to_string())
+        .await
+        .unwrap()
+        .is_none());
+    assert!(node
+        .get("unrequested-key".to_string())
+        .await
+        .unwrap()
+        .is_none());
+    let report = node
+        .sender_report(FragmentId(0), "raw-data-peer")
+        .await
+        .unwrap();
+    assert_eq!(report.state, "buffer_reset");
+    assert_eq!(report.reconcile_rounds, 0);
+
+    node.shutdown().await;
+}
+
 /// Phase 5: batches from a stale session are discarded. We replay a
 /// batch with a bogus session id over a raw TCP connection; the
 /// receiver must drop it.
@@ -1278,7 +2346,6 @@ async fn stale_session_batches_discarded() {
     use actordb::proto::{
         Envelope, EnvelopeMsg, Hello, ReplicateBatch, ReplicateOp, ReplicationAckLevel,
     };
-    use prost::Message;
     use tokio::io::AsyncWriteExt;
 
     let a = test_node("a").await;
@@ -1342,7 +2409,6 @@ async fn current_session_rejects_far_future_timestamp() {
         Envelope, EnvelopeMsg, Hello, ReplicateBatch, ReplicateOp, ReplicationAckLevel,
         SessionStart,
     };
-    use prost::Message;
     use tokio::io::AsyncWriteExt;
 
     let node = test_node("receiver").await;
@@ -2141,6 +3207,319 @@ async fn placement_migration_no_lost_writes() {
     b.shutdown().await;
 }
 
+/// A sender awaiting overflow reconciliation is not drained merely because
+/// its ordinary buffer and in-flight batch count are both zero. Placement
+/// revocation must keep the fragment subtree alive past the warning threshold
+/// and tear it down only after reset actually completes.
+#[tokio::test]
+async fn placement_drain_waits_for_buffer_reset() {
+    use actordb::placement::{FragmentPlacementState, ManualPlacement};
+    use actordb::proto::{
+        BatchAck, Envelope, EnvelopeMsg, Hello, ReconcileResponse, ReplicationAckLevel,
+    };
+    use actordb::replication::SenderConfig;
+    use actordb::shard::FragmentId;
+
+    let initial = HashMap::from([(
+        FragmentId(0),
+        vec!["drain-a".to_string(), "raw-drain-peer".to_string()],
+    )]);
+    let controller = Arc::new(ManualPlacement::new(initial));
+    let node = Node::start(
+        "drain-a".to_string(),
+        "127.0.0.1:0".parse().unwrap(),
+        NodeConfig {
+            placement_controller: Some(controller.clone()),
+            placement_poll_interval: Duration::from_millis(25),
+            placement_drain_warn_interval: Duration::from_millis(100),
+            replication: SenderConfig {
+                batch_size: 100,
+                batch_interval: Duration::from_secs(3600),
+                max_in_flight: 1,
+                buffer_capacity: 1,
+                consistency_interval: Duration::from_secs(3600),
+                reconcile_timeout: Duration::from_secs(30),
+                required_ack_durability:
+                    actordb::replication::ReplicationAckDurability::MemoryApplied,
+            },
+            ..NodeConfig::default()
+        },
+    )
+    .await
+    .unwrap();
+    let mut stream = tokio::net::TcpStream::connect(node.addr()).await.unwrap();
+    send_frame(
+        &mut stream,
+        Envelope {
+            msg: Some(EnvelopeMsg::Hello(Hello {
+                node_id: "raw-drain-peer".to_string(),
+                auth_tag: Vec::new(),
+            })),
+        },
+    )
+    .await;
+
+    common::wait_for(
+        || async {
+            node.sender_report(FragmentId(0), "raw-drain-peer")
+                .await
+                .map(|report| report.session_id != 0)
+                .unwrap_or(false)
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+    node.put("drain-a".to_string(), b"a".to_vec())
+        .await
+        .unwrap();
+    node.put("drain-b".to_string(), b"b".to_vec())
+        .await
+        .unwrap();
+    common::wait_for(
+        || async {
+            node.sender_report(FragmentId(0), "raw-drain-peer")
+                .await
+                .map(|report| report.state == "buffer_reset")
+                .unwrap_or(false)
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    controller.set_placement(HashMap::from([(
+        FragmentId(0),
+        vec!["raw-drain-peer".to_string()],
+    )]));
+    common::wait_for(
+        || async {
+            node.placement_report().await.states.get(&FragmentId(0))
+                == Some(&FragmentPlacementState::Draining)
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    assert_eq!(
+        node.placement_report().await.states.get(&FragmentId(0)),
+        Some(&FragmentPlacementState::Draining),
+        "placement warning threshold destructively timed out the drain"
+    );
+    assert_eq!(
+        node.sender_report(FragmentId(0), "raw-drain-peer")
+            .await
+            .unwrap()
+            .state,
+        "buffer_reset"
+    );
+
+    let request = loop {
+        if let Some(EnvelopeMsg::ReconcileRequest(request)) = recv_frame(&mut stream).await.msg {
+            break request;
+        }
+    };
+    send_frame(
+        &mut stream,
+        Envelope {
+            msg: Some(EnvelopeMsg::ReconcileResponse(ReconcileResponse {
+                fragment: 0,
+                summaries: Vec::new(),
+                session_id: request.session_id,
+                round_id: request.round_id,
+            })),
+        },
+    )
+    .await;
+    let barrier = loop {
+        if let Some(EnvelopeMsg::ReplicateBatch(batch)) = recv_frame(&mut stream).await.msg {
+            if batch.batch_seq != u64::MAX {
+                break batch;
+            }
+        }
+    };
+    send_frame(
+        &mut stream,
+        Envelope {
+            msg: Some(EnvelopeMsg::BatchAck(BatchAck {
+                session_id: request.session_id,
+                batch_seq: barrier.batch_seq,
+                fragment: 0,
+                level: ReplicationAckLevel::Applied as i32,
+            })),
+        },
+    )
+    .await;
+    common::wait_for(
+        || async {
+            node.placement_report().await.states.get(&FragmentId(0))
+                == Some(&FragmentPlacementState::Stopped)
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+    assert!(
+        node.sender_report(FragmentId(0), "raw-drain-peer")
+            .await
+            .is_none(),
+        "completed drain retained its sender"
+    );
+
+    node.shutdown().await;
+}
+
+/// A placement reversal cancels an in-progress loss transition. The stale
+/// drainer must not tear down a fragment that the controller made
+/// authoritative again while BufferReset was still recovering.
+#[tokio::test]
+async fn placement_readd_while_draining_cancels_teardown() {
+    use actordb::placement::{FragmentPlacementState, ManualPlacement};
+    use actordb::proto::{
+        BatchAck, Envelope, EnvelopeMsg, Hello, ReconcileResponse, ReplicationAckLevel,
+    };
+    use actordb::replication::SenderConfig;
+    use actordb::shard::FragmentId;
+
+    let overlap = HashMap::from([(
+        FragmentId(0),
+        vec!["readd-a".to_string(), "raw-readd-peer".to_string()],
+    )]);
+    let controller = Arc::new(ManualPlacement::new(overlap.clone()));
+    let node = Node::start(
+        "readd-a".to_string(),
+        "127.0.0.1:0".parse().unwrap(),
+        NodeConfig {
+            placement_controller: Some(controller.clone()),
+            placement_poll_interval: Duration::from_millis(25),
+            placement_drain_warn_interval: Duration::from_millis(100),
+            replication: SenderConfig {
+                batch_size: 100,
+                batch_interval: Duration::from_secs(3600),
+                max_in_flight: 1,
+                buffer_capacity: 1,
+                consistency_interval: Duration::from_secs(3600),
+                reconcile_timeout: Duration::from_secs(5),
+                required_ack_durability:
+                    actordb::replication::ReplicationAckDurability::MemoryApplied,
+            },
+            ..NodeConfig::default()
+        },
+    )
+    .await
+    .unwrap();
+    let mut stream = tokio::net::TcpStream::connect(node.addr()).await.unwrap();
+    send_frame(
+        &mut stream,
+        Envelope {
+            msg: Some(EnvelopeMsg::Hello(Hello {
+                node_id: "raw-readd-peer".to_string(),
+                auth_tag: Vec::new(),
+            })),
+        },
+    )
+    .await;
+    common::wait_for(
+        || async {
+            node.sender_report(FragmentId(0), "raw-readd-peer")
+                .await
+                .map(|report| report.session_id != 0)
+                .unwrap_or(false)
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    node.put("readd-first".to_string(), b"first".to_vec())
+        .await
+        .unwrap();
+    node.put("readd-second".to_string(), b"second".to_vec())
+        .await
+        .unwrap();
+    common::wait_for(
+        || async {
+            node.sender_report(FragmentId(0), "raw-readd-peer")
+                .await
+                .map(|report| report.state == "buffer_reset")
+                .unwrap_or(false)
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    controller.set_placement(HashMap::from([(
+        FragmentId(0),
+        vec!["raw-readd-peer".to_string()],
+    )]));
+    common::wait_for(
+        || async {
+            node.placement_report().await.states.get(&FragmentId(0))
+                == Some(&FragmentPlacementState::Draining)
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+    controller.set_placement(overlap);
+    common::wait_for(
+        || async {
+            node.placement_report().await.states.get(&FragmentId(0))
+                == Some(&FragmentPlacementState::Serving)
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    let request = loop {
+        if let Some(EnvelopeMsg::ReconcileRequest(request)) = recv_frame(&mut stream).await.msg {
+            break request;
+        }
+    };
+    send_frame(
+        &mut stream,
+        Envelope {
+            msg: Some(EnvelopeMsg::ReconcileResponse(ReconcileResponse {
+                fragment: 0,
+                summaries: Vec::new(),
+                session_id: request.session_id,
+                round_id: request.round_id,
+            })),
+        },
+    )
+    .await;
+    let barrier = loop {
+        if let Some(EnvelopeMsg::ReplicateBatch(batch)) = recv_frame(&mut stream).await.msg {
+            if batch.batch_seq != u64::MAX {
+                break batch;
+            }
+        }
+    };
+    send_frame(
+        &mut stream,
+        Envelope {
+            msg: Some(EnvelopeMsg::BatchAck(BatchAck {
+                session_id: request.session_id,
+                batch_seq: barrier.batch_seq,
+                fragment: 0,
+                level: ReplicationAckLevel::Applied as i32,
+            })),
+        },
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    assert_eq!(
+        node.placement_report().await.states.get(&FragmentId(0)),
+        Some(&FragmentPlacementState::Serving),
+        "stale drain tore down a fragment after placement re-added it"
+    );
+    assert_eq!(
+        node.get("readd-second".to_string())
+            .await
+            .unwrap()
+            .unwrap()
+            .value,
+        b"second".to_vec()
+    );
+
+    node.shutdown().await;
+}
+
 /// Phase 8: rolling restart with dynamic placement. The survivor keeps
 /// serving; the restarted node catches up via delta reconciliation
 /// only — no full-state resync.
@@ -2333,7 +3712,6 @@ async fn shed_delete_never_acked_ok() {
 #[tokio::test]
 async fn pre_handshake_forwarded_put_ignored() {
     use actordb::proto::{Envelope, EnvelopeMsg, ForwardedPut};
-    use prost::Message;
     use tokio::io::AsyncWriteExt;
 
     let a = test_node("a").await;
@@ -2378,8 +3756,6 @@ async fn pre_handshake_forwarded_put_ignored() {
 #[tokio::test]
 async fn hello_auth_mismatch_drops_connection() {
     use actordb::proto::{Envelope, EnvelopeMsg, Hello};
-    use prost::Message;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let config = NodeConfig {
         cluster_secret: Some(b"correct-secret".to_vec()),
@@ -2422,8 +3798,6 @@ async fn hello_auth_mismatch_drops_connection() {
 #[tokio::test]
 async fn hello_claiming_self_id_rejected() {
     use actordb::proto::{Envelope, EnvelopeMsg, Hello};
-    use prost::Message;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let a = test_node("a").await;
 
@@ -2448,6 +3822,137 @@ async fn hello_claiming_self_id_rejected() {
     assert_eq!(n, 0, "expected connection to be closed on self-id Hello");
 
     a.shutdown().await;
+}
+
+/// Peer identity is immutable for the life of a connection. Accepting a
+/// second Hello used to let one socket replace its identity and rotate every
+/// sender session while leaving stale peer-map entries behind.
+#[tokio::test]
+async fn second_hello_closes_established_connection() {
+    use actordb::proto::{Envelope, EnvelopeMsg, Hello};
+
+    let node = test_node("hello-server").await;
+    let mut stream = tokio::net::TcpStream::connect(node.addr()).await.unwrap();
+    for peer in ["first-peer", "second-peer"] {
+        let mut encoded = Vec::new();
+        Envelope {
+            msg: Some(EnvelopeMsg::Hello(Hello {
+                node_id: peer.to_string(),
+                auth_tag: Vec::new(),
+            })),
+        }
+        .encode(&mut encoded)
+        .unwrap();
+        stream.write_u32(encoded.len() as u32).await.unwrap();
+        stream.write_all(&encoded).await.unwrap();
+    }
+    stream.flush().await.unwrap();
+
+    let mut remainder = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut remainder))
+        .await
+        .expect("server did not close after a second Hello")
+        .unwrap();
+    common::wait_for(
+        || async { node.peer_count().await == 0 },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    node.shutdown().await;
+}
+
+/// Replaying SessionStart with the same id must not clear a failed-repair
+/// latch. Otherwise an empty tracked barrier could ACK immediately after an
+/// untracked repair failed and falsely certify convergence.
+#[tokio::test]
+async fn same_session_replay_does_not_clear_reconcile_failure() {
+    use actordb::proto::{
+        Envelope, EnvelopeMsg, Hello, ReplicateBatch, ReplicateOp, ReplicationAckLevel,
+        SessionStart,
+    };
+
+    let node = Node::start(
+        "poison-receiver".to_string(),
+        "127.0.0.1:0".parse().unwrap(),
+        NodeConfig {
+            store: Some(Arc::new(AlwaysFailStore)),
+            flush_batch_size: 1,
+            flush_interval: Duration::from_secs(3600),
+            snapshot_interval: Duration::from_secs(3600),
+            ..NodeConfig::default()
+        },
+    )
+    .await
+    .unwrap();
+    let mut stream = tokio::net::TcpStream::connect(node.addr()).await.unwrap();
+    send_frame(
+        &mut stream,
+        Envelope {
+            msg: Some(EnvelopeMsg::Hello(Hello {
+                node_id: "raw-poison-sender".to_string(),
+                auth_tag: Vec::new(),
+            })),
+        },
+    )
+    .await;
+
+    let session_id = 77;
+    let start = || Envelope {
+        msg: Some(EnvelopeMsg::SessionStart(SessionStart {
+            session_id,
+            fragment: 0,
+        })),
+    };
+    send_frame(&mut stream, start()).await;
+    send_frame(
+        &mut stream,
+        Envelope {
+            msg: Some(EnvelopeMsg::ReplicateBatch(ReplicateBatch {
+                session_id,
+                batch_seq: u64::MAX,
+                fragment: 0,
+                ops: vec![ReplicateOp {
+                    key: "failed-repair".to_string(),
+                    value: b"value".to_vec(),
+                    timestamp_ms: now_ms(),
+                    node_id: "raw-poison-sender".to_string(),
+                    seq: 1,
+                    boot_id: 1,
+                    expires_at_ms: 0,
+                    is_tombstone: false,
+                }],
+                required_ack_level: ReplicationAckLevel::Applied as i32,
+            })),
+        },
+    )
+    .await;
+    // Same-id replay is not a new session and cannot erase the failure.
+    send_frame(&mut stream, start()).await;
+    send_frame(
+        &mut stream,
+        Envelope {
+            msg: Some(EnvelopeMsg::ReplicateBatch(ReplicateBatch {
+                session_id,
+                batch_seq: 9,
+                fragment: 0,
+                ops: Vec::new(),
+                required_ack_level: ReplicationAckLevel::Applied as i32,
+            })),
+        },
+    )
+    .await;
+
+    let nack = loop {
+        if let Some(EnvelopeMsg::BatchNack(nack)) = recv_frame(&mut stream).await.msg {
+            if nack.session_id == session_id && nack.batch_seq == 9 {
+                break nack;
+            }
+        }
+    };
+    assert!(nack.error.contains("injected permanent failure"));
+
+    node.shutdown().await;
 }
 
 /// Positive case: two nodes with the same cluster secret complete the
@@ -2817,4 +4322,272 @@ async fn replication_nack_retries_the_exact_batch_after_store_failure() {
 
     a.shutdown().await;
     b.shutdown().await;
+}
+
+/// A failed untracked reconciliation repair must poison that receiver
+/// session. The following empty barrier may not ACK and falsely certify the
+/// missing tail of the repair batch; the sender must rotate its session and
+/// reconcile again.
+#[tokio::test]
+async fn failed_reconcile_repair_cannot_be_hidden_by_barrier_ack() {
+    use actordb::replication::{ReplicationAckDurability, SenderConfig};
+    use actordb::shard::FragmentId;
+
+    let store = Arc::new(FailOnceStore::default());
+    let sender_config = NodeConfig {
+        replication: SenderConfig {
+            batch_size: 100,
+            batch_interval: Duration::from_secs(3600),
+            max_in_flight: 1,
+            buffer_capacity: 1,
+            consistency_interval: Duration::from_secs(3600),
+            reconcile_timeout: Duration::from_secs(5),
+            required_ack_durability: ReplicationAckDurability::StoreCommitted,
+        },
+        ..NodeConfig::default()
+    };
+    let receiver_config = NodeConfig {
+        store: Some(store.clone()),
+        // Force the first repair op to encounter the injected store failure
+        // before the rest of that untracked repair batch can be applied.
+        flush_batch_size: 1,
+        flush_interval: Duration::from_secs(3600),
+        snapshot_interval: Duration::from_secs(3600),
+        ..NodeConfig::default()
+    };
+    let a = Node::start(
+        "repair-sender".to_string(),
+        "127.0.0.1:0".parse().unwrap(),
+        sender_config,
+    )
+    .await
+    .unwrap();
+    let b = Node::start(
+        "repair-receiver".to_string(),
+        "127.0.0.1:0".parse().unwrap(),
+        receiver_config,
+    )
+    .await
+    .unwrap();
+    b.connect(a.addr()).await.unwrap();
+    wait_for_peers(&a, &b).await;
+
+    let writes: Vec<_> = (0..4)
+        .map(|i| (format!("repair-{i}"), format!("value-{i}").into_bytes()))
+        .collect();
+    let results = a.put_multi(writes.clone()).await;
+    assert!(results.iter().all(Result::is_ok));
+
+    common::wait_for(
+        || async {
+            let converged = b.get_all().await.unwrap();
+            let all_present = writes.iter().all(|(key, value)| {
+                converged.get(key).map(|stored| stored.value.as_slice()) == Some(value.as_slice())
+            });
+            a.sender_report(FragmentId(0), "repair-receiver")
+                .await
+                .map(|report| {
+                    report.state == "connected"
+                        && report.reconcile_rounds >= 1
+                        && report.in_flight == 0
+                        && all_present
+                })
+                .unwrap_or(false)
+        },
+        Duration::from_secs(10),
+    )
+    .await;
+    assert!(
+        store.attempts.load(Ordering::SeqCst) >= 2,
+        "repair failure was not retried through a fresh session"
+    );
+
+    a.shutdown().await;
+    b.shutdown().await;
+}
+
+/// A failed local StoreCommitted fence remains required even when the retry
+/// sees the fetched winner already present in cache and therefore needs no
+/// second fetch. The remote barrier alone cannot certify requester durability.
+#[tokio::test]
+async fn fetched_reconcile_value_retries_failed_local_store_fence() {
+    use actordb::proto::{
+        BatchAck, Envelope, EnvelopeMsg, Hello, KeySummary, ReconcileData, ReconcileResponse,
+        ReplicationAckLevel, SyncEntry,
+    };
+    use actordb::replication::{ReplicationAckDurability, SenderConfig};
+    use actordb::shard::FragmentId;
+
+    let store = Arc::new(FailOnceStore::default());
+    let mut fragment_map = HashMap::new();
+    fragment_map.insert(
+        FragmentId(0),
+        vec!["fetch-store".to_string(), "raw-fetch-peer".to_string()],
+    );
+    let node = Node::start(
+        "fetch-store".to_string(),
+        "127.0.0.1:0".parse().unwrap(),
+        NodeConfig {
+            store: Some(store.clone()),
+            flush_batch_size: usize::MAX,
+            flush_interval: Duration::from_secs(3600),
+            snapshot_interval: Duration::from_secs(3600),
+            fragment_map,
+            replication: SenderConfig {
+                batch_size: 100,
+                batch_interval: Duration::from_secs(3600),
+                max_in_flight: 1,
+                buffer_capacity: 1,
+                consistency_interval: Duration::from_secs(3600),
+                reconcile_timeout: Duration::from_secs(5),
+                required_ack_durability: ReplicationAckDurability::StoreCommitted,
+            },
+            ..NodeConfig::default()
+        },
+    )
+    .await
+    .unwrap();
+    let mut stream = tokio::net::TcpStream::connect(node.addr()).await.unwrap();
+    send_frame(
+        &mut stream,
+        Envelope {
+            msg: Some(EnvelopeMsg::Hello(Hello {
+                node_id: "raw-fetch-peer".to_string(),
+                auth_tag: Vec::new(),
+            })),
+        },
+    )
+    .await;
+    loop {
+        if matches!(
+            recv_frame(&mut stream).await.msg,
+            Some(EnvelopeMsg::SessionStart(_))
+        ) {
+            break;
+        }
+    }
+    node.put("fetch-local-a".to_string(), b"a".to_vec())
+        .await
+        .unwrap();
+    node.put("fetch-local-b".to_string(), b"b".to_vec())
+        .await
+        .unwrap();
+
+    let remote_timestamp = now_ms();
+    let summary = KeySummary {
+        key: "fetched-durable".to_string(),
+        timestamp_ms: remote_timestamp,
+        node_id: "raw-fetch-peer".to_string(),
+        is_tombstone: false,
+    };
+    let first = loop {
+        if let Some(EnvelopeMsg::ReconcileRequest(request)) = recv_frame(&mut stream).await.msg {
+            break request;
+        }
+    };
+    send_frame(
+        &mut stream,
+        Envelope {
+            msg: Some(EnvelopeMsg::ReconcileResponse(ReconcileResponse {
+                fragment: 0,
+                summaries: vec![summary.clone()],
+                session_id: first.session_id,
+                round_id: first.round_id,
+            })),
+        },
+    )
+    .await;
+    let fetch = loop {
+        if let Some(EnvelopeMsg::ReconcileFetch(fetch)) = recv_frame(&mut stream).await.msg {
+            break fetch;
+        }
+    };
+    send_frame(
+        &mut stream,
+        Envelope {
+            msg: Some(EnvelopeMsg::ReconcileData(ReconcileData {
+                fragment: 0,
+                entries: vec![SyncEntry {
+                    key: summary.key.clone(),
+                    value: b"durable".to_vec(),
+                    timestamp_ms: summary.timestamp_ms,
+                    node_id: summary.node_id.clone(),
+                    expires_at_ms: 0,
+                    is_tombstone: false,
+                }],
+                session_id: first.session_id,
+                round_id: first.round_id,
+                chunk_seq: fetch.chunk_seq,
+            })),
+        },
+    )
+    .await;
+
+    let second = loop {
+        if let Some(EnvelopeMsg::ReconcileRequest(request)) = recv_frame(&mut stream).await.msg {
+            if request.round_id != first.round_id {
+                break request;
+            }
+        }
+    };
+    assert_eq!(store.attempts.load(Ordering::SeqCst), 1);
+    send_frame(
+        &mut stream,
+        Envelope {
+            msg: Some(EnvelopeMsg::ReconcileResponse(ReconcileResponse {
+                fragment: 0,
+                summaries: vec![summary],
+                session_id: second.session_id,
+                round_id: second.round_id,
+            })),
+        },
+    )
+    .await;
+    let barrier = loop {
+        if let Some(EnvelopeMsg::ReplicateBatch(batch)) = recv_frame(&mut stream).await.msg {
+            if batch.batch_seq != u64::MAX {
+                break batch;
+            }
+        }
+    };
+    assert!(barrier.ops.is_empty());
+    assert!(
+        store.attempts.load(Ordering::SeqCst) >= 2,
+        "no-fetch retry skipped the failed local flush"
+    );
+    let mut durable_key = 0u32.to_be_bytes().to_vec();
+    durable_key.extend_from_slice(b"fetched-durable");
+    assert_eq!(
+        store
+            .entries
+            .lock()
+            .unwrap()
+            .get(&durable_key)
+            .map(|value| value.value.clone()),
+        Some(b"durable".to_vec())
+    );
+    send_frame(
+        &mut stream,
+        Envelope {
+            msg: Some(EnvelopeMsg::BatchAck(BatchAck {
+                session_id: second.session_id,
+                batch_seq: barrier.batch_seq,
+                fragment: 0,
+                level: ReplicationAckLevel::StoreCommitted as i32,
+            })),
+        },
+    )
+    .await;
+    common::wait_for(
+        || async {
+            node.sender_report(FragmentId(0), "raw-fetch-peer")
+                .await
+                .map(|report| report.state == "connected" && report.reconcile_rounds == 1)
+                .unwrap_or(false)
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    node.shutdown().await;
 }

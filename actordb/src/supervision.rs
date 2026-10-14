@@ -18,7 +18,7 @@
 //! The supervisor also answers [`FragmentHealth`](crate::supervision::FragmentHealth) queries, feeding the
 //! observability layer and (later) the Phase 8 placement controller.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
@@ -92,7 +92,7 @@ pub struct SupervisorArgs {
     pub tombstone_gc_age: Option<Duration>,
     /// Senders currently in BufferReset. The cleaner blocks tombstone
     /// GC while any sender for this fragment is in the set.
-    pub reset_senders: Arc<Mutex<HashSet<(FragmentId, String)>>>,
+    pub reset_senders: Arc<Mutex<HashMap<(FragmentId, String), u64>>>,
 }
 
 /// The per-fragment supervisor: owns the dispatcher, cleaner and
@@ -396,14 +396,14 @@ pub struct CleanerArgs {
     pub tombstone_gc_age: Option<Duration>,
     /// Senders in BufferReset; tombstone GC is blocked while any
     /// sender for `fragment` is in the set.
-    pub reset_senders: Arc<Mutex<HashSet<(FragmentId, String)>>>,
+    pub reset_senders: Arc<Mutex<HashMap<(FragmentId, String), u64>>>,
 }
 
 pub struct CleanerState {
     fragment: FragmentId,
     shared: Arc<FragmentState>,
     tombstone_gc_age: Option<Duration>,
-    reset_senders: Arc<Mutex<HashSet<(FragmentId, String)>>>,
+    reset_senders: Arc<Mutex<HashMap<(FragmentId, String), u64>>>,
 }
 
 impl Actor for Cleaner {
@@ -449,12 +449,12 @@ impl Actor for Cleaner {
                     // is in BufferReset: the tombstone may not have reached
                     // the peer, and GC'ing it would let reconciliation
                     // resurrect the deleted key.
-                    let blocked = state
-                        .reset_senders
-                        .lock()
-                        .await
-                        .iter()
-                        .any(|(f, _)| *f == state.fragment);
+                    // Keep the guard through reclamation. Otherwise a sender
+                    // can enter BufferReset after this check but before the
+                    // cache sweep, shedding the only queued copy of a
+                    // tombstone that the sweep then removes.
+                    let reset_senders = state.reset_senders.lock().await;
+                    let blocked = reset_senders.keys().any(|(f, _)| *f == state.fragment);
                     if !blocked {
                         let gc_age_ms = u64::try_from(gc_age.as_millis()).unwrap_or(u64::MAX);
                         state.shared.gc_tombstones(now, gc_age_ms).await;

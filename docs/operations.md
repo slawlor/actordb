@@ -46,8 +46,9 @@ node converges to the full dataset with zero full-state sync entries.
 - TTL expiry creates a tombstone with the TTL write's version, so a
   pre-expiry value on the other side cannot reappear when the partition heals.
 - **Opt-in tombstone resurrection risk**: `tombstone_gc_age` defaults to
-  `None`. If time-based GC is enabled and a partition outlasts that age, the
-  GC'd tombstone is gone and the other side's older value can win on heal.
+  `None`. Time-based GC is unsafe even when the configured age exceeds normal
+  partitions: buffered delivery, `MemoryApplied` receiver crashes, and restart
+  can all erase the convergence evidence before collection.
 - While partitioned, batch reads and writes fail over across `replica_order`
   while single-key forwarded puts/gets currently select one owner. If no
   selected/retried replica is reachable, the operation returns
@@ -67,8 +68,10 @@ read as "not found" — the API makes that impossible by construction.
 The driver's fail-safes, in order: `validate_placement` rejects maps that drop
 a fragment's replicas or leave a fragment uncovered (keeps the current
 placement); a failed subtree spawn clears the `Bootstrapping` mark so the next
-tick retries; bootstrap timeout goes Serving anyway; drain timeout stops the
-subtree anyway. During map disagreement, ops re-forward hop-limited
+tick retries; bootstrap timeout goes Serving anyway; an incomplete revoke
+remains `Draining` and warns every `placement_drain_warn_interval` rather than
+discarding recovery state. Re-adding the node cancels that stale teardown.
+During map disagreement, ops re-forward hop-limited
 (`MAX_FORWARD_HOPS = 4`) instead of being dropped. If a controller publishes a
 bad map, `placement_report()` shows the authoritative map and per-fragment
 states (`Bootstrapping`/`Serving`/`Draining`/`Stopped`) for diagnosis.
@@ -90,7 +93,8 @@ Operational rules of thumb:
   static mode — a mismatch silently makes keys unreachable.
 - Keep at least two replicas per fragment if you care about the unflushed
   write tail surviving `kill -9`.
-- Leave `tombstone_gc_age` as `None` unless the deployment has a stronger
-  convergence/repair guarantee. If enabled, it must exceed every partition.
+- Leave `tombstone_gc_age` as `None` in replicated deployments. A time bound
+  alone is not sufficient: the current guard does not cover ordinary buffered
+  tombstones, restart-persistent progress, or durable receipt by every replica.
 - The background pool's default 1000 ops/s rate limit is a feature, not a bug
   — raise it deliberately if your bulk path needs more.

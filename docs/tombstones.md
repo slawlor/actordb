@@ -50,14 +50,14 @@ tombstones age from `timestamp_ms`; expiry tombstones age from their retained
    RocksDB — the store layer only ever issues `put`s. After memory GC, the old
    tombstone bytes remain on disk and are **re-loaded into memory on the next
    boot**. Durable tombstone GC does not exist in the current implementation.
-2. **GC requires convergence.** The cleaner blocks GC while any replication
-   sender for the fragment is in `BufferReset` — the tombstone may not have
-   reached the peer, and GC'ing it would let reconciliation resurrect the
-   deleted key. That guard cannot prove convergence across an arbitrary
-   partition. If time-based GC is enabled, its age **must exceed every possible
-   partition**: a node rejoining after the marker was GC'd can resurrect an
-   older value because it beats "nothing" in the LWW comparison. For this
-   reason GC is disabled by default.
+2. **The reset guard is not a convergence proof.** The cleaner blocks GC while
+   any replication sender for the fragment is in `BufferReset`, including the
+   cache sweep under the same guard lock. It does not cover an old tombstone
+   that is merely buffered/in flight before a later overflow, persist guard
+   state across restart, or prove that a `MemoryApplied` peer persisted the
+   repair before the source collects it. Any of those sequences can resurrect
+   an older value. Time-based GC is therefore unsafe for replicated
+   deployments regardless of the chosen age and is disabled by default.
 
 ## On-disk encoding
 

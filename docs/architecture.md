@@ -75,11 +75,13 @@ Key design points:
   Local and forwarded client mutations await the serving worker's exact apply
   outcome rather than inferring it from a subsequent read (see
   [Consistency](consistency.md)).
-- **Supervision is local and shallow.** A dead worker is replaced in place with
-  the same `Arc<FragmentState>` and the same pool slot; a dead child of a
-  fragment supervisor (dispatcher, cleaner, snapshotter) is respawned in place.
-  There is no escalation across fragments — one fragment's failure never touches
-  a sibling.
+- **Supervision is local and shallow, but not yet lossless.** A dead worker is
+  replaced with the same `Arc<FragmentState>` and pool slot, but accepted jobs
+  in its mailbox are not replayed and pending admission accounting can leak.
+  Cleaner and snapshotter restart in place. A dispatcher restart is not yet
+  republished to `FragmentRouter`, so callers can retain the dead reference.
+  The planned ractor `Factory` migration addresses worker admission/drain and
+  a stable routed facade without coupling failures across fragments.
 - **Placement is authoritative input.** In static mode the node routes by
   `fragment_map`. With a `PlacementController` set, a driver polls
   `desired_placement()` every `placement_poll_interval` and spawns/stops

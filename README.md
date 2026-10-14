@@ -45,8 +45,7 @@ A working, tested prototype of the actor-first sharded database vision:
 * **`proto`**: the wire protocol — prost-encoded `Envelope` frames,
   length-delimited over TCP.
 
-Run the tests (more than 40 cluster integration tests over real localhost
-TCP, plus more than 20 unit tests):
+Run the unit and real-localhost-TCP integration tests:
 
 ```bash
 cargo test
@@ -187,10 +186,11 @@ Key `NodeConfig` knobs:
 | `flush_batch_size` / `flush_interval` | 1000 / 100ms | Persistence batching |
 | `clean_interval` | 30s | TTL-expiry materialization / optional tombstone-GC sweep period |
 | `snapshot_interval` | 60s | Periodic durable flush |
-| `tombstone_gc_age` | None | Tombstone GC disabled; `Some(age)` is an unsafe, memory-only opt-in |
-| `replication` | defaults | `SenderConfig`: batching, in-flight/buffer bounds, reconcile cadence, required ACK durability |
+| `tombstone_gc_age` | None | Tombstone GC disabled; `Some(age)` is unsafe for replicated deployments |
+| `replication` | defaults | `SenderConfig`: batching, in-flight/buffer bounds, reconcile cadence/timeout, required ACK durability |
 | `placement_controller` | None | Phase 8: `Some(Arc<dyn PlacementController>)` opts into dynamic placement |
 | `placement_poll_interval` | 1s | Phase 8: how often the driver re-evaluates desired placement |
+| `placement_drain_warn_interval` | 10s | Warning cadence for a safe, non-destructive stalled drain |
 | `store` | None | `Some(Arc<dyn KvStore>)`; `NodeConfig::with_rocksdb(path)` with the `rocksdb` feature |
 
 - Local and remote writes await the serving worker's exact apply outcome;
@@ -347,16 +347,21 @@ as issues in the [issue tracker](https://github.com/slawlor/actordb/issues):
 - **Replication ingress/timeout hardening remains** — apply/flush-aware ACKs,
   NACK retry, and disconnect replay prevent false delivery, but receiver
   mailboxes are not yet byte-bounded and an open connection that never replies
-  can fill `max_in_flight` because there is no ACK timer. A sender that enters
-  `BufferReset` while that connection stays open also waits for a session
-  transition before reconciling.
+  to ordinary streaming batches can fill `max_in_flight` because there is no
+  ACK timer. Buffer overflow recovery itself is immediate, correlated, and
+  fenced; reconciliation phases have their own timeout.
 - **Wire upgrades must be coordinated** — `Hello` does not yet negotiate
   protocol capabilities. The mutation-response and durability-ACK fields fail
   closed across old/new peers rather than silently claiming success.
 - **Tombstone GC is disabled by default** — the optional time-based mode is
-  memory-only. A node partitioned longer than the configured age can resurrect
-  deleted keys on rejoin, and GC'd tombstones are re-loaded from RocksDB on the
-  next boot (no durable delete path exists).
+  explicitly unsafe for replicated deployments. Its reset guard cannot protect
+  tombstones that are still in ordinary sender buffers, survive process
+  restart, or prove durable receipt by every replica. GC'd tombstones are also
+  re-loaded from RocksDB on the next boot (no durable delete path exists).
+- **Custom worker-pool supervision is incomplete** — a worker crash can drop
+  accepted mailbox work and leak admission accounting, and a restarted
+  dispatcher is not yet republished through the fragment router. Migration to
+  ractor's `Factory` lifecycle is tracked before production use.
 
 ## Contributors
 

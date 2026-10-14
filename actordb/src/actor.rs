@@ -289,6 +289,13 @@ pub enum KvMessage {
     GetAll {
         reply: RpcReplyPort<HashMap<String, VersionedValue>>,
     },
+    /// Read a reconciliation snapshot and the fragment-wide mutation
+    /// revision captured under the same cache read lock.
+    GetSnapshot {
+        reply: RpcReplyPort<(HashMap<String, VersionedValue>, u64)>,
+    },
+    /// Read the current fragment-wide mutation revision.
+    GetRevision { reply: RpcReplyPort<u64> },
     /// Query per-pool shed counts (high, default, background).
     GetShedCounts {
         reply: RpcReplyPort<(u64, u64, u64)>,
@@ -312,6 +319,9 @@ pub struct FragmentState {
     cache: RwLock<HashMap<String, VersionedValue>>,
     /// Optional durable layer behind the cache. `None` = no persistence.
     kvstore: Option<Arc<dyn KvStore>>,
+    /// Advances for every winning cache mutation, including replicated
+    /// writes, expiry conversion, and optional tombstone reclamation.
+    revision: AtomicU64,
     /// Buffered writes awaiting flush.
     flush: Mutex<FlushBuffer>,
     /// Allows exactly one store write at a time for this fragment. The
@@ -340,6 +350,7 @@ impl FragmentState {
         Self {
             cache: RwLock::new(cache),
             kvstore,
+            revision: AtomicU64::new(0),
             flush: Mutex::new(FlushBuffer {
                 pending: Vec::new(),
                 in_flight: None,
@@ -382,6 +393,9 @@ impl FragmentState {
         if self.kvstore.is_none() {
             let mut cache = self.cache.write().await;
             let outcome = Self::merge_cache(&mut cache, &op.key, value);
+            if outcome == ApplyOutcome::Applied {
+                self.revision.fetch_add(1, Ordering::Release);
+            }
             return Ok(Self::reported_outcome(outcome, expired));
         }
 
@@ -397,6 +411,7 @@ impl FragmentState {
                 return Ok(Self::reported_outcome(outcome, expired));
             }
             flush.pending.push((op.key.clone(), value.clone()));
+            self.revision.fetch_add(1, Ordering::Release);
             let should_flush = flush.pending.len() >= self.flush_batch_size
                 || flush.last_flush.elapsed() >= self.flush_interval;
             (outcome, should_flush)
@@ -502,10 +517,15 @@ impl FragmentState {
     /// not persisted their conversion yet, so synchronization never erases a
     /// version floor. Callers serving user reads should filter tombstones out.
     pub async fn get_all(&self) -> HashMap<String, VersionedValue> {
+        self.snapshot_with_revision().await.0
+    }
+
+    /// Read a cache snapshot and its mutation revision atomically with
+    /// respect to winning cache updates.
+    pub async fn snapshot_with_revision(&self) -> (HashMap<String, VersionedValue>, u64) {
         let now = now_ms();
-        self.cache
-            .read()
-            .await
+        let cache = self.cache.read().await;
+        let snapshot = cache
             .iter()
             .map(|(key, value)| {
                 let value = if value.is_expired(now) {
@@ -515,7 +535,19 @@ impl FragmentState {
                 };
                 (key.clone(), value)
             })
-            .collect()
+            .collect();
+        let revision = self.revision.load(Ordering::Acquire);
+        (snapshot, revision)
+    }
+
+    /// Read the mutation revision while holding the cache read lock.
+    ///
+    /// Writers advance the revision while holding the cache write lock, so
+    /// taking the corresponding read lock makes this a fence against an
+    /// in-progress winning mutation rather than a merely atomic observation.
+    pub async fn current_revision(&self) -> u64 {
+        let _cache = self.cache.read().await;
+        self.revision.load(Ordering::Acquire)
     }
 
     /// Remove tombstones older than `gc_age_ms`. Returns the count
@@ -531,7 +563,14 @@ impl FragmentState {
             let created_at_ms = v.expires_at_ms.unwrap_or(v.timestamp_ms);
             now_ms.saturating_sub(created_at_ms) < gc_age_ms
         });
-        before - cache.len()
+        let removed = before - cache.len();
+        if removed != 0 {
+            self.revision.fetch_add(
+                u64::try_from(removed).unwrap_or(u64::MAX),
+                Ordering::Release,
+            );
+        }
+        removed
     }
 
     /// Convert all expired live values to durable expiry tombstones. Returns
@@ -547,6 +586,12 @@ impl FragmentState {
                     converted += 1;
                 }
             }
+            if converted != 0 {
+                self.revision.fetch_add(
+                    u64::try_from(converted).unwrap_or(u64::MAX),
+                    Ordering::Release,
+                );
+            }
             return Ok(converted);
         }
 
@@ -561,6 +606,12 @@ impl FragmentState {
                     flush.pending.push((key.clone(), tombstone));
                     converted += 1;
                 }
+            }
+            if converted != 0 {
+                self.revision.fetch_add(
+                    u64::try_from(converted).unwrap_or(u64::MAX),
+                    Ordering::Release,
+                );
             }
             let should_flush = converted > 0
                 && (flush.pending.len() >= self.flush_batch_size
@@ -697,8 +748,11 @@ impl Actor for KvWorker {
                 )));
                 Ok(())
             }
-            // GetAll is served by the dispatcher straight from shared state.
-            KvMessage::GetAll { .. } => Ok(()),
+            // Snapshot queries are served by the dispatcher straight from
+            // shared state.
+            KvMessage::GetAll { .. }
+            | KvMessage::GetSnapshot { .. }
+            | KvMessage::GetRevision { .. } => Ok(()),
             // Shed counts are a dispatcher-level query; workers don't track them.
             KvMessage::GetShedCounts { reply } => {
                 let _ = reply.send((0, 0, 0));
@@ -1042,6 +1096,14 @@ impl Actor for KvActor {
             }
             KvMessage::GetAll { reply } => {
                 let _ = reply.send(state.shared.get_all().await);
+                Ok(())
+            }
+            KvMessage::GetSnapshot { reply } => {
+                let _ = reply.send(state.shared.snapshot_with_revision().await);
+                Ok(())
+            }
+            KvMessage::GetRevision { reply } => {
+                let _ = reply.send(state.shared.current_revision().await);
                 Ok(())
             }
             KvMessage::GetShedCounts { reply } => {

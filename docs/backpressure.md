@@ -67,12 +67,13 @@ Shed behavior by operation:
   mutation result. A shed single put or batch entry reaches the origin as
   `NodeError::Backpressure`; it is never reported as success.
 
-Because the pending counter is pool-level (`Arc<AtomicU64>` shared by all
-workers in the pool), **worker restarts preserve pending accounting** — the
-replacement worker inherits the same counter, so a restart doesn't zero the
-queue depth. (The op in flight on the dead worker obviously doesn't complete,
-so the counter can drift by at most the ops in flight at death; the design
-guarantees it is never reset.)
+The current custom pool does **not** provide lossless worker restart. Accepted
+jobs already queued in a dead worker's actor mailbox are dropped, and their
+shared pending count is never decremented; the leak can consume pool capacity,
+not merely one active slot. Shutdown also stops workers rather than proving
+that every accepted mailbox job completed. Replacing this lifecycle with
+ractor `Factory` admission, discard replies, worker replacement, and explicit
+drain is required before treating the queue bound as a production guarantee.
 
 ## Observability
 
