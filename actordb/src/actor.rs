@@ -335,7 +335,7 @@ impl FragmentState {
     /// Write the currently buffered writes to the store in one batch.
     ///
     /// At most one write is in progress per fragment. The authoritative copy
-    /// of the batch remains in [`FlushBuffer::in_flight`] until the write
+    /// of the batch remains in the buffer's in-flight slot until the write
     /// succeeds, so failure or cancellation cannot make a later flush forget
     /// it. Writes that arrive during the store call remain pending for the
     /// next flush.
