@@ -2459,60 +2459,55 @@ async fn stale_session_batches_discarded() {
     use actordb::proto::{
         Envelope, EnvelopeMsg, Hello, ReplicateBatch, ReplicateOp, ReplicationAckLevel,
     };
-    use tokio::io::AsyncWriteExt;
 
-    let a = test_node("a").await;
     let b = test_node("b").await;
-    b.connect(a.addr()).await.unwrap();
-    wait_for_peers(&a, &b).await;
 
-    // Hijack: open a raw TCP connection to b, claim to be "a", and send
-    // a batch with a session id b never issued. It must be discarded.
+    // Open a raw peer connection and send a batch without first establishing
+    // a fragment session. Using a unique peer identity avoids racing the
+    // node's intentional replacement of duplicate peer connections.
     let mut stream = tokio::net::TcpStream::connect(b.addr()).await.unwrap();
-    let mut hello_buf = Vec::new();
-    Envelope {
-        msg: Some(EnvelopeMsg::Hello(Hello {
-            node_id: "a".to_string(),
-            auth_tag: Vec::new(),
-        })),
-    }
-    .encode(&mut hello_buf)
-    .unwrap();
-    stream.write_u32(hello_buf.len() as u32).await.unwrap();
-    stream.write_all(&hello_buf).await.unwrap();
+    send_frame(
+        &mut stream,
+        Envelope {
+            msg: Some(EnvelopeMsg::Hello(Hello {
+                node_id: "raw-stale-peer".to_string(),
+                auth_tag: Vec::new(),
+            })),
+        },
+    )
+    .await;
+    assert!(matches!(
+        recv_frame(&mut stream).await.msg,
+        Some(EnvelopeMsg::Hello(Hello { node_id, .. })) if node_id == "b"
+    ));
 
-    // Give b a moment to process the hello.
-    tokio::time::sleep(Duration::from_millis(200)).await;
-
-    let mut batch_buf = Vec::new();
-    Envelope {
-        msg: Some(EnvelopeMsg::ReplicateBatch(ReplicateBatch {
-            session_id: 0xDEADBEEF, // bogus: no such session
-            batch_seq: 0,
-            fragment: 0,
-            ops: vec![ReplicateOp {
-                key: "evil".to_string(),
-                value: b"bad".to_vec(),
-                timestamp_ms: u64::MAX, // would win any LWW...
-                node_id: "a".to_string(),
-                seq: 999,
-                boot_id: 1,
-                expires_at_ms: 0,
-                is_tombstone: false,
-            }],
-            required_ack_level: ReplicationAckLevel::Applied as i32,
-        })),
-    }
-    .encode(&mut batch_buf)
-    .unwrap();
-    stream.write_u32(batch_buf.len() as u32).await.unwrap();
-    stream.write_all(&batch_buf).await.unwrap();
+    send_frame(
+        &mut stream,
+        Envelope {
+            msg: Some(EnvelopeMsg::ReplicateBatch(ReplicateBatch {
+                session_id: 0xDEADBEEF, // bogus: no such session
+                batch_seq: 0,
+                fragment: 0,
+                ops: vec![ReplicateOp {
+                    key: "evil".to_string(),
+                    value: b"bad".to_vec(),
+                    timestamp_ms: u64::MAX, // would win any LWW...
+                    node_id: "raw-stale-peer".to_string(),
+                    seq: 999,
+                    boot_id: 1,
+                    expires_at_ms: 0,
+                    is_tombstone: false,
+                }],
+                required_ack_level: ReplicationAckLevel::Applied as i32,
+            })),
+        },
+    )
+    .await;
 
     // The batch must NOT be applied, despite the huge timestamp.
     tokio::time::sleep(Duration::from_millis(500)).await;
     assert!(b.get("evil".to_string()).await.unwrap().is_none());
 
-    a.shutdown().await;
     b.shutdown().await;
 }
 
