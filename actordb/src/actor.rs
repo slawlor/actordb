@@ -25,7 +25,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use ractor::rpc::CallResult;
-use ractor::{Actor, ActorProcessingErr, ActorRef, RpcReplyPort};
+use ractor::{Actor, ActorCell, ActorProcessingErr, ActorRef, RpcReplyPort, SupervisionEvent};
 use tokio::sync::{Mutex, RwLock};
 
 use crate::shard::{hash_key, FragmentId};
@@ -35,12 +35,16 @@ use crate::store::KvStore;
 ///
 /// Versions are totally ordered by `(timestamp_ms, node_id)`: the higher
 /// wall-clock timestamp wins, and the node id breaks ties deterministically
-/// so every replica picks the same winner.
+/// so every replica picks the same winner. `expires_at_ms` is an optional
+/// wall-clock deadline (set via `put_with_ttl`); expired values are
+/// invisible to reads and reaped by the fragment's cleaner.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VersionedValue {
     pub value: Vec<u8>,
     pub timestamp_ms: u64,
     pub node_id: String,
+    /// Wall-clock expiry in ms since epoch. `None` = no expiry.
+    pub expires_at_ms: Option<u64>,
 }
 
 impl VersionedValue {
@@ -49,12 +53,18 @@ impl VersionedValue {
             value,
             timestamp_ms,
             node_id,
+            expires_at_ms: None,
         }
     }
 
     /// Returns `true` if `self` wins over `other` under last-writer-wins.
     pub fn wins_over(&self, other: &VersionedValue) -> bool {
         (self.timestamp_ms, &self.node_id) > (other.timestamp_ms, &other.node_id)
+    }
+
+    /// Returns `true` if this value is past its expiry at `now_ms`.
+    pub fn is_expired(&self, now_ms: u64) -> bool {
+        matches!(self.expires_at_ms, Some(exp) if now_ms >= exp)
     }
 }
 
@@ -117,7 +127,7 @@ struct FlushBuffer {
 }
 
 impl FragmentState {
-    fn new(
+    pub fn new(
         cache: HashMap<String, VersionedValue>,
         kvstore: Option<Arc<dyn KvStore>>,
         flush_batch_size: usize,
@@ -136,8 +146,13 @@ impl FragmentState {
     }
 
     /// Merge an op into the cache, keeping whichever version wins.
-    /// Returns `true` if the op replaced the stored version.
-    async fn apply(&self, op: &ReplicatedOp) -> bool {
+    /// Returns `true` if the op replaced the stored version. Ops that
+    /// are already expired are dropped — storing them would only wait
+    /// for the cleaner to reap them.
+    pub async fn apply(&self, op: &ReplicatedOp) -> bool {
+        if op.value.is_expired(now_ms()) {
+            return false;
+        }
         let mut cache = self.cache.write().await;
         let replace = match cache.get(&op.key) {
             Some(existing) => op.value.wins_over(existing),
@@ -154,7 +169,11 @@ impl FragmentState {
     /// won the merge. Memory is always updated first, so reads never
     /// wait for a flush. No-op when no store is configured. The store
     /// write happens without holding the buffer lock.
-    async fn buffer(&self, key: &str, value: &VersionedValue) -> Result<(), ActorProcessingErr> {
+    pub async fn buffer(
+        &self,
+        key: &str,
+        value: &VersionedValue,
+    ) -> Result<(), ActorProcessingErr> {
         if self.kvstore.is_none() {
             return Ok(());
         }
@@ -176,7 +195,7 @@ impl FragmentState {
     }
 
     /// Write all buffered writes to the store in one batch.
-    async fn flush(&self) -> Result<(), ActorProcessingErr> {
+    pub async fn flush(&self) -> Result<(), ActorProcessingErr> {
         let batch = {
             let mut flush = self.flush.lock().await;
             if flush.pending.is_empty() {
@@ -199,12 +218,37 @@ impl FragmentState {
         Ok(())
     }
 
-    async fn get(&self, key: &str) -> Option<VersionedValue> {
-        self.cache.read().await.get(key).cloned()
+    /// Read a key, treating expired values as absent.
+    pub async fn get(&self, key: &str) -> Option<VersionedValue> {
+        let now = now_ms();
+        self.cache
+            .read()
+            .await
+            .get(key)
+            .filter(|v| !v.is_expired(now))
+            .cloned()
     }
 
-    async fn get_all(&self) -> HashMap<String, VersionedValue> {
-        self.cache.read().await.clone()
+    /// Read the full cache, excluding expired values.
+    pub async fn get_all(&self) -> HashMap<String, VersionedValue> {
+        let now = now_ms();
+        self.cache
+            .read()
+            .await
+            .iter()
+            .filter(|(_, v)| !v.is_expired(now))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
+    }
+
+    /// Remove all expired keys. Returns the number reaped. Called by the
+    /// fragment's cleaner; reads already hide expired values, so this is
+    /// memory hygiene, not a correctness gate.
+    pub async fn remove_expired(&self, now_ms: u64) -> usize {
+        let mut cache = self.cache.write().await;
+        let before = cache.len();
+        cache.retain(|_, v| !v.is_expired(now_ms));
+        before - cache.len()
     }
 }
 
@@ -226,20 +270,18 @@ impl FlushBuffer {
 /// Arguments to spawn a [KvActor].
 #[derive(Clone)]
 pub struct KvArgs {
-    /// Optional durable storage behind the in-memory cache. `None`
-    /// (default) = no persistence; the node is purely in-memory.
-    pub store: Option<Arc<dyn KvStore>>,
-    /// Which fragment this actor serves. Used for store namespacing
-    /// and debug output.
+    /// The fragment's shared state, created by the supervisor (which
+    /// also hands it to the cleaner and snapshotter).
+    pub shared: Arc<FragmentState>,
+    /// Owning node id, for unique worker naming.
+    /// Which fragment this actor serves. Used for debug output.
     pub fragment: FragmentId,
+    /// Prefix for worker actor names (must be unique per dispatcher
+    /// in the process; the supervisor generates it).
+    pub worker_prefix: String,
     /// Number of worker actors in this fragment's pool. Keys are
     /// sticky-routed by `hash(key) % worker_count`.
     pub worker_count: usize,
-    /// Flush the write buffer after this many buffered ops.
-    pub flush_batch_size: usize,
-    /// Flush the write buffer after this long, even if the batch isn't
-    /// full. Checked on each applied write.
-    pub flush_interval: Duration,
 }
 
 /// A fragment's worker: applies ops and serves reads against the shared
@@ -297,7 +339,7 @@ impl Actor for KvWorker {
 
 /// The worker index for `key`: sticky across calls, so a key's ops
 /// always land on the same worker.
-fn worker_idx(key: &str, worker_count: usize) -> usize {
+pub fn worker_idx(key: &str, worker_count: usize) -> usize {
     hash_key(key.as_bytes()) as usize % worker_count
 }
 
@@ -312,11 +354,42 @@ pub struct WorkerPool {
 }
 
 impl WorkerPool {
-    /// Spawn `worker_count` workers sharing `shared` state.
+    /// Spawn `worker_count` workers sharing `shared` state, linked to
+    /// `supervisor` so a dead worker raises a supervision event there.
+    /// Workers are named `frag-<fragment>-worker-<slot>` for registry
+    /// lookup (tests, debugging).
+    pub async fn spawn_linked(
+        worker_count: usize,
+        shared: Arc<FragmentState>,
+        supervisor: ActorCell,
+        worker_prefix: &str,
+    ) -> Result<Self, ActorProcessingErr> {
+        let worker_count = worker_count.max(1);
+        let mut workers = Vec::with_capacity(worker_count);
+        for slot in 0..worker_count {
+            let name = format!("{worker_prefix}-worker-{slot}");
+            let (worker, _handle) = KvWorker::spawn_linked(
+                Some(name),
+                KvWorker,
+                KvWorkerArgs {
+                    shared: shared.clone(),
+                },
+                supervisor.clone(),
+            )
+            .await
+            .map_err(|e| ActorProcessingErr::from(e.to_string()))?;
+            workers.push(worker);
+        }
+        Ok(Self { workers })
+    }
+
+    /// Spawn `worker_count` workers sharing `shared` state, unsupervised.
     pub async fn spawn(
         worker_count: usize,
         shared: Arc<FragmentState>,
     ) -> Result<Self, ActorProcessingErr> {
+        // Unsupervised spawn: used only in tests. Production pools go
+        // through `spawn_linked` so the dispatcher restarts dead workers.
         let worker_count = worker_count.max(1);
         let mut workers = Vec::with_capacity(worker_count);
         for _ in 0..worker_count {
@@ -339,6 +412,20 @@ impl WorkerPool {
         &self.workers[worker_idx(key, self.workers.len())]
     }
 
+    /// Find the pool slot holding `cell`, if any.
+    pub fn slot_of(&self, cell: &ActorCell) -> Option<usize> {
+        self.workers
+            .iter()
+            .position(|w| w.get_id() == cell.get_id())
+    }
+
+    /// Replace the worker at `slot` with `worker` (supervised restart).
+    pub fn replace(&mut self, slot: usize, worker: ActorRef<KvMessage>) {
+        if let Some(w) = self.workers.get_mut(slot) {
+            *w = worker;
+        }
+    }
+
     /// Stop every worker, waiting for each. Call before flushing shared
     /// state so no new writes land mid-flush.
     pub async fn shutdown(&self) {
@@ -358,6 +445,7 @@ pub struct KvActor;
 pub struct KvState {
     pool: WorkerPool,
     shared: Arc<FragmentState>,
+    worker_prefix: String,
 }
 
 impl Actor for KvActor {
@@ -367,34 +455,23 @@ impl Actor for KvActor {
 
     async fn pre_start(
         &self,
-        _myself: ActorRef<Self::Msg>,
+        myself: ActorRef<Self::Msg>,
         args: Self::Arguments,
     ) -> Result<Self::State, ActorProcessingErr> {
-        // Reload the in-memory cache from the store, if any. A corrupt
-        // store fails the boot loudly rather than silently dropping data.
-        let cache: HashMap<String, VersionedValue> = match &args.store {
-            Some(kvstore) => {
-                let mut map = HashMap::new();
-                for (k, v) in kvstore
-                    .load()
-                    .map_err(|e| ActorProcessingErr::from(e.to_string()))?
-                {
-                    let key = String::from_utf8(k)
-                        .map_err(|e| ActorProcessingErr::from(e.to_string()))?;
-                    map.insert(key, v);
-                }
-                map
-            }
-            None => HashMap::new(),
-        };
-        let shared = Arc::new(FragmentState::new(
-            cache,
-            args.store,
-            args.flush_batch_size,
-            args.flush_interval,
-        ));
-        let pool = WorkerPool::spawn(args.worker_count, shared.clone()).await?;
-        Ok(KvState { pool, shared })
+        // Workers are linked to the dispatcher: a dead worker raises a
+        // supervision event here and gets replaced in-place.
+        let pool = WorkerPool::spawn_linked(
+            args.worker_count,
+            args.shared.clone(),
+            myself.get_cell(),
+            &args.worker_prefix,
+        )
+        .await?;
+        Ok(KvState {
+            pool,
+            shared: args.shared,
+            worker_prefix: args.worker_prefix.clone(),
+        })
     }
 
     async fn post_stop(
@@ -445,6 +522,38 @@ impl Actor for KvActor {
                 Ok(())
             }
         }
+    }
+
+    async fn handle_supervisor_evt(
+        &self,
+        myself: ActorRef<Self::Msg>,
+        message: SupervisionEvent,
+        state: &mut Self::State,
+    ) -> Result<(), ActorProcessingErr> {
+        // A dead worker is replaced in-place: the pool slot keeps its
+        // index, so sticky routing is unaffected and no keys move.
+        let dead = match &message {
+            SupervisionEvent::ActorFailed(cell, _) => Some(cell.clone()),
+            SupervisionEvent::ActorTerminated(cell, _, _) => Some(cell.clone()),
+            _ => None,
+        };
+        if let Some(cell) = dead {
+            if let Some(slot) = state.pool.slot_of(&cell) {
+                let name = format!("{}-worker-{slot}", state.worker_prefix);
+                let (worker, _handle) = KvWorker::spawn_linked(
+                    Some(name),
+                    KvWorker,
+                    KvWorkerArgs {
+                        shared: state.shared.clone(),
+                    },
+                    myself.get_cell(),
+                )
+                .await
+                .map_err(|e| ActorProcessingErr::from(e.to_string()))?;
+                state.pool.replace(slot, worker);
+            }
+        }
+        Ok(())
     }
 }
 

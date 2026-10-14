@@ -33,5 +33,8 @@ pub mod store;
 /// Sharding: deterministic key → fragment mapping.
 pub mod shard;
 
+/// Per-fragment supervision: dispatcher pool, TTL cleaner, snapshotter.
+pub mod supervision;
+
 #[cfg(test)]
 pub(crate) mod common_test;

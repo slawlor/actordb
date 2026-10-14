@@ -35,6 +35,8 @@ message ReplicateOp {
   // (same node_id, sequence counter back at zero) is not mistaken for
   // a replay of its pre-restart ops.
   uint64 boot_id = 6;
+  // Optional key expiry (wall-clock ms). 0/absent = no expiry.
+  uint64 expires_at_ms = 7;
 }
 
 // A client-routed write: "you own this key's fragment — apply it as
@@ -46,6 +48,8 @@ message ForwardedPut {
   string node_id = 4;
   uint64 seq = 5;
   uint64 boot_id = 6;
+  // Optional key expiry (wall-clock ms). 0/absent = no expiry.
+  uint64 expires_at_ms = 7;
 }
 
 // A client-routed read: "you own this key's fragment — read it and
@@ -61,6 +65,8 @@ message GetResponse {
   bytes value = 3;
   uint64 timestamp_ms = 4;
   string node_id = 5;
+  // Optional key expiry (wall-clock ms). 0/absent = no expiry.
+  uint64 expires_at_ms = 6;
 }
 
 // Ask a peer for the fragments listed (anti-entropy when a node joins
@@ -79,6 +85,8 @@ message SyncEntry {
   bytes value = 2;
   uint64 timestamp_ms = 3;
   string node_id = 4;
+  // Optional key expiry (wall-clock ms). 0/absent = no expiry.
+  uint64 expires_at_ms = 5;
 }
 
 // Top-level wire envelope, length-delimited on the wire
