@@ -38,6 +38,13 @@ use crate::store::KvStore;
 /// so every replica picks the same winner. `expires_at_ms` is an optional
 /// wall-clock deadline (set via `put_with_ttl`); expired values are
 /// invisible to reads and reaped by the fragment's cleaner.
+///
+/// A tombstone (`is_tombstone`) marks a deleted key. Tombstones participate
+/// in LWW like writes: a tombstone with a higher timestamp shadows a live
+/// value, and a live write with a higher timestamp resurrects the key.
+/// On exact `(timestamp, node_id)` ties the tombstone wins (deletes are
+/// explicit). Tombstones are shipped by sync and aged out by the cleaner
+/// after `tombstone_gc_age`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VersionedValue {
     pub value: Vec<u8>,
@@ -45,6 +52,8 @@ pub struct VersionedValue {
     pub node_id: String,
     /// Wall-clock expiry in ms since epoch. `None` = no expiry.
     pub expires_at_ms: Option<u64>,
+    /// True if this is a deletion marker.
+    pub is_tombstone: bool,
 }
 
 impl VersionedValue {
@@ -54,17 +63,32 @@ impl VersionedValue {
             timestamp_ms,
             node_id,
             expires_at_ms: None,
+            is_tombstone: false,
+        }
+    }
+
+    /// A tombstone for `node_id` at `timestamp_ms`.
+    pub fn tombstone(timestamp_ms: u64, node_id: String) -> Self {
+        Self {
+            value: Vec::new(),
+            timestamp_ms,
+            node_id,
+            expires_at_ms: None,
+            is_tombstone: true,
         }
     }
 
     /// Returns `true` if `self` wins over `other` under last-writer-wins.
+    /// Tombstones win exact `(timestamp, node_id)` ties.
     pub fn wins_over(&self, other: &VersionedValue) -> bool {
-        (self.timestamp_ms, &self.node_id) > (other.timestamp_ms, &other.node_id)
+        (self.timestamp_ms, &self.node_id, self.is_tombstone)
+            > (other.timestamp_ms, &other.node_id, other.is_tombstone)
     }
 
     /// Returns `true` if this value is past its expiry at `now_ms`.
+    /// Tombstones never expire by TTL (they're aged by GC instead).
     pub fn is_expired(&self, now_ms: u64) -> bool {
-        matches!(self.expires_at_ms, Some(exp) if now_ms >= exp)
+        !self.is_tombstone && matches!(self.expires_at_ms, Some(exp) if now_ms >= exp)
     }
 }
 
@@ -218,18 +242,20 @@ impl FragmentState {
         Ok(())
     }
 
-    /// Read a key, treating expired values as absent.
+    /// Read a key, treating expired values and tombstones as absent.
     pub async fn get(&self, key: &str) -> Option<VersionedValue> {
         let now = now_ms();
         self.cache
             .read()
             .await
             .get(key)
-            .filter(|v| !v.is_expired(now))
+            .filter(|v| !v.is_tombstone && !v.is_expired(now))
             .cloned()
     }
 
-    /// Read the full cache, excluding expired values.
+    /// Read the full cache, excluding expired values but *including*
+    /// tombstones: sync must ship tombstones so deletes propagate.
+    /// Callers serving user reads should filter tombstones out.
     pub async fn get_all(&self) -> HashMap<String, VersionedValue> {
         let now = now_ms();
         self.cache
@@ -239,6 +265,21 @@ impl FragmentState {
             .filter(|(_, v)| !v.is_expired(now))
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect()
+    }
+
+    /// Remove tombstones older than `gc_age_ms`. Returns the count
+    /// reaped. Only call once converged; a partitioned node rejoining
+    /// with a pre-delete live value would resurrect the key.
+    pub async fn gc_tombstones(&self, now_ms: u64, gc_age_ms: u64) -> usize {
+        let mut cache = self.cache.write().await;
+        let before = cache.len();
+        cache.retain(|_, v| {
+            if !v.is_tombstone {
+                return true;
+            }
+            now_ms.saturating_sub(v.timestamp_ms) < gc_age_ms
+        });
+        before - cache.len()
     }
 
     /// Remove all expired keys. Returns the number reaped. Called by the
@@ -565,6 +606,71 @@ pub fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// Hybrid logical clock (simplified): monotonic per node, tracks the
+/// max of wall-clock and observed remote timestamps.
+///
+/// Pure wall-clock LWW breaks under clock skew: a fast-clocked node's
+/// writes shadow newer data from slow-clocked nodes, silently. HLC
+/// keeps the `(timestamp, node_id)` tiebreak shape so the merge stays
+/// idempotent and commutative, but guarantees per-node monotonicity and
+/// moves forward when it sees a higher remote timestamp.
+///
+/// Timestamps are still wall-clock-meaningful when clocks agree; under
+/// skew they degrade to logical ordering, which is the correct
+/// tradeoff for LWW.
+#[derive(Debug, Clone)]
+pub struct HlcClock {
+    last_ms: u64,
+    /// Wall-clock offset in ms. Zero in production; tests use it to
+    /// simulate clock skew between nodes.
+    offset_ms: i64,
+}
+
+impl HlcClock {
+    pub fn new() -> Self {
+        Self::with_offset(0)
+    }
+
+    /// Create a clock whose wall-clock reads are shifted by `offset_ms`.
+    /// Used to simulate clock skew in tests.
+    pub fn with_offset(offset_ms: i64) -> Self {
+        Self {
+            last_ms: 0,
+            offset_ms,
+        }
+    }
+
+    fn wall(&self) -> u64 {
+        let now = now_ms();
+        if self.offset_ms >= 0 {
+            now.saturating_add(self.offset_ms as u64)
+        } else {
+            now.saturating_sub(self.offset_ms.unsigned_abs())
+        }
+    }
+
+    /// Timestamp for a local event: `max(wall, last + 1)`.
+    pub fn tick(&mut self) -> u64 {
+        let wall = self.wall();
+        self.last_ms = wall.max(self.last_ms.saturating_add(1));
+        self.last_ms
+    }
+
+    /// Observe a remote timestamp: `max(wall, last + 1, remote + 1)`.
+    pub fn observe(&mut self, remote_ms: u64) {
+        let wall = self.wall();
+        self.last_ms = wall
+            .max(self.last_ms.saturating_add(1))
+            .max(remote_ms.saturating_add(1));
+    }
+}
+
+impl Default for HlcClock {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -582,5 +688,40 @@ mod tests {
         assert!(!b.wins_over(&c));
         // identical versions never "win" — merge is a no-op
         assert!(!a.wins_over(&a));
+    }
+}
+
+#[cfg(test)]
+mod tombstone_hlc_tests {
+    use super::*;
+
+    #[test]
+    fn tombstone_wins_exact_tie() {
+        let ts = 1_000u64;
+        let live = VersionedValue::new(b"v".to_vec(), ts, "node-a".to_string());
+        let tomb = VersionedValue::tombstone(ts, "node-a".to_string());
+        // Same (timestamp, node_id): tombstone wins the tie.
+        assert!(tomb.wins_over(&live));
+        assert!(!live.wins_over(&tomb));
+        // Higher timestamp still beats the tombstone.
+        let newer = VersionedValue::new(b"v2".to_vec(), ts + 1, "node-a".to_string());
+        assert!(newer.wins_over(&tomb));
+        assert!(!tomb.wins_over(&newer));
+    }
+
+    #[test]
+    fn hlc_is_monotonic_and_observes_remote() {
+        let mut hlc = HlcClock::new();
+        let t1 = hlc.tick();
+        let t2 = hlc.tick();
+        assert!(t2 >= t1, "ticks must be monotonic");
+        // Observing a far-future remote timestamp moves the clock past it.
+        hlc.observe(t2 + 100_000);
+        let t3 = hlc.tick();
+        assert!(t3 > t2 + 100_000, "clock must move past observed remote");
+        // Observing a stale timestamp never moves the clock backward.
+        hlc.observe(1);
+        let t4 = hlc.tick();
+        assert!(t4 >= t3, "clock must never go backward");
     }
 }

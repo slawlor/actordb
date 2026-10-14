@@ -727,3 +727,148 @@ async fn worker_kill_triggers_supervised_restart() {
 
     a.shutdown().await;
 }
+
+/// Tombstones: delete hides the key locally and the tombstone
+/// propagates to replicas via replication and handshake sync.
+#[tokio::test]
+async fn delete_propagates_to_replicas() {
+    let a = test_node("a").await;
+    let b = test_node("b").await;
+    b.connect(a.addr()).await.unwrap();
+    wait_for_peers(&a, &b).await;
+
+    a.put("gone".to_string(), b"v".to_vec()).await.unwrap();
+    common::wait_for(
+        || async { b.get("gone".to_string()).await.unwrap().is_some() },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    b.delete("gone".to_string()).await.unwrap();
+    // Deleted on the deleter immediately...
+    assert!(b.get("gone".to_string()).await.unwrap().is_none());
+    // ...and on the replica once the tombstone replicates.
+    common::wait_for(
+        || async { a.get("gone".to_string()).await.unwrap().is_none() },
+        Duration::from_secs(5),
+    )
+    .await;
+    // Tombstones are hidden from get_all too.
+    assert!(!a.get_all().await.unwrap().contains_key("gone"));
+
+    a.shutdown().await;
+    b.shutdown().await;
+}
+
+/// Tombstones: a delete survives node restart (tombstone is durable)
+/// and a late joiner learns the delete via handshake sync.
+#[tokio::test]
+async fn delete_survives_restart_and_rejoin() {
+    let a = test_node("a").await;
+    let b = test_node("b").await;
+    b.connect(a.addr()).await.unwrap();
+    wait_for_peers(&a, &b).await;
+
+    a.put("k".to_string(), b"v".to_vec()).await.unwrap();
+    common::wait_for(
+        || async { b.get("k".to_string()).await.unwrap().is_some() },
+        Duration::from_secs(5),
+    )
+    .await;
+    a.delete("k".to_string()).await.unwrap();
+    common::wait_for(
+        || async { b.get("k".to_string()).await.unwrap().is_none() },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    // A fresh node joining after the delete learns the tombstone from
+    // sync and does not resurrect the key.
+    let c = test_node("c").await;
+    c.connect(a.addr()).await.unwrap();
+    common::wait_for(
+        || async { c.peer_count().await == 1 },
+        Duration::from_secs(5),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(c.get("k".to_string()).await.unwrap().is_none());
+
+    // A put after the delete resurrects the key with a higher timestamp.
+    b.put("k".to_string(), b"v2".to_vec()).await.unwrap();
+    common::wait_for(
+        || async { a.get("k".to_string()).await.unwrap().map(|v| v.value) == Some(b"v2".to_vec()) },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    a.shutdown().await;
+    b.shutdown().await;
+    c.shutdown().await;
+}
+
+/// HLC (#14): one node with a +5min clock skew must not permanently
+/// shadow the slow node's writes. After observing the fast node's
+/// timestamp the slow node's HLC jumps forward, so its next write
+/// wins everywhere. With wall-clock LWW this test fails: the fast
+/// node's write would win forever.
+#[tokio::test]
+async fn hlc_orders_writes_under_clock_skew() {
+    let skewed_config = NodeConfig {
+        clock_skew_ms: 300_000, // +5 minutes
+        ..NodeConfig::default()
+    };
+    let fast = Node::start(
+        "fast".to_string(),
+        "127.0.0.1:0".parse().unwrap(),
+        skewed_config,
+    )
+    .await
+    .unwrap();
+    let slow = test_node("slow").await;
+    slow.connect(fast.addr()).await.unwrap();
+    wait_for_peers(&slow, &fast).await;
+
+    // Slow node writes first.
+    slow.put("sk".to_string(), b"slow-1".to_vec())
+        .await
+        .unwrap();
+    common::wait_for(
+        || async {
+            fast.get("sk".to_string()).await.unwrap().map(|v| v.value) == Some(b"slow-1".to_vec())
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    // Fast node (clock +5min) overwrites: its timestamp is huge, so it
+    // wins — correctly, since it really is the later write.
+    fast.put("sk".to_string(), b"fast-1".to_vec())
+        .await
+        .unwrap();
+    common::wait_for(
+        || async {
+            slow.get("sk".to_string()).await.unwrap().map(|v| v.value) == Some(b"fast-1".to_vec())
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    // Slow node writes again. Its HLC has observed fast's timestamp,
+    // so this write's timestamp exceeds it and wins on both nodes.
+    slow.put("sk".to_string(), b"slow-2".to_vec())
+        .await
+        .unwrap();
+    common::wait_for(
+        || async {
+            slow.get("sk".to_string()).await.unwrap().map(|v| v.value) == Some(b"slow-2".to_vec())
+                && fast.get("sk".to_string()).await.unwrap().map(|v| v.value)
+                    == Some(b"slow-2".to_vec())
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    slow.shutdown().await;
+    fast.shutdown().await;
+}

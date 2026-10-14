@@ -42,7 +42,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::task::AbortHandle;
 
-use crate::actor::{now_ms, KvMessage, ReplicatedOp, VersionedValue};
+use crate::actor::{HlcClock, KvMessage, ReplicatedOp, VersionedValue};
 use crate::network::{BoxStream, Network, TcpNetwork};
 use crate::proto::{
     Envelope, EnvelopeMsg, ForwardedGet, ForwardedPut, GetResponse, Hello,
@@ -79,6 +79,7 @@ struct ConnContext {
     peers: PeerMap,
     seen_ops: Arc<Mutex<HashSet<(String, u64, u64)>>>,
     tasks: Arc<Mutex<Vec<AbortHandle>>>,
+    hlc: Arc<Mutex<HlcClock>>,
 }
 
 /// Routes keys to the fragment actors this node serves. Cloned into
@@ -183,6 +184,8 @@ pub struct Node {
     seen_ops: Arc<Mutex<HashSet<(String, u64, u64)>>>,
     /// Per-node sequence number for locally originated ops.
     next_seq: Arc<Mutex<u64>>,
+    /// Hybrid logical clock for LWW timestamps.
+    hlc: Arc<Mutex<HlcClock>>,
     tasks: Arc<Mutex<Vec<AbortHandle>>>,
     network: Arc<dyn Network>,
 }
@@ -248,6 +251,16 @@ pub struct NodeConfig {
     /// How often each fragment's snapshotter flushes the write buffer
     /// to the store. Default 60 seconds.
     pub snapshot_interval: Duration,
+    /// How long tombstones are kept before the cleaner garbage-collects
+    /// them. Must exceed the longest expected partition: a node
+    /// rejoining after its tombstones were GC'd can resurrect deleted
+    /// keys. Default 1 hour.
+    pub tombstone_gc_age: Duration,
+    /// Wall-clock offset (ms) applied to this node's HLC. Zero in
+    /// production; tests use it to simulate clock skew. Hidden from
+    /// docs: not a tuning knob.
+    #[doc(hidden)]
+    pub clock_skew_ms: i64,
 }
 
 impl Default for NodeConfig {
@@ -263,6 +276,8 @@ impl Default for NodeConfig {
             worker_count: 4,
             clean_interval: Duration::from_secs(30),
             snapshot_interval: Duration::from_secs(60),
+            tombstone_gc_age: Duration::from_secs(3600),
+            clock_skew_ms: 0,
         }
     }
 }
@@ -358,6 +373,7 @@ impl Node {
                     fragment,
                     worker_prefix,
                     store,
+                    tombstone_gc_age: config.tombstone_gc_age,
                     worker_count: config.worker_count,
                     flush_batch_size: config.flush_batch_size,
                     flush_interval: config.flush_interval,
@@ -406,6 +422,7 @@ impl Node {
             peers: Arc::new(Mutex::new(HashMap::new())),
             seen_ops: Arc::new(Mutex::new(HashSet::new())),
             next_seq: Arc::new(Mutex::new(0)),
+            hlc: Arc::new(Mutex::new(HlcClock::with_offset(config.clock_skew_ms))),
             tasks: Arc::new(Mutex::new(Vec::new())),
             network: config.network.clone(),
         };
@@ -419,6 +436,7 @@ impl Node {
             peers: node.peers.clone(),
             seen_ops: node.seen_ops.clone(),
             tasks: node.tasks.clone(),
+            hlc: node.hlc.clone(),
         };
         let accept_task = tokio::spawn(async move {
             while let Ok(stream) = acceptor.accept().await {
@@ -465,6 +483,7 @@ impl Node {
             peers: self.peers.clone(),
             seen_ops: self.seen_ops.clone(),
             tasks: self.tasks.clone(),
+            hlc: self.hlc.clone(),
         };
         let network = self.network.clone();
         let h = tokio::spawn(async move {
@@ -557,7 +576,7 @@ impl Node {
             *guard += 1;
             *guard
         };
-        let now = now_ms();
+        let now = self.hlc.lock().await.tick();
         let mut vv = VersionedValue::new(value, now, self.node_id.clone());
         vv.expires_at_ms = ttl.map(|t| now + t.as_millis() as u64);
         let op = ReplicatedOp {
@@ -566,13 +585,39 @@ impl Node {
             seq,
             boot_id: self.boot_id,
         };
+        self.apply_local(op).await
+    }
+
+    /// Delete `key`: writes a tombstone that propagates to all replicas
+    /// like a put. Reads treat tombstoned keys as absent; sync ships
+    /// tombstones so deletes survive node restarts and re-joins. A later
+    /// `put` with a higher timestamp resurrects the key.
+    pub async fn delete(&self, key: String) -> Result<(), NodeError> {
+        let seq = {
+            let mut guard = self.next_seq.lock().await;
+            *guard += 1;
+            *guard
+        };
+        let now = self.hlc.lock().await.tick();
+        let op = ReplicatedOp {
+            key: key.clone(),
+            value: VersionedValue::tombstone(now, self.node_id.clone()),
+            seq,
+            boot_id: self.boot_id,
+        };
+        self.apply_local(op).await
+    }
+
+    /// Apply a locally-originated op: mark seen, route to the fragment
+    /// actor, barrier on read-your-write, then replicate.
+    async fn apply_local(&self, op: ReplicatedOp) -> Result<(), NodeError> {
         // Mark locally originated ops as seen so inbound echoes terminate.
         self.seen_ops
             .lock()
             .await
-            .insert((self.node_id.clone(), self.boot_id, seq));
+            .insert((self.node_id.clone(), self.boot_id, op.seq));
 
-        let frag = fragment_of(&key, self.router.fragment_count);
+        let frag = fragment_of(&op.key, self.router.fragment_count);
         if let Some(actor) = self.fragment_actor(&op.key) {
             actor
                 .send_message(KvMessage::ApplyOp(op.clone()))
@@ -581,8 +626,15 @@ impl Node {
             // Barrier: the actor drains its mailbox in FIFO order, so this
             // `call` returns only after the ApplyOp above has been applied.
             // (A `get` on the same key doubles as the read-your-write check.)
+            // For tombstones the get returns None — the barrier still holds.
             match actor
-                .call(|reply| KvMessage::Get { key, reply }, None)
+                .call(
+                    |reply| KvMessage::Get {
+                        key: op.key.clone(),
+                        reply,
+                    },
+                    None,
+                )
                 .await
                 .map_err(|e| NodeError::Actor(e.to_string()))?
             {
@@ -615,6 +667,7 @@ impl Node {
                     seq: op.seq,
                     boot_id: op.boot_id,
                     expires_at_ms: op.value.expires_at_ms.unwrap_or(0),
+                    is_tombstone: op.value.is_tombstone,
                 })),
             },
         )
@@ -673,7 +726,9 @@ impl Node {
 
     /// Read the full local copy across all fragments (debugging / tests).
     pub async fn get_all(&self) -> Result<HashMap<String, VersionedValue>, NodeError> {
-        self.router.get_all().await
+        let all = self.router.get_all().await?;
+        // Hide tombstones from user reads (sync needs them, users don't).
+        Ok(all.into_iter().filter(|(_, v)| !v.is_tombstone).collect())
     }
 
     /// This node's id.
@@ -746,6 +801,7 @@ async fn handle_connection(ctx: ConnContext, stream: BoxStream, we_dialed: bool)
         peers,
         seen_ops,
         tasks,
+        hlc,
     } = ctx;
     let (mut reader, writer) = tokio::io::split(stream);
     let (tx, mut rx) = mpsc::channel::<Vec<u8>>(PEER_CHANNEL_DEPTH);
@@ -803,6 +859,9 @@ async fn handle_connection(ctx: ConnContext, stream: BoxStream, we_dialed: bool)
                 if !is_new {
                     continue; // already applied
                 }
+                // HLC: observe the remote timestamp so our clock moves
+                // forward past it.
+                hlc.lock().await.observe(op.timestamp_ms);
                 let replicated = ReplicatedOp {
                     key: op.key.clone(),
                     value: {
@@ -816,6 +875,7 @@ async fn handle_connection(ctx: ConnContext, stream: BoxStream, we_dialed: bool)
                         } else {
                             Some(op.expires_at_ms)
                         };
+                        v.is_tombstone = op.is_tombstone;
                         v
                     },
                     seq: op.seq,
@@ -835,6 +895,7 @@ async fn handle_connection(ctx: ConnContext, stream: BoxStream, we_dialed: bool)
                 }
             }
             Some(EnvelopeMsg::ForwardedPut(p)) => {
+                hlc.lock().await.observe(p.timestamp_ms);
                 // We own this fragment: apply as coordinator, then fan
                 // out to the other replica holders (excluding the sender).
                 let replicated = ReplicatedOp {
@@ -891,15 +952,17 @@ async fn handle_connection(ctx: ConnContext, stream: BoxStream, we_dialed: bool)
                     }
                     None => None,
                 };
-                let (found, bytes, timestamp_ms, origin, expires_at_ms) = match value {
+                let (found, bytes, timestamp_ms, origin, expires_at_ms, is_tombstone) = match value
+                {
                     Some(v) => (
                         true,
                         v.value,
                         v.timestamp_ms,
                         v.node_id,
                         v.expires_at_ms.unwrap_or(0),
+                        v.is_tombstone,
                     ),
-                    None => (false, Vec::new(), 0, String::new(), 0),
+                    None => (false, Vec::new(), 0, String::new(), 0, false),
                 };
                 send_envelope(
                     &tx,
@@ -911,6 +974,7 @@ async fn handle_connection(ctx: ConnContext, stream: BoxStream, we_dialed: bool)
                             timestamp_ms,
                             node_id: origin,
                             expires_at_ms,
+                            is_tombstone,
                         })),
                     },
                 )
@@ -962,6 +1026,7 @@ async fn handle_connection(ctx: ConnContext, stream: BoxStream, we_dialed: bool)
                             timestamp_ms: v.timestamp_ms,
                             node_id: v.node_id,
                             expires_at_ms: v.expires_at_ms.unwrap_or(0),
+                            is_tombstone: v.is_tombstone,
                         })
                         .collect();
                     send_envelope(
@@ -978,6 +1043,7 @@ async fn handle_connection(ctx: ConnContext, stream: BoxStream, we_dialed: bool)
                 // already has these ops; everyone else will get them
                 // through normal gossip or their own sync).
                 for e in resp.entries {
+                    hlc.lock().await.observe(e.timestamp_ms);
                     let op = ReplicatedOp {
                         key: e.key,
                         value: {
@@ -987,6 +1053,7 @@ async fn handle_connection(ctx: ConnContext, stream: BoxStream, we_dialed: bool)
                             } else {
                                 Some(e.expires_at_ms)
                             };
+                            v.is_tombstone = e.is_tombstone;
                             v
                         },
                         seq: 0,     // seq/boot_id are propagation concerns;
@@ -1106,6 +1173,7 @@ async fn replicate_to_holders(
         seq: op.seq,
         boot_id: op.boot_id,
         expires_at_ms: op.value.expires_at_ms.unwrap_or(0),
+        is_tombstone: op.value.is_tombstone,
     };
     let peers = peers.lock().await;
     for target in targets {

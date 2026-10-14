@@ -37,6 +37,8 @@ message ReplicateOp {
   uint64 boot_id = 6;
   // Optional key expiry (wall-clock ms). 0/absent = no expiry.
   uint64 expires_at_ms = 7;
+  // True if this is a deletion tombstone.
+  bool is_tombstone = 8;
 }
 
 // A client-routed write: "you own this key's fragment — apply it as
@@ -50,6 +52,8 @@ message ForwardedPut {
   uint64 boot_id = 6;
   // Optional key expiry (wall-clock ms). 0/absent = no expiry.
   uint64 expires_at_ms = 7;
+  // True if this is a deletion tombstone.
+  bool is_tombstone = 8;
 }
 
 // A client-routed read: "you own this key's fragment — read it and
@@ -67,6 +71,8 @@ message GetResponse {
   string node_id = 5;
   // Optional key expiry (wall-clock ms). 0/absent = no expiry.
   uint64 expires_at_ms = 6;
+  // True if this is a deletion tombstone.
+  bool is_tombstone = 7;
 }
 
 // Ask a peer for the fragments listed (anti-entropy when a node joins
@@ -87,6 +93,8 @@ message SyncEntry {
   string node_id = 4;
   // Optional key expiry (wall-clock ms). 0/absent = no expiry.
   uint64 expires_at_ms = 5;
+  // True if this is a deletion tombstone.
+  bool is_tombstone = 6;
 }
 
 // Top-level wire envelope, length-delimited on the wire

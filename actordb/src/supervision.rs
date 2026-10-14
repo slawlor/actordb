@@ -73,6 +73,8 @@ pub struct SupervisorArgs {
     pub clean_interval: Duration,
     /// How often the snapshotter flushes to the store.
     pub snapshot_interval: Duration,
+    /// How long tombstones are kept before garbage collection.
+    pub tombstone_gc_age: Duration,
 }
 
 /// The per-fragment supervisor: owns the dispatcher, cleaner and
@@ -163,6 +165,7 @@ impl Actor for FragmentSupervisor {
             CleanerArgs {
                 shared: shared.clone(),
                 interval: args.clean_interval,
+                tombstone_gc_age: args.tombstone_gc_age,
             },
             cell.clone(),
         )
@@ -271,6 +274,7 @@ impl Actor for FragmentSupervisor {
                     CleanerArgs {
                         shared: state.shared.clone(),
                         interval: state.args.clean_interval,
+                        tombstone_gc_age: state.args.tombstone_gc_age,
                     },
                     myself_cell,
                 )
@@ -316,10 +320,13 @@ pub struct Cleaner;
 pub struct CleanerArgs {
     pub shared: Arc<FragmentState>,
     pub interval: Duration,
+    /// Tombstones older than this are garbage-collected.
+    pub tombstone_gc_age: Duration,
 }
 
 pub struct CleanerState {
     shared: Arc<FragmentState>,
+    tombstone_gc_age: Duration,
 }
 
 impl Actor for Cleaner {
@@ -344,6 +351,7 @@ impl Actor for Cleaner {
         });
         Ok(CleanerState {
             shared: args.shared,
+            tombstone_gc_age: args.tombstone_gc_age,
         })
     }
 
@@ -355,7 +363,12 @@ impl Actor for Cleaner {
     ) -> Result<(), ActorProcessingErr> {
         match message {
             CleanerMessage::Sweep => {
-                state.shared.remove_expired(now_ms()).await;
+                let now = now_ms();
+                state.shared.remove_expired(now).await;
+                state
+                    .shared
+                    .gc_tombstones(now, state.tombstone_gc_age.as_millis() as u64)
+                    .await;
                 Ok(())
             }
         }

@@ -115,7 +115,7 @@ impl KvStore for PrefixedStore {
 
 /// RocksDB-backed store. Available with the `rocksdb` cargo feature.
 ///
-/// Values are encoded as `[timestamp_ms: u64 BE][expires_at_ms: u64 BE, 0 = none][node_id_len: u32 BE][node_id][value]`.
+/// Values are encoded as `[timestamp_ms: u64 BE][expires_at_ms: u64 BE, 0 = none][is_tombstone: u8][node_id_len: u32 BE][node_id][value]`.
 #[cfg(feature = "rocksdb")]
 pub struct RocksDbStore {
     db: rocksdb::DB,
@@ -132,10 +132,11 @@ impl RocksDbStore {
     }
 
     fn encode(v: &VersionedValue) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(20 + v.node_id.len() + v.value.len());
+        let mut buf = Vec::with_capacity(21 + v.node_id.len() + v.value.len());
         buf.extend_from_slice(&v.timestamp_ms.to_be_bytes());
         // 0 = no expiry.
         buf.extend_from_slice(&v.expires_at_ms.unwrap_or(0).to_be_bytes());
+        buf.push(v.is_tombstone as u8);
         buf.extend_from_slice(&(v.node_id.len() as u32).to_be_bytes());
         buf.extend_from_slice(v.node_id.as_bytes());
         buf.extend_from_slice(&v.value);
@@ -160,14 +161,15 @@ impl RocksDbStore {
                 bytes.len()
             ));
         }
-        let node_id = String::from_utf8(bytes[20..20 + id_len].to_vec())
+        let node_id = String::from_utf8(bytes[21..21 + id_len].to_vec())
             .map_err(|e| format!("node_id not UTF-8: {e}"))?;
-        let value = bytes[20 + id_len..].to_vec();
+        let value = bytes[21 + id_len..].to_vec();
         Ok(VersionedValue {
             value,
             timestamp_ms,
             node_id,
             expires_at_ms,
+            is_tombstone,
         })
     }
 }
