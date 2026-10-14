@@ -65,9 +65,11 @@ Key design points:
   saturate its pool without touching the p99 of high-priority traffic — this is
   covered by the `background_saturation_leaves_high_priority_p99_unaffected`
   integration test.
-- **Sticky key routing.** Inside a fragment, a key's operations always land on
-  the same worker (`seahash(key) % workers`). Combined with ractor's FIFO
-  mailboxes, this is what makes the read-your-write barrier work
+- **Sticky key routing.** Inside one priority pool, a key's operations land on
+  the same worker (`seahash(key) % workers`). Different priorities use
+  different workers; `FragmentState` therefore serializes each LWW merge with
+  its persistence enqueue so disk ordering cannot diverge from the cache.
+  The same-priority FIFO path is what the current read-your-write barrier uses
   (see [Consistency](consistency.md)).
 - **Supervision is local and shallow.** A dead worker is replaced in place with
   the same `Arc<FragmentState>` and the same pool slot; a dead child of a

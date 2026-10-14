@@ -7,14 +7,15 @@
 //!
 //! A `KvActor` is the per-fragment dispatcher: it routes every operation
 //! to one of its `KvWorker`s by `hash(key) % worker_count`. Sticky
-//! dispatch preserves per-key ordering (a key's ops always land on the
-//! same worker, whose mailbox is FIFO), while different keys execute
-//! concurrently across workers.
+//! dispatch preserves per-key ordering within a priority pool, while the
+//! shared fragment state serializes conflicting writes across pools and
+//! different keys execute concurrently across workers.
 //!
 //! Workers share the fragment's state ([`FragmentState`](crate::actor::FragmentState)): one in-memory
-//! cache, one persistence buffer, one [`KvStore`](crate::store::KvStore).
-//! The cache is a `RwLock` — sticky dispatch means workers almost never
-//! touch the same key, so contention is minimal. Replication is just
+//! cache, one ordered persistence buffer, one [`KvStore`](crate::store::KvStore).
+//! Cache merges and persistence enqueueing happen as one ordered operation,
+//! including when two priority pools update the same key concurrently.
+//! Replication is just
 //! messages: a local write becomes a `ReplicatedOp` which the node's
 //! transport layer forwards to the fragment's replica holders, and
 //! inbound ops merge here with last-writer-wins. Because the merge is
@@ -242,12 +243,19 @@ pub struct FragmentState {
     kvstore: Option<Arc<dyn KvStore>>,
     /// Buffered writes awaiting flush.
     flush: Mutex<FlushBuffer>,
+    /// Allows exactly one store write at a time for this fragment. The
+    /// buffered batch remains recorded while the write is in progress, so a
+    /// cancelled or failed flush can be retried without losing it.
+    flush_in_progress: Mutex<()>,
     flush_batch_size: usize,
     flush_interval: Duration,
 }
 
 struct FlushBuffer {
     pending: Vec<(String, VersionedValue)>,
+    /// The batch currently being attempted. It stays here until the store
+    /// write succeeds; retries may therefore write the same versions again.
+    in_flight: Option<Vec<(String, VersionedValue)>>,
     last_flush: Instant,
 }
 
@@ -263,90 +271,108 @@ impl FragmentState {
             kvstore,
             flush: Mutex::new(FlushBuffer {
                 pending: Vec::new(),
+                in_flight: None,
                 last_flush: Instant::now(),
             }),
+            flush_in_progress: Mutex::new(()),
             flush_batch_size,
             flush_interval,
         }
     }
 
-    /// Merge an op into the cache, keeping whichever version wins.
-    /// Returns `true` if the op replaced the stored version. Ops that
-    /// are already expired are dropped — storing them would only wait
-    /// for the cleaner to reap them.
-    pub async fn apply(&self, op: &ReplicatedOp) -> bool {
+    /// Merge an op into the cache and enqueue the same winning version for
+    /// persistence as one ordered operation.
+    ///
+    /// Returns `true` if the op replaced the stored version. Ops that are
+    /// already expired are dropped. When persistence is configured, taking
+    /// the flush-buffer lock before the cache lock ensures that concurrent
+    /// workers cannot enqueue versions in a different order from the cache
+    /// merge. This matters across priority pools, where the same key can be
+    /// handled by different workers.
+    pub async fn apply(&self, op: &ReplicatedOp) -> Result<bool, ActorProcessingErr> {
         if op.value.is_expired(now_ms()) {
-            return false;
+            return Ok(false);
         }
-        let mut cache = self.cache.write().await;
-        let replace = match cache.get(&op.key) {
-            Some(existing) => op.value.wins_over(existing),
-            None => true,
-        };
-        if replace {
-            cache.insert(op.key.clone(), op.value.clone());
-        }
-        replace
-    }
 
-    /// Buffer an applied write, flushing to the store when the batch is
-    /// full or the flush interval has elapsed. Called only for ops that
-    /// won the merge. Memory is always updated first, so reads never
-    /// wait for a flush. No-op when no store is configured. The store
-    /// write happens without holding the buffer lock.
-    pub async fn buffer(
-        &self,
-        key: &str,
-        value: &VersionedValue,
-    ) -> Result<(), ActorProcessingErr> {
         if self.kvstore.is_none() {
-            return Ok(());
+            let mut cache = self.cache.write().await;
+            let replace = match cache.get(&op.key) {
+                Some(existing) => op.value.wins_over(existing),
+                None => true,
+            };
+            if replace {
+                cache.insert(op.key.clone(), op.value.clone());
+            }
+            return Ok(replace);
         }
-        let batch = {
+
+        let should_flush = {
+            // Keep the winning cache mutation and its durable enqueue
+            // adjacent, with no await point between them. Flushes may take a
+            // batch before or after this critical section, never halfway
+            // through it.
             let mut flush = self.flush.lock().await;
-            flush.pending.push((key.to_string(), value.clone()));
-            if flush.pending.len() >= self.flush_batch_size
+            let mut cache = self.cache.write().await;
+            let replace = match cache.get(&op.key) {
+                Some(existing) => op.value.wins_over(existing),
+                None => true,
+            };
+            if !replace {
+                return Ok(false);
+            }
+            cache.insert(op.key.clone(), op.value.clone());
+            flush.pending.push((op.key.clone(), op.value.clone()));
+            flush.pending.len() >= self.flush_batch_size
                 || flush.last_flush.elapsed() >= self.flush_interval
-            {
-                Some(flush.take_batch())
-            } else {
-                None
-            }
         };
-        if let Some(batch) = batch {
-            // Retain-then-commit: the batch stays buffered until the
-            // write succeeds, so a transient store error retries on the
-            // next flush instead of silently discarding acknowledged
-            // writes (adversarial review #7).
-            let n = batch.len();
-            self.write_batch(batch).await?;
-            self.flush.lock().await.commit_batch(n);
+
+        if should_flush {
+            self.flush().await?;
         }
-        Ok(())
+        Ok(true)
     }
 
-    /// Write all buffered writes to the store in one batch.
+    /// Write the currently buffered writes to the store in one batch.
+    ///
+    /// At most one write is in progress per fragment. The authoritative copy
+    /// of the batch remains in the buffer's in-flight slot until the write
+    /// succeeds, so failure or cancellation cannot make a later flush forget
+    /// it. Writes that arrive during the store call remain pending for the
+    /// next flush.
     pub async fn flush(&self) -> Result<(), ActorProcessingErr> {
+        let _single_flight = self.flush_in_progress.lock().await;
         let batch = {
             let mut flush = self.flush.lock().await;
-            if flush.pending.is_empty() {
-                return Ok(());
+            match flush.begin_batch() {
+                Some(batch) => batch,
+                None => return Ok(()),
             }
-            flush.take_batch()
         };
-        let n = batch.len();
-        self.write_batch(batch).await?;
-        self.flush.lock().await.commit_batch(n);
+
+        self.write_batch(&batch)?;
+        self.flush.lock().await.commit_batch();
         Ok(())
     }
 
-    async fn write_batch(
-        &self,
-        batch: Vec<(Vec<u8>, VersionedValue)>,
-    ) -> Result<(), ActorProcessingErr> {
+    fn write_batch(&self, batch: &[(String, VersionedValue)]) -> Result<(), ActorProcessingErr> {
         if let Some(kvstore) = &self.kvstore {
+            // A busy key may appear several times in one batch. Send only
+            // its LWW winner so backend implementations do not need to
+            // define duplicate-key ordering within a batch.
+            let mut coalesced: HashMap<Vec<u8>, VersionedValue> =
+                HashMap::with_capacity(batch.len());
+            for (key, value) in batch {
+                let replace = match coalesced.get(key.as_bytes()) {
+                    Some(existing) => value.wins_over(existing),
+                    None => true,
+                };
+                if replace {
+                    coalesced.insert(key.as_bytes().to_vec(), value.clone());
+                }
+            }
+            let encoded: Vec<(Vec<u8>, VersionedValue)> = coalesced.into_iter().collect();
             kvstore
-                .write_batch(&batch)
+                .write_batch(&encoded)
                 .map_err(|e| ActorProcessingErr::from(e.to_string()))?;
         }
         Ok(())
@@ -412,32 +438,27 @@ impl FragmentState {
 }
 
 impl FlushBuffer {
-    /// Collect the pending writes for a flush attempt WITHOUT removing
-    /// them: the caller must call [`Self::commit_batch`] once the write
-    /// succeeds. On failure the batch stays buffered and is retried on
-    /// the next flush tick — a failed write must never silently discard
-    /// acknowledged data (adversarial review #7).
+    /// Start or resume a flush attempt. The returned batch is a snapshot;
+    /// its authoritative copy remains in `in_flight` until commit.
     ///
-    /// The attempt time is stamped even on failure: this rate-limits
-    /// retries to the flush interval instead of hot-looping against a
-    /// sick store.
-    fn take_batch(&mut self) -> Vec<(Vec<u8>, VersionedValue)> {
-        let batch: Vec<(Vec<u8>, VersionedValue)> = self
-            .pending
-            .iter()
-            .map(|(k, v)| (k.as_bytes().to_vec(), v.clone()))
-            .collect();
+    /// Pending writes are appended to a failed/cancelled attempt before its
+    /// retry, preserving the cache's winning-version order. The attempt time
+    /// is stamped even on failure to avoid a hot retry loop against a sick
+    /// store.
+    fn begin_batch(&mut self) -> Option<Vec<(String, VersionedValue)>> {
+        if self.in_flight.is_none() && self.pending.is_empty() {
+            return None;
+        }
+        let pending = std::mem::take(&mut self.pending);
+        self.in_flight.get_or_insert_with(Vec::new).extend(pending);
         self.last_flush = Instant::now();
-        batch
+        self.in_flight.clone()
     }
 
-    /// Drop the first `n` buffered entries after a successful write.
-    /// New writes appended between `take_batch` and `commit_batch` land
-    /// after the batch, so draining the prefix removes exactly the
-    /// flushed entries.
-    fn commit_batch(&mut self, n: usize) {
-        let drain_n = n.min(self.pending.len());
-        self.pending.drain(..drain_n);
+    /// Forget only the batch whose store write has completed. Writes that
+    /// arrived during that call remain in `pending`.
+    fn commit_batch(&mut self) {
+        self.in_flight = None;
     }
 }
 
@@ -501,12 +522,10 @@ impl Actor for KvWorker {
                 priority: _,
                 is_replication: _,
             } => {
-                // Memory first (read-your-write never waits for disk),
-                // then buffer for the next batched flush. A DB error
-                // fails the actor loudly rather than diverging silently.
-                if state.0.apply(&op).await {
-                    state.0.buffer(&op.key, &op.value).await?;
-                }
+                // Cache merge and durable enqueue are one ordered operation.
+                // A DB error fails the actor loudly rather than diverging
+                // silently.
+                state.0.apply(&op).await?;
                 Ok(())
             }
             KvMessage::Get {
@@ -1129,8 +1148,18 @@ mod flush_retention_tests {
     use super::*;
     use crate::store::{KvStore, StoreError};
     use std::collections::HashMap;
-    use std::sync::Mutex as StdMutex;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+    use std::sync::{Condvar, Mutex as StdMutex};
     use std::time::Duration;
+
+    fn op(key: &str, value: VersionedValue) -> ReplicatedOp {
+        ReplicatedOp {
+            key: key.to_string(),
+            value,
+            seq: 0,
+            boot_id: 0,
+        }
+    }
 
     /// A store that fails the first `failures` writes, then succeeds,
     /// recording everything it receives. Regression test for
@@ -1176,9 +1205,9 @@ mod flush_retention_tests {
 
         let v1 = VersionedValue::new(b"v1".to_vec(), 100, "n1".to_string());
         let v2 = VersionedValue::new(b"v2".to_vec(), 101, "n1".to_string());
-        state.buffer("k1", &v1).await.unwrap();
+        state.apply(&op("k1", v1)).await.unwrap();
         // Second buffered op triggers the flush, which fails.
-        let err = state.buffer("k2", &v2).await.unwrap_err();
+        let err = state.apply(&op("k2", v2)).await.unwrap_err();
         assert!(
             err.to_string().contains("injected failure"),
             "expected injected failure, got {err}"
@@ -1199,5 +1228,132 @@ mod flush_retention_tests {
         // And the buffer is drained — a further flush is a no-op.
         state.flush().await.unwrap();
         assert_eq!(store.written.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn flush_coalesces_each_key_to_its_lww_winner() {
+        let store = Arc::new(FlakyStore {
+            failures_left: StdMutex::new(0),
+            written: StdMutex::new(Vec::new()),
+        });
+        let state = FragmentState::new(
+            HashMap::new(),
+            Some(store.clone() as Arc<dyn KvStore>),
+            100,
+            Duration::from_secs(3600),
+        );
+
+        let old = VersionedValue::new(b"old".to_vec(), 100, "n1".to_string());
+        let winner = VersionedValue::new(b"winner".to_vec(), 300, "n1".to_string());
+        let stale = VersionedValue::new(b"stale".to_vec(), 200, "n1".to_string());
+        assert!(state.apply(&op("key", old)).await.unwrap());
+        assert!(state.apply(&op("key", winner.clone())).await.unwrap());
+        assert!(!state.apply(&op("key", stale)).await.unwrap());
+
+        state.flush().await.unwrap();
+        let written = store.written.lock().unwrap();
+        assert_eq!(written.len(), 1);
+        assert_eq!(written[0], (b"key".to_vec(), winner));
+    }
+
+    /// Store whose first write waits until the test releases it. A second
+    /// write, if allowed to overlap, completes first and exposes durable
+    /// version regression deterministically.
+    struct GatedStore {
+        calls: AtomicUsize,
+        release_first: (StdMutex<bool>, Condvar),
+        stored: StdMutex<HashMap<Vec<u8>, VersionedValue>>,
+    }
+
+    impl GatedStore {
+        fn release_first(&self) {
+            let (released, wake) = &self.release_first;
+            *released.lock().unwrap() = true;
+            wake.notify_all();
+        }
+    }
+
+    impl KvStore for GatedStore {
+        fn load(&self) -> Result<Vec<(Vec<u8>, VersionedValue)>, StoreError> {
+            Ok(self
+                .stored
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect())
+        }
+
+        fn write_batch(&self, writes: &[(Vec<u8>, VersionedValue)]) -> Result<(), StoreError> {
+            let call = self.calls.fetch_add(1, AtomicOrdering::SeqCst);
+            if call == 0 {
+                let (released, wake) = &self.release_first;
+                let mut released = released.lock().unwrap();
+                while !*released {
+                    released = wake.wait(released).unwrap();
+                }
+            }
+
+            let mut stored = self.stored.lock().unwrap();
+            for (key, value) in writes {
+                stored.insert(key.clone(), value.clone());
+            }
+            Ok(())
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn overlapping_flushes_are_serialized_and_preserve_latest_version() {
+        let store = Arc::new(GatedStore {
+            calls: AtomicUsize::new(0),
+            release_first: (StdMutex::new(false), Condvar::new()),
+            stored: StdMutex::new(HashMap::new()),
+        });
+        let state = Arc::new(FragmentState::new(
+            HashMap::new(),
+            Some(store.clone() as Arc<dyn KvStore>),
+            100,
+            Duration::from_secs(3600),
+        ));
+
+        let old = VersionedValue::new(b"old".to_vec(), 100, "n1".to_string());
+        let new = VersionedValue::new(b"new".to_vec(), 200, "n1".to_string());
+        state.apply(&op("key", old)).await.unwrap();
+
+        let first_state = state.clone();
+        let first = tokio::spawn(async move { first_state.flush().await });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while store.calls.load(AtomicOrdering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("first flush did not reach the store");
+
+        // The newer version is applied while the old batch is blocked in the
+        // store. A second flush must wait rather than commit ahead of it.
+        state.apply(&op("key", new.clone())).await.unwrap();
+        let second_state = state.clone();
+        let second = tokio::spawn(async move { second_state.flush().await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            store.calls.load(AtomicOrdering::SeqCst),
+            1,
+            "a second store write overlapped the first"
+        );
+
+        store.release_first();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            first.await.unwrap().unwrap();
+            second.await.unwrap().unwrap();
+        })
+        .await
+        .expect("serialized flushes did not complete");
+
+        assert_eq!(
+            store.stored.lock().unwrap().get(b"key".as_slice()),
+            Some(&new),
+            "durable state regressed behind the in-memory LWW winner"
+        );
     }
 }

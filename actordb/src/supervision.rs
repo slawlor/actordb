@@ -74,7 +74,8 @@ pub struct SupervisorArgs {
     pub background_pool: PoolConfig,
     /// Flush the write buffer after this many buffered ops.
     pub flush_batch_size: usize,
-    /// Flush the write buffer after this long, even if not full.
+    /// A new write triggers a flush after this long, even if not full.
+    /// The snapshotter separately flushes idle fragments.
     pub flush_interval: Duration,
     /// How often the cleaner sweeps for expired keys.
     pub clean_interval: Duration,

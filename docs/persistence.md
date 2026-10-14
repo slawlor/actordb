@@ -20,6 +20,9 @@ The contract is deliberately narrow:
 - `write_batch` persists a batch of **winning writes** (post-LWW-merge).
   The actor never calls `get`/`put`/`delete` on the store; it works from the
   in-memory `FragmentState` cache and pushes batches down.
+- Writes are serialized per fragment and each batch contains at most one
+  version per key. A failed or cancelled attempt can be retried, so custom
+  stores must apply identical key/version writes idempotently.
 - Keys are raw bytes; the actor converts `String` keys at the boundary, so
   non-UTF-8 keys fail boot loudly rather than corrupting the store.
 
@@ -56,13 +59,24 @@ Keys on disk are the raw key bytes, optionally prefixed by `PrefixedStore`'s
 
 ## Flush batching and "snapshots"
 
-Writes take a **memory-first** path: `FragmentState::apply` updates the cache
-(read-your-write never waits for disk), and the op is appended to a
-`FlushBuffer`. The buffer is pushed to the store when:
+`FragmentState::apply` performs the LWW cache merge and persistence enqueue as
+one ordered operation. This prevents workers in different priority pools from
+persisting versions in a different order from the in-memory winner. Reads use
+the cache and do not wait for an ordinary buffered write to reach disk.
+
+Only one store write may be in progress per fragment. A batch remains marked
+in flight until the store write succeeds; failures and cancelled flush callers
+therefore leave it available for an idempotent retry. Duplicate updates to one
+key are coalesced to their LWW winner before calling the store.
+
+The buffer is pushed to the store when:
 
 - it reaches `flush_batch_size` (default 1000 ops; ignored when `store` is `None`), or
-- `flush_interval` elapses (default 100 ms), or
+- a write arrives after `flush_interval` has elapsed (default 100 ms), or
 - the periodic **Snapshotter** ticks (every `snapshot_interval`, default 60 s).
+
+`flush_interval` is write-triggered, not an independent timer. For an idle
+fragment, `snapshot_interval` is the upper bound before a periodic flush.
 
 Despite the name, the `Snapshotter` is **not** a RocksDB checkpoint — it is a
 periodic durable-flush actor (`SnapshotterMessage::Snap` → `shared.flush()`).
