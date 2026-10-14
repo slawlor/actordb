@@ -65,11 +65,11 @@ node.put_multi_with_priority(batch, OpPriority::Background).await;
 
 `OpPriority` is `High` / `Default` / `Background` (`Default` is the
 `#[default]`). Priorities map to three isolated worker pools per fragment; a
-shed operation surfaces as `NodeError::Backpressure` — never as a silent
-`Ok(None)`. Important: **read-your-write holds within a priority, not across
-priorities** — a default-priority read is not ordered behind a background write
-to the same key. See [Consistency](consistency.md) and
-[Traffic classes & backpressure](backpressure.md).
+shed local operation surfaces as `NodeError::Backpressure` — never as a silent
+`Ok(None)`. A local put waits for its exact apply outcome; once it returns
+`Ok`, reads in every pool observe that version or a newer winner. Remote puts
+remain asynchronous until the mutation-response protocol is enabled. See
+[Consistency](consistency.md) and [Traffic classes & backpressure](backpressure.md).
 
 ## Multi-key batching
 
@@ -129,6 +129,9 @@ pub enum NodeError {
     Actor(String),             // misconfiguration, timeouts talking to actors
     Network(String),           // no peer / no replica reachable
     Backpressure(String),      // shed by queue cap or rate limit — retry with backoff
+    Storage(String),           // persistence failed during apply
+    Superseded { .. },         // another LWW version won; this write was not applied
+    Expired,                   // TTL elapsed before the fragment applied the write
 }
 ```
 
@@ -136,8 +139,10 @@ The distinction that matters in practice:
 
 - A shed **read** returns `Err(NodeError::Backpressure(..))` — it never returns
   `Ok(None)`, so "not found" and "shed" can't be confused.
-- A shed **write barrier** returns
-  `Err(NodeError::Backpressure("put barrier shed: ..."))`.
+- A shed local write returns `Err(NodeError::Backpressure(..))` directly from
+  the apply attempt; it is never inferred from a read-back barrier.
+- `Superseded` is explicit: the API never reports a write successful merely
+  because a different, newer value was already present.
 - `Network` vs `Actor`: connectivity problems vs. configuration problems (e.g.
   a fragment with no usable replica listed).
 

@@ -57,14 +57,15 @@ Shed behavior by operation:
 - **Shed read** → the caller gets `Err(NodeError::Backpressure(..))`. A shed
   `Get` never returns `Ok(None)` — "not found" and "shed" are
   indistinguishable nowhere.
-- **Shed write barrier** → the `put` returns
-  `Err(NodeError::Backpressure("put barrier shed: ..."))`. The write itself
-  may or may not have applied; retry with backoff.
-- **Shed fire-and-forget write** (`ApplyOp` outside a barrier, e.g. replicated
-  or reconciled applies) → the op is dropped and counted. No error is
-  returned to anyone, by construction.
-- Forwarded operations propagate shed: a shed on the owner comes back as
-  `NodeError::Backpressure` to the originator.
+- **Shed local write** → the apply reply is
+  `Err(NodeError::Backpressure(..))`; the operation was not dispatched to a
+  worker and did not apply.
+- **Replicated/reconciled write** → currently bypasses admission control. This
+  avoids shedding an operation that the sender may acknowledge, but means the
+  actor mailbox itself is not a bounded replication queue.
+- **Forwarded client write** → currently has no response message. The remote
+  owner can shed it while the origin has already returned `Ok`; this remains a
+  known gap until mutation responses are added.
 
 Because the pending counter is pool-level (`Arc<AtomicU64>` shared by all
 workers in the pool), **worker restarts preserve pending accounting** — the
@@ -87,6 +88,6 @@ The property the design is built around: **background saturation must not move
 high-priority p99.** The `background_saturation_leaves_high_priority_p99_unaffected`
 integration test asserts exactly this, and
 `queue_cap_shed_is_explicit_and_counted` asserts that hitting the cap is
-explicit and counted. The price of isolation is the consistency caveat in
-[Consistency](consistency.md): pools make no cross-pool ordering promise, so
-read-your-write holds only within a priority.
+explicit and counted. Worker execution remains isolated by priority, while a
+completed local mutation is visible through the shared fragment cache to all
+three pools.

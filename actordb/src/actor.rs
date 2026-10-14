@@ -178,6 +178,48 @@ pub struct ReplicatedOp {
     pub boot_id: u64,
 }
 
+/// Result of merging one exact version into a fragment.
+///
+/// Callers must use this result rather than infer success from a later read:
+/// a concurrently present newer value does not prove that this operation was
+/// ever applied.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ApplyOutcome {
+    /// This operation won the LWW merge and changed the cache.
+    Applied,
+    /// The exact key/value/version was already present. Replaying it is an
+    /// idempotent success.
+    AlreadyPresent,
+    /// A different version already wins the LWW merge.
+    Superseded {
+        timestamp_ms: u64,
+        node_id: String,
+        is_tombstone: bool,
+    },
+    /// The operation's TTL deadline had already passed before application.
+    Expired,
+}
+
+/// Failure before a fragment can produce an [`ApplyOutcome`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ApplyError {
+    /// Admission control rejected a client-originated mutation.
+    Backpressure,
+    /// Persistence failed while applying a batch-triggering mutation.
+    Storage(String),
+}
+
+impl std::fmt::Display for ApplyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Backpressure => write!(f, "fragment worker pool is at capacity"),
+            Self::Storage(error) => write!(f, "persistence failed: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for ApplyError {}
+
 /// Messages handled by the [KvActor].
 pub enum KvMessage {
     /// Apply a write — local or replicated. Merged with last-writer-wins,
@@ -196,20 +238,14 @@ pub enum KvMessage {
         op: ReplicatedOp,
         priority: OpPriority,
         is_replication: bool,
+        /// Optional exact result. Replication and synchronization paths may
+        /// omit it until their protocol-level acknowledgement is required.
+        reply: Option<RpcReplyPort<Result<ApplyOutcome, ApplyError>>>,
     },
     /// Read a single key from the local copy. The reply is
     /// `Ok(value)` on success, `Err(shed_reason)` if the op was shed
     /// due to backpressure (never confused with "not found").
     Get {
-        key: String,
-        reply: RpcReplyPort<Result<Option<VersionedValue>, String>>,
-        priority: OpPriority,
-    },
-    /// Read the raw cached value, including tombstones. For the
-    /// write barrier only: a delete's barrier must observe the
-    /// tombstone to distinguish "applied" from "shed". Never served
-    /// to user reads.
-    GetRaw {
         key: String,
         reply: RpcReplyPort<Result<Option<VersionedValue>, String>>,
         priority: OpPriority,
@@ -283,53 +319,58 @@ impl FragmentState {
     /// Merge an op into the cache and enqueue the same winning version for
     /// persistence as one ordered operation.
     ///
-    /// Returns `true` if the op replaced the stored version. Ops that are
-    /// already expired are dropped. When persistence is configured, taking
+    /// Returns the exact merge outcome. Ops that are already expired are
+    /// rejected. When persistence is configured, taking
     /// the flush-buffer lock before the cache lock ensures that concurrent
     /// workers cannot enqueue versions in a different order from the cache
     /// merge. This matters across priority pools, where the same key can be
     /// handled by different workers.
-    pub async fn apply(&self, op: &ReplicatedOp) -> Result<bool, ActorProcessingErr> {
+    pub async fn apply(&self, op: &ReplicatedOp) -> Result<ApplyOutcome, ActorProcessingErr> {
         if op.value.is_expired(now_ms()) {
-            return Ok(false);
+            return Ok(ApplyOutcome::Expired);
         }
 
         if self.kvstore.is_none() {
             let mut cache = self.cache.write().await;
-            let replace = match cache.get(&op.key) {
-                Some(existing) => op.value.wins_over(existing),
-                None => true,
-            };
-            if replace {
-                cache.insert(op.key.clone(), op.value.clone());
-            }
-            return Ok(replace);
+            return Ok(Self::merge_cache(&mut cache, op));
         }
 
-        let should_flush = {
+        let (outcome, should_flush) = {
             // Keep the winning cache mutation and its durable enqueue
             // adjacent, with no await point between them. Flushes may take a
             // batch before or after this critical section, never halfway
             // through it.
             let mut flush = self.flush.lock().await;
             let mut cache = self.cache.write().await;
-            let replace = match cache.get(&op.key) {
-                Some(existing) => op.value.wins_over(existing),
-                None => true,
-            };
-            if !replace {
-                return Ok(false);
+            let outcome = Self::merge_cache(&mut cache, op);
+            if outcome != ApplyOutcome::Applied {
+                return Ok(outcome);
             }
-            cache.insert(op.key.clone(), op.value.clone());
             flush.pending.push((op.key.clone(), op.value.clone()));
-            flush.pending.len() >= self.flush_batch_size
-                || flush.last_flush.elapsed() >= self.flush_interval
+            let should_flush = flush.pending.len() >= self.flush_batch_size
+                || flush.last_flush.elapsed() >= self.flush_interval;
+            (outcome, should_flush)
         };
 
         if should_flush {
             self.flush().await?;
         }
-        Ok(true)
+        Ok(outcome)
+    }
+
+    fn merge_cache(cache: &mut HashMap<String, VersionedValue>, op: &ReplicatedOp) -> ApplyOutcome {
+        match cache.get(&op.key) {
+            Some(existing) if existing == &op.value => ApplyOutcome::AlreadyPresent,
+            Some(existing) if !op.value.wins_over(existing) => ApplyOutcome::Superseded {
+                timestamp_ms: existing.timestamp_ms,
+                node_id: existing.node_id.clone(),
+                is_tombstone: existing.is_tombstone,
+            },
+            _ => {
+                cache.insert(op.key.clone(), op.value.clone());
+                ApplyOutcome::Applied
+            }
+        }
     }
 
     /// Write the currently buffered writes to the store in one batch.
@@ -387,14 +428,6 @@ impl FragmentState {
             .get(key)
             .filter(|v| !v.is_tombstone && !v.is_expired(now))
             .cloned()
-    }
-
-    /// Read the raw cached value, including tombstones. For the
-    /// write barrier only: verifying a delete requires seeing the
-    /// tombstone, which [`Self::get`] filters out. Not for serving
-    /// user reads.
-    pub async fn get_raw(&self, key: &str) -> Option<VersionedValue> {
-        self.cache.read().await.get(key).cloned()
     }
 
     /// Read the full cache, excluding expired values but *including*
@@ -483,8 +516,9 @@ pub struct KvArgs {
 
 /// A fragment's worker: applies ops and serves reads against the shared
 /// [`FragmentState`]. One worker's mailbox is FIFO, and sticky dispatch
-/// sends each key to one worker, so per-key ordering holds while
-/// different keys execute concurrently.
+/// sends each key to one worker within a priority pool. Cross-pool LWW merges
+/// are serialized by the shared state while different keys execute
+/// concurrently.
 pub struct KvWorker;
 
 /// Arguments to spawn a [KvWorker].
@@ -521,12 +555,25 @@ impl Actor for KvWorker {
                 op,
                 priority: _,
                 is_replication: _,
+                reply,
             } => {
                 // Cache merge and durable enqueue are one ordered operation.
                 // A DB error fails the actor loudly rather than diverging
                 // silently.
-                state.0.apply(&op).await?;
-                Ok(())
+                match state.0.apply(&op).await {
+                    Ok(outcome) => {
+                        if let Some(reply) = reply {
+                            let _ = reply.send(Ok(outcome));
+                        }
+                        Ok(())
+                    }
+                    Err(error) => {
+                        if let Some(reply) = reply {
+                            let _ = reply.send(Err(ApplyError::Storage(error.to_string())));
+                        }
+                        Err(error)
+                    }
+                }
             }
             KvMessage::Get {
                 key,
@@ -535,16 +582,6 @@ impl Actor for KvWorker {
             } => {
                 // The receiver may be gone (e.g. timed-out caller); that's fine.
                 let _ = reply.send(Ok(state.0.get(&key).await));
-                Ok(())
-            }
-            KvMessage::GetRaw {
-                key,
-                reply,
-                priority: _,
-            } => {
-                // Barrier-only: surface tombstones so a delete's barrier
-                // can distinguish "tombstone applied" from "op shed".
-                let _ = reply.send(Ok(state.0.get_raw(&key).await));
                 Ok(())
             }
             // GetAll is served by the dispatcher straight from shared state.
@@ -563,8 +600,8 @@ impl Actor for KvWorker {
     }
 }
 
-/// The worker index for `key`: sticky across calls, so a key's ops
-/// always land on the same worker.
+/// The worker index for `key`: sticky across calls within one pool, so a key's
+/// operations at one priority always land on the same worker.
 pub fn worker_idx(key: &str, worker_count: usize) -> usize {
     hash_key(key.as_bytes()) as usize % worker_count
 }
@@ -804,6 +841,7 @@ impl Actor for KvActor {
                 op,
                 priority,
                 is_replication,
+                reply,
             } => {
                 let pool = match priority {
                     OpPriority::High => &state.high_pool,
@@ -821,8 +859,11 @@ impl Actor for KvActor {
                 if is_replication {
                     pool.admit_unchecked();
                 } else if !pool.try_admit().await {
-                    // Shed: counted in pool.shed_count, not silent.
-                    // For fire-and-forget ApplyOp, we just drop.
+                    // Shed: counted in pool.shed_count and returned to callers
+                    // that requested an exact apply outcome.
+                    if let Some(reply) = reply {
+                        let _ = reply.send(Err(ApplyError::Backpressure));
+                    }
                     return Ok(());
                 }
                 pool.route(&op.key)
@@ -830,6 +871,7 @@ impl Actor for KvActor {
                         op,
                         priority,
                         is_replication,
+                        reply,
                     })
                     .map_err(|e| ActorProcessingErr::from(e.to_string()))?;
                 Ok(())
@@ -839,14 +881,12 @@ impl Actor for KvActor {
                 reply,
                 priority,
             } => {
-                // Same sticky route as the write path, so a Get issued
-                // after an ApplyOp at the same priority lands behind it
-                // in the worker's FIFO mailbox — the read-your-write
-                // barrier holds within a priority pool. Cross-priority
-                // sequences make no ordering promise (separate pools).
-                // The worker replies through the caller's reply channel
-                // directly. On worker timeout/error the reply is dropped
-                // and the caller sees a SenderError.
+                // Reads sticky-route within their selected priority pool.
+                // Completed writes are already visible in the shared cache,
+                // regardless of which pool applied them. The worker replies
+                // through the caller's channel directly; on worker
+                // timeout/error it is dropped and the caller sees a
+                // SenderError.
                 let pool = match priority {
                     OpPriority::High => &state.high_pool,
                     OpPriority::Default => &state.default_pool,
@@ -862,40 +902,6 @@ impl Actor for KvActor {
                 if let Ok(CallResult::Success(value)) = worker
                     .call(
                         |r| KvMessage::Get {
-                            key,
-                            reply: r,
-                            priority,
-                        },
-                        None,
-                    )
-                    .await
-                {
-                    let _ = reply.send(value);
-                }
-                Ok(())
-            }
-            KvMessage::GetRaw {
-                key,
-                reply,
-                priority,
-            } => {
-                // Barrier-only raw read (includes tombstones). Same
-                // sticky routing and admission control as Get: the
-                // barrier must land behind the write in the worker's
-                // FIFO mailbox, in the same pool.
-                let pool = match priority {
-                    OpPriority::High => &state.high_pool,
-                    OpPriority::Default => &state.default_pool,
-                    OpPriority::Background => &state.background_pool,
-                };
-                if !pool.try_admit().await {
-                    let _ = reply.send(Err("shed: pool at queue cap or rate limit".to_string()));
-                    return Ok(());
-                }
-                let worker = pool.route(&key);
-                if let Ok(CallResult::Success(value)) = worker
-                    .call(
-                        |r| KvMessage::GetRaw {
                             key,
                             reply: r,
                             priority,
@@ -978,6 +984,25 @@ pub fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// A remote or persisted timestamp exceeds the configured future-skew bound.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClockSkewError {
+    pub timestamp_ms: u64,
+    pub max_allowed_ms: u64,
+}
+
+impl std::fmt::Display for ClockSkewError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "timestamp {} exceeds maximum allowed future time {}",
+            self.timestamp_ms, self.max_allowed_ms
+        )
+    }
+}
+
+impl std::error::Error for ClockSkewError {}
+
 /// Hybrid logical clock (simplified): monotonic per node, tracks the
 /// max of wall-clock and observed remote timestamps.
 ///
@@ -996,9 +1021,9 @@ pub struct HlcClock {
     /// Wall-clock offset in ms. Zero in production; tests use it to
     /// simulate clock skew between nodes.
     offset_ms: i64,
-    /// Maximum a remote timestamp may exceed our wall clock before it
-    /// is clamped. Bounds `observe()` so a single far-future timestamp
-    /// cannot permanently poison the clock (adversarial review #5).
+    /// Maximum a remote or persisted timestamp may exceed our wall clock
+    /// before it is rejected. Bounds `observe()` so a single far-future
+    /// timestamp cannot permanently poison stored LWW versions.
     /// `u64::MAX` = unbounded (legacy behavior).
     max_skew_ms: u64,
 }
@@ -1018,9 +1043,10 @@ impl HlcClock {
         }
     }
 
-    /// Set the maximum accepted clock skew for remote timestamps.
-    /// Remote timestamps more than `max_skew_ms` ahead of our wall
-    /// clock are clamped to `wall + max_skew_ms` in [`Self::observe`].
+    /// Set the maximum accepted future skew for remote and persisted
+    /// timestamps. Values beyond the bound are rejected, not clamped: storing
+    /// the original value after clamping only the clock would still poison
+    /// LWW ordering.
     pub fn with_max_skew(mut self, max_skew_ms: u64) -> Self {
         self.max_skew_ms = max_skew_ms;
         self
@@ -1042,19 +1068,35 @@ impl HlcClock {
         self.last_ms
     }
 
-    /// Observe a remote timestamp: `max(wall, last + 1, remote + 1)`.
-    ///
-    /// The remote timestamp is clamped to `wall + max_skew_ms`: without
-    /// this bound, a single far-future timestamp (malicious or from a
-    /// badly-skewed peer) would permanently drag the HLC forward,
-    /// degrading all future last-writer-wins comparisons to `node_id`
-    /// string order and defeating tombstone GC cluster-wide.
-    pub fn observe(&mut self, remote_ms: u64) {
+    /// Observe an accepted remote timestamp:
+    /// `max(wall, last + 1, remote + 1)`.
+    pub fn observe(&mut self, remote_ms: u64) -> Result<(), ClockSkewError> {
         let wall = self.wall();
-        let remote_ms = remote_ms.min(wall.saturating_add(self.max_skew_ms));
+        self.validate(remote_ms, wall)?;
         self.last_ms = wall
             .max(self.last_ms.saturating_add(1))
             .max(remote_ms.saturating_add(1));
+        Ok(())
+    }
+
+    /// Seed the clock from a durable version before serving writes. This does
+    /// not create an event; the next [`Self::tick`] advances beyond it.
+    pub fn seed_persisted(&mut self, timestamp_ms: u64) -> Result<(), ClockSkewError> {
+        let wall = self.wall();
+        self.validate(timestamp_ms, wall)?;
+        self.last_ms = self.last_ms.max(timestamp_ms);
+        Ok(())
+    }
+
+    fn validate(&self, timestamp_ms: u64, wall_ms: u64) -> Result<(), ClockSkewError> {
+        let max_allowed_ms = wall_ms.saturating_add(self.max_skew_ms);
+        if timestamp_ms > max_allowed_ms {
+            return Err(ClockSkewError {
+                timestamp_ms,
+                max_allowed_ms,
+            });
+        }
+        Ok(())
     }
 }
 
@@ -1110,36 +1152,48 @@ mod tombstone_hlc_tests {
         assert!(t2 >= t1, "ticks must be monotonic");
         // Observing a far-future remote timestamp moves the clock past it
         // (unbounded by default, preserving legacy behavior).
-        hlc.observe(t2 + 100_000);
+        hlc.observe(t2 + 100_000).unwrap();
         let t3 = hlc.tick();
         assert!(t3 > t2 + 100_000, "clock must move past observed remote");
         // Observing a stale timestamp never moves the clock backward.
-        hlc.observe(1);
+        hlc.observe(1).unwrap();
         let t4 = hlc.tick();
         assert!(t4 >= t3, "clock must never go backward");
     }
 
     #[test]
-    fn hlc_clamps_far_future_remote_timestamps() {
+    fn hlc_rejects_far_future_remote_timestamps() {
         // Adversarial review #5: a far-future timestamp must not
         // permanently poison the clock.
         let mut hlc = HlcClock::new().with_max_skew(300_000); // 5 min
         let t1 = hlc.tick();
         // u64::MAX would previously drag the clock to u64::MAX forever.
-        hlc.observe(u64::MAX);
+        let error = hlc.observe(u64::MAX).unwrap_err();
+        assert_eq!(error.timestamp_ms, u64::MAX);
         let t2 = hlc.tick();
-        // Clock advanced past the clamped remote (wall + 5 min), not past
-        // u64::MAX: it stays within a sane bound of the wall clock.
+        // Rejection leaves the clock near wall time instead of storing or
+        // advancing to the poisonous timestamp.
         let wall = hlc.wall();
         assert!(
-            t2 <= wall.saturating_add(300_000).saturating_add(10),
-            "far-future remote must be clamped, got t2={t2} wall={wall}"
+            t2 <= wall.saturating_add(10),
+            "far-future remote must be rejected, got t2={t2} wall={wall}"
         );
         assert!(t2 >= t1, "clock must still be monotonic");
         // A moderately-ahead (within skew) remote still moves the clock.
-        hlc.observe(wall + 60_000);
+        hlc.observe(wall + 60_000).unwrap();
         let t3 = hlc.tick();
         assert!(t3 > wall + 60_000, "in-skew remote must be observed");
+    }
+
+    #[test]
+    fn hlc_seeds_from_persisted_versions() {
+        let mut hlc = HlcClock::new().with_max_skew(300_000);
+        let persisted = hlc.wall() + 60_000;
+        hlc.seed_persisted(persisted).unwrap();
+        assert!(
+            hlc.tick() > persisted,
+            "the first post-restart write must beat durable state"
+        );
     }
 }
 
@@ -1246,14 +1300,54 @@ mod flush_retention_tests {
         let old = VersionedValue::new(b"old".to_vec(), 100, "n1".to_string());
         let winner = VersionedValue::new(b"winner".to_vec(), 300, "n1".to_string());
         let stale = VersionedValue::new(b"stale".to_vec(), 200, "n1".to_string());
-        assert!(state.apply(&op("key", old)).await.unwrap());
-        assert!(state.apply(&op("key", winner.clone())).await.unwrap());
-        assert!(!state.apply(&op("key", stale)).await.unwrap());
+        assert_eq!(
+            state.apply(&op("key", old)).await.unwrap(),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            state.apply(&op("key", winner.clone())).await.unwrap(),
+            ApplyOutcome::Applied
+        );
+        assert!(matches!(
+            state.apply(&op("key", stale)).await.unwrap(),
+            ApplyOutcome::Superseded { .. }
+        ));
 
         state.flush().await.unwrap();
         let written = store.written.lock().unwrap();
         assert_eq!(written.len(), 1);
         assert_eq!(written[0], (b"key".to_vec(), winner));
+    }
+
+    #[tokio::test]
+    async fn apply_reports_exact_lww_outcome() {
+        let state = FragmentState::new(HashMap::new(), None, 100, Duration::from_secs(3600));
+        let winner = VersionedValue::new(b"winner".to_vec(), 300, "n1".to_string());
+        assert_eq!(
+            state.apply(&op("key", winner.clone())).await.unwrap(),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            state.apply(&op("key", winner.clone())).await.unwrap(),
+            ApplyOutcome::AlreadyPresent
+        );
+
+        let stale = VersionedValue::new(b"stale".to_vec(), 200, "n1".to_string());
+        assert_eq!(
+            state.apply(&op("key", stale)).await.unwrap(),
+            ApplyOutcome::Superseded {
+                timestamp_ms: winner.timestamp_ms,
+                node_id: winner.node_id,
+                is_tombstone: winner.is_tombstone,
+            }
+        );
+
+        let mut expired = VersionedValue::new(b"expired".to_vec(), 400, "n1".to_string());
+        expired.expires_at_ms = Some(1);
+        assert_eq!(
+            state.apply(&op("expired", expired)).await.unwrap(),
+            ApplyOutcome::Expired
+        );
     }
 
     /// Store whose first write waits until the test releases it. A second

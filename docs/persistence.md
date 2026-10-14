@@ -87,6 +87,19 @@ but `kill -9` can lose the unflushed write-buffer tail. Recovery for that tail
 comes from peer sync on reconnect — which is why production deployments want
 at least two replicas per fragment.
 
+## Clock recovery and timestamp admission
+
+Each fragment load reports the highest persisted `timestamp_ms` to the
+node-wide `HlcClock` before its dispatcher starts. The first post-restart write
+therefore advances beyond durable LWW state instead of returning success while
+being rejected by an older, future-dated value.
+
+Persisted and peer-supplied timestamps are checked against
+`NodeConfig.max_clock_skew`. Values farther ahead than the configured bound are
+not clamped and stored: peer input closes that connection, while poisoned
+durable state fails startup with an error. Operators must correct the clock or
+explicitly widen the bound after investigating the data.
+
 ## What persistence does not do
 
 - **No durable tombstone GC.** `gc_tombstones` removes tombstones from the

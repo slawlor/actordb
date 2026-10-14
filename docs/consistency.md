@@ -10,11 +10,13 @@ Every write — put, TTL put, delete (tombstone) — is stamped by the node's
 **hybrid logical clock** (`HlcClock`, one per node):
 
 - `tick()`: `max(wall_clock_ms, last + 1)` — monotonic, never moves backward.
-- `observe(remote_ms)`: `max(wall, last + 1, remote + 1)` — called on every
-  inbound path (replicated batches, sync entries, forwarded puts, batch puts),
-  so the clock always moves past timestamps it has seen. (One deliberate edge:
-  `ReconcileData` entries are merged inside the sender task, which holds no HLC
-  handle, so reconcile-fetched timestamps are applied verbatim.)
+- `observe(remote_ms)`: first rejects values beyond `max_clock_skew`, then
+  advances to `max(wall, last + 1, remote + 1)`. Validation happens before
+  replicated, forwarded, synchronized, reconciled, or read-response versions
+  are accepted; a violating peer connection is closed.
+- `seed_persisted(timestamp_ms)`: runs while each durable fragment starts, so
+  the first post-restart write advances beyond every loaded version. A durable
+  timestamp beyond `max_clock_skew` fails startup instead of freezing keys.
 
 Conflicts resolve by `VersionedValue::wins_over` on
 `(timestamp_ms, node_id, is_tombstone)`: the higher timestamp wins; exact
@@ -22,36 +24,40 @@ Conflicts resolve by `VersionedValue::wins_over` on
 commutative, so replicas converge without coordination. `seq`/`boot_id` are
 transport dedup metadata and play no role in conflict resolution.
 
-Under clock skew the HLC keeps ordering sane: the `hlc_orders_writes_under_clock_skew`
-integration test simulates skewed clocks and asserts the later logical write
-still wins everywhere.
+Under bounded clock skew the HLC keeps ordering sane: the
+`hlc_orders_writes_under_clock_skew` integration test simulates skewed clocks
+and asserts the later logical write still wins everywhere. The current clock
+is still a scalar millisecond value: sustained rates above one event per
+millisecond can move it ahead of wall time. A future on-disk/wire format change
+is required for a true physical/logical tuple.
 
-## Read-your-write — within a priority
+## Local apply outcomes and read-your-write
 
-After applying a write, `Node` issues a **barrier read**: a raw `Get` (tombstones
-visible) sent to the same worker the write went to, at the **write's priority**.
-Ractor drains each worker's mailbox FIFO, so the barrier returns only after the
-write applied — and the barrier **verifies** the read-back value is at least as
-new as the write in LWW order. The `put` future resolves with the write visible
-to subsequent reads *at that priority*.
+For a locally owned fragment, `Node` sends `ApplyOp` as an RPC and waits for the
+worker's exact result:
 
-If the write was shed under backpressure (the barrier read comes back stale or
-absent), `put` returns `Err(NodeError::Backpressure)` instead of acking a write
-that never landed. A shed write is never reported `Ok`.
+- `Applied`: this version won and changed the cache.
+- `AlreadyPresent`: the identical version had already applied; replay is an
+  idempotent success.
+- `Superseded { .. }`: another version won; `Node` returns
+  `NodeError::Superseded` and never reports this write successful.
+- `Expired`: the TTL elapsed before application; `Node` returns
+  `NodeError::Expired`.
 
-The scoping matters:
+Admission and storage failures are also returned directly as
+`NodeError::Backpressure` and `NodeError::Storage`. There is no read-back
+barrier and no inference that “a newer value exists” proves this operation
+applied.
 
-- ✅ Same-priority write then read: ordered. This is the guarantee `put`/`get`
-  give you.
-- ❌ **Cross-priority pairs are not ordered.** The three pools are independent
-  actors with no cross-pool ordering promise. A background write followed by a
-  default-priority read may not see the write. This is documented on
-  `put_with_priority`/`get_with_priority` and is by design: ordering across
-  isolated pools would defeat the isolation.
+After a local put returns `Ok`, the shared fragment cache contains that version
+or a newer winner. Subsequent local reads observe it regardless of which
+priority pool serves them. Priority still controls admission and scheduling;
+it no longer scopes the completed-write visibility guarantee.
 
-If the barrier read itself is shed by backpressure, the write returns
-`Err(NodeError::Backpressure("put barrier shed: ..."))` — the write may or may
-not have applied; the caller should retry.
+This guarantee does not yet cover a put forwarded to a remote fragment owner:
+that wire message currently has no response and the origin returns after
+enqueueing it. The mutation-response work tracked separately will extend exact
+outcomes across nodes.
 
 ## Replication lag and partitions
 
