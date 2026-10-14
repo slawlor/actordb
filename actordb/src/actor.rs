@@ -295,7 +295,8 @@ impl Actor for KvWorker {
     }
 }
 
-/// The worker index for `key`: sticky across calls.
+/// The worker index for `key`: sticky across calls, so a key's ops
+/// always land on the same worker.
 fn worker_idx(key: &str, worker_count: usize) -> usize {
     hash_key(key.as_bytes()) as usize % worker_count
 }
