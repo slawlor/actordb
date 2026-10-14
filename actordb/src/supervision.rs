@@ -10,7 +10,7 @@
 //!
 //! - the [`KvActor`](crate::actor::KvActor) dispatcher and its worker pool
 //!   (Phase 3), which self-supervises worker restarts;
-//! - the [`Cleaner`](crate::supervision::Cleaner), which reaps TTL-expired keys on an interval;
+//! - the [`Cleaner`](crate::supervision::Cleaner), which materializes TTL-expiry tombstones on an interval;
 //! - the [`Snapshotter`](crate::supervision::Snapshotter), which periodically flushes the write
 //!   buffer so the durable store holds a fresh snapshot.
 //!
@@ -86,8 +86,10 @@ pub struct SupervisorArgs {
     pub clean_interval: Duration,
     /// How often the snapshotter flushes to the store.
     pub snapshot_interval: Duration,
-    /// How long tombstones are kept before garbage collection.
-    pub tombstone_gc_age: Duration,
+    /// Optional age after which tombstones are removed from memory. `None`
+    /// retains them indefinitely; time-based GC can resurrect deleted data
+    /// after a sufficiently long partition and must be explicitly enabled.
+    pub tombstone_gc_age: Option<Duration>,
     /// Senders currently in BufferReset. The cleaner blocks tombstone
     /// GC while any sender for this fragment is in the set.
     pub reset_senders: Arc<Mutex<HashSet<(FragmentId, String)>>>,
@@ -117,7 +119,9 @@ impl SupervisorState {
         match store {
             Some(kvstore) => {
                 let mut map = HashMap::new();
+                let mut expiry_updates = Vec::new();
                 let mut high_water: Option<u64> = None;
+                let now = now_ms();
                 for (k, v) in kvstore
                     .load()
                     .map_err(|e| ActorProcessingErr::from(e.to_string()))?
@@ -127,13 +131,24 @@ impl SupervisorState {
                             .map(|current| current.max(v.timestamp_ms))
                             .unwrap_or(v.timestamp_ms),
                     );
-                    let key = String::from_utf8(k)
+                    let key = String::from_utf8(k.clone())
                         .map_err(|e| ActorProcessingErr::from(e.to_string()))?;
-                    // Drop already-expired values at boot; the cleaner
-                    // would reap them on its first sweep anyway.
-                    if !v.is_expired(now_ms()) {
-                        map.insert(key, v);
-                    }
+                    let value = if v.is_expired(now) {
+                        let tombstone = v.expiry_tombstone();
+                        expiry_updates.push((k, tombstone.clone()));
+                        tombstone
+                    } else {
+                        v
+                    };
+                    map.insert(key, value);
+                }
+                // Persist boot-time expiry conversion before the fragment
+                // serves reads or sync. Otherwise a crash could reload the
+                // live value and later resurrect an older replica's data.
+                if !expiry_updates.is_empty() {
+                    kvstore
+                        .write_batch(&expiry_updates)
+                        .map_err(|e| ActorProcessingErr::from(e.to_string()))?;
                 }
                 Ok((map, high_water))
             }
@@ -365,10 +380,10 @@ pub enum CleanerMessage {
     Sweep,
 }
 
-/// Background actor: periodically reaps TTL-expired keys from the
-/// fragment's shared state. Reads already hide expired values; the
-/// cleaner is memory hygiene. Tombstone aging plugs in here once
-/// tombstones land (#13).
+/// Background actor: periodically converts TTL-expired values into
+/// versioned tombstones. Reads already hide expired values, but retaining the
+/// version floor prevents older replicas from resurrecting them. Optional
+/// time-based tombstone GC is unsafe and disabled by default.
 pub struct Cleaner;
 
 #[derive(Clone)]
@@ -376,8 +391,9 @@ pub struct CleanerArgs {
     pub fragment: FragmentId,
     pub shared: Arc<FragmentState>,
     pub interval: Duration,
-    /// Tombstones older than this are garbage-collected.
-    pub tombstone_gc_age: Duration,
+    /// Tombstones older than this are garbage-collected from memory. `None`
+    /// keeps them indefinitely.
+    pub tombstone_gc_age: Option<Duration>,
     /// Senders in BufferReset; tombstone GC is blocked while any
     /// sender for `fragment` is in the set.
     pub reset_senders: Arc<Mutex<HashSet<(FragmentId, String)>>>,
@@ -386,7 +402,7 @@ pub struct CleanerArgs {
 pub struct CleanerState {
     fragment: FragmentId,
     shared: Arc<FragmentState>,
-    tombstone_gc_age: Duration,
+    tombstone_gc_age: Option<Duration>,
     reset_senders: Arc<Mutex<HashSet<(FragmentId, String)>>>,
 }
 
@@ -427,22 +443,22 @@ impl Actor for Cleaner {
         match message {
             CleanerMessage::Sweep => {
                 let now = now_ms();
-                state.shared.remove_expired(now).await;
-                // Block tombstone GC while any sender for this fragment
-                // is in BufferReset: the tombstone may not have reached
-                // the peer, and GC'ing it would let reconciliation
-                // resurrect the deleted key.
-                let blocked = state
-                    .reset_senders
-                    .lock()
-                    .await
-                    .iter()
-                    .any(|(f, _)| *f == state.fragment);
-                if !blocked {
-                    state
-                        .shared
-                        .gc_tombstones(now, state.tombstone_gc_age.as_millis() as u64)
-                        .await;
+                state.shared.expire_values(now).await?;
+                if let Some(gc_age) = state.tombstone_gc_age {
+                    // Block tombstone GC while any sender for this fragment
+                    // is in BufferReset: the tombstone may not have reached
+                    // the peer, and GC'ing it would let reconciliation
+                    // resurrect the deleted key.
+                    let blocked = state
+                        .reset_senders
+                        .lock()
+                        .await
+                        .iter()
+                        .any(|(f, _)| *f == state.fragment);
+                    if !blocked {
+                        let gc_age_ms = u64::try_from(gc_age.as_millis()).unwrap_or(u64::MAX);
+                        state.shared.gc_tombstones(now, gc_age_ms).await;
+                    }
                 }
                 Ok(())
             }

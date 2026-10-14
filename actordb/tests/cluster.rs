@@ -22,6 +22,12 @@ impl PreloadedStore {
         prefixed.extend_from_slice(key.as_bytes());
         self.entries.lock().unwrap().insert(prefixed, value);
     }
+
+    fn get_fragment_zero(&self, key: &str) -> Option<VersionedValue> {
+        let mut prefixed = 0u32.to_be_bytes().to_vec();
+        prefixed.extend_from_slice(key.as_bytes());
+        self.entries.lock().unwrap().get(&prefixed).cloned()
+    }
 }
 
 impl KvStore for PreloadedStore {
@@ -456,6 +462,131 @@ async fn memory_store_exercises_persistence_plumbing() {
     let got = a.get("k".to_string()).await.unwrap().expect("k missing");
     assert_eq!(got.value, b"v");
     a.shutdown().await;
+}
+
+#[tokio::test]
+async fn ttl_expiry_is_persisted_as_a_versioned_tombstone() {
+    let store = Arc::new(PreloadedStore::default());
+    let config = NodeConfig {
+        store: Some(store.clone()),
+        flush_batch_size: 1,
+        clean_interval: Duration::from_millis(10),
+        ..NodeConfig::default()
+    };
+    let node = Node::start(
+        "ttl-durable".to_string(),
+        "127.0.0.1:0".parse().unwrap(),
+        config,
+    )
+    .await
+    .expect("node failed to start");
+
+    node.put_with_ttl(
+        "ephemeral".to_string(),
+        b"value".to_vec(),
+        Some(Duration::from_millis(40)),
+    )
+    .await
+    .unwrap();
+    common::wait_for(
+        || async {
+            store
+                .get_fragment_zero("ephemeral")
+                .is_some_and(|value| value.is_tombstone)
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    let marker = store.get_fragment_zero("ephemeral").unwrap();
+    assert!(marker.is_tombstone);
+    assert!(marker.expires_at_ms.is_some());
+    assert!(node.get("ephemeral".to_string()).await.unwrap().is_none());
+    node.shutdown().await;
+}
+
+#[tokio::test]
+async fn ttl_expiry_does_not_resurrect_an_older_partitioned_value() {
+    let config = NodeConfig {
+        clean_interval: Duration::from_millis(10),
+        ..NodeConfig::default()
+    };
+    let a = Node::start("ttl-a".to_string(), "127.0.0.1:0".parse().unwrap(), config)
+        .await
+        .expect("node a failed to start");
+    let b = test_node("ttl-b").await;
+
+    // b's disconnected value predates a's TTL write. Once a's value expires,
+    // its marker must still beat b's old value when the partition heals.
+    b.put("ttl-race".to_string(), b"old".to_vec())
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    a.put_with_ttl(
+        "ttl-race".to_string(),
+        b"temporary".to_vec(),
+        Some(Duration::from_millis(40)),
+    )
+    .await
+    .unwrap();
+
+    common::wait_for(
+        || async { a.get("ttl-race".to_string()).await.unwrap().is_none() },
+        Duration::from_secs(5),
+    )
+    .await;
+    assert_eq!(
+        b.get("ttl-race".to_string())
+            .await
+            .unwrap()
+            .map(|value| value.value),
+        Some(b"old".to_vec())
+    );
+
+    b.connect(a.addr()).await.unwrap();
+    wait_for_peers(&a, &b).await;
+    common::wait_for(
+        || async {
+            a.get("ttl-race".to_string()).await.unwrap().is_none()
+                && b.get("ttl-race".to_string()).await.unwrap().is_none()
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    a.shutdown().await;
+    b.shutdown().await;
+}
+
+#[tokio::test]
+async fn startup_rewrites_expired_durable_values_as_tombstones() {
+    let store = Arc::new(PreloadedStore::default());
+    let timestamp = now_ms().saturating_sub(100);
+    let mut expired = VersionedValue::new(b"stale".to_vec(), timestamp, "old".to_string());
+    expired.expires_at_ms = Some(now_ms().saturating_sub(1));
+    store.insert_fragment_zero("expired-at-boot", expired.clone());
+    let config = NodeConfig {
+        store: Some(store.clone()),
+        ..NodeConfig::default()
+    };
+
+    let node = Node::start(
+        "ttl-restart".to_string(),
+        "127.0.0.1:0".parse().unwrap(),
+        config,
+    )
+    .await
+    .expect("node failed to start");
+    assert!(node
+        .get("expired-at-boot".to_string())
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        store.get_fragment_zero("expired-at-boot"),
+        Some(expired.expiry_tombstone())
+    );
+    node.shutdown().await;
 }
 
 #[tokio::test]

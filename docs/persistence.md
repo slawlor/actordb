@@ -54,8 +54,9 @@ Keys on disk are the raw key bytes, optionally prefixed by `PrefixedStore`'s
 
 - The fixed header is 21 bytes (8 + 8 + 1 + 4).
 - TTLs are stored exactly as `expires_at_ms`; `0` means "no expiry".
-- Tombstones are stored as tombstone-flagged entries — deletes are durable,
-  not physical removals.
+- Tombstones are stored as tombstone-flagged entries — deletes and TTL expiry
+  markers are durable, not physical removals. An expiry marker keeps the TTL
+  write's timestamp, node id, and expiry deadline while clearing its value.
 
 ## Flush batching and "snapshots"
 
@@ -77,6 +78,9 @@ The buffer is pushed to the store when:
 
 `flush_interval` is write-triggered, not an independent timer. For an idle
 fragment, `snapshot_interval` is the upper bound before a periodic flush.
+The cleaner enqueues TTL-expiry tombstones through the same ordered buffer.
+Expired values found during startup are rewritten as tombstones before that
+fragment starts serving, so a crash/restart cannot erase the version floor.
 
 Despite the name, the `Snapshotter` is **not** a RocksDB checkpoint — it is a
 periodic durable-flush actor (`SnapshotterMessage::Snap` → `shared.flush()`).
@@ -102,7 +106,8 @@ explicitly widen the bound after investigating the data.
 
 ## What persistence does not do
 
-- **No durable tombstone GC.** `gc_tombstones` removes tombstones from the
+- **No durable tombstone GC.** GC is disabled by default. If explicitly
+  enabled, `gc_tombstones` removes tombstones from the
   in-memory cache only; there is no code path that issues deletes to RocksDB.
   After memory GC, the old tombstone bytes stay on disk and are re-loaded into
   memory on the next boot (see [Tombstones & deletes](tombstones.md)).
