@@ -69,8 +69,7 @@ type PeerMap = Arc<Mutex<HashMap<String, mpsc::Sender<Vec<u8>>>>>;
 /// Phase 5 senders, keyed by (fragment, peer node id).
 type SenderMap = Arc<Mutex<HashMap<(FragmentId, String), mpsc::UnboundedSender<SenderMsg>>>>;
 /// Sender state reports, keyed by (fragment, peer node id).
-type SenderReportMap =
-    Arc<Mutex<HashMap<(FragmentId, String), Arc<Mutex<SenderStateReport>>>>>;
+type SenderReportMap = Arc<Mutex<HashMap<(FragmentId, String), Arc<Mutex<SenderStateReport>>>>>;
 /// Senders currently in BufferReset, keyed by (fragment, peer).
 type ResetSenderSet = Arc<Mutex<HashSet<(FragmentId, String)>>>;
 
