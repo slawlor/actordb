@@ -20,9 +20,9 @@ There is **no consistent hashing** anywhere in the codebase — no hash ring, no
 rendezvous hashing, no virtual nodes. The keyspace split is plain
 `hash % N`, and fragment→node assignment is an explicit map.
 
-Within a fragment, a key's operations sticky-route to one worker
-(`seahash(key) % workers`), which is what the read-your-write barrier relies on
-(see [Consistency](consistency.md)).
+Within a priority pool, a key's operations sticky-route to one worker
+(`seahash(key) % workers`). A local mutation returns only after that worker
+reports the exact LWW apply outcome (see [Consistency](consistency.md)).
 
 ## Static placement (default)
 

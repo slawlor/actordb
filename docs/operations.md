@@ -21,6 +21,11 @@ Memory-only caveat: tombstones GC'd from memory before the crash are
 re-loaded from RocksDB on boot (GC is memory-only — see
 [Tombstones](tombstones.md)).
 
+Startup also seeds the node HLC from the highest durable version. A persisted
+timestamp farther in the future than `max_clock_skew` fails startup rather
+than allowing that version to freeze its key; investigate clock rollback or
+poisoned data before widening the bound.
+
 ### Rolling restart with placement
 
 With a `PlacementController` configured, a rolling restart is the migration

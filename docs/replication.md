@@ -2,8 +2,8 @@
 
 Each fragment runs **one `ReplicationSender` task per peer** — replication is
 asynchronous, batched, and session-based. There is no synchronous quorum on the
-write path: a `put` returns after the local apply plus a read-your-write
-barrier (see [Consistency](consistency.md)); reaching replicas happens in the
+write path: a local `put` returns after the worker reports its exact apply
+outcome (see [Consistency](consistency.md)); reaching replicas happens in the
 background.
 
 ## Sender state machine

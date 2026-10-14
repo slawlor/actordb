@@ -2,10 +2,47 @@
 
 mod common;
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
+use actordb::actor::{now_ms, VersionedValue};
 use actordb::node::{Node, NodeConfig};
+use actordb::store::{KvStore, StoreError};
+
+#[derive(Default)]
+struct PreloadedStore {
+    entries: StdMutex<HashMap<Vec<u8>, VersionedValue>>,
+}
+
+impl PreloadedStore {
+    fn insert_fragment_zero(&self, key: &str, value: VersionedValue) {
+        let mut prefixed = 0u32.to_be_bytes().to_vec();
+        prefixed.extend_from_slice(key.as_bytes());
+        self.entries.lock().unwrap().insert(prefixed, value);
+    }
+}
+
+impl KvStore for PreloadedStore {
+    fn load(&self) -> Result<Vec<(Vec<u8>, VersionedValue)>, StoreError> {
+        Ok(self
+            .entries
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect())
+    }
+
+    fn write_batch(&self, writes: &[(Vec<u8>, VersionedValue)]) -> Result<(), StoreError> {
+        let mut entries = self.entries.lock().unwrap();
+        for (key, value) in writes {
+            entries.insert(key.clone(), value.clone());
+        }
+        Ok(())
+    }
+}
 
 async fn test_node(id: &str) -> Node {
     let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
@@ -419,6 +456,65 @@ async fn memory_store_exercises_persistence_plumbing() {
     let got = a.get("k".to_string()).await.unwrap().expect("k missing");
     assert_eq!(got.value, b"v");
     a.shutdown().await;
+}
+
+#[tokio::test]
+async fn persisted_version_seeds_clock_before_first_write() {
+    let store = Arc::new(PreloadedStore::default());
+    let persisted_timestamp = now_ms() + 60_000;
+    store.insert_fragment_zero(
+        "key",
+        VersionedValue::new(
+            b"persisted".to_vec(),
+            persisted_timestamp,
+            "previous-boot".to_string(),
+        ),
+    );
+    let config = NodeConfig {
+        store: Some(store),
+        flush_batch_size: 1,
+        ..NodeConfig::default()
+    };
+
+    let node = Node::start("node".to_string(), "127.0.0.1:0".parse().unwrap(), config)
+        .await
+        .expect("node failed to start from an in-policy durable timestamp");
+    node.put("key".to_string(), b"new".to_vec())
+        .await
+        .expect("first post-restart write was not applied");
+
+    let current = node
+        .get("key".to_string())
+        .await
+        .unwrap()
+        .expect("key missing");
+    assert_eq!(current.value, b"new");
+    assert!(current.timestamp_ms > persisted_timestamp);
+    node.shutdown().await;
+}
+
+#[tokio::test]
+async fn startup_rejects_out_of_policy_persisted_timestamp() {
+    let store = Arc::new(PreloadedStore::default());
+    store.insert_fragment_zero(
+        "poisoned",
+        VersionedValue::new(b"bad".to_vec(), u64::MAX, "old-peer".to_string()),
+    );
+    let config = NodeConfig {
+        store: Some(store),
+        ..NodeConfig::default()
+    };
+
+    match Node::start("node".to_string(), "127.0.0.1:0".parse().unwrap(), config).await {
+        Ok(node) => {
+            node.shutdown().await;
+            panic!("node accepted a poisoned durable timestamp");
+        }
+        Err(error) => assert!(
+            error.to_string().contains("exceeds maximum allowed"),
+            "unexpected startup error: {error}"
+        ),
+    }
 }
 
 #[tokio::test]
@@ -1020,6 +1116,58 @@ async fn stale_session_batches_discarded() {
 
     a.shutdown().await;
     b.shutdown().await;
+}
+
+#[tokio::test]
+async fn current_session_rejects_far_future_timestamp() {
+    use actordb::proto::{Envelope, EnvelopeMsg, Hello, ReplicateBatch, ReplicateOp, SessionStart};
+    use prost::Message;
+    use tokio::io::AsyncWriteExt;
+
+    let node = test_node("receiver").await;
+    let mut stream = tokio::net::TcpStream::connect(node.addr()).await.unwrap();
+    let frames = [
+        Envelope {
+            msg: Some(EnvelopeMsg::Hello(Hello {
+                node_id: "raw-peer".to_string(),
+                auth_tag: Vec::new(),
+            })),
+        },
+        Envelope {
+            msg: Some(EnvelopeMsg::SessionStart(SessionStart {
+                session_id: 42,
+                fragment: 0,
+            })),
+        },
+        Envelope {
+            msg: Some(EnvelopeMsg::ReplicateBatch(ReplicateBatch {
+                session_id: 42,
+                batch_seq: 1,
+                fragment: 0,
+                ops: vec![ReplicateOp {
+                    key: "poisoned".to_string(),
+                    value: b"bad".to_vec(),
+                    timestamp_ms: u64::MAX,
+                    node_id: "raw-peer".to_string(),
+                    seq: 1,
+                    boot_id: 1,
+                    expires_at_ms: 0,
+                    is_tombstone: false,
+                }],
+            })),
+        },
+    ];
+    for frame in frames {
+        let mut encoded = Vec::new();
+        frame.encode(&mut encoded).unwrap();
+        stream.write_u32(encoded.len() as u32).await.unwrap();
+        stream.write_all(&encoded).await.unwrap();
+    }
+    stream.flush().await.unwrap();
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(node.get("poisoned".to_string()).await.unwrap().is_none());
+    node.shutdown().await;
 }
 
 /// Phase 6: multi-key put/get spanning fragments and nodes.

@@ -20,9 +20,10 @@ A working, tested prototype of the actor-first sharded database vision:
 * **`actor`**: per fragment, a `KvActor` dispatcher (built on
   [ractor](https://github.com/slawlor/ractor)) routes ops to a
   `WorkerPool` by `hash(key) % worker_count`. Sticky dispatch preserves
-  per-key ordering while different keys execute concurrently. Workers
-  share the fragment's `FragmentState`: one in-memory cache, one
-  persistence buffer, one `KvStore`.
+  per-key ordering within a priority pool while different keys execute
+  concurrently. Workers share the fragment's `FragmentState`: one in-memory
+  cache, one ordered persistence buffer, one `KvStore`; cross-pool LWW merges
+  are serialized there.
 * **`supervision`**: every fragment runs under a `FragmentSupervisor`
   owning the dispatcher pool plus background actors — a `Cleaner`
   (TTL expiry, tombstone aging) and a `Snapshotter` (periodic durable
@@ -74,8 +75,8 @@ Comprehensive guides live in [`docs/`](docs/):
   acks, periodic reconciliation, the Hello/full-state handshake
 - [Tombstones & deletes](docs/tombstones.md) — delete lifecycle, conflict
   rules, GC limits (memory-only GC is documented honestly)
-- [Consistency model](docs/consistency.md) — LWW via HLC, read-your-write
-  within a priority, partitions
+- [Consistency model](docs/consistency.md) — LWW via HLC, exact local apply
+  outcomes, read-your-write, partitions
 - [Multi-key batching](docs/batching.md) — fan-out, failover, partial failures
 - [Traffic classes & backpressure](docs/backpressure.md) — `OpPriority`,
   pool config, shed behavior and observability
@@ -194,12 +195,13 @@ Key `NodeConfig` knobs:
 | `placement_poll_interval` | 1s | Phase 8: how often the driver re-evaluates desired placement |
 | `store` | None | `Some(Arc<dyn KvStore>)`; `NodeConfig::with_rocksdb(path)` with the `rocksdb` feature |
 
-- Local writes are read-your-write within a priority (the barrier
-  read runs in the write's pool); remote-fragment writes forward in
-  one hop to a replica holder.
+- Local writes await the worker's exact apply outcome; after `Ok`, reads in
+  every priority pool see that version or a newer winner. Remote-fragment
+  writes currently forward asynchronously in one hop.
 - Conflicts resolve with last-writer-wins on HLC timestamps,
   tie-broken by `node_id`; tombstones win exact ties.
-- Failures surface as `NodeError::{Io, Codec, Actor}`.
+- Failures surface as typed `NodeError` variants, including `Backpressure`,
+  `Storage`, `Superseded`, and `Expired` rather than false success.
 
 ### `actordb::actor` — the storage core
 
@@ -209,6 +211,8 @@ Key `NodeConfig` knobs:
   — a value plus its LWW version; `wins_over` implements the conflict
   rule, `is_expired` the TTL check.
 - `HlcClock` — hybrid logical clock behind all timestamps.
+- `ApplyOutcome::{Applied, AlreadyPresent, Superseded, Expired}` — the exact
+  result used instead of inferring write success from a later read.
 - `KvMessage::{ApplyOp, Get, GetAll, GetShedCounts}` — for embedders
   driving the dispatcher directly instead of through `Node`.
 
@@ -233,11 +237,10 @@ Each fragment runs **three isolated worker pools** instead of one:
 - Shed counts are surfaced per pool `(high, default, background)` via
   `node.health()` → `FragmentHealth.shed_counts`.
 
-Ordering honesty: read-your-write holds **within a priority** — the
-write barrier reads in the write's pool, so a same-priority get sees
-the write. A cross-priority sequence (background write, then a
-default-priority get) makes **no** ordering promise; the pools are
-independent.
+Ordering honesty: a local put waits for the selected worker to return its
+exact apply outcome. Once it returns `Ok`, every priority pool reads the same
+shared cache, so a subsequent local get sees that version or a newer winner.
+This does not yet extend to asynchronously forwarded remote puts.
 
 ### `actordb::supervision` — per-fragment supervision
 

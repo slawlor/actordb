@@ -42,7 +42,10 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::task::AbortHandle;
 
-use crate::actor::{HlcClock, KvMessage, OpPriority, PoolConfig, ReplicatedOp, VersionedValue};
+use crate::actor::{
+    ApplyError, ApplyOutcome, HlcClock, KvMessage, OpPriority, PoolConfig, ReplicatedOp,
+    VersionedValue,
+};
 use crate::network::{BoxStream, Network, TcpNetwork};
 use crate::placement::{
     validate_placement, FragmentPlacementState, PlacementController, PlacementReport,
@@ -207,6 +210,17 @@ pub enum NodeError {
     /// limit). The caller should retry with backoff or reduce load.
     /// Distinct from "not found" — a shed Get never returns Ok(None).
     Backpressure(String),
+    /// A store failed while applying a mutation.
+    Storage(String),
+    /// A different version already wins the LWW merge. The attempted write
+    /// was not applied and is never reported as successful.
+    Superseded {
+        timestamp_ms: u64,
+        node_id: String,
+        is_tombstone: bool,
+    },
+    /// A mutation reached the fragment after its TTL deadline.
+    Expired,
 }
 
 impl std::fmt::Display for NodeError {
@@ -217,6 +231,16 @@ impl std::fmt::Display for NodeError {
             NodeError::Actor(e) => write!(f, "actor error: {e}"),
             NodeError::Network(e) => write!(f, "network error: {e}"),
             NodeError::Backpressure(e) => write!(f, "backpressure shed: {e}"),
+            NodeError::Storage(e) => write!(f, "storage error: {e}"),
+            NodeError::Superseded {
+                timestamp_ms,
+                node_id,
+                is_tombstone,
+            } => write!(
+                f,
+                "write was superseded by timestamp={timestamp_ms} node_id={node_id} tombstone={is_tombstone}"
+            ),
+            NodeError::Expired => write!(f, "write expired before it could be applied"),
         }
     }
 }
@@ -238,6 +262,24 @@ fn priority_from_proto(v: i32) -> OpPriority {
         x if x == ProtoPriority::High as i32 => OpPriority::High,
         x if x == ProtoPriority::Background as i32 => OpPriority::Background,
         _ => OpPriority::Default,
+    }
+}
+
+/// Validate and observe one timestamp before any peer-supplied version can
+/// affect routing, reconciliation, or stored LWW state. Invalid timestamps
+/// terminate the connection at the call site; clamping only the local clock
+/// while retaining the raw value would leave the key permanently poisoned.
+async fn observe_remote_timestamp(
+    hlc: &Arc<Mutex<HlcClock>>,
+    timestamp_ms: u64,
+    message: &str,
+) -> bool {
+    match hlc.lock().await.observe(timestamp_ms) {
+        Ok(()) => true,
+        Err(error) => {
+            tracing::warn!("rejecting {message} with invalid timestamp: {error}");
+            false
+        }
     }
 }
 
@@ -339,6 +381,7 @@ async fn spawn_fragment_subtree(
     fragment: FragmentId,
     config: &NodeConfig,
     reset_senders: &Arc<Mutex<HashSet<(FragmentId, String)>>>,
+    hlc: &Arc<Mutex<HlcClock>>,
 ) -> Result<(ActorRef<SupervisorMessage>, ActorRef<KvMessage>), NodeError> {
     // Unique per supervisor: tests run nodes in parallel in one
     // process, and the actor registry is process-global.
@@ -359,6 +402,7 @@ async fn spawn_fragment_subtree(
             fragment,
             worker_prefix,
             store,
+            hlc: hlc.clone(),
             tombstone_gc_age: config.tombstone_gc_age,
             reset_senders: reset_senders.clone(),
             default_pool: config.default_pool.clone(),
@@ -448,11 +492,10 @@ pub struct NodeConfig {
     /// docs: not a tuning knob.
     #[doc(hidden)]
     pub clock_skew_ms: i64,
-    /// Maximum a remote timestamp may exceed this node's wall clock
-    /// before it is clamped in [`crate::actor::HlcClock::observe`].
-    /// Bounds the damage from a far-future timestamp (malicious or
-    /// from a badly-skewed peer): without it, one bad timestamp
-    /// permanently poisons last-writer-wins cluster-wide. Default
+    /// Maximum a remote or persisted timestamp may exceed this node's wall
+    /// clock before the connection or durable startup is rejected. The raw
+    /// out-of-policy value is never stored. Without this bound, one bad
+    /// timestamp permanently poisons last-writer-wins cluster-wide. Default
     /// 5 minutes.
     pub max_clock_skew: Duration,
     /// Pre-shared cluster secret for handshake authentication. When
@@ -609,6 +652,10 @@ impl Node {
         // dispatcher through the supervisor.
         let reset_senders: Arc<Mutex<HashSet<(FragmentId, String)>>> =
             Arc::new(Mutex::new(HashSet::new()));
+        let hlc = Arc::new(Mutex::new(
+            HlcClock::with_offset(config.clock_skew_ms)
+                .with_max_skew(config.max_clock_skew.as_millis().min(u64::MAX as u128) as u64),
+        ));
         let supervisors: Arc<Mutex<HashMap<FragmentId, ActorRef<SupervisorMessage>>>> =
             Arc::new(Mutex::new(HashMap::with_capacity(my_fragments.len())));
         let router = FragmentRouter {
@@ -626,7 +673,7 @@ impl Node {
             ));
         for fragment in my_fragments {
             let (supervisor, dispatcher) =
-                spawn_fragment_subtree(&node_id, fragment, &config, &reset_senders).await?;
+                spawn_fragment_subtree(&node_id, fragment, &config, &reset_senders, &hlc).await?;
             supervisors.lock().await.insert(fragment, supervisor);
             router.insert(fragment, dispatcher);
         }
@@ -663,10 +710,7 @@ impl Node {
             next_req_id: Arc::new(AtomicU64::new(1)),
             peers: Arc::new(Mutex::new(HashMap::new())),
             next_seq: Arc::new(Mutex::new(0)),
-            hlc: Arc::new(Mutex::new(
-                HlcClock::with_offset(config.clock_skew_ms)
-                    .with_max_skew(config.max_clock_skew.as_millis().min(u64::MAX as u128) as u64),
-            )),
+            hlc: hlc.clone(),
             senders: Arc::new(Mutex::new(HashMap::new())),
             reset_senders: reset_senders.clone(),
             sender_config: config.replication.clone(),
@@ -714,6 +758,7 @@ impl Node {
                 reset_senders: reset_senders.clone(),
                 sender_config: node.sender_config.clone(),
                 peers: node.peers.clone(),
+                hlc: hlc.clone(),
             };
             let membership_rx = membership_rx.expect("checked above");
             let h = tokio::spawn(placement_driver(deps, membership_rx));
@@ -945,12 +990,10 @@ impl Node {
     /// The priority is honored end-to-end: forwarded puts carry it on
     /// the wire and the owner applies them at the same priority.
     ///
-    /// Read-your-write holds within a priority: the barrier read runs
-    /// in the write's pool, so a `get_with_priority` at the *same*
-    /// priority sees this write. A cross-priority read (e.g. background
-    /// write, default-priority get) is NOT ordered behind the write —
-    /// the pools are independent and make no cross-pool ordering
-    /// promise.
+    /// For a locally owned fragment, this waits for the worker's exact apply
+    /// outcome. After it returns `Ok`, subsequent local reads at any priority
+    /// observe this version or a newer winner. Remote forwarding remains
+    /// asynchronous until the mutation-response protocol is enabled.
     pub async fn put_with_priority(
         &self,
         key: String,
@@ -1028,8 +1071,8 @@ impl Node {
         self.apply_local(op).await
     }
 
-    /// Apply a locally-originated op: mark seen, route to the fragment
-    /// actor, barrier on read-your-write, then replicate.
+    /// Apply a locally-originated op, await its exact merge outcome, then
+    /// replicate only an operation that was applied or already present.
     async fn apply_local(&self, op: ReplicatedOp) -> Result<(), NodeError> {
         self.apply_local_with_priority(op, OpPriority::Default)
             .await
@@ -1042,61 +1085,48 @@ impl Node {
     ) -> Result<(), NodeError> {
         let frag = fragment_of(&op.key, self.router.fragment_count);
         if let Some(actor) = self.fragment_actor(&op.key) {
-            actor
-                .send_message(KvMessage::ApplyOp {
-                    op: op.clone(),
-                    priority,
-                    is_replication: false,
-                })
-                .map_err(|e| NodeError::Actor(e.to_string()))?;
-
-            // Barrier: the actor drains its mailbox in FIFO order, so this
-            // `call` returns only after the ApplyOp above has been applied.
-            // The barrier uses a raw read (tombstones visible) and
-            // verifies the value is at least as new as our op in LWW
-            // order: if the ApplyOp was shed, the key holds an older
-            // value (or nothing) and we must report Backpressure rather
-            // than acking a write that never applied (adversarial
-            // review #1). A newer concurrent write passing the check is
-            // fine — our op was applied, then superseded.
-            // The barrier read uses the write's priority: it must land in
-            // the same pool, or a cross-pool read would not be ordered
-            // behind the write.
-            let op_version = (
-                op.value.timestamp_ms,
-                op.value.node_id.clone(),
-                op.value.is_tombstone,
-            );
-            match actor
+            let outcome = match actor
                 .call(
-                    |reply| KvMessage::GetRaw {
-                        key: op.key.clone(),
-                        reply,
+                    |reply| KvMessage::ApplyOp {
+                        op: op.clone(),
                         priority,
+                        is_replication: false,
+                        reply: Some(reply),
                     },
                     None,
                 )
                 .await
                 .map_err(|e| NodeError::Actor(e.to_string()))?
             {
-                CallResult::Success(Ok(Some(v)))
-                    if (v.timestamp_ms, &v.node_id, v.is_tombstone)
-                        >= (op_version.0, &op_version.1, op_version.2) =>
-                {
-                    // Our op (or a newer one) is visible: barrier holds.
-                }
-                CallResult::Success(Ok(_)) => {
+                CallResult::Success(Ok(outcome)) => outcome,
+                CallResult::Success(Err(ApplyError::Backpressure)) => {
                     return Err(NodeError::Backpressure(
-                        "put shed: barrier read did not observe the write".to_string(),
+                        "fragment worker pool is at capacity".to_string(),
                     ))
                 }
-                CallResult::Success(Err(shed)) => {
-                    return Err(NodeError::Backpressure(format!("put barrier shed: {shed}")))
+                CallResult::Success(Err(ApplyError::Storage(error))) => {
+                    return Err(NodeError::Storage(error))
                 }
-                CallResult::Timeout => return Err(NodeError::Actor("put timed out".to_string())),
+                CallResult::Timeout => return Err(NodeError::Actor("apply timed out".to_string())),
                 CallResult::SenderError => {
-                    return Err(NodeError::Actor("put reply channel dropped".to_string()))
+                    return Err(NodeError::Actor("apply reply channel dropped".to_string()))
                 }
+            };
+
+            match outcome {
+                ApplyOutcome::Applied | ApplyOutcome::AlreadyPresent => {}
+                ApplyOutcome::Superseded {
+                    timestamp_ms,
+                    node_id,
+                    is_tombstone,
+                } => {
+                    return Err(NodeError::Superseded {
+                        timestamp_ms,
+                        node_id,
+                        is_tombstone,
+                    })
+                }
+                ApplyOutcome::Expired => return Err(NodeError::Expired),
             }
 
             self.enqueue_for_replication(frag, &op).await;
@@ -1142,9 +1172,9 @@ impl Node {
     /// the high pool (isolated from background bulk traffic); background
     /// reads go to the background pool (rate-limited, sheddable).
     ///
-    /// Read-your-write pairs with [`put_with_priority`](Self::put_with_priority)
-    /// at the same priority. A high-priority read is not ordered behind
-    /// a background write to the same key.
+    /// Once a local [`put_with_priority`](Self::put_with_priority) returns,
+    /// the shared fragment cache makes its result visible to reads in every
+    /// priority pool.
     pub async fn get_with_priority(
         &self,
         key: String,
@@ -1258,8 +1288,8 @@ impl Node {
             }
         }
 
-        // Local puts: run concurrently, each with its own barrier, at
-        // the requested priority.
+        // Local puts run concurrently, each awaiting its exact apply outcome
+        // at the requested priority.
         let local_futs = local.into_iter().map(|(i, key, value)| {
             let this = self;
             async move {
@@ -1620,6 +1650,7 @@ struct PlacementDriverDeps {
     reset_senders: ResetSenderSet,
     sender_config: SenderConfig,
     peers: PeerMap,
+    hlc: Arc<Mutex<HlcClock>>,
 }
 
 impl PlacementDriverDeps {
@@ -1842,6 +1873,7 @@ async fn gain_fragment(deps: &PlacementDriverDeps, fragment: FragmentId) {
         fragment,
         &deps.subtree_config,
         &deps.reset_senders,
+        &deps.hlc,
     )
     .await
     {
@@ -2224,8 +2256,12 @@ async fn handle_connection(ctx: ConnContext, stream: BoxStream, we_dialed: bool)
                 if current != Some(b.session_id) {
                     continue; // stale session
                 }
+                if let Some(timestamp_ms) = b.ops.iter().map(|op| op.timestamp_ms).max() {
+                    if !observe_remote_timestamp(&hlc, timestamp_ms, "ReplicateBatch").await {
+                        break;
+                    }
+                }
                 for op in b.ops {
-                    hlc.lock().await.observe(op.timestamp_ms);
                     let replicated = ReplicatedOp {
                         key: op.key.clone(),
                         value: {
@@ -2252,6 +2288,7 @@ async fn handle_connection(ctx: ConnContext, stream: BoxStream, we_dialed: bool)
                             op: replicated,
                             priority: OpPriority::Default,
                             is_replication: true,
+                            reply: None,
                         });
                     }
                 }
@@ -2346,6 +2383,11 @@ async fn handle_connection(ctx: ConnContext, stream: BoxStream, we_dialed: bool)
                 }
             }
             Some(EnvelopeMsg::ReconcileResponse(r)) => {
+                if let Some(timestamp_ms) = r.summaries.iter().map(|s| s.timestamp_ms).max() {
+                    if !observe_remote_timestamp(&hlc, timestamp_ms, "ReconcileResponse").await {
+                        break;
+                    }
+                }
                 // Route to the sender for (fragment, peer).
                 if let Some(peer) = peer_node_id.clone() {
                     let senders = senders.lock().await;
@@ -2357,6 +2399,11 @@ async fn handle_connection(ctx: ConnContext, stream: BoxStream, we_dialed: bool)
                 }
             }
             Some(EnvelopeMsg::ReconcileData(d)) => {
+                if let Some(timestamp_ms) = d.entries.iter().map(|e| e.timestamp_ms).max() {
+                    if !observe_remote_timestamp(&hlc, timestamp_ms, "ReconcileData").await {
+                        break;
+                    }
+                }
                 // Route to the sender for (fragment, peer).
                 if let Some(peer) = peer_node_id.clone() {
                     let senders = senders.lock().await;
@@ -2366,7 +2413,9 @@ async fn handle_connection(ctx: ConnContext, stream: BoxStream, we_dialed: bool)
                 }
             }
             Some(EnvelopeMsg::ForwardedPut(p)) => {
-                hlc.lock().await.observe(p.timestamp_ms);
+                if !observe_remote_timestamp(&hlc, p.timestamp_ms, "ForwardedPut").await {
+                    break;
+                }
                 // We run this fragment (serving or bootstrapping):
                 // apply as coordinator, then enqueue for async
                 // replication to the other holders.
@@ -2394,6 +2443,7 @@ async fn handle_connection(ctx: ConnContext, stream: BoxStream, we_dialed: bool)
                         // Client-originated (not acked replication):
                         // subject to admission control.
                         is_replication: false,
+                        reply: None,
                     });
                     // Phase 5: async fan-out via senders.
                     let senders = senders.lock().await;
@@ -2474,6 +2524,9 @@ async fn handle_connection(ctx: ConnContext, stream: BoxStream, we_dialed: bool)
                 .await;
             }
             Some(EnvelopeMsg::GetResponse(r)) => {
+                if r.found && !observe_remote_timestamp(&hlc, r.timestamp_ms, "GetResponse").await {
+                    break;
+                }
                 // A relayed read completing: forward the response to the
                 // origin peer with its original req_id.
                 if let Some((origin_tx, orig_id)) = pending_relays.lock().await.remove(&r.req_id) {
@@ -2520,9 +2573,11 @@ async fn handle_connection(ctx: ConnContext, stream: BoxStream, we_dialed: bool)
                 // during migration), re-forward the whole batch to the
                 // current owner.
                 let batch_priority = priority_from_proto(bp.priority);
-                hlc.lock()
-                    .await
-                    .observe(bp.puts.iter().map(|p| p.timestamp_ms).max().unwrap_or(0));
+                if let Some(timestamp_ms) = bp.puts.iter().map(|p| p.timestamp_ms).max() {
+                    if !observe_remote_timestamp(&hlc, timestamp_ms, "BatchPut").await {
+                        break;
+                    }
+                }
                 let batch_frag = bp
                     .puts
                     .first()
@@ -2567,6 +2622,7 @@ async fn handle_connection(ctx: ConnContext, stream: BoxStream, we_dialed: bool)
                             // Client-originated (not acked replication):
                             // subject to admission control.
                             is_replication: false,
+                            reply: None,
                         });
                         let senders = senders.lock().await;
                         for ((f, _peer), tx) in senders.iter() {
@@ -2636,6 +2692,17 @@ async fn handle_connection(ctx: ConnContext, stream: BoxStream, we_dialed: bool)
                 .await;
             }
             Some(EnvelopeMsg::BatchGetResponse(r)) => {
+                if let Some(timestamp_ms) = r
+                    .results
+                    .iter()
+                    .filter(|result| result.found)
+                    .map(|result| result.timestamp_ms)
+                    .max()
+                {
+                    if !observe_remote_timestamp(&hlc, timestamp_ms, "BatchGetResponse").await {
+                        break;
+                    }
+                }
                 if let Some(resp_tx) = pending_batch_gets.lock().await.remove(&r.req_id) {
                     let _ = resp_tx.send(r.results);
                 }
@@ -2687,9 +2754,13 @@ async fn handle_connection(ctx: ConnContext, stream: BoxStream, we_dialed: bool)
                 // Merge-only: sync never re-broadcasts (the gossiper
                 // already has these ops; everyone else will get them
                 // through normal gossip or their own sync).
+                if let Some(timestamp_ms) = resp.entries.iter().map(|e| e.timestamp_ms).max() {
+                    if !observe_remote_timestamp(&hlc, timestamp_ms, "SyncResponse").await {
+                        break;
+                    }
+                }
                 sync_entries_applied.fetch_add(resp.entries.len() as u64, Ordering::Relaxed);
                 for e in resp.entries {
-                    hlc.lock().await.observe(e.timestamp_ms);
                     let op = ReplicatedOp {
                         key: e.key,
                         value: {
@@ -2710,6 +2781,7 @@ async fn handle_connection(ctx: ConnContext, stream: BoxStream, we_dialed: bool)
                             op,
                             priority: OpPriority::Background,
                             is_replication: true,
+                            reply: None,
                         });
                     }
                 }

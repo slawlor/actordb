@@ -9,7 +9,7 @@ and results come back in input order.
 
 1. Each key is hashed to its fragment (`seahash(key) % fragment_count`).
 2. Local keys (this node serves the fragment) run through the normal single-key
-   path — including the per-op read-your-write barrier — concurrently via
+   path — including the exact per-op apply outcome — concurrently via
    `join_all`, then are stamped back into their input positions.
 3. Remote keys are grouped by `FragmentId` and each group goes out as **one**
    `BatchPut` / `BatchGet` message to the fragment's owner — one message per

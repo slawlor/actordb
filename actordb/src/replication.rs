@@ -392,6 +392,7 @@ async fn sender_task(
                                     op,
                                     priority: OpPriority::Default,
                                     is_replication: true,
+                                    reply: None,
                                 });
                             }
                         }

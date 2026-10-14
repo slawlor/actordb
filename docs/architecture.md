@@ -69,8 +69,8 @@ Key design points:
   the same worker (`seahash(key) % workers`). Different priorities use
   different workers; `FragmentState` therefore serializes each LWW merge with
   its persistence enqueue so disk ordering cannot diverge from the cache.
-  The same-priority FIFO path is what the current read-your-write barrier uses
-  (see [Consistency](consistency.md)).
+  Local mutation calls await the selected worker's exact apply outcome rather
+  than inferring it from a subsequent read (see [Consistency](consistency.md)).
 - **Supervision is local and shallow.** A dead worker is replaced in place with
   the same `Arc<FragmentState>` and the same pool slot; a dead child of a
   fragment supervisor (dispatcher, cleaner, snapshotter) is respawned in place.
