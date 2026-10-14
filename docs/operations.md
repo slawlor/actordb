@@ -55,6 +55,30 @@ node converges to the full dataset with zero full-state sync entries.
   selected/retried replica is reachable, the operation returns
   `NodeError::Network`.
 
+### Slow or non-reading peer
+
+- Each connection has one shared outbound queue, 256 frames by default. Queue
+  admission is capped at 5 seconds and each complete socket frame write at 30
+  seconds. Either expiry cancels that exact connection; its senders retain or
+  requeue outstanding work, and the configured dialer reconnects with backoff.
+- A forwarded owner attempt has one 5-second default budget for both enqueue
+  and response. Expiry removes the pending request; batch APIs then try the next
+  holder. Remote fragments and holder attempts are sequential, so a slow
+  attempt delays those that follow.
+- An ordinary replication batch must receive an acceptable ACK within 30
+  seconds by default. Expiry rotates the sender session and replays every
+  unacknowledged exact stamped operation in original order. Duplicate applies
+  are safe under LWW, and stale ACKs from the old session are rejected. A weak
+  ACK does not extend the deadline.
+- Reconciliation summary/data/barrier waits use
+  `SenderConfig::reconcile_timeout` (also 30 seconds by default), not the
+  ordinary ACK deadline.
+
+These values are configurable through `NodeRuntimeOptions` and
+`Node::start_with_options`. Queue capacity counts frames, not bytes: frames can
+approach the 16 MiB protocol limit, so 256 slots are not a fixed memory budget.
+Operation priority does not reorder this shared socket queue.
+
 ### Overloaded node (backpressure)
 
 Shed operations are counted per pool in `FragmentHealth.shed_counts`
@@ -86,7 +110,8 @@ states (`Bootstrapping`/`Serving`/`Draining`/`Stopped`) for diagnosis.
 | Restarts | `health()[frag].restarts` | Repeated worker/dispatcher restarts = crash loop; investigate before it cascades |
 | Placement | `Node::placement_report()` | Authoritative map, lifecycle states, `dynamic` flag — is migration stuck in `Bootstrapping`/`Draining`? |
 | Sync entries | `Node::sync_entries_applied()` | Full-state sync volume since start; nonzero in dynamic mode = reconciler isn't owning anti-entropy |
-| Replication lag | `batch_interval` + receiver apply/flush + peer RTT | ACKs follow the receiver fence; an unanswered live session has no ACK timer and can stall, while later reconciliation repairs divergence |
+| Replication lag | `batch_interval` + receiver apply/flush + peer RTT | ACKs follow the receiver fence; an unanswered ordinary batch rotates and replays at `replication_ack_timeout`, while barriers use `reconcile_timeout` |
+| Peer churn | `Node::peer_count()` and timeout/session-rotation warning logs | Repeated queue/write cancellation or ACK expiry usually means a non-reading, overloaded, or unhealthy peer |
 
 Operational rules of thumb:
 
@@ -99,3 +124,6 @@ Operational rules of thumb:
   durable, replica-aware reclamation protocol.
 - The background pool's default 1000 ops/s rate limit is a feature, not a bug
   — raise it deliberately if your bulk path needs more.
+- Size the peer frame queue with encoded message sizes in mind; it is not a
+  byte-bounded memory budget. Reconciliation fetches are chunked at 500 keys,
+  but the fragment summary and encoded bytes are not paginated yet.

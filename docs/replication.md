@@ -17,8 +17,10 @@ background.
         └──────────────── PeerDisconnected (BufferReset survives disconnects)
 ```
 
-- **Connected**: local mutations accumulate in a bounded buffer
-  (`buffer_capacity`, default 10 000). Batches ship on a timer
+- **Connected**: dequeued local mutations accumulate in a bounded owned buffer
+  (`buffer_capacity`, default 10 000). The command mailbox feeding the sender
+  is currently unbounded, so this is not a total replication-ingress memory
+  bound. Batches ship on a timer
   (`batch_interval` 100 ms, `batch_size` 100), with at most `max_in_flight`
   (4) batches awaiting ack.
 - **Disconnected**: peer down; buffered and in-flight operations are retained
@@ -46,6 +48,14 @@ Tuning lives in `SenderConfig` (see [Configuration](configuration.md)):
 `buffer_capacity: 10 000`, `consistency_interval: 300 s`,
 `reconcile_timeout: 30 s`, and
 `required_ack_durability: MemoryApplied`.
+
+Runtime liveness policy is separate for source compatibility. A node maps
+`NodeRuntimeOptions::replication_ack_timeout` (30 seconds by default) and
+`queue_admission_timeout` (5 seconds) into each sender. Direct embedders get the
+same defaults from `spawn_sender`; use `spawn_sender_with_options` plus
+`SenderRuntimeOptions::with_ack_timeout` and
+`with_queue_admission_timeout` to override them. Reconciliation barriers always
+use `SenderConfig::reconcile_timeout`, not the ordinary ACK timeout.
 
 ## Sessions and acks
 
@@ -91,7 +101,8 @@ flush failure returns `BatchNack`; the sender requeues the exact stamped batch
 at the front for idempotent retry after a one-second floor, preventing a
 permanently failing store from becoming a tight write/log loop.
 `SenderStateReport::ack_durability_mismatch` exposes a valid but insufficient
-ACK; the batch remains in flight. ACK observations reset on every session.
+ACK; the batch remains in flight. A weak ACK does not extend that batch's
+original deadline. ACK observations reset on every session.
 
 This protocol change is deliberately fail-closed but has no negotiated version
 bit yet. Older receivers do not send mutation responses and emit fieldless ACKs
@@ -99,19 +110,25 @@ that a new sender rejects; older senders omit the required ACK level and ignore
 the new receiver's NACK. Upgrade all nodes together until explicit Hello
 capability negotiation lands.
 
-**Ordinary streaming batches still have no ACK timeout or retransmission
-timer.** `max_in_flight` only
-gates *sending* new batches; an unacked batch sits in memory until a NACK or
-session transition. Detected disconnects, reconnect races, and failed sends all
-requeue every unacknowledged operation at the front before discarding the old
-session. Reconciliation phases do have `reconcile_timeout`; a silent summary,
-data, or barrier phase rotates the session and retries after the one-second
-retry floor. Streaming ACK timeout/retransmission and bounded receiver ingress
-remain separate hardening work; a connection that stays open but never ACKs
-ordinary batches can still fill `max_in_flight` and stall that sender.
-The phase deadline starts after the outbound frame enters the bounded peer
-queue; queue admission itself still awaits without a timeout, so a blocked
-socket writer can delay both reconciliation timers and sender mailbox work.
+Every ordinary streaming batch receives an ACK deadline after its frame enters
+the peer queue (30 seconds by default). If any ordinary batch expires, the
+sender restores **all** in-flight batches to the front of its buffer in original
+batch and operation order, waits at least one second before streaming again,
+mints a new session, and sends `SessionStart`. It reuses the live transport when
+possible. Exact timestamps and origin ids are replayed rather than restamped,
+so duplicate delivery is an idempotent LWW merge. A delayed ACK or NACK names
+the expired session and is ignored.
+
+Reconciliation summary, data, and tracked-barrier phases instead use
+`reconcile_timeout`; an expired phase also rotates the session and retries the
+round after the one-second floor. Neither kind of session rotation necessarily
+drops a healthy socket. Queue admission has its own bounded wait (5 seconds by
+default). In the `Node` integration, admission expiry marks the exact peer
+connection failed and cancels it; the connection is removed, senders retain or
+requeue work, and the configured dialer can redial. A per-frame socket write
+that exceeds its 30-second default has the same connection-cancellation and
+redial path. A forwarded request's separately configured budget (5 seconds by
+default) covers its entire enqueue-plus-response attempt.
 
 ## Periodic reconciliation (anti-entropy)
 
@@ -158,7 +175,7 @@ convergence watermarks and durable store deletion, which are not implemented.
 Reconcile fetches are chunked by key count, but the summary response still
 describes the whole fragment in one frame and neither path is currently
 budgeted by encoded bytes. A large fragment or value can exceed the 16 MiB
-frame limit; byte-bounded pagination remains required.
+frame limit; byte-bounded reconciliation pagination remains follow-up work.
 
 ## The Hello / full-state handshake
 
@@ -176,7 +193,12 @@ the reconciler owns anti-entropy (the rolling-restart test asserts
   `MAX_FRAME_BYTES` is 16 MiB.
 - Reconnect uses exponential backoff from `RECONNECT_BASE` (100 ms, doubling),
   managed by the redial supervisor in the node layer.
-- `PEER_CHANNEL_DEPTH` is 256.
+- The per-peer outbound queue defaults to 256 **frames** through
+  `NodeRuntimeOptions`; it is not byte-bounded. All protocol traffic shares the
+  same queue and socket writer. `OpPriority` selects the receiver's actor pool
+  but does not give its frame queue precedence.
+- Remote fragment fan-out and per-fragment replica attempts are sequential;
+  priority does not make those network attempts concurrent.
 - Every inbound version path, including `ReconcileData`, validates and observes
   the remote timestamp before it can affect stored LWW state.
 

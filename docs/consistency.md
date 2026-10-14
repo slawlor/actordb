@@ -55,9 +55,9 @@ At the exact apply point, the serving owner's shared fragment cache contains
 that version or an identical replay; by return time it may contain a newer LWW
 winner. Subsequent reads at that owner observe the applied version or a newer
 winner regardless of which priority pool serves them. A remote call has a
-5-second deadline covering queueing and response; a missing or malformed reply
-is never converted to success. Priority still controls admission and
-scheduling.
+configured deadline (5 seconds by default) covering queueing and response; a
+missing or malformed reply is never converted to success. Priority still
+controls admission and scheduling.
 
 ## Replication lag and partitions
 

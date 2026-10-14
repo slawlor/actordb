@@ -152,18 +152,50 @@ let peers = node.peer_count().await;
 node.shutdown().await;
 ```
 
+`Node::start` uses the default transport and replication liveness policy. Use
+`Node::start_with_options` when those runtime-only limits need tuning:
+
+```rust
+use actordb::node::NodeRuntimeOptions;
+use std::time::Duration;
+
+let runtime = NodeRuntimeOptions::default()
+    .with_peer_queue_frame_capacity(512)
+    .with_queue_admission_timeout(Duration::from_secs(2))
+    .with_forwarded_attempt_timeout(Duration::from_secs(8))
+    .with_socket_write_timeout(Duration::from_secs(20))
+    .with_replication_ack_timeout(Duration::from_secs(20));
+
+let node = Node::start_with_options(
+    "node-a".to_string(),
+    "0.0.0.0:7447".parse().unwrap(),
+    NodeConfig::default(),
+    runtime,
+)
+.await?;
+```
+
+The defaults are a 256-frame queue per peer, 5 seconds to reserve a queue
+slot, 5 seconds total for each forwarded owner attempt (enqueue plus response),
+30 seconds for one socket frame write, and 30 seconds for an acceptable
+ordinary replication ACK. Reconciliation barriers use
+`SenderConfig::reconcile_timeout` instead of the ordinary ACK timeout. The
+queue limit counts frames, not encoded bytes.
+
 Multi-key semantics:
 
 - `put_multi` / `get_multi` partition keys by fragment and send one
   `BatchPut` / `BatchGet` per remote fragment and owner attempt, rather than
   one message per key.
 - Local and remote puts await the serving fragment's exact per-key apply
-  outcome. Remote batches preserve request order/cardinality and use a
-  5-second deadline that includes outbound queueing and the response.
+  outcome. Remote batches preserve request order/cardinality and use the
+  configured per-attempt deadline (5 seconds by default), including outbound
+  queueing and the response.
 - Batch APIs fail over across replica holders in placement order on transport,
-  timeout, or malformed-response failures. Mutation attempts have a 5-second
-  send-and-response deadline; read attempts time out 5 seconds after
-  enqueueing. A typed all-`Unavailable` mutation response tries the next
+  timeout, or malformed-response failures. Every owner attempt has one
+  configured budget (5 seconds by default) covering queue admission and the
+  response. A typed
+  all-`Unavailable` mutation response tries the next
   holder; other valid per-key outcomes are returned directly.
 - Errors are per-key and classified: `NodeError::Actor` for
   misconfiguration (no replica listed for a fragment),
@@ -231,15 +263,17 @@ Each fragment runs **three isolated worker pools** instead of one:
   with "not found".
 - Priority is preserved end-to-end: forwarded single-key ops and batch
   messages carry the originator's priority on the wire, and the owner
-  applies/serves them in the matching pool.
+  applies/serves them in the matching pool. Priority selects that remote actor
+  pool; it does not prioritize the shared per-peer socket queue.
 - Shed counts are surfaced per pool `(high, default, background)` via
   `node.health()` → `FragmentHealth.shed_counts`.
 
 Ordering honesty: local and forwarded puts wait for the serving worker's exact
 apply outcome. At that point its shared cache contains the applied version or
 an identical replay; by return time a newer concurrent LWW winner may exist.
-A 5-second remote deadline covers both bounded outbound-queue admission and
-the reply; cancellation and late replies remove or ignore pending state.
+The configured remote deadline (5 seconds by default) covers both bounded
+outbound-queue admission and the reply; cancellation and late replies remove
+or ignore pending state.
 
 ### `actordb::supervision` — per-fragment supervision
 
@@ -254,6 +288,11 @@ the reply; cancellation and late replies remove or ignore pending state.
   tombstones) off the write path: ships on a timer, bounded in-flight,
   and retains each batch until a typed ACK reaches the configured durability
   fence. Receiver apply/flush failures NACK and requeue the exact batch.
+- An ordinary ACK has a 30-second default deadline. Expiry rotates the sender
+  session and replays all unacknowledged, already-stamped operations in their
+  original order; LWW makes duplicates idempotent, and ACKs from the old
+  session are ignored. An ACK below the requested durability neither retires
+  the batch nor extends its deadline.
 - Session ids per pairing; stale batches discarded on reconnect.
 - Buffer overflow → `buffer_reset`: shed, rotate the session, and reconcile
   via timestamp/tombstone comparison immediately or when the peer returns.
@@ -344,12 +383,16 @@ as issues in the [issue tracker](https://github.com/slawlor/actordb/issues):
   steady-state replication is incremental (batches + reconciliation).
   With dynamic placement enabled the handshake skips the full-state
   sync and the reconciler owns anti-entropy (delta-only).
-- **Replication ingress/timeout hardening remains** — apply/flush-aware ACKs,
-  NACK retry, and disconnect replay prevent false delivery, but receiver
-  mailboxes are not yet byte-bounded and an open connection that never replies
-  to ordinary streaming batches can fill `max_in_flight` because there is no
-  ACK timer. Buffer overflow recovery itself is immediate, correlated, and
-  fenced; reconciliation phases have their own timeout.
+- **Transport bounds are frame-count based** — the shared per-peer outbound
+  queue defaults to 256 frames, not a byte budget, and a single accepted frame
+  can approach 16 MiB. Queue admission and socket writes have bounded waits;
+  expiry cancels the connection so the dialer can reconnect. Receiver
+  mailboxes are not byte-bounded either, and the command mailbox feeding each
+  sender's bounded owned deque is still unbounded. Reconciliation fetches use
+  500-key chunks, but the summary and encoded byte size are not paginated yet.
+- **Fan-out is sequential** — remote fragment groups and their replica-holder
+  attempts are currently awaited one at a time. Operation priority chooses the
+  destination actor pool but does not schedule the shared socket queue.
 - **Wire upgrades must be coordinated** — `Hello` does not yet negotiate
   protocol capabilities. The mutation-response and durability-ACK fields fail
   closed across old/new peers rather than silently claiming success.

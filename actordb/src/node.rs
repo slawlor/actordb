@@ -35,9 +35,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use prost::Message as ProstMessage;
 use ractor::rpc::CallResult;
 use ractor::{Actor, ActorRef};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::sync::{mpsc, oneshot, watch, Mutex};
 use tokio::task::{AbortHandle, JoinSet};
+use tokio::time::Instant;
 
 use crate::actor::{
     ApplyDurability, ApplyError, ApplyOutcome, HlcClock, KvMessage, OpPriority, PoolConfig,
@@ -54,7 +55,8 @@ use crate::proto::{
     ReplicationAckLevel, SyncEntry, SyncResponse,
 };
 use crate::replication::{
-    spawn_sender, ReplicationAckDurability, SenderConfig, SenderDeps, SenderMsg, SenderStateReport,
+    spawn_sender_with_options, ReplicationAckDurability, SenderConfig, SenderDeps, SenderMsg,
+    SenderRuntimeOptions, SenderStateReport,
 };
 use crate::shard::{fragment_of, FragmentId};
 use crate::store::{KvStore, PrefixedStore};
@@ -71,24 +73,59 @@ const PEER_CHANNEL_DEPTH: usize = 256;
 const RECONNECT_BASE: Duration = Duration::from_millis(100);
 const RECONNECT_MAX: Duration = Duration::from_secs(30);
 const REMOTE_RPC_TIMEOUT: Duration = Duration::from_secs(5);
+const SOCKET_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+
+fn deadline_after(timeout: Duration) -> Instant {
+    let now = Instant::now();
+    now.checked_add(timeout).unwrap_or(now)
+}
+
+/// One live connection's bounded outbound queue plus a cancellation signal
+/// shared by every producer and the socket reader/writer tasks.
+#[derive(Clone)]
+struct PeerChannel {
+    tx: mpsc::Sender<Vec<u8>>,
+    cancel: watch::Sender<bool>,
+    queue_admission_timeout: Duration,
+}
+
+impl PeerChannel {
+    fn same_channel(&self, other: &Self) -> bool {
+        self.tx.same_channel(&other.tx)
+    }
+
+    fn same_sender(&self, other: &mpsc::Sender<Vec<u8>>) -> bool {
+        self.tx.same_channel(other)
+    }
+
+    fn raw_sender(&self) -> mpsc::Sender<Vec<u8>> {
+        self.tx.clone()
+    }
+
+    fn cancel(&self) {
+        let _ = self.cancel.send(true);
+    }
+}
 
 /// peer node_id -> outbound frame queue
-type PeerMap = Arc<Mutex<HashMap<String, mpsc::Sender<Vec<u8>>>>>;
+type PeerMap = Arc<Mutex<HashMap<String, PeerChannel>>>;
 /// Phase 5 senders, keyed by (fragment, peer node id).
 type SenderMap = Arc<Mutex<HashMap<(FragmentId, String), mpsc::UnboundedSender<SenderMsg>>>>;
 /// Sender state reports, keyed by (fragment, peer node id).
 type SenderReportMap = Arc<Mutex<HashMap<(FragmentId, String), Arc<Mutex<SenderStateReport>>>>>;
-/// Relayed forwarded-gets: relay_req_id -> (origin peer_tx, origin req_id).
-type RelayMap = Arc<Mutex<HashMap<u64, (mpsc::Sender<Vec<u8>>, u64)>>>;
+/// Relayed forwarded-gets keyed by their locally allocated request id.
+type RelayMap = Arc<Mutex<HashMap<u64, GetRelay>>>;
 /// Relayed forwarded mutations: relay req_id -> (origin peer_tx, origin req_id).
 type MutationRelayMap = Arc<Mutex<HashMap<u64, MutationRelay>>>;
 
 struct SenderEntryDeps<'a> {
     config: &'a SenderConfig,
+    runtime: &'a SenderRuntimeOptions,
     router: &'a FragmentRouter,
     hlc: &'a Arc<Mutex<HlcClock>>,
     senders: &'a SenderMap,
     reports: &'a SenderReportMap,
+    peers: &'a PeerMap,
 }
 
 /// Atomically install the one replication sender allowed to own a
@@ -110,7 +147,24 @@ async fn ensure_sender_entry(fragment: FragmentId, peer: &str, deps: SenderEntry
         ack_durability_mismatch: false,
         reconcile_rounds: 0,
     }));
-    let sender = spawn_sender(
+    let peers = deps.peers.clone();
+    let expected_peer = peer.to_string();
+    let runtime = deps
+        .runtime
+        .clone()
+        .with_queue_failure_handler(Arc::new(move |failed_tx| {
+            let peers = peers.clone();
+            let expected_peer = expected_peer.clone();
+            tokio::spawn(async move {
+                let current = peers.lock().await.get(&expected_peer).cloned();
+                if let Some(current) = current {
+                    if current.same_sender(&failed_tx) {
+                        current.cancel();
+                    }
+                }
+            });
+        }));
+    let sender = spawn_sender_with_options(
         fragment,
         peer.to_string(),
         deps.config.clone(),
@@ -120,7 +174,9 @@ async fn ensure_sender_entry(fragment: FragmentId, peer: &str, deps: SenderEntry
             reset_senders: Arc::new(Mutex::new(HashMap::new())),
             state_report: report.clone(),
         },
-    );
+        runtime,
+    )
+    .expect("node runtime options were validated before sender spawn");
     deps.reports.lock().await.insert(key.clone(), report);
     senders_guard.insert(key, sender);
 }
@@ -128,7 +184,13 @@ async fn ensure_sender_entry(fragment: FragmentId, peer: &str, deps: SenderEntry
 struct MutationRelay {
     expected_peer: String,
     expected_keys: Vec<String>,
-    origin_tx: mpsc::Sender<Vec<u8>>,
+    origin_tx: PeerChannel,
+    origin_req_id: u64,
+    timeout_cancel: oneshot::Sender<()>,
+}
+
+struct GetRelay {
+    origin_tx: PeerChannel,
     origin_req_id: u64,
     timeout_cancel: oneshot::Sender<()>,
 }
@@ -137,9 +199,9 @@ struct MutationRelay {
 /// reply is `Ok(value)` or `Err(shed_reason)` if the remote shed the
 /// read due to backpressure.
 type PendingGets =
-    Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Option<VersionedValue>, String>>>>>;
+    Arc<StdMutex<HashMap<u64, oneshot::Sender<Result<Option<VersionedValue>, String>>>>>;
 /// Pending batched forwarded reads: req_id -> reply channel.
-type PendingBatchGets = Arc<Mutex<HashMap<u64, oneshot::Sender<Vec<BatchKeyValue>>>>>;
+type PendingBatchGets = Arc<StdMutex<HashMap<u64, oneshot::Sender<Vec<BatchKeyValue>>>>>;
 /// Pending single or batched forwarded mutations. Results preserve request
 /// order and cardinality.
 type PendingMutations = Arc<StdMutex<HashMap<u64, PendingMutation>>>;
@@ -155,6 +217,28 @@ struct PendingMutation {
 struct PendingMutationGuard {
     req_id: u64,
     pending: PendingMutations,
+}
+
+struct PendingGetGuard {
+    req_id: u64,
+    pending: PendingGets,
+}
+
+impl Drop for PendingGetGuard {
+    fn drop(&mut self) {
+        self.pending.lock().unwrap().remove(&self.req_id);
+    }
+}
+
+struct PendingBatchGetGuard {
+    req_id: u64,
+    pending: PendingBatchGets,
+}
+
+impl Drop for PendingBatchGetGuard {
+    fn drop(&mut self) {
+        self.pending.lock().unwrap().remove(&self.req_id);
+    }
 }
 
 impl Drop for PendingMutationGuard {
@@ -194,6 +278,8 @@ struct ConnContext {
     hlc: Arc<Mutex<HlcClock>>,
     senders: SenderMap,
     sender_config: SenderConfig,
+    sender_runtime: SenderRuntimeOptions,
+    runtime_options: NodeRuntimeOptions,
     sender_reports: SenderReportMap,
     /// Full-state sync entries applied (observability for the Phase 8
     /// rolling-restart test: must stay 0 when dynamic placement owns
@@ -622,6 +708,8 @@ pub struct Node {
     senders: SenderMap,
     /// Phase 5 sender tuning.
     sender_config: SenderConfig,
+    /// Transport and replication liveness policy.
+    runtime_options: NodeRuntimeOptions,
     /// State reports for each sender, keyed by (fragment, peer).
     sender_reports: SenderReportMap,
     /// Full-state sync entries applied via SyncResponse (observability;
@@ -646,6 +734,40 @@ fn fresh_boot_id() -> u64 {
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(0);
     nanos ^ ((std::process::id() as u64) << 32)
+}
+
+async fn run_peer_writer<W>(
+    mut writer: W,
+    mut rx: mpsc::Receiver<Vec<u8>>,
+    mut cancel_rx: watch::Receiver<bool>,
+    cancel_tx: watch::Sender<bool>,
+    socket_write_timeout: Duration,
+) where
+    W: AsyncWrite + Unpin,
+{
+    loop {
+        let frame = tokio::select! {
+            changed = cancel_rx.changed() => {
+                let _ = changed;
+                break;
+            }
+            frame = rx.recv() => {
+                let Some(frame) = frame else { break };
+                frame
+            }
+        };
+        let write = async {
+            writer.write_u32(frame.len() as u32).await?;
+            writer.write_all(&frame).await
+        };
+        if !matches!(
+            tokio::time::timeout(socket_write_timeout, write).await,
+            Ok(Ok(()))
+        ) {
+            break;
+        }
+    }
+    let _ = cancel_tx.send(true);
 }
 
 /// Spawn one fragment's supervised subtree (supervisor + dispatcher)
@@ -704,6 +826,135 @@ async fn spawn_fragment_subtree(
         }
     };
     Ok((supervisor, dispatcher))
+}
+
+/// Runtime liveness and queue policy for a [`Node`].
+///
+/// This is separate from [`NodeConfig`] so adding transport policy does not
+/// break existing exhaustive `NodeConfig` literals. [`Node::start`] uses the
+/// defaults; pass an override to [`Node::start_with_options`].
+#[derive(Clone, Debug)]
+pub struct NodeRuntimeOptions {
+    peer_queue_frame_capacity: usize,
+    queue_admission_timeout: Duration,
+    forwarded_attempt_timeout: Duration,
+    socket_write_timeout: Duration,
+    replication_ack_timeout: Duration,
+}
+
+impl Default for NodeRuntimeOptions {
+    fn default() -> Self {
+        Self {
+            peer_queue_frame_capacity: PEER_CHANNEL_DEPTH,
+            queue_admission_timeout: REMOTE_RPC_TIMEOUT,
+            forwarded_attempt_timeout: REMOTE_RPC_TIMEOUT,
+            socket_write_timeout: SOCKET_WRITE_TIMEOUT,
+            replication_ack_timeout: Duration::from_secs(30),
+        }
+    }
+}
+
+impl NodeRuntimeOptions {
+    /// Set the number of frames buffered per peer connection.
+    pub fn with_peer_queue_frame_capacity(mut self, capacity: usize) -> Self {
+        self.peer_queue_frame_capacity = capacity;
+        self
+    }
+
+    /// Set the maximum wait to reserve a peer queue slot.
+    pub fn with_queue_admission_timeout(mut self, timeout: Duration) -> Self {
+        self.queue_admission_timeout = timeout;
+        self
+    }
+
+    /// Set the total enqueue-plus-response budget for one forwarded owner
+    /// attempt.
+    pub fn with_forwarded_attempt_timeout(mut self, timeout: Duration) -> Self {
+        self.forwarded_attempt_timeout = timeout;
+        self
+    }
+
+    /// Set the maximum time allowed for one socket frame write.
+    pub fn with_socket_write_timeout(mut self, timeout: Duration) -> Self {
+        self.socket_write_timeout = timeout;
+        self
+    }
+
+    /// Set the maximum wait for an acceptable ordinary replication ACK after
+    /// queue admission.
+    pub fn with_replication_ack_timeout(mut self, timeout: Duration) -> Self {
+        self.replication_ack_timeout = timeout;
+        self
+    }
+
+    /// Current per-peer outbound frame capacity.
+    pub fn peer_queue_frame_capacity(&self) -> usize {
+        self.peer_queue_frame_capacity
+    }
+
+    /// Current peer-queue admission timeout.
+    pub fn queue_admission_timeout(&self) -> Duration {
+        self.queue_admission_timeout
+    }
+
+    /// Current total forwarded-attempt timeout.
+    pub fn forwarded_attempt_timeout(&self) -> Duration {
+        self.forwarded_attempt_timeout
+    }
+
+    /// Current per-frame socket-write timeout.
+    pub fn socket_write_timeout(&self) -> Duration {
+        self.socket_write_timeout
+    }
+
+    /// Current ordinary replication ACK timeout.
+    pub fn replication_ack_timeout(&self) -> Duration {
+        self.replication_ack_timeout
+    }
+
+    fn sender_options(&self) -> SenderRuntimeOptions {
+        SenderRuntimeOptions::default()
+            .with_ack_timeout(self.replication_ack_timeout)
+            .with_queue_admission_timeout(self.queue_admission_timeout)
+    }
+
+    fn validate(&self) -> Result<(), NodeError> {
+        if self.peer_queue_frame_capacity == 0 {
+            return Err(NodeError::Actor(
+                "peer queue frame capacity must be non-zero".to_string(),
+            ));
+        }
+        if self.peer_queue_frame_capacity > tokio::sync::Semaphore::MAX_PERMITS {
+            return Err(NodeError::Actor(format!(
+                "peer queue frame capacity exceeds maximum {}",
+                tokio::sync::Semaphore::MAX_PERMITS
+            )));
+        }
+        if self.queue_admission_timeout.is_zero()
+            || self.forwarded_attempt_timeout.is_zero()
+            || self.socket_write_timeout.is_zero()
+            || self.replication_ack_timeout.is_zero()
+        {
+            return Err(NodeError::Actor(
+                "runtime transport and replication timeouts must be non-zero".to_string(),
+            ));
+        }
+        let now = Instant::now();
+        if [
+            self.queue_admission_timeout,
+            self.forwarded_attempt_timeout,
+            self.socket_write_timeout,
+            self.replication_ack_timeout,
+        ]
+        .iter()
+        .any(|timeout| now.checked_add(*timeout).is_none())
+        {
+            return Err(NodeError::Actor(
+                "runtime transport and replication timeouts must be representable".to_string(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// Configuration for a [Node]. Start with `NodeConfig::default()` and
@@ -865,30 +1116,28 @@ impl Node {
         listen_addr: SocketAddr,
         config: NodeConfig,
     ) -> Result<Self, NodeError> {
+        Self::start_with_options(node_id, listen_addr, config, NodeRuntimeOptions::default()).await
+    }
+
+    /// Start a node with explicit runtime liveness and outbound-queue policy.
+    /// Existing callers can continue using [`Node::start`] for the defaults.
+    pub async fn start_with_options(
+        node_id: String,
+        listen_addr: SocketAddr,
+        config: NodeConfig,
+        runtime_options: NodeRuntimeOptions,
+    ) -> Result<Self, NodeError> {
+        runtime_options.validate()?;
         let dynamic = config.placement_controller.is_some();
         if config.fragment_count == 0 {
             return Err(NodeError::Actor(
                 "fragment_count must be non-zero".to_string(),
             ));
         }
-        if config.replication.batch_size == 0 {
-            return Err(NodeError::Actor(
-                "replication.batch_size must be non-zero".to_string(),
-            ));
-        }
-        if config.replication.max_in_flight == 0 {
-            return Err(NodeError::Actor(
-                "replication.max_in_flight must be non-zero".to_string(),
-            ));
-        }
-        if config.replication.batch_interval.is_zero()
-            || config.replication.consistency_interval.is_zero()
-            || config.replication.reconcile_timeout.is_zero()
-        {
-            return Err(NodeError::Actor(
-                "replication intervals and timeouts must be non-zero".to_string(),
-            ));
-        }
+        config
+            .replication
+            .validate()
+            .map_err(|error| NodeError::Actor(error.to_string()))?;
         if dynamic
             && (config.placement_poll_interval.is_zero()
                 || config.placement_drain_warn_interval.is_zero())
@@ -1015,8 +1264,8 @@ impl Node {
             placement_controller: config.placement_controller.clone(),
             placement_poll_interval: config.placement_poll_interval,
             members: config.members.clone(),
-            pending_gets: Arc::new(Mutex::new(HashMap::new())),
-            pending_batch_gets: Arc::new(Mutex::new(HashMap::new())),
+            pending_gets: Arc::new(StdMutex::new(HashMap::new())),
+            pending_batch_gets: Arc::new(StdMutex::new(HashMap::new())),
             pending_mutations: Arc::new(StdMutex::new(HashMap::new())),
             pending_relays: Arc::new(Mutex::new(HashMap::new())),
             pending_mutation_relays: Arc::new(Mutex::new(HashMap::new())),
@@ -1026,6 +1275,7 @@ impl Node {
             hlc: hlc.clone(),
             senders: Arc::new(Mutex::new(HashMap::new())),
             sender_config: config.replication.clone(),
+            runtime_options: runtime_options.clone(),
             sender_reports: Arc::new(Mutex::new(HashMap::new())),
             sync_entries_applied: Arc::new(AtomicU64::new(0)),
             membership_tx: membership_tx.clone(),
@@ -1069,6 +1319,7 @@ impl Node {
                 senders: node.senders.clone(),
                 sender_reports: node.sender_reports.clone(),
                 sender_config: node.sender_config.clone(),
+                sender_runtime: node.runtime_options.sender_options(),
                 peers: node.peers.clone(),
                 hlc: hlc.clone(),
             };
@@ -1095,6 +1346,8 @@ impl Node {
             hlc: node.hlc.clone(),
             senders: node.senders.clone(),
             sender_config: node.sender_config.clone(),
+            sender_runtime: node.runtime_options.sender_options(),
+            runtime_options: node.runtime_options.clone(),
             sender_reports: node.sender_reports.clone(),
             sync_entries_applied: node.sync_entries_applied.clone(),
             membership_tx: node.membership_tx.clone(),
@@ -1154,6 +1407,8 @@ impl Node {
             hlc: self.hlc.clone(),
             senders: self.senders.clone(),
             sender_config: self.sender_config.clone(),
+            sender_runtime: self.runtime_options.sender_options(),
+            runtime_options: self.runtime_options.clone(),
             sender_reports: self.sender_reports.clone(),
             sync_entries_applied: self.sync_entries_applied.clone(),
             membership_tx: self.membership_tx.clone(),
@@ -1191,10 +1446,12 @@ impl Node {
             peer,
             SenderEntryDeps {
                 config: &self.sender_config,
+                runtime: &self.runtime_options.sender_options(),
                 router: &self.router,
                 hlc: &self.hlc,
                 senders: &self.senders,
                 reports: &self.sender_reports,
+                peers: &self.peers,
             },
         )
         .await;
@@ -1236,7 +1493,7 @@ impl Node {
     }
 
     /// Outbound channel to `node_id`, if connected.
-    async fn peer_sender(&self, node_id: &str) -> Option<mpsc::Sender<Vec<u8>>> {
+    async fn peer_sender(&self, node_id: &str) -> Option<PeerChannel> {
         self.peers.lock().await.get(node_id).cloned()
     }
 
@@ -1410,43 +1667,42 @@ impl Node {
             req_id,
             pending: self.pending_mutations.clone(),
         };
-        let response = tokio::time::timeout(REMOTE_RPC_TIMEOUT, async {
-            if !try_send_envelope(
-                &tx,
-                Envelope {
-                    msg: Some(EnvelopeMsg::ForwardedPut(ForwardedPut {
-                        key: op.key,
-                        value: op.value.value,
-                        timestamp_ms: op.value.timestamp_ms,
-                        node_id: op.value.node_id,
-                        seq: op.seq,
-                        boot_id: op.boot_id,
-                        expires_at_ms: op.value.expires_at_ms.unwrap_or(0),
-                        is_tombstone: op.value.is_tombstone,
-                        priority: priority_to_proto(priority),
-                        hops: 0,
-                        req_id,
-                    })),
-                },
-            )
-            .await
-            {
-                return Err(NodeError::Network(format!(
-                    "connection to fragment owner {owner} closed while sending mutation"
-                )));
-            }
-            resp_rx
-                .await
-                .map_err(|_| NodeError::Actor("forwarded mutation reply dropped".to_string()))
-        })
-        .await;
+        let attempt_deadline = deadline_after(self.runtime_options.forwarded_attempt_timeout);
+        if !try_send_envelope_until(
+            &tx,
+            Envelope {
+                msg: Some(EnvelopeMsg::ForwardedPut(ForwardedPut {
+                    key: op.key,
+                    value: op.value.value,
+                    timestamp_ms: op.value.timestamp_ms,
+                    node_id: op.value.node_id,
+                    seq: op.seq,
+                    boot_id: op.boot_id,
+                    expires_at_ms: op.value.expires_at_ms.unwrap_or(0),
+                    is_tombstone: op.value.is_tombstone,
+                    priority: priority_to_proto(priority),
+                    hops: 0,
+                    req_id,
+                })),
+            },
+            attempt_deadline,
+        )
+        .await
+        {
+            return Err(NodeError::Network(format!(
+                "connection to fragment owner {owner} closed or timed out while sending mutation"
+            )));
+        }
+        let response = tokio::time::timeout_at(attempt_deadline, resp_rx).await;
         match response {
             Ok(Ok(mut results)) => {
                 validate_mutation_results(std::slice::from_ref(&expected_key), &results)?;
                 let result = results.remove(0);
                 decode_mutation_result(result)
             }
-            Ok(Err(error)) => Err(error),
+            Ok(Err(_)) => Err(NodeError::Actor(
+                "forwarded mutation reply dropped".to_string(),
+            )),
             Err(_) => Err(NodeError::Network(format!(
                 "forwarded mutation to {owner} timed out"
             ))),
@@ -1505,8 +1761,13 @@ impl Node {
         })?;
         let req_id = self.next_req_id.fetch_add(1, Ordering::Relaxed);
         let (resp_tx, resp_rx) = oneshot::channel();
-        self.pending_gets.lock().await.insert(req_id, resp_tx);
-        send_envelope(
+        self.pending_gets.lock().unwrap().insert(req_id, resp_tx);
+        let _pending_guard = PendingGetGuard {
+            req_id,
+            pending: self.pending_gets.clone(),
+        };
+        let attempt_deadline = deadline_after(self.runtime_options.forwarded_attempt_timeout);
+        if !try_send_envelope_until(
             &tx,
             Envelope {
                 msg: Some(EnvelopeMsg::ForwardedGet(ForwardedGet {
@@ -1516,19 +1777,22 @@ impl Node {
                     hops: 0,
                 })),
             },
+            attempt_deadline,
         )
-        .await;
-        // Bounded wait: a dead owner must not hang the caller forever.
-        match tokio::time::timeout(Duration::from_secs(5), resp_rx).await {
+        .await
+        {
+            return Err(NodeError::Network(format!(
+                "connection to fragment owner {owner} closed or timed out while sending read"
+            )));
+        }
+        let response = tokio::time::timeout_at(attempt_deadline, resp_rx).await;
+        match response {
             Ok(Ok(Ok(value))) => Ok(value),
             Ok(Ok(Err(shed))) => Err(NodeError::Backpressure(shed)),
             Ok(Err(_)) => Err(NodeError::Actor("forwarded get dropped".to_string())),
-            Err(_) => {
-                self.pending_gets.lock().await.remove(&req_id);
-                Err(NodeError::Network(format!(
-                    "forwarded get to {owner} timed out"
-                )))
-            }
+            Err(_) => Err(NodeError::Network(format!(
+                "forwarded get to {owner} timed out"
+            ))),
         }
     }
 
@@ -1550,8 +1814,9 @@ impl Node {
     /// accepts the batch. Returns per-key results in input order.
     ///
     /// Local and remote keys await an exact per-key apply outcome. Remote
-    /// batches have a 5s timeout per replica attempt and fail over
-    /// idempotently when a connection drops or no response arrives.
+    /// batches use the configured timeout (5 seconds by default) per replica
+    /// attempt and fail over idempotently when a connection drops or no
+    /// response arrives.
     pub async fn put_multi_with_priority(
         &self,
         kvs: Vec<(String, Vec<u8>)>,
@@ -1642,24 +1907,24 @@ impl Node {
                     req_id,
                     pending: self.pending_mutations.clone(),
                 };
-                let response = tokio::time::timeout(REMOTE_RPC_TIMEOUT, async {
-                    if !try_send_envelope(
-                        &tx,
-                        Envelope {
-                            msg: Some(EnvelopeMsg::BatchPut(BatchPut {
-                                puts: puts.clone(),
-                                priority: wire_priority,
-                                req_id,
-                            })),
-                        },
-                    )
-                    .await
-                    {
-                        return Err(());
-                    }
-                    resp_rx.await.map_err(|_| ())
-                })
-                .await;
+                let attempt_deadline =
+                    deadline_after(self.runtime_options.forwarded_attempt_timeout);
+                if !try_send_envelope_until(
+                    &tx,
+                    Envelope {
+                        msg: Some(EnvelopeMsg::BatchPut(BatchPut {
+                            puts: puts.clone(),
+                            priority: wire_priority,
+                            req_id,
+                        })),
+                    },
+                    attempt_deadline,
+                )
+                .await
+                {
+                    continue;
+                }
+                let response = tokio::time::timeout_at(attempt_deadline, resp_rx).await;
                 match response {
                     Ok(Ok(wire_results))
                         if validate_mutation_results(&expected_keys, &wire_results).is_ok() =>
@@ -1721,8 +1986,8 @@ impl Node {
     /// and each fragment's keys are fetched with one `BatchGet` message.
     /// Returns per-key results in input order.
     ///
-    /// Remote reads have a 5s timeout per replica attempt and fail over
-    /// to the next replica holder when the preferred owner is
+    /// Remote reads use the configured timeout (5 seconds by default) per
+    /// replica attempt and fail over to the next replica holder when the preferred owner is
     /// unreachable or stops responding; a dead owner fails only its
     /// keys, and only when no replica holder answers. Errors are
     /// classified: `NodeError::Actor` for misconfiguration (no replica
@@ -1782,8 +2047,17 @@ impl Node {
                 };
                 let req_id = self.next_req_id.fetch_add(1, Ordering::Relaxed);
                 let (resp_tx, resp_rx) = oneshot::channel();
-                self.pending_batch_gets.lock().await.insert(req_id, resp_tx);
-                send_envelope(
+                self.pending_batch_gets
+                    .lock()
+                    .unwrap()
+                    .insert(req_id, resp_tx);
+                let _pending_guard = PendingBatchGetGuard {
+                    req_id,
+                    pending: self.pending_batch_gets.clone(),
+                };
+                let attempt_deadline =
+                    deadline_after(self.runtime_options.forwarded_attempt_timeout);
+                if !try_send_envelope_until(
                     &tx,
                     Envelope {
                         msg: Some(EnvelopeMsg::BatchGet(BatchGet {
@@ -1792,49 +2066,48 @@ impl Node {
                             priority: wire_priority,
                         })),
                     },
+                    attempt_deadline,
                 )
-                .await;
-                match tokio::time::timeout(Duration::from_secs(5), resp_rx).await {
-                    Ok(Ok(kvs)) => {
-                        // Map back by key.
-                        let by_key: HashMap<String, BatchKeyValue> =
-                            kvs.into_iter().map(|kv| (kv.key.clone(), kv)).collect();
-                        for (i, key) in indices.iter().zip(&keys) {
-                            match by_key.get(key) {
-                                Some(kv) if kv.shed => {
-                                    results[*i] = Some(Err(NodeError::Backpressure(format!(
-                                        "batch get for key {key} shed by remote"
-                                    ))));
-                                }
-                                Some(kv) if kv.found => {
-                                    let mut v = VersionedValue::new(
-                                        kv.value.clone(),
-                                        kv.timestamp_ms,
-                                        kv.node_id.clone(),
-                                    );
-                                    v.expires_at_ms = if kv.expires_at_ms == 0 {
-                                        None
-                                    } else {
-                                        Some(kv.expires_at_ms)
-                                    };
-                                    v.is_tombstone = kv.is_tombstone;
-                                    // Tombstones read as absent.
-                                    results[*i] =
-                                        Some(Ok(if v.is_tombstone { None } else { Some(v) }));
-                                }
-                                _ => results[*i] = Some(Ok(None)),
-                            }
-                        }
-                        done = true;
-                        break;
-                    }
-                    // Dropped reply or timeout: clean up and fail over
-                    // to the next replica. A late response for a
-                    // removed req_id is ignored by the handler.
-                    _ => {
-                        self.pending_batch_gets.lock().await.remove(&req_id);
-                    }
+                .await
+                {
+                    continue;
                 }
+                let response = tokio::time::timeout_at(attempt_deadline, resp_rx).await;
+                if let Ok(Ok(kvs)) = response {
+                    // Map back by key.
+                    let by_key: HashMap<String, BatchKeyValue> =
+                        kvs.into_iter().map(|kv| (kv.key.clone(), kv)).collect();
+                    for (i, key) in indices.iter().zip(&keys) {
+                        match by_key.get(key) {
+                            Some(kv) if kv.shed => {
+                                results[*i] = Some(Err(NodeError::Backpressure(format!(
+                                    "batch get for key {key} shed by remote"
+                                ))));
+                            }
+                            Some(kv) if kv.found => {
+                                let mut v = VersionedValue::new(
+                                    kv.value.clone(),
+                                    kv.timestamp_ms,
+                                    kv.node_id.clone(),
+                                );
+                                v.expires_at_ms = if kv.expires_at_ms == 0 {
+                                    None
+                                } else {
+                                    Some(kv.expires_at_ms)
+                                };
+                                v.is_tombstone = kv.is_tombstone;
+                                // Tombstones read as absent.
+                                results[*i] = Some(Ok(if v.is_tombstone { None } else { Some(v) }));
+                            }
+                            _ => results[*i] = Some(Ok(None)),
+                        }
+                    }
+                    done = true;
+                    break;
+                }
+                // A dropped reply or timeout falls through to the next
+                // replica. The guard removes this req_id, so a late response
+                // is ignored by the handler.
             }
             if !done {
                 for i in indices {
@@ -1856,9 +2129,9 @@ impl Node {
     ///
     /// Bulk gets run at [`OpPriority::Background`]; see
     /// [`get_multi_with_priority`](Self::get_multi_with_priority) for an
-    /// explicit priority. Remote reads have a 5s timeout per replica
-    /// attempt; a dead owner fails only its keys, and only when no
-    /// replica holder answers.
+    /// explicit priority. Remote reads use the configured timeout (5 seconds
+    /// by default) per replica attempt; a dead owner fails only its keys, and
+    /// only when no replica holder answers.
     pub async fn get_multi(
         &self,
         keys: Vec<String>,
@@ -1980,6 +2253,7 @@ struct PlacementDriverDeps {
     senders: SenderMap,
     sender_reports: SenderReportMap,
     sender_config: SenderConfig,
+    sender_runtime: SenderRuntimeOptions,
     peers: PeerMap,
     hlc: Arc<Mutex<HlcClock>>,
 }
@@ -1992,10 +2266,12 @@ impl PlacementDriverDeps {
             peer,
             SenderEntryDeps {
                 config: &self.sender_config,
+                runtime: &self.sender_runtime,
                 router: &self.router,
                 hlc: &self.hlc,
                 senders: &self.senders,
                 reports: &self.sender_reports,
+                peers: &self.peers,
             },
         )
         .await;
@@ -2148,7 +2424,7 @@ async fn ensure_fragment_senders(
                 (peers.get(peer), senders.get(&(fragment, peer.clone())))
             {
                 let _ = sender.send(SenderMsg::PeerConnected {
-                    peer_tx: tx.clone(),
+                    peer_tx: tx.raw_sender(),
                 });
             }
         }
@@ -2232,7 +2508,7 @@ async fn gain_fragment(deps: &PlacementDriverDeps, fragment: FragmentId) {
                 (peers.get(peer), senders.get(&(fragment, peer.clone())))
             {
                 let _ = sender.send(SenderMsg::PeerConnected {
-                    peer_tx: tx.clone(),
+                    peer_tx: tx.raw_sender(),
                 });
             }
         }
@@ -2323,7 +2599,7 @@ async fn lose_fragment(deps: &PlacementDriverDeps, fragment: FragmentId) {
             if *f == fragment {
                 if let Some(peer_tx) = peers.get(p) {
                     let _ = tx.send(SenderMsg::PeerConnected {
-                        peer_tx: peer_tx.clone(),
+                        peer_tx: peer_tx.raw_sender(),
                     });
                 }
             }
@@ -2444,6 +2720,8 @@ async fn handle_connection(ctx: ConnContext, stream: BoxStream, we_dialed: bool)
         hlc,
         senders,
         sender_config,
+        sender_runtime,
+        runtime_options,
         sender_reports,
         sync_entries_applied,
         membership_tx,
@@ -2459,20 +2737,29 @@ async fn handle_connection(ctx: ConnContext, stream: BoxStream, we_dialed: bool)
     // the poison and lets the sender retry the complete round.
     let mut reconcile_failures: HashMap<(String, FragmentId), (u64, String)> = HashMap::new();
     let (mut reader, writer) = tokio::io::split(stream);
-    let (tx, mut rx) = mpsc::channel::<Vec<u8>>(PEER_CHANNEL_DEPTH);
+    let (raw_tx, rx) = mpsc::channel::<Vec<u8>>(runtime_options.peer_queue_frame_capacity);
+    let (cancel, _) = watch::channel(false);
+    let tx = PeerChannel {
+        tx: raw_tx,
+        cancel: cancel.clone(),
+        queue_admission_timeout: runtime_options.queue_admission_timeout,
+    };
+    let writer_cancel = cancel.subscribe();
+    // Subscribe before the writer or handshake can signal cancellation;
+    // subscribing after an early failure would mark that value as already
+    // observed and leave the read side waiting forever.
+    let mut read_cancel = cancel.subscribe();
+    let writer_cancel_tx = cancel.clone();
+    let socket_write_timeout = runtime_options.socket_write_timeout;
 
     // Writer task: owns the socket's write half, drains the queue.
-    let writer_task = tokio::spawn(async move {
-        let mut w = writer;
-        while let Some(frame) = rx.recv().await {
-            if w.write_u32(frame.len() as u32).await.is_err() {
-                break;
-            }
-            if w.write_all(&frame).await.is_err() {
-                break;
-            }
-        }
-    });
+    let writer_task = tokio::spawn(run_peer_writer(
+        writer,
+        rx,
+        writer_cancel,
+        writer_cancel_tx,
+        socket_write_timeout,
+    ));
     tasks.lock().await.push(writer_task.abort_handle());
 
     // The dialer introduces itself first.
@@ -2488,17 +2775,35 @@ async fn handle_connection(ctx: ConnContext, stream: BoxStream, we_dialed: bool)
         pending_relays: pending_relays.clone(),
         pending_mutation_relays: pending_mutation_relays.clone(),
         next_req_id: next_req_id.clone(),
+        forwarded_attempt_timeout: runtime_options.forwarded_attempt_timeout,
     };
 
     let mut peer_node_id: Option<String> = None;
     // Length-delimited framing: 4-byte big-endian length prefix.
-    while let Ok(n) = reader.read_u32().await {
+    loop {
+        let n = tokio::select! {
+            changed = read_cancel.changed() => {
+                let _ = changed;
+                break;
+            }
+            result = reader.read_u32() => {
+                let Ok(n) = result else { break };
+                n
+            }
+        };
         let len = n as usize;
         if len > MAX_FRAME_BYTES {
             break; // corrupt stream; drop the connection
         }
         let mut buf = vec![0u8; len];
-        if reader.read_exact(&mut buf).await.is_err() {
+        let read_result = tokio::select! {
+            changed = read_cancel.changed() => {
+                let _ = changed;
+                break;
+            }
+            result = reader.read_exact(&mut buf) => result,
+        };
+        if read_result.is_err() {
             break;
         }
         let envelope = match Envelope::decode(&buf[..]) {
@@ -2549,7 +2854,11 @@ async fn handle_connection(ctx: ConnContext, stream: BoxStream, we_dialed: bool)
                     }
                 }
                 peer_node_id = Some(peer.clone());
-                peers.lock().await.insert(peer.clone(), tx.clone());
+                if let Some(previous) = peers.lock().await.insert(peer.clone(), tx.clone()) {
+                    if !previous.same_channel(&tx) {
+                        previous.cancel();
+                    }
+                }
                 if !we_dialed {
                     // The listener answers the handshake...
                     send_hello(&tx, &node_id, cluster_secret.as_deref()).await;
@@ -2584,10 +2893,12 @@ async fn handle_connection(ctx: ConnContext, stream: BoxStream, we_dialed: bool)
                             &peer,
                             SenderEntryDeps {
                                 config: &sender_config,
+                                runtime: &sender_runtime,
                                 router: &router,
                                 hlc: &hlc,
                                 senders: &senders,
                                 reports: &sender_reports,
+                                peers: &peers,
                             },
                         )
                         .await;
@@ -2609,7 +2920,7 @@ async fn handle_connection(ctx: ConnContext, stream: BoxStream, we_dialed: bool)
                     for ((_, sender_peer), sender_tx) in senders_guard.iter() {
                         if sender_peer == &peer {
                             let _ = sender_tx.send(SenderMsg::PeerConnected {
-                                peer_tx: tx.clone(),
+                                peer_tx: tx.raw_sender(),
                             });
                         }
                     }
@@ -3139,12 +3450,14 @@ async fn handle_connection(ctx: ConnContext, stream: BoxStream, we_dialed: bool)
                 }
                 // A relayed read completing: forward the response to the
                 // origin peer with its original req_id.
-                if let Some((origin_tx, orig_id)) = pending_relays.lock().await.remove(&r.req_id) {
+                let relay = { pending_relays.lock().await.remove(&r.req_id) };
+                if let Some(relay) = relay {
+                    let _ = relay.timeout_cancel.send(());
                     send_envelope(
-                        &origin_tx,
+                        &relay.origin_tx,
                         Envelope {
                             msg: Some(EnvelopeMsg::GetResponse(GetResponse {
-                                req_id: orig_id,
+                                req_id: relay.origin_req_id,
                                 ..r
                             })),
                         },
@@ -3152,7 +3465,7 @@ async fn handle_connection(ctx: ConnContext, stream: BoxStream, we_dialed: bool)
                     .await;
                     continue;
                 }
-                if let Some(resp_tx) = pending_gets.lock().await.remove(&r.req_id) {
+                if let Some(resp_tx) = pending_gets.lock().unwrap().remove(&r.req_id) {
                     if r.shed {
                         let _ = resp_tx.send(Err(
                             "shed: remote pool at queue cap or rate limit".to_string()
@@ -3413,7 +3726,7 @@ async fn handle_connection(ctx: ConnContext, stream: BoxStream, we_dialed: bool)
                         break;
                     }
                 }
-                if let Some(resp_tx) = pending_batch_gets.lock().await.remove(&r.req_id) {
+                if let Some(resp_tx) = pending_batch_gets.lock().unwrap().remove(&r.req_id) {
                     let _ = resp_tx.send(r.results);
                 }
             }
@@ -3514,7 +3827,7 @@ async fn handle_connection(ctx: ConnContext, stream: BoxStream, we_dialed: bool)
                 for ((_, p), sender_tx) in senders_guard.iter() {
                     if p == &peer {
                         let _ = sender_tx.send(SenderMsg::PeerDisconnected {
-                            peer_tx: tx.clone(),
+                            peer_tx: tx.raw_sender(),
                         });
                     }
                 }
@@ -3526,6 +3839,7 @@ async fn handle_connection(ctx: ConnContext, stream: BoxStream, we_dialed: bool)
             }
         }
     }
+    tx.cancel();
     writer_task.abort();
 }
 
@@ -3539,6 +3853,7 @@ struct ReforwardCtx {
     pending_relays: RelayMap,
     pending_mutation_relays: MutationRelayMap,
     next_req_id: Arc<AtomicU64>,
+    forwarded_attempt_timeout: Duration,
 }
 
 /// The current owner for a re-forward: not us, and not the peer the op
@@ -3547,7 +3862,7 @@ async fn reforward_target(
     ctx: &ReforwardCtx,
     peer_node_id: &Option<String>,
     frag: FragmentId,
-) -> Option<(String, mpsc::Sender<Vec<u8>>)> {
+) -> Option<(String, PeerChannel)> {
     let replicas = ctx.placement.read().unwrap().get(&frag).cloned()?;
     let peers = ctx.peers.lock().await;
     for owner in replicas {
@@ -3574,12 +3889,7 @@ fn unavailable_mutation_results(keys: Vec<String>, reason: &str) -> Vec<Mutation
         .collect()
 }
 
-async fn send_unavailable_mutation(
-    tx: &mpsc::Sender<Vec<u8>>,
-    req_id: u64,
-    keys: Vec<String>,
-    reason: &str,
-) {
+async fn send_unavailable_mutation(tx: &PeerChannel, req_id: u64, keys: Vec<String>, reason: &str) {
     send_mutation_response(
         tx,
         MutationResponse {
@@ -3590,18 +3900,14 @@ async fn send_unavailable_mutation(
     .await;
 }
 
-async fn send_mutation_response(tx: &mpsc::Sender<Vec<u8>>, response: MutationResponse) -> bool {
-    tokio::time::timeout(
-        REMOTE_RPC_TIMEOUT,
-        try_send_envelope(
-            tx,
-            Envelope {
-                msg: Some(EnvelopeMsg::MutationResponse(response)),
-            },
-        ),
+async fn send_mutation_response(tx: &PeerChannel, response: MutationResponse) -> bool {
+    try_send_envelope(
+        tx,
+        Envelope {
+            msg: Some(EnvelopeMsg::MutationResponse(response)),
+        },
     )
     .await
-    .unwrap_or(false)
 }
 
 async fn register_mutation_relay(
@@ -3609,9 +3915,9 @@ async fn register_mutation_relay(
     relay_id: u64,
     expected_peer: String,
     expected_keys: Vec<String>,
-    origin_tx: mpsc::Sender<Vec<u8>>,
+    origin_tx: PeerChannel,
     origin_req_id: u64,
-    timeout_after: Duration,
+    deadline: Instant,
 ) {
     let (timeout_cancel, cancelled) = oneshot::channel();
     let timeout_keys = expected_keys.clone();
@@ -3630,7 +3936,7 @@ async fn register_mutation_relay(
     // in the map, so every registered relay has exactly one live deadline.
     tokio::spawn(async move {
         tokio::select! {
-            _ = tokio::time::sleep(timeout_after) => {
+            _ = tokio::time::sleep_until(deadline) => {
                 let relay = { relays.lock().await.remove(&relay_id) };
                 if let Some(relay) = relay {
                     send_unavailable_mutation(
@@ -3647,13 +3953,39 @@ async fn register_mutation_relay(
     });
 }
 
+async fn register_get_relay(
+    relays: RelayMap,
+    relay_id: u64,
+    origin_tx: PeerChannel,
+    origin_req_id: u64,
+    deadline: Instant,
+) {
+    let (timeout_cancel, cancelled) = oneshot::channel();
+    relays.lock().await.insert(
+        relay_id,
+        GetRelay {
+            origin_tx,
+            origin_req_id,
+            timeout_cancel,
+        },
+    );
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = tokio::time::sleep_until(deadline) => {
+                relays.lock().await.remove(&relay_id);
+            }
+            _ = cancelled => {}
+        }
+    });
+}
+
 /// Relay a write to the fragment's current owner and preserve the exact
 /// response path. A fresh local request id prevents collisions between
 /// independent upstream peers.
 async fn relay_put(
     mut p: ForwardedPut,
     frag: FragmentId,
-    origin_tx: &mpsc::Sender<Vec<u8>>,
+    origin_tx: &PeerChannel,
     peer_node_id: &Option<String>,
     ctx: &ReforwardCtx,
 ) {
@@ -3670,6 +4002,7 @@ async fn relay_put(
         return;
     };
     let relay_id = ctx.next_req_id.fetch_add(1, Ordering::Relaxed);
+    let attempt_deadline = deadline_after(ctx.forwarded_attempt_timeout);
     register_mutation_relay(
         ctx.pending_mutation_relays.clone(),
         relay_id,
@@ -3677,22 +4010,19 @@ async fn relay_put(
         keys.clone(),
         origin_tx.clone(),
         original_req_id,
-        REMOTE_RPC_TIMEOUT,
+        attempt_deadline,
     )
     .await;
     p.req_id = relay_id;
     p.hops += 1;
-    let sent = tokio::time::timeout(
-        REMOTE_RPC_TIMEOUT,
-        try_send_envelope(
-            &owner_tx,
-            Envelope {
-                msg: Some(EnvelopeMsg::ForwardedPut(p)),
-            },
-        ),
+    let sent = try_send_envelope_until(
+        &owner_tx,
+        Envelope {
+            msg: Some(EnvelopeMsg::ForwardedPut(p)),
+        },
+        attempt_deadline,
     )
-    .await
-    .unwrap_or(false);
+    .await;
     if !sent {
         let relay = { ctx.pending_mutation_relays.lock().await.remove(&relay_id) };
         if let Some(relay) = relay {
@@ -3712,7 +4042,7 @@ async fn relay_put(
 async fn relay_batch(
     mut bp: BatchPut,
     frag: FragmentId,
-    origin_tx: &mpsc::Sender<Vec<u8>>,
+    origin_tx: &PeerChannel,
     peer_node_id: &Option<String>,
     ctx: &ReforwardCtx,
 ) {
@@ -3729,6 +4059,7 @@ async fn relay_batch(
         return;
     };
     let relay_id = ctx.next_req_id.fetch_add(1, Ordering::Relaxed);
+    let attempt_deadline = deadline_after(ctx.forwarded_attempt_timeout);
     register_mutation_relay(
         ctx.pending_mutation_relays.clone(),
         relay_id,
@@ -3736,24 +4067,21 @@ async fn relay_batch(
         keys.clone(),
         origin_tx.clone(),
         original_req_id,
-        REMOTE_RPC_TIMEOUT,
+        attempt_deadline,
     )
     .await;
     bp.req_id = relay_id;
     for p in bp.puts.iter_mut() {
         p.hops += 1;
     }
-    let sent = tokio::time::timeout(
-        REMOTE_RPC_TIMEOUT,
-        try_send_envelope(
-            &owner_tx,
-            Envelope {
-                msg: Some(EnvelopeMsg::BatchPut(bp)),
-            },
-        ),
+    let sent = try_send_envelope_until(
+        &owner_tx,
+        Envelope {
+            msg: Some(EnvelopeMsg::BatchPut(bp)),
+        },
+        attempt_deadline,
     )
-    .await
-    .unwrap_or(false);
+    .await;
     if !sent {
         let relay = { ctx.pending_mutation_relays.lock().await.remove(&relay_id) };
         if let Some(relay) = relay {
@@ -3775,7 +4103,7 @@ async fn relay_batch(
 async fn relay_get(
     g: &ForwardedGet,
     frag: FragmentId,
-    origin_tx: &mpsc::Sender<Vec<u8>>,
+    origin_tx: &PeerChannel,
     peer_node_id: &Option<String>,
     ctx: &ReforwardCtx,
 ) {
@@ -3783,11 +4111,16 @@ async fn relay_get(
         return;
     };
     let relay_id = ctx.next_req_id.fetch_add(1, Ordering::Relaxed);
-    ctx.pending_relays
-        .lock()
-        .await
-        .insert(relay_id, (origin_tx.clone(), g.req_id));
-    send_envelope(
+    let attempt_deadline = deadline_after(ctx.forwarded_attempt_timeout);
+    register_get_relay(
+        ctx.pending_relays.clone(),
+        relay_id,
+        origin_tx.clone(),
+        g.req_id,
+        attempt_deadline,
+    )
+    .await;
+    let sent = try_send_envelope_until(
         &owner_tx,
         Envelope {
             msg: Some(EnvelopeMsg::ForwardedGet(ForwardedGet {
@@ -3798,8 +4131,14 @@ async fn relay_get(
                 hops: g.hops + 1,
             })),
         },
+        attempt_deadline,
     )
     .await;
+    if !sent {
+        if let Some(relay) = ctx.pending_relays.lock().await.remove(&relay_id) {
+            let _ = relay.timeout_cancel.send(());
+        }
+    }
 }
 
 /// Redial `addr` until a connection sticks, with exponential backoff.
@@ -3839,7 +4178,7 @@ fn jitter(backoff: Duration) -> Duration {
 /// Legacy gossip: re-send an op to all peers except the connection it
 /// arrived on. Only used when no fragment_map is configured; the sharded
 /// path fans out from the coordinator instead.
-async fn send_hello(tx: &mpsc::Sender<Vec<u8>>, node_id: &str, cluster_secret: Option<&[u8]>) {
+async fn send_hello(tx: &PeerChannel, node_id: &str, cluster_secret: Option<&[u8]>) {
     send_envelope(
         tx,
         Envelope {
@@ -3871,7 +4210,7 @@ fn verify_hello_auth_tag(secret: &[u8], node_id: &str, tag: &[u8]) -> bool {
     expected.as_slice().ct_eq(tag).into()
 }
 
-async fn send_sync_request(tx: &mpsc::Sender<Vec<u8>>, fragments: Vec<u32>) {
+async fn send_sync_request(tx: &PeerChannel, fragments: Vec<u32>) {
     send_envelope(
         tx,
         Envelope {
@@ -3883,21 +4222,72 @@ async fn send_sync_request(tx: &mpsc::Sender<Vec<u8>>, fragments: Vec<u32>) {
     .await;
 }
 
-async fn send_envelope(tx: &mpsc::Sender<Vec<u8>>, envelope: Envelope) {
+async fn send_envelope(tx: &PeerChannel, envelope: Envelope) {
     let _ = try_send_envelope(tx, envelope).await;
 }
 
-async fn try_send_envelope(tx: &mpsc::Sender<Vec<u8>>, envelope: Envelope) -> bool {
+async fn try_send_envelope(tx: &PeerChannel, envelope: Envelope) -> bool {
+    try_send_envelope_with_deadline(tx, envelope, None).await
+}
+
+async fn try_send_envelope_until(
+    tx: &PeerChannel,
+    envelope: Envelope,
+    attempt_deadline: Instant,
+) -> bool {
+    try_send_envelope_with_deadline(tx, envelope, Some(attempt_deadline)).await
+}
+
+async fn try_send_envelope_with_deadline(
+    tx: &PeerChannel,
+    envelope: Envelope,
+    attempt_deadline: Option<Instant>,
+) -> bool {
     let mut frame = Vec::new();
     if envelope.encode(&mut frame).is_err() {
         return false;
     }
-    tx.send(frame).await.is_ok()
+    let queue_deadline = deadline_after(tx.queue_admission_timeout);
+    let admission_deadline = attempt_deadline
+        .map(|deadline| deadline.min(queue_deadline))
+        .unwrap_or(queue_deadline);
+    if Instant::now() >= admission_deadline {
+        tx.cancel();
+        return false;
+    }
+    match tokio::time::timeout_at(admission_deadline, tx.tx.reserve()).await {
+        Ok(Ok(permit)) => {
+            if Instant::now() >= admission_deadline {
+                drop(permit);
+                tx.cancel();
+                return false;
+            }
+            permit.send(frame);
+            true
+        }
+        Ok(Err(_)) | Err(_) => {
+            tx.cancel();
+            false
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_peer_channel(capacity: usize) -> (PeerChannel, mpsc::Receiver<Vec<u8>>) {
+        let (tx, rx) = mpsc::channel(capacity);
+        let (cancel, _) = watch::channel(false);
+        (
+            PeerChannel {
+                tx,
+                cancel,
+                queue_admission_timeout: Duration::from_millis(10),
+            },
+            rx,
+        )
+    }
 
     fn result(key: &str, request_index: u32) -> MutationResult {
         MutationResult {
@@ -3918,6 +4308,28 @@ mod tests {
         assert!(validate_mutation_results(&expected, &[result("a", 0)]).is_err());
         assert!(validate_mutation_results(&expected, &[result("b", 0), result("a", 1)]).is_err());
         assert!(validate_mutation_results(&expected, &[result("a", 1), result("b", 0)]).is_err());
+    }
+
+    #[test]
+    fn runtime_option_defaults_are_explicit_and_source_compatible() {
+        let options = NodeRuntimeOptions::default();
+        assert_eq!(options.peer_queue_frame_capacity(), 256);
+        assert_eq!(options.queue_admission_timeout(), Duration::from_secs(5));
+        assert_eq!(options.forwarded_attempt_timeout(), Duration::from_secs(5));
+        assert_eq!(options.socket_write_timeout(), Duration::from_secs(30));
+        assert_eq!(options.replication_ack_timeout(), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn runtime_options_reject_unrepresentable_limits() {
+        assert!(NodeRuntimeOptions::default()
+            .with_socket_write_timeout(Duration::MAX)
+            .validate()
+            .is_err());
+        assert!(NodeRuntimeOptions::default()
+            .with_peer_queue_frame_capacity(tokio::sync::Semaphore::MAX_PERMITS.saturating_add(1))
+            .validate()
+            .is_err());
     }
 
     #[test]
@@ -3961,10 +4373,116 @@ mod tests {
         assert!(pending.lock().unwrap().is_empty());
     }
 
+    #[test]
+    fn dropping_pending_read_waiters_removes_registry_entries() {
+        let pending_gets: PendingGets = Arc::new(StdMutex::new(HashMap::new()));
+        let (get_reply, _get_response) = oneshot::channel();
+        pending_gets.lock().unwrap().insert(3, get_reply);
+        {
+            let _guard = PendingGetGuard {
+                req_id: 3,
+                pending: pending_gets.clone(),
+            };
+        }
+        assert!(pending_gets.lock().unwrap().is_empty());
+
+        let pending_batch_gets: PendingBatchGets = Arc::new(StdMutex::new(HashMap::new()));
+        let (batch_reply, _batch_response) = oneshot::channel();
+        pending_batch_gets.lock().unwrap().insert(4, batch_reply);
+        {
+            let _guard = PendingBatchGetGuard {
+                req_id: 4,
+                pending: pending_batch_gets.clone(),
+            };
+        }
+        assert!(pending_batch_gets.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn full_peer_queue_times_out_cancels_and_does_not_admit_frame() {
+        let (peer, mut rx) = test_peer_channel(1);
+        let mut cancelled = peer.cancel.subscribe();
+        let envelope = || Envelope { msg: None };
+        assert!(try_send_envelope(&peer, envelope()).await);
+        assert!(!try_send_envelope(&peer, envelope()).await);
+        tokio::time::timeout(Duration::from_secs(1), cancelled.changed())
+            .await
+            .expect("connection was not cancelled")
+            .expect("cancellation sender dropped");
+        assert!(*cancelled.borrow());
+        assert!(rx.recv().await.is_some());
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn forwarded_attempt_deadline_caps_queue_admission_wait() {
+        let (mut peer, mut rx) = test_peer_channel(1);
+        peer.queue_admission_timeout = Duration::from_secs(1);
+        assert!(try_send_envelope(&peer, Envelope { msg: None }).await);
+        let started = Instant::now();
+        assert!(
+            !try_send_envelope_until(
+                &peer,
+                Envelope { msg: None },
+                started + Duration::from_millis(10),
+            )
+            .await
+        );
+        assert!(started.elapsed() < Duration::from_millis(200));
+        assert!(rx.recv().await.is_some());
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn expired_forwarded_attempt_never_admits_to_an_empty_queue() {
+        let (peer, mut rx) = test_peer_channel(1);
+        let expired = Instant::now();
+        tokio::task::yield_now().await;
+        assert!(
+            !try_send_envelope_until(&peer, Envelope { msg: None }, expired).await,
+            "an expired total attempt budget must fail before reserving capacity"
+        );
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn closed_peer_queue_fails_and_cancels_connection() {
+        let (peer, rx) = test_peer_channel(1);
+        let mut cancelled = peer.cancel.subscribe();
+        drop(rx);
+        assert!(!try_send_envelope(&peer, Envelope { msg: None }).await);
+        tokio::time::timeout(Duration::from_secs(1), cancelled.changed())
+            .await
+            .expect("connection was not cancelled")
+            .expect("cancellation sender dropped");
+        assert!(*cancelled.borrow());
+    }
+
+    #[tokio::test]
+    async fn socket_write_timeout_signals_connection_cancellation() {
+        let (_reader, writer) = tokio::io::duplex(1);
+        let (frame_tx, frame_rx) = mpsc::channel(1);
+        let (cancel_tx, mut cancelled) = watch::channel(false);
+        frame_tx.send(vec![0; 1024]).await.unwrap();
+        let task = tokio::spawn(run_peer_writer(
+            writer,
+            frame_rx,
+            cancel_tx.subscribe(),
+            cancel_tx,
+            Duration::from_millis(10),
+        ));
+        tokio::time::timeout(Duration::from_secs(1), cancelled.changed())
+            .await
+            .expect("writer did not signal cancellation")
+            .expect("writer cancellation sender dropped");
+        assert!(*cancelled.borrow());
+        task.await.unwrap();
+    }
+
     #[tokio::test]
     async fn mutation_relay_timeout_removes_entry_and_replies_unavailable() {
         let relays: MutationRelayMap = Arc::new(Mutex::new(HashMap::new()));
-        let (origin_tx, mut origin_rx) = mpsc::channel(1);
+        let (origin_tx, mut origin_rx) = test_peer_channel(1);
         register_mutation_relay(
             relays.clone(),
             17,
@@ -3972,7 +4490,7 @@ mod tests {
             vec!["key".to_string()],
             origin_tx,
             9,
-            Duration::from_millis(10),
+            Instant::now() + Duration::from_millis(10),
         )
         .await;
         assert!(relays.lock().await.contains_key(&17));
@@ -3998,7 +4516,7 @@ mod tests {
     #[tokio::test]
     async fn completed_mutation_relay_cancels_timeout() {
         let relays: MutationRelayMap = Arc::new(Mutex::new(HashMap::new()));
-        let (origin_tx, mut origin_rx) = mpsc::channel(1);
+        let (origin_tx, mut origin_rx) = test_peer_channel(1);
         register_mutation_relay(
             relays.clone(),
             17,
@@ -4006,7 +4524,7 @@ mod tests {
             vec!["key".to_string()],
             origin_tx,
             9,
-            Duration::from_millis(10),
+            Instant::now() + Duration::from_millis(10),
         )
         .await;
         let relay = relays.lock().await.remove(&17).expect("relay missing");
@@ -4015,6 +4533,31 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(30)).await;
         assert!(origin_rx.try_recv().is_err());
         assert!(relays.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn read_relay_timeout_removes_registry_entry() {
+        let relays: RelayMap = Arc::new(Mutex::new(HashMap::new()));
+        let (origin_tx, _origin_rx) = test_peer_channel(1);
+        register_get_relay(
+            relays.clone(),
+            23,
+            origin_tx,
+            11,
+            Instant::now() + Duration::from_millis(10),
+        )
+        .await;
+        assert!(relays.lock().await.contains_key(&23));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if relays.lock().await.is_empty() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("relay deadline did not remove the entry");
     }
 
     #[tokio::test]
@@ -4032,7 +4575,7 @@ mod tests {
             ack_durability_mismatch: false,
             reconcile_rounds: 0,
         }));
-        let sender = spawn_sender(
+        let sender = crate::replication::spawn_sender(
             FragmentId(0),
             "peer".to_string(),
             SenderConfig {
@@ -4087,6 +4630,759 @@ mod tests {
             .send(SenderMsg::PeerDisconnected { peer_tx: new_tx })
             .unwrap();
         common_wait_for_sender_report(&report, |state| state.state == "disconnected").await;
+    }
+
+    #[tokio::test]
+    async fn reset_sender_retries_reconcile_after_live_queue_admission_timeout() {
+        let router = FragmentRouter {
+            actors: Arc::new(RwLock::new(HashMap::new())),
+            fragment_count: 1,
+        };
+        let report = Arc::new(Mutex::new(SenderStateReport {
+            state: "disconnected".to_string(),
+            session_id: 0,
+            buffered: 0,
+            in_flight: 0,
+            last_ack_durability: None,
+            ack_durability_mismatch: false,
+            reconcile_rounds: 0,
+        }));
+        let sender = spawn_sender_with_options(
+            FragmentId(0),
+            "peer".to_string(),
+            SenderConfig {
+                batch_interval: Duration::from_secs(3600),
+                buffer_capacity: 1,
+                consistency_interval: Duration::from_secs(3600),
+                reconcile_timeout: Duration::from_secs(5),
+                ..SenderConfig::default()
+            },
+            SenderDeps {
+                router,
+                hlc: Arc::new(Mutex::new(HlcClock::new())),
+                reset_senders: Arc::new(Mutex::new(HashMap::new())),
+                state_report: report.clone(),
+            },
+            SenderRuntimeOptions::default().with_queue_admission_timeout(Duration::from_millis(20)),
+        )
+        .expect("sender options are valid");
+        let op = |key: &str| ReplicatedOp {
+            key: key.to_string(),
+            value: VersionedValue::new(Vec::new(), 1, "node".to_string()),
+            seq: 0,
+            boot_id: 0,
+        };
+
+        sender.send(SenderMsg::Enqueue(op("first"))).unwrap();
+        sender.send(SenderMsg::Enqueue(op("overflow"))).unwrap();
+        common_wait_for_sender_report(&report, |state| {
+            state.state == "buffer_reset" && state.session_id == 0
+        })
+        .await;
+
+        let (peer_tx, mut peer_rx) = mpsc::channel(1);
+        sender.send(SenderMsg::PeerConnected { peer_tx }).unwrap();
+
+        // The SessionStart fills the only queue slot. The sender publishes
+        // this session only after the immediate ReconcileRequest admission
+        // has timed out against the still-live, full channel.
+        common_wait_for_sender_report(&report, |state| {
+            state.state == "buffer_reset" && state.session_id != 0
+        })
+        .await;
+        let session_id = report.lock().await.session_id;
+        let session_frame = peer_rx.recv().await.expect("SessionStart frame missing");
+        match Envelope::decode(session_frame.as_slice()).unwrap().msg {
+            Some(EnvelopeMsg::SessionStart(session)) => {
+                assert_eq!(session.session_id, session_id);
+                assert_eq!(session.fragment, 0);
+            }
+            other => panic!("expected SessionStart, got {other:?}"),
+        }
+        assert!(peer_rx.try_recv().is_err());
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(500), peer_rx.recv())
+                .await
+                .is_err(),
+            "reconcile retried before the retry floor"
+        );
+        let reconcile_frame = tokio::time::timeout(Duration::from_secs(2), peer_rx.recv())
+            .await
+            .expect("sender did not retry reconciliation")
+            .expect("peer channel closed");
+        match Envelope::decode(reconcile_frame.as_slice()).unwrap().msg {
+            Some(EnvelopeMsg::ReconcileRequest(request)) => {
+                assert_eq!(request.session_id, session_id);
+                assert_ne!(request.round_id, 0);
+                assert_eq!(request.fragment, 0);
+            }
+            other => panic!("expected ReconcileRequest, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn routine_reconcile_disconnect_drains_buffer_before_retry() {
+        let router = FragmentRouter {
+            actors: Arc::new(RwLock::new(HashMap::new())),
+            fragment_count: 1,
+        };
+        let report = Arc::new(Mutex::new(SenderStateReport {
+            state: "disconnected".to_string(),
+            session_id: 0,
+            buffered: 0,
+            in_flight: 0,
+            last_ack_durability: None,
+            ack_durability_mismatch: false,
+            reconcile_rounds: 0,
+        }));
+        let sender = spawn_sender_with_options(
+            FragmentId(0),
+            "peer".to_string(),
+            SenderConfig {
+                batch_interval: Duration::from_millis(10),
+                consistency_interval: Duration::from_secs(3600),
+                reconcile_timeout: Duration::from_secs(5),
+                ..SenderConfig::default()
+            },
+            SenderDeps {
+                router,
+                hlc: Arc::new(Mutex::new(HlcClock::new())),
+                reset_senders: Arc::new(Mutex::new(HashMap::new())),
+                state_report: report.clone(),
+            },
+            SenderRuntimeOptions::default(),
+        )
+        .expect("sender options are valid");
+
+        let (old_tx, mut old_rx) = mpsc::channel(4);
+        sender
+            .send(SenderMsg::PeerConnected {
+                peer_tx: old_tx.clone(),
+            })
+            .unwrap();
+        let old_session = match Envelope::decode(old_rx.recv().await.unwrap().as_slice())
+            .unwrap()
+            .msg
+        {
+            Some(EnvelopeMsg::SessionStart(session)) => session.session_id,
+            other => panic!("expected SessionStart, got {other:?}"),
+        };
+
+        sender.send(SenderMsg::ReconcileNow).unwrap();
+        let old_round = match Envelope::decode(old_rx.recv().await.unwrap().as_slice())
+            .unwrap()
+            .msg
+        {
+            Some(EnvelopeMsg::ReconcileRequest(request)) => {
+                assert_eq!(request.session_id, old_session);
+                request.round_id
+            }
+            other => panic!("expected ReconcileRequest, got {other:?}"),
+        };
+
+        sender
+            .send(SenderMsg::Enqueue(ReplicatedOp {
+                key: "buffered-during-reconcile".to_string(),
+                value: VersionedValue::new(b"value".to_vec(), 1, "node".to_string()),
+                seq: 7,
+                boot_id: 11,
+            }))
+            .unwrap();
+        sender
+            .send(SenderMsg::PeerDisconnected { peer_tx: old_tx })
+            .unwrap();
+        common_wait_for_sender_report(&report, |state| {
+            state.state == "disconnected" && state.buffered == 1
+        })
+        .await;
+
+        let (new_tx, mut new_rx) = mpsc::channel(4);
+        sender
+            .send(SenderMsg::PeerConnected { peer_tx: new_tx })
+            .unwrap();
+        let new_session = match Envelope::decode(new_rx.recv().await.unwrap().as_slice())
+            .unwrap()
+            .msg
+        {
+            Some(EnvelopeMsg::SessionStart(session)) => session.session_id,
+            other => panic!("expected replacement SessionStart, got {other:?}"),
+        };
+        assert_ne!(new_session, old_session);
+
+        let batch = tokio::time::timeout(Duration::from_secs(1), new_rx.recv())
+            .await
+            .expect("buffered mutation was not replayed")
+            .expect("replacement peer channel closed");
+        let batch = match Envelope::decode(batch.as_slice()).unwrap().msg {
+            Some(EnvelopeMsg::ReplicateBatch(batch)) => batch,
+            other => panic!("expected ReplicateBatch before reconcile retry, got {other:?}"),
+        };
+        assert_eq!(batch.session_id, new_session);
+        assert_eq!(batch.ops.len(), 1);
+        assert_eq!(batch.ops[0].key, "buffered-during-reconcile");
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), new_rx.recv())
+                .await
+                .is_err(),
+            "reconciliation retried before the ordinary batch was ACKed"
+        );
+        sender
+            .send(SenderMsg::Ack {
+                session_id: new_session,
+                batch_seq: batch.batch_seq,
+                durability: ReplicationAckDurability::MemoryApplied,
+            })
+            .unwrap();
+
+        let retry = tokio::time::timeout(Duration::from_secs(2), new_rx.recv())
+            .await
+            .expect("routine reconciliation was not retried after the batch ACK")
+            .expect("replacement peer channel closed");
+        match Envelope::decode(retry.as_slice()).unwrap().msg {
+            Some(EnvelopeMsg::ReconcileRequest(request)) => {
+                assert_eq!(request.session_id, new_session);
+                assert_ne!(request.round_id, 0);
+                assert_ne!(request.round_id, old_round);
+            }
+            other => panic!("expected ReconcileRequest after batch ACK, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn fresh_reconcile_pause_does_not_skip_requeued_batch_on_reconnect() {
+        let router = FragmentRouter {
+            actors: Arc::new(RwLock::new(HashMap::new())),
+            fragment_count: 1,
+        };
+        let report = Arc::new(Mutex::new(SenderStateReport {
+            state: "disconnected".to_string(),
+            session_id: 0,
+            buffered: 0,
+            in_flight: 0,
+            last_ack_durability: None,
+            ack_durability_mismatch: false,
+            reconcile_rounds: 0,
+        }));
+        let sender = spawn_sender_with_options(
+            FragmentId(0),
+            "peer".to_string(),
+            SenderConfig {
+                batch_interval: Duration::from_millis(10),
+                consistency_interval: Duration::from_secs(3600),
+                reconcile_timeout: Duration::from_secs(5),
+                ..SenderConfig::default()
+            },
+            SenderDeps {
+                router,
+                hlc: Arc::new(Mutex::new(HlcClock::new())),
+                reset_senders: Arc::new(Mutex::new(HashMap::new())),
+                state_report: report.clone(),
+            },
+            SenderRuntimeOptions::default(),
+        )
+        .expect("sender options are valid");
+
+        let (old_tx, mut old_rx) = mpsc::channel(4);
+        sender
+            .send(SenderMsg::PeerConnected {
+                peer_tx: old_tx.clone(),
+            })
+            .unwrap();
+        let old_session = match Envelope::decode(old_rx.recv().await.unwrap().as_slice())
+            .unwrap()
+            .msg
+        {
+            Some(EnvelopeMsg::SessionStart(session)) => session.session_id,
+            other => panic!("expected SessionStart, got {other:?}"),
+        };
+
+        sender
+            .send(SenderMsg::Enqueue(ReplicatedOp {
+                key: "requeued-for-reconnect".to_string(),
+                value: VersionedValue::new(b"value".to_vec(), 17, "node".to_string()),
+                seq: 23,
+                boot_id: 29,
+            }))
+            .unwrap();
+        let first_batch = tokio::time::timeout(Duration::from_secs(1), old_rx.recv())
+            .await
+            .expect("ordinary batch was not sent")
+            .expect("old peer channel closed");
+        let first_batch = match Envelope::decode(first_batch.as_slice()).unwrap().msg {
+            Some(EnvelopeMsg::ReplicateBatch(batch)) => batch,
+            other => panic!("expected ReplicateBatch, got {other:?}"),
+        };
+        assert_eq!(first_batch.session_id, old_session);
+        assert_eq!(first_batch.ops.len(), 1);
+
+        // ReconcileNow observes the in-flight batch and enters the fresh-drain
+        // pause. Disconnecting before its ACK must turn that batch back into
+        // replay work, rather than preserving a pause that skips the replay.
+        sender.send(SenderMsg::ReconcileNow).unwrap();
+        sender
+            .send(SenderMsg::PeerDisconnected { peer_tx: old_tx })
+            .unwrap();
+        common_wait_for_sender_report(&report, |state| {
+            state.state == "disconnected" && state.buffered == 1 && state.in_flight == 0
+        })
+        .await;
+        assert!(old_rx.try_recv().is_err());
+
+        let (new_tx, mut new_rx) = mpsc::channel(4);
+        sender
+            .send(SenderMsg::PeerConnected { peer_tx: new_tx })
+            .unwrap();
+        let new_session = match Envelope::decode(new_rx.recv().await.unwrap().as_slice())
+            .unwrap()
+            .msg
+        {
+            Some(EnvelopeMsg::SessionStart(session)) => session.session_id,
+            other => panic!("expected replacement SessionStart, got {other:?}"),
+        };
+        assert_ne!(new_session, old_session);
+
+        let replay = tokio::time::timeout(Duration::from_secs(1), new_rx.recv())
+            .await
+            .expect("requeued batch was not replayed")
+            .expect("replacement peer channel closed");
+        let replay = match Envelope::decode(replay.as_slice()).unwrap().msg {
+            Some(EnvelopeMsg::ReplicateBatch(batch)) => batch,
+            other => panic!("expected ReplicateBatch before reconcile retry, got {other:?}"),
+        };
+        assert_eq!(replay.session_id, new_session);
+        assert_eq!(replay.fragment, first_batch.fragment);
+        assert_eq!(replay.required_ack_level, first_batch.required_ack_level);
+        assert_eq!(replay.ops, first_batch.ops);
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), new_rx.recv())
+                .await
+                .is_err(),
+            "reconciliation retried before the replayed batch was ACKed"
+        );
+        sender
+            .send(SenderMsg::Ack {
+                session_id: new_session,
+                batch_seq: replay.batch_seq,
+                durability: ReplicationAckDurability::MemoryApplied,
+            })
+            .unwrap();
+
+        let retry = tokio::time::timeout(Duration::from_secs(2), new_rx.recv())
+            .await
+            .expect("routine reconciliation was not resumed after replay ACK")
+            .expect("replacement peer channel closed");
+        match Envelope::decode(retry.as_slice()).unwrap().msg {
+            Some(EnvelopeMsg::ReconcileRequest(request)) => {
+                assert_eq!(request.session_id, new_session);
+                assert_ne!(request.round_id, 0);
+            }
+            other => panic!("expected ReconcileRequest after replay ACK, got {other:?}"),
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum FreshPauseRequeue {
+        Nack,
+        AckTimeout,
+    }
+
+    #[tokio::test]
+    async fn fresh_reconcile_pause_does_not_skip_nacked_batch() {
+        assert_fresh_pause_replays_before_reconcile(FreshPauseRequeue::Nack).await;
+    }
+
+    #[tokio::test]
+    async fn fresh_reconcile_pause_does_not_skip_ack_timed_out_batch() {
+        assert_fresh_pause_replays_before_reconcile(FreshPauseRequeue::AckTimeout).await;
+    }
+
+    async fn assert_fresh_pause_replays_before_reconcile(trigger: FreshPauseRequeue) {
+        let router = FragmentRouter {
+            actors: Arc::new(RwLock::new(HashMap::new())),
+            fragment_count: 1,
+        };
+        let report = Arc::new(Mutex::new(SenderStateReport {
+            state: "disconnected".to_string(),
+            session_id: 0,
+            buffered: 0,
+            in_flight: 0,
+            last_ack_durability: None,
+            ack_durability_mismatch: false,
+            reconcile_rounds: 0,
+        }));
+        let required_ack_durability = match trigger {
+            FreshPauseRequeue::Nack => ReplicationAckDurability::MemoryApplied,
+            FreshPauseRequeue::AckTimeout => ReplicationAckDurability::StoreCommitted,
+        };
+        let runtime = match trigger {
+            FreshPauseRequeue::Nack => SenderRuntimeOptions::default(),
+            // The weak ACK below is an observable FIFO barrier proving that
+            // ReconcileNow was handled before this deliberately short expiry.
+            FreshPauseRequeue::AckTimeout => {
+                SenderRuntimeOptions::default().with_ack_timeout(Duration::from_secs(1))
+            }
+        };
+        let sender = spawn_sender_with_options(
+            FragmentId(0),
+            "peer".to_string(),
+            SenderConfig {
+                batch_interval: Duration::from_millis(10),
+                consistency_interval: Duration::from_secs(3600),
+                reconcile_timeout: Duration::from_secs(5),
+                required_ack_durability,
+                ..SenderConfig::default()
+            },
+            SenderDeps {
+                router,
+                hlc: Arc::new(Mutex::new(HlcClock::new())),
+                reset_senders: Arc::new(Mutex::new(HashMap::new())),
+                state_report: report.clone(),
+            },
+            runtime,
+        )
+        .expect("sender options are valid");
+
+        let (peer_tx, mut peer_rx) = mpsc::channel(4);
+        sender.send(SenderMsg::PeerConnected { peer_tx }).unwrap();
+        let first_session = match Envelope::decode(peer_rx.recv().await.unwrap().as_slice())
+            .unwrap()
+            .msg
+        {
+            Some(EnvelopeMsg::SessionStart(session)) => session.session_id,
+            other => panic!("expected SessionStart, got {other:?}"),
+        };
+
+        let key = match trigger {
+            FreshPauseRequeue::Nack => "requeued-after-nack",
+            FreshPauseRequeue::AckTimeout => "requeued-after-ack-timeout",
+        };
+        sender
+            .send(SenderMsg::Enqueue(ReplicatedOp {
+                key: key.to_string(),
+                value: VersionedValue::new(b"value".to_vec(), 31, "node".to_string()),
+                seq: 37,
+                boot_id: 41,
+            }))
+            .unwrap();
+        let first_batch = tokio::time::timeout(Duration::from_secs(1), peer_rx.recv())
+            .await
+            .expect("ordinary batch was not sent")
+            .expect("peer channel closed");
+        let first_batch = match Envelope::decode(first_batch.as_slice()).unwrap().msg {
+            Some(EnvelopeMsg::ReplicateBatch(batch)) => batch,
+            other => panic!("expected ReplicateBatch, got {other:?}"),
+        };
+        assert_eq!(first_batch.session_id, first_session);
+        assert_eq!(first_batch.ops.len(), 1);
+
+        sender.send(SenderMsg::ReconcileNow).unwrap();
+        let replay_session = match trigger {
+            FreshPauseRequeue::Nack => {
+                sender
+                    .send(SenderMsg::Nack {
+                        session_id: first_session,
+                        batch_seq: first_batch.batch_seq,
+                        error: "injected rejection".to_string(),
+                    })
+                    .unwrap();
+                common_wait_for_sender_report(&report, |state| {
+                    state.buffered == 1 && state.in_flight == 0
+                })
+                .await;
+                first_session
+            }
+            FreshPauseRequeue::AckTimeout => {
+                sender
+                    .send(SenderMsg::Ack {
+                        session_id: first_session,
+                        batch_seq: first_batch.batch_seq,
+                        durability: ReplicationAckDurability::MemoryApplied,
+                    })
+                    .unwrap();
+                common_wait_for_sender_report(&report, |state| {
+                    state.in_flight == 1 && state.ack_durability_mismatch
+                })
+                .await;
+                let session_frame = tokio::time::timeout(Duration::from_secs(2), peer_rx.recv())
+                    .await
+                    .expect("ACK timeout did not rotate the session")
+                    .expect("peer channel closed");
+                let session_id = match Envelope::decode(session_frame.as_slice()).unwrap().msg {
+                    Some(EnvelopeMsg::SessionStart(session)) => session.session_id,
+                    other => panic!("expected replacement SessionStart, got {other:?}"),
+                };
+                assert_ne!(session_id, first_session);
+                session_id
+            }
+        };
+
+        let replay = tokio::time::timeout(Duration::from_secs(2), peer_rx.recv())
+            .await
+            .expect("ordinary batch was not replayed")
+            .expect("peer channel closed");
+        let replay = match Envelope::decode(replay.as_slice()).unwrap().msg {
+            Some(EnvelopeMsg::ReplicateBatch(batch)) => batch,
+            other => panic!("expected ReplicateBatch before reconcile retry, got {other:?}"),
+        };
+        assert_eq!(replay.session_id, replay_session);
+        assert_eq!(replay.fragment, first_batch.fragment);
+        assert_eq!(replay.required_ack_level, first_batch.required_ack_level);
+        assert_eq!(replay.ops, first_batch.ops);
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), peer_rx.recv())
+                .await
+                .is_err(),
+            "reconciliation retried before the replayed batch was ACKed"
+        );
+        sender
+            .send(SenderMsg::Ack {
+                session_id: replay_session,
+                batch_seq: replay.batch_seq,
+                durability: required_ack_durability,
+            })
+            .unwrap();
+
+        let retry = tokio::time::timeout(Duration::from_secs(2), peer_rx.recv())
+            .await
+            .expect("routine reconciliation was not resumed after replay ACK")
+            .expect("peer channel closed");
+        match Envelope::decode(retry.as_slice()).unwrap().msg {
+            Some(EnvelopeMsg::ReconcileRequest(request)) => {
+                assert_eq!(request.session_id, replay_session);
+                assert_ne!(request.round_id, 0);
+            }
+            other => panic!("expected ReconcileRequest after replay ACK, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn reconnect_preserves_ordinary_nack_retry_floor() {
+        let router = FragmentRouter {
+            actors: Arc::new(RwLock::new(HashMap::new())),
+            fragment_count: 1,
+        };
+        let report = Arc::new(Mutex::new(SenderStateReport {
+            state: "disconnected".to_string(),
+            session_id: 0,
+            buffered: 0,
+            in_flight: 0,
+            last_ack_durability: None,
+            ack_durability_mismatch: false,
+            reconcile_rounds: 0,
+        }));
+        let sender = spawn_sender_with_options(
+            FragmentId(0),
+            "peer".to_string(),
+            SenderConfig {
+                batch_interval: Duration::from_millis(10),
+                consistency_interval: Duration::from_secs(3600),
+                ..SenderConfig::default()
+            },
+            SenderDeps {
+                router,
+                hlc: Arc::new(Mutex::new(HlcClock::new())),
+                reset_senders: Arc::new(Mutex::new(HashMap::new())),
+                state_report: report.clone(),
+            },
+            SenderRuntimeOptions::default(),
+        )
+        .expect("sender options are valid");
+
+        let (old_tx, mut old_rx) = mpsc::channel(4);
+        sender
+            .send(SenderMsg::PeerConnected {
+                peer_tx: old_tx.clone(),
+            })
+            .unwrap();
+        let old_session = match Envelope::decode(old_rx.recv().await.unwrap().as_slice())
+            .unwrap()
+            .msg
+        {
+            Some(EnvelopeMsg::SessionStart(session)) => session.session_id,
+            other => panic!("expected SessionStart, got {other:?}"),
+        };
+        sender
+            .send(SenderMsg::Enqueue(ReplicatedOp {
+                key: "nack-floor".to_string(),
+                value: VersionedValue::new(b"value".to_vec(), 43, "node".to_string()),
+                seq: 47,
+                boot_id: 53,
+            }))
+            .unwrap();
+        let first_batch = tokio::time::timeout(Duration::from_secs(1), old_rx.recv())
+            .await
+            .expect("ordinary batch was not sent")
+            .expect("old peer channel closed");
+        let first_batch = match Envelope::decode(first_batch.as_slice()).unwrap().msg {
+            Some(EnvelopeMsg::ReplicateBatch(batch)) => batch,
+            other => panic!("expected ReplicateBatch, got {other:?}"),
+        };
+        assert_eq!(first_batch.session_id, old_session);
+
+        let nack_sent_at = Instant::now();
+        sender
+            .send(SenderMsg::Nack {
+                session_id: old_session,
+                batch_seq: first_batch.batch_seq,
+                error: "injected rejection".to_string(),
+            })
+            .unwrap();
+        common_wait_for_sender_report(&report, |state| state.buffered == 1 && state.in_flight == 0)
+            .await;
+        sender
+            .send(SenderMsg::PeerDisconnected { peer_tx: old_tx })
+            .unwrap();
+        common_wait_for_sender_report(&report, |state| state.state == "disconnected").await;
+
+        let (new_tx, mut new_rx) = mpsc::channel(4);
+        sender
+            .send(SenderMsg::PeerConnected { peer_tx: new_tx })
+            .unwrap();
+        let new_session = match Envelope::decode(new_rx.recv().await.unwrap().as_slice())
+            .unwrap()
+            .msg
+        {
+            Some(EnvelopeMsg::SessionStart(session)) => session.session_id,
+            other => panic!("expected replacement SessionStart, got {other:?}"),
+        };
+        assert_ne!(new_session, old_session);
+
+        let early_deadline = nack_sent_at + Duration::from_millis(800);
+        if Instant::now() < early_deadline {
+            assert!(
+                tokio::time::timeout_at(early_deadline, new_rx.recv())
+                    .await
+                    .is_err(),
+                "reconnect bypassed the NACK retry floor"
+            );
+        }
+        let replay = tokio::time::timeout(Duration::from_secs(2), new_rx.recv())
+            .await
+            .expect("ordinary batch was not replayed after the retry floor")
+            .expect("replacement peer channel closed");
+        assert!(nack_sent_at.elapsed() >= Duration::from_millis(900));
+        let replay = match Envelope::decode(replay.as_slice()).unwrap().msg {
+            Some(EnvelopeMsg::ReplicateBatch(batch)) => batch,
+            other => panic!("expected replayed ReplicateBatch, got {other:?}"),
+        };
+        assert_eq!(replay.session_id, new_session);
+        assert_eq!(replay.ops, first_batch.ops);
+    }
+
+    #[tokio::test]
+    async fn reconnect_preserves_reconcile_timeout_retry_floor() {
+        let router = FragmentRouter {
+            actors: Arc::new(RwLock::new(HashMap::new())),
+            fragment_count: 1,
+        };
+        let report = Arc::new(Mutex::new(SenderStateReport {
+            state: "disconnected".to_string(),
+            session_id: 0,
+            buffered: 0,
+            in_flight: 0,
+            last_ack_durability: None,
+            ack_durability_mismatch: false,
+            reconcile_rounds: 0,
+        }));
+        let sender = spawn_sender_with_options(
+            FragmentId(0),
+            "peer".to_string(),
+            SenderConfig {
+                batch_interval: Duration::from_secs(3600),
+                consistency_interval: Duration::from_secs(3600),
+                reconcile_timeout: Duration::from_millis(50),
+                ..SenderConfig::default()
+            },
+            SenderDeps {
+                router,
+                hlc: Arc::new(Mutex::new(HlcClock::new())),
+                reset_senders: Arc::new(Mutex::new(HashMap::new())),
+                state_report: report.clone(),
+            },
+            SenderRuntimeOptions::default(),
+        )
+        .expect("sender options are valid");
+
+        let (timed_out_tx, mut timed_out_rx) = mpsc::channel(4);
+        sender
+            .send(SenderMsg::PeerConnected {
+                peer_tx: timed_out_tx.clone(),
+            })
+            .unwrap();
+        let initial_session = match Envelope::decode(timed_out_rx.recv().await.unwrap().as_slice())
+            .unwrap()
+            .msg
+        {
+            Some(EnvelopeMsg::SessionStart(session)) => session.session_id,
+            other => panic!("expected SessionStart, got {other:?}"),
+        };
+        sender.send(SenderMsg::ReconcileNow).unwrap();
+        let initial_round = match Envelope::decode(timed_out_rx.recv().await.unwrap().as_slice())
+            .unwrap()
+            .msg
+        {
+            Some(EnvelopeMsg::ReconcileRequest(request)) => {
+                assert_eq!(request.session_id, initial_session);
+                request.round_id
+            }
+            other => panic!("expected ReconcileRequest, got {other:?}"),
+        };
+
+        let rotated = tokio::time::timeout(Duration::from_secs(1), timed_out_rx.recv())
+            .await
+            .expect("reconcile timeout did not rotate the session")
+            .expect("peer channel closed");
+        let rotated_session = match Envelope::decode(rotated.as_slice()).unwrap().msg {
+            Some(EnvelopeMsg::SessionStart(session)) => session.session_id,
+            other => panic!("expected rotated SessionStart, got {other:?}"),
+        };
+        assert_ne!(rotated_session, initial_session);
+        let retry_floor_observed_at = Instant::now();
+
+        sender
+            .send(SenderMsg::PeerDisconnected {
+                peer_tx: timed_out_tx,
+            })
+            .unwrap();
+        common_wait_for_sender_report(&report, |state| state.state == "disconnected").await;
+        let (new_tx, mut new_rx) = mpsc::channel(4);
+        sender
+            .send(SenderMsg::PeerConnected { peer_tx: new_tx })
+            .unwrap();
+        let new_session = match Envelope::decode(new_rx.recv().await.unwrap().as_slice())
+            .unwrap()
+            .msg
+        {
+            Some(EnvelopeMsg::SessionStart(session)) => session.session_id,
+            other => panic!("expected replacement SessionStart, got {other:?}"),
+        };
+        assert_ne!(new_session, rotated_session);
+
+        let early_deadline = retry_floor_observed_at + Duration::from_millis(800);
+        if Instant::now() < early_deadline {
+            assert!(
+                tokio::time::timeout_at(early_deadline, new_rx.recv())
+                    .await
+                    .is_err(),
+                "reconnect bypassed the reconcile retry floor"
+            );
+        }
+        let retry = tokio::time::timeout(Duration::from_secs(2), new_rx.recv())
+            .await
+            .expect("reconciliation was not retried after the retry floor")
+            .expect("replacement peer channel closed");
+        assert!(retry_floor_observed_at.elapsed() >= Duration::from_millis(900));
+        match Envelope::decode(retry.as_slice()).unwrap().msg {
+            Some(EnvelopeMsg::ReconcileRequest(request)) => {
+                assert_eq!(request.session_id, new_session);
+                assert_ne!(request.round_id, initial_round);
+            }
+            other => panic!("expected delayed ReconcileRequest, got {other:?}"),
+        }
     }
 
     async fn common_wait_for_sender_report(

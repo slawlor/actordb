@@ -9,7 +9,7 @@ use std::sync::{Arc, Condvar, Mutex as StdMutex};
 use std::time::Duration;
 
 use actordb::actor::{now_ms, VersionedValue};
-use actordb::node::{Node, NodeConfig};
+use actordb::node::{Node, NodeConfig, NodeRuntimeOptions};
 use actordb::proto::Envelope;
 use actordb::store::{KvStore, StoreError};
 use prost::Message;
@@ -231,6 +231,46 @@ async fn invalid_zero_sized_replication_and_placement_config_is_rejected() {
         .await,
         Err(NodeError::Actor(_))
     ));
+
+    // Runtime liveness policy is validated before the network bind. Holding
+    // this address open distinguishes the intended Actor error from a later
+    // bind failure.
+    let occupied = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let occupied_addr = occupied.local_addr().unwrap();
+    let invalid_runtime_options = [
+        (
+            "invalid-peer-queue-capacity",
+            NodeRuntimeOptions::default().with_peer_queue_frame_capacity(0),
+        ),
+        (
+            "invalid-queue-admission-timeout",
+            NodeRuntimeOptions::default().with_queue_admission_timeout(Duration::ZERO),
+        ),
+        (
+            "invalid-forwarded-attempt-timeout",
+            NodeRuntimeOptions::default().with_forwarded_attempt_timeout(Duration::ZERO),
+        ),
+        (
+            "invalid-socket-write-timeout",
+            NodeRuntimeOptions::default().with_socket_write_timeout(Duration::ZERO),
+        ),
+        (
+            "invalid-replication-ack-timeout",
+            NodeRuntimeOptions::default().with_replication_ack_timeout(Duration::ZERO),
+        ),
+    ];
+    for (id, options) in invalid_runtime_options {
+        assert!(matches!(
+            Node::start_with_options(
+                id.to_string(),
+                occupied_addr,
+                NodeConfig::default(),
+                options,
+            )
+            .await,
+            Err(NodeError::Actor(_))
+        ));
+    }
 }
 
 #[tokio::test]
@@ -4323,6 +4363,470 @@ async fn replication_rejects_an_ack_below_the_configured_durability() {
 
     a.shutdown().await;
     b.shutdown().await;
+}
+
+/// An admitted ordinary batch cannot remain in flight forever. A silent peer
+/// forces a fresh sender session, and every still-unacknowledged stamped op is
+/// replayed only after the retry floor. ACKs from the expired session remain
+/// harmless even when the new session reuses the same batch sequence number.
+#[tokio::test]
+async fn ordinary_ack_timeout_rotates_session_and_replays_exact_batch() {
+    use actordb::proto::{BatchAck, EnvelopeMsg, Hello, ReplicationAckLevel};
+    use actordb::replication::{ReplicationAckDurability, SenderConfig};
+    use actordb::shard::FragmentId;
+
+    let mut fragment_map = HashMap::new();
+    fragment_map.insert(
+        FragmentId(0),
+        vec![
+            "ack-timeout-sender".to_string(),
+            "raw-ack-timeout-peer".to_string(),
+        ],
+    );
+    let node = Node::start_with_options(
+        "ack-timeout-sender".to_string(),
+        "127.0.0.1:0".parse().unwrap(),
+        NodeConfig {
+            fragment_map,
+            replication: SenderConfig {
+                batch_size: 1,
+                batch_interval: Duration::from_millis(10),
+                max_in_flight: 1,
+                buffer_capacity: 100,
+                consistency_interval: Duration::from_secs(3600),
+                reconcile_timeout: Duration::from_secs(5),
+                required_ack_durability: ReplicationAckDurability::MemoryApplied,
+            },
+            ..NodeConfig::default()
+        },
+        NodeRuntimeOptions::default()
+            .with_replication_ack_timeout(Duration::from_millis(250))
+            .with_queue_admission_timeout(Duration::from_millis(100)),
+    )
+    .await
+    .unwrap();
+
+    let mut stream = tokio::net::TcpStream::connect(node.addr()).await.unwrap();
+    send_frame(
+        &mut stream,
+        Envelope {
+            msg: Some(EnvelopeMsg::Hello(Hello {
+                node_id: "raw-ack-timeout-peer".to_string(),
+                auth_tag: Vec::new(),
+            })),
+        },
+    )
+    .await;
+    let initial_session = loop {
+        if let Some(EnvelopeMsg::SessionStart(session)) = recv_frame(&mut stream).await.msg {
+            break session.session_id;
+        }
+    };
+
+    node.put("ack-timeout-key".to_string(), b"value".to_vec())
+        .await
+        .unwrap();
+    let first = loop {
+        if let Some(EnvelopeMsg::ReplicateBatch(batch)) = recv_frame(&mut stream).await.msg {
+            if batch.batch_seq != u64::MAX {
+                break batch;
+            }
+        }
+    };
+    assert_eq!(first.session_id, initial_session);
+    assert_eq!(first.ops.len(), 1);
+    assert_eq!(first.ops[0].key, "ack-timeout-key");
+    let first_received_at = tokio::time::Instant::now();
+
+    // Withhold the ACK. The timeout invalidates the whole old session before
+    // any replay, so a delayed old-session ACK can never certify the retry.
+    let replay_session = loop {
+        if let Some(EnvelopeMsg::SessionStart(session)) = recv_frame(&mut stream).await.msg {
+            if session.session_id != initial_session {
+                break session.session_id;
+            }
+        }
+    };
+    let replay = loop {
+        if let Some(EnvelopeMsg::ReplicateBatch(batch)) = recv_frame(&mut stream).await.msg {
+            if batch.batch_seq != u64::MAX && batch.session_id == replay_session {
+                break batch;
+            }
+        }
+    };
+    assert!(
+        first_received_at.elapsed() >= Duration::from_millis(900),
+        "timed-out batch replayed without the one-second retry floor"
+    );
+    assert_eq!(
+        replay.ops, first.ops,
+        "replay changed the stamped operation"
+    );
+    assert_eq!(replay.required_ack_level, first.required_ack_level);
+
+    send_frame(
+        &mut stream,
+        Envelope {
+            msg: Some(EnvelopeMsg::BatchAck(BatchAck {
+                session_id: first.session_id,
+                batch_seq: first.batch_seq,
+                fragment: first.fragment,
+                level: ReplicationAckLevel::Applied as i32,
+            })),
+        },
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let pending = node
+        .sender_report(FragmentId(0), "raw-ack-timeout-peer")
+        .await
+        .unwrap();
+    assert_eq!(pending.session_id, replay_session);
+    assert_eq!(pending.in_flight, 1, "stale ACK retired the replay");
+
+    send_frame(
+        &mut stream,
+        Envelope {
+            msg: Some(EnvelopeMsg::BatchAck(BatchAck {
+                session_id: replay.session_id,
+                batch_seq: replay.batch_seq,
+                fragment: replay.fragment,
+                level: ReplicationAckLevel::Applied as i32,
+            })),
+        },
+    )
+    .await;
+    common::wait_for(
+        || async {
+            node.sender_report(FragmentId(0), "raw-ack-timeout-peer")
+                .await
+                .map(|report| {
+                    report.session_id == replay_session
+                        && report.in_flight == 0
+                        && report.last_ack_durability
+                            == Some(ReplicationAckDurability::MemoryApplied)
+                })
+                .unwrap_or(false)
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    node.shutdown().await;
+}
+
+/// ACKs may arrive out of order. Retiring a newer batch must neither refresh
+/// the older batch's deadline nor cause the already-ACKed operation to be
+/// replayed when that older deadline rotates the session.
+#[tokio::test]
+async fn older_batch_timeout_replays_only_the_unacknowledged_batch() {
+    use actordb::proto::{BatchAck, EnvelopeMsg, Hello, ReplicationAckLevel};
+    use actordb::replication::{ReplicationAckDurability, SenderConfig};
+    use actordb::shard::FragmentId;
+
+    let mut fragment_map = HashMap::new();
+    fragment_map.insert(
+        FragmentId(0),
+        vec![
+            "out-of-order-ack-sender".to_string(),
+            "raw-out-of-order-ack-peer".to_string(),
+        ],
+    );
+    let node = Node::start_with_options(
+        "out-of-order-ack-sender".to_string(),
+        "127.0.0.1:0".parse().unwrap(),
+        NodeConfig {
+            fragment_map,
+            replication: SenderConfig {
+                batch_size: 1,
+                batch_interval: Duration::from_millis(10),
+                max_in_flight: 2,
+                buffer_capacity: 100,
+                consistency_interval: Duration::from_secs(3600),
+                reconcile_timeout: Duration::from_secs(5),
+                required_ack_durability: ReplicationAckDurability::MemoryApplied,
+            },
+            ..NodeConfig::default()
+        },
+        NodeRuntimeOptions::default()
+            .with_replication_ack_timeout(Duration::from_millis(500))
+            .with_queue_admission_timeout(Duration::from_millis(100)),
+    )
+    .await
+    .unwrap();
+
+    let mut stream = tokio::net::TcpStream::connect(node.addr()).await.unwrap();
+    send_frame(
+        &mut stream,
+        Envelope {
+            msg: Some(EnvelopeMsg::Hello(Hello {
+                node_id: "raw-out-of-order-ack-peer".to_string(),
+                auth_tag: Vec::new(),
+            })),
+        },
+    )
+    .await;
+    let initial_session = loop {
+        if let Some(EnvelopeMsg::SessionStart(session)) = recv_frame(&mut stream).await.msg {
+            break session.session_id;
+        }
+    };
+
+    node.put("older-unacked".to_string(), b"first".to_vec())
+        .await
+        .unwrap();
+    node.put("newer-acked".to_string(), b"second".to_vec())
+        .await
+        .unwrap();
+    let first = loop {
+        if let Some(EnvelopeMsg::ReplicateBatch(batch)) = recv_frame(&mut stream).await.msg {
+            if batch.batch_seq != u64::MAX {
+                break batch;
+            }
+        }
+    };
+    let second = loop {
+        if let Some(EnvelopeMsg::ReplicateBatch(batch)) = recv_frame(&mut stream).await.msg {
+            if batch.batch_seq != u64::MAX {
+                break batch;
+            }
+        }
+    };
+    assert_eq!(first.session_id, initial_session);
+    assert_eq!(second.session_id, initial_session);
+    assert_eq!(first.ops.len(), 1);
+    assert_eq!(second.ops.len(), 1);
+    assert_eq!(first.ops[0].key, "older-unacked");
+    assert_eq!(second.ops[0].key, "newer-acked");
+
+    // Retire only the newer batch and synchronize on the sender report before
+    // allowing the older batch's original admission deadline to expire.
+    send_frame(
+        &mut stream,
+        Envelope {
+            msg: Some(EnvelopeMsg::BatchAck(BatchAck {
+                session_id: second.session_id,
+                batch_seq: second.batch_seq,
+                fragment: second.fragment,
+                level: ReplicationAckLevel::Applied as i32,
+            })),
+        },
+    )
+    .await;
+    common::wait_for(
+        || async {
+            node.sender_report(FragmentId(0), "raw-out-of-order-ack-peer")
+                .await
+                .map(|report| {
+                    report.session_id == initial_session
+                        && report.in_flight == 1
+                        && report.last_ack_durability
+                            == Some(ReplicationAckDurability::MemoryApplied)
+                })
+                .unwrap_or(false)
+        },
+        Duration::from_millis(350),
+    )
+    .await;
+
+    let replay_session = loop {
+        if let Some(EnvelopeMsg::SessionStart(session)) = recv_frame(&mut stream).await.msg {
+            if session.session_id != initial_session {
+                break session.session_id;
+            }
+        }
+    };
+    let replay = loop {
+        if let Some(EnvelopeMsg::ReplicateBatch(batch)) = recv_frame(&mut stream).await.msg {
+            if batch.batch_seq != u64::MAX && batch.session_id == replay_session {
+                break batch;
+            }
+        }
+    };
+    assert_eq!(replay.ops, first.ops);
+    assert_ne!(replay.ops, second.ops);
+
+    // With max_in_flight=2, an erroneously requeued second op would be emitted
+    // on the next 10ms batch tick without waiting for this replay's ACK.
+    if let Ok(unexpected) =
+        tokio::time::timeout(Duration::from_millis(100), recv_frame(&mut stream)).await
+    {
+        panic!("retired newer batch produced protocol output: {unexpected:?}");
+    }
+
+    send_frame(
+        &mut stream,
+        Envelope {
+            msg: Some(EnvelopeMsg::BatchAck(BatchAck {
+                session_id: replay.session_id,
+                batch_seq: replay.batch_seq,
+                fragment: replay.fragment,
+                level: ReplicationAckLevel::Applied as i32,
+            })),
+        },
+    )
+    .await;
+    common::wait_for(
+        || async {
+            node.sender_report(FragmentId(0), "raw-out-of-order-ack-peer")
+                .await
+                .map(|report| report.session_id == replay_session && report.in_flight == 0)
+                .unwrap_or(false)
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    node.shutdown().await;
+}
+
+/// A correlated ACK below the requested durability is not a keepalive. It
+/// leaves the original admission deadline intact and eventually forces the
+/// same fail-closed session rotation and exact replay as a missing ACK.
+#[tokio::test]
+async fn weak_ack_does_not_prevent_timeout_and_exact_replay() {
+    use actordb::proto::{BatchAck, EnvelopeMsg, Hello, ReplicationAckLevel};
+    use actordb::replication::{ReplicationAckDurability, SenderConfig};
+    use actordb::shard::FragmentId;
+
+    let mut fragment_map = HashMap::new();
+    fragment_map.insert(
+        FragmentId(0),
+        vec![
+            "weak-ack-sender".to_string(),
+            "raw-weak-ack-peer".to_string(),
+        ],
+    );
+    let node = Node::start_with_options(
+        "weak-ack-sender".to_string(),
+        "127.0.0.1:0".parse().unwrap(),
+        NodeConfig {
+            fragment_map,
+            replication: SenderConfig {
+                batch_size: 1,
+                batch_interval: Duration::from_millis(10),
+                max_in_flight: 1,
+                buffer_capacity: 100,
+                consistency_interval: Duration::from_secs(3600),
+                reconcile_timeout: Duration::from_secs(5),
+                required_ack_durability: ReplicationAckDurability::StoreCommitted,
+            },
+            ..NodeConfig::default()
+        },
+        NodeRuntimeOptions::default()
+            .with_replication_ack_timeout(Duration::from_millis(300))
+            .with_queue_admission_timeout(Duration::from_millis(100)),
+    )
+    .await
+    .unwrap();
+
+    let mut stream = tokio::net::TcpStream::connect(node.addr()).await.unwrap();
+    send_frame(
+        &mut stream,
+        Envelope {
+            msg: Some(EnvelopeMsg::Hello(Hello {
+                node_id: "raw-weak-ack-peer".to_string(),
+                auth_tag: Vec::new(),
+            })),
+        },
+    )
+    .await;
+    let initial_session = loop {
+        if let Some(EnvelopeMsg::SessionStart(session)) = recv_frame(&mut stream).await.msg {
+            break session.session_id;
+        }
+    };
+
+    node.put("weak-ack-key".to_string(), b"value".to_vec())
+        .await
+        .unwrap();
+    let first = loop {
+        if let Some(EnvelopeMsg::ReplicateBatch(batch)) = recv_frame(&mut stream).await.msg {
+            if batch.batch_seq != u64::MAX {
+                break batch;
+            }
+        }
+    };
+    assert_eq!(first.session_id, initial_session);
+    assert_eq!(
+        first.required_ack_level,
+        ReplicationAckLevel::StoreCommitted as i32
+    );
+    let first_received_at = tokio::time::Instant::now();
+
+    send_frame(
+        &mut stream,
+        Envelope {
+            msg: Some(EnvelopeMsg::BatchAck(BatchAck {
+                session_id: first.session_id,
+                batch_seq: first.batch_seq,
+                fragment: first.fragment,
+                level: ReplicationAckLevel::Applied as i32,
+            })),
+        },
+    )
+    .await;
+    common::wait_for(
+        || async {
+            node.sender_report(FragmentId(0), "raw-weak-ack-peer")
+                .await
+                .map(|report| report.in_flight == 1 && report.ack_durability_mismatch)
+                .unwrap_or(false)
+        },
+        Duration::from_millis(250),
+    )
+    .await;
+
+    let replay_session = loop {
+        if let Some(EnvelopeMsg::SessionStart(session)) = recv_frame(&mut stream).await.msg {
+            if session.session_id != initial_session {
+                break session.session_id;
+            }
+        }
+    };
+    let replay = loop {
+        if let Some(EnvelopeMsg::ReplicateBatch(batch)) = recv_frame(&mut stream).await.msg {
+            if batch.batch_seq != u64::MAX && batch.session_id == replay_session {
+                break batch;
+            }
+        }
+    };
+    assert!(
+        first_received_at.elapsed() >= Duration::from_millis(900),
+        "weak ACK reset the deadline or bypassed the retry floor"
+    );
+    assert_eq!(replay.ops, first.ops, "weak-ACK replay changed the op");
+
+    send_frame(
+        &mut stream,
+        Envelope {
+            msg: Some(EnvelopeMsg::BatchAck(BatchAck {
+                session_id: replay.session_id,
+                batch_seq: replay.batch_seq,
+                fragment: replay.fragment,
+                level: ReplicationAckLevel::StoreCommitted as i32,
+            })),
+        },
+    )
+    .await;
+    common::wait_for(
+        || async {
+            node.sender_report(FragmentId(0), "raw-weak-ack-peer")
+                .await
+                .map(|report| {
+                    report.session_id == replay_session
+                        && report.in_flight == 0
+                        && report.last_ack_durability
+                            == Some(ReplicationAckDurability::StoreCommitted)
+                        && !report.ack_durability_mismatch
+                })
+                .unwrap_or(false)
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    node.shutdown().await;
 }
 
 #[tokio::test]

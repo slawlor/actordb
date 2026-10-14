@@ -16,8 +16,9 @@
 //!        └─────────────────────▶ BufferReset ──reconcile + ACK fence──▶ Connected
 //! ```
 //!
-//! - **Connected**: mutations (writes + tombstoned deletes) accumulate
-//!   in a bounded local buffer. The sender ships batches on a timer,
+//! - **Connected**: dequeued mutations (writes + tombstoned deletes)
+//!   accumulate in a bounded local buffer. The sender command mailbox that
+//!   feeds it is currently unbounded. The sender ships batches on a timer,
 //!   keeps a bounded number of batches in flight, and drops acked
 //!   records. Each sender↔receiver pairing gets a fresh `session_id`;
 //!   the receiver discards batches from stale sessions.
@@ -31,10 +32,11 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use ractor::rpc::CallResult;
 use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::time::Instant;
 
 use crate::actor::{ApplyDurability, HlcClock, KvMessage, OpPriority, VersionedValue};
 use crate::node::FragmentRouter;
@@ -48,6 +50,165 @@ use crate::shard::FragmentId;
 /// NACK/write/log loop. Full retry policy belongs with ACK timeouts and bounded
 /// ingress; this floor makes the current explicit retry operationally safe.
 const NACK_RETRY_DELAY: Duration = Duration::from_secs(1);
+
+fn deadline_after(timeout: Duration) -> Instant {
+    let now = Instant::now();
+    now.checked_add(timeout).unwrap_or(now)
+}
+
+type QueueFailureHandler = Arc<dyn Fn(mpsc::Sender<Vec<u8>>) + Send + Sync>;
+
+/// Runtime-only liveness policy for a replication sender.
+///
+/// These settings live outside [`SenderConfig`] so existing exhaustive
+/// `SenderConfig` literals remain source-compatible. Use
+/// [`spawn_sender_with_options`] to override the defaults.
+#[derive(Clone)]
+pub struct SenderRuntimeOptions {
+    ack_timeout: Duration,
+    queue_admission_timeout: Duration,
+    queue_failure_handler: Option<QueueFailureHandler>,
+}
+
+impl std::fmt::Debug for SenderRuntimeOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SenderRuntimeOptions")
+            .field("ack_timeout", &self.ack_timeout)
+            .field("queue_admission_timeout", &self.queue_admission_timeout)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Default for SenderRuntimeOptions {
+    fn default() -> Self {
+        Self {
+            ack_timeout: Duration::from_secs(30),
+            queue_admission_timeout: Duration::from_secs(5),
+            queue_failure_handler: None,
+        }
+    }
+}
+
+/// Invalid sender configuration passed to [`spawn_sender_with_options`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SenderOptionsError {
+    /// A batch could never contain an operation.
+    ZeroBatchSize,
+    /// The batch timer cannot make progress.
+    ZeroBatchInterval,
+    /// No ordinary batch could ever be in flight.
+    ZeroMaxInFlight,
+    /// No operation could be buffered before reset.
+    ZeroBufferCapacity,
+    /// Periodic reconciliation would spin continuously.
+    ZeroConsistencyInterval,
+    /// A reconciliation phase would expire immediately.
+    ZeroReconcileTimeout,
+    /// An ordinary batch would expire immediately.
+    ZeroAckTimeout,
+    /// An outbound queue reservation would expire immediately.
+    ZeroQueueAdmissionTimeout,
+    /// The ordinary ACK timeout cannot be represented by Tokio's clock.
+    AckTimeoutTooLarge,
+    /// The queue timeout cannot be represented by Tokio's clock.
+    QueueAdmissionTimeoutTooLarge,
+    /// The batch interval cannot be represented by Tokio's clock.
+    BatchIntervalTooLarge,
+    /// The consistency interval cannot be represented by Tokio's clock.
+    ConsistencyIntervalTooLarge,
+    /// The reconcile timeout cannot be represented by Tokio's clock.
+    ReconcileTimeoutTooLarge,
+}
+
+impl std::fmt::Display for SenderOptionsError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ZeroBatchSize => write!(f, "replication batch size must be non-zero"),
+            Self::ZeroBatchInterval => write!(f, "replication batch interval must be non-zero"),
+            Self::ZeroMaxInFlight => write!(f, "replication max in-flight must be non-zero"),
+            Self::ZeroBufferCapacity => {
+                write!(f, "replication buffer capacity must be non-zero")
+            }
+            Self::ZeroConsistencyInterval => {
+                write!(f, "replication consistency interval must be non-zero")
+            }
+            Self::ZeroReconcileTimeout => {
+                write!(f, "replication reconcile timeout must be non-zero")
+            }
+            Self::ZeroAckTimeout => write!(f, "replication ack timeout must be non-zero"),
+            Self::ZeroQueueAdmissionTimeout => {
+                write!(f, "replication queue admission timeout must be non-zero")
+            }
+            Self::AckTimeoutTooLarge => {
+                write!(f, "replication ack timeout is too large")
+            }
+            Self::QueueAdmissionTimeoutTooLarge => {
+                write!(f, "replication queue admission timeout is too large")
+            }
+            Self::BatchIntervalTooLarge => {
+                write!(f, "replication batch interval is too large")
+            }
+            Self::ConsistencyIntervalTooLarge => {
+                write!(f, "replication consistency interval is too large")
+            }
+            Self::ReconcileTimeoutTooLarge => {
+                write!(f, "replication reconcile timeout is too large")
+            }
+        }
+    }
+}
+
+impl std::error::Error for SenderOptionsError {}
+
+impl SenderRuntimeOptions {
+    /// Set the maximum wait for an acceptable ACK after an ordinary batch is
+    /// admitted to the peer queue. Reconciliation barriers continue to use
+    /// [`SenderConfig::reconcile_timeout`].
+    pub fn with_ack_timeout(mut self, timeout: Duration) -> Self {
+        self.ack_timeout = timeout;
+        self
+    }
+
+    /// Set the maximum wait to reserve one slot in the peer's outbound frame
+    /// queue.
+    pub fn with_queue_admission_timeout(mut self, timeout: Duration) -> Self {
+        self.queue_admission_timeout = timeout;
+        self
+    }
+
+    /// Current ordinary-batch ACK timeout.
+    pub fn ack_timeout(&self) -> Duration {
+        self.ack_timeout
+    }
+
+    /// Current peer-queue admission timeout.
+    pub fn queue_admission_timeout(&self) -> Duration {
+        self.queue_admission_timeout
+    }
+
+    pub(crate) fn with_queue_failure_handler(mut self, handler: QueueFailureHandler) -> Self {
+        self.queue_failure_handler = Some(handler);
+        self
+    }
+
+    fn validate(&self) -> Result<(), SenderOptionsError> {
+        if self.ack_timeout.is_zero() {
+            return Err(SenderOptionsError::ZeroAckTimeout);
+        }
+        if self.queue_admission_timeout.is_zero() {
+            return Err(SenderOptionsError::ZeroQueueAdmissionTimeout);
+        }
+        let now = Instant::now();
+        if now.checked_add(self.ack_timeout).is_none() {
+            return Err(SenderOptionsError::AckTimeoutTooLarge);
+        }
+        if now.checked_add(self.queue_admission_timeout).is_none() {
+            return Err(SenderOptionsError::QueueAdmissionTimeoutTooLarge);
+        }
+        Ok(())
+    }
+}
 
 /// Tuning knobs for the replication sender. All fields are public so
 /// embedders can tune; `Default` is sane for tests and small clusters.
@@ -87,6 +248,40 @@ impl Default for SenderConfig {
             reconcile_timeout: Duration::from_secs(30),
             required_ack_durability: ReplicationAckDurability::MemoryApplied,
         }
+    }
+}
+
+impl SenderConfig {
+    pub(crate) fn validate(&self) -> Result<(), SenderOptionsError> {
+        if self.batch_size == 0 {
+            return Err(SenderOptionsError::ZeroBatchSize);
+        }
+        if self.batch_interval.is_zero() {
+            return Err(SenderOptionsError::ZeroBatchInterval);
+        }
+        if self.max_in_flight == 0 {
+            return Err(SenderOptionsError::ZeroMaxInFlight);
+        }
+        if self.buffer_capacity == 0 {
+            return Err(SenderOptionsError::ZeroBufferCapacity);
+        }
+        if self.consistency_interval.is_zero() {
+            return Err(SenderOptionsError::ZeroConsistencyInterval);
+        }
+        if self.reconcile_timeout.is_zero() {
+            return Err(SenderOptionsError::ZeroReconcileTimeout);
+        }
+        let now = Instant::now();
+        if now.checked_add(self.batch_interval).is_none() {
+            return Err(SenderOptionsError::BatchIntervalTooLarge);
+        }
+        if now.checked_add(self.consistency_interval).is_none() {
+            return Err(SenderOptionsError::ConsistencyIntervalTooLarge);
+        }
+        if now.checked_add(self.reconcile_timeout).is_none() {
+            return Err(SenderOptionsError::ReconcileTimeoutTooLarge);
+        }
+        Ok(())
     }
 }
 
@@ -152,13 +347,64 @@ pub enum ReplicationAckDurability {
 struct InflightBatch {
     batch_seq: u64,
     ops: Vec<crate::actor::ReplicatedOp>,
+    kind: InflightKind,
+}
+
+#[derive(Clone, Copy)]
+enum InflightKind {
+    Streaming { ack_deadline: Instant },
+    ReconcileBarrier,
 }
 
 struct ActiveConnection {
-    peer_tx: mpsc::Sender<Vec<u8>>,
+    peer_tx: SenderPeer,
     session_id: u64,
+    session_ready: bool,
     next_batch_seq: u64,
     in_flight: VecDeque<InflightBatch>,
+}
+
+impl ActiveConnection {
+    fn next_streaming_deadline(&self) -> Option<Instant> {
+        self.in_flight
+            .iter()
+            .filter_map(|batch| match batch.kind {
+                InflightKind::Streaming { ack_deadline } => Some(ack_deadline),
+                InflightKind::ReconcileBarrier => None,
+            })
+            .min()
+    }
+}
+
+#[derive(Clone)]
+struct SenderPeer {
+    tx: mpsc::Sender<Vec<u8>>,
+    queue_admission_timeout: Duration,
+    queue_failure_handler: Option<QueueFailureHandler>,
+}
+
+impl SenderPeer {
+    fn new(tx: mpsc::Sender<Vec<u8>>, options: &SenderRuntimeOptions) -> Self {
+        Self {
+            tx,
+            queue_admission_timeout: options.queue_admission_timeout,
+            queue_failure_handler: options.queue_failure_handler.clone(),
+        }
+    }
+
+    fn same_channel(&self, other: &mpsc::Sender<Vec<u8>>) -> bool {
+        self.tx.same_channel(other)
+    }
+
+    fn report_failure(&self) {
+        if let Some(handler) = &self.queue_failure_handler {
+            handler(self.tx.clone());
+        }
+    }
+
+    fn must_disconnect_after_failure(&self) -> bool {
+        self.tx.is_closed() || self.queue_failure_handler.is_some()
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -211,12 +457,18 @@ fn disconnect_transport(
     connection: &mut Option<ActiveConnection>,
     delivery: DeliveryState,
     buffer: &mut VecDeque<crate::actor::ReplicatedOp>,
-) {
+) -> bool {
+    if connection.as_ref().map_or(false, |connection| {
+        !connection.peer_tx.must_disconnect_after_failure()
+    }) {
+        return false;
+    }
     if let Some(mut connection) = connection.take() {
         if matches!(delivery, DeliveryState::Streaming) {
             requeue_in_flight(&mut connection.in_flight, buffer);
         }
     }
+    true
 }
 
 /// A snapshot of a sender's state, for health checks and tests.
@@ -256,15 +508,43 @@ pub struct SenderDeps {
 }
 
 /// Spawn a replication sender for (`fragment`, `peer_id`).
+///
+/// # Panics
+///
+/// Panics when `config` contains a zero or unrepresentable limit. Prefer
+/// [`spawn_sender_with_options`] when configuration errors must be handled.
 pub fn spawn_sender(
     fragment: FragmentId,
     peer_id: String,
     config: SenderConfig,
     deps: SenderDeps,
 ) -> mpsc::UnboundedSender<SenderMsg> {
+    spawn_sender_with_options(
+        fragment,
+        peer_id,
+        config,
+        deps,
+        SenderRuntimeOptions::default(),
+    )
+    .expect("sender configuration must be valid")
+}
+
+/// Spawn a replication sender with explicit runtime liveness policy.
+///
+/// [`spawn_sender`] remains the source-compatible default entry point. This
+/// variant validates both `config` and `options` before spawning the task.
+pub fn spawn_sender_with_options(
+    fragment: FragmentId,
+    peer_id: String,
+    config: SenderConfig,
+    deps: SenderDeps,
+    options: SenderRuntimeOptions,
+) -> Result<mpsc::UnboundedSender<SenderMsg>, SenderOptionsError> {
+    config.validate()?;
+    options.validate()?;
     let (tx, rx) = mpsc::unbounded_channel();
-    tokio::spawn(sender_task(fragment, peer_id, config, deps, rx));
-    tx
+    tokio::spawn(sender_task(fragment, peer_id, config, deps, options, rx));
+    Ok(tx)
 }
 
 fn proto_op(op: &crate::actor::ReplicatedOp) -> ProtoReplicateOp {
@@ -280,7 +560,11 @@ fn proto_op(op: &crate::actor::ReplicatedOp) -> ProtoReplicateOp {
     }
 }
 
-async fn send_envelope(peer_tx: &mpsc::Sender<Vec<u8>>, msg: EnvelopeMsg) -> bool {
+async fn send_envelope(
+    peer: &SenderPeer,
+    tracked_deadline: Option<Instant>,
+    msg: EnvelopeMsg,
+) -> bool {
     let mut buf = Vec::new();
     {
         use prost::Message;
@@ -289,7 +573,30 @@ async fn send_envelope(peer_tx: &mpsc::Sender<Vec<u8>>, msg: EnvelopeMsg) -> boo
             return false;
         }
     }
-    peer_tx.send(buf).await.is_ok()
+    let now = Instant::now();
+    let queue_deadline = now.checked_add(peer.queue_admission_timeout).unwrap_or(now);
+    let admission_deadline = tracked_deadline
+        .map(|deadline| deadline.min(queue_deadline))
+        .unwrap_or(queue_deadline);
+    if Instant::now() >= admission_deadline {
+        peer.report_failure();
+        return false;
+    }
+    match tokio::time::timeout_at(admission_deadline, peer.tx.reserve()).await {
+        Ok(Ok(permit)) => {
+            if Instant::now() >= admission_deadline {
+                drop(permit);
+                peer.report_failure();
+                return false;
+            }
+            permit.send(buf);
+            true
+        }
+        Ok(Err(_)) | Err(_) => {
+            peer.report_failure();
+            false
+        }
+    }
 }
 
 async fn sender_task(
@@ -297,6 +604,7 @@ async fn sender_task(
     peer_id: String,
     config: SenderConfig,
     deps: SenderDeps,
+    runtime: SenderRuntimeOptions,
     mut rx: mpsc::UnboundedReceiver<SenderMsg>,
 ) {
     let mut delivery = DeliveryState::Streaming;
@@ -304,13 +612,11 @@ async fn sender_task(
     let mut buffer: VecDeque<crate::actor::ReplicatedOp> = VecDeque::new();
     // `interval()` ticks immediately once, which made the first batch race
     // sender startup instead of consistently observing `batch_interval`.
-    let mut batch_timer = tokio::time::interval_at(
-        tokio::time::Instant::now() + config.batch_interval,
-        config.batch_interval,
-    );
+    let mut batch_timer =
+        tokio::time::interval_at(deadline_after(config.batch_interval), config.batch_interval);
     batch_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut consistency_timer = tokio::time::interval_at(
-        tokio::time::Instant::now() + config.consistency_interval,
+        deadline_after(config.consistency_interval),
         config.consistency_interval,
     );
     consistency_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -322,7 +628,12 @@ async fn sender_task(
     let mut last_ack_durability = None;
     let mut ack_durability_mismatch = false;
     let mut retry_not_before: Option<Instant> = None;
+    let mut session_retry: Option<Instant> = None;
     let mut reconcile_retry: Option<(Instant, ReconcilePurpose)> = None;
+    // Fresh routine reconciliation briefly drains existing ordinary batches
+    // before it starts. A failed round clears this flag so buffered ordinary
+    // replication takes precedence over an anti-entropy retry.
+    let mut pause_new_streaming = false;
     // A fetched winner may have entered a configured local store's write
     // buffer before a flush failed. Carry that obligation across retry
     // rounds; ordinary no-fetch reconciliation on a storeless sender must not
@@ -334,7 +645,13 @@ async fn sender_task(
         {
             let state = match delivery {
                 DeliveryState::Reset { .. } => "buffer_reset",
-                DeliveryState::Streaming if connection.is_some() => "connected",
+                DeliveryState::Streaming
+                    if connection
+                        .as_ref()
+                        .map_or(false, |connection| connection.session_ready) =>
+                {
+                    "connected"
+                }
                 DeliveryState::Streaming => "disconnected",
             };
             *deps.state_report.lock().await = SenderStateReport {
@@ -347,15 +664,29 @@ async fn sender_task(
                 reconcile_rounds,
             };
         }
-        let reconcile_wakeup = active_reconcile
+        let sender_wakeup = active_reconcile
             .as_ref()
             .map(|round| round.phase_deadline)
             .into_iter()
             .chain(
                 reconcile_retry
-                    .filter(|_| connection.is_some())
+                    .filter(|_| {
+                        connection
+                            .as_ref()
+                            .map_or(false, |connection| connection.session_ready)
+                    })
                     .map(|(deadline, _)| deadline),
             )
+            .chain(session_retry.filter(|_| connection.is_some()))
+            .chain(connection.iter().flat_map(|connection| {
+                connection
+                    .in_flight
+                    .iter()
+                    .filter_map(|batch| match batch.kind {
+                        InflightKind::Streaming { ack_deadline } => Some(ack_deadline),
+                        InflightKind::ReconcileBarrier => None,
+                    })
+            }))
             .min();
         tokio::select! {
             msg = rx.recv() => {
@@ -385,6 +716,7 @@ async fn sender_task(
                             delivery = DeliveryState::Reset { epoch };
                             active_reconcile = None;
                             reconcile_retry = None;
+                            pause_new_streaming = false;
 
                             // Invalidate old streaming batches before taking
                             // the reset snapshot. Delayed ACKs and reconcile
@@ -409,10 +741,31 @@ async fn sender_task(
                                 .await
                                 {
                                     Ok(round) => active_reconcile = Some(round),
-                                    Err(()) => disconnect_transport(&mut connection, delivery, &mut buffer),
+                                    Err(()) => {
+                                        reconcile_retry = Some((
+                                            Instant::now() + NACK_RETRY_DELAY,
+                                            ReconcilePurpose::Reset { epoch },
+                                        ));
+                                        disconnect_transport(
+                                            &mut connection,
+                                            delivery,
+                                            &mut buffer,
+                                        );
+                                    }
                                 }
                             } else if connection.is_some() {
-                                disconnect_transport(&mut connection, delivery, &mut buffer);
+                                reconcile_retry = Some((
+                                    Instant::now() + NACK_RETRY_DELAY,
+                                    ReconcilePurpose::Reset { epoch },
+                                ));
+                                if !disconnect_transport(
+                                    &mut connection,
+                                    delivery,
+                                    &mut buffer,
+                                ) {
+                                    session_retry =
+                                        Some(Instant::now() + NACK_RETRY_DELAY);
+                                }
                             }
                             continue;
                         }
@@ -432,28 +785,50 @@ async fn sender_task(
                         }
                         if let Some(mut old) = connection.take() {
                             if matches!(delivery, DeliveryState::Streaming) {
+                                if !old.in_flight.is_empty() {
+                                    pause_new_streaming = false;
+                                }
                                 requeue_in_flight(&mut old.in_flight, &mut buffer);
                             }
                         }
-                        retry_not_before = None;
                         last_ack_durability = None;
                         ack_durability_mismatch = false;
                         let mut conn = ActiveConnection {
-                            peer_tx: tx,
+                            peer_tx: SenderPeer::new(tx, &runtime),
                             session_id: rand_session_id(),
+                            session_ready: false,
                             next_batch_seq: 0,
                             in_flight: VecDeque::new(),
                         };
-                        if !send_session_start(fragment, &conn).await {
+                        if !send_session_start(fragment, &mut conn).await {
+                            if conn.peer_tx.must_disconnect_after_failure() {
+                                continue;
+                            }
+                            let retry_at = Instant::now() + NACK_RETRY_DELAY;
+                            session_retry = Some(retry_at);
+                            if let DeliveryState::Reset { epoch } = delivery {
+                                reconcile_retry =
+                                    Some((retry_at, ReconcilePurpose::Reset { epoch }));
+                            }
+                            connection = Some(conn);
                             continue;
                         }
+                        session_retry = None;
+                        let retry_due = reconcile_retry
+                            .map(|(deadline, _)| Instant::now() >= deadline)
+                            .unwrap_or(true);
                         let reconcile_purpose = match delivery {
-                            DeliveryState::Reset { epoch } => {
+                            DeliveryState::Reset { epoch } if retry_due => {
                                 Some(ReconcilePurpose::Reset { epoch })
                             }
-                            DeliveryState::Streaming => {
+                            DeliveryState::Reset { .. } => None,
+                            DeliveryState::Streaming
+                                if retry_due
+                                    && (pause_new_streaming || buffer.is_empty()) =>
+                            {
                                 reconcile_retry.map(|(_, purpose)| purpose)
                             }
+                            DeliveryState::Streaming => None,
                         };
                         if let Some(purpose) = reconcile_purpose {
                             match begin_reconcile(
@@ -468,9 +843,17 @@ async fn sender_task(
                                 Ok(round) => {
                                     active_reconcile = Some(round);
                                     reconcile_retry = None;
+                                    pause_new_streaming = false;
                                 }
                                 Err(()) => {
-                                    conn.in_flight.clear();
+                                    reconcile_retry = Some((
+                                        deadline_after(NACK_RETRY_DELAY),
+                                        purpose,
+                                    ));
+                                    pause_new_streaming = false;
+                                    if !conn.peer_tx.must_disconnect_after_failure() {
+                                        connection = Some(conn);
+                                    }
                                     continue;
                                 }
                             }
@@ -489,9 +872,13 @@ async fn sender_task(
                         }
                         if let Some(mut conn) = connection.take() {
                             if matches!(delivery, DeliveryState::Streaming) {
+                                if !conn.in_flight.is_empty() {
+                                    pause_new_streaming = false;
+                                }
                                 requeue_in_flight(&mut conn.in_flight, &mut buffer);
                             }
                         }
+                        session_retry = None;
                         last_ack_durability = None;
                         ack_durability_mismatch = false;
                     }
@@ -541,6 +928,7 @@ async fn sender_task(
                         }
                         if let Some(mut round) = completed_round {
                             reconcile_retry = None;
+                            pause_new_streaming = false;
                             match round.purpose {
                                 ReconcilePurpose::Routine => {
                                     if round.snapshot_revision.is_some() {
@@ -629,7 +1017,7 @@ async fn sender_task(
                                                 round.phase =
                                                     ReconcilePhase::Barrier { batch_seq };
                                                 round.phase_deadline =
-                                                    Instant::now() + config.reconcile_timeout;
+                                                    deadline_after(config.reconcile_timeout);
                                                 active_reconcile = Some(round);
                                             }
                                             Err(()) => {
@@ -757,18 +1145,25 @@ async fn sender_task(
                                         "replication batch rejected; queued for retry"
                                     );
                                     if !is_barrier {
+                                        pause_new_streaming = false;
                                         retry_not_before = Some(Instant::now() + NACK_RETRY_DELAY);
                                     }
                                 }
                             }
                         }
                         if restart_session {
-                            let restarted = match connection.as_ref() {
+                            let restarted = match connection.as_mut() {
                                 Some(conn) => send_session_start(fragment, conn).await,
                                 None => false,
                             };
-                            if !restarted {
-                                disconnect_transport(&mut connection, delivery, &mut buffer);
+                            if !restarted
+                                && !disconnect_transport(
+                                    &mut connection,
+                                    delivery,
+                                    &mut buffer,
+                                )
+                            {
+                                session_retry = Some(Instant::now() + NACK_RETRY_DELAY);
                             }
                         }
                     }
@@ -777,6 +1172,15 @@ async fn sender_task(
                             && active_reconcile.is_none()
                         {
                             if let Some(conn) = connection.as_ref() {
+                                if !conn.session_ready || !conn.in_flight.is_empty() {
+                                    reconcile_retry = Some((
+                                        deadline_after(NACK_RETRY_DELAY),
+                                        ReconcilePurpose::Routine,
+                                    ));
+                                    pause_new_streaming = true;
+                                    continue;
+                                }
+                                pause_new_streaming = false;
                                 match begin_reconcile(
                                     fragment,
                                     ReconcilePurpose::Routine,
@@ -795,6 +1199,7 @@ async fn sender_task(
                                             Instant::now() + NACK_RETRY_DELAY,
                                             ReconcilePurpose::Routine,
                                         ));
+                                        pause_new_streaming = false;
                                         disconnect_transport(&mut connection, delivery, &mut buffer);
                                     }
                                 }
@@ -804,6 +1209,7 @@ async fn sender_task(
                                 // the request.
                                 reconcile_retry =
                                     Some((Instant::now(), ReconcilePurpose::Routine));
+                                pause_new_streaming = true;
                             }
                         }
                     }
@@ -869,7 +1275,7 @@ async fn sender_task(
                                     expected_keys,
                                 };
                                 round.phase_deadline =
-                                    Instant::now() + config.reconcile_timeout;
+                                    deadline_after(config.reconcile_timeout);
                                 active_reconcile = Some(round);
                             }
                             Ok((None, snapshot_revision)) => {
@@ -894,7 +1300,7 @@ async fn sender_task(
                                     Ok(batch_seq) => {
                                         round.phase = ReconcilePhase::Barrier { batch_seq };
                                         round.phase_deadline =
-                                            Instant::now() + config.reconcile_timeout;
+                                            deadline_after(config.reconcile_timeout);
                                         active_reconcile = Some(round);
                                     }
                                     Err(()) => {
@@ -1011,6 +1417,7 @@ async fn sender_task(
                             let expected_keys = keys.iter().cloned().collect();
                             let ok = send_envelope(
                                 &conn.peer_tx,
+                                conn.next_streaming_deadline(),
                                 EnvelopeMsg::ReconcileFetch(ReconcileFetch {
                                     fragment: fragment.0,
                                     keys,
@@ -1033,8 +1440,7 @@ async fn sender_task(
                                 next_chunk_seq: next_seq,
                                 expected_keys,
                             };
-                            round.phase_deadline =
-                                Instant::now() + config.reconcile_timeout;
+                            round.phase_deadline = deadline_after(config.reconcile_timeout);
                             active_reconcile = Some(round);
                             continue;
                         }
@@ -1057,7 +1463,7 @@ async fn sender_task(
                             Ok(batch_seq) => {
                                 round.phase = ReconcilePhase::Barrier { batch_seq };
                                 round.phase_deadline =
-                                    Instant::now() + config.reconcile_timeout;
+                                    deadline_after(config.reconcile_timeout);
                                 active_reconcile = Some(round);
                             }
                             Err(()) => {
@@ -1075,24 +1481,28 @@ async fn sender_task(
                 if matches!(delivery, DeliveryState::Reset { .. }) {
                     continue;
                 }
-                let (sid, tx) = match connection.as_ref() {
+                let (sid, tx, tracked_deadline) = match connection.as_ref() {
                     Some(conn)
                         if !buffer.is_empty()
                             && conn.in_flight.len() < config.max_in_flight
+                            && conn.session_ready
+                            && active_reconcile.is_none()
+                            && !pause_new_streaming
                             && retry_not_before
                                 .map(|deadline| Instant::now() >= deadline)
                                 .unwrap_or(true) =>
                     {
-                        (conn.session_id, conn.peer_tx.clone())
+                        let tracked_deadline = conn
+                            .next_streaming_deadline()
+                            .into_iter()
+                            .chain(active_reconcile.as_ref().map(|round| round.phase_deadline))
+                            .min();
+                        (conn.session_id, conn.peer_tx.clone(), tracked_deadline)
                     }
                     _ => continue,
                 };
                 let batch_seq = match connection.as_mut() {
-                    Some(conn) => {
-                        let seq = conn.next_batch_seq;
-                        conn.next_batch_seq = conn.next_batch_seq.wrapping_add(1);
-                        seq
-                    }
+                    Some(conn) => allocate_batch_seq(conn),
                     None => continue,
                 };
                 let ops: Vec<_> = buffer
@@ -1101,6 +1511,7 @@ async fn sender_task(
                 let proto_ops = ops.iter().map(proto_op).collect();
                 let ok = send_envelope(
                     &tx,
+                    tracked_deadline,
                     EnvelopeMsg::ReplicateBatch(ReplicateBatch {
                         session_id: sid,
                         batch_seq,
@@ -1119,31 +1530,52 @@ async fn sender_task(
                 .await;
                 if ok {
                     if let Some(conn) = connection.as_mut() {
-                        conn.in_flight.push_back(InflightBatch { batch_seq, ops });
+                        conn.in_flight.push_back(InflightBatch {
+                            batch_seq,
+                            ops,
+                            kind: InflightKind::Streaming {
+                                ack_deadline: deadline_after(runtime.ack_timeout),
+                            },
+                        });
                     }
                 } else {
                     for op in ops.into_iter().rev() {
                         buffer.push_front(op);
                     }
-                    last_ack_durability = None;
-                    ack_durability_mismatch = false;
-                    if let Some(mut conn) = connection.take() {
-                        requeue_in_flight(&mut conn.in_flight, &mut buffer);
-                    }
-                    if let Some(round) = active_reconcile.take() {
-                        reconcile_retry = Some((Instant::now(), round.purpose));
+                    retry_not_before = Some(Instant::now() + NACK_RETRY_DELAY);
+                    if disconnect_transport(&mut connection, delivery, &mut buffer) {
+                        last_ack_durability = None;
+                        ack_durability_mismatch = false;
+                        if let Some(round) = active_reconcile.take() {
+                            reconcile_retry = Some((Instant::now(), round.purpose));
+                        }
                     }
                 }
             }
             _ = async {
-                match reconcile_wakeup {
+                match sender_wakeup {
                     Some(deadline) => {
-                        tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await;
+                        tokio::time::sleep_until(deadline).await;
                     }
                     None => std::future::pending::<()>().await,
                 }
             } => {
                 let now = Instant::now();
+                if session_retry.map_or(false, |deadline| now >= deadline) {
+                    let restarted = match connection.as_mut() {
+                        Some(conn) if !conn.session_ready => {
+                            send_session_start(fragment, conn).await
+                        }
+                        Some(_) => true,
+                        None => false,
+                    };
+                    if restarted || disconnect_transport(&mut connection, delivery, &mut buffer) {
+                        session_retry = None;
+                    } else {
+                        session_retry = Some(Instant::now() + NACK_RETRY_DELAY);
+                    }
+                    continue;
+                }
                 if active_reconcile
                     .as_ref()
                     .map_or(false, |round| now >= round.phase_deadline)
@@ -1169,8 +1601,47 @@ async fn sender_task(
                     } else {
                         true
                     };
-                    if !restarted {
-                        disconnect_transport(&mut connection, delivery, &mut buffer);
+                    if !restarted
+                        && !disconnect_transport(&mut connection, delivery, &mut buffer)
+                    {
+                        session_retry = Some(Instant::now() + NACK_RETRY_DELAY);
+                    }
+                    continue;
+                }
+
+                let ordinary_ack_timed_out = connection.as_ref().map_or(false, |conn| {
+                    conn.in_flight.iter().any(|batch| {
+                        matches!(
+                            batch.kind,
+                            InflightKind::Streaming { ack_deadline } if now >= ack_deadline
+                        )
+                    })
+                });
+                if ordinary_ack_timed_out {
+                    pause_new_streaming = false;
+                    let expired_session = connection.as_ref().map_or(0, |conn| conn.session_id);
+                    tracing::warn!(
+                        peer = %peer_id,
+                        fragment = fragment.0,
+                        session_id = expired_session,
+                        "replication ACK timed out; rotating session and replaying in-flight batches"
+                    );
+                    if let Some(round) = active_reconcile.take() {
+                        reconcile_retry = Some((now + NACK_RETRY_DELAY, round.purpose));
+                    }
+                    retry_not_before = Some(now + NACK_RETRY_DELAY);
+                    let restarted = if let Some(conn) = connection.as_mut() {
+                        requeue_in_flight(&mut conn.in_flight, &mut buffer);
+                        conn.session_id = rand_session_id();
+                        conn.next_batch_seq = 0;
+                        send_session_start(fragment, conn).await
+                    } else {
+                        true
+                    };
+                    if !restarted
+                        && !disconnect_transport(&mut connection, delivery, &mut buffer)
+                    {
+                        session_retry = Some(Instant::now() + NACK_RETRY_DELAY);
                     }
                     continue;
                 }
@@ -1186,6 +1657,18 @@ async fn sender_task(
                     DeliveryState::Streaming => requested_purpose,
                 };
                 if let Some(conn) = connection.as_ref() {
+                    if !conn.session_ready || active_reconcile.is_some() {
+                        continue;
+                    }
+                    if !conn.in_flight.is_empty()
+                        || (!pause_new_streaming
+                            && matches!(delivery, DeliveryState::Streaming)
+                            && !buffer.is_empty())
+                    {
+                        reconcile_retry = Some((deadline_after(NACK_RETRY_DELAY), purpose));
+                        continue;
+                    }
+                    pause_new_streaming = false;
                     match begin_reconcile(
                         fragment,
                         purpose,
@@ -1201,6 +1684,7 @@ async fn sender_task(
                         }
                         Err(()) => {
                             reconcile_retry = Some((now + NACK_RETRY_DELAY, purpose));
+                            pause_new_streaming = false;
                             disconnect_transport(&mut connection, delivery, &mut buffer);
                         }
                     }
@@ -1209,8 +1693,21 @@ async fn sender_task(
             _ = consistency_timer.tick() => {
                 if matches!(delivery, DeliveryState::Streaming)
                     && active_reconcile.is_none()
+                    && reconcile_retry.is_none()
                 {
                     if let Some(conn) = connection.as_ref() {
+                        if !conn.session_ready {
+                            continue;
+                        }
+                        if !conn.in_flight.is_empty() {
+                            reconcile_retry = Some((
+                                deadline_after(NACK_RETRY_DELAY),
+                                ReconcilePurpose::Routine,
+                            ));
+                            pause_new_streaming = true;
+                            continue;
+                        }
+                        pause_new_streaming = false;
                         match begin_reconcile(
                             fragment,
                             ReconcilePurpose::Routine,
@@ -1229,6 +1726,7 @@ async fn sender_task(
                                     Instant::now() + NACK_RETRY_DELAY,
                                     ReconcilePurpose::Routine,
                                 ));
+                                pause_new_streaming = false;
                                 disconnect_transport(&mut connection, delivery, &mut buffer);
                             }
                         }
@@ -1264,15 +1762,18 @@ fn allocate_batch_seq(connection: &mut ActiveConnection) -> u64 {
     seq
 }
 
-async fn send_session_start(fragment: FragmentId, connection: &ActiveConnection) -> bool {
-    send_envelope(
+async fn send_session_start(fragment: FragmentId, connection: &mut ActiveConnection) -> bool {
+    let sent = send_envelope(
         &connection.peer_tx,
+        connection.next_streaming_deadline(),
         EnvelopeMsg::SessionStart(SessionStart {
             session_id: connection.session_id,
             fragment: fragment.0,
         }),
     )
-    .await
+    .await;
+    connection.session_ready = sent;
+    sent
 }
 
 async fn begin_reconcile(
@@ -1285,6 +1786,7 @@ async fn begin_reconcile(
     let round_id = next_nonzero(next_round_id);
     let ok = send_envelope(
         &connection.peer_tx,
+        connection.next_streaming_deadline(),
         EnvelopeMsg::ReconcileRequest(ReconcileRequest {
             fragment: fragment.0,
             session_id: connection.session_id,
@@ -1300,7 +1802,7 @@ async fn begin_reconcile(
         round_id,
         purpose,
         phase: ReconcilePhase::Response,
-        phase_deadline: Instant::now() + phase_timeout,
+        phase_deadline: deadline_after(phase_timeout),
         snapshot_revision: None,
     })
 }
@@ -1313,6 +1815,7 @@ async fn send_reconcile_barrier(
     let batch_seq = allocate_batch_seq(connection);
     let ok = send_envelope(
         &connection.peer_tx,
+        connection.next_streaming_deadline(),
         EnvelopeMsg::ReplicateBatch(ReplicateBatch {
             session_id: connection.session_id,
             batch_seq,
@@ -1333,6 +1836,7 @@ async fn send_reconcile_barrier(
     connection.in_flight.push_back(InflightBatch {
         batch_seq,
         ops: Vec::new(),
+        kind: InflightKind::ReconcileBarrier,
     });
     Ok(batch_seq)
 }
@@ -1346,6 +1850,7 @@ async fn send_repair_ops(
         let proto_ops = chunk.iter().map(proto_op).collect();
         if !send_envelope(
             &connection.peer_tx,
+            connection.next_streaming_deadline(),
             EnvelopeMsg::ReplicateBatch(ReplicateBatch {
                 session_id: connection.session_id,
                 batch_seq: u64::MAX,
@@ -1484,6 +1989,7 @@ async fn reconcile(
     let expected_keys = first.iter().cloned().collect();
     if !send_envelope(
         &connection.peer_tx,
+        connection.next_streaming_deadline(),
         EnvelopeMsg::ReconcileFetch(ReconcileFetch {
             fragment: fragment.0,
             keys: first,
@@ -1609,6 +2115,7 @@ fn rand_session_id() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     fn op(key: &str) -> crate::actor::ReplicatedOp {
         crate::actor::ReplicatedOp {
@@ -1625,10 +2132,16 @@ mod tests {
             InflightBatch {
                 batch_seq: 0,
                 ops: vec![op("a"), op("b")],
+                kind: InflightKind::Streaming {
+                    ack_deadline: Instant::now() + Duration::from_secs(1),
+                },
             },
             InflightBatch {
                 batch_seq: 1,
                 ops: vec![op("c")],
+                kind: InflightKind::Streaming {
+                    ack_deadline: Instant::now() + Duration::from_secs(1),
+                },
             },
         ]);
         let mut buffer = VecDeque::from([op("d")]);
@@ -1638,5 +2151,171 @@ mod tests {
             buffer.into_iter().map(|op| op.key).collect::<Vec<_>>(),
             ["a", "b", "c", "d"]
         );
+    }
+
+    #[test]
+    fn batch_sequence_allocator_never_emits_reserved_repair_sentinel() {
+        let (tx, _rx) = mpsc::channel(1);
+        let mut connection = ActiveConnection {
+            peer_tx: SenderPeer::new(tx, &SenderRuntimeOptions::default()),
+            session_id: 1,
+            session_ready: true,
+            next_batch_seq: u64::MAX - 1,
+            in_flight: VecDeque::new(),
+        };
+        assert_eq!(allocate_batch_seq(&mut connection), u64::MAX - 1);
+        assert_eq!(allocate_batch_seq(&mut connection), 0);
+        assert_eq!(allocate_batch_seq(&mut connection), 1);
+    }
+
+    #[test]
+    fn invalid_sender_options_are_rejected() {
+        let defaults = SenderRuntimeOptions::default();
+        assert_eq!(defaults.ack_timeout(), Duration::from_secs(30));
+        assert_eq!(defaults.queue_admission_timeout(), Duration::from_secs(5));
+        assert_eq!(
+            SenderRuntimeOptions::default()
+                .with_ack_timeout(Duration::ZERO)
+                .validate(),
+            Err(SenderOptionsError::ZeroAckTimeout)
+        );
+        assert_eq!(
+            SenderRuntimeOptions::default()
+                .with_queue_admission_timeout(Duration::ZERO)
+                .validate(),
+            Err(SenderOptionsError::ZeroQueueAdmissionTimeout)
+        );
+        assert_eq!(
+            SenderRuntimeOptions::default()
+                .with_ack_timeout(Duration::MAX)
+                .validate(),
+            Err(SenderOptionsError::AckTimeoutTooLarge)
+        );
+        assert_eq!(
+            SenderRuntimeOptions::default()
+                .with_queue_admission_timeout(Duration::MAX)
+                .validate(),
+            Err(SenderOptionsError::QueueAdmissionTimeoutTooLarge)
+        );
+        assert_eq!(
+            SenderConfig {
+                batch_size: 0,
+                ..SenderConfig::default()
+            }
+            .validate(),
+            Err(SenderOptionsError::ZeroBatchSize)
+        );
+        assert_eq!(
+            SenderConfig {
+                batch_interval: Duration::ZERO,
+                ..SenderConfig::default()
+            }
+            .validate(),
+            Err(SenderOptionsError::ZeroBatchInterval)
+        );
+        assert_eq!(
+            SenderConfig {
+                max_in_flight: 0,
+                ..SenderConfig::default()
+            }
+            .validate(),
+            Err(SenderOptionsError::ZeroMaxInFlight)
+        );
+        assert_eq!(
+            SenderConfig {
+                buffer_capacity: 0,
+                ..SenderConfig::default()
+            }
+            .validate(),
+            Err(SenderOptionsError::ZeroBufferCapacity)
+        );
+        assert_eq!(
+            SenderConfig {
+                consistency_interval: Duration::ZERO,
+                ..SenderConfig::default()
+            }
+            .validate(),
+            Err(SenderOptionsError::ZeroConsistencyInterval)
+        );
+        assert_eq!(
+            SenderConfig {
+                reconcile_timeout: Duration::ZERO,
+                ..SenderConfig::default()
+            }
+            .validate(),
+            Err(SenderOptionsError::ZeroReconcileTimeout)
+        );
+        assert_eq!(
+            SenderConfig {
+                batch_interval: Duration::MAX,
+                ..SenderConfig::default()
+            }
+            .validate(),
+            Err(SenderOptionsError::BatchIntervalTooLarge)
+        );
+        assert_eq!(
+            SenderConfig {
+                consistency_interval: Duration::MAX,
+                ..SenderConfig::default()
+            }
+            .validate(),
+            Err(SenderOptionsError::ConsistencyIntervalTooLarge)
+        );
+        assert_eq!(
+            SenderConfig {
+                reconcile_timeout: Duration::MAX,
+                ..SenderConfig::default()
+            }
+            .validate(),
+            Err(SenderOptionsError::ReconcileTimeoutTooLarge)
+        );
+    }
+
+    #[tokio::test]
+    async fn replication_queue_timeout_reports_failure_without_admitting_frame() {
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.send(vec![1]).await.unwrap();
+        let failed = Arc::new(AtomicBool::new(false));
+        let observed = failed.clone();
+        let options = SenderRuntimeOptions::default()
+            .with_queue_admission_timeout(Duration::from_millis(10))
+            .with_queue_failure_handler(Arc::new(move |_| {
+                observed.store(true, Ordering::SeqCst);
+            }));
+        let peer = SenderPeer::new(tx, &options);
+        assert!(
+            !send_envelope(
+                &peer,
+                None,
+                EnvelopeMsg::SessionStart(SessionStart {
+                    session_id: 1,
+                    fragment: 0,
+                }),
+            )
+            .await
+        );
+        assert!(failed.load(Ordering::SeqCst));
+        assert_eq!(rx.recv().await, Some(vec![1]));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn expired_replication_deadline_never_admits_to_an_empty_queue() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let peer = SenderPeer::new(tx, &SenderRuntimeOptions::default());
+        let expired = Instant::now();
+        tokio::task::yield_now().await;
+        assert!(
+            !send_envelope(
+                &peer,
+                Some(expired),
+                EnvelopeMsg::SessionStart(SessionStart {
+                    session_id: 1,
+                    fragment: 0,
+                }),
+            )
+            .await
+        );
+        assert!(rx.try_recv().is_err());
     }
 }
