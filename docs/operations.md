@@ -4,8 +4,9 @@
 
 ### Node crash (`kill -9`) and restart
 
-1. The unflushed write-buffer tail (up to `flush_batch_size` / `flush_interval`
-   old) is lost on the crashed node.
+1. The unflushed write-buffer tail is lost on the crashed node. Batch size and
+   active-write latency are controlled by `flush_batch_size` / `flush_interval`;
+   an idle fragment is flushed on `snapshot_interval`.
 2. On restart with the same `node_id`, the node re-establishes sessions (new
    `session_id`; receivers discard the old session's batches) and the Phase 5
    reconciler repairs the divergence — in static mode the full-state

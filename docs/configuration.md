@@ -11,7 +11,7 @@ of the defaults.
 | `store` | `Option<Arc<dyn KvStore>>` | `None` | `None` = purely in-memory node. Set to a `RocksDbStore` (or `PrefixedStore`-wrapped) for durability. |
 | `network` | `Arc<dyn Network>` | `TcpNetwork` | Plain TCP. Implement `Network` for TLS or custom transports. |
 | `flush_batch_size` | `usize` | `1000` | Ops buffered before a store flush. Ignored when `store` is `None`. Larger = fewer, bigger RocksDB write batches. |
-| `flush_interval` | `Duration` | `100 ms` | Max age of the unflushed write tail. `kill -9` can lose the tail; it is recovered via peer sync. |
+| `flush_interval` | `Duration` | `100 ms` | A new write triggers a flush when the previous attempt is this old; idle fragments are bounded by `snapshot_interval`. |
 | `fragment_count` | `usize` | `1` | Number of keyspace fragments. **Must be identical on every node** or keys become unreachable. |
 | `fragment_map` | `HashMap<FragmentId, Vec<String>>` | empty | Fragment → replica node ids. Empty = this node serves all fragments. **Must be identical on every node** (static mode). |
 | `members` | `HashMap<String, SocketAddr>` | empty | Static membership; `Node::start` best-effort dials all members. |

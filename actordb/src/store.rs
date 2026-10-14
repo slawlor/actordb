@@ -33,9 +33,12 @@ impl std::error::Error for StoreError {}
 
 /// Durable storage for a node's local copy.
 ///
-/// Implementors must be thread-safe: the actor calls these from its
-/// message handler. `load` runs once at actor boot; `write_batch` runs
-/// on every flush (see `NodeConfig` flush knobs).
+/// Implementors must be thread-safe: different fragments can call the same
+/// underlying store concurrently. `load` runs once at actor boot;
+/// `write_batch` runs on every flush (see `NodeConfig` flush knobs). Writes
+/// for one fragment are serialized, but a batch may be retried after a
+/// failure or cancelled caller, so implementations must be idempotent for
+/// the same key/value versions.
 ///
 /// Keys are raw bytes. The actor works with `String` keys and converts
 /// at the boundary (failing boot loudly on non-UTF-8 data); the store
@@ -43,7 +46,8 @@ impl std::error::Error for StoreError {}
 pub trait KvStore: Send + Sync + 'static {
     /// Load the full dataset. Called once at actor boot.
     fn load(&self) -> Result<Vec<(Vec<u8>, VersionedValue)>, StoreError>;
-    /// Persist a batch of winning writes.
+    /// Atomically persist a batch of winning writes. Each key occurs at most
+    /// once in a batch.
     fn write_batch(&self, writes: &[(Vec<u8>, VersionedValue)]) -> Result<(), StoreError>;
 }
 
