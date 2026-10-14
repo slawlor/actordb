@@ -51,8 +51,21 @@ tracing = "0.1"
 # Optional dependencies
 
 [dev-dependencies]
+criterion = { version = "0.5.1", features = ["async_tokio"] }
 tempfile = "3"
 tokio = { version = "1", features = ["rt", "time", "sync", "macros", "rt-multi-thread", "signal"] }
 tracing-glog = "0.3"
 tracing-subscriber = { version = "0.3", features = ["env-filter"]}
 tracing-test = "0.2"
+
+[[bench]]
+name = "put_get"
+harness = false
+
+[[bench]]
+name = "fanout"
+harness = false
+
+[[bench]]
+name = "replication"
+harness = false
