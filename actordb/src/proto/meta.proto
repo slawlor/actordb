@@ -98,14 +98,71 @@ message SyncEntry {
 }
 
 // Top-level wire envelope, length-delimited on the wire
+// Phase 5: async sender/receiver replication. The sender batches ops
+// per (fragment, peer) and ships them on a timer; the receiver acks
+// each batch. Session ids distinguish pairings across reconnects;
+// stale batches (old session) are discarded.
+message SessionStart {
+  uint64 session_id = 1;
+  uint32 fragment = 2;
+}
+
+message ReplicateBatch {
+  uint64 session_id = 1;
+  uint64 batch_seq = 2;
+  uint32 fragment = 3;
+  repeated ReplicateOp ops = 4;
+}
+
+message BatchAck {
+  uint64 session_id = 1;
+  uint64 batch_seq = 2;
+  uint32 fragment = 3;
+}
+
+// Incremental anti-entropy: exchange (timestamp, tombstone) summaries,
+// then only the divergent keys.
+message KeySummary {
+  string key = 1;
+  uint64 timestamp_ms = 2;
+  string node_id = 3;
+  bool is_tombstone = 4;
+}
+
+message ReconcileRequest {
+  uint32 fragment = 1;
+}
+
+message ReconcileResponse {
+  uint32 fragment = 1;
+  repeated KeySummary summaries = 2;
+}
+
+message ReconcileFetch {
+  uint32 fragment = 1;
+  repeated string keys = 2;
+}
+
+message ReconcileData {
+  uint32 fragment = 1;
+  repeated SyncEntry entries = 2;
+}
+
 message Envelope {
   oneof msg {
     Hello hello = 1;
-    ReplicateOp replicate = 2;
+    // Phase 5: ReplicateOp (2) retired; batches carry Repeated ReplicateOp.
     SyncRequest sync_request = 3;
     SyncResponse sync_response = 4;
     ForwardedPut forwarded_put = 5;
     ForwardedGet forwarded_get = 6;
     GetResponse get_response = 7;
+    SessionStart session_start = 8;
+    ReplicateBatch replicate_batch = 9;
+    BatchAck batch_ack = 10;
+    ReconcileRequest reconcile_request = 11;
+    ReconcileResponse reconcile_response = 12;
+    ReconcileFetch reconcile_fetch = 13;
+    ReconcileData reconcile_data = 14;
   }
 }

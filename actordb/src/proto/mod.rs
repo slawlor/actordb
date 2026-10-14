@@ -13,6 +13,7 @@ pub mod meta {
 
 pub use meta::envelope::Msg as EnvelopeMsg;
 pub use meta::{
-    Envelope, ForwardedGet, ForwardedPut, GetResponse, Hello, ReplicateOp, SyncEntry, SyncRequest,
-    SyncResponse,
+    BatchAck, Envelope, ForwardedGet, ForwardedPut, GetResponse, Hello, KeySummary, ReconcileData,
+    ReconcileFetch, ReconcileRequest, ReconcileResponse, ReplicateBatch, ReplicateOp, SessionStart,
+    SyncEntry, SyncRequest, SyncResponse,
 };

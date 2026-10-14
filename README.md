@@ -31,9 +31,9 @@ A working, tested prototype of the actor-first sharded database vision:
   health.
 * **`node`**: a `Node` pairs the per-fragment supervisors with a Tokio
   TCP mesh. Static placement (`fragment_map`) with caller-side one-hop
-  routing: a node either applies a write locally and fans out to
-  replicas, or forwards it to a fragment owner. Inbound ops merge with
-  **last-writer-wins** on hybrid-logical-clock timestamps
+  routing: a node either applies a write locally and enqueues it for
+  async replication, or forwards it to a fragment owner. Inbound ops
+  merge with **last-writer-wins** on hybrid-logical-clock timestamps
   (tie-broken by `node_id`), which is idempotent and commutative, so
   replicas converge without coordination. Deletes are tombstones that
   propagate like writes. A joining node pulls state via handshake sync
@@ -44,7 +44,7 @@ A working, tested prototype of the actor-first sharded database vision:
 * **`proto`**: the wire protocol — prost-encoded `Envelope` frames,
   length-delimited over TCP.
 
-Run the tests (17 cluster integration tests over real localhost TCP,
+Run the tests (19 cluster integration tests over real localhost TCP,
 plus 9 unit tests):
 
 ```bash
@@ -129,6 +129,7 @@ Key `NodeConfig` knobs:
 | `clean_interval` | 30s | TTL/tombstone sweep period |
 | `snapshot_interval` | 60s | Periodic durable flush |
 | `tombstone_gc_age` | 1h | Tombstone retention (must exceed longest expected partition) |
+| `replication` | defaults | `SenderConfig`: batch size/interval, max in-flight, buffer capacity, consistency interval |
 | `store` | None | `Some(Arc<dyn KvStore>)`; `NodeConfig::with_rocksdb(path)` with the `rocksdb` feature |
 
 - Local writes are read-your-write; remote-fragment writes forward in
@@ -155,6 +156,16 @@ Key `NodeConfig` knobs:
 - `FragmentHealth` — per-fragment health snapshot (worker count/names,
   restart counts).
 
+### `actordb::replication` — async sender/receiver
+
+- Per fragment, per peer, a sender task batches mutations (writes +
+  tombstones) off the write path: ships on a timer, bounded in-flight,
+  acks drop acked records.
+- Session ids per pairing; stale batches discarded on reconnect.
+- Buffer overflow → `buffer_reset`: shed, block tombstone GC, and
+  reconcile via timestamp/tombstone comparison when the peer returns.
+- Periodic anti-entropy repairs residual divergence.
+
 ### `actordb::proto` — wire protocol
 
 Prost-generated protobuf types (`Envelope`, `Hello`, `ReplicateOp`,
@@ -171,10 +182,9 @@ as issues in the [issue tracker](https://github.com/slawlor/actordb/issues):
   durability; without it the dataset lives in memory and a restart
   wipes it (recoverable only via peer sync).
 - **No TLS/authentication** — plaintext, unauthenticated TCP.
-- **Synchronous replication** — writes fan out on the write path;
-  async sender/receiver with batching and acks is Phase 5 (#32).
-- **Full-state anti-entropy** — every handshake ships the whole
-  dataset (tombstones included).
+- **Full-state handshake anti-entropy** — every handshake ships the
+  whole dataset (tombstones included); steady-state replication is
+  incremental (batches + reconciliation).
 - **Tombstone GC is time-based** — a node partitioned longer than
   `tombstone_gc_age` can resurrect deleted keys on rejoin.
 

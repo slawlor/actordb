@@ -37,5 +37,9 @@ pub mod shard;
 /// Per-fragment supervision: dispatcher pool, TTL cleaner, snapshotter.
 pub mod supervision;
 
+/// Phase 5: async sender/receiver replication (per-fragment, per-peer
+/// senders with batching, acks, and reconciliation).
+pub mod replication;
+
 #[cfg(test)]
 pub(crate) mod common_test;
