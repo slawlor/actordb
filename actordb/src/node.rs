@@ -2331,23 +2331,27 @@ async fn handle_connection(ctx: ConnContext, stream: BoxStream, we_dialed: bool)
                     }
                     continue;
                 }
-                let value = match router.route(&g.key) {
+                // Serve at the originator's priority (Phase 7).
+                let get_priority = priority_from_proto(g.priority);
+                let (value, shed) = match router.route(&g.key) {
                     Some(actor) => {
                         match actor
                             .call(
                                 |reply| KvMessage::Get {
                                     key: g.key.clone(),
                                     reply,
+                                    priority: get_priority,
                                 },
                                 None,
                             )
                             .await
                         {
-                            Ok(CallResult::Success(v)) => v,
-                            _ => None,
+                            Ok(CallResult::Success(Ok(v))) => (v, false),
+                            Ok(CallResult::Success(Err(_))) => (None, true),
+                            _ => (None, false),
                         }
                     }
-                    None => None,
+                    None => (None, false),
                 };
                 let (found, bytes, timestamp_ms, origin, expires_at_ms, is_tombstone) = match value
                 {
@@ -2372,6 +2376,7 @@ async fn handle_connection(ctx: ConnContext, stream: BoxStream, we_dialed: bool)
                             node_id: origin,
                             expires_at_ms,
                             is_tombstone,
+                            shed,
                         })),
                     },
                 )
@@ -2394,17 +2399,26 @@ async fn handle_connection(ctx: ConnContext, stream: BoxStream, we_dialed: bool)
                     continue;
                 }
                 if let Some(resp_tx) = pending_gets.lock().await.remove(&r.req_id) {
-                    let value = r.found.then(|| {
-                        let mut v =
-                            VersionedValue::new(r.value.clone(), r.timestamp_ms, r.node_id.clone());
-                        v.expires_at_ms = if r.expires_at_ms == 0 {
-                            None
-                        } else {
-                            Some(r.expires_at_ms)
-                        };
-                        v
-                    });
-                    let _ = resp_tx.send(value);
+                    if r.shed {
+                        let _ = resp_tx.send(Err(
+                            "shed: remote pool at queue cap or rate limit".to_string()
+                        ));
+                    } else {
+                        let value = r.found.then(|| {
+                            let mut v = VersionedValue::new(
+                                r.value.clone(),
+                                r.timestamp_ms,
+                                r.node_id.clone(),
+                            );
+                            v.expires_at_ms = if r.expires_at_ms == 0 {
+                                None
+                            } else {
+                                Some(r.expires_at_ms)
+                            };
+                            v
+                        });
+                        let _ = resp_tx.send(Ok(value));
+                    }
                 }
             }
             Some(EnvelopeMsg::BatchPut(bp)) => {
@@ -2530,83 +2544,6 @@ async fn handle_connection(ctx: ConnContext, stream: BoxStream, we_dialed: bool)
             Some(EnvelopeMsg::BatchGetResponse(r)) => {
                 if let Some(resp_tx) = pending_batch_gets.lock().await.remove(&r.req_id) {
                     let _ = resp_tx.send(r.results);
-                }
-            }
-            Some(EnvelopeMsg::ForwardedGet(g)) => {
-                // We own this fragment: read it and reply on this
-                // connection, at the originator's priority.
-                let get_priority = priority_from_proto(g.priority);
-                let (value, shed) = match router.route(&g.key) {
-                    Some(actor) => {
-                        match actor
-                            .call(
-                                |reply| KvMessage::Get {
-                                    key: g.key.clone(),
-                                    reply,
-                                    priority: get_priority,
-                                },
-                                None,
-                            )
-                            .await
-                        {
-                            Ok(CallResult::Success(Ok(v))) => (v, false),
-                            Ok(CallResult::Success(Err(_))) => (None, true),
-                            _ => (None, false),
-                        }
-                    }
-                    None => (None, false),
-                };
-                let (found, bytes, timestamp_ms, origin, expires_at_ms, is_tombstone) = match value
-                {
-                    Some(v) => (
-                        true,
-                        v.value,
-                        v.timestamp_ms,
-                        v.node_id,
-                        v.expires_at_ms.unwrap_or(0),
-                        v.is_tombstone,
-                    ),
-                    None => (false, Vec::new(), 0, String::new(), 0, false),
-                };
-                send_envelope(
-                    &tx,
-                    Envelope {
-                        msg: Some(EnvelopeMsg::GetResponse(GetResponse {
-                            req_id: g.req_id,
-                            found,
-                            value: bytes,
-                            timestamp_ms,
-                            node_id: origin,
-                            expires_at_ms,
-                            is_tombstone,
-                            shed,
-                        })),
-                    },
-                )
-                .await;
-            }
-            Some(EnvelopeMsg::GetResponse(r)) => {
-                if let Some(resp_tx) = pending_gets.lock().await.remove(&r.req_id) {
-                    if r.shed {
-                        let _ = resp_tx.send(Err(
-                            "shed: remote pool at queue cap or rate limit".to_string()
-                        ));
-                    } else {
-                        let value = r.found.then(|| {
-                            let mut v = VersionedValue::new(
-                                r.value.clone(),
-                                r.timestamp_ms,
-                                r.node_id.clone(),
-                            );
-                            v.expires_at_ms = if r.expires_at_ms == 0 {
-                                None
-                            } else {
-                                Some(r.expires_at_ms)
-                            };
-                            v
-                        });
-                        let _ = resp_tx.send(Ok(value));
-                    }
                 }
             }
             Some(EnvelopeMsg::SyncRequest(req)) => {
@@ -2818,6 +2755,8 @@ async fn relay_get(
             msg: Some(EnvelopeMsg::ForwardedGet(ForwardedGet {
                 key: g.key.clone(),
                 req_id: relay_id,
+                // Preserve the originator's priority across the relay.
+                priority: g.priority,
                 hops: g.hops + 1,
             })),
         },

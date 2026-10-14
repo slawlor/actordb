@@ -1229,6 +1229,10 @@ async fn background_saturation_leaves_high_priority_p99_unaffected() {
                     .map(|j| (format!("bg{i}-{j}"), vec![0u8; 32]))
                     .collect();
                 let _ = n.put_multi(kvs).await;
+            }
+        })
+    };
+
     // High-priority reads stay fast while the background pool is
     // saturated: separate pool, separate worker, separate counters.
     let mut latencies = Vec::with_capacity(40);
@@ -1392,6 +1396,10 @@ async fn forwarded_priority_preserved_end_to_end() {
         default_shed, 0,
         "default-priority batch must not shed on b's healthy default pool"
     );
+
+    a.shutdown().await;
+    b.shutdown().await;
+}
 /// Phase 8: migrate a fragment between two live nodes under continuous
 /// writes. Zero lost writes; reads stay correct throughout.
 #[tokio::test]
@@ -1475,6 +1483,10 @@ async fn placement_migration_no_lost_writes() {
                 }
                 round += 1;
                 tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+    };
+
     // Let the writer run, then start the migration: overlap [A, B].
     tokio::time::sleep(Duration::from_millis(300)).await;
     let mut overlap = HashMap::new();
@@ -1540,6 +1552,10 @@ async fn placement_migration_no_lost_writes() {
         Duration::from_secs(15),
     )
     .await;
+
+    a.shutdown().await;
+    b.shutdown().await;
+}
 
 /// Phase 8: rolling restart with dynamic placement. The survivor keeps
 /// serving; the restarted node catches up via delta reconciliation
@@ -1644,13 +1660,5 @@ async fn placement_rolling_restart_delta_reconcile_only() {
     );
 
     a2.shutdown().await;
-    b.shutdown().await;
-}
-            }
-        })
-    };
-
-
-    a.shutdown().await;
     b.shutdown().await;
 }
