@@ -36,7 +36,7 @@ use prost::Message as ProstMessage;
 use ractor::rpc::CallResult;
 use ractor::{Actor, ActorRef};
 use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::sync::{mpsc, oneshot, watch, Mutex};
+use tokio::sync::{mpsc, oneshot, watch, Mutex, RwLock as AsyncRwLock};
 use tokio::task::{AbortHandle, JoinSet};
 use tokio::time::Instant;
 
@@ -55,7 +55,7 @@ use crate::proto::{
     ReplicationAckLevel, SyncEntry, SyncResponse,
 };
 use crate::replication::{
-    spawn_sender_with_options, ReplicationAckDurability, SenderConfig, SenderDeps, SenderMsg,
+    spawn_node_sender, NodeSender, ReplicationAckDurability, SenderConfig, SenderDeps, SenderMsg,
     SenderRuntimeOptions, SenderStateReport,
 };
 use crate::shard::{fragment_of, FragmentId};
@@ -66,8 +66,23 @@ use crate::supervision::{FragmentHealth, FragmentSupervisor, SupervisorArgs, Sup
 /// corrupt stream and the connection is dropped.
 const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 
+/// Current peer wire protocol version. Hello ranges must include this value.
+pub const WIRE_PROTOCOL_VERSION: u32 = 1;
+/// The peer returns exact forwarded-mutation outcomes.
+pub const CAPABILITY_MUTATION_RESULTS: u64 = 1 << 0;
+/// Replication ACKs carry an explicit receiver durability fence.
+pub const CAPABILITY_DURABILITY_ACKS: u64 = 1 << 1;
+/// Reconciliation frames carry session/round/chunk correlation.
+pub const CAPABILITY_CORRELATED_RECONCILIATION: u64 = 1 << 2;
+/// Capabilities required by this binary before it installs a peer connection.
+pub const REQUIRED_WIRE_CAPABILITIES: u64 =
+    CAPABILITY_MUTATION_RESULTS | CAPABILITY_DURABILITY_ACKS | CAPABILITY_CORRELATED_RECONCILIATION;
+
 /// Outbound queue depth per peer connection.
 const PEER_CHANNEL_DEPTH: usize = 256;
+/// Protocol-control messages retained per fragment/peer sender. Mutation
+/// ingress has its own lane sized by `SenderConfig::buffer_capacity`.
+const REPLICATION_CONTROL_CHANNEL_DEPTH: usize = 64;
 
 /// Reconnect backoff: first retry after this, doubling to the cap.
 const RECONNECT_BASE: Duration = Duration::from_millis(100);
@@ -110,7 +125,7 @@ impl PeerChannel {
 /// peer node_id -> outbound frame queue
 type PeerMap = Arc<Mutex<HashMap<String, PeerChannel>>>;
 /// Phase 5 senders, keyed by (fragment, peer node id).
-type SenderMap = Arc<Mutex<HashMap<(FragmentId, String), mpsc::UnboundedSender<SenderMsg>>>>;
+type SenderMap = Arc<Mutex<HashMap<(FragmentId, String), NodeSender>>>;
 /// Sender state reports, keyed by (fragment, peer node id).
 type SenderReportMap = Arc<Mutex<HashMap<(FragmentId, String), Arc<Mutex<SenderStateReport>>>>>;
 /// Relayed forwarded-gets keyed by their locally allocated request id.
@@ -135,9 +150,23 @@ struct SenderEntryDeps<'a> {
 async fn ensure_sender_entry(fragment: FragmentId, peer: &str, deps: SenderEntryDeps<'_>) {
     let key = (fragment, peer.to_string());
     let mut senders_guard = deps.senders.lock().await;
-    if senders_guard.contains_key(&key) {
+    // A connection or placement tick can have queued this ensure call while a
+    // loss transition committed. The drainer removes the router entry before
+    // releasing the sender-map lock; re-check here so the stale ensure cannot
+    // recreate a sender whose snapshot source has already been detached.
+    if deps.router.route_for_fragment(fragment).is_none() {
         return;
     }
+    let replacing_stopped_sender = if let Some(sender) = senders_guard.get(&key) {
+        if !sender.is_closed() {
+            return;
+        }
+        senders_guard.remove(&key);
+        deps.reports.lock().await.remove(&key);
+        true
+    } else {
+        false
+    };
     let report = Arc::new(Mutex::new(SenderStateReport {
         state: "disconnected".to_string(),
         session_id: 0,
@@ -164,7 +193,7 @@ async fn ensure_sender_entry(fragment: FragmentId, peer: &str, deps: SenderEntry
                 }
             });
         }));
-    let sender = spawn_sender_with_options(
+    let sender = spawn_node_sender(
         fragment,
         peer.to_string(),
         deps.config.clone(),
@@ -177,6 +206,12 @@ async fn ensure_sender_entry(fragment: FragmentId, peer: &str, deps: SenderEntry
         runtime,
     )
     .expect("node runtime options were validated before sender spawn");
+    if replacing_stopped_sender {
+        // The prior task may have died after accepting an already-applied
+        // mutation. Start its replacement in snapshot recovery rather than
+        // assuming the lost volatile queue was empty.
+        sender.schedule_reset();
+    }
     deps.reports.lock().await.insert(key.clone(), report);
     senders_guard.insert(key, sender);
 }
@@ -288,8 +323,9 @@ struct ConnContext {
     /// Notify the placement driver on peer join/leave. `None` in
     /// static mode.
     membership_tx: Option<mpsc::UnboundedSender<()>>,
-    /// Pre-shared cluster secret for handshake authentication.
-    /// `None` = unauthenticated mesh.
+    /// Pre-shared cluster secret for the static Hello integrity tag.
+    /// This is not replay-resistant peer authentication on plaintext TCP.
+    /// `None` = no group-membership tag.
     cluster_secret: Option<Vec<u8>>,
 }
 
@@ -305,9 +341,32 @@ const MAX_FORWARD_HOPS: u32 = 4;
 pub struct FragmentRouter {
     actors: Arc<RwLock<HashMap<FragmentId, ActorRef<KvMessage>>>>,
     fragment_count: usize,
+    /// A mutation holds a shared lease from its serving decision through
+    /// apply and replication fan-out. Placement revocation takes the exclusive
+    /// lease before removing `serving`, closing the apply/enqueue teardown race.
+    mutation_gates: Arc<Vec<Arc<AsyncRwLock<()>>>>,
 }
 
 impl FragmentRouter {
+    pub(crate) fn new(fragment_count: usize, actor_capacity: usize) -> Self {
+        Self {
+            actors: Arc::new(RwLock::new(HashMap::with_capacity(actor_capacity))),
+            fragment_count,
+            mutation_gates: Arc::new(
+                (0..fragment_count)
+                    .map(|_| Arc::new(AsyncRwLock::new(())))
+                    .collect(),
+            ),
+        }
+    }
+
+    fn mutation_gate(&self, fragment: FragmentId) -> Arc<AsyncRwLock<()>> {
+        self.mutation_gates
+            .get(fragment.0 as usize)
+            .expect("fragment was validated against fragment_count")
+            .clone()
+    }
+
     fn route(&self, key: &str) -> Option<ActorRef<KvMessage>> {
         let frag = fragment_of(key, self.fragment_count);
         self.route_for_fragment(frag)
@@ -717,8 +776,9 @@ pub struct Node {
     sync_entries_applied: Arc<AtomicU64>,
     /// Wake the placement driver on membership change (Phase 8).
     membership_tx: Option<mpsc::UnboundedSender<()>>,
-    /// Pre-shared cluster secret for handshake authentication.
-    /// `None` = unauthenticated mesh.
+    /// Pre-shared cluster secret for the static Hello integrity tag.
+    /// This is not replay-resistant peer authentication on plaintext TCP.
+    /// `None` = no group-membership tag.
     cluster_secret: Option<Vec<u8>>,
     tasks: Arc<Mutex<Vec<AbortHandle>>>,
     network: Arc<dyn Network>,
@@ -836,6 +896,7 @@ async fn spawn_fragment_subtree(
 #[derive(Clone, Debug)]
 pub struct NodeRuntimeOptions {
     peer_queue_frame_capacity: usize,
+    replication_control_message_capacity: usize,
     queue_admission_timeout: Duration,
     forwarded_attempt_timeout: Duration,
     socket_write_timeout: Duration,
@@ -846,6 +907,7 @@ impl Default for NodeRuntimeOptions {
     fn default() -> Self {
         Self {
             peer_queue_frame_capacity: PEER_CHANNEL_DEPTH,
+            replication_control_message_capacity: REPLICATION_CONTROL_CHANNEL_DEPTH,
             queue_admission_timeout: REMOTE_RPC_TIMEOUT,
             forwarded_attempt_timeout: REMOTE_RPC_TIMEOUT,
             socket_write_timeout: SOCKET_WRITE_TIMEOUT,
@@ -858,6 +920,14 @@ impl NodeRuntimeOptions {
     /// Set the number of frames buffered per peer connection.
     pub fn with_peer_queue_frame_capacity(mut self, capacity: usize) -> Self {
         self.peer_queue_frame_capacity = capacity;
+        self
+    }
+
+    /// Set the number of ACK/NACK/reconciliation responses retained per
+    /// fragment/peer sender. Saturation closes the contributing connection so
+    /// its session can replay instead of growing memory without bound.
+    pub fn with_replication_control_message_capacity(mut self, capacity: usize) -> Self {
+        self.replication_control_message_capacity = capacity;
         self
     }
 
@@ -892,6 +962,11 @@ impl NodeRuntimeOptions {
         self.peer_queue_frame_capacity
     }
 
+    /// Current per-sender protocol-control message capacity.
+    pub fn replication_control_message_capacity(&self) -> usize {
+        self.replication_control_message_capacity
+    }
+
     /// Current peer-queue admission timeout.
     pub fn queue_admission_timeout(&self) -> Duration {
         self.queue_admission_timeout
@@ -916,6 +991,7 @@ impl NodeRuntimeOptions {
         SenderRuntimeOptions::default()
             .with_ack_timeout(self.replication_ack_timeout)
             .with_queue_admission_timeout(self.queue_admission_timeout)
+            .with_control_channel_capacity(self.replication_control_message_capacity)
     }
 
     fn validate(&self) -> Result<(), NodeError> {
@@ -924,9 +1000,20 @@ impl NodeRuntimeOptions {
                 "peer queue frame capacity must be non-zero".to_string(),
             ));
         }
+        if self.replication_control_message_capacity == 0 {
+            return Err(NodeError::Actor(
+                "replication control message capacity must be non-zero".to_string(),
+            ));
+        }
         if self.peer_queue_frame_capacity > tokio::sync::Semaphore::MAX_PERMITS {
             return Err(NodeError::Actor(format!(
                 "peer queue frame capacity exceeds maximum {}",
+                tokio::sync::Semaphore::MAX_PERMITS
+            )));
+        }
+        if self.replication_control_message_capacity > tokio::sync::Semaphore::MAX_PERMITS {
+            return Err(NodeError::Actor(format!(
+                "replication control message capacity exceeds maximum {}",
                 tokio::sync::Semaphore::MAX_PERMITS
             )));
         }
@@ -1024,13 +1111,13 @@ pub struct NodeConfig {
     /// timestamp permanently poisons last-writer-wins cluster-wide. Default
     /// 5 minutes.
     pub max_clock_skew: Duration,
-    /// Pre-shared cluster secret for handshake authentication. When
-    /// set, every `Hello` carries an HMAC-SHA256(secret, node_id) tag
-    /// which the receiver verifies; mismatches drop the connection,
-    /// and any non-`Hello` message arriving before a completed
-    /// handshake is ignored. `None` (default) = unauthenticated mesh
-    /// (anyone with TCP reachability can join); a warning is logged
-    /// at startup. Must be identical on every node.
+    /// Pre-shared secret for a static Hello HMAC over identity, protocol range,
+    /// and capabilities. Mismatches drop the connection and pre-Hello messages
+    /// are ignored. The tag prevents accidental mismatch and unauthenticated
+    /// capability rewriting, but has no fresh challenge: a captured Hello can
+    /// be replayed to impersonate that node on plaintext TCP. Use a protected
+    /// custom [`Network`] transport when peer identity matters. Must be
+    /// non-empty and identical on every node. `None` (default) sends no tag.
     pub cluster_secret: Option<Vec<u8>>,
     /// Phase 5 async replication tuning (batching, acks, buffers).
     pub replication: SenderConfig,
@@ -1138,6 +1225,10 @@ impl Node {
             .replication
             .validate()
             .map_err(|error| NodeError::Actor(error.to_string()))?;
+        config
+            .replication
+            .validate_node_ingress()
+            .map_err(|error| NodeError::Actor(error.to_string()))?;
         if dynamic
             && (config.placement_poll_interval.is_zero()
                 || config.placement_drain_warn_interval.is_zero())
@@ -1152,11 +1243,19 @@ impl Node {
                     .to_string(),
             ));
         }
+        if config.cluster_secret.as_ref().map_or(false, Vec::is_empty) {
+            return Err(NodeError::Actor(
+                "cluster_secret must be non-empty when configured".to_string(),
+            ));
+        }
         if config.cluster_secret.is_none() {
             tracing::warn!(
-                "no cluster_secret configured: the peer mesh is unauthenticated; \
-                 anyone with TCP reachability can join. Set \
-                 NodeConfig.cluster_secret in production."
+                "no cluster_secret configured: anyone with TCP reachability can join the peer mesh"
+            );
+        } else {
+            tracing::warn!(
+                "cluster_secret uses a static, replayable Hello tag; use a protected custom \
+                 Network transport when replay-resistant peer identity is required"
             );
         }
         // Initial placement: the controller's map in dynamic mode
@@ -1218,10 +1317,7 @@ impl Node {
         ));
         let supervisors: Arc<Mutex<HashMap<FragmentId, ActorRef<SupervisorMessage>>>> =
             Arc::new(Mutex::new(HashMap::with_capacity(my_fragments.len())));
-        let router = FragmentRouter {
-            actors: Arc::new(RwLock::new(HashMap::with_capacity(my_fragments.len()))),
-            fragment_count: config.fragment_count,
-        };
+        let router = FragmentRouter::new(config.fragment_count, my_fragments.len());
         let serving: Arc<RwLock<HashSet<FragmentId>>> =
             Arc::new(RwLock::new(my_fragments.iter().copied().collect()));
         let placement_states: Arc<Mutex<HashMap<FragmentId, FragmentPlacementState>>> =
@@ -1617,7 +1713,17 @@ impl Node {
         priority: OpPriority,
     ) -> Result<(), NodeError> {
         let frag = fragment_of(&op.key, self.router.fragment_count);
-        if let Some(actor) = self.fragment_actor(&op.key) {
+        let mutation_lease = if self.placement_controller.is_some() {
+            Some(self.router.mutation_gate(frag).read_owned().await)
+        } else {
+            None
+        };
+        let local_actor = if self.serving.read().unwrap().contains(&frag) {
+            self.router.route_for_fragment(frag)
+        } else {
+            None
+        };
+        if let Some(actor) = local_actor {
             let outcome = call_apply(&actor, op.clone(), priority, false).await?;
 
             match outcome {
@@ -1644,6 +1750,7 @@ impl Node {
             self.enqueue_for_replication(frag, &op).await;
             return Ok(());
         }
+        drop(mutation_lease);
 
         // Remote fragment: forward to a replica holder in one hop.
         let owner = self
@@ -2179,6 +2286,11 @@ impl Node {
         for t in tasks.drain(..) {
             t.abort();
         }
+        drop(tasks);
+        let senders: Vec<NodeSender> = self.senders.lock().await.values().cloned().collect();
+        for sender in senders {
+            sender.stop().await;
+        }
         // Stop the supervisors; each drains its dispatcher pool (which
         // flushes) and its background actors. Failures just mean an
         // actor was already dead.
@@ -2335,16 +2447,21 @@ async fn placement_tick(deps: &PlacementDriverDeps, transitions: &mut JoinSet<()
         eprintln!("[placement] invalid desired placement ({e}); keeping current");
         return;
     }
-    // The controller's map is the routing table.
-    *deps.placement.write().unwrap() = desired.clone();
-
     let mine_desired: HashSet<FragmentId> = desired
         .iter()
         .filter(|(_, r)| r.iter().any(|id| id == &deps.node_id))
         .map(|(f, _)| *f)
         .collect();
+
+    // `placement_states` is also the transition commit mutex. Publishing a
+    // controller map and marking its gain/loss transitions in one critical
+    // section prevents a stale drainer from validating the old map and then
+    // tearing down state after a re-add has already been published.
     let (mine_current, in_flight): (HashSet<FragmentId>, HashSet<FragmentId>) = {
-        let states = deps.placement_states.lock().await;
+        let mut states = deps.placement_states.lock().await;
+        // Canonical lock order is placement_states -> placement. The sync map
+        // guard never crosses an await.
+        *deps.placement.write().unwrap() = desired.clone();
         let mut current = HashSet::new();
         let mut flight = HashSet::new();
         for (f, s) in states.iter() {
@@ -2359,33 +2476,27 @@ async fn placement_tick(deps: &PlacementDriverDeps, transitions: &mut JoinSet<()
                 }
             }
         }
+
+        // Mark transitions before spawning so the next tick cannot create a
+        // duplicate while the child task is waiting to be scheduled.
+        for f in mine_desired.difference(&current) {
+            states.insert(*f, FragmentPlacementState::Bootstrapping);
+            let d = deps.clone();
+            let frag = *f;
+            transitions.spawn(async move { gain_fragment(&d, frag).await });
+        }
+        for f in current.difference(&mine_desired) {
+            if flight.contains(f) {
+                continue;
+            }
+            states.insert(*f, FragmentPlacementState::Draining);
+            let d = deps.clone();
+            let frag = *f;
+            transitions.spawn(async move { lose_fragment(&d, frag).await });
+        }
         (current, flight)
     };
 
-    // Gains: mark Bootstrapping synchronously so the next tick doesn't
-    // spawn a duplicate.
-    for f in mine_desired.difference(&mine_current) {
-        deps.placement_states
-            .lock()
-            .await
-            .insert(*f, FragmentPlacementState::Bootstrapping);
-        let d = deps.clone();
-        let frag = *f;
-        transitions.spawn(async move { gain_fragment(&d, frag).await });
-    }
-    // Losses (skip ones already draining).
-    for f in mine_current.difference(&mine_desired) {
-        if in_flight.contains(f) {
-            continue;
-        }
-        deps.placement_states
-            .lock()
-            .await
-            .insert(*f, FragmentPlacementState::Draining);
-        let d = deps.clone();
-        let frag = *f;
-        transitions.spawn(async move { lose_fragment(&d, frag).await });
-    }
     // Steady state: keep senders aligned with the replica sets.
     for f in mine_desired.intersection(&mine_current) {
         if in_flight.contains(f) {
@@ -2443,9 +2554,17 @@ async fn ensure_fragment_senders(
     if !stale.is_empty() {
         let mut senders = deps.senders.lock().await;
         let mut reports = deps.sender_reports.lock().await;
+        let mut removed = Vec::with_capacity(stale.len());
         for key in stale {
-            senders.remove(&key);
+            if let Some(sender) = senders.remove(&key) {
+                removed.push(sender);
+            }
             reports.remove(&key);
+        }
+        drop(reports);
+        drop(senders);
+        for sender in removed {
+            sender.stop().await;
         }
     }
 }
@@ -2573,12 +2692,61 @@ async fn bootstrap_from(
     }
 }
 
+async fn fragment_sender_set_is_drained(
+    fragment: FragmentId,
+    senders: &HashMap<(FragmentId, String), NodeSender>,
+    reports: &HashMap<(FragmentId, String), Arc<Mutex<SenderStateReport>>>,
+) -> bool {
+    for (key @ (sender_fragment, _), sender) in senders {
+        if *sender_fragment != fragment {
+            continue;
+        }
+        if sender.is_closed() || !sender.ingress_is_idle() {
+            return false;
+        }
+        let Some(report) = reports.get(key) else {
+            return false;
+        };
+        let report = report.lock().await;
+        if report.buffered != 0 || report.in_flight != 0 || report.state == "buffer_reset" {
+            return false;
+        }
+    }
+    // Treat an orphan report as non-drained. It indicates that a concurrent
+    // lifecycle transition has not committed its exact sender/report set yet.
+    reports
+        .keys()
+        .filter(|(report_fragment, _)| *report_fragment == fragment)
+        .all(|key| senders.contains_key(key))
+}
+
+async fn restore_fragment_if_readded(deps: &PlacementDriverDeps, fragment: FragmentId) -> bool {
+    let mut states = deps.placement_states.lock().await;
+    let is_desired = deps
+        .placement
+        .read()
+        .unwrap()
+        .get(&fragment)
+        .map_or(false, |replicas| {
+            replicas.iter().any(|node| node == &deps.node_id)
+        });
+    if is_desired {
+        deps.serving.write().unwrap().insert(fragment);
+        states.insert(fragment, FragmentPlacementState::Serving);
+    }
+    is_desired
+}
+
 /// Lose a fragment: stop serving new local ops (they forward to the
 /// new owner), drain replication senders, then stop the subtree.
 async fn lose_fragment(deps: &PlacementDriverDeps, fragment: FragmentId) {
-    // Leave the serving set first: new local ops forward to the new
-    // owner instead of enqueueing here.
+    // First wait for every mutation which already chose this owner to finish
+    // both its local apply and sender fan-out. New mutations queue behind this
+    // exclusive lease, observe `serving` removed, and forward to the new owner.
+    let mutation_gate = deps.router.mutation_gate(fragment);
+    let mutation_revocation = mutation_gate.write_owned().await;
     deps.serving.write().unwrap().remove(&fragment);
+    drop(mutation_revocation);
     // Keep senders to the current replicas so queued ops drain out.
     let replicas: Vec<String> = deps
         .placement
@@ -2610,40 +2778,90 @@ async fn lose_fragment(deps: &PlacementDriverDeps, fragment: FragmentId) {
     // connectivity without the old owner destroying its recovery state.
     let mut next_warning = std::time::Instant::now() + deps.drain_warn_interval;
     loop {
-        let still_revoked = deps
-            .placement
-            .read()
-            .unwrap()
-            .get(&fragment)
-            .map(|replicas| !replicas.iter().any(|node| node == &deps.node_id))
-            .unwrap_or(true);
-        if !still_revoked {
+        if restore_fragment_if_readded(deps, fragment).await {
             // The controller reversed the move while it was draining. Restore
             // local service instead of letting the stale transition remove a
             // newly authoritative fragment.
-            deps.serving.write().unwrap().insert(fragment);
+            return;
+        }
+
+        let drained = {
+            let senders = deps.senders.lock().await;
+            let reports = deps.sender_reports.lock().await;
+            fragment_sender_set_is_drained(fragment, &senders, &reports).await
+        };
+        if drained {
+            // Final teardown commit. `placement_states` serializes this
+            // validation with placement publication. Keeping the sender map
+            // locked through router removal also forces already-queued ensure
+            // calls to re-check the now-absent snapshot source.
+            let mut states = deps.placement_states.lock().await;
+            let still_revoked = deps
+                .placement
+                .read()
+                .unwrap()
+                .get(&fragment)
+                .map_or(true, |replicas| {
+                    !replicas.iter().any(|node| node == &deps.node_id)
+                });
+            if !still_revoked {
+                deps.serving.write().unwrap().insert(fragment);
+                states.insert(fragment, FragmentPlacementState::Serving);
+                return;
+            }
+
+            // Fence every dynamic mutation path before the destructive commit.
+            // New readers wait until the router entry is gone and then fail or
+            // forward without touching the retired actor.
+            let mutation_commit = deps.router.mutation_gate(fragment).write_owned().await;
+            let mut senders = deps.senders.lock().await;
+            let mut reports = deps.sender_reports.lock().await;
+            if !fragment_sender_set_is_drained(fragment, &senders, &reports).await {
+                drop(reports);
+                drop(senders);
+                drop(mutation_commit);
+                drop(states);
+                continue;
+            }
+
+            let keys: Vec<(FragmentId, String)> = senders
+                .keys()
+                .filter(|(sender_fragment, _)| *sender_fragment == fragment)
+                .cloned()
+                .collect();
+            let mut removed_senders = Vec::with_capacity(keys.len());
+            for key in keys {
+                if let Some(sender) = senders.remove(&key) {
+                    removed_senders.push(sender);
+                }
+                reports.remove(&key);
+            }
+            for sender in &removed_senders {
+                sender.request_stop();
+            }
+
+            // Detach every admission/recreation path before the first teardown
+            // wait. A queued ensure call cannot acquire `senders` until after
+            // the router is absent, and an inbound mutation cannot acquire its
+            // shared lease until after the same point.
+            let supervisor = deps.supervisors.lock().await.remove(&fragment);
+            deps.router.remove(fragment);
+            drop(reports);
+            drop(senders);
+            drop(mutation_commit);
+            drop(states);
+
+            for sender in removed_senders {
+                sender.stop().await;
+            }
+            if let Some(supervisor) = supervisor {
+                let _ = supervisor.stop_and_wait(None, None).await;
+            }
             deps.placement_states
                 .lock()
                 .await
-                .insert(fragment, FragmentPlacementState::Serving);
+                .insert(fragment, FragmentPlacementState::Stopped);
             return;
-        }
-        let drained = {
-            let reports = deps.sender_reports.lock().await;
-            let mut ok = true;
-            for ((f, _), r) in reports.iter() {
-                if *f == fragment {
-                    let rep = r.lock().await;
-                    if rep.buffered != 0 || rep.in_flight != 0 || rep.state == "buffer_reset" {
-                        ok = false;
-                        break;
-                    }
-                }
-            }
-            ok
-        };
-        if drained {
-            break;
         }
         if std::time::Instant::now() >= next_warning {
             tracing::warn!(
@@ -2654,44 +2872,6 @@ async fn lose_fragment(deps: &PlacementDriverDeps, fragment: FragmentId) {
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    // A placement reversal can race the final report poll.
-    let still_revoked = deps
-        .placement
-        .read()
-        .unwrap()
-        .get(&fragment)
-        .map(|replicas| !replicas.iter().any(|node| node == &deps.node_id))
-        .unwrap_or(true);
-    if !still_revoked {
-        deps.serving.write().unwrap().insert(fragment);
-        deps.placement_states
-            .lock()
-            .await
-            .insert(fragment, FragmentPlacementState::Serving);
-        return;
-    }
-    // Tear down: stop the supervisor, drop the actor and the senders.
-    if let Some(sup) = deps.supervisors.lock().await.remove(&fragment) {
-        let _ = sup.stop_and_wait(None, None).await;
-    }
-    deps.router.remove(fragment);
-    {
-        let mut senders = deps.senders.lock().await;
-        let mut reports = deps.sender_reports.lock().await;
-        let keys: Vec<(FragmentId, String)> = senders
-            .keys()
-            .filter(|(f, _)| *f == fragment)
-            .cloned()
-            .collect();
-        for key in keys {
-            senders.remove(&key);
-            reports.remove(&key);
-        }
-    }
-    deps.placement_states
-        .lock()
-        .await
-        .insert(fragment, FragmentPlacementState::Stopped);
 }
 
 /// Drive one peer connection: handshake, then a read loop.
@@ -2824,6 +3004,9 @@ async fn handle_connection(ctx: ConnContext, stream: BoxStream, we_dialed: bool)
             Some(EnvelopeMsg::Hello(Hello {
                 node_id: peer,
                 auth_tag,
+                min_protocol_version,
+                max_protocol_version,
+                capabilities,
             })) => {
                 // A connection has exactly one immutable peer identity. A
                 // second Hello could otherwise replace `peer_node_id`, churn
@@ -2842,11 +3025,41 @@ async fn handle_connection(ctx: ConnContext, stream: BoxStream, we_dialed: bool)
                     tracing::warn!("rejecting Hello claiming our own node_id; dropping connection");
                     break;
                 }
+                if min_protocol_version == 0
+                    || min_protocol_version > WIRE_PROTOCOL_VERSION
+                    || max_protocol_version < WIRE_PROTOCOL_VERSION
+                {
+                    tracing::warn!(
+                        claimed_node_id = %peer,
+                        min_protocol_version,
+                        max_protocol_version,
+                        local_protocol_version = WIRE_PROTOCOL_VERSION,
+                        "peer wire-version range is incompatible; dropping connection"
+                    );
+                    break;
+                }
+                let missing_capabilities = REQUIRED_WIRE_CAPABILITIES & !capabilities;
+                if missing_capabilities != 0 {
+                    tracing::warn!(
+                        claimed_node_id = %peer,
+                        capabilities,
+                        missing_capabilities,
+                        "peer omitted required wire capabilities; dropping connection"
+                    );
+                    break;
+                }
                 // Authenticate the handshake when a cluster secret is
                 // configured. Without it, anyone with TCP reachability
                 // can join the mesh (adversarial review #3, #4).
                 if let Some(secret) = cluster_secret.as_deref() {
-                    if !verify_hello_auth_tag(secret, &peer, &auth_tag) {
+                    if !verify_hello_auth_tag(
+                        secret,
+                        &peer,
+                        min_protocol_version,
+                        max_protocol_version,
+                        capabilities,
+                        &auth_tag,
+                    ) {
                         tracing::warn!(
                             "Hello auth failed for claimed node_id={peer}; dropping connection"
                         );
@@ -2938,8 +3151,16 @@ async fn handle_connection(ctx: ConnContext, stream: BoxStream, we_dialed: bool)
                     );
                     continue;
                 }
+                let fragment = FragmentId(s.fragment);
+                if router.route_for_fragment(fragment).is_none() {
+                    tracing::warn!(
+                        fragment = s.fragment,
+                        "ignoring SessionStart for a fragment this node does not host"
+                    );
+                    continue;
+                }
                 if let Some(peer) = peer_node_id.clone() {
-                    let key = (peer, FragmentId(s.fragment));
+                    let key = (peer, fragment);
                     let previous = sessions.lock().await.insert(key.clone(), s.session_id);
                     if previous != Some(s.session_id) {
                         reconcile_failures.remove(&key);
@@ -2960,6 +3181,15 @@ async fn handle_connection(ctx: ConnContext, stream: BoxStream, we_dialed: bool)
                 if current != Some(b.session_id) {
                     continue; // stale session
                 }
+                // Dynamic placement teardown takes the exclusive side of this
+                // lease before detaching the actor. Hold the shared side
+                // through apply, durability fencing, and ACK enqueue so no
+                // mutation can be acknowledged during destructive teardown.
+                let _mutation_lease = if dynamic_placement {
+                    Some(router.mutation_gate(frag).read_owned().await)
+                } else {
+                    None
+                };
                 let tracked = b.batch_seq != u64::MAX;
                 let requested_ack = if tracked {
                     match ReplicationAckLevel::try_from(b.required_ack_level) {
@@ -3114,11 +3344,16 @@ async fn handle_connection(ctx: ConnContext, stream: BoxStream, we_dialed: bool)
                     };
                     let senders = senders.lock().await;
                     if let Some(tx) = senders.get(&(FragmentId(a.fragment), peer)) {
-                        let _ = tx.send(SenderMsg::Ack {
-                            session_id: a.session_id,
-                            batch_seq: a.batch_seq,
-                            durability,
-                        });
+                        if tx
+                            .send(SenderMsg::Ack {
+                                session_id: a.session_id,
+                                batch_seq: a.batch_seq,
+                                durability,
+                            })
+                            .is_err()
+                        {
+                            break;
+                        }
                     }
                 }
             }
@@ -3126,11 +3361,16 @@ async fn handle_connection(ctx: ConnContext, stream: BoxStream, we_dialed: bool)
                 if let Some(peer) = peer_node_id.clone() {
                     let senders = senders.lock().await;
                     if let Some(tx) = senders.get(&(FragmentId(n.fragment), peer)) {
-                        let _ = tx.send(SenderMsg::Nack {
-                            session_id: n.session_id,
-                            batch_seq: n.batch_seq,
-                            error: n.error,
-                        });
+                        if tx
+                            .send(SenderMsg::Nack {
+                                session_id: n.session_id,
+                                batch_seq: n.batch_seq,
+                                error: n.error,
+                            })
+                            .is_err()
+                        {
+                            break;
+                        }
                     }
                 }
             }
@@ -3322,6 +3562,11 @@ async fn handle_connection(ctx: ConnContext, stream: BoxStream, we_dialed: bool)
                     break;
                 }
                 let frag = fragment_of(&p.key, router.fragment_count);
+                let mutation_lease = if dynamic_placement {
+                    Some(router.mutation_gate(frag).read_owned().await)
+                } else {
+                    None
+                };
                 let is_serving = serving.read().unwrap().contains(&frag);
                 if is_serving {
                     let result = match router.route_for_fragment(frag) {
@@ -3360,6 +3605,7 @@ async fn handle_connection(ctx: ConnContext, stream: BoxStream, we_dialed: bool)
                             ))),
                         ),
                     };
+                    drop(mutation_lease);
                     send_mutation_response(
                         &tx,
                         MutationResponse {
@@ -3369,8 +3615,10 @@ async fn handle_connection(ctx: ConnContext, stream: BoxStream, we_dialed: bool)
                     )
                     .await;
                 } else if p.hops < MAX_FORWARD_HOPS {
+                    drop(mutation_lease);
                     relay_put(p, frag, &tx, &peer_node_id, &rfctx).await;
                 } else {
+                    drop(mutation_lease);
                     send_unavailable_mutation(
                         &tx,
                         p.req_id,
@@ -3601,8 +3849,14 @@ async fn handle_connection(ctx: ConnContext, stream: BoxStream, we_dialed: bool)
                     continue;
                 }
 
+                let mutation_lease = if dynamic_placement {
+                    Some(router.mutation_gate(frag).read_owned().await)
+                } else {
+                    None
+                };
                 let is_serving = serving.read().unwrap().contains(&frag);
                 if !is_serving {
+                    drop(mutation_lease);
                     let max_hops = bp.puts.iter().map(|p| p.hops).max().unwrap_or(0);
                     if max_hops < MAX_FORWARD_HOPS {
                         relay_batch(bp, frag, &tx, &peer_node_id, &rfctx).await;
@@ -3619,6 +3873,7 @@ async fn handle_connection(ctx: ConnContext, stream: BoxStream, we_dialed: bool)
                 }
 
                 let Some(actor) = router.route_for_fragment(frag) else {
+                    drop(mutation_lease);
                     send_unavailable_mutation(
                         &tx,
                         bp.req_id,
@@ -3654,6 +3909,7 @@ async fn handle_connection(ctx: ConnContext, stream: BoxStream, we_dialed: bool)
                         .await,
                     );
                 }
+                drop(mutation_lease);
                 send_mutation_response(&tx, MutationResponse { req_id, results }).await;
             }
             Some(EnvelopeMsg::BatchGet(bg)) => {
@@ -3782,7 +4038,7 @@ async fn handle_connection(ctx: ConnContext, stream: BoxStream, we_dialed: bool)
                         break;
                     }
                 }
-                sync_entries_applied.fetch_add(resp.entries.len() as u64, Ordering::Relaxed);
+                let mut sync_failed = false;
                 for e in resp.entries {
                     let op = ReplicatedOp {
                         key: e.key,
@@ -3800,13 +4056,23 @@ async fn handle_connection(ctx: ConnContext, stream: BoxStream, we_dialed: bool)
                         boot_id: 0, // sync is not gossip
                     };
                     if let Some(actor) = router.route(&op.key) {
-                        let _ = actor.send_message(KvMessage::ApplyOp {
-                            op,
-                            priority: OpPriority::Background,
-                            is_replication: true,
-                            reply: None,
-                        });
+                        match call_apply(&actor, op, OpPriority::Background, true).await {
+                            Ok(_) => {
+                                sync_entries_applied.fetch_add(1, Ordering::Relaxed);
+                            }
+                            Err(error) => {
+                                tracing::warn!(
+                                    %error,
+                                    "full-state sync apply failed; closing connection for retry"
+                                );
+                                sync_failed = true;
+                                break;
+                            }
+                        }
                     }
+                }
+                if sync_failed {
+                    break;
                 }
             }
             None => {}
@@ -4179,34 +4445,73 @@ fn jitter(backoff: Duration) -> Duration {
 /// arrived on. Only used when no fragment_map is configured; the sharded
 /// path fans out from the coordinator instead.
 async fn send_hello(tx: &PeerChannel, node_id: &str, cluster_secret: Option<&[u8]>) {
+    let min_protocol_version = WIRE_PROTOCOL_VERSION;
+    let max_protocol_version = WIRE_PROTOCOL_VERSION;
+    let capabilities = REQUIRED_WIRE_CAPABILITIES;
     send_envelope(
         tx,
         Envelope {
             msg: Some(EnvelopeMsg::Hello(Hello {
                 node_id: node_id.to_string(),
                 auth_tag: cluster_secret
-                    .map(|s| hello_auth_tag(s, node_id))
+                    .map(|s| {
+                        hello_auth_tag(
+                            s,
+                            node_id,
+                            min_protocol_version,
+                            max_protocol_version,
+                            capabilities,
+                        )
+                    })
                     .unwrap_or_default(),
+                min_protocol_version,
+                max_protocol_version,
+                capabilities,
             })),
         },
     )
     .await;
 }
 
-/// HMAC-SHA256(secret, node_id): proves knowledge of the cluster
-/// secret without revealing it. Compared in constant time.
-fn hello_auth_tag(secret: &[u8], node_id: &str) -> Vec<u8> {
+/// HMAC-SHA256 over the complete, length-delimited Hello transcript. Binding
+/// capabilities prevents unauthenticated feature rewriting when the optional
+/// static tag is configured. The transcript has no freshness and is replayable.
+fn hello_auth_tag(
+    secret: &[u8],
+    node_id: &str,
+    min_protocol_version: u32,
+    max_protocol_version: u32,
+    capabilities: u64,
+) -> Vec<u8> {
     use hmac::{Hmac, Mac};
     use sha2::Sha256;
     let mut mac = Hmac::<Sha256>::new_from_slice(secret).expect("HMAC accepts any key length");
+    mac.update(b"actordb-hello-v1\0");
+    mac.update(&(node_id.len() as u64).to_be_bytes());
     mac.update(node_id.as_bytes());
+    mac.update(&min_protocol_version.to_be_bytes());
+    mac.update(&max_protocol_version.to_be_bytes());
+    mac.update(&capabilities.to_be_bytes());
     mac.finalize().into_bytes().to_vec()
 }
 
 /// Constant-time verification of a Hello's auth tag.
-fn verify_hello_auth_tag(secret: &[u8], node_id: &str, tag: &[u8]) -> bool {
+fn verify_hello_auth_tag(
+    secret: &[u8],
+    node_id: &str,
+    min_protocol_version: u32,
+    max_protocol_version: u32,
+    capabilities: u64,
+    tag: &[u8],
+) -> bool {
     use subtle::ConstantTimeEq;
-    let expected = hello_auth_tag(secret, node_id);
+    let expected = hello_auth_tag(
+        secret,
+        node_id,
+        min_protocol_version,
+        max_protocol_version,
+        capabilities,
+    );
     expected.as_slice().ct_eq(tag).into()
 }
 
@@ -4275,6 +4580,7 @@ async fn try_send_envelope_with_deadline(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::replication::spawn_sender_with_options;
 
     fn test_peer_channel(capacity: usize) -> (PeerChannel, mpsc::Receiver<Vec<u8>>) {
         let (tx, rx) = mpsc::channel(capacity);
@@ -4314,6 +4620,7 @@ mod tests {
     fn runtime_option_defaults_are_explicit_and_source_compatible() {
         let options = NodeRuntimeOptions::default();
         assert_eq!(options.peer_queue_frame_capacity(), 256);
+        assert_eq!(options.replication_control_message_capacity(), 64);
         assert_eq!(options.queue_admission_timeout(), Duration::from_secs(5));
         assert_eq!(options.forwarded_attempt_timeout(), Duration::from_secs(5));
         assert_eq!(options.socket_write_timeout(), Duration::from_secs(30));
@@ -4330,6 +4637,130 @@ mod tests {
             .with_peer_queue_frame_capacity(tokio::sync::Semaphore::MAX_PERMITS.saturating_add(1))
             .validate()
             .is_err());
+        assert!(NodeRuntimeOptions::default()
+            .with_replication_control_message_capacity(0)
+            .validate()
+            .is_err());
+        assert!(NodeRuntimeOptions::default()
+            .with_replication_control_message_capacity(
+                tokio::sync::Semaphore::MAX_PERMITS.saturating_add(1),
+            )
+            .validate()
+            .is_err());
+    }
+
+    #[test]
+    fn static_hello_hmac_binds_wire_capabilities() {
+        let authenticated = hello_auth_tag(
+            b"secret",
+            "peer",
+            WIRE_PROTOCOL_VERSION,
+            WIRE_PROTOCOL_VERSION,
+            REQUIRED_WIRE_CAPABILITIES,
+        );
+        assert!(verify_hello_auth_tag(
+            b"secret",
+            "peer",
+            WIRE_PROTOCOL_VERSION,
+            WIRE_PROTOCOL_VERSION,
+            REQUIRED_WIRE_CAPABILITIES,
+            &authenticated,
+        ));
+        assert!(!verify_hello_auth_tag(
+            b"secret",
+            "peer",
+            WIRE_PROTOCOL_VERSION,
+            WIRE_PROTOCOL_VERSION,
+            REQUIRED_WIRE_CAPABILITIES & !CAPABILITY_DURABILITY_ACKS,
+            &authenticated,
+        ));
+    }
+
+    #[tokio::test]
+    async fn placement_revocation_waits_for_admitted_mutation_lease() {
+        let router = FragmentRouter::new(1, 0);
+        let fragment = FragmentId(0);
+        let serving = Arc::new(RwLock::new(HashSet::from([fragment])));
+        let admitted = router.mutation_gate(fragment).read_owned().await;
+        let revocation_gate = router.mutation_gate(fragment);
+        let revoked_serving = serving.clone();
+        let revoke = tokio::spawn(async move {
+            let exclusive = revocation_gate.write_owned().await;
+            revoked_serving.write().unwrap().remove(&fragment);
+            drop(exclusive);
+        });
+        tokio::task::yield_now().await;
+        assert!(!revoke.is_finished());
+        assert!(serving.read().unwrap().contains(&fragment));
+
+        drop(admitted);
+        revoke.await.unwrap();
+        assert!(!serving.read().unwrap().contains(&fragment));
+        let _late_mutation = router.mutation_gate(fragment).read_owned().await;
+        assert!(!serving.read().unwrap().contains(&fragment));
+    }
+
+    #[tokio::test]
+    async fn placement_drain_rechecks_reset_required_sender_as_one_map_snapshot() {
+        let fragment = FragmentId(0);
+        let report = Arc::new(Mutex::new(SenderStateReport {
+            state: "disconnected".to_string(),
+            session_id: 0,
+            buffered: 0,
+            in_flight: 0,
+            last_ack_durability: None,
+            ack_durability_mismatch: false,
+            reconcile_rounds: 0,
+        }));
+        let sender = spawn_node_sender(
+            fragment,
+            "peer".to_string(),
+            SenderConfig::default(),
+            SenderDeps {
+                router: FragmentRouter::new(1, 0),
+                hlc: Arc::new(Mutex::new(HlcClock::new())),
+                reset_senders: Arc::new(Mutex::new(HashMap::new())),
+                state_report: report.clone(),
+            },
+            SenderRuntimeOptions::default(),
+        )
+        .unwrap();
+        sender.schedule_reset();
+        let key = (fragment, "peer".to_string());
+        let senders = HashMap::from([(key.clone(), sender.clone())]);
+        let reports = HashMap::from([(key, report)]);
+
+        assert!(!fragment_sender_set_is_drained(fragment, &senders, &reports).await);
+        sender.stop().await;
+    }
+
+    #[tokio::test]
+    async fn stale_sender_ensure_refuses_a_removed_router_fragment() {
+        let router = FragmentRouter::new(1, 0);
+        let senders: SenderMap = Arc::new(Mutex::new(HashMap::new()));
+        let reports: SenderReportMap = Arc::new(Mutex::new(HashMap::new()));
+        let peers: PeerMap = Arc::new(Mutex::new(HashMap::new()));
+        let config = SenderConfig::default();
+        let runtime = SenderRuntimeOptions::default();
+        let hlc = Arc::new(Mutex::new(HlcClock::new()));
+
+        ensure_sender_entry(
+            FragmentId(0),
+            "peer",
+            SenderEntryDeps {
+                config: &config,
+                runtime: &runtime,
+                router: &router,
+                hlc: &hlc,
+                senders: &senders,
+                reports: &reports,
+                peers: &peers,
+            },
+        )
+        .await;
+
+        assert!(senders.lock().await.is_empty());
+        assert!(reports.lock().await.is_empty());
     }
 
     #[test]
@@ -4562,10 +4993,7 @@ mod tests {
 
     #[tokio::test]
     async fn stale_peer_disconnect_does_not_clear_replacement_sender_channel() {
-        let router = FragmentRouter {
-            actors: Arc::new(RwLock::new(HashMap::new())),
-            fragment_count: 1,
-        };
+        let router = FragmentRouter::new(1, 0);
         let report = Arc::new(Mutex::new(SenderStateReport {
             state: "disconnected".to_string(),
             session_id: 0,
@@ -4634,10 +5062,7 @@ mod tests {
 
     #[tokio::test]
     async fn reset_sender_retries_reconcile_after_live_queue_admission_timeout() {
-        let router = FragmentRouter {
-            actors: Arc::new(RwLock::new(HashMap::new())),
-            fragment_count: 1,
-        };
+        let router = FragmentRouter::new(1, 0);
         let report = Arc::new(Mutex::new(SenderStateReport {
             state: "disconnected".to_string(),
             session_id: 0,
@@ -4723,10 +5148,7 @@ mod tests {
 
     #[tokio::test]
     async fn routine_reconcile_disconnect_drains_buffer_before_retry() {
-        let router = FragmentRouter {
-            actors: Arc::new(RwLock::new(HashMap::new())),
-            fragment_count: 1,
-        };
+        let router = FragmentRouter::new(1, 0);
         let report = Arc::new(Mutex::new(SenderStateReport {
             state: "disconnected".to_string(),
             session_id: 0,
@@ -4852,10 +5274,7 @@ mod tests {
 
     #[tokio::test]
     async fn fresh_reconcile_pause_does_not_skip_requeued_batch_on_reconnect() {
-        let router = FragmentRouter {
-            actors: Arc::new(RwLock::new(HashMap::new())),
-            fragment_count: 1,
-        };
+        let router = FragmentRouter::new(1, 0);
         let report = Arc::new(Mutex::new(SenderStateReport {
             state: "disconnected".to_string(),
             session_id: 0,
@@ -5000,10 +5419,7 @@ mod tests {
     }
 
     async fn assert_fresh_pause_replays_before_reconcile(trigger: FreshPauseRequeue) {
-        let router = FragmentRouter {
-            actors: Arc::new(RwLock::new(HashMap::new())),
-            fragment_count: 1,
-        };
+        let router = FragmentRouter::new(1, 0);
         let report = Arc::new(Mutex::new(SenderStateReport {
             state: "disconnected".to_string(),
             session_id: 0,
@@ -5161,10 +5577,7 @@ mod tests {
 
     #[tokio::test]
     async fn reconnect_preserves_ordinary_nack_retry_floor() {
-        let router = FragmentRouter {
-            actors: Arc::new(RwLock::new(HashMap::new())),
-            fragment_count: 1,
-        };
+        let router = FragmentRouter::new(1, 0);
         let report = Arc::new(Mutex::new(SenderStateReport {
             state: "disconnected".to_string(),
             session_id: 0,
@@ -5275,10 +5688,7 @@ mod tests {
 
     #[tokio::test]
     async fn reconnect_preserves_reconcile_timeout_retry_floor() {
-        let router = FragmentRouter {
-            actors: Arc::new(RwLock::new(HashMap::new())),
-            fragment_count: 1,
-        };
+        let router = FragmentRouter::new(1, 0);
         let report = Arc::new(Mutex::new(SenderStateReport {
             state: "disconnected".to_string(),
             session_id: 0,

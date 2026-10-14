@@ -17,18 +17,21 @@ background.
         └──────────────── PeerDisconnected (BufferReset survives disconnects)
 ```
 
-- **Connected**: dequeued local mutations accumulate in a bounded owned buffer
-  (`buffer_capacity`, default 10 000). The command mailbox feeding the sender
-  is currently unbounded, so this is not a total replication-ingress memory
-  bound. Batches ship on a timer
+- **Connected**: locally applied mutations first enter a bounded Node data lane
+  and then a bounded sender-owned buffer (each uses `buffer_capacity`, default
+  10 000). Batches ship on a timer
   (`batch_interval` 100 ms, `batch_size` 100), with at most `max_in_flight`
-  (4) batches awaiting ack.
+  (4) batches awaiting ack. Protocol responses use a separate bounded lane
+  (64 messages by default); peer lifecycle, overflow generations, and
+  on-demand reconciliation are persistent/coalesced signals, so mutation
+  saturation cannot hide control progress.
 - **Disconnected**: peer down; buffered and in-flight operations are retained
   for replay in the next session.
-- **BufferReset**: entered when an `Enqueue` arrives with the buffer already
-  full. The buffer is shed and the op itself is still applied locally. A live
-  sender rotates its session and starts reconciliation immediately; reconnect
-  is not required.
+- **BufferReset**: entered when either the mutation-ingress lane or owned
+  buffer is full. Shed commands name mutations already applied to authoritative
+  fragment state; overflow atomically advances a persistent generation before
+  returning to the caller. A live sender rotates its session and starts
+  reconciliation immediately; reconnect is not required.
   Mutations arriving during reset are retained as post-snapshot deltas up to
   the same bound. Another overflow advances the reset epoch, so an older round
   cannot complete the newer reset state. `BufferReset` also survives
@@ -51,7 +54,9 @@ Tuning lives in `SenderConfig` (see [Configuration](configuration.md)):
 
 Runtime liveness policy is separate for source compatibility. A node maps
 `NodeRuntimeOptions::replication_ack_timeout` (30 seconds by default) and
-`queue_admission_timeout` (5 seconds) into each sender. Direct embedders get the
+`queue_admission_timeout` (5 seconds) into each sender; the Node integration
+also bounds the separate protocol-control lane to 64 messages by default via
+`replication_control_message_capacity`. Direct embedders get the
 same defaults from `spawn_sender`; use `spawn_sender_with_options` plus
 `SenderRuntimeOptions::with_ack_timeout` and
 `with_queue_admission_timeout` to override them. Reconciliation barriers always
@@ -70,6 +75,13 @@ rotate the session. Connect/disconnect notifications carry the exact peer
 queue identity, so an older connection cannot replace or clear a newer one.
 Replaying `SessionStart` with the same id also does not clear a failed-repair
 latch; only a genuinely new session does.
+
+The receiver accepts `SessionStart` only for a fragment it currently hosts,
+which bounds the per-connection session table by configured fragments. Normal
+replication batches are processed sequentially per connection and await every
+actor apply. Legacy full-state `SyncResponse` entries now do the same and are
+counted only after successful application; a shed or failed apply closes the
+connection so handshake sync can retry instead of silently dropping a suffix.
 
 A tracked batch carries the sender's `required_ack_level`. The receiver first
 verifies that every key belongs to the declared fragment and awaits every exact
@@ -104,11 +116,16 @@ permanently failing store from becoming a tight write/log loop.
 ACK; the batch remains in flight. A weak ACK does not extend that batch's
 original deadline. ACK observations reset on every session.
 
-This protocol change is deliberately fail-closed but has no negotiated version
-bit yet. Older receivers do not send mutation responses and emit fieldless ACKs
-that a new sender rejects; older senders omit the required ACK level and ignore
-the new receiver's NACK. Upgrade all nodes together until explicit Hello
-capability negotiation lands.
+`Hello` advertises an inclusive protocol-version range and capability bits for
+exact mutation results, durability ACKs, and correlated reconciliation. The
+connection is rejected before peer installation unless the range includes the
+local version and every required bit is present. With `cluster_secret`
+configured, identity, range, and capabilities are all bound into the HMAC, so
+an on-path peer cannot strip a feature bit without failing tag verification.
+This static tag is not peer authentication: it has no fresh challenge, so a
+captured Hello can be replayed on the plaintext transport. Fieldless legacy
+Hellos fail closed. The current release supports one wire version, so upgrades
+still require mutually compatible binaries.
 
 Every ordinary streaming batch receives an ACK deadline after its frame enters
 the peer queue (30 seconds by default). If any ordinary batch expires, the
@@ -180,7 +197,8 @@ frame limit; byte-bounded reconciliation pagination remains follow-up work.
 ## The Hello / full-state handshake
 
 The connection handshake is **not** replaced by the reconciler in static mode.
-The dialer sends `Hello { node_id }` immediately; the listener replies; then,
+The dialer sends `Hello { node_id, protocol range, capabilities, auth_tag }`
+immediately; the listener validates and replies; then,
 when dynamic placement is *off*, each side sends a full-state `SyncRequest`
 for its fragments and the peer answers with `SyncResponse` entries. With the
 Phase 8 placement driver active, the handshake skips `SyncRequest` entirely —
@@ -197,6 +215,12 @@ the reconciler owns anti-entropy (the rolling-restart test asserts
   `NodeRuntimeOptions`; it is not byte-bounded. All protocol traffic shares the
   same queue and socket writer. `OpPriority` selects the receiver's actor pool
   but does not give its frame queue precedence.
+- Each fragment/peer Node sender separately retains at most
+  `buffer_capacity` queued mutation commands, `buffer_capacity` owned deltas,
+  `max_in_flight * batch_size` ordinary in-flight operations, and 64 queued
+  control messages by default. These are count bounds; values and control
+  payloads are not byte-budgeted. Standalone `spawn_sender*` callers retain the
+  source-compatible unbounded command channel.
 - Remote fragment fan-out and per-fragment replica attempts are sequential;
   priority does not make those network attempts concurrent.
 - Every inbound version path, including `ReconcileData`, validates and observes

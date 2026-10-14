@@ -75,6 +75,13 @@ an fsync guarantee unless that store provides one. The sender retires the batch
 only if the reported level is sufficient. Apply failure, or a configured-store
 flush failure, sends a NACK and the exact stamped batch is retried.
 
+The Node's asynchronous sender path is count-bounded. If its mutation ingress
+or owned deque fills after a local apply, it records a non-droppable overflow
+generation and reconciles from the authoritative fragment snapshot. This keeps
+the client path nonblocking without turning an already-applied write into a
+silent replication loss. It does not make that write synchronously replicated:
+the same eventual-consistency and origin crash window still apply.
+
 On partition:
 
 - Each side keeps accepting writes (availability over consistency).

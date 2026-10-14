@@ -19,10 +19,19 @@ package meta;
 // Handshake: identifies the connecting node
 message Hello {
   string node_id = 1;
-  // HMAC-SHA256(cluster_secret, node_id). Present iff the cluster is
-  // configured with a secret; the receiver recomputes and compares in
-  // constant time. Empty = no secret configured (unauthenticated).
+  // HMAC-SHA256 over the complete handshake transcript (identity, protocol
+  // range, and capabilities). Present iff the cluster is configured with a
+  // secret; the receiver recomputes and compares in constant time. Empty = no
+  // secret configured (unauthenticated).
   bytes auth_tag = 2;
+  // Inclusive wire-version range understood by this peer. Both are nonzero;
+  // a connection proceeds only when the ranges overlap.
+  uint32 min_protocol_version = 3;
+  uint32 max_protocol_version = 4;
+  // Feature bitset. Required bits are checked before either side installs the
+  // connection, so mixed binaries fail closed rather than mis-acknowledging
+  // mutations or replication.
+  uint64 capabilities = 5;
 }
 
 // Phase 7: operation priority for traffic isolation. Wire values are

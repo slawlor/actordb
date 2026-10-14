@@ -61,6 +61,17 @@ node converges to the full dataset with zero full-state sync entries.
   admission is capped at 5 seconds and each complete socket frame write at 30
   seconds. Either expiry cancels that exact connection; its senders retain or
   requeue outstanding work, and the configured dialer reconnects with backoff.
+- Inbound connection-task admission is not yet bounded, completed task handles
+  are retained until shutdown, and a socket that never sends Hello has no
+  handshake deadline. Put an external connection/TLS proxy in front of an
+  untrusted network until the transport-lifecycle hardening lands.
+- Each fragment/peer sender also has a bounded local-mutation ingress lane
+  sized by `SenderConfig::buffer_capacity` and a separate 64-message protocol
+  control lane by default. Mutation-lane saturation coalesces a persistent
+  reset generation and returns without blocking an already-applied client
+  write. Control saturation closes the exact connection so ACK/session replay
+  repairs it. Peer connect/disconnect and `ReconcileNow` are persistent
+  side-band signals and cannot be hidden by either full lane.
 - A forwarded owner attempt has one 5-second default budget for both enqueue
   and response. Expiry removes the pending request; batch APIs then try the next
   holder. Remote fragments and holder attempts are sequential, so a slow
@@ -74,7 +85,9 @@ node converges to the full dataset with zero full-state sync entries.
   `SenderConfig::reconcile_timeout` (also 30 seconds by default), not the
   ordinary ACK deadline.
 
-These values are configurable through `NodeRuntimeOptions` and
+The peer queue, control-lane capacity, and timeout values are configurable
+through `NodeRuntimeOptions`; mutation ingress follows
+`SenderConfig::buffer_capacity`. Use
 `Node::start_with_options`. Queue capacity counts frames, not bytes: frames can
 approach the 16 MiB protocol limit, so 256 slots are not a fixed memory budget.
 Operation priority does not reorder this shared socket queue.

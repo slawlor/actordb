@@ -26,7 +26,7 @@ of the defaults.
 | `placement_poll_interval` | `Duration` | `1 s` | Driver re-evaluation cadence. Ignored in static mode. |
 | `placement_drain_warn_interval` | `Duration` | `10 s` | Warning cadence while a revoked fragment cannot safely drain. This never forces destructive teardown; the node remains `Draining` until recovery completes. |
 | `max_clock_skew` | `Duration` | `300 s` (5 min) | Peer and persisted timestamps farther ahead than this are rejected before storage. A violating peer connection is closed; poisoned durable state fails startup. |
-| `cluster_secret` | `Option<Vec<u8>>` | `None` | Pre-shared secret for handshake authentication. When set, `Hello` carries HMAC-SHA256(secret, node_id); mismatches drop the connection and pre-handshake messages are ignored. `None` = unauthenticated mesh (warning logged). Must be identical on every node. |
+| `cluster_secret` | `Option<Vec<u8>>` | `None` | Non-empty pre-shared secret for a static Hello HMAC over identity, protocol range, and capabilities. Mismatches drop the connection and pre-Hello messages are ignored, but the tag has no fresh challenge and a captured Hello is replayable. Use a protected custom `Network` transport for peer identity. Must be identical on every node. |
 
 `clock_skew_ms` exists but is `#[doc(hidden)]` — it is a test-only HLC skew
 simulator, not a tuning knob.
@@ -34,8 +34,10 @@ simulator, not a tuning knob.
 `fragment_count`, `replication.batch_size`, `replication.max_in_flight`, and
 `replication.buffer_capacity` must be nonzero. Replication and
 dynamic-placement intervals/timeouts must also be nonzero; replication timer
-values must fit Tokio's clock. `Node::start` rejects invalid values instead of
-allowing zero-sized batches or timer panics.
+values must fit Tokio's clock, and bounded-channel capacities may not exceed
+Tokio's semaphore maximum. `Node::start` rejects invalid values instead of
+allowing channel or timer panics. An explicitly configured `cluster_secret`
+must not be empty.
 
 ## `NodeRuntimeOptions`
 
@@ -47,6 +49,7 @@ does not break exhaustive `NodeConfig` literals. `Node::start` uses
 | Builder / getter | Default | Guidance |
 |---|---|---|
 | `with_peer_queue_frame_capacity` / `peer_queue_frame_capacity` | `256` frames | Capacity of the single outbound queue per peer connection. This is a frame-count bound, not a byte bound, and all traffic classes share it. |
+| `with_replication_control_message_capacity` / `replication_control_message_capacity` | `64` messages | Capacity of the separate ACK/NACK/reconciliation-response lane per fragment/peer sender. Full or closed admission fails the contributing connection so session replay/reconciliation recovers it. Peer lifecycle and on-demand reconcile signals are coalesced out of band. |
 | `with_queue_admission_timeout` / `queue_admission_timeout` | `5 s` | Maximum wait to reserve one peer-queue slot. Expiry cancels that connection; an outbound peer is then redialed. |
 | `with_forwarded_attempt_timeout` / `forwarded_attempt_timeout` | `5 s` | Total budget for one forwarded owner attempt, including queue admission and response. Batch holder attempts and remote fragment groups remain sequential. |
 | `with_socket_write_timeout` / `socket_write_timeout` | `30 s` | Maximum time to write one complete length-prefixed frame. Expiry cancels the connection and allows redial. |
@@ -63,7 +66,7 @@ not schedule the shared peer queue or socket writer.
 | `batch_size` | `100` | Ops per replication batch. |
 | `batch_interval` | `100 ms` | Max batching delay — bounds steady-state replication lag. |
 | `max_in_flight` | `4` | Ordinary batches awaiting ACK before sending pauses. Each gets the `NodeRuntimeOptions::replication_ack_timeout` deadline after queue admission. |
-| `buffer_capacity` | `10_000` | Bound on the sender-owned deque after commands are received. Overflow enters `BufferReset`, rotates the live session, and immediately starts correlated reconciliation; reconnect is not required. The command mailbox feeding this deque is still unbounded. |
+| `buffer_capacity` | `10_000` | Bound on both the Node sender's locally-applied-mutation ingress lane and its sender-owned deque. Either overflow advances a persistent `BufferReset` generation; a live sender rotates the session and starts correlated reconciliation without blocking the client write. Total retained operations also include bounded in-flight batches. This is an operation-count bound, not a byte bound. |
 | `consistency_interval` | `300 s` | Periodic anti-entropy reconcile cadence per sender. |
 | `reconcile_timeout` | `30 s` | Max wait after enqueueing each reconcile summary, data, or barrier phase. Timeout rotates the session and retries. This also governs reconciliation barrier ACKs; ordinary streaming ACKs use the runtime ACK timeout. |
 | `required_ack_durability` | `MemoryApplied` | Minimum receiver fence allowed to retire a batch. Set `StoreCommitted` only when every target has a configured store. Store acceptance does not imply fsync unless the backend guarantees it. |
@@ -92,7 +95,9 @@ them; the function returns `SenderOptionsError` for invalid sender limits or
 timeouts, including values that Tokio's clock cannot represent.
 `SenderConfig::reconcile_timeout` still controls summary, data, and barrier
 phases. Node users normally configure the corresponding values through
-`NodeRuntimeOptions` instead.
+`NodeRuntimeOptions` instead. For source compatibility these standalone
+constructors still return `mpsc::UnboundedSender<SenderMsg>`; the bounded
+mutation/control split is the `Node` integration's lifecycle-aware path.
 
 ## `PoolConfig`
 
