@@ -111,10 +111,10 @@ println!("dynamic={} map={:?} states={:?}", report.dynamic, report.placement, re
 ```
 
 `FragmentHealth` fields: `fragment`, `worker_count`, `worker_names`,
-`restarts` (per-child restart counts), `last_reaped` (keys the cleaner reaped
-on its last sweep), and `shed_counts: (u64, u64, u64)` — operations shed by
-backpressure per pool, ordered **(high, default, background)**, always counted,
-never silent.
+`restarts` (per-child restart counts), `last_reaped` (a legacy compatibility
+field that is always zero), and `shed_counts: (u64, u64, u64)` — operations
+shed by backpressure per pool, ordered **(high, default, background)**, always
+counted, never silent.
 
 `sender_report(fragment, peer)` is a `#[doc(hidden)]` test hook; production
 monitoring should use `health()` and `placement_report()`. There is also

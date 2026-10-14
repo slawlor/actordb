@@ -27,15 +27,7 @@
 //!   if the transport is live, reconciliation starts immediately. Every
 //!   round is correlated to its session and round id, fetched values are
 //!   awaited locally, and a tracked empty batch fences outbound repairs
-//!   before the reset completes. While any sender is in this state,
-//!   tombstone GC is blocked (see below).
-//!
-//! Tombstone GC blocking: if a tombstone were GC'd locally while a
-//! peer was down, reconciliation could resurrect the deleted key (the
-//! peer still holds the live value, we no longer know it was deleted).
-//! Senders register themselves in `reset_senders` while in
-//! `BufferReset`; the fragment's cleaner skips tombstone GC while its
-//! fragment appears in the set.
+//!   before the reset completes.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
@@ -256,8 +248,8 @@ pub struct SenderDeps {
     /// Node-wide HLC. Reconcile frames are observed here only after the sender
     /// has authenticated their exact session/round/phase correlation.
     pub hlc: Arc<Mutex<HlcClock>>,
-    /// Senders currently in `BufferReset`, keyed by (fragment, peer).
-    /// The cleaner consults this to block tombstone GC.
+    /// Legacy compatibility field. Ignored because tombstone collection no
+    /// longer depends on transient sender reset state.
     pub reset_senders: Arc<Mutex<HashMap<(FragmentId, String), u64>>>,
     /// Where the sender publishes its state.
     pub state_report: Arc<Mutex<SenderStateReport>>,
@@ -324,7 +316,6 @@ async fn sender_task(
     consistency_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     let mut active_reconcile: Option<ReconcileRound> = None;
-    let reset_generation = rand_session_id();
     let mut next_round_id = 0_u64;
     let mut next_reset_epoch = 0_u64;
     let mut reconcile_rounds: u64 = 0;
@@ -386,14 +377,9 @@ async fn sender_task(
                             continue;
                         }
                         if buffer.len() >= config.buffer_capacity {
-                            // Install the tombstone-GC guard before shedding
-                            // the only queued copies. The overflowing op is
-                            // already in local state and is recovered by the
-                            // correlated reconciliation snapshot.
-                            deps.reset_senders
-                                .lock()
-                                .await
-                                .insert((fragment, peer_id.clone()), reset_generation);
+                            // The overflowing op is already in local state and
+                            // is recovered by the correlated reconciliation
+                            // snapshot.
                             buffer.clear();
                             let epoch = next_nonzero(&mut next_reset_epoch);
                             delivery = DeliveryState::Reset { epoch };
@@ -675,11 +661,6 @@ async fn sender_task(
                                         DeliveryState::Reset { epoch }
                                             if epoch == completed_epoch && snapshot_is_current =>
                                         {
-                                        let key = (fragment, peer_id.clone());
-                                        let mut reset_senders = deps.reset_senders.lock().await;
-                                        if reset_senders.get(&key) == Some(&reset_generation) {
-                                            reset_senders.remove(&key);
-                                        }
                                         delivery = DeliveryState::Streaming;
                                         reconcile_rounds = reconcile_rounds.saturating_add(1);
                                         }

@@ -17,8 +17,9 @@
    peers. A redial supervisor in the node layer re-establishes dropped
    connections with exponential backoff from 100 ms.
 
-Memory-only caveat: tombstones GC'd from memory before the crash are
-re-loaded from RocksDB on boot (GC is memory-only — see
+With a durable store, persisted tombstones are retained across restarts.
+Time-based collection is rejected at startup because elapsed time alone cannot
+prove that every replica has durably observed a delete (see
 [Tombstones](tombstones.md)).
 
 Startup also seeds the node HLC from the highest durable version. A persisted
@@ -45,10 +46,10 @@ node converges to the full dataset with zero full-state sync entries.
   wins, silently.
 - TTL expiry creates a tombstone with the TTL write's version, so a
   pre-expiry value on the other side cannot reappear when the partition heals.
-- **Opt-in tombstone resurrection risk**: `tombstone_gc_age` defaults to
-  `None`. Time-based GC is unsafe even when the configured age exceeds normal
-  partitions: buffered delivery, `MemoryApplied` receiver crashes, and restart
-  can all erase the convergence evidence before collection.
+- Tombstones are retained indefinitely. `Node::start` rejects every
+  `tombstone_gc_age: Some(..)` setting: buffered delivery, `MemoryApplied`
+  receiver crashes, and restart can all erase convergence evidence that a
+  time bound cannot replace.
 - While partitioned, batch reads and writes fail over across `replica_order`
   while single-key forwarded puts/gets currently select one owner. If no
   selected/retried replica is reachable, the operation returns
@@ -80,7 +81,7 @@ states (`Bootstrapping`/`Serving`/`Draining`/`Stopped`) for diagnosis.
 
 | Signal | Source | What it tells you |
 |---|---|---|
-| Per-fragment health | `Node::health()` | Worker counts/names, per-child restart counts, `last_reaped`, `shed_counts` |
+| Per-fragment health | `Node::health()` | Worker counts/names, per-child restart counts, `shed_counts` |
 | Shed counters | `health()[frag].shed_counts` | `(high, default, background)` — backpressure pressure per traffic class |
 | Restarts | `health()[frag].restarts` | Repeated worker/dispatcher restarts = crash loop; investigate before it cascades |
 | Placement | `Node::placement_report()` | Authoritative map, lifecycle states, `dynamic` flag — is migration stuck in `Bootstrapping`/`Draining`? |
@@ -93,8 +94,8 @@ Operational rules of thumb:
   static mode — a mismatch silently makes keys unreachable.
 - Keep at least two replicas per fragment if you care about the unflushed
   write tail surviving `kill -9`.
-- Leave `tombstone_gc_age` as `None` in replicated deployments. A time bound
-  alone is not sufficient: the current guard does not cover ordinary buffered
-  tombstones, restart-persistent progress, or durable receipt by every replica.
+- `tombstone_gc_age` must be `None`; every `Some(..)` setting fails startup.
+  Size durable storage for retained tombstones until the system has a
+  durable, replica-aware reclamation protocol.
 - The background pool's default 1000 ops/s rate limit is a feature, not a bug
   — raise it deliberately if your bulk path needs more.

@@ -26,7 +26,7 @@ A working, tested prototype of the actor-first sharded database vision:
   are serialized there.
 * **`supervision`**: every fragment runs under a `FragmentSupervisor`
   owning the dispatcher pool plus background actors — a `Cleaner`
-  (durable TTL-expiry markers, optional tombstone aging) and a `Snapshotter`
+  (durable TTL-expiry markers) and a `Snapshotter`
   (periodic durable flush). Dead workers restart in place; dead children restart without
   touching sibling fragments. `Node::health()` reports per-fragment
   health.
@@ -73,7 +73,7 @@ Comprehensive guides live in [`docs/`](docs/):
 - [Replication](docs/replication.md) — sender/receiver state machine, sessions,
   acks, periodic reconciliation, the Hello/full-state handshake
 - [Tombstones & deletes](docs/tombstones.md) — delete lifecycle, conflict
-  rules, GC limits (memory-only GC is documented honestly)
+  rules, retention, and requirements for safe future reclamation
 - [Consistency model](docs/consistency.md) — LWW via HLC, exact local apply
   outcomes, read-your-write, partitions
 - [Multi-key batching](docs/batching.md) — fan-out, failover, partial failures
@@ -184,9 +184,9 @@ Key `NodeConfig` knobs:
 | `high_pool` defaults | 2 workers / cap 5_000 / no limit | Latency-sensitive traffic |
 | `background_pool` defaults | 2 workers / cap 5_000 / 1000 ops/s | Bulk/scan traffic (rate-limited) |
 | `flush_batch_size` / `flush_interval` | 1000 / 100ms | Persistence batching |
-| `clean_interval` | 30s | TTL-expiry materialization / optional tombstone-GC sweep period |
+| `clean_interval` | 30s | TTL-expiry tombstone materialization cadence |
 | `snapshot_interval` | 60s | Periodic durable flush |
-| `tombstone_gc_age` | None | Tombstone GC disabled; `Some(age)` is unsafe for replicated deployments |
+| `tombstone_gc_age` | None | Compatibility field; every `Some(age)` is rejected because safe distributed GC is not implemented |
 | `replication` | defaults | `SenderConfig`: batching, in-flight/buffer bounds, reconcile cadence/timeout, required ACK durability |
 | `placement_controller` | None | Phase 8: `Some(Arc<dyn PlacementController>)` opts into dynamic placement |
 | `placement_poll_interval` | 1s | Phase 8: how often the driver re-evaluates desired placement |
@@ -255,8 +255,8 @@ the reply; cancellation and late replies remove or ignore pending state.
   and retains each batch until a typed ACK reaches the configured durability
   fence. Receiver apply/flush failures NACK and requeue the exact batch.
 - Session ids per pairing; stale batches discarded on reconnect.
-- Buffer overflow → `buffer_reset`: shed, block tombstone GC, and
-  reconcile via timestamp/tombstone comparison when the peer returns.
+- Buffer overflow → `buffer_reset`: shed, rotate the session, and reconcile
+  via timestamp/tombstone comparison immediately or when the peer returns.
 - Periodic anti-entropy repairs residual divergence, including in the
   connected state (timestamp/tombstone compare, fetch in 500-key
   chunks, ship winners back). Reconcile rounds are counted per sender
@@ -353,11 +353,10 @@ as issues in the [issue tracker](https://github.com/slawlor/actordb/issues):
 - **Wire upgrades must be coordinated** — `Hello` does not yet negotiate
   protocol capabilities. The mutation-response and durability-ACK fields fail
   closed across old/new peers rather than silently claiming success.
-- **Tombstone GC is disabled by default** — the optional time-based mode is
-  explicitly unsafe for replicated deployments. Its reset guard cannot protect
-  tombstones that are still in ordinary sender buffers, survive process
-  restart, or prove durable receipt by every replica. GC'd tombstones are also
-  re-loaded from RocksDB on the next boot (no durable delete path exists).
+- **Tombstones are retained** — `Node::start` rejects every
+  `tombstone_gc_age: Some(..)` setting. Safe reclamation needs durable
+  per-replica convergence evidence plus a durable store delete path; elapsed
+  wall-clock time cannot prove either condition.
 - **Custom worker-pool supervision is incomplete** — a worker crash can drop
   accepted mailbox work and leak admission accounting, and a restarted
   dispatcher is not yet republished through the fragment router. Migration to

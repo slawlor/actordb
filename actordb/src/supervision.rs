@@ -44,7 +44,8 @@ pub struct FragmentHealth {
     /// Restart counts per child (`dispatcher`, `cleaner`, `snapshotter`,
     /// `worker-<slot>`).
     pub restarts: HashMap<String, u64>,
-    /// Keys reaped by the cleaner on its last sweep.
+    /// Legacy compatibility field. Always zero because the unsafe time-based
+    /// tombstone collector has been removed.
     pub last_reaped: usize,
     /// Ops shed by backpressure, per pool (high, default, background).
     /// Explicit and counted, never silent (Phase 7).
@@ -86,12 +87,10 @@ pub struct SupervisorArgs {
     pub clean_interval: Duration,
     /// How often the snapshotter flushes to the store.
     pub snapshot_interval: Duration,
-    /// Optional age after which tombstones are removed from memory. `None`
-    /// retains them indefinitely; time-based GC can resurrect deleted data
-    /// after a sufficiently long partition and must be explicitly enabled.
+    /// Legacy compatibility field. Ignored; node startup rejects `Some`.
     pub tombstone_gc_age: Option<Duration>,
-    /// Senders currently in BufferReset. The cleaner blocks tombstone
-    /// GC while any sender for this fragment is in the set.
+    /// Legacy compatibility field. The removed collector no longer consults
+    /// replication reset state.
     pub reset_senders: Arc<Mutex<HashMap<(FragmentId, String), u64>>>,
 }
 
@@ -107,7 +106,6 @@ pub struct SupervisorState {
     shared: Arc<FragmentState>,
     args: SupervisorArgs,
     restarts: HashMap<String, u64>,
-    last_reaped: usize,
 }
 
 impl SupervisorState {
@@ -238,7 +236,6 @@ impl Actor for FragmentSupervisor {
             shared,
             args,
             restarts: HashMap::new(),
-            last_reaped: 0,
         })
     }
 
@@ -295,7 +292,7 @@ impl Actor for FragmentSupervisor {
                     worker_count: worker_names.len(),
                     worker_names,
                     restarts: state.restarts.clone(),
-                    last_reaped: state.last_reaped,
+                    last_reaped: 0,
                     shed_counts,
                 });
                 Ok(())
@@ -382,28 +379,24 @@ pub enum CleanerMessage {
 
 /// Background actor: periodically converts TTL-expired values into
 /// versioned tombstones. Reads already hide expired values, but retaining the
-/// version floor prevents older replicas from resurrecting them. Optional
-/// time-based tombstone GC is unsafe and disabled by default.
+/// version floor prevents older replicas from resurrecting them.
 pub struct Cleaner;
 
 #[derive(Clone)]
 pub struct CleanerArgs {
+    /// Legacy compatibility field. The cleaner no longer uses fragment ids.
     pub fragment: FragmentId,
     pub shared: Arc<FragmentState>,
     pub interval: Duration,
-    /// Tombstones older than this are garbage-collected from memory. `None`
-    /// keeps them indefinitely.
+    /// Legacy compatibility field. Ignored; tombstones are retained.
     pub tombstone_gc_age: Option<Duration>,
-    /// Senders in BufferReset; tombstone GC is blocked while any
-    /// sender for `fragment` is in the set.
+    /// Legacy compatibility field. Ignored because time-based collection was
+    /// removed rather than guarded by transient sender state.
     pub reset_senders: Arc<Mutex<HashMap<(FragmentId, String), u64>>>,
 }
 
 pub struct CleanerState {
-    fragment: FragmentId,
     shared: Arc<FragmentState>,
-    tombstone_gc_age: Option<Duration>,
-    reset_senders: Arc<Mutex<HashMap<(FragmentId, String), u64>>>,
 }
 
 impl Actor for Cleaner {
@@ -427,10 +420,7 @@ impl Actor for Cleaner {
             }
         });
         Ok(CleanerState {
-            fragment: args.fragment,
             shared: args.shared,
-            tombstone_gc_age: args.tombstone_gc_age,
-            reset_senders: args.reset_senders,
         })
     }
 
@@ -444,22 +434,6 @@ impl Actor for Cleaner {
             CleanerMessage::Sweep => {
                 let now = now_ms();
                 state.shared.expire_values(now).await?;
-                if let Some(gc_age) = state.tombstone_gc_age {
-                    // Block tombstone GC while any sender for this fragment
-                    // is in BufferReset: the tombstone may not have reached
-                    // the peer, and GC'ing it would let reconciliation
-                    // resurrect the deleted key.
-                    // Keep the guard through reclamation. Otherwise a sender
-                    // can enter BufferReset after this check but before the
-                    // cache sweep, shedding the only queued copy of a
-                    // tombstone that the sweep then removes.
-                    let reset_senders = state.reset_senders.lock().await;
-                    let blocked = reset_senders.keys().any(|(f, _)| *f == state.fragment);
-                    if !blocked {
-                        let gc_age_ms = u64::try_from(gc_age.as_millis()).unwrap_or(u64::MAX);
-                        state.shared.gc_tombstones(now, gc_age_ms).await;
-                    }
-                }
                 Ok(())
             }
         }

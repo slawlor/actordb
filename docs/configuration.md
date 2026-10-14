@@ -18,9 +18,9 @@ of the defaults.
 | `default_pool` | `PoolConfig` | `4` workers, cap `10_000`, no rate limit | Normal traffic. |
 | `high_pool` | `PoolConfig` | `2` workers, cap `5_000`, no rate limit | Latency-sensitive traffic. |
 | `background_pool` | `PoolConfig` | `2` workers, cap `5_000`, `1000`/s | Bulk traffic; rate-limited by default. |
-| `clean_interval` | `Duration` | `30 s` | How often each fragment's cleaner materializes TTL-expiry tombstones and, when enabled, sweeps GC-eligible tombstones. |
+| `clean_interval` | `Duration` | `30 s` | How often each fragment's cleaner materializes TTL-expiry tombstones. |
 | `snapshot_interval` | `Duration` | `60 s` | Snapshotter flush cadence (periodic durable flush, not a checkpoint). |
-| `tombstone_gc_age` | `Option<Duration>` | `None` | `None` retains tombstones indefinitely. `Some(age)` enables explicitly unsafe, memory-only GC. No age makes it safe for replication: sender buffers, `MemoryApplied` crashes, and restart lose the progress needed to prove deletion convergence. |
+| `tombstone_gc_age` | `Option<Duration>` | `None` | Compatibility field for the removed collector. Must remain `None`; `Node::start` rejects every `Some(age)` because elapsed time cannot prove replica convergence. |
 | `replication` | `SenderConfig` | see below | Per-fragment×peer sender tuning. |
 | `placement_controller` | `Option<Arc<dyn PlacementController>>` | `None` | `None` = static placement. Set to `ManualPlacement` (or your own controller) for dynamic migration. |
 | `placement_poll_interval` | `Duration` | `1 s` | Driver re-evaluation cadence. Ignored in static mode. |

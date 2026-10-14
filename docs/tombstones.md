@@ -22,12 +22,12 @@ serving the old value forever.
 4. **TTL expiry**: an expired live value becomes an expiry tombstone with the
    same `(timestamp_ms, node_id)` and a winning `is_tombstone` tie-break bit.
    It beats the TTL value and every older version without deleting a genuinely
-   later put. The marker retains `expires_at_ms` as its optional GC age anchor.
-   Reads synthesize this marker immediately; the cleaner persists it, and boot
-   rewrites expired durable values before serving.
-5. **Garbage collection**: `tombstone_gc_age` defaults to `None`, retaining
-   tombstones indefinitely. `Some(age)` explicitly enables unsafe,
-   time-based removal from the **in-memory cache** only.
+   later put. The marker retains `expires_at_ms`. Reads synthesize this marker
+   immediately; the cleaner persists it, and boot rewrites expired durable
+   values before serving.
+5. **Retention**: tombstones are retained indefinitely. The
+   `tombstone_gc_age` compatibility field must be `None`; `Node::start`
+   rejects every `Some(age)` setting.
 
 ## Conflict rules
 
@@ -38,30 +38,26 @@ serving the old value forever.
   explicit.
 - A later put with a higher timestamp resurrects the key normally.
 
-## Garbage collection — and its limits
+## Why time-based garbage collection is rejected
 
-`gc_tombstones(now_ms, gc_age_ms)` retains tombstones until their configured
-age elapses and then drops them from the in-memory `HashMap`. Ordinary delete
-tombstones age from `timestamp_ms`; expiry tombstones age from their retained
-`expires_at_ms`. The cleaner calls this only when `NodeConfig` contains
-`tombstone_gc_age: Some(..)`. Two important caveats:
+Elapsed time is not evidence that every replica has durably observed a
+delete. A tombstone can still be buffered or in flight after an arbitrary
+delay, replication progress is not persisted across restart, and the default
+`MemoryApplied` acknowledgement can precede durable storage on the receiver.
+Collecting the source tombstone in any of those states can allow an older
+value to reappear.
 
-1. **GC is memory-only.** There is no code path that deletes tombstones from
-   RocksDB — the store layer only ever issues `put`s. After memory GC, the old
-   tombstone bytes remain on disk and are **re-loaded into memory on the next
-   boot**. Durable tombstone GC does not exist in the current implementation.
-2. **The reset guard is not a convergence proof.** The cleaner blocks GC while
-   any replication sender for the fragment is in `BufferReset`, including the
-   cache sweep under the same guard lock. It does not cover an old tombstone
-   that is merely buffered/in flight before a later overflow, persist guard
-   state across restart, or prove that a `MemoryApplied` peer persisted the
-   repair before the source collects it. Any of those sequences can resurrect
-   an older value. Time-based GC is therefore unsafe for replicated
-   deployments regardless of the chosen age and is disabled by default.
+For that reason `Node::start` rejects every
+`tombstone_gc_age: Some(..)` configuration before binding its listener or
+spawning actors. Safe reclamation needs durable per-replica convergence
+evidence plus deletion support in the storage layer; neither exists yet.
+The field remains temporarily for source compatibility and must be `None`.
+The public `FragmentState::gc_tombstones` method likewise remains as a
+source-compatible no-op that retains every tombstone and returns zero.
 
 ## On-disk encoding
 
 Tombstones persist with the `is_tombstone` byte set in the 21-byte value
 header (see [Persistence](persistence.md)). Expiry tombstones additionally
 retain the original TTL deadline. They are durable across restarts — which is
-exactly why the memory-only GC caveat above matters.
+why delete state survives a node restart.
