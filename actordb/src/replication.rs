@@ -310,7 +310,12 @@ async fn sender_task(
     let mut delivery = DeliveryState::Streaming;
     let mut connection: Option<ActiveConnection> = None;
     let mut buffer: VecDeque<crate::actor::ReplicatedOp> = VecDeque::new();
-    let mut batch_timer = tokio::time::interval(config.batch_interval);
+    // `interval()` ticks immediately once, which made the first batch race
+    // sender startup instead of consistently observing `batch_interval`.
+    let mut batch_timer = tokio::time::interval_at(
+        tokio::time::Instant::now() + config.batch_interval,
+        config.batch_interval,
+    );
     batch_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut consistency_timer = tokio::time::interval_at(
         tokio::time::Instant::now() + config.consistency_interval,
