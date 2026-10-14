@@ -92,6 +92,14 @@ impl Acceptor for TcpAcceptor {
     fn accept(&mut self) -> AcceptFuture<'_> {
         Box::pin(async move {
             let (stream, _) = self.listener.accept().await?;
+            // Disable Nagle: the mesh is small request/response RPCs
+            // (acks, forwarded gets, hellos). Buffering them for
+            // coalescing interacts badly with delayed ACKs and adds
+            // tens of ms per exchange. Best-effort: a failure here
+            // must not fail the connection.
+            if let Err(e) = stream.set_nodelay(true) {
+                tracing::warn!("failed to set TCP_NODELAY on accepted peer: {e}");
+            }
             let boxed: Box<dyn PeerStream> = Box::new(stream);
             Ok(Pin::new(boxed))
         })
@@ -113,6 +121,10 @@ impl Network for TcpNetwork {
     fn connect(&self, addr: SocketAddr) -> ConnectFuture<'_> {
         Box::pin(async move {
             let stream = TcpStream::connect(addr).await?;
+            // See accept(): disable Nagle on dialed connections too.
+            if let Err(e) = stream.set_nodelay(true) {
+                tracing::warn!("failed to set TCP_NODELAY on dialed peer: {e}");
+            }
             let boxed: Box<dyn PeerStream> = Box::new(stream);
             Ok(Pin::new(boxed))
         })
