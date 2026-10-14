@@ -231,6 +231,10 @@ pub struct NodeConfig {
     /// Static membership: node_id -> address, for dialing fragment
     /// owners. `Node::start` best-effort dials all members.
     pub members: HashMap<String, SocketAddr>,
+    /// Worker actors per fragment. Keys route sticky by
+    /// `hash(key) % worker_count`: per-key ordering holds, different
+    /// keys execute concurrently. Default 4.
+    pub worker_count: usize,
 }
 
 impl Default for NodeConfig {
@@ -243,6 +247,7 @@ impl Default for NodeConfig {
             fragment_count: 1,
             fragment_map: HashMap::new(),
             members: HashMap::new(),
+            worker_count: 4,
         }
     }
 }
@@ -326,6 +331,7 @@ impl Node {
                 KvArgs {
                     store,
                     fragment,
+                    worker_count: config.worker_count,
                     flush_batch_size: config.flush_batch_size,
                     flush_interval: config.flush_interval,
                 },
