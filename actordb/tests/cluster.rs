@@ -255,7 +255,6 @@ async fn time_based_tombstone_gc_is_rejected_before_binding() {
 #[tokio::test]
 async fn legacy_tombstone_gc_api_remains_source_compatible_and_safe() {
     use actordb::actor::{FragmentState, HlcClock, PoolConfig};
-    use actordb::replication::SenderDeps;
     use actordb::shard::FragmentId;
     use actordb::supervision::{CleanerArgs, FragmentHealth, SupervisorArgs};
     use tokio::sync::Mutex;
@@ -300,14 +299,10 @@ async fn legacy_tombstone_gc_api_remains_source_compatible_and_safe() {
         last_reaped: 0,
         shed_counts: (0, 0, 0),
     };
-    fn legacy_sender_field_is_public(deps: &SenderDeps) {
-        let _ = &deps.reset_senders;
-    }
-
     assert_eq!(shared.gc_tombstones(u64::MAX, 0).await, 0);
     assert!(shared.get_all().await.contains_key("deleted"));
     assert_eq!(health.last_reaped, 0);
-    let _ = (cleaner, supervisor, legacy_sender_field_is_public);
+    let _ = (cleaner, supervisor);
 }
 
 #[tokio::test]
