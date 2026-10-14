@@ -7,7 +7,8 @@
 //!
 //! Static placement (`NodeConfig::fragment_map`) fixes every fragment's
 //! replica set at startup. Dynamic placement replaces the fixed map
-//! with a [`PlacementController`]: a source of truth for "which nodes
+//! with a [`PlacementController`](crate::placement::PlacementController):
+//! a source of truth for "which nodes
 //! hold which fragments" that each node's placement driver polls and
 //! converges toward at runtime.
 //!
