@@ -392,6 +392,10 @@ async fn restart_crashing(
         )
         .await?;
         ctx.log("CRASH_TEST_OK");
+        // Stay up to let readers (node-c) finish via re-dial.
+        // Sleep long enough for the scenario timeout, then exit.
+        ctx.log("staying up for readers (60s)");
+        tokio::time::sleep(Duration::from_secs(60)).await;
         ctx.node.shutdown().await;
         ctx.log(&format!("done in {:.1}s", ctx.elapsed()));
         return Ok(());
