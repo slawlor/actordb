@@ -3,6 +3,16 @@
 # per scenario via the env files in docker/envs/, e.g.
 #
 #   docker compose --env-file docker/envs/replication.env up
+#
+# Build cache: layers are shared with GitHub Actions' cache backend so
+# dependency compilation is reused across workflow runs. Requires Buildx
+# (docker/setup-buildx-action@v3) in the workflow for `type=gha` to work.
+
+x-build-cache: &build-cache
+  cache_from:
+    - type=gha
+  cache_to:
+    - type=gha,mode=max
 
 services:
   node-a:
@@ -10,6 +20,7 @@ services:
     build:
       context: .
       dockerfile: docker-tests/Dockerfile
+      <<: *build-cache
     image: actordb-docker-test:latest
     networks:
       - test-net
@@ -22,6 +33,7 @@ services:
     build:
       context: .
       dockerfile: docker-tests/Dockerfile
+      <<: *build-cache
     image: actordb-docker-test:latest
     networks:
       - test-net
@@ -34,6 +46,7 @@ services:
     build:
       context: .
       dockerfile: docker-tests/Dockerfile
+      <<: *build-cache
     image: actordb-docker-test:latest
     networks:
       - test-net
