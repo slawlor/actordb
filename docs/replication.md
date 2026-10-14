@@ -24,12 +24,13 @@ background.
 - **Disconnected**: peer down; buffered and in-flight operations are retained
   for replay in the next session.
 - **BufferReset**: entered when an `Enqueue` arrives with the buffer already
-  full. The buffer is shed, the op itself is still applied locally, and the
-  `(fragment, peer)` pair is recorded in `reset_senders`. A live sender rotates
-  its session and starts reconciliation immediately; reconnect is not required.
+  full. The buffer is shed and the op itself is still applied locally. A live
+  sender rotates its session and starts reconciliation immediately; reconnect
+  is not required.
   Mutations arriving during reset are retained as post-snapshot deltas up to
   the same bound. Another overflow advances the reset epoch, so an older round
-  cannot clear the guard. `BufferReset` also survives disconnects.
+  cannot complete the newer reset state. `BufferReset` also survives
+  disconnects.
 
 Reset completion is deliberately strict. The sender accepts only messages for
 the current nonzero `(session_id, round_id, chunk_seq)`, validates fetched data
@@ -145,16 +146,14 @@ placement bootstrap) is retained across a connection race and local failures
 retry on their own one-second timer rather than waiting for `batch_interval` or
 the next consistency tick. Reset rounds restart on reconnect before streaming
 resumes. Local, transport, NACK, and phase-timeout failures all fail closed:
-they never increment the completed-round counter or clear `reset_senders`.
+they never increment the completed-round counter or clear the reset state.
 Placement drain likewise treats `BufferReset` as active work even when its
 ordinary buffer and in-flight counts are zero.
 
-When optional tombstone GC is enabled, it is **blocked while any sender for the
-fragment is in `BufferReset`**: the tombstone may not have reached the peer,
-and GC'ing it would let reconciliation resurrect the deleted key. GC defaults
-to disabled because this guard cannot prove convergence across an arbitrary
-partition or protect every tombstone still sitting in an ordinary pre-overflow
-sender buffer. Time-based tombstone GC remains explicitly unsafe.
+Tombstones are retained: `Node::start` rejects time-based GC because neither a
+quiet sender nor an elapsed age proves that every current and future replica
+has durably observed the deletion. Safe reclamation requires durable
+convergence watermarks and durable store deletion, which are not implemented.
 
 Reconcile fetches are chunked by key count, but the summary response still
 describes the whole fragment in one frame and neither path is currently

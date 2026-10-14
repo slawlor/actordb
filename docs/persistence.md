@@ -119,11 +119,11 @@ explicitly widen the bound after investigating the data.
 
 ## What persistence does not do
 
-- **No durable tombstone GC.** GC is disabled by default. If explicitly
-  enabled, `gc_tombstones` removes tombstones from the
-  in-memory cache only; there is no code path that issues deletes to RocksDB.
-  After memory GC, the old tombstone bytes stay on disk and are re-loaded into
-  memory on the next boot (see [Tombstones & deletes](tombstones.md)).
+- **No tombstone reclamation.** Tombstones are retained in memory and on disk.
+  `Node::start` rejects every `tombstone_gc_age: Some(..)` setting because a
+  time bound cannot prove durable replica convergence. Safe reclamation needs
+  such evidence plus store deletion support (see
+  [Tombstones & deletes](tombstones.md)).
 - **No per-fragment drop/migrate at the store layer yet.** `PrefixedStore`'s
   design notes that prefix scans would enable per-fragment drop/migrate, but it
   is not implemented.

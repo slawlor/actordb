@@ -36,7 +36,7 @@ integration crate, and an `xtask` for coverage.
 | `actordb::node` | Public API: `Node`, `NodeConfig`, `NodeError`, peer mesh, routing, forwarding, replication wiring, placement driver |
 | `actordb::actor` | Per-fragment `KvActor` dispatcher, `WorkerPool`, `FragmentState` (the in-memory cache), `VersionedValue`, `wins_over`, `HlcClock`, priority enum |
 | `actordb::replication` | Phase 5 async sender/receiver: `ReplicationSender` state machine, sessions, acks, `ReconcileRequest/Response/Fetch/Data` anti-entropy |
-| `actordb::supervision` | `FragmentSupervisor` + children: dispatcher, `Cleaner` (TTL-expiry markers / optional tombstone GC), `Snapshotter` (periodic flush) |
+| `actordb::supervision` | `FragmentSupervisor` + children: dispatcher, `Cleaner` (TTL-expiry markers), `Snapshotter` (periodic flush) |
 | `actordb::placement` | Phase 8 dynamic placement: `PlacementController` trait, `StaticPlacement`, `ManualPlacement`, migration lifecycle states |
 | `actordb::store` | `KvStore` trait, `MemoryStore`, `PrefixedStore`, `RocksDbStore` (feature-gated) |
 | `actordb::shard` | `FragmentId`, `hash_key` (seahash), `fragment_of` |
@@ -55,7 +55,7 @@ Node
         │   ├── high_pool      (N workers)
         │   ├── default_pool   (N workers)
         │   └── background_pool(N workers)
-        ├── Cleaner                        (TTL markers + optional tombstone GC, every clean_interval)
+        ├── Cleaner                        (TTL markers, every clean_interval)
         └── Snapshotter                    (periodic durable flush, every snapshot_interval)
     └── ReplicationSender × replica peers  (one sender task per fragment×target)
 ```

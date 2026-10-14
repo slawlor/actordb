@@ -82,9 +82,9 @@ On partition:
   when the partition heals — the later timestamp wins, the earlier is
   silently discarded. There is no conflict callback.
 - Deletes and TTL expiry leave versioned tombstones, so they beat older values
-  when replicas meet. Tombstone GC defaults off; explicitly enabling it
-  reintroduces resurrection risk after a partition longer than the chosen age
-  (see [Tombstones](tombstones.md)).
+  when replicas meet. Tombstones are retained; time-based GC is rejected
+  because it would reintroduce resurrection risk (see
+  [Tombstones](tombstones.md)).
 - A node that restarts with the same `node_id` gets a new session id and
   reconciles; batches from its old session are discarded by receivers.
 

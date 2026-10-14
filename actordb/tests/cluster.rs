@@ -234,6 +234,83 @@ async fn invalid_zero_sized_replication_and_placement_config_is_rejected() {
 }
 
 #[tokio::test]
+async fn time_based_tombstone_gc_is_rejected_before_binding() {
+    use actordb::node::NodeError;
+
+    let occupied = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = occupied.local_addr().unwrap();
+    let config = NodeConfig {
+        tombstone_gc_age: Some(Duration::from_secs(24 * 60 * 60)),
+        ..NodeConfig::default()
+    };
+
+    assert!(matches!(
+        Node::start("unsafe-gc".to_string(), addr, config).await,
+        Err(NodeError::Actor(message))
+            if message
+                == "tombstone_gc_age is unsupported because time alone cannot prove replica convergence; it must be None"
+    ));
+}
+
+#[tokio::test]
+async fn legacy_tombstone_gc_api_remains_source_compatible_and_safe() {
+    use actordb::actor::{FragmentState, HlcClock, PoolConfig};
+    use actordb::replication::SenderDeps;
+    use actordb::shard::FragmentId;
+    use actordb::supervision::{CleanerArgs, FragmentHealth, SupervisorArgs};
+    use tokio::sync::Mutex;
+
+    let reset_senders = Arc::new(Mutex::new(HashMap::new()));
+    let shared = Arc::new(FragmentState::new(
+        HashMap::from([(
+            "deleted".to_string(),
+            VersionedValue::tombstone(1, "node".to_string()),
+        )]),
+        None,
+        100,
+        Duration::from_secs(1),
+    ));
+    let cleaner = CleanerArgs {
+        fragment: FragmentId(0),
+        shared: shared.clone(),
+        interval: Duration::from_secs(1),
+        tombstone_gc_age: Some(Duration::ZERO),
+        reset_senders: reset_senders.clone(),
+    };
+    let supervisor = SupervisorArgs {
+        fragment: FragmentId(0),
+        worker_prefix: "compat".to_string(),
+        store: None,
+        hlc: Arc::new(Mutex::new(HlcClock::new())),
+        default_pool: PoolConfig::default(),
+        high_pool: PoolConfig::default(),
+        background_pool: PoolConfig::default(),
+        flush_batch_size: 100,
+        flush_interval: Duration::from_secs(1),
+        clean_interval: Duration::from_secs(1),
+        snapshot_interval: Duration::from_secs(1),
+        tombstone_gc_age: None,
+        reset_senders,
+    };
+    let health = FragmentHealth {
+        fragment: FragmentId(0),
+        worker_count: 0,
+        worker_names: Vec::new(),
+        restarts: HashMap::new(),
+        last_reaped: 0,
+        shed_counts: (0, 0, 0),
+    };
+    fn legacy_sender_field_is_public(deps: &SenderDeps) {
+        let _ = &deps.reset_senders;
+    }
+
+    assert_eq!(shared.gc_tombstones(u64::MAX, 0).await, 0);
+    assert!(shared.get_all().await.contains_key("deleted"));
+    assert_eq!(health.last_reaped, 0);
+    let _ = (cleaner, supervisor, legacy_sender_field_is_public);
+}
+
+#[tokio::test]
 async fn two_nodes_replicate() {
     let a = test_node("a").await;
     let b = test_node("b").await;
@@ -1007,7 +1084,8 @@ async fn worker_pool_concurrent_keys_and_ordering() {
 }
 
 /// Phase 4: TTL expiry — a key with a TTL disappears without manual
-/// intervention (reads hide it past expiry; the cleaner reaps it).
+/// intervention (reads hide it past expiry; the cleaner materializes its
+/// tombstone).
 #[tokio::test]
 async fn ttl_expiry_removes_key() {
     let config = NodeConfig {

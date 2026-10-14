@@ -78,8 +78,6 @@ type PeerMap = Arc<Mutex<HashMap<String, mpsc::Sender<Vec<u8>>>>>;
 type SenderMap = Arc<Mutex<HashMap<(FragmentId, String), mpsc::UnboundedSender<SenderMsg>>>>;
 /// Sender state reports, keyed by (fragment, peer node id).
 type SenderReportMap = Arc<Mutex<HashMap<(FragmentId, String), Arc<Mutex<SenderStateReport>>>>>;
-/// Senders currently in BufferReset, keyed by (fragment, peer).
-type ResetSenderSet = Arc<Mutex<HashMap<(FragmentId, String), u64>>>;
 /// Relayed forwarded-gets: relay_req_id -> (origin peer_tx, origin req_id).
 type RelayMap = Arc<Mutex<HashMap<u64, (mpsc::Sender<Vec<u8>>, u64)>>>;
 /// Relayed forwarded mutations: relay req_id -> (origin peer_tx, origin req_id).
@@ -89,7 +87,6 @@ struct SenderEntryDeps<'a> {
     config: &'a SenderConfig,
     router: &'a FragmentRouter,
     hlc: &'a Arc<Mutex<HlcClock>>,
-    reset_senders: &'a ResetSenderSet,
     senders: &'a SenderMap,
     reports: &'a SenderReportMap,
 }
@@ -120,7 +117,7 @@ async fn ensure_sender_entry(fragment: FragmentId, peer: &str, deps: SenderEntry
         SenderDeps {
             router: deps.router.clone(),
             hlc: deps.hlc.clone(),
-            reset_senders: deps.reset_senders.clone(),
+            reset_senders: Arc::new(Mutex::new(HashMap::new())),
             state_report: report.clone(),
         },
     );
@@ -197,7 +194,6 @@ struct ConnContext {
     hlc: Arc<Mutex<HlcClock>>,
     senders: SenderMap,
     sender_config: SenderConfig,
-    reset_senders: ResetSenderSet,
     sender_reports: SenderReportMap,
     /// Full-state sync entries applied (observability for the Phase 8
     /// rolling-restart test: must stay 0 when dynamic placement owns
@@ -624,10 +620,6 @@ pub struct Node {
     hlc: Arc<Mutex<HlcClock>>,
     /// Phase 5 senders, keyed by (fragment, peer node id).
     senders: SenderMap,
-    /// Senders currently in BufferReset, keyed by (fragment, peer).
-    /// The cleaner blocks tombstone GC while this is non-empty for the
-    /// fragment.
-    reset_senders: ResetSenderSet,
     /// Phase 5 sender tuning.
     sender_config: SenderConfig,
     /// State reports for each sender, keyed by (fragment, peer).
@@ -664,7 +656,6 @@ async fn spawn_fragment_subtree(
     node_id: &str,
     fragment: FragmentId,
     config: &NodeConfig,
-    reset_senders: &Arc<Mutex<HashMap<(FragmentId, String), u64>>>,
     hlc: &Arc<Mutex<HlcClock>>,
 ) -> Result<(ActorRef<SupervisorMessage>, ActorRef<KvMessage>), NodeError> {
     // Unique per supervisor: tests run nodes in parallel in one
@@ -687,8 +678,6 @@ async fn spawn_fragment_subtree(
             worker_prefix,
             store,
             hlc: hlc.clone(),
-            tombstone_gc_age: config.tombstone_gc_age,
-            reset_senders: reset_senders.clone(),
             default_pool: config.default_pool.clone(),
             high_pool: config.high_pool.clone(),
             background_pool: config.background_pool.clone(),
@@ -696,6 +685,8 @@ async fn spawn_fragment_subtree(
             flush_interval: config.flush_interval,
             clean_interval: config.clean_interval,
             snapshot_interval: config.snapshot_interval,
+            tombstone_gc_age: config.tombstone_gc_age,
+            reset_senders: Arc::new(Mutex::new(HashMap::new())),
         },
     )
     .await
@@ -766,11 +757,10 @@ pub struct NodeConfig {
     /// How often each fragment's snapshotter flushes the write buffer
     /// to the store. Default 60 seconds.
     pub snapshot_interval: Duration,
-    /// Optional age after which the cleaner removes tombstones from memory.
-    /// `None` (default) retains them indefinitely. Time-based GC is unsafe:
-    /// sender buffers, receiver crashes, and restart can lose the convergence
-    /// evidence required to prevent resurrection. Replicated deployments
-    /// should leave this disabled.
+    /// Reserved compatibility field for the removed time-based tombstone
+    /// collector. Must be `None`; [`Node::start`] rejects every `Some` value
+    /// because age alone cannot prove that no replica can resurrect a deleted
+    /// value.
     pub tombstone_gc_age: Option<Duration>,
     /// Wall-clock offset (ms) applied to this node's HLC. Zero in
     /// production; tests use it to simulate clock skew. Hidden from
@@ -907,19 +897,17 @@ impl Node {
                 "dynamic placement intervals must be non-zero".to_string(),
             ));
         }
+        if config.tombstone_gc_age.is_some() {
+            return Err(NodeError::Actor(
+                "tombstone_gc_age is unsupported because time alone cannot prove replica convergence; it must be None"
+                    .to_string(),
+            ));
+        }
         if config.cluster_secret.is_none() {
             tracing::warn!(
                 "no cluster_secret configured: the peer mesh is unauthenticated; \
                  anyone with TCP reachability can join. Set \
                  NodeConfig.cluster_secret in production."
-            );
-        }
-        if let Some(age) = config.tombstone_gc_age {
-            tracing::warn!(
-                ?age,
-                "unsafe time-based tombstone GC is enabled; sender buffering, \
-                 receiver crashes, restart, or partitions can resurrect deleted \
-                 or expired data"
             );
         }
         // Initial placement: the controller's map in dynamic mode
@@ -975,8 +963,6 @@ impl Node {
         // sharing the one underlying store. The supervisor owns the
         // dispatcher, cleaner and snapshotter; the router talks to the
         // dispatcher through the supervisor.
-        let reset_senders: Arc<Mutex<HashMap<(FragmentId, String), u64>>> =
-            Arc::new(Mutex::new(HashMap::new()));
         let hlc = Arc::new(Mutex::new(
             HlcClock::with_offset(config.clock_skew_ms)
                 .with_max_skew(config.max_clock_skew.as_millis().min(u64::MAX as u128) as u64),
@@ -998,7 +984,7 @@ impl Node {
             ));
         for fragment in my_fragments {
             let (supervisor, dispatcher) =
-                spawn_fragment_subtree(&node_id, fragment, &config, &reset_senders, &hlc).await?;
+                spawn_fragment_subtree(&node_id, fragment, &config, &hlc).await?;
             supervisors.lock().await.insert(fragment, supervisor);
             router.insert(fragment, dispatcher);
         }
@@ -1039,7 +1025,6 @@ impl Node {
             next_seq: Arc::new(Mutex::new(0)),
             hlc: hlc.clone(),
             senders: Arc::new(Mutex::new(HashMap::new())),
-            reset_senders: reset_senders.clone(),
             sender_config: config.replication.clone(),
             sender_reports: Arc::new(Mutex::new(HashMap::new())),
             sync_entries_applied: Arc::new(AtomicU64::new(0)),
@@ -1083,7 +1068,6 @@ impl Node {
                 placement_states: placement_states.clone(),
                 senders: node.senders.clone(),
                 sender_reports: node.sender_reports.clone(),
-                reset_senders: reset_senders.clone(),
                 sender_config: node.sender_config.clone(),
                 peers: node.peers.clone(),
                 hlc: hlc.clone(),
@@ -1111,7 +1095,6 @@ impl Node {
             hlc: node.hlc.clone(),
             senders: node.senders.clone(),
             sender_config: node.sender_config.clone(),
-            reset_senders: node.reset_senders.clone(),
             sender_reports: node.sender_reports.clone(),
             sync_entries_applied: node.sync_entries_applied.clone(),
             membership_tx: node.membership_tx.clone(),
@@ -1171,7 +1154,6 @@ impl Node {
             hlc: self.hlc.clone(),
             senders: self.senders.clone(),
             sender_config: self.sender_config.clone(),
-            reset_senders: self.reset_senders.clone(),
             sender_reports: self.sender_reports.clone(),
             sync_entries_applied: self.sync_entries_applied.clone(),
             membership_tx: self.membership_tx.clone(),
@@ -1211,7 +1193,6 @@ impl Node {
                 config: &self.sender_config,
                 router: &self.router,
                 hlc: &self.hlc,
-                reset_senders: &self.reset_senders,
                 senders: &self.senders,
                 reports: &self.sender_reports,
             },
@@ -1998,7 +1979,6 @@ struct PlacementDriverDeps {
     placement_states: Arc<Mutex<HashMap<FragmentId, FragmentPlacementState>>>,
     senders: SenderMap,
     sender_reports: SenderReportMap,
-    reset_senders: ResetSenderSet,
     sender_config: SenderConfig,
     peers: PeerMap,
     hlc: Arc<Mutex<HlcClock>>,
@@ -2014,7 +1994,6 @@ impl PlacementDriverDeps {
                 config: &self.sender_config,
                 router: &self.router,
                 hlc: &self.hlc,
-                reset_senders: &self.reset_senders,
                 senders: &self.senders,
                 reports: &self.sender_reports,
             },
@@ -2188,11 +2167,9 @@ async fn ensure_fragment_senders(
     if !stale.is_empty() {
         let mut senders = deps.senders.lock().await;
         let mut reports = deps.sender_reports.lock().await;
-        let mut reset = deps.reset_senders.lock().await;
         for key in stale {
             senders.remove(&key);
             reports.remove(&key);
-            reset.remove(&key);
         }
     }
 }
@@ -2212,7 +2189,6 @@ async fn gain_fragment(deps: &PlacementDriverDeps, fragment: FragmentId) {
         &deps.node_id,
         fragment,
         &deps.subtree_config,
-        &deps.reset_senders,
         &deps.hlc,
     )
     .await
@@ -2426,7 +2402,6 @@ async fn lose_fragment(deps: &PlacementDriverDeps, fragment: FragmentId) {
     {
         let mut senders = deps.senders.lock().await;
         let mut reports = deps.sender_reports.lock().await;
-        let mut reset = deps.reset_senders.lock().await;
         let keys: Vec<(FragmentId, String)> = senders
             .keys()
             .filter(|(f, _)| *f == fragment)
@@ -2435,7 +2410,6 @@ async fn lose_fragment(deps: &PlacementDriverDeps, fragment: FragmentId) {
         for key in keys {
             senders.remove(&key);
             reports.remove(&key);
-            reset.remove(&key);
         }
     }
     deps.placement_states
@@ -2470,7 +2444,6 @@ async fn handle_connection(ctx: ConnContext, stream: BoxStream, we_dialed: bool)
         hlc,
         senders,
         sender_config,
-        reset_senders,
         sender_reports,
         sync_entries_applied,
         membership_tx,
@@ -2613,7 +2586,6 @@ async fn handle_connection(ctx: ConnContext, stream: BoxStream, we_dialed: bool)
                                 config: &sender_config,
                                 router: &router,
                                 hlc: &hlc,
-                                reset_senders: &reset_senders,
                                 senders: &senders,
                                 reports: &sender_reports,
                             },

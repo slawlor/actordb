@@ -116,8 +116,8 @@ use crate::store::KvStore;
 /// in LWW like writes: a tombstone with a higher timestamp shadows a live
 /// value, and a live write with a higher timestamp resurrects the key.
 /// On exact `(timestamp, node_id)` ties the tombstone wins (deletes are
-/// explicit). Tombstones are shipped by sync and aged out by the cleaner
-/// only when the explicitly configured unsafe tombstone-GC window elapses.
+/// explicit). Tombstones are shipped by sync and retained until a future
+/// causally safe garbage collector can prove that no replica needs them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VersionedValue {
     pub value: Vec<u8>,
@@ -156,9 +156,9 @@ impl VersionedValue {
     /// The marker keeps the original LWW timestamp and writer identity, with
     /// the tombstone tie-break bit set. It therefore defeats versions older
     /// than the TTL write without incorrectly deleting a genuinely later
-    /// concurrent put. `expires_at_ms` is retained as the marker's creation
-    /// time for optional tombstone aging; tombstones themselves never expire
-    /// through [`Self::is_expired`].
+    /// concurrent put. The marker retains the original TTL deadline in
+    /// `expires_at_ms`; tombstones themselves never expire through
+    /// [`Self::is_expired`].
     pub fn expiry_tombstone(&self) -> Self {
         Self {
             value: Vec::new(),
@@ -177,7 +177,7 @@ impl VersionedValue {
     }
 
     /// Returns `true` if this value is past its expiry at `now_ms`.
-    /// Tombstones never expire by TTL (they're aged by GC instead).
+    /// Tombstones never expire by TTL.
     pub fn is_expired(&self, now_ms: u64) -> bool {
         !self.is_tombstone && matches!(self.expires_at_ms, Some(exp) if now_ms >= exp)
     }
@@ -320,7 +320,7 @@ pub struct FragmentState {
     /// Optional durable layer behind the cache. `None` = no persistence.
     kvstore: Option<Arc<dyn KvStore>>,
     /// Advances for every winning cache mutation, including replicated
-    /// writes, expiry conversion, and optional tombstone reclamation.
+    /// writes and expiry conversion.
     revision: AtomicU64,
     /// Buffered writes awaiting flush.
     flush: Mutex<FlushBuffer>,
@@ -550,27 +550,13 @@ impl FragmentState {
         self.revision.load(Ordering::Acquire)
     }
 
-    /// Remove tombstones older than `gc_age_ms`. Returns the count
-    /// reaped. Only call once converged; a partitioned node rejoining
-    /// with a pre-delete live value would resurrect the key.
-    pub async fn gc_tombstones(&self, now_ms: u64, gc_age_ms: u64) -> usize {
-        let mut cache = self.cache.write().await;
-        let before = cache.len();
-        cache.retain(|_, v| {
-            if !v.is_tombstone {
-                return true;
-            }
-            let created_at_ms = v.expires_at_ms.unwrap_or(v.timestamp_ms);
-            now_ms.saturating_sub(created_at_ms) < gc_age_ms
-        });
-        let removed = before - cache.len();
-        if removed != 0 {
-            self.revision.fetch_add(
-                u64::try_from(removed).unwrap_or(u64::MAX),
-                Ordering::Release,
-            );
-        }
-        removed
+    /// Legacy compatibility shim for the removed time-based collector.
+    ///
+    /// This method intentionally retains every tombstone and returns zero.
+    /// Elapsed time cannot prove that all replicas have durably observed a
+    /// delete, so age-based removal can resurrect stale values.
+    pub async fn gc_tombstones(&self, _now_ms: u64, _gc_age_ms: u64) -> usize {
+        0
     }
 
     /// Convert all expired live values to durable expiry tombstones. Returns
@@ -1580,18 +1566,27 @@ mod flush_retention_tests {
     }
 
     #[tokio::test]
-    async fn expiry_tombstone_gc_age_starts_at_the_deadline() {
-        let mut expired = VersionedValue::new(b"ttl".to_vec(), 100, "n1".to_string());
+    async fn cleaner_sweeps_retain_existing_and_new_tombstones() {
+        let existing = VersionedValue::tombstone(100, "n1".to_string());
+        let mut expired = VersionedValue::new(b"ttl".to_vec(), 200, "n1".to_string());
         expired.expires_at_ms = Some(300);
         let state = FragmentState::new(
-            HashMap::from([("key".to_string(), expired.expiry_tombstone())]),
+            HashMap::from([
+                ("deleted".to_string(), existing.clone()),
+                ("expired".to_string(), expired.clone()),
+            ]),
             None,
             100,
             Duration::from_secs(3600),
         );
 
-        assert_eq!(state.gc_tombstones(350, 100).await, 0);
-        assert_eq!(state.gc_tombstones(400, 100).await, 1);
+        assert_eq!(state.expire_values(300).await.unwrap(), 1);
+        assert_eq!(state.expire_values(u64::MAX).await.unwrap(), 0);
+        assert_eq!(state.gc_tombstones(u64::MAX, 0).await, 0);
+
+        let values = state.get_all().await;
+        assert_eq!(values.get("deleted"), Some(&existing));
+        assert_eq!(values.get("expired"), Some(&expired.expiry_tombstone()));
     }
 
     /// Store whose first write waits until the test releases it. A second
