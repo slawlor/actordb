@@ -68,13 +68,14 @@ async fn three_node_mesh_converges() {
     let b = test_node("b").await;
     let c = test_node("c").await;
 
-    // Star topology: b and c dial a. Epidemic broadcast converges
-    // everything everywhere despite no direct b<->c link.
+    // Full mesh: Phase 5 replication is direct sender→receiver (no
+    // gossip multi-hop), so every pair needs a connection.
     b.connect(a.addr()).await.unwrap();
     c.connect(a.addr()).await.unwrap();
+    c.connect(b.addr()).await.unwrap();
     common::wait_for(
         || async {
-            a.peer_count().await == 2 && b.peer_count().await == 1 && c.peer_count().await == 1
+            a.peer_count().await == 2 && b.peer_count().await == 2 && c.peer_count().await == 2
         },
         Duration::from_secs(5),
     )
@@ -726,4 +727,290 @@ async fn worker_kill_triggers_supervised_restart() {
     assert!(health.contains_key(&actordb::shard::FragmentId(0)));
 
     a.shutdown().await;
+}
+
+/// Tombstones: delete hides the key locally and the tombstone
+/// propagates to replicas via replication and handshake sync.
+#[tokio::test]
+async fn delete_propagates_to_replicas() {
+    let a = test_node("a").await;
+    let b = test_node("b").await;
+    b.connect(a.addr()).await.unwrap();
+    wait_for_peers(&a, &b).await;
+
+    a.put("gone".to_string(), b"v".to_vec()).await.unwrap();
+    common::wait_for(
+        || async { b.get("gone".to_string()).await.unwrap().is_some() },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    b.delete("gone".to_string()).await.unwrap();
+    // Deleted on the deleter immediately...
+    assert!(b.get("gone".to_string()).await.unwrap().is_none());
+    // ...and on the replica once the tombstone replicates.
+    common::wait_for(
+        || async { a.get("gone".to_string()).await.unwrap().is_none() },
+        Duration::from_secs(5),
+    )
+    .await;
+    // Tombstones are hidden from get_all too.
+    assert!(!a.get_all().await.unwrap().contains_key("gone"));
+
+    a.shutdown().await;
+    b.shutdown().await;
+}
+
+/// Tombstones: a delete survives node restart (tombstone is durable)
+/// and a late joiner learns the delete via handshake sync.
+#[tokio::test]
+async fn delete_survives_restart_and_rejoin() {
+    let a = test_node("a").await;
+    let b = test_node("b").await;
+    b.connect(a.addr()).await.unwrap();
+    wait_for_peers(&a, &b).await;
+
+    a.put("k".to_string(), b"v".to_vec()).await.unwrap();
+    common::wait_for(
+        || async { b.get("k".to_string()).await.unwrap().is_some() },
+        Duration::from_secs(5),
+    )
+    .await;
+    a.delete("k".to_string()).await.unwrap();
+    common::wait_for(
+        || async { b.get("k".to_string()).await.unwrap().is_none() },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    // A fresh node joining after the delete learns the tombstone from
+    // sync and does not resurrect the key.
+    let c = test_node("c").await;
+    c.connect(a.addr()).await.unwrap();
+    common::wait_for(
+        || async { c.peer_count().await == 1 },
+        Duration::from_secs(5),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(c.get("k".to_string()).await.unwrap().is_none());
+
+    // A put after the delete resurrects the key with a higher timestamp.
+    b.put("k".to_string(), b"v2".to_vec()).await.unwrap();
+    common::wait_for(
+        || async { a.get("k".to_string()).await.unwrap().map(|v| v.value) == Some(b"v2".to_vec()) },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    a.shutdown().await;
+    b.shutdown().await;
+    c.shutdown().await;
+}
+
+/// HLC (#14): one node with a +5min clock skew must not permanently
+/// shadow the slow node's writes. After observing the fast node's
+/// timestamp the slow node's HLC jumps forward, so its next write
+/// wins everywhere. With wall-clock LWW this test fails: the fast
+/// node's write would win forever.
+#[tokio::test]
+async fn hlc_orders_writes_under_clock_skew() {
+    let skewed_config = NodeConfig {
+        clock_skew_ms: 300_000, // +5 minutes
+        ..NodeConfig::default()
+    };
+    let fast = Node::start(
+        "fast".to_string(),
+        "127.0.0.1:0".parse().unwrap(),
+        skewed_config,
+    )
+    .await
+    .unwrap();
+    let slow = test_node("slow").await;
+    slow.connect(fast.addr()).await.unwrap();
+    wait_for_peers(&slow, &fast).await;
+
+    // Slow node writes first.
+    slow.put("sk".to_string(), b"slow-1".to_vec())
+        .await
+        .unwrap();
+    common::wait_for(
+        || async {
+            fast.get("sk".to_string()).await.unwrap().map(|v| v.value) == Some(b"slow-1".to_vec())
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    // Fast node (clock +5min) overwrites: its timestamp is huge, so it
+    // wins — correctly, since it really is the later write.
+    fast.put("sk".to_string(), b"fast-1".to_vec())
+        .await
+        .unwrap();
+    common::wait_for(
+        || async {
+            slow.get("sk".to_string()).await.unwrap().map(|v| v.value) == Some(b"fast-1".to_vec())
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    // Slow node writes again. Its HLC has observed fast's timestamp,
+    // so this write's timestamp exceeds it and wins on both nodes.
+    slow.put("sk".to_string(), b"slow-2".to_vec())
+        .await
+        .unwrap();
+    common::wait_for(
+        || async {
+            slow.get("sk".to_string()).await.unwrap().map(|v| v.value) == Some(b"slow-2".to_vec())
+                && fast.get("sk".to_string()).await.unwrap().map(|v| v.value)
+                    == Some(b"slow-2".to_vec())
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    slow.shutdown().await;
+    fast.shutdown().await;
+}
+
+/// Phase 5: kill a peer mid-replication. The sender's buffer overflows,
+/// it enters `buffer_reset`, and on reconnect it reconciles — no
+/// divergence.
+#[tokio::test]
+async fn sender_buffer_reset_and_reconcile() {
+    use actordb::replication::SenderConfig;
+    use actordb::shard::FragmentId;
+
+    let config = NodeConfig {
+        replication: SenderConfig {
+            batch_size: 5,
+            batch_interval: Duration::from_millis(50),
+            max_in_flight: 2,
+            buffer_capacity: 10, // small: overflow quickly
+            consistency_interval: Duration::from_secs(3600), // disable periodic
+        },
+        ..NodeConfig::default()
+    };
+    let a = Node::start("a".to_string(), "127.0.0.1:0".parse().unwrap(), config)
+        .await
+        .unwrap();
+    let b = test_node("b").await;
+    b.connect(a.addr()).await.unwrap();
+    wait_for_peers(&a, &b).await;
+
+    // Sanity: replication works while connected.
+    a.put("k0".to_string(), b"v0".to_vec()).await.unwrap();
+    common::wait_for(
+        || async {
+            b.get("k0".to_string()).await.unwrap().map(|v| v.value) == Some(b"v0".to_vec())
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    // Kill b. a's sender buffers; overflow → buffer_reset.
+    b.shutdown().await;
+    for i in 1..30 {
+        a.put(format!("k{i}"), format!("v{i}").into_bytes())
+            .await
+            .unwrap();
+    }
+    // The sender should have entered buffer_reset (buffer shed).
+    common::wait_for(
+        || async {
+            a.sender_report(FragmentId(0), "b")
+                .await
+                .map(|r| r.state == "buffer_reset")
+                .unwrap_or(false)
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    // Restart b and reconnect. Reconciliation should converge everything.
+    let b2 = Node::start(
+        "b".to_string(),
+        "127.0.0.1:0".parse().unwrap(),
+        NodeConfig::default(),
+    )
+    .await
+    .unwrap();
+    b2.connect(a.addr()).await.unwrap();
+    common::wait_for(
+        || async {
+            let all = b2.get_all().await.unwrap();
+            (1..30).all(|i| {
+                all.get(&format!("k{i}")).map(|v| v.value.clone())
+                    == Some(format!("v{i}").into_bytes())
+            })
+        },
+        Duration::from_secs(10),
+    )
+    .await;
+
+    a.shutdown().await;
+    b2.shutdown().await;
+}
+
+/// Phase 5: batches from a stale session are discarded. We replay a
+/// batch with a bogus session id over a raw TCP connection; the
+/// receiver must drop it.
+#[tokio::test]
+async fn stale_session_batches_discarded() {
+    use actordb::proto::{Envelope, EnvelopeMsg, Hello, ReplicateBatch, ReplicateOp};
+    use prost::Message;
+    use tokio::io::AsyncWriteExt;
+
+    let a = test_node("a").await;
+    let b = test_node("b").await;
+    b.connect(a.addr()).await.unwrap();
+    wait_for_peers(&a, &b).await;
+
+    // Hijack: open a raw TCP connection to b, claim to be "a", and send
+    // a batch with a session id b never issued. It must be discarded.
+    let mut stream = tokio::net::TcpStream::connect(b.addr()).await.unwrap();
+    let mut hello_buf = Vec::new();
+    Envelope {
+        msg: Some(EnvelopeMsg::Hello(Hello {
+            node_id: "a".to_string(),
+        })),
+    }
+    .encode(&mut hello_buf)
+    .unwrap();
+    stream.write_u32(hello_buf.len() as u32).await.unwrap();
+    stream.write_all(&hello_buf).await.unwrap();
+
+    // Give b a moment to process the hello.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let mut batch_buf = Vec::new();
+    Envelope {
+        msg: Some(EnvelopeMsg::ReplicateBatch(ReplicateBatch {
+            session_id: 0xDEADBEEF, // bogus: no such session
+            batch_seq: 0,
+            fragment: 0,
+            ops: vec![ReplicateOp {
+                key: "evil".to_string(),
+                value: b"bad".to_vec(),
+                timestamp_ms: u64::MAX, // would win any LWW...
+                node_id: "a".to_string(),
+                seq: 999,
+                boot_id: 1,
+                expires_at_ms: 0,
+                is_tombstone: false,
+            }],
+        })),
+    }
+    .encode(&mut batch_buf)
+    .unwrap();
+    stream.write_u32(batch_buf.len() as u32).await.unwrap();
+    stream.write_all(&batch_buf).await.unwrap();
+
+    // The batch must NOT be applied, despite the huge timestamp.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(b.get("evil".to_string()).await.unwrap().is_none());
+
+    a.shutdown().await;
+    b.shutdown().await;
 }

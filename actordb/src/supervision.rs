@@ -18,9 +18,10 @@
 //! The supervisor also answers [`FragmentHealth`](crate::supervision::FragmentHealth) queries, feeding the
 //! observability layer and (later) the Phase 8 placement controller.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::Mutex;
 
 use ractor::{Actor, ActorCell, ActorProcessingErr, ActorRef, RpcReplyPort, SupervisionEvent};
 
@@ -73,6 +74,11 @@ pub struct SupervisorArgs {
     pub clean_interval: Duration,
     /// How often the snapshotter flushes to the store.
     pub snapshot_interval: Duration,
+    /// How long tombstones are kept before garbage collection.
+    pub tombstone_gc_age: Duration,
+    /// Senders currently in BufferReset. The cleaner blocks tombstone
+    /// GC while any sender for this fragment is in the set.
+    pub reset_senders: Arc<Mutex<HashSet<(FragmentId, String)>>>,
 }
 
 /// The per-fragment supervisor: owns the dispatcher, cleaner and
@@ -161,8 +167,11 @@ impl Actor for FragmentSupervisor {
             None,
             Cleaner,
             CleanerArgs {
+                fragment: args.fragment,
                 shared: shared.clone(),
                 interval: args.clean_interval,
+                tombstone_gc_age: args.tombstone_gc_age,
+                reset_senders: args.reset_senders.clone(),
             },
             cell.clone(),
         )
@@ -269,8 +278,11 @@ impl Actor for FragmentSupervisor {
                     None,
                     Cleaner,
                     CleanerArgs {
+                        fragment: state.args.fragment,
                         shared: state.shared.clone(),
                         interval: state.args.clean_interval,
+                        tombstone_gc_age: state.args.tombstone_gc_age,
+                        reset_senders: state.args.reset_senders.clone(),
                     },
                     myself_cell,
                 )
@@ -314,12 +326,21 @@ pub struct Cleaner;
 
 #[derive(Clone)]
 pub struct CleanerArgs {
+    pub fragment: FragmentId,
     pub shared: Arc<FragmentState>,
     pub interval: Duration,
+    /// Tombstones older than this are garbage-collected.
+    pub tombstone_gc_age: Duration,
+    /// Senders in BufferReset; tombstone GC is blocked while any
+    /// sender for `fragment` is in the set.
+    pub reset_senders: Arc<Mutex<HashSet<(FragmentId, String)>>>,
 }
 
 pub struct CleanerState {
+    fragment: FragmentId,
     shared: Arc<FragmentState>,
+    tombstone_gc_age: Duration,
+    reset_senders: Arc<Mutex<HashSet<(FragmentId, String)>>>,
 }
 
 impl Actor for Cleaner {
@@ -343,7 +364,10 @@ impl Actor for Cleaner {
             }
         });
         Ok(CleanerState {
+            fragment: args.fragment,
             shared: args.shared,
+            tombstone_gc_age: args.tombstone_gc_age,
+            reset_senders: args.reset_senders,
         })
     }
 
@@ -355,7 +379,24 @@ impl Actor for Cleaner {
     ) -> Result<(), ActorProcessingErr> {
         match message {
             CleanerMessage::Sweep => {
-                state.shared.remove_expired(now_ms()).await;
+                let now = now_ms();
+                state.shared.remove_expired(now).await;
+                // Block tombstone GC while any sender for this fragment
+                // is in BufferReset: the tombstone may not have reached
+                // the peer, and GC'ing it would let reconciliation
+                // resurrect the deleted key.
+                let blocked = state
+                    .reset_senders
+                    .lock()
+                    .await
+                    .iter()
+                    .any(|(f, _)| *f == state.fragment);
+                if !blocked {
+                    state
+                        .shared
+                        .gc_tombstones(now, state.tombstone_gc_age.as_millis() as u64)
+                        .await;
+                }
                 Ok(())
             }
         }

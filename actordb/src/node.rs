@@ -42,12 +42,13 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::task::AbortHandle;
 
-use crate::actor::{now_ms, KvMessage, ReplicatedOp, VersionedValue};
+use crate::actor::{HlcClock, KvMessage, ReplicatedOp, VersionedValue};
 use crate::network::{BoxStream, Network, TcpNetwork};
 use crate::proto::{
-    Envelope, EnvelopeMsg, ForwardedGet, ForwardedPut, GetResponse, Hello,
-    ReplicateOp as ProtoReplicateOp, SyncEntry, SyncResponse,
+    BatchAck, Envelope, EnvelopeMsg, ForwardedGet, ForwardedPut, GetResponse, Hello, KeySummary,
+    ReconcileData, ReconcileResponse, SyncEntry, SyncResponse,
 };
+use crate::replication::{spawn_sender, SenderConfig, SenderDeps, SenderMsg, SenderStateReport};
 use crate::shard::{fragment_of, FragmentId};
 use crate::store::{KvStore, PrefixedStore};
 use crate::supervision::{FragmentHealth, FragmentSupervisor, SupervisorArgs, SupervisorMessage};
@@ -65,6 +66,12 @@ const RECONNECT_MAX: Duration = Duration::from_secs(30);
 
 /// peer node_id -> outbound frame queue
 type PeerMap = Arc<Mutex<HashMap<String, mpsc::Sender<Vec<u8>>>>>;
+/// Phase 5 senders, keyed by (fragment, peer node id).
+type SenderMap = Arc<Mutex<HashMap<(FragmentId, String), mpsc::UnboundedSender<SenderMsg>>>>;
+/// Sender state reports, keyed by (fragment, peer node id).
+type SenderReportMap = Arc<Mutex<HashMap<(FragmentId, String), Arc<Mutex<SenderStateReport>>>>>;
+/// Senders currently in BufferReset, keyed by (fragment, peer).
+type ResetSenderSet = Arc<Mutex<HashSet<(FragmentId, String)>>>;
 
 /// Unique worker-name prefixes across supervisors in this process.
 static NEXT_WORKER_PREFIX: AtomicU64 = AtomicU64::new(0);
@@ -74,18 +81,21 @@ static NEXT_WORKER_PREFIX: AtomicU64 = AtomicU64::new(0);
 struct ConnContext {
     node_id: String,
     router: FragmentRouter,
-    fragment_map: HashMap<FragmentId, Vec<String>>,
     pending_gets: Arc<Mutex<HashMap<u64, oneshot::Sender<Option<VersionedValue>>>>>,
     peers: PeerMap,
-    seen_ops: Arc<Mutex<HashSet<(String, u64, u64)>>>,
     tasks: Arc<Mutex<Vec<AbortHandle>>>,
+    hlc: Arc<Mutex<HlcClock>>,
+    senders: SenderMap,
+    sender_config: SenderConfig,
+    reset_senders: ResetSenderSet,
+    sender_reports: SenderReportMap,
 }
 
 /// Routes keys to the fragment actors this node serves. Cloned into
 /// every connection task so inbound ops land on the right fragment.
 /// Returns `None` for fragments this node doesn't serve.
 #[derive(Clone)]
-struct FragmentRouter {
+pub struct FragmentRouter {
     actors: HashMap<FragmentId, ActorRef<KvMessage>>,
     fragment_count: usize,
 }
@@ -94,6 +104,11 @@ impl FragmentRouter {
     fn route(&self, key: &str) -> Option<&ActorRef<KvMessage>> {
         let frag = fragment_of(key, self.fragment_count);
         self.actors.get(&frag)
+    }
+
+    /// The actor serving `fragment`, if this node serves it.
+    pub fn route_for_fragment(&self, fragment: FragmentId) -> Option<&ActorRef<KvMessage>> {
+        self.actors.get(&fragment)
     }
 
     fn fragment_ids(&self) -> Vec<u32> {
@@ -177,12 +192,20 @@ pub struct Node {
     pending_gets: Arc<Mutex<HashMap<u64, oneshot::Sender<Option<VersionedValue>>>>>,
     next_req_id: AtomicU64,
     peers: PeerMap,
-    /// (origin node_id, boot_id, seq) of every op already applied, to
-    /// stop re-broadcast storms. The actor's LWW merge is idempotent,
-    /// so this is purely a propagation concern.
-    seen_ops: Arc<Mutex<HashSet<(String, u64, u64)>>>,
     /// Per-node sequence number for locally originated ops.
     next_seq: Arc<Mutex<u64>>,
+    /// Hybrid logical clock for LWW timestamps.
+    hlc: Arc<Mutex<HlcClock>>,
+    /// Phase 5 senders, keyed by (fragment, peer node id).
+    senders: SenderMap,
+    /// Senders currently in BufferReset, keyed by (fragment, peer).
+    /// The cleaner blocks tombstone GC while this is non-empty for the
+    /// fragment.
+    reset_senders: ResetSenderSet,
+    /// Phase 5 sender tuning.
+    sender_config: SenderConfig,
+    /// State reports for each sender, keyed by (fragment, peer).
+    sender_reports: SenderReportMap,
     tasks: Arc<Mutex<Vec<AbortHandle>>>,
     network: Arc<dyn Network>,
 }
@@ -248,6 +271,18 @@ pub struct NodeConfig {
     /// How often each fragment's snapshotter flushes the write buffer
     /// to the store. Default 60 seconds.
     pub snapshot_interval: Duration,
+    /// How long tombstones are kept before the cleaner garbage-collects
+    /// them. Must exceed the longest expected partition: a node
+    /// rejoining after its tombstones were GC'd can resurrect deleted
+    /// keys. Default 1 hour.
+    pub tombstone_gc_age: Duration,
+    /// Wall-clock offset (ms) applied to this node's HLC. Zero in
+    /// production; tests use it to simulate clock skew. Hidden from
+    /// docs: not a tuning knob.
+    #[doc(hidden)]
+    pub clock_skew_ms: i64,
+    /// Phase 5 async replication tuning (batching, acks, buffers).
+    pub replication: SenderConfig,
 }
 
 impl Default for NodeConfig {
@@ -263,6 +298,9 @@ impl Default for NodeConfig {
             worker_count: 4,
             clean_interval: Duration::from_secs(30),
             snapshot_interval: Duration::from_secs(60),
+            tombstone_gc_age: Duration::from_secs(3600),
+            clock_skew_ms: 0,
+            replication: SenderConfig::default(),
         }
     }
 }
@@ -336,6 +374,8 @@ impl Node {
         // sharing the one underlying store. The supervisor owns the
         // dispatcher, cleaner and snapshotter; the router talks to the
         // dispatcher through the supervisor.
+        let reset_senders: Arc<Mutex<HashSet<(FragmentId, String)>>> =
+            Arc::new(Mutex::new(HashSet::new()));
         let mut supervisors = HashMap::with_capacity(my_fragments.len());
         let mut actors = HashMap::with_capacity(my_fragments.len());
         for fragment in my_fragments {
@@ -358,6 +398,8 @@ impl Node {
                     fragment,
                     worker_prefix,
                     store,
+                    tombstone_gc_age: config.tombstone_gc_age,
+                    reset_senders: reset_senders.clone(),
                     worker_count: config.worker_count,
                     flush_batch_size: config.flush_batch_size,
                     flush_interval: config.flush_interval,
@@ -404,21 +446,64 @@ impl Node {
             pending_gets: Arc::new(Mutex::new(HashMap::new())),
             next_req_id: AtomicU64::new(1),
             peers: Arc::new(Mutex::new(HashMap::new())),
-            seen_ops: Arc::new(Mutex::new(HashSet::new())),
             next_seq: Arc::new(Mutex::new(0)),
+            hlc: Arc::new(Mutex::new(HlcClock::with_offset(config.clock_skew_ms))),
+            senders: Arc::new(Mutex::new(HashMap::new())),
+            reset_senders: reset_senders.clone(),
+            sender_config: config.replication.clone(),
+            sender_reports: Arc::new(Mutex::new(HashMap::new())),
             tasks: Arc::new(Mutex::new(Vec::new())),
             network: config.network.clone(),
         };
+
+        // Phase 5: spawn a sender per (fragment, static replica peer).
+        // Legacy mode (no fragment map) spawns senders lazily on connect.
+        for frag in router.fragment_ids() {
+            let frag_id = FragmentId(frag);
+            if let Some(replicas) = config.fragment_map.get(&frag_id) {
+                for peer in replicas {
+                    if peer != &node_id {
+                        let report = Arc::new(Mutex::new(SenderStateReport {
+                            state: "disconnected".to_string(),
+                            session_id: 0,
+                            buffered: 0,
+                            in_flight: 0,
+                        }));
+                        let tx = spawn_sender(
+                            frag_id,
+                            peer.clone(),
+                            config.replication.clone(),
+                            SenderDeps {
+                                router: router.clone(),
+                                reset_senders: reset_senders.clone(),
+                                state_report: report.clone(),
+                            },
+                        );
+                        node.senders
+                            .lock()
+                            .await
+                            .insert((frag_id, peer.clone()), tx);
+                        node.sender_reports
+                            .lock()
+                            .await
+                            .insert((frag_id, peer.clone()), report);
+                    }
+                }
+            }
+        }
 
         // Accept loop: every inbound connection gets a handler task.
         let ctx = ConnContext {
             node_id: node.node_id.clone(),
             router: node.router.clone(),
-            fragment_map: node.fragment_map.clone(),
             pending_gets: node.pending_gets.clone(),
             peers: node.peers.clone(),
-            seen_ops: node.seen_ops.clone(),
             tasks: node.tasks.clone(),
+            hlc: node.hlc.clone(),
+            senders: node.senders.clone(),
+            sender_config: node.sender_config.clone(),
+            reset_senders: node.reset_senders.clone(),
+            sender_reports: node.sender_reports.clone(),
         };
         let accept_task = tokio::spawn(async move {
             while let Ok(stream) = acceptor.accept().await {
@@ -460,11 +545,14 @@ impl Node {
         let ctx = ConnContext {
             node_id: self.node_id.clone(),
             router: self.router.clone(),
-            fragment_map: self.fragment_map.clone(),
             pending_gets: self.pending_gets.clone(),
             peers: self.peers.clone(),
-            seen_ops: self.seen_ops.clone(),
             tasks: self.tasks.clone(),
+            hlc: self.hlc.clone(),
+            senders: self.senders.clone(),
+            sender_config: self.sender_config.clone(),
+            reset_senders: self.reset_senders.clone(),
+            sender_reports: self.sender_reports.clone(),
         };
         let network = self.network.clone();
         let h = tokio::spawn(async move {
@@ -508,16 +596,22 @@ impl Node {
     /// Fan out an op to the other replica holders of `frag`.
     /// Fire-and-forget: a dead peer is skipped (its data is recovered
     /// via sync when it returns).
-    async fn replicate(&self, frag: FragmentId, op: &ReplicatedOp, exclude: Option<&str>) {
-        replicate_to_holders(
-            &self.node_id,
-            &self.fragment_map,
-            &self.peers,
-            frag,
-            op,
-            exclude,
-        )
-        .await;
+    /// Phase 5: enqueue `op` for async replication to every sender
+    /// serving `frag`. Returns immediately; the senders batch, ship,
+    /// and ack off the write path.
+    async fn enqueue_for_replication(&self, frag: FragmentId, op: &ReplicatedOp) {
+        // Ensure senders exist for all current replication targets.
+        // (Static peers got senders at startup; legacy-mode peers get
+        // them on connect.)
+        let senders = self.senders.lock().await;
+        for ((f, _peer), tx) in senders.iter() {
+            if *f == frag {
+                // Unbounded channel: the sender's internal buffer is the
+                // bound (overflow → BufferReset). A dead sender is dropped
+                // lazily.
+                let _ = tx.send(SenderMsg::Enqueue(op.clone()));
+            }
+        }
     }
 
     /// Write a key locally and gossip it to all peers.
@@ -557,7 +651,7 @@ impl Node {
             *guard += 1;
             *guard
         };
-        let now = now_ms();
+        let now = self.hlc.lock().await.tick();
         let mut vv = VersionedValue::new(value, now, self.node_id.clone());
         vv.expires_at_ms = ttl.map(|t| now + t.as_millis() as u64);
         let op = ReplicatedOp {
@@ -566,13 +660,33 @@ impl Node {
             seq,
             boot_id: self.boot_id,
         };
-        // Mark locally originated ops as seen so inbound echoes terminate.
-        self.seen_ops
-            .lock()
-            .await
-            .insert((self.node_id.clone(), self.boot_id, seq));
+        self.apply_local(op).await
+    }
 
-        let frag = fragment_of(&key, self.router.fragment_count);
+    /// Delete `key`: writes a tombstone that propagates to all replicas
+    /// like a put. Reads treat tombstoned keys as absent; sync ships
+    /// tombstones so deletes survive node restarts and re-joins. A later
+    /// `put` with a higher timestamp resurrects the key.
+    pub async fn delete(&self, key: String) -> Result<(), NodeError> {
+        let seq = {
+            let mut guard = self.next_seq.lock().await;
+            *guard += 1;
+            *guard
+        };
+        let now = self.hlc.lock().await.tick();
+        let op = ReplicatedOp {
+            key: key.clone(),
+            value: VersionedValue::tombstone(now, self.node_id.clone()),
+            seq,
+            boot_id: self.boot_id,
+        };
+        self.apply_local(op).await
+    }
+
+    /// Apply a locally-originated op: mark seen, route to the fragment
+    /// actor, barrier on read-your-write, then replicate.
+    async fn apply_local(&self, op: ReplicatedOp) -> Result<(), NodeError> {
+        let frag = fragment_of(&op.key, self.router.fragment_count);
         if let Some(actor) = self.fragment_actor(&op.key) {
             actor
                 .send_message(KvMessage::ApplyOp(op.clone()))
@@ -581,8 +695,15 @@ impl Node {
             // Barrier: the actor drains its mailbox in FIFO order, so this
             // `call` returns only after the ApplyOp above has been applied.
             // (A `get` on the same key doubles as the read-your-write check.)
+            // For tombstones the get returns None — the barrier still holds.
             match actor
-                .call(|reply| KvMessage::Get { key, reply }, None)
+                .call(
+                    |reply| KvMessage::Get {
+                        key: op.key.clone(),
+                        reply,
+                    },
+                    None,
+                )
                 .await
                 .map_err(|e| NodeError::Actor(e.to_string()))?
             {
@@ -593,7 +714,7 @@ impl Node {
                 }
             }
 
-            self.replicate(frag, &op, None).await;
+            self.enqueue_for_replication(frag, &op).await;
             return Ok(());
         }
 
@@ -615,6 +736,7 @@ impl Node {
                     seq: op.seq,
                     boot_id: op.boot_id,
                     expires_at_ms: op.value.expires_at_ms.unwrap_or(0),
+                    is_tombstone: op.value.is_tombstone,
                 })),
             },
         )
@@ -673,12 +795,29 @@ impl Node {
 
     /// Read the full local copy across all fragments (debugging / tests).
     pub async fn get_all(&self) -> Result<HashMap<String, VersionedValue>, NodeError> {
-        self.router.get_all().await
+        let all = self.router.get_all().await?;
+        // Hide tombstones from user reads (sync needs them, users don't).
+        Ok(all.into_iter().filter(|(_, v)| !v.is_tombstone).collect())
     }
 
     /// This node's id.
     pub fn id(&self) -> &str {
         &self.node_id
+    }
+
+    /// Test hook: the sender's state report for (`fragment`, `peer`),
+    /// if the sender exists. Hidden from docs.
+    #[doc(hidden)]
+    pub async fn sender_report(
+        &self,
+        fragment: FragmentId,
+        peer: &str,
+    ) -> Option<SenderStateReport> {
+        let reports = self.sender_reports.lock().await;
+        match reports.get(&(fragment, peer.to_string())) {
+            Some(r) => Some(r.lock().await.clone()),
+            None => None,
+        }
     }
 
     /// The address this node is listening on.
@@ -741,12 +880,19 @@ async fn handle_connection(ctx: ConnContext, stream: BoxStream, we_dialed: bool)
     let ConnContext {
         node_id,
         router,
-        fragment_map,
         pending_gets,
         peers,
-        seen_ops,
         tasks,
+        hlc,
+        senders,
+        sender_config,
+        reset_senders,
+        sender_reports,
     } = ctx;
+    // Phase 5: current session per (peer, fragment) on this connection.
+    // Sessions are per-connection: a new connection means a new pairing.
+    let sessions: Arc<Mutex<HashMap<(String, FragmentId), u64>>> =
+        Arc::new(Mutex::new(HashMap::new()));
     let (mut reader, writer) = tokio::io::split(stream);
     let (tx, mut rx) = mpsc::channel::<Vec<u8>>(PEER_CHANNEL_DEPTH);
 
@@ -788,7 +934,7 @@ async fn handle_connection(ctx: ConnContext, stream: BoxStream, we_dialed: bool)
         match envelope.msg {
             Some(EnvelopeMsg::Hello(Hello { node_id: peer })) => {
                 peer_node_id = Some(peer.clone());
-                peers.lock().await.insert(peer, tx.clone());
+                peers.lock().await.insert(peer.clone(), tx.clone());
                 if !we_dialed {
                     // The listener answers the handshake...
                     send_hello(&tx, &node_id).await;
@@ -796,47 +942,207 @@ async fn handle_connection(ctx: ConnContext, stream: BoxStream, we_dialed: bool)
                 // ...and both sides then pull the fragments they serve
                 // for anti-entropy.
                 send_sync_request(&tx, router.fragment_ids()).await;
-            }
-            Some(EnvelopeMsg::Replicate(op)) => {
-                let id = (op.node_id.clone(), op.boot_id, op.seq);
-                let is_new = seen_ops.lock().await.insert(id);
-                if !is_new {
-                    continue; // already applied
+                // Phase 5: (re)connect the senders for this peer. Legacy
+                // mode (no fragment map) spawns senders lazily here.
+                {
+                    let mut senders_guard = senders.lock().await;
+                    for frag_id in router.fragment_ids() {
+                        let frag = FragmentId(frag_id);
+                        let key = (frag, peer.clone());
+                        if !senders_guard.contains_key(&key) {
+                            let report = Arc::new(Mutex::new(SenderStateReport {
+                                state: "disconnected".to_string(),
+                                session_id: 0,
+                                buffered: 0,
+                                in_flight: 0,
+                            }));
+                            let sender_tx = spawn_sender(
+                                frag,
+                                peer.clone(),
+                                sender_config.clone(),
+                                SenderDeps {
+                                    router: router.clone(),
+                                    reset_senders: reset_senders.clone(),
+                                    state_report: report.clone(),
+                                },
+                            );
+                            sender_reports.lock().await.insert(key.clone(), report);
+                            senders_guard.insert(key.clone(), sender_tx);
+                        }
+                    }
+                    for ((frag, p), sender_tx) in senders_guard.iter() {
+                        if p == &peer {
+                            let _ = sender_tx.send(SenderMsg::PeerConnected {
+                                peer_tx: tx.clone(),
+                            });
+                            let _ = frag; // silence unused
+                        }
+                    }
                 }
-                let replicated = ReplicatedOp {
-                    key: op.key.clone(),
-                    value: {
-                        let mut v = VersionedValue::new(
-                            op.value.clone(),
-                            op.timestamp_ms,
-                            op.node_id.clone(),
-                        );
-                        v.expires_at_ms = if op.expires_at_ms == 0 {
-                            None
-                        } else {
-                            Some(op.expires_at_ms)
-                        };
-                        v
-                    },
-                    seq: op.seq,
-                    boot_id: op.boot_id,
+            }
+            Some(EnvelopeMsg::SessionStart(s)) => {
+                // New sender↔receiver pairing: adopt the session id.
+                // Batches from older sessions are discarded.
+                if let Some(peer) = peer_node_id.clone() {
+                    sessions
+                        .lock()
+                        .await
+                        .insert((peer, FragmentId(s.fragment)), s.session_id);
+                }
+            }
+            Some(EnvelopeMsg::ReplicateBatch(b)) => {
+                // Phase 5: validate the session, apply via LWW (idempotent),
+                // and ack. Stale sessions are discarded.
+                let peer = match peer_node_id.clone() {
+                    Some(p) => p,
+                    None => continue,
                 };
-                // Apply the op. In legacy mode (no fragment map) we also
-                // re-gossip it, so multi-hop topologies converge. In
-                // sharded mode the coordinator fans out to all holders
-                // directly — never re-forward here. Ops for fragments we
-                // don't serve are dropped (misrouted or stale placement).
-                if let Some(actor) = router.route(&replicated.key) {
-                    if actor.send_message(KvMessage::ApplyOp(replicated)).is_ok()
-                        && fragment_map.is_empty()
+                let frag = FragmentId(b.fragment);
+                let current = sessions.lock().await.get(&(peer.clone(), frag)).copied();
+                if current != Some(b.session_id) {
+                    continue; // stale session
+                }
+                for op in b.ops {
+                    hlc.lock().await.observe(op.timestamp_ms);
+                    let replicated = ReplicatedOp {
+                        key: op.key.clone(),
+                        value: {
+                            let mut v = VersionedValue::new(
+                                op.value.clone(),
+                                op.timestamp_ms,
+                                op.node_id.clone(),
+                            );
+                            v.expires_at_ms = if op.expires_at_ms == 0 {
+                                None
+                            } else {
+                                Some(op.expires_at_ms)
+                            };
+                            v.is_tombstone = op.is_tombstone;
+                            v
+                        },
+                        seq: op.seq,
+                        boot_id: op.boot_id,
+                    };
+                    // u64::MAX marks reconciliation batches (not ack-tracked);
+                    // they still apply via LWW.
+                    if let Some(actor) = router.route(&replicated.key) {
+                        let _ = actor.send_message(KvMessage::ApplyOp(replicated));
+                    }
+                }
+                // Ack unless this was a reconciliation batch.
+                if b.batch_seq != u64::MAX {
+                    send_envelope(
+                        &tx,
+                        Envelope {
+                            msg: Some(EnvelopeMsg::BatchAck(BatchAck {
+                                session_id: b.session_id,
+                                batch_seq: b.batch_seq,
+                                fragment: b.fragment,
+                            })),
+                        },
+                    )
+                    .await;
+                }
+            }
+            Some(EnvelopeMsg::BatchAck(a)) => {
+                // Route the ack to the sender for (fragment, peer).
+                if let Some(peer) = peer_node_id.clone() {
+                    let senders = senders.lock().await;
+                    if let Some(tx) = senders.get(&(FragmentId(a.fragment), peer)) {
+                        let _ = tx.send(SenderMsg::Ack {
+                            session_id: a.session_id,
+                            batch_seq: a.batch_seq,
+                        });
+                    }
+                }
+            }
+            Some(EnvelopeMsg::ReconcileRequest(r)) => {
+                // Peer wants our (timestamp, tombstone) summaries.
+                let frag = FragmentId(r.fragment);
+                if let Some(actor) = router.route_for_fragment(frag) {
+                    if let Ok(CallResult::Success(map)) =
+                        actor.call(|reply| KvMessage::GetAll { reply }, None).await
                     {
-                        rebroadcast(&peers, &tx, &op).await;
+                        let summaries = map
+                            .into_iter()
+                            .map(|(key, v): (String, VersionedValue)| KeySummary {
+                                key,
+                                timestamp_ms: v.timestamp_ms,
+                                node_id: v.node_id,
+                                is_tombstone: v.is_tombstone,
+                            })
+                            .collect();
+                        send_envelope(
+                            &tx,
+                            Envelope {
+                                msg: Some(EnvelopeMsg::ReconcileResponse(ReconcileResponse {
+                                    fragment: r.fragment,
+                                    summaries,
+                                })),
+                            },
+                        )
+                        .await;
+                    }
+                }
+            }
+            Some(EnvelopeMsg::ReconcileFetch(f)) => {
+                // Peer wants full values for these keys.
+                let frag = FragmentId(f.fragment);
+                if let Some(actor) = router.route_for_fragment(frag) {
+                    if let Ok(CallResult::Success(map)) =
+                        actor.call(|reply| KvMessage::GetAll { reply }, None).await
+                    {
+                        let entries = f
+                            .keys
+                            .into_iter()
+                            .filter_map(|key| {
+                                map.get(&key).map(|v| SyncEntry {
+                                    key: key.clone(),
+                                    value: v.value.clone(),
+                                    timestamp_ms: v.timestamp_ms,
+                                    node_id: v.node_id.clone(),
+                                    expires_at_ms: v.expires_at_ms.unwrap_or(0),
+                                    is_tombstone: v.is_tombstone,
+                                })
+                            })
+                            .collect();
+                        send_envelope(
+                            &tx,
+                            Envelope {
+                                msg: Some(EnvelopeMsg::ReconcileData(ReconcileData {
+                                    fragment: f.fragment,
+                                    entries,
+                                })),
+                            },
+                        )
+                        .await;
+                    }
+                }
+            }
+            Some(EnvelopeMsg::ReconcileResponse(r)) => {
+                // Route to the sender for (fragment, peer).
+                if let Some(peer) = peer_node_id.clone() {
+                    let senders = senders.lock().await;
+                    if let Some(tx) = senders.get(&(FragmentId(r.fragment), peer)) {
+                        let _ = tx.send(SenderMsg::ReconcileResponse {
+                            summaries: r.summaries,
+                        });
+                    }
+                }
+            }
+            Some(EnvelopeMsg::ReconcileData(d)) => {
+                // Route to the sender for (fragment, peer).
+                if let Some(peer) = peer_node_id.clone() {
+                    let senders = senders.lock().await;
+                    if let Some(tx) = senders.get(&(FragmentId(d.fragment), peer)) {
+                        let _ = tx.send(SenderMsg::ReconcileData { entries: d.entries });
                     }
                 }
             }
             Some(EnvelopeMsg::ForwardedPut(p)) => {
-                // We own this fragment: apply as coordinator, then fan
-                // out to the other replica holders (excluding the sender).
+                hlc.lock().await.observe(p.timestamp_ms);
+                // We own this fragment: apply as coordinator, then
+                // enqueue for async replication to the other holders.
                 let replicated = ReplicatedOp {
                     key: p.key.clone(),
                     value: {
@@ -847,6 +1153,7 @@ async fn handle_connection(ctx: ConnContext, stream: BoxStream, we_dialed: bool)
                         } else {
                             Some(p.expires_at_ms)
                         };
+                        v.is_tombstone = p.is_tombstone;
                         v
                     },
                     seq: p.seq,
@@ -855,19 +1162,13 @@ async fn handle_connection(ctx: ConnContext, stream: BoxStream, we_dialed: bool)
                 let frag = fragment_of(&replicated.key, router.fragment_count);
                 if let Some(actor) = router.route(&replicated.key) {
                     let _ = actor.send_message(KvMessage::ApplyOp(replicated.clone()));
-                    seen_ops
-                        .lock()
-                        .await
-                        .insert((p.node_id.clone(), p.boot_id, p.seq));
-                    replicate_to_holders(
-                        &node_id,
-                        &fragment_map,
-                        &peers,
-                        frag,
-                        &replicated,
-                        peer_node_id.as_deref(),
-                    )
-                    .await;
+                    // Phase 5: async fan-out via senders.
+                    let senders = senders.lock().await;
+                    for ((f, _peer), tx) in senders.iter() {
+                        if *f == frag {
+                            let _ = tx.send(SenderMsg::Enqueue(replicated.clone()));
+                        }
+                    }
                 }
             }
             Some(EnvelopeMsg::ForwardedGet(g)) => {
@@ -891,15 +1192,17 @@ async fn handle_connection(ctx: ConnContext, stream: BoxStream, we_dialed: bool)
                     }
                     None => None,
                 };
-                let (found, bytes, timestamp_ms, origin, expires_at_ms) = match value {
+                let (found, bytes, timestamp_ms, origin, expires_at_ms, is_tombstone) = match value
+                {
                     Some(v) => (
                         true,
                         v.value,
                         v.timestamp_ms,
                         v.node_id,
                         v.expires_at_ms.unwrap_or(0),
+                        v.is_tombstone,
                     ),
-                    None => (false, Vec::new(), 0, String::new(), 0),
+                    None => (false, Vec::new(), 0, String::new(), 0, false),
                 };
                 send_envelope(
                     &tx,
@@ -911,6 +1214,7 @@ async fn handle_connection(ctx: ConnContext, stream: BoxStream, we_dialed: bool)
                             timestamp_ms,
                             node_id: origin,
                             expires_at_ms,
+                            is_tombstone,
                         })),
                     },
                 )
@@ -962,6 +1266,7 @@ async fn handle_connection(ctx: ConnContext, stream: BoxStream, we_dialed: bool)
                             timestamp_ms: v.timestamp_ms,
                             node_id: v.node_id,
                             expires_at_ms: v.expires_at_ms.unwrap_or(0),
+                            is_tombstone: v.is_tombstone,
                         })
                         .collect();
                     send_envelope(
@@ -978,6 +1283,7 @@ async fn handle_connection(ctx: ConnContext, stream: BoxStream, we_dialed: bool)
                 // already has these ops; everyone else will get them
                 // through normal gossip or their own sync).
                 for e in resp.entries {
+                    hlc.lock().await.observe(e.timestamp_ms);
                     let op = ReplicatedOp {
                         key: e.key,
                         value: {
@@ -987,6 +1293,7 @@ async fn handle_connection(ctx: ConnContext, stream: BoxStream, we_dialed: bool)
                             } else {
                                 Some(e.expires_at_ms)
                             };
+                            v.is_tombstone = e.is_tombstone;
                             v
                         },
                         seq: 0,     // seq/boot_id are propagation concerns;
@@ -1009,6 +1316,14 @@ async fn handle_connection(ctx: ConnContext, stream: BoxStream, we_dialed: bool)
         if let Some(tx_existing) = guard.get(&peer) {
             if tx_existing.same_channel(&tx) {
                 guard.remove(&peer);
+                // Phase 5: the senders retain their buffers for resume.
+                // Only notify if we were the current connection.
+                let senders_guard = senders.lock().await;
+                for ((_, p), sender_tx) in senders_guard.iter() {
+                    if p == &peer {
+                        let _ = sender_tx.send(SenderMsg::PeerDisconnected);
+                    }
+                }
             }
         }
     }
@@ -1052,75 +1367,6 @@ fn jitter(backoff: Duration) -> Duration {
 /// Legacy gossip: re-send an op to all peers except the connection it
 /// arrived on. Only used when no fragment_map is configured; the sharded
 /// path fans out from the coordinator instead.
-async fn rebroadcast(peers: &PeerMap, arrived_on: &mpsc::Sender<Vec<u8>>, op: &ProtoReplicateOp) {
-    let mut frame = Vec::new();
-    if (Envelope {
-        msg: Some(EnvelopeMsg::Replicate(op.clone())),
-    })
-    .encode(&mut frame)
-    .is_err()
-    {
-        return;
-    }
-    let peers = peers.lock().await;
-    for tx in peers.values() {
-        if !tx.same_channel(arrived_on) {
-            let _ = tx.send(frame.clone()).await;
-        }
-    }
-}
-
-/// Fan out an op to the other replica holders of `frag`, excluding
-/// `exclude` (typically the node the op arrived from). Fire-and-forget.
-async fn replicate_to_holders(
-    node_id: &str,
-    fragment_map: &HashMap<FragmentId, Vec<String>>,
-    peers: &PeerMap,
-    frag: FragmentId,
-    op: &ReplicatedOp,
-    exclude: Option<&str>,
-) {
-    let targets: Vec<String> = match fragment_map.get(&frag) {
-        Some(replicas) => replicas
-            .iter()
-            .filter(|r| r.as_str() != node_id && Some(r.as_str()) != exclude)
-            .cloned()
-            .collect(),
-        // No map: legacy — replicate to every connected peer.
-        None => peers
-            .lock()
-            .await
-            .keys()
-            .filter(|k| Some(k.as_str()) != exclude)
-            .cloned()
-            .collect(),
-    };
-    if targets.is_empty() {
-        return;
-    }
-    let proto_op = ProtoReplicateOp {
-        key: op.key.clone(),
-        value: op.value.value.clone(),
-        timestamp_ms: op.value.timestamp_ms,
-        node_id: op.value.node_id.clone(),
-        seq: op.seq,
-        boot_id: op.boot_id,
-        expires_at_ms: op.value.expires_at_ms.unwrap_or(0),
-    };
-    let peers = peers.lock().await;
-    for target in targets {
-        if let Some(tx) = peers.get(&target) {
-            send_envelope(
-                tx,
-                Envelope {
-                    msg: Some(EnvelopeMsg::Replicate(proto_op.clone())),
-                },
-            )
-            .await;
-        }
-    }
-}
-
 async fn send_hello(tx: &mpsc::Sender<Vec<u8>>, node_id: &str) {
     send_envelope(
         tx,

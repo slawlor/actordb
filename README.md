@@ -12,26 +12,40 @@ A rust actor-based distributed database based on *RocksDb*
 
 ## Working prototype
 
-The crate now contains a working, tested prototype of the actor-first
-distributed database vision:
+A working, tested prototype of the actor-first sharded database vision:
 
-* **`actor`**: a `KvActor` (built on [ractor](https://github.com/slawlor/ractor))
-  owns each node's *local copy* of the keyspace. The actor's message
-  handler is the only code that mutates that copy — no locks, no shared
-  mutable state.
-* **`node`**: a `Node` pairs the actor with a Tokio TCP mesh. Local writes
-  are applied to the actor and gossiped to peers with **epidemic
-  broadcast** (each node forwards each op once, tracked by
-  `(origin node_id, seq)`); inbound writes merge with
-  **last-writer-wins** on `(timestamp_ms, node_id)`, which is idempotent
-  and commutative, so replicas converge without coordination. A joining
-  node pulls full state via a handshake sync (anti-entropy).
-* **`proto`**: the wire protocol — prost-encoded `Envelope` frames
-  (`Hello`, `ReplicateOp`, `SyncRequest`, `SyncResponse`),
+* **`shard`**: deterministic key → fragment mapping (`fragment_of`
+  via seahash). The keyspace is partitioned into `fragment_count`
+  fragments; every node agrees on the mapping.
+* **`actor`**: per fragment, a `KvActor` dispatcher (built on
+  [ractor](https://github.com/slawlor/ractor)) routes ops to a
+  `WorkerPool` by `hash(key) % worker_count`. Sticky dispatch preserves
+  per-key ordering while different keys execute concurrently. Workers
+  share the fragment's `FragmentState`: one in-memory cache, one
+  persistence buffer, one `KvStore`.
+* **`supervision`**: every fragment runs under a `FragmentSupervisor`
+  owning the dispatcher pool plus background actors — a `Cleaner`
+  (TTL expiry, tombstone aging) and a `Snapshotter` (periodic durable
+  flush). Dead workers restart in place; dead children restart without
+  touching sibling fragments. `Node::health()` reports per-fragment
+  health.
+* **`node`**: a `Node` pairs the per-fragment supervisors with a Tokio
+  TCP mesh. Static placement (`fragment_map`) with caller-side one-hop
+  routing: a node either applies a write locally and enqueues it for
+  async replication, or forwards it to a fragment owner. Inbound ops
+  merge with **last-writer-wins** on hybrid-logical-clock timestamps
+  (tie-broken by `node_id`), which is idempotent and commutative, so
+  replicas converge without coordination. Deletes are tombstones that
+  propagate like writes. A joining node pulls state via handshake sync
+  (anti-entropy).
+* **`store`**: pluggable durable storage. In-memory by default; enable
+  the `rocksdb` feature for RocksDB (per-fragment key namespacing via
+  `PrefixedStore`).
+* **`proto`**: the wire protocol — prost-encoded `Envelope` frames,
   length-delimited over TCP.
 
-Run the tests (7 cluster integration tests over real localhost TCP, plus
-a unit test for the LWW ordering):
+Run the tests (19 cluster integration tests over real localhost TCP,
+plus 9 unit tests):
 
 ```bash
 cargo test
@@ -74,15 +88,11 @@ CI runs both scenarios on every push/PR touching the relevant paths
 
 ## Public API
 
-Three modules:
-
 ### `actordb::node` — the main entry point
-
-`Node` pairs a `KvActor` with the Tokio TCP replication mesh. This is
-what most users interact with:
 
 ```rust
 use actordb::node::{Node, NodeConfig};
+use std::time::Duration;
 
 let node = Node::start(
     "node-a".to_string(),
@@ -91,39 +101,76 @@ let node = Node::start(
 )
 .await?;
 // port 0 picks an ephemeral port; the bound address is available via `node.addr()`
-// NodeConfig { db_path: Some(path) } enables RocksDB write-through persistence
 
 node.connect("127.0.0.1:7447".parse().unwrap()).await?;
 // handshake runs a full-state sync, so a joining node converges immediately.
-// The dialer side owns the connection and redials with backoff if it drops.
 
 node.put("key".to_string(), b"value".to_vec()).await?;
+node.put_with_ttl("temp".to_string(), b"value".to_vec(), Some(Duration::from_secs(60))).await?;
+node.delete("key".to_string()).await?;
+
 let value = node.get("key".to_string()).await?;  // local-only read, Option<VersionedValue>
-let all = node.get_all().await?;                  // full local copy
+let all = node.get_all().await?;                  // full local copy (live keys)
+let health = node.health().await?;                // per-fragment supervision health
 let peers = node.peer_count().await;
 
 node.shutdown().await;
 ```
 
-- Writes are applied to the local actor and gossiped to peers with
-  epidemic broadcast; reads never touch the network.
-- Conflicts resolve with last-writer-wins on `(timestamp_ms, node_id)`.
+Key `NodeConfig` knobs:
+
+| Field | Default | Meaning |
+|---|---|---|
+| `fragment_count` | 1 | Fragments in the keyspace (must agree cluster-wide) |
+| `fragment_map` | {} | Static placement: fragment → replica node ids (empty = serve all) |
+| `members` | {} | Static membership: node id → address |
+| `worker_count` | 4 | Worker actors per fragment |
+| `flush_batch_size` / `flush_interval` | 1000 / 100ms | Persistence batching |
+| `clean_interval` | 30s | TTL/tombstone sweep period |
+| `snapshot_interval` | 60s | Periodic durable flush |
+| `tombstone_gc_age` | 1h | Tombstone retention (must exceed longest expected partition) |
+| `replication` | defaults | `SenderConfig`: batch size/interval, max in-flight, buffer capacity, consistency interval |
+| `store` | None | `Some(Arc<dyn KvStore>)`; `NodeConfig::with_rocksdb(path)` with the `rocksdb` feature |
+
+- Local writes are read-your-write; remote-fragment writes forward in
+  one hop to a replica holder.
+- Conflicts resolve with last-writer-wins on HLC timestamps,
+  tie-broken by `node_id`; tombstones win exact ties.
 - Failures surface as `NodeError::{Io, Codec, Actor}`.
 
 ### `actordb::actor` — the storage core
 
-- `KvActor` — the [ractor](https://github.com/slawlor/ractor) actor
-  owning one node's local copy. Its message handler is the only code
-  that mutates state: no locks, no shared mutability.
-- `VersionedValue { value, timestamp_ms, node_id }` — a value plus its
-  LWW version; `wins_over` implements the conflict rule.
-- `KvMessage::{ApplyOp, Get, GetAll}` — for embedders driving the actor
-  directly instead of through `Node`.
+- `KvActor` — per-fragment dispatcher; `WorkerPool` — sticky-hash
+  worker pool; `FragmentState` — the shared cache/buffer/store.
+- `VersionedValue { value, timestamp_ms, node_id, expires_at_ms, is_tombstone }`
+  — a value plus its LWW version; `wins_over` implements the conflict
+  rule, `is_expired` the TTL check.
+- `HlcClock` — hybrid logical clock behind all timestamps.
+- `KvMessage::{ApplyOp, Get, GetAll}` — for embedders driving the
+  dispatcher directly instead of through `Node`.
+
+### `actordb::supervision` — per-fragment supervision
+
+- `FragmentSupervisor` — owns a fragment's dispatcher, `Cleaner`, and
+  `Snapshotter`; restarts dead children in place.
+- `FragmentHealth` — per-fragment health snapshot (worker count/names,
+  restart counts).
+
+### `actordb::replication` — async sender/receiver
+
+- Per fragment, per peer, a sender task batches mutations (writes +
+  tombstones) off the write path: ships on a timer, bounded in-flight,
+  acks drop acked records.
+- Session ids per pairing; stale batches discarded on reconnect.
+- Buffer overflow → `buffer_reset`: shed, block tombstone GC, and
+  reconcile via timestamp/tombstone comparison when the peer returns.
+- Periodic anti-entropy repairs residual divergence.
 
 ### `actordb::proto` — wire protocol
 
 Prost-generated protobuf types (`Envelope`, `Hello`, `ReplicateOp`,
-`SyncRequest`, `SyncResponse`), sent as 4-byte length-prefixed frames
+`ForwardedPut`, `ForwardedGet`, `GetResponse`, `SyncRequest`,
+`SyncResponse`, `SyncEntry`), sent as 4-byte length-prefixed frames
 over TCP. Mostly of interest if you're implementing a compatible peer.
 
 ### Current limitations
@@ -131,23 +178,15 @@ over TCP. Mostly of interest if you're implementing a compatible peer.
 This is a working prototype, not production-ready. Known gaps, tracked
 as issues in the [issue tracker](https://github.com/slawlor/actordb/issues):
 
-- **Persistence is opt-in** — pass `db_path` in `NodeConfig` for
-  RocksDB write-through persistence; without it the dataset lives in
-  memory and a restart wipes it (recoverable only via peer sync).
+- **Persistence is opt-in** — pass a `store` in `NodeConfig` for
+  durability; without it the dataset lives in memory and a restart
+  wipes it (recoverable only via peer sync).
 - **No TLS/authentication** — plaintext, unauthenticated TCP.
-- **No deletes** — keys live forever.
-- **Wall-clock LWW** — no hybrid logical clocks yet; skewed clocks can
-  lose writes.
-- **Silent drops under extreme load** — the per-peer queue is bounded
-  and overflow is currently silent.
-- **Full-state anti-entropy** — every handshake ships the whole dataset.
-
-## TODO List
-
-1. Make generic input(recv)/output(send) service definitions.
-2. Leave network-level protocols up to implementer (gRPC, raw TCP, Thrift etc doesn't matter)
-3. Test lib can implement a basic TCP version without auth/TLS etc on a docker cluster for automated tests
-4. Decide consensus models we want to implement and then do we (a) use an existing lib or (b) build it/them ourself?
+- **Full-state handshake anti-entropy** — every handshake ships the
+  whole dataset (tombstones included); steady-state replication is
+  incremental (batches + reconciliation).
+- **Tombstone GC is time-based** — a node partitioned longer than
+  `tombstone_gc_age` can resurrect deleted keys on rejoin.
 
 ## Contributors
 
