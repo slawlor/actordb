@@ -42,7 +42,12 @@ COPY . .
 RUN cargo build --release --bin actordb-docker-test \
     && cp target/release/actordb-docker-test /usr/local/bin/actordb-docker-test
 
-FROM debian:bookworm-slim AS runtime
+FROM debian:trixie-slim AS runtime
+# NOTE: this must match the Debian release underlying rust:latest
+# (trixie as of Oct 2026). The builder links against its glibc/libstdc++,
+# so a runtime older than the builder fails with
+# "GLIBC_X.XX not found" / "CXXABI_X.X.XX not found". If rust:latest moves
+# to a newer Debian, bump this tag to match.
 # librocksdb-sys links rocksdb statically, but the binary still needs the
 # C++ runtime. Keep the image minimal: no toolchain, no source, no registry.
 RUN apt-get update \
