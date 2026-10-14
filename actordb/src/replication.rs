@@ -94,6 +94,10 @@ pub enum SenderMsg {
     ReconcileResponse { summaries: Vec<KeySummary> },
     /// Full values for keys we asked to fetch.
     ReconcileData { entries: Vec<SyncEntry> },
+    /// Trigger an anti-entropy reconcile round now (if connected).
+    /// Used by the Phase 8 placement driver to bootstrap a newly
+    /// assigned fragment without waiting for the periodic timer.
+    ReconcileNow,
 }
 
 /// A batch awaiting its ack.
@@ -123,6 +127,9 @@ pub struct SenderStateReport {
     pub buffered: usize,
     /// Batches in flight.
     pub in_flight: usize,
+    /// Completed anti-entropy reconcile rounds. The Phase 8 placement
+    /// driver polls this to detect bootstrap completion.
+    pub reconcile_rounds: u64,
 }
 
 /// Shared dependencies for a sender task.
@@ -189,6 +196,13 @@ async fn sender_task(
 
     // The sender only learns its session id on PeerConnected.
     let mut session_id: u64 = 0;
+    // Remaining fetch chunks for the in-flight reconcile round.
+    // Chunking bounds the memory of a single ReconcileData message
+    // during bootstrap / anti-entropy on large fragments.
+    let mut fetch_queue: VecDeque<Vec<String>> = VecDeque::new();
+    // Completed reconcile rounds, published for health/tests (the
+    // Phase 8 placement driver polls this for bootstrap completion).
+    let mut reconcile_rounds: u64 = 0;
 
     loop {
         // Publish state for health checks and tests.
@@ -205,6 +219,7 @@ async fn sender_task(
                 session_id,
                 buffered: buffer.len(),
                 in_flight,
+                reconcile_rounds,
             };
         }
         tokio::select! {
@@ -298,31 +313,59 @@ async fn sender_task(
                             }
                         }
                     }
+                    SenderMsg::ReconcileNow => {
+                        // On-demand anti-entropy (Phase 8 bootstrap).
+                        // A disconnected sender reconciles on the next
+                        // PeerConnected; a BufferReset sender already
+                        // has a round in flight.
+                        if matches!(state, SenderState::Connected { .. }) {
+                            if let Some(tx) = peer_tx.clone() {
+                                send_envelope(
+                                    &tx,
+                                    EnvelopeMsg::ReconcileRequest(ReconcileRequest {
+                                        fragment: fragment.0,
+                                    }),
+                                )
+                                .await;
+                            }
+                        }
+                    }
                     SenderMsg::ReconcileResponse { summaries } => {
-                        if !matches!(state, SenderState::BufferReset) {
+                        // Anti-entropy applies in BufferReset (recovery)
+                        // and in Connected (periodic repair): a response
+                        // received while Disconnected belongs to a dead
+                        // session and is ignored.
+                        let in_reset = matches!(state, SenderState::BufferReset);
+                        if !in_reset && !matches!(state, SenderState::Connected { .. }) {
                             continue;
                         }
                         let Some(tx) = peer_tx.clone() else { continue };
-                        let needs_fetch = reconcile(
-                            fragment,
-                            &deps.router,
-                            &tx,
-                            session_id,
-                            summaries,
-                        )
-                        .await;
-                        if !needs_fetch {
-                            finish_reconcile(
-                                fragment,
-                                &peer_id,
-                                &deps.reset_senders,
-                                &mut state,
-                                session_id,
-                                peer_tx.clone(),
-                            )
-                            .await;
+                        // A newer round supersedes an older one still
+                        // fetching: LWW makes the exchange idempotent.
+                        fetch_queue.clear();
+                        match reconcile(fragment, &deps.router, &tx, session_id, summaries).await
+                        {
+                            // No fetch needed: the round is complete.
+                            None => {
+                                reconcile_rounds += 1;
+                                if in_reset {
+                                    finish_reconcile(
+                                        fragment,
+                                        &peer_id,
+                                        &deps.reset_senders,
+                                        &mut state,
+                                        session_id,
+                                        peer_tx.clone(),
+                                    )
+                                    .await;
+                                }
+                            }
+                            // First chunk sent; the rest wait for
+                            // ReconcileData.
+                            Some(remaining) => {
+                                fetch_queue = remaining;
+                            }
                         }
-                        // Else: ReconcileData completes the round.
                     }
                     SenderMsg::ReconcileData { entries } => {
                         // Merge fetched values locally via LWW.
@@ -351,17 +394,43 @@ async fn sender_task(
                                 });
                             }
                         }
+                        // More chunks? Send the next fetch; otherwise the
+                        // round is complete.
+                        let mut next_chunk = fetch_queue.pop_front();
+                        // A queued chunk with no peer is useless; drop it
+                        // and finish the round instead of stalling.
+                        if next_chunk.is_some() && peer_tx.is_none() {
+                            next_chunk = None;
+                            fetch_queue.clear();
+                        }
+                        if let Some(chunk) = next_chunk {
+                            if let Some(tx) = peer_tx.clone() {
+                                send_envelope(
+                                    &tx,
+                                    EnvelopeMsg::ReconcileFetch(ReconcileFetch {
+                                        fragment: fragment.0,
+                                        keys: chunk,
+                                    }),
+                                )
+                                .await;
+                                continue;
+                            }
+                        }
+                        reconcile_rounds += 1;
                         // Reconciliation is complete once the data lands:
-                        // leave BufferReset and go Connected.
-                        finish_reconcile(
-                            fragment,
-                            &peer_id,
-                            &deps.reset_senders,
-                            &mut state,
-                            session_id,
-                            peer_tx.clone(),
-                        )
-                        .await;
+                        // leave BufferReset and go Connected. A
+                        // Connected sender simply stays connected.
+                        if matches!(state, SenderState::BufferReset) {
+                            finish_reconcile(
+                                fragment,
+                                &peer_id,
+                                &deps.reset_senders,
+                                &mut state,
+                                session_id,
+                                peer_tx.clone(),
+                            )
+                            .await;
+                        }
                     }
                 }
             }
@@ -431,10 +500,18 @@ async fn sender_task(
     }
 }
 
+/// Keys per ReconcileFetch chunk. Bounds the memory of a single
+/// ReconcileData message during bootstrap / anti-entropy on large
+/// fragments (Phase 8 chunked bootstrap).
+const RECONCILE_FETCH_CHUNK: usize = 500;
+
 /// Run one reconciliation round: compare the peer's summaries against
 /// local state, fetch keys where the peer wins, and ship keys where we
-/// win. Returns `true` if we sent a `ReconcileFetch` and are waiting
-/// for `ReconcileData`; `false` if the round is complete.
+/// win.
+///
+/// Returns `None` when no fetch was needed (the round is complete).
+/// Otherwise sends the first fetch chunk and returns the remaining
+/// chunks; the caller sends them as each `ReconcileData` arrives.
 ///
 /// LWW makes the whole exchange idempotent: if a shipped op no longer
 /// wins by the time the peer applies it, the peer's merge rejects it.
@@ -444,14 +521,12 @@ async fn reconcile(
     peer_tx: &mpsc::Sender<Vec<u8>>,
     session_id: u64,
     summaries: Vec<KeySummary>,
-) -> bool {
-    let Some(actor) = router.route_for_fragment(fragment) else {
-        return false;
-    };
+) -> Option<VecDeque<Vec<String>>> {
+    let actor = router.route_for_fragment(fragment)?;
     let local: HashMap<String, VersionedValue> =
         match actor.call(|reply| KvMessage::GetAll { reply }, None).await {
             Ok(CallResult::Success(map)) => map,
-            _ => return false,
+            _ => return None,
         };
 
     let mut fetch_keys = Vec::new();
@@ -515,18 +590,25 @@ async fn reconcile(
     }
 
     if fetch_keys.is_empty() {
-        return false;
+        return None;
     }
-    // Ask for the values; ReconcileData completes the round.
+    // Chunk the fetch so a large fragment doesn't materialize as one
+    // giant ReconcileData message: send the first chunk now, queue the
+    // rest for the caller to send as each chunk's data arrives.
+    let mut chunks: VecDeque<Vec<String>> = fetch_keys
+        .chunks(RECONCILE_FETCH_CHUNK)
+        .map(|c| c.to_vec())
+        .collect();
+    let first = chunks.pop_front().unwrap_or_default();
     send_envelope(
         peer_tx,
         EnvelopeMsg::ReconcileFetch(ReconcileFetch {
             fragment: fragment.0,
-            keys: fetch_keys,
+            keys: first,
         }),
     )
     .await;
-    true
+    Some(chunks)
 }
 
 /// Leave `BufferReset` after reconciliation: clear the reset flag and
