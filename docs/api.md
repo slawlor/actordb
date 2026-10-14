@@ -34,8 +34,8 @@ async fn main() -> Result<(), actordb::node::NodeError> {
 ## Single-key operations
 
 ```rust
-// Write (default priority). Applies locally, then forwards to the owner
-// if this node doesn't serve the key's fragment.
+// Applies at the serving owner: locally when hosted here, otherwise
+// forwarded and awaited.
 node.put("user:42".to_string(), b"{\"name\":\"Ada\"}".to_vec()).await?;
 
 // Write with TTL — the key reads as absent after `ttl` elapses.
@@ -65,10 +65,10 @@ node.put_multi_with_priority(batch, OpPriority::Background).await;
 
 `OpPriority` is `High` / `Default` / `Background` (`Default` is the
 `#[default]`). Priorities map to three isolated worker pools per fragment; a
-shed local operation surfaces as `NodeError::Backpressure` — never as a silent
-`Ok(None)`. A local put waits for its exact apply outcome; once it returns
-`Ok`, reads in every pool observe that version or a newer winner. Remote puts
-remain asynchronous until the mutation-response protocol is enabled. See
+shed operation surfaces as `NodeError::Backpressure` — never as a silent
+success or `Ok(None)`. Local and forwarded puts wait for the serving worker's
+exact apply outcome; once it returns `Ok`, reads at that owner observe that
+version or a newer winner. See
 [Consistency](consistency.md) and [Traffic classes & backpressure](backpressure.md).
 
 ## Multi-key batching
@@ -87,10 +87,11 @@ Semantics (full detail in [Multi-key batching](batching.md)):
   `_with_priority` variants take an explicit priority.
 - Keys are grouped by destination fragment; remote groups go out as **one
   `BatchPut` / `BatchGet` message per fragment** (not per key).
-- Remote puts fail over across replica holders until one accepts the batch,
-  but are **fire-and-forget** — there is no end-to-end ack.
-- Remote gets have a **5-second per-attempt timeout** and fail over to the next
-  replica holder on timeout.
+- Remote puts have a **5-second per-attempt deadline** including outbound
+  queueing. Remote gets use a 5-second reply timeout after enqueueing. Both
+  fail over on a closed connection or missing reply; put replies additionally
+  require one ordered exact outcome per key, and an all-`Unavailable` put
+  response tries the next holder.
 - Per-key errors use `NodeError`: `Actor` = misconfiguration (no usable
   replica), `Network` = no replica reachable, `Backpressure` = shed.
 
@@ -139,8 +140,9 @@ The distinction that matters in practice:
 
 - A shed **read** returns `Err(NodeError::Backpressure(..))` — it never returns
   `Ok(None)`, so "not found" and "shed" can't be confused.
-- A shed local write returns `Err(NodeError::Backpressure(..))` directly from
-  the apply attempt; it is never inferred from a read-back barrier.
+- A shed local or forwarded write returns `Err(NodeError::Backpressure(..))`
+  directly from the serving fragment; it is never inferred from a read-back
+  barrier.
 - `Superseded` is explicit: the API never reports a write successful merely
   because a different, newer value was already present.
 - `Network` vs `Actor`: connectivity problems vs. configuration problems (e.g.

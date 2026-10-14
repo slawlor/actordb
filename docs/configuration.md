@@ -36,9 +36,10 @@ simulator, not a tuning knob.
 |---|---|---|
 | `batch_size` | `100` | Ops per replication batch. |
 | `batch_interval` | `100 ms` | Max batching delay — bounds steady-state replication lag. |
-| `max_in_flight` | `4` | Batches awaiting ack before sending pauses. There is **no ack timeout**; an unacked batch waits for session end. |
-| `buffer_capacity` | `10_000` | Bounded per-sender buffer. On overflow the buffer is shed and the sender enters `BufferReset` (reconcile-on-reconnect). |
+| `max_in_flight` | `4` | Batches awaiting ACK before sending pauses. There is **no ACK timeout**; a NACK or session change retries, but a silent open peer can stall at this bound. |
+| `buffer_capacity` | `10_000` | Bounded per-sender buffer. On overflow the buffer is shed and the sender enters `BufferReset`. Reconciliation currently begins on the next session connection; live-session overflow recovery is pending. |
 | `consistency_interval` | `300 s` | Periodic anti-entropy reconcile cadence per sender. |
+| `required_ack_durability` | `MemoryApplied` | Minimum receiver fence allowed to retire a batch. Set `StoreCommitted` only when every target has a configured store. Store acceptance does not imply fsync unless the backend guarantees it. |
 
 ## `PoolConfig`
 
@@ -55,7 +56,9 @@ These are `const`s, documented here so they don't surprise you:
 | Constant | Value | Meaning |
 |---|---|---|
 | `MAX_FORWARD_HOPS` | `4` | Bounds re-forward chains during placement disagreement. |
-| Remote-get timeout | `5 s` | Per-attempt timeout in `get_with_priority` / `get_multi_with_priority`, with failover to the next replica. |
+| Remote-mutation deadline | `5 s` | Covers queueing plus response. Batch puts fail over; single puts currently select one owner. |
+| Remote-read response timeout | `5 s` | Starts after queueing. Batch gets fail over; single gets currently select one owner. |
+| `NACK_RETRY_DELAY` | `1 s` | Minimum delay before retrying a receiver-rejected replication batch. |
 | `BOOTSTRAP_TIMEOUT` | `30 s` | Max wait bootstrapping a gained fragment before going Serving anyway. |
 | `DRAIN_TIMEOUT` | `10 s` | Max wait draining senders when losing a fragment. |
 | `RECONCILE_FETCH_CHUNK` | `500` | Keys per `ReconcileFetch`/`ReconcileData` message. |

@@ -37,7 +37,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ractor::rpc::CallResult;
 use tokio::sync::{mpsc, Mutex};
@@ -46,9 +46,14 @@ use crate::actor::{KvMessage, OpPriority, VersionedValue};
 use crate::node::FragmentRouter;
 use crate::proto::{
     Envelope, EnvelopeMsg, KeySummary, ReconcileFetch, ReconcileRequest, ReplicateBatch,
-    ReplicateOp as ProtoReplicateOp, SessionStart, SyncEntry,
+    ReplicateOp as ProtoReplicateOp, ReplicationAckLevel, SessionStart, SyncEntry,
 };
 use crate::shard::FragmentId;
+
+/// Prevent a permanently failing receiver store from becoming a tight
+/// NACK/write/log loop. Full retry policy belongs with ACK timeouts and bounded
+/// ingress; this floor makes the current explicit retry operationally safe.
+const NACK_RETRY_DELAY: Duration = Duration::from_secs(1);
 
 /// Tuning knobs for the replication sender. All fields are public so
 /// embedders can tune; `Default` is sane for tests and small clusters.
@@ -66,6 +71,10 @@ pub struct SenderConfig {
     /// How often a connected sender runs anti-entropy reconciliation
     /// to repair divergence.
     pub consistency_interval: Duration,
+    /// Minimum receiver fence that may retire an in-flight batch.
+    /// `MemoryApplied` accepts either acknowledgement level;
+    /// `StoreCommitted` requires a receiver with a configured store.
+    pub required_ack_durability: ReplicationAckDurability,
 }
 
 impl Default for SenderConfig {
@@ -76,6 +85,7 @@ impl Default for SenderConfig {
             max_in_flight: 4,
             buffer_capacity: 10_000,
             consistency_interval: Duration::from_secs(300),
+            required_ack_durability: ReplicationAckDurability::MemoryApplied,
         }
     }
 }
@@ -88,8 +98,19 @@ pub enum SenderMsg {
     PeerConnected { peer_tx: mpsc::Sender<Vec<u8>> },
     /// The peer connection dropped; retain the buffer.
     PeerDisconnected,
-    /// The peer acked a batch.
-    Ack { session_id: u64, batch_seq: u64 },
+    /// The peer acked a batch after reaching the reported durability fence.
+    Ack {
+        session_id: u64,
+        batch_seq: u64,
+        durability: ReplicationAckDurability,
+    },
+    /// The peer could not apply or flush a batch. Requeue the exact stamped
+    /// operations; LWW application makes retries idempotent.
+    Nack {
+        session_id: u64,
+        batch_seq: u64,
+        error: String,
+    },
     /// Response to our reconcile request.
     ReconcileResponse { summaries: Vec<KeySummary> },
     /// Full values for keys we asked to fetch.
@@ -98,6 +119,17 @@ pub enum SenderMsg {
     /// Used by the Phase 8 placement driver to bootstrap a newly
     /// assigned fragment without waiting for the periodic timer.
     ReconcileNow,
+}
+
+/// Receiver guarantee attached to the most recent accepted batch ACK.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ReplicationAckDurability {
+    /// Every operation is visible in the receiver's in-memory cache. No store
+    /// flush is required, even when the receiver has a configured store.
+    MemoryApplied,
+    /// The receiver applied every op and its configured store accepted a
+    /// flush. This is not an fsync guarantee unless that store says so.
+    StoreCommitted,
 }
 
 /// A batch awaiting its ack.
@@ -116,6 +148,19 @@ enum SenderState {
     BufferReset,
 }
 
+fn requeue_in_flight(
+    in_flight: &mut VecDeque<InflightBatch>,
+    buffer: &mut VecDeque<crate::actor::ReplicatedOp>,
+) {
+    // Pop newest batches first and push each batch in reverse so the final
+    // buffer preserves original batch and operation order.
+    while let Some(batch) = in_flight.pop_back() {
+        for op in batch.ops.into_iter().rev() {
+            buffer.push_front(op);
+        }
+    }
+}
+
 /// A snapshot of a sender's state, for health checks and tests.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SenderStateReport {
@@ -127,6 +172,13 @@ pub struct SenderStateReport {
     pub buffered: usize,
     /// Batches in flight.
     pub in_flight: usize,
+    /// Durability fence reported by the most recent well-formed ACK. This may
+    /// be below `required_ack_durability`, in which case the batch remains in
+    /// flight and the mismatch is observable here.
+    pub last_ack_durability: Option<ReplicationAckDurability>,
+    /// The most recent matching ACK was below the configured minimum and did
+    /// not retire its batch.
+    pub ack_durability_mismatch: bool,
     /// Completed anti-entropy reconcile rounds. The Phase 8 placement
     /// driver polls this to detect bootstrap completion.
     pub reconcile_rounds: u64,
@@ -203,6 +255,9 @@ async fn sender_task(
     // Completed reconcile rounds, published for health/tests (the
     // Phase 8 placement driver polls this for bootstrap completion).
     let mut reconcile_rounds: u64 = 0;
+    let mut last_ack_durability = None;
+    let mut ack_durability_mismatch = false;
+    let mut retry_not_before: Option<Instant> = None;
 
     loop {
         // Publish state for health checks and tests.
@@ -219,6 +274,8 @@ async fn sender_task(
                 session_id,
                 buffered: buffer.len(),
                 in_flight,
+                last_ack_durability,
+                ack_durability_mismatch,
                 reconcile_rounds,
             };
         }
@@ -245,14 +302,13 @@ async fn sender_task(
                     SenderMsg::PeerConnected { peer_tx: tx } => {
                         session_id = rand_session_id();
                         peer_tx = Some(tx.clone());
+                        retry_not_before = None;
+                        last_ack_durability = None;
+                        ack_durability_mismatch = false;
                         // Requeue unacked ops at the front: the new session
                         // must not lose them, and redelivery is idempotent.
                         if let SenderState::Connected { in_flight, .. } = &mut state {
-                            while let Some(b) = in_flight.pop_back() {
-                                for op in b.ops.into_iter().rev() {
-                                    buffer.push_front(op);
-                                }
-                            }
+                            requeue_in_flight(in_flight, &mut buffer);
                         }
                         match state {
                             SenderState::BufferReset => {
@@ -292,7 +348,13 @@ async fn sender_task(
                     }
                     SenderMsg::PeerDisconnected => {
                         peer_tx = None;
-                        if !matches!(state, SenderState::BufferReset) {
+                        session_id = 0;
+                        last_ack_durability = None;
+                        ack_durability_mismatch = false;
+                        if let SenderState::Connected { in_flight, .. } = &mut state {
+                            // Preserve every unacknowledged operation before
+                            // discarding the dead session.
+                            requeue_in_flight(in_flight, &mut buffer);
                             state = SenderState::Disconnected;
                         }
                         // BufferReset survives disconnects: we still need
@@ -301,6 +363,7 @@ async fn sender_task(
                     SenderMsg::Ack {
                         session_id: ack_session,
                         batch_seq,
+                        durability,
                     } => {
                         if ack_session != session_id {
                             continue; // stale session ack
@@ -309,7 +372,49 @@ async fn sender_task(
                             if let Some(pos) =
                                 in_flight.iter().position(|b| b.batch_seq == batch_seq)
                             {
-                                in_flight.remove(pos);
+                                last_ack_durability = Some(durability);
+                                ack_durability_mismatch =
+                                    durability < config.required_ack_durability;
+                                if ack_durability_mismatch {
+                                    tracing::warn!(
+                                        peer = %peer_id,
+                                        fragment = fragment.0,
+                                        batch_seq,
+                                        ?durability,
+                                        required = ?config.required_ack_durability,
+                                        "replication ack did not meet the configured durability fence"
+                                    );
+                                } else {
+                                    in_flight.remove(pos);
+                                }
+                            }
+                        }
+                    }
+                    SenderMsg::Nack {
+                        session_id: nack_session,
+                        batch_seq,
+                        error,
+                    } => {
+                        if nack_session != session_id {
+                            continue; // stale session nack
+                        }
+                        if let SenderState::Connected { in_flight, .. } = &mut state {
+                            if let Some(pos) =
+                                in_flight.iter().position(|b| b.batch_seq == batch_seq)
+                            {
+                                if let Some(batch) = in_flight.remove(pos) {
+                                    for op in batch.ops.into_iter().rev() {
+                                        buffer.push_front(op);
+                                    }
+                                    tracing::warn!(
+                                        peer = %peer_id,
+                                        fragment = fragment.0,
+                                        batch_seq,
+                                        %error,
+                                        "replication batch rejected; queued for retry"
+                                    );
+                                    retry_not_before = Some(Instant::now() + NACK_RETRY_DELAY);
+                                }
                             }
                         }
                     }
@@ -439,7 +544,11 @@ async fn sender_task(
             _ = batch_timer.tick() => {
                 let (sid, tx) = match (&state, peer_tx.clone()) {
                     (SenderState::Connected { session_id, in_flight, .. }, Some(tx))
-                        if !buffer.is_empty() && in_flight.len() < config.max_in_flight =>
+                        if !buffer.is_empty()
+                            && in_flight.len() < config.max_in_flight
+                            && retry_not_before
+                                .map(|deadline| Instant::now() >= deadline)
+                                .unwrap_or(true) =>
                     {
                         (*session_id, tx)
                     }
@@ -464,6 +573,14 @@ async fn sender_task(
                         batch_seq,
                         fragment: fragment.0,
                         ops: proto_ops,
+                        required_ack_level: match config.required_ack_durability {
+                            ReplicationAckDurability::MemoryApplied => {
+                                ReplicationAckLevel::Applied as i32
+                            }
+                            ReplicationAckDurability::StoreCommitted => {
+                                ReplicationAckLevel::StoreCommitted as i32
+                            }
+                        },
                     }),
                 )
                 .await;
@@ -478,7 +595,11 @@ async fn sender_task(
                         buffer.push_front(op);
                     }
                     peer_tx = None;
-                    if !matches!(state, SenderState::BufferReset) {
+                    session_id = 0;
+                    last_ack_durability = None;
+                    ack_durability_mismatch = false;
+                    if let SenderState::Connected { in_flight, .. } = &mut state {
+                        requeue_in_flight(in_flight, &mut buffer);
                         state = SenderState::Disconnected;
                     }
                 }
@@ -586,6 +707,7 @@ async fn reconcile(
                 batch_seq: u64::MAX, // reconciliation batch; not ack-tracked
                 fragment: fragment.0,
                 ops: proto_ops,
+                required_ack_level: ReplicationAckLevel::Applied as i32,
             }),
         )
         .await;
@@ -654,5 +776,40 @@ fn rand_session_id() -> u64 {
         1
     } else {
         id
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn op(key: &str) -> crate::actor::ReplicatedOp {
+        crate::actor::ReplicatedOp {
+            key: key.to_string(),
+            value: VersionedValue::new(Vec::new(), 1, "node".to_string()),
+            seq: 0,
+            boot_id: 0,
+        }
+    }
+
+    #[test]
+    fn requeue_in_flight_preserves_batches_ahead_of_newer_buffered_ops() {
+        let mut in_flight = VecDeque::from([
+            InflightBatch {
+                batch_seq: 0,
+                ops: vec![op("a"), op("b")],
+            },
+            InflightBatch {
+                batch_seq: 1,
+                ops: vec![op("c")],
+            },
+        ]);
+        let mut buffer = VecDeque::from([op("d")]);
+        requeue_in_flight(&mut in_flight, &mut buffer);
+        assert!(in_flight.is_empty());
+        assert_eq!(
+            buffer.into_iter().map(|op| op.key).collect::<Vec<_>>(),
+            ["a", "b", "c", "d"]
+        );
     }
 }

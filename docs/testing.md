@@ -31,14 +31,24 @@ process — the bulk of behavioral coverage:
 - **HLC**: `hlc_orders_writes_under_clock_skew` (simulated skew via the
   hidden `clock_skew_ms` knob).
 - **Replication internals**: `sender_buffer_reset_and_reconcile`,
-  `stale_session_batches_discarded`.
+  `stale_session_batches_discarded`,
+  `memory_applied_ack_does_not_force_a_receiver_store_flush`,
+  `replication_ack_waits_for_the_receiver_store_fence`,
+  `replication_rejects_an_ack_below_the_configured_durability`,
+  `replication_nack_retries_the_exact_batch_after_store_failure`.
 - **Persistence**: `persistence_roundtrip`,
   `persistence_keeps_gossiped_winner`, `persistence_flushes_on_shutdown`,
   `memory_store_exercises_persistence_plumbing`.
-- **Multi-key**: `multi_key_fanout`, `multi_key_partial_failure`.
+- **Multi-key**: `multi_key_fanout`, `multi_key_partial_failure`,
+  `batch_put_fails_over_after_a_stale_owner_returns_unavailable`,
+  `mutation_relay_scans_past_the_origin_to_a_connected_owner`.
 - **Backpressure**: `background_saturation_leaves_high_priority_p99_unaffected`,
   `queue_cap_shed_is_explicit_and_counted`,
-  `forwarded_priority_preserved_end_to_end`.
+  `forwarded_priority_preserved_end_to_end`,
+  `forwarded_single_put_returns_remote_backpressure`.
+- **Remote mutation failures**:
+  `forwarded_put_returns_remote_storage_failure`; node unit tests reject
+  unspecified statuses and malformed result order/cardinality.
 - **Placement**: `placement_migration_no_lost_writes` (single writer during a
   live migration asserts zero lost writes),
   `placement_rolling_restart_delta_reconcile_only` (restarted node converges
@@ -65,7 +75,7 @@ re-establishment.
 
 ```bash
 cargo test -p actordb            # unit + integration
-cargo xtask coverage             # coverage report (CI enforces it)
+cargo run --bin xtask -- coverage # coverage report (CI enforces it)
 # Docker scenarios run in CI; see docker/run-scenario.sh to run locally.
 ```
 

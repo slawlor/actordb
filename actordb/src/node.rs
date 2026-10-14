@@ -5,22 +5,19 @@
 
 //! A database node.
 //!
-//! Each node runs one [crate::actor::KvActor] holding the node's
-//! *local copy* of the keyspace, plus a Tokio TCP mesh to its peers.
-//! Writes are disseminated with **epidemic broadcast**: a local write is
-//! applied to the local actor and gossiped to every peer; each peer
-//! applies it and re-gossips it once, tracked by
-//! `(origin node_id, boot_id, seq)`
-//! so the flood terminates. Inbound writes merge into the local copy
-//! with last-writer-wins, which is idempotent and commutative — so all
-//! replicas converge without any coordination, even across restarts and
-//! late joiners (a joining node pulls full state with a sync exchange
-//! during the handshake).
+//! Each node runs one supervised actor subtree per locally hosted fragment,
+//! plus a Tokio TCP mesh to its peers. A client mutation is applied by one
+//! serving fragment owner, which returns its exact outcome to the caller and
+//! enqueues the winning version to per-fragment/per-peer replication senders.
+//! Receivers report the durability they achieved after every operation is
+//! accounted for and any requested flush is attempted: `MemoryApplied` after
+//! cache application, or `StoreCommitted` after a configured store accepts the
+//! flush. Senders retire only ACKs that meet their requested level.
+//! Periodic anti-entropy repairs residual divergence.
 //!
-//! `boot_id` is minted fresh at every process start: a restarted node
-//! reuses its `node_id` but its sequence counter starts back at zero,
-//! so without it peers would mistake the new boot's first writes for
-//! replays of pre-restart ops and silently drop them.
+//! `seq` and the per-process `boot_id` are carried as propagation metadata.
+//! Idempotency and conflict resolution use the value's LWW version rather than
+//! deduplicating on those fields.
 //!
 //! The dialer side of each connection owns it: if the TCP stream drops,
 //! it is redialed with exponential backoff until the node shuts down,
@@ -32,7 +29,7 @@
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex as StdMutex, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use prost::Message as ProstMessage;
@@ -43,19 +40,22 @@ use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::task::AbortHandle;
 
 use crate::actor::{
-    ApplyError, ApplyOutcome, HlcClock, KvMessage, OpPriority, PoolConfig, ReplicatedOp,
-    VersionedValue,
+    ApplyDurability, ApplyError, ApplyOutcome, HlcClock, KvMessage, OpPriority, PoolConfig,
+    ReplicatedOp, VersionedValue,
 };
 use crate::network::{BoxStream, Network, TcpNetwork};
 use crate::placement::{
     validate_placement, FragmentPlacementState, PlacementController, PlacementReport,
 };
 use crate::proto::{
-    BatchAck, BatchGet, BatchGetResponse, BatchKeyValue, BatchPut, Envelope, EnvelopeMsg,
-    ForwardedGet, ForwardedPut, GetResponse, Hello, KeySummary, Priority as ProtoPriority,
-    ReconcileData, ReconcileResponse, SyncEntry, SyncResponse,
+    BatchAck, BatchGet, BatchGetResponse, BatchKeyValue, BatchNack, BatchPut, Envelope,
+    EnvelopeMsg, ForwardedGet, ForwardedPut, GetResponse, Hello, KeySummary, MutationResponse,
+    MutationResult, MutationStatus, Priority as ProtoPriority, ReconcileData, ReconcileResponse,
+    ReplicationAckLevel, SyncEntry, SyncResponse,
 };
-use crate::replication::{spawn_sender, SenderConfig, SenderDeps, SenderMsg, SenderStateReport};
+use crate::replication::{
+    spawn_sender, ReplicationAckDurability, SenderConfig, SenderDeps, SenderMsg, SenderStateReport,
+};
 use crate::shard::{fragment_of, FragmentId};
 use crate::store::{KvStore, PrefixedStore};
 use crate::supervision::{FragmentHealth, FragmentSupervisor, SupervisorArgs, SupervisorMessage};
@@ -70,6 +70,7 @@ const PEER_CHANNEL_DEPTH: usize = 256;
 /// Reconnect backoff: first retry after this, doubling to the cap.
 const RECONNECT_BASE: Duration = Duration::from_millis(100);
 const RECONNECT_MAX: Duration = Duration::from_secs(30);
+const REMOTE_RPC_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// peer node_id -> outbound frame queue
 type PeerMap = Arc<Mutex<HashMap<String, mpsc::Sender<Vec<u8>>>>>;
@@ -81,6 +82,16 @@ type SenderReportMap = Arc<Mutex<HashMap<(FragmentId, String), Arc<Mutex<SenderS
 type ResetSenderSet = Arc<Mutex<HashSet<(FragmentId, String)>>>;
 /// Relayed forwarded-gets: relay_req_id -> (origin peer_tx, origin req_id).
 type RelayMap = Arc<Mutex<HashMap<u64, (mpsc::Sender<Vec<u8>>, u64)>>>;
+/// Relayed forwarded mutations: relay req_id -> (origin peer_tx, origin req_id).
+type MutationRelayMap = Arc<Mutex<HashMap<u64, MutationRelay>>>;
+
+struct MutationRelay {
+    expected_peer: String,
+    expected_keys: Vec<String>,
+    origin_tx: mpsc::Sender<Vec<u8>>,
+    origin_req_id: u64,
+    timeout_cancel: oneshot::Sender<()>,
+}
 
 /// Pending single-key forwarded reads: req_id -> reply channel. The
 /// reply is `Ok(value)` or `Err(shed_reason)` if the remote shed the
@@ -89,6 +100,28 @@ type PendingGets =
     Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Option<VersionedValue>, String>>>>>;
 /// Pending batched forwarded reads: req_id -> reply channel.
 type PendingBatchGets = Arc<Mutex<HashMap<u64, oneshot::Sender<Vec<BatchKeyValue>>>>>;
+/// Pending single or batched forwarded mutations. Results preserve request
+/// order and cardinality.
+type PendingMutations = Arc<StdMutex<HashMap<u64, PendingMutation>>>;
+
+struct PendingMutation {
+    expected_peer: String,
+    expected_keys: Vec<String>,
+    reply: oneshot::Sender<Vec<MutationResult>>,
+}
+
+/// Removes a pending request even if its future is cancelled while waiting
+/// for outbound queue capacity or a peer response.
+struct PendingMutationGuard {
+    req_id: u64,
+    pending: PendingMutations,
+}
+
+impl Drop for PendingMutationGuard {
+    fn drop(&mut self) {
+        self.pending.lock().unwrap().remove(&self.req_id);
+    }
+}
 
 /// Unique worker-name prefixes across supervisors in this process.
 static NEXT_WORKER_PREFIX: AtomicU64 = AtomicU64::new(0);
@@ -111,8 +144,10 @@ struct ConnContext {
     dynamic_placement: bool,
     pending_gets: PendingGets,
     pending_batch_gets: PendingBatchGets,
+    pending_mutations: PendingMutations,
     /// Relayed forwarded-gets: relay_req_id -> (origin peer_tx, origin req_id).
     pending_relays: RelayMap,
+    pending_mutation_relays: MutationRelayMap,
     next_req_id: Arc<AtomicU64>,
     peers: PeerMap,
     tasks: Arc<Mutex<Vec<AbortHandle>>>,
@@ -284,6 +319,203 @@ async fn observe_remote_timestamp(
     }
 }
 
+async fn call_apply(
+    actor: &ActorRef<KvMessage>,
+    op: ReplicatedOp,
+    priority: OpPriority,
+    is_replication: bool,
+) -> Result<ApplyOutcome, NodeError> {
+    match actor
+        .call(
+            |reply| KvMessage::ApplyOp {
+                op,
+                priority,
+                is_replication,
+                reply: Some(reply),
+            },
+            None,
+        )
+        .await
+        .map_err(|error| NodeError::Actor(error.to_string()))?
+    {
+        CallResult::Success(Ok(outcome)) => Ok(outcome),
+        CallResult::Success(Err(ApplyError::Backpressure)) => Err(NodeError::Backpressure(
+            "fragment worker pool is at capacity".to_string(),
+        )),
+        CallResult::Success(Err(ApplyError::Storage(error))) => Err(NodeError::Storage(error)),
+        CallResult::Timeout => Err(NodeError::Actor("apply timed out".to_string())),
+        CallResult::SenderError => Err(NodeError::Actor("apply reply channel dropped".to_string())),
+    }
+}
+
+async fn flush_fence(actor: &ActorRef<KvMessage>) -> Result<ApplyDurability, NodeError> {
+    match actor
+        .call(|reply| KvMessage::Flush { reply }, None)
+        .await
+        .map_err(|error| NodeError::Actor(error.to_string()))?
+    {
+        CallResult::Success(Ok(durability)) => Ok(durability),
+        CallResult::Success(Err(ApplyError::Storage(error))) => Err(NodeError::Storage(error)),
+        CallResult::Success(Err(ApplyError::Backpressure)) => Err(NodeError::Actor(
+            "flush fence unexpectedly hit admission control".to_string(),
+        )),
+        CallResult::Timeout => Err(NodeError::Actor("flush fence timed out".to_string())),
+        CallResult::SenderError => Err(NodeError::Actor(
+            "flush fence reply channel dropped".to_string(),
+        )),
+    }
+}
+
+async fn enqueue_to_senders(senders: &SenderMap, frag: FragmentId, op: &ReplicatedOp) {
+    let senders = senders.lock().await;
+    for ((sender_frag, _peer), sender) in senders.iter() {
+        if *sender_frag == frag {
+            let _ = sender.send(SenderMsg::Enqueue(op.clone()));
+        }
+    }
+}
+
+fn mutation_result(
+    key: String,
+    request_index: usize,
+    result: Result<ApplyOutcome, NodeError>,
+) -> MutationResult {
+    let mut wire = MutationResult {
+        key,
+        status: MutationStatus::Applied as i32,
+        error: String::new(),
+        winner_timestamp_ms: 0,
+        winner_node_id: String::new(),
+        winner_is_tombstone: false,
+        request_index: request_index as u32,
+    };
+    match result {
+        Ok(ApplyOutcome::Applied) => {}
+        Ok(ApplyOutcome::AlreadyPresent) => {
+            wire.status = MutationStatus::AlreadyPresent as i32;
+        }
+        Ok(ApplyOutcome::Superseded {
+            timestamp_ms,
+            node_id,
+            is_tombstone,
+        }) => {
+            wire.status = MutationStatus::Superseded as i32;
+            wire.winner_timestamp_ms = timestamp_ms;
+            wire.winner_node_id = node_id;
+            wire.winner_is_tombstone = is_tombstone;
+        }
+        Ok(ApplyOutcome::Expired) | Err(NodeError::Expired) => {
+            wire.status = MutationStatus::Expired as i32;
+        }
+        Err(NodeError::Backpressure(error)) => {
+            wire.status = MutationStatus::Backpressure as i32;
+            wire.error = error;
+        }
+        Err(NodeError::Storage(error)) => {
+            wire.status = MutationStatus::StorageError as i32;
+            wire.error = error;
+        }
+        Err(NodeError::Superseded {
+            timestamp_ms,
+            node_id,
+            is_tombstone,
+        }) => {
+            wire.status = MutationStatus::Superseded as i32;
+            wire.winner_timestamp_ms = timestamp_ms;
+            wire.winner_node_id = node_id;
+            wire.winner_is_tombstone = is_tombstone;
+        }
+        Err(NodeError::Network(error)) => {
+            wire.status = MutationStatus::Unavailable as i32;
+            wire.error = error;
+        }
+        Err(error) => {
+            wire.status = MutationStatus::ActorError as i32;
+            wire.error = error.to_string();
+        }
+    }
+    wire
+}
+
+fn decode_mutation_result(result: MutationResult) -> Result<(), NodeError> {
+    match MutationStatus::try_from(result.status) {
+        Ok(MutationStatus::Applied | MutationStatus::AlreadyPresent) => Ok(()),
+        Ok(MutationStatus::Superseded) => Err(NodeError::Superseded {
+            timestamp_ms: result.winner_timestamp_ms,
+            node_id: result.winner_node_id,
+            is_tombstone: result.winner_is_tombstone,
+        }),
+        Ok(MutationStatus::Expired) => Err(NodeError::Expired),
+        Ok(MutationStatus::Backpressure) => Err(NodeError::Backpressure(result.error)),
+        Ok(MutationStatus::StorageError) => Err(NodeError::Storage(result.error)),
+        Ok(MutationStatus::ActorError) => Err(NodeError::Actor(result.error)),
+        Ok(MutationStatus::Unavailable) => Err(NodeError::Network(result.error)),
+        Ok(MutationStatus::Unknown) => Err(NodeError::Codec(
+            "peer returned an unspecified mutation status".to_string(),
+        )),
+        Err(_) => Err(NodeError::Codec(format!(
+            "unknown mutation status {}",
+            result.status
+        ))),
+    }
+}
+
+fn validate_mutation_results(
+    expected_keys: &[String],
+    results: &[MutationResult],
+) -> Result<(), NodeError> {
+    if results.len() != expected_keys.len() {
+        return Err(NodeError::Codec(format!(
+            "forwarded mutation returned {} results, expected {}",
+            results.len(),
+            expected_keys.len()
+        )));
+    }
+    for (request_index, (expected_key, result)) in expected_keys.iter().zip(results).enumerate() {
+        if result.request_index as usize != request_index || &result.key != expected_key {
+            return Err(NodeError::Codec(format!(
+                "forwarded mutation result {request_index} did not match its request"
+            )));
+        }
+        if matches!(
+            MutationStatus::try_from(result.status),
+            Ok(MutationStatus::Unknown) | Err(_)
+        ) {
+            return Err(NodeError::Codec(format!(
+                "forwarded mutation result {request_index} has unknown status {}",
+                result.status
+            )));
+        }
+    }
+    Ok(())
+}
+
+async fn apply_forwarded_mutation(
+    actor: &ActorRef<KvMessage>,
+    senders: &SenderMap,
+    frag: FragmentId,
+    op: ReplicatedOp,
+    priority: OpPriority,
+    request_index: usize,
+) -> MutationResult {
+    let key = op.key.clone();
+    let result = call_apply(actor, op.clone(), priority, false).await;
+    if let Ok(outcome) = &result {
+        match outcome {
+            ApplyOutcome::Applied | ApplyOutcome::AlreadyPresent => {
+                enqueue_to_senders(senders, frag, &op).await;
+            }
+            ApplyOutcome::Expired => {
+                let mut expiry = op;
+                expiry.value = expiry.value.expiry_tombstone();
+                enqueue_to_senders(senders, frag, &expiry).await;
+            }
+            ApplyOutcome::Superseded { .. } => {}
+        }
+    }
+    mutation_result(key, request_index, result)
+}
+
 impl std::error::Error for NodeError {}
 
 impl From<std::io::Error> for NodeError {
@@ -301,8 +533,8 @@ impl From<prost::DecodeError> for NodeError {
 /// A node in the database cluster.
 pub struct Node {
     node_id: String,
-    /// Random identifier minted at process start; joins the gossip
-    /// dedup key so a restarted node is not mistaken for a replay.
+    /// Random identifier minted at process start and carried as propagation
+    /// metadata. Replay safety comes from the value's LWW version.
     boot_id: u64,
     listen_addr: SocketAddr,
     /// Routes keys to their fragment actors.
@@ -331,8 +563,12 @@ pub struct Node {
     pending_gets: PendingGets,
     /// In-flight batched forwarded reads: req_id -> reply channel.
     pending_batch_gets: PendingBatchGets,
+    /// In-flight single and batched forwarded mutation outcomes.
+    pending_mutations: PendingMutations,
     /// Relayed forwarded-gets (Phase 8 re-forwarding).
     pending_relays: RelayMap,
+    /// Relayed forwarded-mutation responses (Phase 8 re-forwarding).
+    pending_mutation_relays: MutationRelayMap,
     next_req_id: Arc<AtomicU64>,
     peers: PeerMap,
     /// Per-node sequence number for locally originated ops.
@@ -714,7 +950,9 @@ impl Node {
             members: config.members.clone(),
             pending_gets: Arc::new(Mutex::new(HashMap::new())),
             pending_batch_gets: Arc::new(Mutex::new(HashMap::new())),
+            pending_mutations: Arc::new(StdMutex::new(HashMap::new())),
             pending_relays: Arc::new(Mutex::new(HashMap::new())),
+            pending_mutation_relays: Arc::new(Mutex::new(HashMap::new())),
             next_req_id: Arc::new(AtomicU64::new(1)),
             peers: Arc::new(Mutex::new(HashMap::new())),
             next_seq: Arc::new(Mutex::new(0)),
@@ -782,7 +1020,9 @@ impl Node {
             dynamic_placement: dynamic,
             pending_gets: node.pending_gets.clone(),
             pending_batch_gets: node.pending_batch_gets.clone(),
+            pending_mutations: node.pending_mutations.clone(),
             pending_relays: node.pending_relays.clone(),
+            pending_mutation_relays: node.pending_mutation_relays.clone(),
             next_req_id: node.next_req_id.clone(),
             peers: node.peers.clone(),
             tasks: node.tasks.clone(),
@@ -840,7 +1080,9 @@ impl Node {
             dynamic_placement: self.placement_controller.is_some(),
             pending_gets: self.pending_gets.clone(),
             pending_batch_gets: self.pending_batch_gets.clone(),
+            pending_mutations: self.pending_mutations.clone(),
             pending_relays: self.pending_relays.clone(),
+            pending_mutation_relays: self.pending_mutation_relays.clone(),
             next_req_id: self.next_req_id.clone(),
             peers: self.peers.clone(),
             tasks: self.tasks.clone(),
@@ -893,6 +1135,8 @@ impl Node {
             session_id: 0,
             buffered: 0,
             in_flight: 0,
+            last_ack_durability: None,
+            ack_durability_mismatch: false,
             reconcile_rounds: 0,
         }));
         let tx = spawn_sender(
@@ -955,40 +1199,25 @@ impl Node {
         self.peers.lock().await.get(node_id).cloned()
     }
 
-    /// Fan out an op to the other replica holders of `frag`.
-    /// Fire-and-forget: a dead peer is skipped (its data is recovered
-    /// via sync when it returns).
-    /// Phase 5: enqueue `op` for async replication to every sender
-    /// serving `frag`. Returns immediately; the senders batch, ship,
-    /// and ack off the write path.
+    /// Enqueue an op for asynchronous replication to every sender serving
+    /// `frag`. The client write path does not await those replica ACKs; each
+    /// sender retains its own batch through the configured receiver fence.
     async fn enqueue_for_replication(&self, frag: FragmentId, op: &ReplicatedOp) {
         // Ensure senders exist for all current replication targets.
         // (Static peers got senders at startup; legacy-mode peers get
         // them on connect.)
-        let senders = self.senders.lock().await;
-        for ((f, _peer), tx) in senders.iter() {
-            if *f == frag {
-                // Unbounded channel: the sender's internal buffer is the
-                // bound (overflow → BufferReset). A dead sender is dropped
-                // lazily.
-                let _ = tx.send(SenderMsg::Enqueue(op.clone()));
-            }
-        }
+        enqueue_to_senders(&self.senders, frag, op).await;
     }
 
-    /// Write a key locally and gossip it to all peers.
-    ///
-    /// This is read-your-write: when `put` returns, the op has been
-    /// applied to the local copy (and, with persistence enabled,
-    /// written to disk). The gossip to peers is fire-and-forget.
     /// Write a key. The op is routed in one hop to a node serving the
     /// key's fragment: applied locally if we serve it, otherwise
     /// forwarded to a replica holder.
     ///
-    /// Local puts are read-your-write: when `put` returns, the op has
-    /// been applied to the local copy. Forwarded puts are fire-and-forget
-    /// to the owner (at-least-once; the owner replicates to the other
-    /// holders).
+    /// Local and forwarded puts both wait for the serving fragment's exact
+    /// apply outcome. An `Ok` means that version was applied or was already
+    /// present at that apply point; admission, storage, expiry, and
+    /// supersession are typed errors. `Ok` does not force a persistence flush
+    /// or await asynchronous fan-out to the other replicas.
     pub async fn put(&self, key: String, value: Vec<u8>) -> Result<(), NodeError> {
         self.put_with_ttl(key, value, None).await
     }
@@ -998,10 +1227,9 @@ impl Node {
     /// The priority is honored end-to-end: forwarded puts carry it on
     /// the wire and the owner applies them at the same priority.
     ///
-    /// For a locally owned fragment, this waits for the worker's exact apply
-    /// outcome. After it returns `Ok`, subsequent local reads at any priority
-    /// observe this version or a newer winner. Remote forwarding remains
-    /// asynchronous until the mutation-response protocol is enabled.
+    /// This waits for the serving worker's exact apply outcome, including when
+    /// the fragment is remote. After it returns `Ok`, reads on the serving
+    /// replica observe this version or a newer winner.
     pub async fn put_with_priority(
         &self,
         key: String,
@@ -1046,10 +1274,8 @@ impl Node {
     /// materializes and persists a versioned expiry tombstone on its next
     /// sweep so older replicas cannot resurrect it.
     ///
-    /// Local puts are read-your-write: when `put_with_ttl` returns, the
-    /// op has been applied to the local copy. Forwarded puts are
-    /// fire-and-forget to the owner (at-least-once; the owner replicates
-    /// to the other holders).
+    /// Local and forwarded puts wait for the serving fragment's exact apply
+    /// outcome before returning.
     pub async fn put_with_ttl(
         &self,
         key: String,
@@ -1094,33 +1320,7 @@ impl Node {
     ) -> Result<(), NodeError> {
         let frag = fragment_of(&op.key, self.router.fragment_count);
         if let Some(actor) = self.fragment_actor(&op.key) {
-            let outcome = match actor
-                .call(
-                    |reply| KvMessage::ApplyOp {
-                        op: op.clone(),
-                        priority,
-                        is_replication: false,
-                        reply: Some(reply),
-                    },
-                    None,
-                )
-                .await
-                .map_err(|e| NodeError::Actor(e.to_string()))?
-            {
-                CallResult::Success(Ok(outcome)) => outcome,
-                CallResult::Success(Err(ApplyError::Backpressure)) => {
-                    return Err(NodeError::Backpressure(
-                        "fragment worker pool is at capacity".to_string(),
-                    ))
-                }
-                CallResult::Success(Err(ApplyError::Storage(error))) => {
-                    return Err(NodeError::Storage(error))
-                }
-                CallResult::Timeout => return Err(NodeError::Actor("apply timed out".to_string())),
-                CallResult::SenderError => {
-                    return Err(NodeError::Actor("apply reply channel dropped".to_string()))
-                }
-            };
+            let outcome = call_apply(&actor, op.clone(), priority, false).await?;
 
             match outcome {
                 ApplyOutcome::Applied | ApplyOutcome::AlreadyPresent => {}
@@ -1154,25 +1354,62 @@ impl Node {
         let tx = self.peer_sender(&owner).await.ok_or_else(|| {
             NodeError::Network(format!("not connected to fragment owner {owner}"))
         })?;
-        send_envelope(
-            &tx,
-            Envelope {
-                msg: Some(EnvelopeMsg::ForwardedPut(ForwardedPut {
-                    key: op.key,
-                    value: op.value.value,
-                    timestamp_ms: op.value.timestamp_ms,
-                    node_id: op.value.node_id,
-                    seq: op.seq,
-                    boot_id: op.boot_id,
-                    expires_at_ms: op.value.expires_at_ms.unwrap_or(0),
-                    is_tombstone: op.value.is_tombstone,
-                    priority: priority_to_proto(priority),
-                    hops: 0,
-                })),
+        let req_id = self.next_req_id.fetch_add(1, Ordering::Relaxed);
+        let expected_key = op.key.clone();
+        let (resp_tx, resp_rx) = oneshot::channel();
+        self.pending_mutations.lock().unwrap().insert(
+            req_id,
+            PendingMutation {
+                expected_peer: owner.clone(),
+                expected_keys: vec![expected_key.clone()],
+                reply: resp_tx,
             },
-        )
+        );
+        let _pending_guard = PendingMutationGuard {
+            req_id,
+            pending: self.pending_mutations.clone(),
+        };
+        let response = tokio::time::timeout(REMOTE_RPC_TIMEOUT, async {
+            if !try_send_envelope(
+                &tx,
+                Envelope {
+                    msg: Some(EnvelopeMsg::ForwardedPut(ForwardedPut {
+                        key: op.key,
+                        value: op.value.value,
+                        timestamp_ms: op.value.timestamp_ms,
+                        node_id: op.value.node_id,
+                        seq: op.seq,
+                        boot_id: op.boot_id,
+                        expires_at_ms: op.value.expires_at_ms.unwrap_or(0),
+                        is_tombstone: op.value.is_tombstone,
+                        priority: priority_to_proto(priority),
+                        hops: 0,
+                        req_id,
+                    })),
+                },
+            )
+            .await
+            {
+                return Err(NodeError::Network(format!(
+                    "connection to fragment owner {owner} closed while sending mutation"
+                )));
+            }
+            resp_rx
+                .await
+                .map_err(|_| NodeError::Actor("forwarded mutation reply dropped".to_string()))
+        })
         .await;
-        Ok(())
+        match response {
+            Ok(Ok(mut results)) => {
+                validate_mutation_results(std::slice::from_ref(&expected_key), &results)?;
+                let result = results.remove(0);
+                decode_mutation_result(result)
+            }
+            Ok(Err(error)) => Err(error),
+            Err(_) => Err(NodeError::Network(format!(
+                "forwarded mutation to {owner} timed out"
+            ))),
+        }
     }
 
     /// Read a key. Routed in one hop to a node serving the key's
@@ -1271,11 +1508,9 @@ impl Node {
     /// failing over across replica holders (self first) until one
     /// accepts the batch. Returns per-key results in input order.
     ///
-    /// Local keys are read-your-write (like `put`); remote keys are
-    /// fire-and-forget to the owner (like `put`): a remote key fails
-    /// only when no replica holder is connected
-    /// (`NodeError::Network`), or the fragment has no usable replica
-    /// (`NodeError::Actor`, misconfiguration).
+    /// Local and remote keys await an exact per-key apply outcome. Remote
+    /// batches have a 5s timeout per replica attempt and fail over
+    /// idempotently when a connection drops or no response arrives.
     pub async fn put_multi_with_priority(
         &self,
         kvs: Vec<(String, Vec<u8>)>,
@@ -1340,36 +1575,79 @@ impl Node {
                     is_tombstone: false,
                     priority: wire_priority,
                     hops: 0,
+                    req_id: 0,
                 });
                 indices.push(i);
             }
-            let mut sent = false;
+            let expected_keys: Vec<String> = puts.iter().map(|put| put.key.clone()).collect();
+            let mut done = false;
             let mut tried: Vec<String> = Vec::new();
             for owner in self.replica_order(frag) {
                 tried.push(owner.clone());
                 let Some(tx) = self.peer_sender(&owner).await else {
                     continue;
                 };
-                send_envelope(
-                    &tx,
-                    Envelope {
-                        msg: Some(EnvelopeMsg::BatchPut(BatchPut {
-                            puts: puts.clone(),
-                            priority: wire_priority,
-                        })),
+                let req_id = self.next_req_id.fetch_add(1, Ordering::Relaxed);
+                let (resp_tx, resp_rx) = oneshot::channel();
+                self.pending_mutations.lock().unwrap().insert(
+                    req_id,
+                    PendingMutation {
+                        expected_peer: owner.clone(),
+                        expected_keys: expected_keys.clone(),
+                        reply: resp_tx,
                     },
-                )
+                );
+                let _pending_guard = PendingMutationGuard {
+                    req_id,
+                    pending: self.pending_mutations.clone(),
+                };
+                let response = tokio::time::timeout(REMOTE_RPC_TIMEOUT, async {
+                    if !try_send_envelope(
+                        &tx,
+                        Envelope {
+                            msg: Some(EnvelopeMsg::BatchPut(BatchPut {
+                                puts: puts.clone(),
+                                priority: wire_priority,
+                                req_id,
+                            })),
+                        },
+                    )
+                    .await
+                    {
+                        return Err(());
+                    }
+                    resp_rx.await.map_err(|_| ())
+                })
                 .await;
-                for i in &indices {
-                    results[*i] = Some(Ok(()));
+                match response {
+                    Ok(Ok(wire_results))
+                        if validate_mutation_results(&expected_keys, &wire_results).is_ok() =>
+                    {
+                        // A stale/non-serving holder or failed relay returns a
+                        // typed routing failure for every key. Retry the exact
+                        // stamped batch at the next configured replica.
+                        if wire_results.iter().all(|result| {
+                            MutationStatus::try_from(result.status)
+                                == Ok(MutationStatus::Unavailable)
+                        }) {
+                            continue;
+                        }
+                        for (index, result) in indices.iter().zip(wire_results) {
+                            results[*index] = Some(decode_mutation_result(result));
+                        }
+                        done = true;
+                        break;
+                    }
+                    // A timeout or malformed/dropped response may follow a
+                    // successful apply. Retrying the exact stamped versions
+                    // at another holder is safe under the idempotent merge.
+                    _ => {}
                 }
-                sent = true;
-                break;
             }
-            if !sent {
+            if !done {
                 for i in indices {
                     results[i] = Some(Err(NodeError::Network(format!(
-                        "no connected replica for fragment {frag} (tried {})",
+                        "no replica acknowledged batch put for fragment {frag} (tried {})",
                         tried.join(",")
                     ))));
                 }
@@ -1386,8 +1664,8 @@ impl Node {
     ///
     /// Bulk puts run at [`OpPriority::Background`]; see
     /// [`put_multi_with_priority`](Self::put_multi_with_priority) for an
-    /// explicit priority. Local keys are read-your-write (like `put`);
-    /// remote keys are fire-and-forget to the owner (like `put`).
+    /// explicit priority. Local and remote keys both return exact per-key
+    /// outcomes from the serving fragment.
     pub async fn put_multi(&self, kvs: Vec<(String, Vec<u8>)>) -> Vec<Result<(), NodeError>> {
         self.put_multi_with_priority(kvs, OpPriority::Background)
             .await
@@ -1578,10 +1856,8 @@ impl Node {
         self.peers.lock().await.len()
     }
 
-    /// Stop all networking tasks. The actor is left running; dropping the
-    /// process ends it.
-    /// Shut the node down: abort all connection tasks and stop the
-    /// actor. Stopping the actor drops its state, which releases the
+    /// Shut the node down: abort all connection tasks and stop every fragment
+    /// supervisor. Stopping the actors drops their state, which releases the
     /// RocksDB lock (when persistence is enabled) so the database can
     /// be reopened — e.g. by a restarted node on the same path.
     pub async fn shutdown(&self) {
@@ -1683,6 +1959,8 @@ impl PlacementDriverDeps {
             session_id: 0,
             buffered: 0,
             in_flight: 0,
+            last_ack_durability: None,
+            ack_durability_mismatch: false,
             reconcile_rounds: 0,
         }));
         let tx = spawn_sender(
@@ -2096,7 +2374,9 @@ async fn handle_connection(ctx: ConnContext, stream: BoxStream, we_dialed: bool)
         dynamic_placement,
         pending_gets,
         pending_batch_gets,
+        pending_mutations,
         pending_relays,
+        pending_mutation_relays,
         next_req_id,
         peers,
         tasks,
@@ -2141,6 +2421,7 @@ async fn handle_connection(ctx: ConnContext, stream: BoxStream, we_dialed: bool)
         placement: placement.clone(),
         peers: peers.clone(),
         pending_relays: pending_relays.clone(),
+        pending_mutation_relays: pending_mutation_relays.clone(),
         next_req_id: next_req_id.clone(),
     };
 
@@ -2215,6 +2496,17 @@ async fn handle_connection(ctx: ConnContext, stream: BoxStream, we_dialed: bool)
                     let mut senders_guard = senders.lock().await;
                     for frag_id in router.fragment_ids() {
                         let frag = FragmentId(frag_id);
+                        let is_replica = {
+                            let map = placement.read().unwrap();
+                            map.is_empty()
+                                || map
+                                    .get(&frag)
+                                    .map(|replicas| replicas.iter().any(|id| id == &peer))
+                                    .unwrap_or(false)
+                        };
+                        if !is_replica {
+                            continue;
+                        }
                         let key = (frag, peer.clone());
                         if !senders_guard.contains_key(&key) {
                             let report = Arc::new(Mutex::new(SenderStateReport {
@@ -2222,6 +2514,8 @@ async fn handle_connection(ctx: ConnContext, stream: BoxStream, we_dialed: bool)
                                 session_id: 0,
                                 buffered: 0,
                                 in_flight: 0,
+                                last_ack_durability: None,
+                                ack_durability_mismatch: false,
                                 reconcile_rounds: 0,
                             }));
                             let sender_tx = spawn_sender(
@@ -2259,8 +2553,9 @@ async fn handle_connection(ctx: ConnContext, stream: BoxStream, we_dialed: bool)
                 }
             }
             Some(EnvelopeMsg::ReplicateBatch(b)) => {
-                // Phase 5: validate the session, apply via LWW (idempotent),
-                // and ack. Stale sessions are discarded.
+                // Validate the session and the whole batch before applying
+                // anything. An ACK is sent only after every exact outcome is
+                // known and the sender's requested fence is reached.
                 let peer = match peer_node_id.clone() {
                     Some(p) => p,
                     None => continue,
@@ -2275,60 +2570,158 @@ async fn handle_connection(ctx: ConnContext, stream: BoxStream, we_dialed: bool)
                         break;
                     }
                 }
-                for op in b.ops {
-                    let replicated = ReplicatedOp {
-                        key: op.key.clone(),
-                        value: {
-                            let mut v = VersionedValue::new(
-                                op.value.clone(),
-                                op.timestamp_ms,
-                                op.node_id.clone(),
-                            );
-                            v.expires_at_ms = if op.expires_at_ms == 0 {
-                                None
-                            } else {
-                                Some(op.expires_at_ms)
-                            };
-                            v.is_tombstone = op.is_tombstone;
-                            v
-                        },
-                        seq: op.seq,
-                        boot_id: op.boot_id,
-                    };
-                    // u64::MAX marks reconciliation batches (not ack-tracked);
-                    // they still apply via LWW.
-                    if let Some(actor) = router.route(&replicated.key) {
-                        let _ = actor.send_message(KvMessage::ApplyOp {
-                            op: replicated,
-                            priority: OpPriority::Default,
-                            is_replication: true,
-                            reply: None,
-                        });
+                let tracked = b.batch_seq != u64::MAX;
+                let requested_ack = if tracked {
+                    match ReplicationAckLevel::try_from(b.required_ack_level) {
+                        Ok(ReplicationAckLevel::Applied) => {
+                            Some(ReplicationAckDurability::MemoryApplied)
+                        }
+                        Ok(ReplicationAckLevel::StoreCommitted) => {
+                            Some(ReplicationAckDurability::StoreCommitted)
+                        }
+                        Ok(ReplicationAckLevel::Unknown) | Err(_) => None,
+                    }
+                } else {
+                    None
+                };
+                let invalid_key = b
+                    .ops
+                    .iter()
+                    .find(|op| fragment_of(&op.key, router.fragment_count) != frag)
+                    .map(|op| op.key.clone());
+                let actor = router.route_for_fragment(frag);
+                let mut failure = match (tracked, requested_ack, invalid_key, actor.as_ref()) {
+                    (true, None, _, _) => Some(
+                        "tracked replication batch omitted a valid ACK requirement".to_string(),
+                    ),
+                    (_, _, Some(key), _) => Some(format!(
+                        "replication key {key:?} does not belong to declared fragment {frag}"
+                    )),
+                    (_, _, None, None) => Some(format!(
+                        "receiver does not host declared replication fragment {frag}"
+                    )),
+                    (_, _, None, Some(_)) => None,
+                };
+
+                if failure.is_none() {
+                    let actor = actor.as_ref().expect("validated actor");
+                    for op in b.ops {
+                        let replicated = ReplicatedOp {
+                            key: op.key,
+                            value: {
+                                let mut v =
+                                    VersionedValue::new(op.value, op.timestamp_ms, op.node_id);
+                                v.expires_at_ms = if op.expires_at_ms == 0 {
+                                    None
+                                } else {
+                                    Some(op.expires_at_ms)
+                                };
+                                v.is_tombstone = op.is_tombstone;
+                                v
+                            },
+                            seq: op.seq,
+                            boot_id: op.boot_id,
+                        };
+                        if let Err(error) =
+                            call_apply(actor, replicated, OpPriority::Default, true).await
+                        {
+                            failure = Some(error.to_string());
+                            break;
+                        }
                     }
                 }
-                // Ack unless this was a reconciliation batch.
-                if b.batch_seq != u64::MAX {
+
+                let durability = if failure.is_none() {
+                    match requested_ack {
+                        Some(ReplicationAckDurability::MemoryApplied) => {
+                            Some(ApplyDurability::MemoryApplied)
+                        }
+                        Some(ReplicationAckDurability::StoreCommitted) | None => {
+                            match flush_fence(actor.as_ref().expect("validated actor")).await {
+                                Ok(durability) => Some(durability),
+                                Err(error) => {
+                                    failure = Some(error.to_string());
+                                    None
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    None
+                };
+
+                if tracked {
+                    let response = if let Some(error) = failure {
+                        EnvelopeMsg::BatchNack(BatchNack {
+                            session_id: b.session_id,
+                            batch_seq: b.batch_seq,
+                            fragment: b.fragment,
+                            error,
+                        })
+                    } else {
+                        let level = match durability.expect("successful durability fence") {
+                            ApplyDurability::MemoryApplied => ReplicationAckLevel::Applied,
+                            ApplyDurability::StoreCommitted => ReplicationAckLevel::StoreCommitted,
+                        };
+                        EnvelopeMsg::BatchAck(BatchAck {
+                            session_id: b.session_id,
+                            batch_seq: b.batch_seq,
+                            fragment: b.fragment,
+                            level: level as i32,
+                        })
+                    };
                     send_envelope(
                         &tx,
                         Envelope {
-                            msg: Some(EnvelopeMsg::BatchAck(BatchAck {
-                                session_id: b.session_id,
-                                batch_seq: b.batch_seq,
-                                fragment: b.fragment,
-                            })),
+                            msg: Some(response),
                         },
                     )
                     .await;
+                } else if let Some(error) = failure {
+                    tracing::warn!(
+                        peer = %peer,
+                        fragment = frag.0,
+                        %error,
+                        "reconciliation batch failed"
+                    );
                 }
             }
             Some(EnvelopeMsg::BatchAck(a)) => {
                 // Route the ack to the sender for (fragment, peer).
                 if let Some(peer) = peer_node_id.clone() {
+                    let durability = match ReplicationAckLevel::try_from(a.level) {
+                        Ok(ReplicationAckLevel::Applied) => ReplicationAckDurability::MemoryApplied,
+                        Ok(ReplicationAckLevel::StoreCommitted) => {
+                            ReplicationAckDurability::StoreCommitted
+                        }
+                        Ok(ReplicationAckLevel::Unknown) | Err(_) => {
+                            tracing::warn!(
+                                peer = %peer,
+                                fragment = a.fragment,
+                                level = a.level,
+                                "ignoring replication ack with unknown durability"
+                            );
+                            continue;
+                        }
+                    };
                     let senders = senders.lock().await;
                     if let Some(tx) = senders.get(&(FragmentId(a.fragment), peer)) {
                         let _ = tx.send(SenderMsg::Ack {
                             session_id: a.session_id,
                             batch_seq: a.batch_seq,
+                            durability,
+                        });
+                    }
+                }
+            }
+            Some(EnvelopeMsg::BatchNack(n)) => {
+                if let Some(peer) = peer_node_id.clone() {
+                    let senders = senders.lock().await;
+                    if let Some(tx) = senders.get(&(FragmentId(n.fragment), peer)) {
+                        let _ = tx.send(SenderMsg::Nack {
+                            session_id: n.session_id,
+                            batch_seq: n.batch_seq,
+                            error: n.error,
                         });
                     }
                 }
@@ -2430,47 +2823,63 @@ async fn handle_connection(ctx: ConnContext, stream: BoxStream, we_dialed: bool)
                 if !observe_remote_timestamp(&hlc, p.timestamp_ms, "ForwardedPut").await {
                     break;
                 }
-                // We run this fragment (serving or bootstrapping):
-                // apply as coordinator, then enqueue for async
-                // replication to the other holders.
-                let replicated = ReplicatedOp {
-                    key: p.key.clone(),
-                    value: {
-                        let mut v =
-                            VersionedValue::new(p.value.clone(), p.timestamp_ms, p.node_id.clone());
-                        v.expires_at_ms = if p.expires_at_ms == 0 {
-                            None
-                        } else {
-                            Some(p.expires_at_ms)
-                        };
-                        v.is_tombstone = p.is_tombstone;
-                        v
-                    },
-                    seq: p.seq,
-                    boot_id: p.boot_id,
-                };
-                let frag = fragment_of(&replicated.key, router.fragment_count);
-                if let Some(actor) = router.route(&replicated.key) {
-                    let _ = actor.send_message(KvMessage::ApplyOp {
-                        op: replicated.clone(),
-                        priority: priority_from_proto(p.priority),
-                        // Client-originated (not acked replication):
-                        // subject to admission control.
-                        is_replication: false,
-                        reply: None,
-                    });
-                    // Phase 5: async fan-out via senders.
-                    let senders = senders.lock().await;
-                    for ((f, _peer), tx) in senders.iter() {
-                        if *f == frag {
-                            let _ = tx.send(SenderMsg::Enqueue(replicated.clone()));
+                let frag = fragment_of(&p.key, router.fragment_count);
+                let is_serving = serving.read().unwrap().contains(&frag);
+                if is_serving {
+                    let result = match router.route_for_fragment(frag) {
+                        Some(actor) => {
+                            let replicated = ReplicatedOp {
+                                key: p.key.clone(),
+                                value: {
+                                    let mut v = VersionedValue::new(
+                                        p.value.clone(),
+                                        p.timestamp_ms,
+                                        p.node_id.clone(),
+                                    );
+                                    v.expires_at_ms =
+                                        (p.expires_at_ms != 0).then_some(p.expires_at_ms);
+                                    v.is_tombstone = p.is_tombstone;
+                                    v
+                                },
+                                seq: p.seq,
+                                boot_id: p.boot_id,
+                            };
+                            apply_forwarded_mutation(
+                                &actor,
+                                &senders,
+                                frag,
+                                replicated,
+                                priority_from_proto(p.priority),
+                                0,
+                            )
+                            .await
                         }
-                    }
+                        None => mutation_result(
+                            p.key.clone(),
+                            0,
+                            Err(NodeError::Actor(format!(
+                                "serving fragment {frag} has no actor"
+                            ))),
+                        ),
+                    };
+                    send_mutation_response(
+                        &tx,
+                        MutationResponse {
+                            req_id: p.req_id,
+                            results: vec![result],
+                        },
+                    )
+                    .await;
                 } else if p.hops < MAX_FORWARD_HOPS {
-                    // We don't run this fragment (stale sender map
-                    // during migration): re-forward to the current
-                    // owner instead of dropping the write.
-                    reforward_put(&p, frag, &peer_node_id, &rfctx).await;
+                    relay_put(p, frag, &tx, &peer_node_id, &rfctx).await;
+                } else {
+                    send_unavailable_mutation(
+                        &tx,
+                        p.req_id,
+                        vec![p.key],
+                        "forward hop limit reached",
+                    )
+                    .await;
                 }
             }
             Some(EnvelopeMsg::ForwardedGet(g)) => {
@@ -2579,73 +2988,173 @@ async fn handle_connection(ctx: ConnContext, stream: BoxStream, we_dialed: bool)
                     }
                 }
             }
+            Some(EnvelopeMsg::MutationResponse(mut response)) => {
+                let Some(peer) = peer_node_id.clone() else {
+                    continue;
+                };
+                let expected_keys = {
+                    let relays = pending_mutation_relays.lock().await;
+                    relays.get(&response.req_id).and_then(|relay| {
+                        (relay.expected_peer == peer).then(|| relay.expected_keys.clone())
+                    })
+                }
+                .or_else(|| {
+                    let pending = pending_mutations.lock().unwrap();
+                    pending.get(&response.req_id).and_then(|request| {
+                        (request.expected_peer == peer).then(|| request.expected_keys.clone())
+                    })
+                });
+                let Some(expected_keys) = expected_keys else {
+                    continue;
+                };
+                if let Err(error) = validate_mutation_results(&expected_keys, &response.results) {
+                    tracing::warn!(
+                        peer = %peer,
+                        req_id = response.req_id,
+                        %error,
+                        "ignoring malformed mutation response"
+                    );
+                    continue;
+                }
+                if let Some(timestamp_ms) = response
+                    .results
+                    .iter()
+                    .filter(|result| {
+                        MutationStatus::try_from(result.status) == Ok(MutationStatus::Superseded)
+                    })
+                    .map(|result| result.winner_timestamp_ms)
+                    .max()
+                {
+                    if !observe_remote_timestamp(&hlc, timestamp_ms, "MutationResponse").await {
+                        break;
+                    }
+                }
+
+                let relay = {
+                    let mut relays = pending_mutation_relays.lock().await;
+                    if matches!(
+                        relays.get(&response.req_id),
+                        Some(relay) if relay.expected_peer == peer
+                    ) {
+                        relays.remove(&response.req_id)
+                    } else {
+                        None
+                    }
+                };
+                if let Some(relay) = relay {
+                    let _ = relay.timeout_cancel.send(());
+                    response.req_id = relay.origin_req_id;
+                    send_mutation_response(&relay.origin_tx, response).await;
+                    continue;
+                }
+
+                let pending = {
+                    let mut pending = pending_mutations.lock().unwrap();
+                    if matches!(
+                        pending.get(&response.req_id),
+                        Some(request) if request.expected_peer == peer
+                    ) {
+                        pending.remove(&response.req_id)
+                    } else {
+                        None
+                    }
+                };
+                if let Some(pending) = pending {
+                    let _ = pending.reply.send(response.results);
+                }
+            }
             Some(EnvelopeMsg::BatchPut(bp)) => {
-                // Phase 6: apply each put as coordinator, enqueue for
-                // async replication. Phase 7: the batch carries one
-                // priority applied to every put. A batch is
-                // single-fragment; if we don't run it (stale sender map
-                // during migration), re-forward the whole batch to the
-                // current owner.
                 let batch_priority = priority_from_proto(bp.priority);
                 if let Some(timestamp_ms) = bp.puts.iter().map(|p| p.timestamp_ms).max() {
                     if !observe_remote_timestamp(&hlc, timestamp_ms, "BatchPut").await {
                         break;
                     }
                 }
-                let batch_frag = bp
+                let keys: Vec<String> = bp.puts.iter().map(|p| p.key.clone()).collect();
+                let Some(frag) = bp
                     .puts
                     .first()
-                    .map(|p| fragment_of(&p.key, router.fragment_count));
-                let we_run = batch_frag
-                    .map(|f| router.route_for_fragment(f).is_some())
-                    .unwrap_or(false);
-                if !we_run {
+                    .map(|p| fragment_of(&p.key, router.fragment_count))
+                else {
+                    send_mutation_response(
+                        &tx,
+                        MutationResponse {
+                            req_id: bp.req_id,
+                            results: Vec::new(),
+                        },
+                    )
+                    .await;
+                    continue;
+                };
+                if bp
+                    .puts
+                    .iter()
+                    .any(|p| fragment_of(&p.key, router.fragment_count) != frag)
+                {
+                    send_unavailable_mutation(
+                        &tx,
+                        bp.req_id,
+                        keys,
+                        "batch contains keys from multiple fragments",
+                    )
+                    .await;
+                    continue;
+                }
+
+                let is_serving = serving.read().unwrap().contains(&frag);
+                if !is_serving {
                     let max_hops = bp.puts.iter().map(|p| p.hops).max().unwrap_or(0);
                     if max_hops < MAX_FORWARD_HOPS {
-                        if let Some(frag) = batch_frag {
-                            reforward_batch(bp, frag, &peer_node_id, &rfctx).await;
-                        }
+                        relay_batch(bp, frag, &tx, &peer_node_id, &rfctx).await;
+                    } else {
+                        send_unavailable_mutation(
+                            &tx,
+                            bp.req_id,
+                            keys,
+                            "forward hop limit reached",
+                        )
+                        .await;
                     }
                     continue;
                 }
-                for p in bp.puts {
+
+                let Some(actor) = router.route_for_fragment(frag) else {
+                    send_unavailable_mutation(
+                        &tx,
+                        bp.req_id,
+                        keys,
+                        "serving fragment has no actor",
+                    )
+                    .await;
+                    continue;
+                };
+                let req_id = bp.req_id;
+                let mut results = Vec::with_capacity(bp.puts.len());
+                for (request_index, p) in bp.puts.into_iter().enumerate() {
                     let replicated = ReplicatedOp {
-                        key: p.key.clone(),
+                        key: p.key,
                         value: {
-                            let mut v = VersionedValue::new(
-                                p.value.clone(),
-                                p.timestamp_ms,
-                                p.node_id.clone(),
-                            );
-                            v.expires_at_ms = if p.expires_at_ms == 0 {
-                                None
-                            } else {
-                                Some(p.expires_at_ms)
-                            };
+                            let mut v = VersionedValue::new(p.value, p.timestamp_ms, p.node_id);
+                            v.expires_at_ms = (p.expires_at_ms != 0).then_some(p.expires_at_ms);
                             v.is_tombstone = p.is_tombstone;
                             v
                         },
                         seq: p.seq,
                         boot_id: p.boot_id,
                     };
-                    let frag = fragment_of(&replicated.key, router.fragment_count);
-                    if let Some(actor) = router.route(&replicated.key) {
-                        let _ = actor.send_message(KvMessage::ApplyOp {
-                            op: replicated.clone(),
-                            priority: batch_priority,
-                            // Client-originated (not acked replication):
-                            // subject to admission control.
-                            is_replication: false,
-                            reply: None,
-                        });
-                        let senders = senders.lock().await;
-                        for ((f, _peer), tx) in senders.iter() {
-                            if *f == frag {
-                                let _ = tx.send(SenderMsg::Enqueue(replicated.clone()));
-                            }
-                        }
-                    }
+                    results.push(
+                        apply_forwarded_mutation(
+                            &actor,
+                            &senders,
+                            frag,
+                            replicated,
+                            batch_priority,
+                            request_index,
+                        )
+                        .await,
+                    );
                 }
+                send_mutation_response(&tx, MutationResponse { req_id, results }).await;
             }
             Some(EnvelopeMsg::BatchGet(bg)) => {
                 // Phase 6: serve a batch of reads. Phase 7: the batch
@@ -2839,20 +3348,8 @@ struct ReforwardCtx {
     placement: Arc<RwLock<HashMap<FragmentId, Vec<String>>>>,
     peers: PeerMap,
     pending_relays: RelayMap,
+    pending_mutation_relays: MutationRelayMap,
     next_req_id: Arc<AtomicU64>,
-}
-
-/// Pick a replica holder for `frag` from `placement`, excluding this
-/// node. Used to re-forward ops that arrived for a fragment this node
-/// no longer serves (stale sender maps during migration).
-fn pick_owner_from_map(
-    placement: &RwLock<HashMap<FragmentId, Vec<String>>>,
-    node_id: &str,
-    frag: FragmentId,
-) -> Option<String> {
-    let map = placement.read().unwrap();
-    let replicas = map.get(&frag)?;
-    replicas.iter().find(|id| *id != node_id).cloned()
 }
 
 /// The current owner for a re-forward: not us, and not the peer the op
@@ -2861,54 +3358,225 @@ async fn reforward_target(
     ctx: &ReforwardCtx,
     peer_node_id: &Option<String>,
     frag: FragmentId,
-) -> Option<mpsc::Sender<Vec<u8>>> {
-    let owner = pick_owner_from_map(&ctx.placement, &ctx.node_id, frag)?;
-    if peer_node_id.as_deref() == Some(owner.as_str()) || owner == ctx.node_id {
-        return None;
+) -> Option<(String, mpsc::Sender<Vec<u8>>)> {
+    let replicas = ctx.placement.read().unwrap().get(&frag).cloned()?;
+    let peers = ctx.peers.lock().await;
+    for owner in replicas {
+        if owner == ctx.node_id || peer_node_id.as_deref() == Some(owner.as_str()) {
+            continue;
+        }
+        if let Some(tx) = peers.get(&owner) {
+            return Some((owner, tx.clone()));
+        }
     }
-    ctx.peers.lock().await.get(&owner).cloned()
+    None
 }
 
-/// Re-forward a write to the fragment's current owner. Hop-limited and
-/// never bounced back to the peer it arrived from.
-async fn reforward_put(
-    p: &ForwardedPut,
+fn unavailable_mutation_results(keys: Vec<String>, reason: &str) -> Vec<MutationResult> {
+    keys.into_iter()
+        .enumerate()
+        .map(|(request_index, key)| {
+            mutation_result(
+                key,
+                request_index,
+                Err(NodeError::Network(reason.to_string())),
+            )
+        })
+        .collect()
+}
+
+async fn send_unavailable_mutation(
+    tx: &mpsc::Sender<Vec<u8>>,
+    req_id: u64,
+    keys: Vec<String>,
+    reason: &str,
+) {
+    send_mutation_response(
+        tx,
+        MutationResponse {
+            req_id,
+            results: unavailable_mutation_results(keys, reason),
+        },
+    )
+    .await;
+}
+
+async fn send_mutation_response(tx: &mpsc::Sender<Vec<u8>>, response: MutationResponse) -> bool {
+    tokio::time::timeout(
+        REMOTE_RPC_TIMEOUT,
+        try_send_envelope(
+            tx,
+            Envelope {
+                msg: Some(EnvelopeMsg::MutationResponse(response)),
+            },
+        ),
+    )
+    .await
+    .unwrap_or(false)
+}
+
+async fn register_mutation_relay(
+    relays: MutationRelayMap,
+    relay_id: u64,
+    expected_peer: String,
+    expected_keys: Vec<String>,
+    origin_tx: mpsc::Sender<Vec<u8>>,
+    origin_req_id: u64,
+    timeout_after: Duration,
+) {
+    let (timeout_cancel, cancelled) = oneshot::channel();
+    let timeout_keys = expected_keys.clone();
+    relays.lock().await.insert(
+        relay_id,
+        MutationRelay {
+            expected_peer,
+            expected_keys,
+            origin_tx,
+            origin_req_id,
+            timeout_cancel,
+        },
+    );
+
+    // Register before spawning the timer. The cancellation sender is already
+    // in the map, so every registered relay has exactly one live deadline.
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = tokio::time::sleep(timeout_after) => {
+                let relay = { relays.lock().await.remove(&relay_id) };
+                if let Some(relay) = relay {
+                    send_unavailable_mutation(
+                        &relay.origin_tx,
+                        relay.origin_req_id,
+                        timeout_keys,
+                        "forwarded mutation relay timed out",
+                    )
+                    .await;
+                }
+            }
+            _ = cancelled => {}
+        }
+    });
+}
+
+/// Relay a write to the fragment's current owner and preserve the exact
+/// response path. A fresh local request id prevents collisions between
+/// independent upstream peers.
+async fn relay_put(
+    mut p: ForwardedPut,
     frag: FragmentId,
+    origin_tx: &mpsc::Sender<Vec<u8>>,
     peer_node_id: &Option<String>,
     ctx: &ReforwardCtx,
 ) {
-    if let Some(tx) = reforward_target(ctx, peer_node_id, frag).await {
-        let mut fwd = p.clone();
-        fwd.hops += 1;
-        send_envelope(
-            &tx,
-            Envelope {
-                msg: Some(EnvelopeMsg::ForwardedPut(fwd)),
-            },
+    let original_req_id = p.req_id;
+    let keys = vec![p.key.clone()];
+    let Some((owner, owner_tx)) = reforward_target(ctx, peer_node_id, frag).await else {
+        send_unavailable_mutation(
+            origin_tx,
+            original_req_id,
+            keys,
+            "no connected owner available for mutation relay",
         )
         .await;
+        return;
+    };
+    let relay_id = ctx.next_req_id.fetch_add(1, Ordering::Relaxed);
+    register_mutation_relay(
+        ctx.pending_mutation_relays.clone(),
+        relay_id,
+        owner,
+        keys.clone(),
+        origin_tx.clone(),
+        original_req_id,
+        REMOTE_RPC_TIMEOUT,
+    )
+    .await;
+    p.req_id = relay_id;
+    p.hops += 1;
+    let sent = tokio::time::timeout(
+        REMOTE_RPC_TIMEOUT,
+        try_send_envelope(
+            &owner_tx,
+            Envelope {
+                msg: Some(EnvelopeMsg::ForwardedPut(p)),
+            },
+        ),
+    )
+    .await
+    .unwrap_or(false);
+    if !sent {
+        let relay = { ctx.pending_mutation_relays.lock().await.remove(&relay_id) };
+        if let Some(relay) = relay {
+            let _ = relay.timeout_cancel.send(());
+            send_unavailable_mutation(
+                &relay.origin_tx,
+                relay.origin_req_id,
+                keys,
+                "mutation relay connection closed while sending",
+            )
+            .await;
+        }
     }
 }
 
-/// Re-forward a whole batch to the fragment's current owner (the batch
-/// is single-fragment).
-async fn reforward_batch(
+/// Relay a whole single-fragment batch with the same response guarantees.
+async fn relay_batch(
     mut bp: BatchPut,
     frag: FragmentId,
+    origin_tx: &mpsc::Sender<Vec<u8>>,
     peer_node_id: &Option<String>,
     ctx: &ReforwardCtx,
 ) {
-    if let Some(tx) = reforward_target(ctx, peer_node_id, frag).await {
-        for p in bp.puts.iter_mut() {
-            p.hops += 1;
-        }
-        send_envelope(
-            &tx,
+    let original_req_id = bp.req_id;
+    let keys: Vec<String> = bp.puts.iter().map(|put| put.key.clone()).collect();
+    let Some((owner, owner_tx)) = reforward_target(ctx, peer_node_id, frag).await else {
+        send_unavailable_mutation(
+            origin_tx,
+            original_req_id,
+            keys,
+            "no connected owner available for batch relay",
+        )
+        .await;
+        return;
+    };
+    let relay_id = ctx.next_req_id.fetch_add(1, Ordering::Relaxed);
+    register_mutation_relay(
+        ctx.pending_mutation_relays.clone(),
+        relay_id,
+        owner,
+        keys.clone(),
+        origin_tx.clone(),
+        original_req_id,
+        REMOTE_RPC_TIMEOUT,
+    )
+    .await;
+    bp.req_id = relay_id;
+    for p in bp.puts.iter_mut() {
+        p.hops += 1;
+    }
+    let sent = tokio::time::timeout(
+        REMOTE_RPC_TIMEOUT,
+        try_send_envelope(
+            &owner_tx,
             Envelope {
                 msg: Some(EnvelopeMsg::BatchPut(bp)),
             },
-        )
-        .await;
+        ),
+    )
+    .await
+    .unwrap_or(false);
+    if !sent {
+        let relay = { ctx.pending_mutation_relays.lock().await.remove(&relay_id) };
+        if let Some(relay) = relay {
+            let _ = relay.timeout_cancel.send(());
+            send_unavailable_mutation(
+                &relay.origin_tx,
+                relay.origin_req_id,
+                keys,
+                "batch relay connection closed while sending",
+            )
+            .await;
+        }
     }
 }
 
@@ -2922,7 +3590,7 @@ async fn relay_get(
     peer_node_id: &Option<String>,
     ctx: &ReforwardCtx,
 ) {
-    let Some(owner_tx) = reforward_target(ctx, peer_node_id, frag).await else {
+    let Some((_owner, owner_tx)) = reforward_target(ctx, peer_node_id, frag).await else {
         return;
     };
     let relay_id = ctx.next_req_id.fetch_add(1, Ordering::Relaxed);
@@ -3027,8 +3695,136 @@ async fn send_sync_request(tx: &mpsc::Sender<Vec<u8>>, fragments: Vec<u32>) {
 }
 
 async fn send_envelope(tx: &mpsc::Sender<Vec<u8>>, envelope: Envelope) {
+    let _ = try_send_envelope(tx, envelope).await;
+}
+
+async fn try_send_envelope(tx: &mpsc::Sender<Vec<u8>>, envelope: Envelope) -> bool {
     let mut frame = Vec::new();
-    if envelope.encode(&mut frame).is_ok() {
-        let _ = tx.send(frame).await;
+    if envelope.encode(&mut frame).is_err() {
+        return false;
+    }
+    tx.send(frame).await.is_ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn result(key: &str, request_index: u32) -> MutationResult {
+        MutationResult {
+            key: key.to_string(),
+            status: MutationStatus::Applied as i32,
+            error: String::new(),
+            winner_timestamp_ms: 0,
+            winner_node_id: String::new(),
+            winner_is_tombstone: false,
+            request_index,
+        }
+    }
+
+    #[test]
+    fn mutation_responses_require_exact_cardinality_order_and_indices() {
+        let expected = vec!["a".to_string(), "b".to_string()];
+        assert!(validate_mutation_results(&expected, &[result("a", 0), result("b", 1)]).is_ok());
+        assert!(validate_mutation_results(&expected, &[result("a", 0)]).is_err());
+        assert!(validate_mutation_results(&expected, &[result("b", 0), result("a", 1)]).is_err());
+        assert!(validate_mutation_results(&expected, &[result("a", 1), result("b", 0)]).is_err());
+    }
+
+    #[test]
+    fn unspecified_wire_statuses_are_never_success() {
+        let unknown = MutationResult {
+            status: MutationStatus::Unknown as i32,
+            ..result("key", 0)
+        };
+        assert!(
+            validate_mutation_results(&["key".to_string()], std::slice::from_ref(&unknown))
+                .is_err()
+        );
+        assert!(matches!(
+            decode_mutation_result(unknown),
+            Err(NodeError::Codec(_))
+        ));
+        assert_eq!(
+            ReplicationAckLevel::try_from(0),
+            Ok(ReplicationAckLevel::Unknown)
+        );
+    }
+
+    #[test]
+    fn dropping_a_pending_mutation_waiter_removes_its_registry_entry() {
+        let pending: PendingMutations = Arc::new(StdMutex::new(HashMap::new()));
+        let (reply, _response) = oneshot::channel();
+        pending.lock().unwrap().insert(
+            7,
+            PendingMutation {
+                expected_peer: "peer".to_string(),
+                expected_keys: vec!["key".to_string()],
+                reply,
+            },
+        );
+        {
+            let _guard = PendingMutationGuard {
+                req_id: 7,
+                pending: pending.clone(),
+            };
+        }
+        assert!(pending.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn mutation_relay_timeout_removes_entry_and_replies_unavailable() {
+        let relays: MutationRelayMap = Arc::new(Mutex::new(HashMap::new()));
+        let (origin_tx, mut origin_rx) = mpsc::channel(1);
+        register_mutation_relay(
+            relays.clone(),
+            17,
+            "owner".to_string(),
+            vec!["key".to_string()],
+            origin_tx,
+            9,
+            Duration::from_millis(10),
+        )
+        .await;
+        assert!(relays.lock().await.contains_key(&17));
+
+        let bytes = tokio::time::timeout(Duration::from_secs(1), origin_rx.recv())
+            .await
+            .expect("relay timeout did not reply")
+            .expect("relay response channel closed");
+        let envelope = Envelope::decode(bytes.as_slice()).expect("invalid relay response");
+        let Some(EnvelopeMsg::MutationResponse(response)) = envelope.msg else {
+            panic!("expected mutation response");
+        };
+        assert_eq!(response.req_id, 9);
+        assert_eq!(response.results.len(), 1);
+        assert_eq!(response.results[0].key, "key");
+        assert_eq!(
+            MutationStatus::try_from(response.results[0].status),
+            Ok(MutationStatus::Unavailable)
+        );
+        assert!(relays.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn completed_mutation_relay_cancels_timeout() {
+        let relays: MutationRelayMap = Arc::new(Mutex::new(HashMap::new()));
+        let (origin_tx, mut origin_rx) = mpsc::channel(1);
+        register_mutation_relay(
+            relays.clone(),
+            17,
+            "owner".to_string(),
+            vec!["key".to_string()],
+            origin_tx,
+            9,
+            Duration::from_millis(10),
+        )
+        .await;
+        let relay = relays.lock().await.remove(&17).expect("relay missing");
+        let _ = relay.timeout_cancel.send(());
+
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(origin_rx.try_recv().is_err());
+        assert!(relays.lock().await.is_empty());
     }
 }

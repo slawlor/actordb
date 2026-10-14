@@ -15,8 +15,9 @@
 //! What it measures
 //! ----------------
 //! * `put_multi/<n>`: latency of one `put_multi` call with `n` keys
-//!   (n = 10, 100, 1000), 100 B values. Includes grouping by destination,
-//!   one message per destination, and per-key result collection.
+//!   (n = 10, 100, 1000), 100 B values. Includes grouping by fragment,
+//!   one message per remote fragment/owner attempt, and per-key result
+//!   collection.
 //! * `get_multi/<n>`: latency of one `get_multi` call with `n` keys.
 //!
 //! Throughput is reported as elements/s (keys per second).
@@ -24,7 +25,7 @@
 //! How to read regressions
 //! -----------------------
 //! * A `put_multi` regression with flat single-`put` (see put_get bench)
-//!   points at fan-out overhead: destination grouping, per-destination
+//!   points at fan-out overhead: fragment grouping, per-fragment
 //!   message encode, or the failover `replica_order` scan.
 //! * A `get_multi` regression points at the remote batch path: note that
 //!   `BatchGet` currently serves keys with sequential actor round-trips
@@ -34,13 +35,9 @@
 //!   per-op latency *increasing* with `n` points at O(n²) behavior such
 //!   as the per-key senders-map scan (finding #22).
 //!
-//! Known baseline anomaly (2026-10-14): `get_multi` has a ~100 ms floor
-//! independent of `n`, even on an empty database. `put_multi` does not
-//! (it is fire-and-forget for remote fragments) while `get_multi` waits
-//! for `BatchGetResponse`. This matches adversarial finding #30 —
-//! `TCP_NODELAY` is not set, so small request/response exchanges pay
-//! Nagle + delayed-ACK (~40 ms per remote fragment round-trip). Fixing
-//! #30 should drop this floor dramatically; this bench will show it.
+//! Both remote paths now await responses, and peer sockets use `TCP_NODELAY`.
+//! A new fixed latency floor therefore points at request correlation,
+//! destination sequencing, or actor round-trips rather than delayed ACKs.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};

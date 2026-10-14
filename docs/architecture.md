@@ -3,8 +3,9 @@
 actordb is a **sharded, actor-model key–value store** written in Rust on top of
 [ractor](https://github.com/slawlor/ractor) (a Rust actor framework). It is a
 working prototype: a real, networked, multi-node KV store with replication,
-persistence, and traffic isolation, but without TLS/auth, multi-datacenter
-support, or transactional semantics.
+persistence, traffic isolation, and optional pre-shared-secret peer
+authentication, but without built-in TLS, multi-datacenter support, or
+transactional semantics.
 
 ## What it is
 
@@ -17,11 +18,13 @@ support, or transactional semantics.
 - **Actor-per-fragment**: every fragment on a node runs its own supervision
   subtree — a dispatcher actor plus three worker pools — so fragments are
   isolated from each other's failures.
-- **Async replication**: each fragment keeps one replication sender per peer;
-  sends are batched, acked, and repaired by periodic delta reconciliation
+- **Async replication**: each fragment keeps one sender per replica peer;
+  batches remain in flight until an apply/flush-aware ACK, retry on NACK or
+  disconnect, and are repaired by periodic delta reconciliation
   (see [Replication](replication.md)).
-- **Opt-in persistence**: RocksDB behind the `rocksdb` cargo feature, flushed in
-  batches by a periodic snapshotter (see [Persistence](persistence.md)).
+- **Opt-in persistence**: RocksDB behind the `rocksdb` cargo feature. Threshold,
+  write-age, periodic, requested `StoreCommitted` ACK, and reconciliation
+  fences flush ordered batches (see [Persistence](persistence.md)).
 
 ## Crate layout
 
@@ -38,7 +41,7 @@ integration crate, and an `xtask` for coverage.
 | `actordb::store` | `KvStore` trait, `MemoryStore`, `PrefixedStore`, `RocksDbStore` (feature-gated) |
 | `actordb::shard` | `FragmentId`, `hash_key` (seahash), `fragment_of` |
 | `actordb::network` | Transport abstraction: `Network`, `TcpNetwork`, `PeerStream`; 4-byte length-prefixed `Envelope` framing |
-| `actordb::proto` | prost-generated `meta` protocol-buffer messages (ids 1–17), priorities, replication and reconcile messages |
+| `actordb::proto` | prost-generated `meta` protocol-buffer messages (ids 1–19), priorities, mutation outcomes, replication and reconcile messages |
 
 ## The hierarchy
 
@@ -54,7 +57,7 @@ Node
         │   └── background_pool(N workers)
         ├── Cleaner                        (TTL markers + optional tombstone GC, every clean_interval)
         └── Snapshotter                    (periodic durable flush, every snapshot_interval)
-    └── ReplicationSender × peers          (one sender task per fragment×peer)
+    └── ReplicationSender × replica peers  (one sender task per fragment×target)
 ```
 
 Key design points:
@@ -69,8 +72,9 @@ Key design points:
   the same worker (`seahash(key) % workers`). Different priorities use
   different workers; `FragmentState` therefore serializes each LWW merge with
   its persistence enqueue so disk ordering cannot diverge from the cache.
-  Local mutation calls await the selected worker's exact apply outcome rather
-  than inferring it from a subsequent read (see [Consistency](consistency.md)).
+  Local and forwarded client mutations await the serving worker's exact apply
+  outcome rather than inferring it from a subsequent read (see
+  [Consistency](consistency.md)).
 - **Supervision is local and shallow.** A dead worker is replaced in place with
   the same `Arc<FragmentState>` and the same pool slot; a dead child of a
   fragment supervisor (dispatcher, cleaner, snapshotter) is respawned in place.
@@ -85,8 +89,9 @@ Key design points:
 
 - No transactions, no multi-key atomicity (see [Multi-key batching](batching.md)
   for exactly what `put_multi` guarantees — it's fan-out, not a transaction).
-- No security: plain TCP, no TLS, no authentication. TLS is a DIY extension
-  point via the `Network` trait.
+- Plain TCP by default and no built-in TLS. Optional pre-shared-secret Hello
+  authentication is available; encrypted transports remain an extension point
+  via the `Network` trait.
 - No consensus: conflict resolution is last-writer-wins by HLC timestamp, not
   Raft/Paxos (see [Consistency](consistency.md)).
 - Persistence is opt-in (`store: None` by default = pure in-memory) and crash

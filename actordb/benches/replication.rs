@@ -9,15 +9,15 @@
 //! --------
 //! Nodes `a` (primary) and `b` (replica) both serve fragment 0
 //! (`fragment_map = {0: [a, b]}`). Writes go to `a` via `put_multi`
-//! (acknowledged, barrier-verified); the async sender replicates to `b`.
+//! (exact source apply completed); the async sender replicates to `b`.
 //!
 //! What it measures
 //! ----------------
 //! `replication_lag/<n>`: wall time from the moment the batch of `n` puts
-//! is acknowledged on `a` until all `n` keys are visible on `b` via
-//! `get_multi`. This is the end-to-end replication lag for a batch —
-//! sender batching (`batch_interval`, `batch_size`), network encode,
-//! receiver apply, and `b`'s barrier read are all in the path.
+//! completes its source apply on `a` until all `n` keys are visible on `b` via
+//! `get_multi`. This does not observe the replication ACK itself. Sender
+//! batching (`batch_interval`, `batch_size`), network encode, receiver apply,
+//! and `b`'s read are all in the measured path.
 //!
 //! How to read regressions
 //! -----------------------

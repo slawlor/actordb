@@ -497,7 +497,11 @@ impl Actor for Snapshotter {
         myself: ActorRef<Self::Msg>,
         args: Self::Arguments,
     ) -> Result<Self::State, ActorProcessingErr> {
-        let mut ticker = tokio::time::interval(args.interval);
+        // `interval()` yields its first tick immediately. Start at one full
+        // interval so a write arriving just after startup is not flushed by a
+        // delayed "initial" tick.
+        let mut ticker =
+            tokio::time::interval_at(tokio::time::Instant::now() + args.interval, args.interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         tokio::spawn(async move {
             loop {

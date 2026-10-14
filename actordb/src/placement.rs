@@ -148,8 +148,8 @@ pub enum FragmentPlacementState {
     Bootstrapping,
     /// Authoritative: reads and writes are served locally.
     Serving,
-    /// Placement revoked: still serving while replication senders
-    /// drain, then the subtree is stopped.
+    /// Placement revoked: new operations relay to the current owner while
+    /// replication senders drain, then the subtree is stopped.
     Draining,
     /// Subtree stopped; the fragment is no longer served here.
     Stopped,

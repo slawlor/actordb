@@ -186,9 +186,9 @@ impl VersionedValue {
 /// A single replicated write operation.
 ///
 /// `seq` is a per-origin-node sequence number and `boot_id` a random
-/// identifier minted at process start; together with the origin node id
-/// they form the transport layer's dedup key to suppress re-broadcast
-/// storms. Neither plays a role in conflict resolution.
+/// identifier minted at process start. They are carried as origin metadata;
+/// the current receiver does not deduplicate on them. Replay safety and
+/// conflict resolution come from the value's LWW version.
 #[derive(Debug, Clone)]
 pub struct ReplicatedOp {
     pub key: String,
@@ -218,6 +218,16 @@ pub enum ApplyOutcome {
     /// The operation's TTL deadline had already passed; its deterministic
     /// expiry tombstone is now present or was already present.
     Expired,
+}
+
+/// Persistence level reached before acknowledging a replicated batch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApplyDurability {
+    /// The batch is visible in memory; no store flush is part of this fence.
+    MemoryApplied,
+    /// The configured [`KvStore`] accepted the fragment flush. This does not
+    /// imply an fsync unless the store implementation provides that guarantee.
+    StoreCommitted,
 }
 
 /// Failure before a fragment can produce an [`ApplyOutcome`].
@@ -258,9 +268,14 @@ pub enum KvMessage {
         op: ReplicatedOp,
         priority: OpPriority,
         is_replication: bool,
-        /// Optional exact result. Replication and synchronization paths may
-        /// omit it until their protocol-level acknowledgement is required.
+        /// Optional exact result. Callers that need an application or
+        /// protocol acknowledgement supply this reply port.
         reply: Option<RpcReplyPort<Result<ApplyOutcome, ApplyError>>>,
+    },
+    /// Flush every persistence update currently ordered before this message.
+    /// Replication uses this as an acknowledgement fence.
+    Flush {
+        reply: RpcReplyPort<Result<ApplyDurability, ApplyError>>,
     },
     /// Read a single key from the local copy. The reply is
     /// `Ok(value)` on success, `Err(shed_reason)` if the op was shed
@@ -333,6 +348,14 @@ impl FragmentState {
             flush_in_progress: Mutex::new(()),
             flush_batch_size,
             flush_interval,
+        }
+    }
+
+    fn durability(&self) -> ApplyDurability {
+        if self.kvstore.is_some() {
+            ApplyDurability::StoreCommitted
+        } else {
+            ApplyDurability::MemoryApplied
         }
     }
 
@@ -666,6 +689,14 @@ impl Actor for KvWorker {
                 let _ = reply.send(Ok(state.0.get(&key).await));
                 Ok(())
             }
+            // Flush fences are handled by the dispatcher against the shared
+            // state. They are never routed through a worker pool.
+            KvMessage::Flush { reply } => {
+                let _ = reply.send(Err(ApplyError::Storage(
+                    "flush fence was routed to a worker".to_string(),
+                )));
+                Ok(())
+            }
             // GetAll is served by the dispatcher straight from shared state.
             KvMessage::GetAll { .. } => Ok(()),
             // Shed counts are a dispatcher-level query; workers don't track them.
@@ -994,6 +1025,19 @@ impl Actor for KvActor {
                 {
                     let _ = reply.send(value);
                 }
+                Ok(())
+            }
+            KvMessage::Flush { reply } => {
+                let result = state
+                    .shared
+                    .flush()
+                    .await
+                    .map(|()| state.shared.durability())
+                    .map_err(|error| ApplyError::Storage(error.to_string()));
+                let _ = reply.send(result);
+                // A failed fence keeps its in-flight buffer for retry. Report
+                // the error to the protocol caller without killing the stable
+                // dispatcher reference.
                 Ok(())
             }
             KvMessage::GetAll { reply } => {

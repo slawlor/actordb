@@ -14,7 +14,8 @@ and results come back in input order.
 3. Remote keys are grouped by `FragmentId` and each group goes out as **one**
    `BatchPut` / `BatchGet` message to the fragment's owner — one message per
    fragment, not per key.
-4. Results are mapped back by key into a `Vec` aligned with the input order:
+4. Put responses must match the request's cardinality, key order, and explicit
+   request indices before results are mapped into the input-aligned `Vec`:
    `Vec<Result<(), NodeError>>` for puts,
    `Vec<Result<Option<VersionedValue>, NodeError>>` for gets.
 
@@ -27,30 +28,38 @@ and results come back in input order.
   batch; `BatchGet.priority` likewise). The remote owner executes at the
   caller's priority — "fan-out preserves traffic isolation end-to-end."
 
-## Remote puts: failover, no end-to-end ack
+## Remote puts: exact outcomes and bounded failover
 
 For each remote fragment, the node iterates `replica_order(frag)` — itself
 first if it serves the fragment — and sends the `BatchPut` to the first
-holder with a live peer channel, **failing over across replica holders until
-one accepts the batch**. This is fire-and-forget: once a holder accepts the
-batch, the key's result is `Ok(())` with **no end-to-end acknowledgement**
-that the write applied. At-least-once delivery to the owner, nothing more.
+holder with a live peer channel. The origin registers the expected peer, sends
+one request id, and waits for one ordered `MutationResult` per put. `Ok(())`
+means the serving worker returned `Applied` or the idempotent
+`AlreadyPresent`; backpressure, storage failure, expiry, and supersession are
+returned per key.
 
-A remote key fails only when:
+Each attempt has a **5-second deadline covering both outbound queueing and the
+reply**. A closed connection, timeout, dropped response, or invalid
+cardinality/order retries the same stamped versions at the next holder. LWW
+application makes that retry idempotent. Cancellation removes the pending
+request, and late or wrong-peer responses are ignored.
 
-- no replica holder is connected → `NodeError::Network(..)`, or
-- the fragment has no usable replica (misconfiguration) → `NodeError::Actor(..)`.
+Transport, timeout, malformed-response, and typed all-`Unavailable` failures
+try the next holder; if none succeeds, the key gets `NodeError::Network(..)`.
+Other valid typed responses end failover and return their exact per-key
+outcomes. A fragment with no usable replica is a configuration
+`NodeError::Actor(..)`.
 
-Note the asymmetry with single-key `put`: the single-key path forwards once to
-`pick_replica` (the first in `replica_order`) and does *not* fail over — it
-returns `Ok` after the send, or `NodeError::Network` if the send fails.
+Single-key `put` also waits for the remote exact outcome, with the same
+5-second send-and-response deadline, but currently selects only the first
+owner rather than failing over.
 
 ## Remote gets: timeout + failover
 
 Remote gets carry a `req_id` and are awaited with a **5-second per-attempt
-timeout**. On timeout or a dropped reply channel, the pending request is
-removed and the node fails over to the next replica holder. A key fails only
-when no replica holder answers:
+response timeout after enqueueing**. On timeout or a dropped reply channel,
+the pending request is removed and the node fails over to the next replica
+holder. A key fails only when no replica holder answers:
 `NodeError::Network("no replica answered batch get for fragment {frag} (tried ...)")`.
 "A dead owner fails only its keys, and only when no replica holder answers."
 
@@ -66,6 +75,8 @@ Per-key result mapping in a `BatchGetResponse`:
 `NodeError::Network` = connectivity (no replica reachable).
 `NodeError::Backpressure` = shed locally or remotely — **a shed read never
 returns `Ok(None)`**, so callers can't mistake backpressure for "not found".
+`NodeError::Storage`, `Superseded`, and `Expired` preserve the serving
+fragment's exact mutation outcome.
 
 The `multi_key_partial_failure` integration test covers the headline case: a
 disconnected owner fails only its keys while the rest succeed.

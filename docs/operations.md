@@ -48,8 +48,10 @@ node converges to the full dataset with zero full-state sync entries.
 - **Opt-in tombstone resurrection risk**: `tombstone_gc_age` defaults to
   `None`. If time-based GC is enabled and a partition outlasts that age, the
   GC'd tombstone is gone and the other side's older value can win on heal.
-- While partitioned, `replica_order` failover only helps if a replica is
-  reachable; otherwise reads fail with `NodeError::Network`.
+- While partitioned, batch reads and writes fail over across `replica_order`
+  while single-key forwarded puts/gets currently select one owner. If no
+  selected/retried replica is reachable, the operation returns
+  `NodeError::Network`.
 
 ### Overloaded node (backpressure)
 
@@ -80,7 +82,7 @@ states (`Bootstrapping`/`Serving`/`Draining`/`Stopped`) for diagnosis.
 | Restarts | `health()[frag].restarts` | Repeated worker/dispatcher restarts = crash loop; investigate before it cascades |
 | Placement | `Node::placement_report()` | Authoritative map, lifecycle states, `dynamic` flag — is migration stuck in `Bootstrapping`/`Draining`? |
 | Sync entries | `Node::sync_entries_applied()` | Full-state sync volume since start; nonzero in dynamic mode = reconciler isn't owning anti-entropy |
-| Replication lag | `batch_interval` + peer RTT | Steady-state lag bound; divergence beyond that shows up via reconcile |
+| Replication lag | `batch_interval` + receiver apply/flush + peer RTT | ACKs follow the receiver fence; an unanswered live session has no ACK timer and can stall, while later reconciliation repairs divergence |
 
 Operational rules of thumb:
 

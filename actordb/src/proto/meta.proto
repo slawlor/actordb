@@ -44,9 +44,8 @@ message ReplicateOp {
   uint64 timestamp_ms = 3;
   string node_id = 4;
   uint64 seq = 5;
-  // Random per process start; joins the dedup key so a restarted node
-  // (same node_id, sequence counter back at zero) is not mistaken for
-  // a replay of its pre-restart ops.
+  // Random per process start. Carried as origin metadata; replay safety is
+  // provided by the value's LWW version rather than transport deduplication.
   uint64 boot_id = 6;
   // Optional key expiry (wall-clock ms). 0/absent = no expiry.
   uint64 expires_at_ms = 7;
@@ -74,6 +73,8 @@ message ForwardedPut {
   // migration) re-forwards it to the current owner instead of
   // dropping it; hops bounds the chain.
   uint32 hops = 10;
+  // Correlates the exact apply outcome back to the originating node.
+  uint64 req_id = 11;
 }
 
 // A client-routed read: "you own this key's fragment — read it and
@@ -126,10 +127,12 @@ message SyncEntry {
 }
 
 // Top-level wire envelope, length-delimited on the wire
-// Phase 5: async sender/receiver replication. The sender batches ops
-// per (fragment, peer) and ships them on a timer; the receiver acks
-// each batch. Session ids distinguish pairings across reconnects;
-// stale batches (old session) are discarded.
+// Phase 5: async sender/receiver replication. The sender batches ops per
+// (fragment, peer) and ships them on a timer. Tracked batches receive an ACK
+// reporting the achieved durability after apply and any requested flush attempt,
+// or a NACK on execution failure; reconciliation batches are untracked.
+// Session ids distinguish pairings
+// across reconnects; stale batches (old session) are discarded.
 message SessionStart {
   uint64 session_id = 1;
   uint32 fragment = 2;
@@ -140,12 +143,34 @@ message ReplicateBatch {
   uint64 batch_seq = 2;
   uint32 fragment = 3;
   repeated ReplicateOp ops = 4;
+  // Minimum fence the sender requires before this tracked batch may retire.
+  // Ignored for untracked reconciliation batches.
+  ReplicationAckLevel required_ack_level = 5;
 }
 
 message BatchAck {
   uint64 session_id = 1;
   uint64 batch_seq = 2;
   uint32 fragment = 3;
+  // Distinguishes volatile in-memory application from a successful flush to
+  // the receiver's configured KvStore.
+  ReplicationAckLevel level = 4;
+}
+
+enum ReplicationAckLevel {
+  REPLICATION_ACK_LEVEL_UNKNOWN = 0;
+  REPLICATION_ACK_LEVEL_APPLIED = 1;
+  REPLICATION_ACK_LEVEL_STORE_COMMITTED = 2;
+}
+
+// A receiver could not account for or persist a batch. The sender retains
+// and retries the exact idempotent operations instead of treating them as
+// delivered.
+message BatchNack {
+  uint64 session_id = 1;
+  uint64 batch_seq = 2;
+  uint32 fragment = 3;
+  string error = 4;
 }
 
 // Incremental anti-entropy: exchange (timestamp, tombstone) summaries,
@@ -176,11 +201,42 @@ message ReconcileData {
   repeated SyncEntry entries = 2;
 }
 
-// Phase 6: multi-key fan-out. One message per destination node.
+// Phase 6: multi-key fan-out. One message per remote fragment/owner attempt.
 message BatchPut {
   repeated ForwardedPut puts = 1;
   // Phase 7: priority applied to every put in the batch.
   Priority priority = 2;
+  // Correlates one ordered result per `puts` entry.
+  uint64 req_id = 3;
+}
+
+// Exact result of one remotely forwarded mutation. Results in a
+// MutationResponse have the same order and cardinality as the request.
+enum MutationStatus {
+  MUTATION_STATUS_UNKNOWN = 0;
+  MUTATION_STATUS_APPLIED = 1;
+  MUTATION_STATUS_ALREADY_PRESENT = 2;
+  MUTATION_STATUS_SUPERSEDED = 3;
+  MUTATION_STATUS_EXPIRED = 4;
+  MUTATION_STATUS_BACKPRESSURE = 5;
+  MUTATION_STATUS_STORAGE_ERROR = 6;
+  MUTATION_STATUS_ACTOR_ERROR = 7;
+  MUTATION_STATUS_UNAVAILABLE = 8;
+}
+
+message MutationResult {
+  string key = 1;
+  MutationStatus status = 2;
+  string error = 3;
+  uint64 winner_timestamp_ms = 4;
+  string winner_node_id = 5;
+  bool winner_is_tombstone = 6;
+  uint32 request_index = 7;
+}
+
+message MutationResponse {
+  uint64 req_id = 1;
+  repeated MutationResult results = 2;
 }
 
 message BatchGet {
@@ -226,5 +282,7 @@ message Envelope {
     BatchPut batch_put = 15;
     BatchGet batch_get = 16;
     BatchGetResponse batch_get_response = 17;
+    MutationResponse mutation_response = 18;
+    BatchNack batch_nack = 19;
   }
 }
