@@ -2,7 +2,8 @@
 
 `delete` never physically removes a key. It writes a **tombstone** — a
 `VersionedValue` with `is_tombstone: true` — stamped with the HLC tick at
-delete time, applied locally and enqueued for replication exactly like a put.
+delete time, applied at the serving owner and enqueued for replication exactly
+like a put.
 Tombstones exist so that a delete wins over concurrent or lagging puts on
 other replicas: without them, a replica that missed the delete would keep
 serving the old value forever.
@@ -10,7 +11,8 @@ serving the old value forever.
 ## Lifecycle
 
 1. **Write**: `node.delete(key)` → `VersionedValue::tombstone(now, node_id)`,
-   applied to the cache, flushed to the store, replicated.
+   merged at the serving owner, enqueued in its persistence buffer, and
+   enqueued for asynchronous replication.
 2. **Reads**: `get` filters tombstones — a tombstoned key reads as `Ok(None)`,
    indistinguishable from "never existed".
 3. **Replication**: tombstones ride in `ReplicateBatch` ops, `SyncEntry`s, and

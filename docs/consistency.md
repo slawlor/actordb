@@ -22,7 +22,8 @@ Conflicts resolve by `VersionedValue::wins_over` on
 `(timestamp_ms, node_id, is_tombstone)`: the higher timestamp wins; exact
 (timestamp, node_id) ties go to the tombstone. The comparison is total and
 commutative, so replicas converge without coordination. `seq`/`boot_id` are
-transport dedup metadata and play no role in conflict resolution.
+origin metadata; the current receiver does not deduplicate on them, and they
+play no role in conflict resolution.
 
 Under bounded clock skew the HLC keeps ordering sane: the
 `hlc_orders_writes_under_clock_skew` integration test simulates skewed clocks
@@ -34,7 +35,8 @@ is required for a true physical/logical tuple.
 ## Local apply outcomes and read-your-write
 
 For a locally owned fragment, `Node` sends `ApplyOp` as an RPC and waits for the
-worker's exact result:
+worker's exact result. A remote owner returns the same result in a correlated
+`MutationResponse`:
 
 - `Applied`: this version won and changed the cache.
 - `AlreadyPresent`: the identical version had already applied; replay is an
@@ -49,22 +51,29 @@ Admission and storage failures are also returned directly as
 barrier and no inference that “a newer value exists” proves this operation
 applied.
 
-After a local put returns `Ok`, the shared fragment cache contains that version
-or a newer winner. Subsequent local reads observe it regardless of which
-priority pool serves them. Priority still controls admission and scheduling;
-it no longer scopes the completed-write visibility guarantee.
-
-This guarantee does not yet cover a put forwarded to a remote fragment owner:
-that wire message currently has no response and the origin returns after
-enqueueing it. The mutation-response work tracked separately will extend exact
-outcomes across nodes.
+At the exact apply point, the serving owner's shared fragment cache contains
+that version or an identical replay; by return time it may contain a newer LWW
+winner. Subsequent reads at that owner observe the applied version or a newer
+winner regardless of which priority pool serves them. A remote call has a
+5-second deadline covering queueing and response; a missing or malformed reply
+is never converted to success. Priority still controls admission and
+scheduling.
 
 ## Replication lag and partitions
 
-Writes return after the local apply; reaching replicas is asynchronous
+Writes return after the serving owner's apply; reaching its other replicas is asynchronous
 (batched every 100 ms by default, repaired by 5-minute periodic
 reconciliation). A read on another replica may return a stale value until the
 batch arrives — this is ordinary eventual consistency.
+
+Replication ACKs are separate from client mutation responses. A receiver
+awaits every batch apply, attempts the fence requested on the wire, and reports
+the level it actually achieved:
+`MemoryApplied` requires cache application only, while `StoreCommitted`
+requires the configured `KvStore` to accept a flush. `StoreCommitted` is not
+an fsync guarantee unless that store provides one. The sender retires the batch
+only if the reported level is sufficient. Apply failure, or a configured-store
+flush failure, sends a NACK and the exact stamped batch is retried.
 
 On partition:
 

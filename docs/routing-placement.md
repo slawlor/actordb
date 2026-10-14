@@ -115,9 +115,12 @@ authoritative and tears down local state for revoked fragments.
 **Overlap-window safety.** While peers' maps transiently disagree, a node that
 receives an op for a fragment it no longer serves **re-forwards** it
 hop-limited (`MAX_FORWARD_HOPS = 4`, never bounced back to the sender, never
-to self) instead of dropping it. In dynamic mode the full-state handshake sync
-is skipped — the Phase 5 reconciler owns anti-entropy, so the rolling-restart
-test asserts `sync_entries_applied() == 0`.
+to self) instead of dropping it. Mutation relays mint a collision-free local
+request id, validate the downstream peer, restore the upstream id, and return
+`Unavailable` on no route, hop exhaustion, send failure, or the 5-second relay
+deadline. In dynamic mode the full-state handshake sync is skipped — the Phase
+5 reconciler owns anti-entropy, so the rolling-restart test asserts
+`sync_entries_applied() == 0`.
 
 ## `placement_report()`
 
@@ -132,8 +135,8 @@ pub async fn placement_report(&self) -> PlacementReport;
 
 `FragmentPlacementState` is `Bootstrapping` (reconciler-owned, not
 authoritative; local ops forwarded to the previous owner), `Serving`,
-`Draining` (placement revoked; still serving while senders drain, then the
-subtree stops), or `Stopped`.
+`Draining` (placement revoked; new ops relay to the current owner while existing
+senders drain, then the subtree stops), or `Stopped`.
 
 `Node::health()` complements it with per-fragment worker health (see
 [API guide](api.md)); on peer join/disconnect the driver notifies the
@@ -164,9 +167,8 @@ controller.set_placement(HashMap::from([
     (0.into(), vec!["b".into()]),
     (1.into(), vec!["a".into()]),
 ]));
-// "a" drains its senders, then stops the fragment-0 subtree. No lost writes:
-// while "a" is Draining it still applies and replicates; once it stops,
-// routing sends everything to "b".
+// "a" stops serving new fragment-0 writes, relays them to "b", drains its
+// existing senders, then stops the subtree.
 ```
 
 This exact sequence is covered by the `placement_migration_no_lost_writes`

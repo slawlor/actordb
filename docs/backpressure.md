@@ -61,11 +61,11 @@ Shed behavior by operation:
   `Err(NodeError::Backpressure(..))`; the operation was not dispatched to a
   worker and did not apply.
 - **Replicated/reconciled write** → currently bypasses admission control. This
-  avoids shedding an operation that the sender may acknowledge, but means the
-  actor mailbox itself is not a bounded replication queue.
-- **Forwarded client write** → currently has no response message. The remote
-  owner can shed it while the origin has already returned `Ok`; this remains a
-  known gap until mutation responses are added.
+  avoids shedding an operation that the receiver must account for before ACK,
+  but means the actor mailbox itself is not yet a bounded replication queue.
+- **Forwarded client write** → the remote owner returns an ordered typed
+  mutation result. A shed single put or batch entry reaches the origin as
+  `NodeError::Backpressure`; it is never reported as success.
 
 Because the pending counter is pool-level (`Arc<AtomicU64>` shared by all
 workers in the pool), **worker restarts preserve pending accounting** — the

@@ -102,8 +102,8 @@ Scenarios live in `docker/envs/`:
   converge on it.
 * **restart** — `SIGKILL` node-a mid-cluster (a real kill -9, delivered
   by the driver script), restart it, and require all three nodes to
-  reconverge. Exercises the redial supervisor, handshake sync, and
-  `boot_id` dedup across process death.
+  reconverge. Exercises the redial supervisor, fresh replication sessions,
+  and handshake sync across process death.
 
 ```bash
 docker compose build
@@ -137,12 +137,12 @@ node.put("key".to_string(), b"value".to_vec()).await?;
 node.put_with_ttl("temp".to_string(), b"value".to_vec(), Some(Duration::from_secs(60))).await?;
 node.delete("key".to_string()).await?;
 
-let value = node.get("key".to_string()).await?;  // local-only read, Option<VersionedValue>
+let value = node.get("key".to_string()).await?;  // routed read, Option<VersionedValue>
 let all = node.get_all().await?;                  // full local copy (live keys)
 let health = node.health().await?;                // per-fragment supervision health
 
-// Bulk APIs: keys hash to fragments, group by fragment, one batch
-// message per destination node. Per-key Results in input order.
+// Bulk APIs: keys hash to fragments, one batch per remote fragment/owner
+// attempt. Per-key Results remain in input order.
 let puts = node.put_multi(vec![
     ("k1".to_string(), b"v1".to_vec()),
     ("k2".to_string(), b"v2".to_vec()),
@@ -156,22 +156,20 @@ node.shutdown().await;
 Multi-key semantics:
 
 - `put_multi` / `get_multi` partition keys by fragment and send one
-  `BatchPut` / `BatchGet` message per destination node, so a 1000-key
-  batch touching 4 nodes costs 4 messages instead of 1000.
-- Local keys are read-your-write (like `put`); remote `put_multi`
-  keys are fire-and-forget to the fragment owner (like `put`) — the
-  call returns once the batch is handed to the owner's connection, and
-  the owner applies it and replicates it to the other holders. There
-  is no end-to-end acknowledgement.
-- Both APIs fail over across replica holders in placement order: if
-  the preferred owner is unreachable (puts) or stops responding
-  within the 5s per-attempt timeout (gets), the batch is retried
-  against the next replica. A key fails only when no replica holder
-  answers.
+  `BatchPut` / `BatchGet` per remote fragment and owner attempt, rather than
+  one message per key.
+- Local and remote puts await the serving fragment's exact per-key apply
+  outcome. Remote batches preserve request order/cardinality and use a
+  5-second deadline that includes outbound queueing and the response.
+- Batch APIs fail over across replica holders in placement order on transport,
+  timeout, or malformed-response failures. Mutation attempts have a 5-second
+  send-and-response deadline; read attempts time out 5 seconds after
+  enqueueing. A typed all-`Unavailable` mutation response tries the next
+  holder; other valid per-key outcomes are returned directly.
 - Errors are per-key and classified: `NodeError::Actor` for
   misconfiguration (no replica listed for a fragment),
-  `NodeError::Network` for connectivity failures,
-  `NodeError::Backpressure` when a pool shed the op.
+  `NodeError::Network` for connectivity failures, plus exact
+  `Backpressure`, `Storage`, `Superseded`, and `Expired` mutation outcomes.
 - `put_multi_with_priority` / `get_multi_with_priority` set the
   operation priority explicitly (default: `Background`); the priority
   is carried on the wire and honored by the remote owner.
@@ -190,14 +188,14 @@ Key `NodeConfig` knobs:
 | `clean_interval` | 30s | TTL-expiry materialization / optional tombstone-GC sweep period |
 | `snapshot_interval` | 60s | Periodic durable flush |
 | `tombstone_gc_age` | None | Tombstone GC disabled; `Some(age)` is an unsafe, memory-only opt-in |
-| `replication` | defaults | `SenderConfig`: batch size/interval, max in-flight, buffer capacity, consistency interval |
+| `replication` | defaults | `SenderConfig`: batching, in-flight/buffer bounds, reconcile cadence, required ACK durability |
 | `placement_controller` | None | Phase 8: `Some(Arc<dyn PlacementController>)` opts into dynamic placement |
 | `placement_poll_interval` | 1s | Phase 8: how often the driver re-evaluates desired placement |
 | `store` | None | `Some(Arc<dyn KvStore>)`; `NodeConfig::with_rocksdb(path)` with the `rocksdb` feature |
 
-- Local writes await the worker's exact apply outcome; after `Ok`, reads in
-  every priority pool see that version or a newer winner. Remote-fragment
-  writes currently forward asynchronously in one hop.
+- Local and remote writes await the serving worker's exact apply outcome;
+  after `Ok`, that owner reads the version or a newer winner. Replication to
+  the owner's other holders remains asynchronous.
 - Conflicts resolve with last-writer-wins on HLC timestamps,
   tie-broken by `node_id`; tombstones win exact ties.
 - Failures surface as typed `NodeError` variants, including `Backpressure`,
@@ -213,7 +211,7 @@ Key `NodeConfig` knobs:
 - `HlcClock` — hybrid logical clock behind all timestamps.
 - `ApplyOutcome::{Applied, AlreadyPresent, Superseded, Expired}` — the exact
   result used instead of inferring write success from a later read.
-- `KvMessage::{ApplyOp, Get, GetAll, GetShedCounts}` — for embedders
+- `KvMessage::{ApplyOp, Flush, Get, GetAll, GetShedCounts}` — for embedders
   driving the dispatcher directly instead of through `Node`.
 
 #### Traffic isolation + backpressure (Phase 7)
@@ -237,10 +235,11 @@ Each fragment runs **three isolated worker pools** instead of one:
 - Shed counts are surfaced per pool `(high, default, background)` via
   `node.health()` → `FragmentHealth.shed_counts`.
 
-Ordering honesty: a local put waits for the selected worker to return its
-exact apply outcome. Once it returns `Ok`, every priority pool reads the same
-shared cache, so a subsequent local get sees that version or a newer winner.
-This does not yet extend to asynchronously forwarded remote puts.
+Ordering honesty: local and forwarded puts wait for the serving worker's exact
+apply outcome. At that point its shared cache contains the applied version or
+an identical replay; by return time a newer concurrent LWW winner may exist.
+A 5-second remote deadline covers both bounded outbound-queue admission and
+the reply; cancellation and late replies remove or ignore pending state.
 
 ### `actordb::supervision` — per-fragment supervision
 
@@ -251,9 +250,10 @@ This does not yet extend to asynchronously forwarded remote puts.
 
 ### `actordb::replication` — async sender/receiver
 
-- Per fragment, per peer, a sender task batches mutations (writes +
+- Per fragment, per replica peer, a sender task batches mutations (writes +
   tombstones) off the write path: ships on a timer, bounded in-flight,
-  acks drop acked records.
+  and retains each batch until a typed ACK reaches the configured durability
+  fence. Receiver apply/flush failures NACK and requeue the exact batch.
 - Session ids per pairing; stale batches discarded on reconnect.
 - Buffer overflow → `buffer_reset`: shed, block tombstone GC, and
   reconcile via timestamp/tombstone comparison when the peer returns.
@@ -322,7 +322,7 @@ controller.set_placement(final_map);
 Prost-generated protobuf types (`Envelope`, `Hello`, `ReplicateOp`,
 `ForwardedPut`, `ForwardedGet`, `GetResponse`, `SyncRequest`,
 `SyncResponse`, `SyncEntry`, `BatchPut`, `BatchGet`,
-`BatchGetResponse`), sent as 4-byte length-prefixed frames
+`BatchGetResponse`, `MutationResponse`, `BatchAck`, `BatchNack`), sent as 4-byte length-prefixed frames
 over TCP. Mostly of interest if you're implementing a compatible peer.
 
 ### Current limitations
@@ -344,6 +344,15 @@ as issues in the [issue tracker](https://github.com/slawlor/actordb/issues):
   steady-state replication is incremental (batches + reconciliation).
   With dynamic placement enabled the handshake skips the full-state
   sync and the reconciler owns anti-entropy (delta-only).
+- **Replication ingress/timeout hardening remains** — apply/flush-aware ACKs,
+  NACK retry, and disconnect replay prevent false delivery, but receiver
+  mailboxes are not yet byte-bounded and an open connection that never replies
+  can fill `max_in_flight` because there is no ACK timer. A sender that enters
+  `BufferReset` while that connection stays open also waits for a session
+  transition before reconciling.
+- **Wire upgrades must be coordinated** — `Hello` does not yet negotiate
+  protocol capabilities. The mutation-response and durability-ACK fields fail
+  closed across old/new peers rather than silently claiming success.
 - **Tombstone GC is disabled by default** — the optional time-based mode is
   memory-only. A node partitioned longer than the configured age can resurrect
   deleted keys on rejoin, and GC'd tombstones are re-loaded from RocksDB on the

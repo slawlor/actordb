@@ -4,7 +4,8 @@ mod common;
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex as StdMutex};
 use std::time::Duration;
 
 use actordb::actor::{now_ms, VersionedValue};
@@ -42,6 +43,88 @@ impl KvStore for PreloadedStore {
     }
 
     fn write_batch(&self, writes: &[(Vec<u8>, VersionedValue)]) -> Result<(), StoreError> {
+        let mut entries = self.entries.lock().unwrap();
+        for (key, value) in writes {
+            entries.insert(key.clone(), value.clone());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+struct AlwaysFailStore;
+
+impl KvStore for AlwaysFailStore {
+    fn load(&self) -> Result<Vec<(Vec<u8>, VersionedValue)>, StoreError> {
+        Ok(Vec::new())
+    }
+
+    fn write_batch(&self, _writes: &[(Vec<u8>, VersionedValue)]) -> Result<(), StoreError> {
+        Err(StoreError("injected permanent failure".to_string()))
+    }
+}
+
+#[derive(Default)]
+struct FailOnceStore {
+    attempts: AtomicUsize,
+    entries: StdMutex<HashMap<Vec<u8>, VersionedValue>>,
+}
+
+impl KvStore for FailOnceStore {
+    fn load(&self) -> Result<Vec<(Vec<u8>, VersionedValue)>, StoreError> {
+        Ok(self
+            .entries
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect())
+    }
+
+    fn write_batch(&self, writes: &[(Vec<u8>, VersionedValue)]) -> Result<(), StoreError> {
+        if self.attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+            return Err(StoreError("injected transient failure".to_string()));
+        }
+        let mut entries = self.entries.lock().unwrap();
+        for (key, value) in writes {
+            entries.insert(key.clone(), value.clone());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+struct GatedStore {
+    entered: AtomicBool,
+    release: (StdMutex<bool>, Condvar),
+    entries: StdMutex<HashMap<Vec<u8>, VersionedValue>>,
+}
+
+impl GatedStore {
+    fn release(&self) {
+        *self.release.0.lock().unwrap() = true;
+        self.release.1.notify_all();
+    }
+}
+
+impl KvStore for GatedStore {
+    fn load(&self) -> Result<Vec<(Vec<u8>, VersionedValue)>, StoreError> {
+        Ok(self
+            .entries
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect())
+    }
+
+    fn write_batch(&self, writes: &[(Vec<u8>, VersionedValue)]) -> Result<(), StoreError> {
+        self.entered.store(true, Ordering::SeqCst);
+        let mut released = self.release.0.lock().unwrap();
+        while !*released {
+            released = self.release.1.wait(released).unwrap();
+        }
+        drop(released);
         let mut entries = self.entries.lock().unwrap();
         for (key, value) in writes {
             entries.insert(key.clone(), value.clone());
@@ -1122,6 +1205,7 @@ async fn sender_buffer_reset_and_reconcile() {
             max_in_flight: 2,
             buffer_capacity: 10, // small: overflow quickly
             consistency_interval: Duration::from_secs(3600), // disable periodic
+            required_ack_durability: actordb::replication::ReplicationAckDurability::MemoryApplied,
         },
         ..NodeConfig::default()
     };
@@ -1191,7 +1275,9 @@ async fn sender_buffer_reset_and_reconcile() {
 /// receiver must drop it.
 #[tokio::test]
 async fn stale_session_batches_discarded() {
-    use actordb::proto::{Envelope, EnvelopeMsg, Hello, ReplicateBatch, ReplicateOp};
+    use actordb::proto::{
+        Envelope, EnvelopeMsg, Hello, ReplicateBatch, ReplicateOp, ReplicationAckLevel,
+    };
     use prost::Message;
     use tokio::io::AsyncWriteExt;
 
@@ -1234,6 +1320,7 @@ async fn stale_session_batches_discarded() {
                 expires_at_ms: 0,
                 is_tombstone: false,
             }],
+            required_ack_level: ReplicationAckLevel::Applied as i32,
         })),
     }
     .encode(&mut batch_buf)
@@ -1251,7 +1338,10 @@ async fn stale_session_batches_discarded() {
 
 #[tokio::test]
 async fn current_session_rejects_far_future_timestamp() {
-    use actordb::proto::{Envelope, EnvelopeMsg, Hello, ReplicateBatch, ReplicateOp, SessionStart};
+    use actordb::proto::{
+        Envelope, EnvelopeMsg, Hello, ReplicateBatch, ReplicateOp, ReplicationAckLevel,
+        SessionStart,
+    };
     use prost::Message;
     use tokio::io::AsyncWriteExt;
 
@@ -1285,6 +1375,7 @@ async fn current_session_rejects_far_future_timestamp() {
                     expires_at_ms: 0,
                     is_tombstone: false,
                 }],
+                required_ack_level: ReplicationAckLevel::Applied as i32,
             })),
         },
     ];
@@ -1471,6 +1562,125 @@ async fn multi_key_partial_failure() {
     a.shutdown().await;
 }
 
+#[tokio::test]
+async fn batch_put_fails_over_after_a_stale_owner_returns_unavailable() {
+    use actordb::shard::FragmentId;
+
+    let map = |owners: &[&str]| {
+        HashMap::from([(
+            FragmentId(0),
+            owners.iter().map(|owner| (*owner).to_string()).collect(),
+        )])
+    };
+    let config = |fragment_map| NodeConfig {
+        fragment_map,
+        ..NodeConfig::default()
+    };
+    let a = Node::start(
+        "stale-a".to_string(),
+        "127.0.0.1:0".parse().unwrap(),
+        config(map(&["stale-b", "stale-c"])),
+    )
+    .await
+    .unwrap();
+    let b = Node::start(
+        "stale-b".to_string(),
+        "127.0.0.1:0".parse().unwrap(),
+        config(map(&["stale-c"])),
+    )
+    .await
+    .unwrap();
+    let c = Node::start(
+        "stale-c".to_string(),
+        "127.0.0.1:0".parse().unwrap(),
+        config(map(&["stale-c"])),
+    )
+    .await
+    .unwrap();
+    b.connect(a.addr()).await.unwrap();
+    c.connect(a.addr()).await.unwrap();
+    common::wait_for(
+        || async { a.peer_count().await == 2 },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    let results = a
+        .put_multi(vec![("stale-batch".to_string(), b"value".to_vec())])
+        .await;
+    assert!(results[0].is_ok(), "failover result: {:?}", results[0]);
+    assert_eq!(
+        c.get("stale-batch".to_string())
+            .await
+            .unwrap()
+            .map(|value| value.value),
+        Some(b"value".to_vec())
+    );
+
+    a.shutdown().await;
+    b.shutdown().await;
+    c.shutdown().await;
+}
+
+#[tokio::test]
+async fn mutation_relay_scans_past_the_origin_to_a_connected_owner() {
+    use actordb::shard::FragmentId;
+
+    let map = |owners: &[&str]| {
+        HashMap::from([(
+            FragmentId(0),
+            owners.iter().map(|owner| (*owner).to_string()).collect(),
+        )])
+    };
+    let config = |fragment_map| NodeConfig {
+        fragment_map,
+        ..NodeConfig::default()
+    };
+    let a = Node::start(
+        "relay-a".to_string(),
+        "127.0.0.1:0".parse().unwrap(),
+        config(map(&["relay-b"])),
+    )
+    .await
+    .unwrap();
+    let b = Node::start(
+        "relay-b".to_string(),
+        "127.0.0.1:0".parse().unwrap(),
+        config(map(&["relay-a", "relay-c"])),
+    )
+    .await
+    .unwrap();
+    let c = Node::start(
+        "relay-c".to_string(),
+        "127.0.0.1:0".parse().unwrap(),
+        config(map(&["relay-c"])),
+    )
+    .await
+    .unwrap();
+    b.connect(a.addr()).await.unwrap();
+    c.connect(b.addr()).await.unwrap();
+    common::wait_for(
+        || async { b.peer_count().await == 2 },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    a.put("relayed-write".to_string(), b"value".to_vec())
+        .await
+        .unwrap();
+    assert_eq!(
+        c.get("relayed-write".to_string())
+            .await
+            .unwrap()
+            .map(|value| value.value),
+        Some(b"value".to_vec())
+    );
+
+    a.shutdown().await;
+    b.shutdown().await;
+    c.shutdown().await;
+}
+
 /// Phase 7: saturating the background pool must not degrade
 /// high-priority read latency — the pools are isolated.
 #[tokio::test]
@@ -1590,6 +1800,7 @@ async fn queue_cap_shed_is_explicit_and_counted() {
 #[tokio::test]
 async fn forwarded_priority_preserved_end_to_end() {
     use actordb::actor::{OpPriority, PoolConfig};
+    use actordb::node::NodeError;
     use actordb::shard::{fragment_of, FragmentId};
     use std::collections::HashMap;
 
@@ -1639,7 +1850,11 @@ async fn forwarded_priority_preserved_end_to_end() {
     let r = a
         .put_multi_with_priority(vec![(key.clone(), b"v".to_vec())], OpPriority::Background)
         .await;
-    assert!(r[0].is_ok(), "fire-and-forget send should succeed");
+    assert!(
+        matches!(&r[0], Err(NodeError::Backpressure(_))),
+        "remote shed must be returned exactly, got {:?}",
+        r[0]
+    );
     common::wait_for(
         || async {
             b.health()
@@ -1675,6 +1890,95 @@ async fn forwarded_priority_preserved_end_to_end() {
     assert_eq!(
         default_shed, 0,
         "default-priority batch must not shed on b's healthy default pool"
+    );
+
+    a.shutdown().await;
+    b.shutdown().await;
+}
+
+#[tokio::test]
+async fn forwarded_single_put_returns_remote_backpressure() {
+    use actordb::actor::PoolConfig;
+    use actordb::node::NodeError;
+    use actordb::shard::{fragment_of, FragmentId};
+
+    let mut fragment_map = HashMap::new();
+    fragment_map.insert(FragmentId(0), vec!["a".to_string()]);
+    fragment_map.insert(FragmentId(1), vec!["b".to_string()]);
+    let config_a = NodeConfig {
+        fragment_count: 2,
+        fragment_map: fragment_map.clone(),
+        ..NodeConfig::default()
+    };
+    let config_b = NodeConfig {
+        default_pool: PoolConfig {
+            workers: 1,
+            queue_cap: 0,
+            rate_limit_per_sec: None,
+        },
+        ..config_a.clone()
+    };
+
+    let a = Node::start("a".to_string(), "127.0.0.1:0".parse().unwrap(), config_a)
+        .await
+        .unwrap();
+    let b = Node::start("b".to_string(), "127.0.0.1:0".parse().unwrap(), config_b)
+        .await
+        .unwrap();
+    b.connect(a.addr()).await.unwrap();
+    wait_for_peers(&a, &b).await;
+    let key = (0..100)
+        .map(|i| format!("remote-shed-{i}"))
+        .find(|key| fragment_of(key, 2) == FragmentId(1))
+        .unwrap();
+
+    let result = a.put(key.clone(), b"value".to_vec()).await;
+    assert!(
+        matches!(result, Err(NodeError::Backpressure(_))),
+        "remote shed must be returned exactly, got {result:?}"
+    );
+    assert!(!b.get_all().await.unwrap().contains_key(&key));
+
+    a.shutdown().await;
+    b.shutdown().await;
+}
+
+#[tokio::test]
+async fn forwarded_put_returns_remote_storage_failure() {
+    use actordb::node::NodeError;
+    use actordb::shard::{fragment_of, FragmentId};
+
+    let mut fragment_map = HashMap::new();
+    fragment_map.insert(FragmentId(0), vec!["a".to_string()]);
+    fragment_map.insert(FragmentId(1), vec!["b".to_string()]);
+    let config_a = NodeConfig {
+        fragment_count: 2,
+        fragment_map: fragment_map.clone(),
+        ..NodeConfig::default()
+    };
+    let config_b = NodeConfig {
+        store: Some(Arc::new(AlwaysFailStore)),
+        flush_batch_size: 1,
+        ..config_a.clone()
+    };
+
+    let a = Node::start("a".to_string(), "127.0.0.1:0".parse().unwrap(), config_a)
+        .await
+        .unwrap();
+    let b = Node::start("b".to_string(), "127.0.0.1:0".parse().unwrap(), config_b)
+        .await
+        .unwrap();
+    b.connect(a.addr()).await.unwrap();
+    wait_for_peers(&a, &b).await;
+    let key = (0..100)
+        .map(|i| format!("remote-store-{i}"))
+        .find(|key| fragment_of(key, 2) == FragmentId(1))
+        .unwrap();
+
+    let result = a.put(key, b"value".to_vec()).await;
+    assert!(
+        matches!(result, Err(NodeError::Storage(_))),
+        "remote storage failure must be returned exactly, got {result:?}"
     );
 
     a.shutdown().await;
@@ -2049,6 +2353,7 @@ async fn pre_handshake_forwarded_put_ignored() {
             boot_id: 0,
             priority: 0, // PRIORITY_DEFAULT
             hops: 0,
+            req_id: 1,
         })),
     }
     .encode(&mut buf)
@@ -2227,6 +2532,287 @@ async fn replication_not_shed_under_backpressure() {
     assert_eq!(
         shed, 0,
         "replicated op was shed under backpressure (ack would be a lie)"
+    );
+
+    a.shutdown().await;
+    b.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn memory_applied_ack_does_not_force_a_receiver_store_flush() {
+    use actordb::replication::{ReplicationAckDurability, SenderConfig};
+    use actordb::shard::FragmentId;
+
+    let store = Arc::new(GatedStore::default());
+    let config_a = NodeConfig {
+        replication: SenderConfig {
+            batch_size: 1,
+            batch_interval: Duration::from_millis(10),
+            required_ack_durability: ReplicationAckDurability::MemoryApplied,
+            ..SenderConfig::default()
+        },
+        ..NodeConfig::default()
+    };
+    let config_b = NodeConfig {
+        store: Some(store.clone()),
+        flush_batch_size: usize::MAX,
+        flush_interval: Duration::from_secs(3600),
+        snapshot_interval: Duration::from_secs(3600),
+        ..NodeConfig::default()
+    };
+    let a = Node::start(
+        "memory-ack-a".to_string(),
+        "127.0.0.1:0".parse().unwrap(),
+        config_a,
+    )
+    .await
+    .unwrap();
+    let b = Node::start(
+        "memory-ack-b".to_string(),
+        "127.0.0.1:0".parse().unwrap(),
+        config_b,
+    )
+    .await
+    .unwrap();
+    b.connect(a.addr()).await.unwrap();
+    wait_for_peers(&a, &b).await;
+
+    a.put("memory-ack".to_string(), b"value".to_vec())
+        .await
+        .unwrap();
+    common::wait_for(
+        || async {
+            a.sender_report(FragmentId(0), "memory-ack-b")
+                .await
+                .map(|report| {
+                    report.in_flight == 0
+                        && report.last_ack_durability
+                            == Some(ReplicationAckDurability::MemoryApplied)
+                })
+                .unwrap_or(false)
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+    assert!(
+        !store.entered.load(Ordering::SeqCst),
+        "MemoryApplied unexpectedly forced a store flush"
+    );
+    assert_eq!(
+        b.get("memory-ack".to_string())
+            .await
+            .unwrap()
+            .map(|value| value.value),
+        Some(b"value".to_vec())
+    );
+
+    // Clean shutdown flushes the buffered write, so release the test store
+    // only after proving that the ACK itself did not enter it.
+    store.release();
+    a.shutdown().await;
+    b.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn replication_ack_waits_for_the_receiver_store_fence() {
+    use actordb::replication::{ReplicationAckDurability, SenderConfig};
+    use actordb::shard::FragmentId;
+
+    let store = Arc::new(GatedStore::default());
+    let config_a = NodeConfig {
+        replication: SenderConfig {
+            batch_size: 1,
+            batch_interval: Duration::from_millis(10),
+            required_ack_durability: ReplicationAckDurability::StoreCommitted,
+            ..SenderConfig::default()
+        },
+        ..NodeConfig::default()
+    };
+    let config_b = NodeConfig {
+        store: Some(store.clone()),
+        flush_batch_size: 1_000_000,
+        ..NodeConfig::default()
+    };
+    let a = Node::start(
+        "ack-a".to_string(),
+        "127.0.0.1:0".parse().unwrap(),
+        config_a,
+    )
+    .await
+    .unwrap();
+    let b = Node::start(
+        "ack-b".to_string(),
+        "127.0.0.1:0".parse().unwrap(),
+        config_b,
+    )
+    .await
+    .unwrap();
+    b.connect(a.addr()).await.unwrap();
+    wait_for_peers(&a, &b).await;
+
+    a.put("ack-gated".to_string(), b"value".to_vec())
+        .await
+        .unwrap();
+    common::wait_for(
+        || async { store.entered.load(Ordering::SeqCst) },
+        Duration::from_secs(5),
+    )
+    .await;
+    let blocked = a
+        .sender_report(FragmentId(0), "ack-b")
+        .await
+        .expect("sender report missing");
+    assert_eq!(blocked.last_ack_durability, None);
+    assert_eq!(blocked.in_flight, 1, "batch retired before store fence");
+
+    store.release();
+    common::wait_for(
+        || async {
+            a.sender_report(FragmentId(0), "ack-b")
+                .await
+                .map(|report| {
+                    report.in_flight == 0
+                        && report.last_ack_durability
+                            == Some(ReplicationAckDurability::StoreCommitted)
+                })
+                .unwrap_or(false)
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+    assert_eq!(
+        b.get("ack-gated".to_string())
+            .await
+            .unwrap()
+            .map(|value| value.value),
+        Some(b"value".to_vec())
+    );
+
+    a.shutdown().await;
+    b.shutdown().await;
+}
+
+#[tokio::test]
+async fn replication_rejects_an_ack_below_the_configured_durability() {
+    use actordb::replication::{ReplicationAckDurability, SenderConfig};
+    use actordb::shard::FragmentId;
+
+    let config_a = NodeConfig {
+        replication: SenderConfig {
+            batch_size: 1,
+            batch_interval: Duration::from_millis(10),
+            required_ack_durability: ReplicationAckDurability::StoreCommitted,
+            ..SenderConfig::default()
+        },
+        ..NodeConfig::default()
+    };
+    let a = Node::start(
+        "durability-a".to_string(),
+        "127.0.0.1:0".parse().unwrap(),
+        config_a,
+    )
+    .await
+    .unwrap();
+    let b = test_node("durability-b").await;
+    b.connect(a.addr()).await.unwrap();
+    wait_for_peers(&a, &b).await;
+
+    a.put("memory-only-target".to_string(), b"value".to_vec())
+        .await
+        .unwrap();
+    common::wait_for(
+        || async {
+            a.sender_report(FragmentId(0), "durability-b")
+                .await
+                .map(|report| {
+                    report.in_flight == 1
+                        && report.ack_durability_mismatch
+                        && report.last_ack_durability
+                            == Some(ReplicationAckDurability::MemoryApplied)
+                })
+                .unwrap_or(false)
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+    assert_eq!(
+        b.get("memory-only-target".to_string())
+            .await
+            .unwrap()
+            .map(|value| value.value),
+        Some(b"value".to_vec())
+    );
+
+    a.shutdown().await;
+    b.shutdown().await;
+}
+
+#[tokio::test]
+async fn replication_nack_retries_the_exact_batch_after_store_failure() {
+    use actordb::replication::{ReplicationAckDurability, SenderConfig};
+    use actordb::shard::FragmentId;
+
+    let store = Arc::new(FailOnceStore::default());
+    let config_a = NodeConfig {
+        replication: SenderConfig {
+            batch_size: 1,
+            batch_interval: Duration::from_millis(10),
+            required_ack_durability: ReplicationAckDurability::StoreCommitted,
+            ..SenderConfig::default()
+        },
+        ..NodeConfig::default()
+    };
+    let config_b = NodeConfig {
+        store: Some(store.clone()),
+        flush_batch_size: 1_000_000,
+        ..NodeConfig::default()
+    };
+    let a = Node::start(
+        "retry-a".to_string(),
+        "127.0.0.1:0".parse().unwrap(),
+        config_a,
+    )
+    .await
+    .unwrap();
+    let b = Node::start(
+        "retry-b".to_string(),
+        "127.0.0.1:0".parse().unwrap(),
+        config_b,
+    )
+    .await
+    .unwrap();
+    b.connect(a.addr()).await.unwrap();
+    wait_for_peers(&a, &b).await;
+
+    a.put("retry-key".to_string(), b"retry-value".to_vec())
+        .await
+        .unwrap();
+    common::wait_for(
+        || async {
+            let acked = a
+                .sender_report(FragmentId(0), "retry-b")
+                .await
+                .map(|report| {
+                    report.in_flight == 0
+                        && report.last_ack_durability
+                            == Some(ReplicationAckDurability::StoreCommitted)
+                })
+                .unwrap_or(false);
+            acked && store.attempts.load(Ordering::SeqCst) >= 2
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+    let mut prefixed_key = 0u32.to_be_bytes().to_vec();
+    prefixed_key.extend_from_slice(b"retry-key");
+    assert_eq!(
+        store
+            .entries
+            .lock()
+            .unwrap()
+            .get(&prefixed_key)
+            .map(|value| value.value.clone()),
+        Some(b"retry-value".to_vec())
     );
 
     a.shutdown().await;

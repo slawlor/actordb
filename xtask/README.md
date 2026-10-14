@@ -9,5 +9,5 @@ cargo install grcov
 
 Subsequently, run:
 ```
-cargo xtask coverage --dev
+cargo run --bin xtask -- coverage --dev
 ```

@@ -74,13 +74,26 @@ The buffer is pushed to the store when:
 
 - it reaches `flush_batch_size` (default 1000 ops; ignored when `store` is `None`), or
 - a write arrives after `flush_interval` has elapsed (default 100 ms), or
-- the periodic **Snapshotter** ticks (every `snapshot_interval`, default 60 s).
+- the periodic **Snapshotter** ticks (every `snapshot_interval`, default 60 s), or
+- a tracked replication batch requests a `StoreCommitted` ACK, or an untracked
+  reconciliation batch finishes applying.
 
 `flush_interval` is write-triggered, not an independent timer. For an idle
 fragment, `snapshot_interval` is the upper bound before a periodic flush.
 The cleaner enqueues TTL-expiry tombstones through the same ordered buffer.
 Expired values found during startup are rewritten as tombstones before that
 fragment starts serving, so a crash/restart cannot erase the version floor.
+
+An inbound tracked replication batch adds an explicit flush fence after all of
+its apply replies only when its sender requests `StoreCommitted`; the default
+`MemoryApplied` requirement leaves the normal batch/interval flush policy in
+effect. Untracked reconciliation batches also flush after application. With a
+configured store, `BatchAck::STORE_COMMITTED` means
+`KvStore::write_batch` returned successfully for every update ordered before
+the fence. It does **not** mean fsync: `RocksDbStore` currently uses RocksDB's
+default WAL-backed, non-sync write options. Deployments that require
+power-loss durability need the later configurable-sync storage work; the wire
+ACK deliberately reports only the guarantee implemented here.
 
 Despite the name, the `Snapshotter` is **not** a RocksDB checkpoint — it is a
 periodic durable-flush actor (`SnapshotterMessage::Snap` → `shared.flush()`).

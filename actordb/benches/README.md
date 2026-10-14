@@ -31,7 +31,7 @@ regressions/improvements vs the first.
 |-------------------|------------------------------------|----------------------------------------------------|
 | `put_get.rs`      | 1 node, in-memory, no network      | `put` / `get` latency at 100 B, 10 KB, 1 MB values |
 | `fanout.rs`       | 3 nodes, 3 fragments (1 each)      | `put_multi` / `get_multi` at 10, 100, 1000 keys    |
-| `replication.rs`  | 2 nodes, 1 shared fragment         | ack-to-visible lag for 10, 100, 1000-key batches   |
+| `replication.rs`  | 2 nodes, 1 shared fragment         | source-apply-completion-to-replica-visible lag for 10, 100, 1000-key batches |
 
 Each file has a doc comment explaining what it measures and how to read a
 regression — start there before tuning.
@@ -66,7 +66,7 @@ matters is the trend on the *same* machine.
 finding #30 closed. `get_multi` went from 99.9/105.6/120.8 ms to
 0.22/0.79/8.31 ms, a 93–99% reduction.)
 
-### replication (mean ack-to-visible lag)
+### replication (mean source-apply-completion-to-replica-visible lag)
 
 | batch size | 10 keys | 100 keys | 1000 keys |
 |------------|---------|----------|-----------|
