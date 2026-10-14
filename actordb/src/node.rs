@@ -219,7 +219,8 @@ pub enum NodeError {
         node_id: String,
         is_tombstone: bool,
     },
-    /// A mutation reached the fragment after its TTL deadline.
+    /// A mutation reached the fragment after its TTL deadline. Its expiry
+    /// tombstone was installed so older values cannot reappear.
     Expired,
 }
 
@@ -482,11 +483,11 @@ pub struct NodeConfig {
     /// How often each fragment's snapshotter flushes the write buffer
     /// to the store. Default 60 seconds.
     pub snapshot_interval: Duration,
-    /// How long tombstones are kept before the cleaner garbage-collects
-    /// them. Must exceed the longest expected partition: a node
-    /// rejoining after its tombstones were GC'd can resurrect deleted
-    /// keys. Default 1 hour.
-    pub tombstone_gc_age: Duration,
+    /// Optional age after which the cleaner removes tombstones from memory.
+    /// `None` (default) retains them indefinitely. Time-based GC is unsafe:
+    /// a node rejoining after a longer partition can resurrect deleted keys,
+    /// so opt in only with a cluster-specific convergence guarantee.
+    pub tombstone_gc_age: Option<Duration>,
     /// Wall-clock offset (ms) applied to this node's HLC. Zero in
     /// production; tests use it to simulate clock skew. Hidden from
     /// docs: not a tuning knob.
@@ -550,7 +551,7 @@ impl Default for NodeConfig {
             },
             clean_interval: Duration::from_secs(30),
             snapshot_interval: Duration::from_secs(60),
-            tombstone_gc_age: Duration::from_secs(3600),
+            tombstone_gc_age: None,
             clock_skew_ms: 0,
             max_clock_skew: Duration::from_secs(300),
             cluster_secret: None,
@@ -594,6 +595,13 @@ impl Node {
                 "no cluster_secret configured: the peer mesh is unauthenticated; \
                  anyone with TCP reachability can join. Set \
                  NodeConfig.cluster_secret in production."
+            );
+        }
+        if let Some(age) = config.tombstone_gc_age {
+            tracing::warn!(
+                ?age,
+                "unsafe time-based tombstone GC is enabled; a node returning \
+                 after a longer partition can resurrect deleted or expired data"
             );
         }
         let dynamic = config.placement_controller.is_some();
@@ -1035,7 +1043,8 @@ impl Node {
     /// Write `value` under `key`, with an optional time-to-live. When
     /// `ttl` is set, the key expires `ttl` after this call (wall-clock):
     /// reads treat it as absent past expiry, and the fragment's cleaner
-    /// reaps it on its next sweep.
+    /// materializes and persists a versioned expiry tombstone on its next
+    /// sweep so older replicas cannot resurrect it.
     ///
     /// Local puts are read-your-write: when `put_with_ttl` returns, the
     /// op has been applied to the local copy. Forwarded puts are
@@ -1126,7 +1135,12 @@ impl Node {
                         is_tombstone,
                     })
                 }
-                ApplyOutcome::Expired => return Err(NodeError::Expired),
+                ApplyOutcome::Expired => {
+                    let mut expiry = op.clone();
+                    expiry.value = expiry.value.expiry_tombstone();
+                    self.enqueue_for_replication(frag, &expiry).await;
+                    return Err(NodeError::Expired);
+                }
             }
 
             self.enqueue_for_replication(frag, &op).await;

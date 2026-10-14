@@ -131,7 +131,7 @@ pub enum NodeError {
     Backpressure(String),      // shed by queue cap or rate limit — retry with backoff
     Storage(String),           // persistence failed during apply
     Superseded { .. },         // another LWW version won; this write was not applied
-    Expired,                   // TTL elapsed before the fragment applied the write
+    Expired,                   // TTL elapsed; its expiry tombstone was installed
 }
 ```
 

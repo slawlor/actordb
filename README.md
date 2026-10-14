@@ -26,8 +26,8 @@ A working, tested prototype of the actor-first sharded database vision:
   are serialized there.
 * **`supervision`**: every fragment runs under a `FragmentSupervisor`
   owning the dispatcher pool plus background actors — a `Cleaner`
-  (TTL expiry, tombstone aging) and a `Snapshotter` (periodic durable
-  flush). Dead workers restart in place; dead children restart without
+  (durable TTL-expiry markers, optional tombstone aging) and a `Snapshotter`
+  (periodic durable flush). Dead workers restart in place; dead children restart without
   touching sibling fragments. `Node::health()` reports per-fragment
   health.
 * **`node`**: a `Node` pairs the per-fragment supervisors with a Tokio
@@ -45,8 +45,8 @@ A working, tested prototype of the actor-first sharded database vision:
 * **`proto`**: the wire protocol — prost-encoded `Envelope` frames,
   length-delimited over TCP.
 
-Run the tests (19 cluster integration tests over real localhost TCP,
-plus 9 unit tests):
+Run the tests (more than 40 cluster integration tests over real localhost
+TCP, plus more than 20 unit tests):
 
 ```bash
 cargo test
@@ -187,9 +187,9 @@ Key `NodeConfig` knobs:
 | `high_pool` defaults | 2 workers / cap 5_000 / no limit | Latency-sensitive traffic |
 | `background_pool` defaults | 2 workers / cap 5_000 / 1000 ops/s | Bulk/scan traffic (rate-limited) |
 | `flush_batch_size` / `flush_interval` | 1000 / 100ms | Persistence batching |
-| `clean_interval` | 30s | TTL/tombstone sweep period |
+| `clean_interval` | 30s | TTL-expiry materialization / optional tombstone-GC sweep period |
 | `snapshot_interval` | 60s | Periodic durable flush |
-| `tombstone_gc_age` | 1h | Tombstone retention (must exceed longest expected partition) |
+| `tombstone_gc_age` | None | Tombstone GC disabled; `Some(age)` is an unsafe, memory-only opt-in |
 | `replication` | defaults | `SenderConfig`: batch size/interval, max in-flight, buffer capacity, consistency interval |
 | `placement_controller` | None | Phase 8: `Some(Arc<dyn PlacementController>)` opts into dynamic placement |
 | `placement_poll_interval` | 1s | Phase 8: how often the driver re-evaluates desired placement |
@@ -344,9 +344,10 @@ as issues in the [issue tracker](https://github.com/slawlor/actordb/issues):
   steady-state replication is incremental (batches + reconciliation).
   With dynamic placement enabled the handshake skips the full-state
   sync and the reconciler owns anti-entropy (delta-only).
-- **Tombstone GC is time-based and memory-only** — a node partitioned longer than
-  `tombstone_gc_age` can resurrect deleted keys on rejoin, and GC'd tombstones
-  are re-loaded from RocksDB on the next boot (no durable delete path exists).
+- **Tombstone GC is disabled by default** — the optional time-based mode is
+  memory-only. A node partitioned longer than the configured age can resurrect
+  deleted keys on rejoin, and GC'd tombstones are re-loaded from RocksDB on the
+  next boot (no durable delete path exists).
 
 ## Contributors
 

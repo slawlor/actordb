@@ -41,8 +41,8 @@ worker's exact result:
   idempotent success.
 - `Superseded { .. }`: another version won; `Node` returns
   `NodeError::Superseded` and never reports this write successful.
-- `Expired`: the TTL elapsed before application; `Node` returns
-  `NodeError::Expired`.
+- `Expired`: the TTL elapsed before application; its deterministic expiry
+  tombstone was installed and `Node` returns `NodeError::Expired`.
 
 Admission and storage failures are also returned directly as
 `NodeError::Backpressure` and `NodeError::Storage`. There is no read-back
@@ -72,10 +72,10 @@ On partition:
 - Concurrent writes to the same key on both sides resolve by HLC timestamp
   when the partition heals — the later timestamp wins, the earlier is
   silently discarded. There is no conflict callback.
-- Deletes are tombstones, so a delete on one side beats a pre-partition put on
-  the other once they meet — unless tombstone GC already reaped the tombstone
-  (see [Tombstones](tombstones.md): `tombstone_gc_age` must exceed the longest
-  expected partition, or deleted keys can resurrect).
+- Deletes and TTL expiry leave versioned tombstones, so they beat older values
+  when replicas meet. Tombstone GC defaults off; explicitly enabling it
+  reintroduces resurrection risk after a partition longer than the chosen age
+  (see [Tombstones](tombstones.md)).
 - A node that restarts with the same `node_id` gets a new session id and
   reconciles; batches from its old session are discarded by receivers.
 
@@ -88,4 +88,5 @@ On partition:
   [Persistence](persistence.md)) — recovered via peer sync.
 - Expired keys read as absent, but expiry is evaluated at read time against
   each node's clock; a heavily skewed clock can serve an expired key slightly
-  longer or hide a live one slightly early.
+  longer or hide a live one slightly early. The cleaner eventually persists a
+  deterministic expiry tombstone using the TTL write's original LWW version.

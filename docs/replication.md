@@ -94,9 +94,11 @@ channel vanishes mid-fetch, the round is treated as complete rather than
 stalled (bootstrap is additionally bounded by `BOOTSTRAP_TIMEOUT` = 30 s —
 availability over consistency).
 
-The cleaner's tombstone GC is **blocked while any sender for the fragment is
-in `BufferReset`**: the tombstone may not have reached the peer, and GC'ing it
-would let reconciliation resurrect the deleted key.
+When optional tombstone GC is enabled, it is **blocked while any sender for the
+fragment is in `BufferReset`**: the tombstone may not have reached the peer,
+and GC'ing it would let reconciliation resurrect the deleted key. GC defaults
+to disabled because this guard cannot prove convergence across an arbitrary
+partition.
 
 ## The Hello / full-state handshake
 

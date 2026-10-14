@@ -43,9 +43,11 @@ node converges to the full dataset with zero full-state sync entries.
   on heal.
 - Concurrent writes to the same key resolve by HLC timestamp on heal — later
   wins, silently.
-- **Tombstone resurrection risk**: if a partition outlasts `tombstone_gc_age`,
-  the GC'd tombstone is gone and the other side's pre-delete value wins on
-  heal. Size `tombstone_gc_age` above your longest expected partition.
+- TTL expiry creates a tombstone with the TTL write's version, so a
+  pre-expiry value on the other side cannot reappear when the partition heals.
+- **Opt-in tombstone resurrection risk**: `tombstone_gc_age` defaults to
+  `None`. If time-based GC is enabled and a partition outlasts that age, the
+  GC'd tombstone is gone and the other side's older value can win on heal.
 - While partitioned, `replica_order` failover only helps if a replica is
   reachable; otherwise reads fail with `NodeError::Network`.
 
@@ -86,6 +88,7 @@ Operational rules of thumb:
   static mode — a mismatch silently makes keys unreachable.
 - Keep at least two replicas per fragment if you care about the unflushed
   write tail surviving `kill -9`.
-- `tombstone_gc_age` > longest expected partition, always.
+- Leave `tombstone_gc_age` as `None` unless the deployment has a stronger
+  convergence/repair guarantee. If enabled, it must exceed every partition.
 - The background pool's default 1000 ops/s rate limit is a feature, not a bug
   — raise it deliberately if your bulk path needs more.

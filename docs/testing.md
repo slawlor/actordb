@@ -13,8 +13,8 @@ integration tests rely on.
 
 ## Integration tests (`actordb/tests/cluster.rs`)
 
-31 tests over real TCP on localhost with multiple `Node`s in one process —
-the bulk of behavioral coverage:
+More than 40 tests over real TCP on localhost with multiple `Node`s in one
+process — the bulk of behavioral coverage:
 
 - **Basics**: `single_node_put_get`, `two_nodes_replicate`,
   `three_node_mesh_converges`, `lww_last_write_wins_everywhere`.
@@ -23,8 +23,11 @@ the bulk of behavioral coverage:
 - **Failures**: `dropped_connection_redials`,
   `restarted_node_writes_are_accepted`, `late_joiner_receives_full_state`,
   `worker_kill_triggers_supervised_restart`.
-- **TTL/tombstones**: `ttl_expiry_removes_key`, `delete_propagates_to_replicas`,
-  `delete_survives_restart_and_rejoin`.
+- **TTL/tombstones**: `ttl_expiry_removes_key`,
+  `ttl_expiry_is_persisted_as_a_versioned_tombstone`,
+  `ttl_expiry_does_not_resurrect_an_older_partitioned_value`,
+  `startup_rewrites_expired_durable_values_as_tombstones`,
+  `delete_propagates_to_replicas`, `delete_survives_restart_and_rejoin`.
 - **HLC**: `hlc_orders_writes_under_clock_skew` (simulated skew via the
   hidden `clock_skew_ms` knob).
 - **Replication internals**: `sender_buffer_reset_and_reconcile`,
