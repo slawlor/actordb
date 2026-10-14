@@ -24,6 +24,8 @@ of the defaults.
 | `replication` | `SenderConfig` | see below | Per-fragment×peer sender tuning. |
 | `placement_controller` | `Option<Arc<dyn PlacementController>>` | `None` | `None` = static placement. Set to `ManualPlacement` (or your own controller) for dynamic migration. |
 | `placement_poll_interval` | `Duration` | `1 s` | Driver re-evaluation cadence. Ignored in static mode. |
+| `max_clock_skew` | `Duration` | `300 s` (5 min) | Remote timestamps more than this far ahead of the local wall clock are clamped in `HlcClock::observe`. Bounds the damage from far-future timestamps (malicious or skewed peers). |
+| `cluster_secret` | `Option<Vec<u8>>` | `None` | Pre-shared secret for handshake authentication. When set, `Hello` carries HMAC-SHA256(secret, node_id); mismatches drop the connection and pre-handshake messages are ignored. `None` = unauthenticated mesh (warning logged). Must be identical on every node. |
 
 `clock_skew_ms` exists but is `#[doc(hidden)]` — it is a test-only HLC skew
 simulator, not a tuning knob.

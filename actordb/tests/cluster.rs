@@ -980,6 +980,7 @@ async fn stale_session_batches_discarded() {
     Envelope {
         msg: Some(EnvelopeMsg::Hello(Hello {
             node_id: "a".to_string(),
+            auth_tag: Vec::new(),
         })),
     }
     .encode(&mut hello_buf)
@@ -1660,5 +1661,295 @@ async fn placement_rolling_restart_delta_reconcile_only() {
     );
 
     a2.shutdown().await;
+    b.shutdown().await;
+}
+
+/// Regression test for adversarial review #1: a shed write must never
+/// be acked `Ok`. With a zero-cap pool every ApplyOp sheds; every `put`
+/// must surface `Backpressure`, never `Ok`.
+#[tokio::test]
+async fn shed_write_never_acked_ok() {
+    use actordb::actor::PoolConfig;
+    use actordb::node::NodeError;
+
+    // Degenerate: cap 0 sheds every op deterministically.
+    let config = NodeConfig {
+        default_pool: PoolConfig {
+            workers: 1,
+            queue_cap: 0,
+            rate_limit_per_sec: None,
+        },
+        ..NodeConfig::default()
+    };
+    let n = Node::start(
+        "shed-ok".to_string(),
+        "127.0.0.1:0".parse().unwrap(),
+        config,
+    )
+    .await
+    .unwrap();
+
+    for i in 0..20 {
+        let key = format!("sw-{i}");
+        let r = n.put(key.clone(), b"v".to_vec()).await;
+        assert!(
+            matches!(r, Err(NodeError::Backpressure(_))),
+            "shed put must be Backpressure, not Ok: got {r:?} for {key}"
+        );
+        // And the key must not exist (nothing was applied).
+        let got = n.get(key.clone()).await;
+        // The get itself sheds (cap 0) → Backpressure, not Ok(None).
+        assert!(
+            matches!(got, Err(NodeError::Backpressure(_))),
+            "shed get must be Backpressure, got {got:?}"
+        );
+    }
+
+    n.shutdown().await;
+}
+
+/// Shed deletes must surface as `Backpressure`, not masquerade as
+/// successful deletes (which also read back as `None` via the
+/// tombstone-filtering `get`).
+#[tokio::test]
+async fn shed_delete_never_acked_ok() {
+    use actordb::actor::PoolConfig;
+    use actordb::node::NodeError;
+
+    // Degenerate: cap 0 sheds every op deterministically.
+    let config = NodeConfig {
+        default_pool: PoolConfig {
+            workers: 1,
+            queue_cap: 0,
+            rate_limit_per_sec: None,
+        },
+        ..NodeConfig::default()
+    };
+    let n = Node::start(
+        "shed-del".to_string(),
+        "127.0.0.1:0".parse().unwrap(),
+        config,
+    )
+    .await
+    .unwrap();
+
+    for i in 0..20 {
+        let key = format!("sd-{i}");
+        let r = n.delete(key.clone()).await;
+        assert!(
+            matches!(r, Err(NodeError::Backpressure(_))),
+            "shed delete must be Backpressure, not Ok: got {r:?} for {key}"
+        );
+    }
+
+    n.shutdown().await;
+}
+
+/// Regression test for adversarial review #3: a ForwardedPut arriving
+/// before any Hello (no completed handshake) must be ignored, not applied.
+#[tokio::test]
+async fn pre_handshake_forwarded_put_ignored() {
+    use actordb::proto::{Envelope, EnvelopeMsg, ForwardedPut};
+    use prost::Message;
+    use tokio::io::AsyncWriteExt;
+
+    let a = test_node("a").await;
+
+    // Raw TCP, no Hello: send a ForwardedPut directly.
+    let mut stream = tokio::net::TcpStream::connect(a.addr()).await.unwrap();
+    let mut buf = Vec::new();
+    Envelope {
+        msg: Some(EnvelopeMsg::ForwardedPut(ForwardedPut {
+            key: "evil".to_string(),
+            value: b"evil-val".to_vec(),
+            timestamp_ms: 1,
+            node_id: "attacker".to_string(),
+            expires_at_ms: 0,
+            is_tombstone: false,
+            seq: 0,
+            boot_id: 0,
+            priority: 0, // PRIORITY_DEFAULT
+            hops: 0,
+        })),
+    }
+    .encode(&mut buf)
+    .unwrap();
+    stream.write_u32(buf.len() as u32).await.unwrap();
+    stream.write_all(&buf).await.unwrap();
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // The key must not exist: the pre-handshake write was dropped.
+    let got = a.get("evil".to_string()).await.unwrap();
+    assert!(
+        got.is_none(),
+        "pre-handshake ForwardedPut was applied! got {got:?}"
+    );
+
+    a.shutdown().await;
+}
+
+/// Regression test for adversarial review #3: with a cluster secret
+/// configured, a Hello with a bad auth tag must drop the connection.
+#[tokio::test]
+async fn hello_auth_mismatch_drops_connection() {
+    use actordb::proto::{Envelope, EnvelopeMsg, Hello};
+    use prost::Message;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let config = NodeConfig {
+        cluster_secret: Some(b"correct-secret".to_vec()),
+        ..NodeConfig::default()
+    };
+    let a = Node::start("a".to_string(), "127.0.0.1:0".parse().unwrap(), config)
+        .await
+        .unwrap();
+
+    // Wrong secret: HMAC won't verify.
+    let mut stream = tokio::net::TcpStream::connect(a.addr()).await.unwrap();
+    let mut buf = Vec::new();
+    Envelope {
+        msg: Some(EnvelopeMsg::Hello(Hello {
+            node_id: "b".to_string(),
+            auth_tag: b"wrong-tag".to_vec(),
+        })),
+    }
+    .encode(&mut buf)
+    .unwrap();
+    stream.write_u32(buf.len() as u32).await.unwrap();
+    stream.write_all(&buf).await.unwrap();
+
+    // The server must close the connection: read returns 0 (EOF).
+    let mut read_buf = [0u8; 16];
+    let n = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut read_buf))
+        .await
+        .expect("timed out waiting for close")
+        .unwrap();
+    assert_eq!(n, 0, "expected connection to be closed on auth failure");
+
+    // And "b" must not be a peer.
+    assert_eq!(a.peer_count().await, 0, "unauthenticated peer was accepted");
+
+    a.shutdown().await;
+}
+
+/// Regression test for adversarial review #4: a Hello claiming our own
+/// node_id must be rejected.
+#[tokio::test]
+async fn hello_claiming_self_id_rejected() {
+    use actordb::proto::{Envelope, EnvelopeMsg, Hello};
+    use prost::Message;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let a = test_node("a").await;
+
+    let mut stream = tokio::net::TcpStream::connect(a.addr()).await.unwrap();
+    let mut buf = Vec::new();
+    Envelope {
+        msg: Some(EnvelopeMsg::Hello(Hello {
+            node_id: "a".to_string(), // our own id!
+            auth_tag: Vec::new(),
+        })),
+    }
+    .encode(&mut buf)
+    .unwrap();
+    stream.write_u32(buf.len() as u32).await.unwrap();
+    stream.write_all(&buf).await.unwrap();
+
+    let mut read_buf = [0u8; 16];
+    let n = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut read_buf))
+        .await
+        .expect("timed out waiting for close")
+        .unwrap();
+    assert_eq!(n, 0, "expected connection to be closed on self-id Hello");
+
+    a.shutdown().await;
+}
+
+/// Positive case: two nodes with the same cluster secret complete the
+/// handshake and replicate.
+#[tokio::test]
+async fn cluster_secret_handshake_succeeds() {
+    let secret = b"shared-secret".to_vec();
+    let config_a = NodeConfig {
+        cluster_secret: Some(secret.clone()),
+        ..NodeConfig::default()
+    };
+    let config_b = NodeConfig {
+        cluster_secret: Some(secret),
+        ..NodeConfig::default()
+    };
+    let a = Node::start("a".to_string(), "127.0.0.1:0".parse().unwrap(), config_a)
+        .await
+        .unwrap();
+    let b = Node::start("b".to_string(), "127.0.0.1:0".parse().unwrap(), config_b)
+        .await
+        .unwrap();
+
+    b.connect(a.addr()).await.unwrap();
+    wait_for_peers(&a, &b).await;
+
+    // Both peers authenticated: they see each other.
+    assert_eq!(a.peer_count().await, 1);
+    assert_eq!(b.peer_count().await, 1);
+
+    a.shutdown().await;
+    b.shutdown().await;
+}
+
+/// Regression test for adversarial review #2: replicated ops must not
+/// be shed under backpressure. The receiver's dispatcher is saturated
+/// (cap 0 sheds all local ops), but replication bypasses admission —
+/// otherwise the sender would ack batches that were never applied.
+#[tokio::test]
+async fn replication_not_shed_under_backpressure() {
+    use actordb::actor::PoolConfig;
+
+    let a = test_node("a").await;
+    // B sheds every local op (cap 0), but replication must still land.
+    let config_b = NodeConfig {
+        default_pool: PoolConfig {
+            workers: 1,
+            queue_cap: 0,
+            rate_limit_per_sec: None,
+        },
+        ..NodeConfig::default()
+    };
+    let b = Node::start("b".to_string(), "127.0.0.1:0".parse().unwrap(), config_b)
+        .await
+        .unwrap();
+
+    b.connect(a.addr()).await.unwrap();
+    wait_for_peers(&a, &b).await;
+
+    // A writes; the batch replicates to B.
+    a.put("repl-k".to_string(), b"repl-v".to_vec())
+        .await
+        .unwrap();
+
+    // B must converge despite its saturated pool: get_all bypasses
+    // admission, so we can observe the replicated state directly.
+    common::wait_for(
+        || async {
+            b.get_all()
+                .await
+                .unwrap()
+                .get("repl-k")
+                .map(|v| v.value.clone())
+                == Some(b"repl-v".to_vec())
+        },
+        Duration::from_secs(15),
+    )
+    .await;
+
+    // And the replicated op must not have been counted as shed.
+    let health = b.health().await.unwrap();
+    let shed: u64 = health.values().map(|h| h.shed_counts.1).sum();
+    assert_eq!(
+        shed, 0,
+        "replicated op was shed under backpressure (ack would be a lie)"
+    );
+
+    a.shutdown().await;
     b.shutdown().await;
 }

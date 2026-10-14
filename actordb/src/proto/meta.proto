@@ -19,6 +19,10 @@ package meta;
 // Handshake: identifies the connecting node
 message Hello {
   string node_id = 1;
+  // HMAC-SHA256(cluster_secret, node_id). Present iff the cluster is
+  // configured with a secret; the receiver recomputes and compares in
+  // constant time. Empty = no secret configured (unauthenticated).
+  bytes auth_tag = 2;
 }
 
 // Phase 7: operation priority for traffic isolation. Wire values are
