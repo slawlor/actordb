@@ -42,7 +42,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::task::AbortHandle;
 
-use crate::actor::{now_ms, KvActor, KvArgs, KvMessage, ReplicatedOp, VersionedValue};
+use crate::actor::{now_ms, KvMessage, ReplicatedOp, VersionedValue};
 use crate::network::{BoxStream, Network, TcpNetwork};
 use crate::proto::{
     Envelope, EnvelopeMsg, ForwardedGet, ForwardedPut, GetResponse, Hello,
@@ -50,6 +50,7 @@ use crate::proto::{
 };
 use crate::shard::{fragment_of, FragmentId};
 use crate::store::{KvStore, PrefixedStore};
+use crate::supervision::{FragmentHealth, FragmentSupervisor, SupervisorArgs, SupervisorMessage};
 
 /// Maximum wire frame size (16 MiB). Anything larger is treated as a
 /// corrupt stream and the connection is dropped.
@@ -64,6 +65,9 @@ const RECONNECT_MAX: Duration = Duration::from_secs(30);
 
 /// peer node_id -> outbound frame queue
 type PeerMap = Arc<Mutex<HashMap<String, mpsc::Sender<Vec<u8>>>>>;
+
+/// Unique worker-name prefixes across supervisors in this process.
+static NEXT_WORKER_PREFIX: AtomicU64 = AtomicU64::new(0);
 
 /// Everything a connection task needs. Cloned per connection.
 #[derive(Clone)]
@@ -162,6 +166,9 @@ pub struct Node {
     listen_addr: SocketAddr,
     /// Routes keys to their fragment actors.
     router: FragmentRouter,
+    /// Per-fragment supervisors (own the dispatcher, cleaner,
+    /// snapshotter). Stopped on shutdown.
+    supervisors: HashMap<FragmentId, ActorRef<SupervisorMessage>>,
     /// Static placement (see `NodeConfig::fragment_map`).
     fragment_map: HashMap<FragmentId, Vec<String>>,
     /// Static membership (see `NodeConfig::members`).
@@ -235,6 +242,12 @@ pub struct NodeConfig {
     /// `hash(key) % worker_count`: per-key ordering holds, different
     /// keys execute concurrently. Default 4.
     pub worker_count: usize,
+    /// How often each fragment's cleaner sweeps for TTL-expired keys.
+    /// Default 30 seconds.
+    pub clean_interval: Duration,
+    /// How often each fragment's snapshotter flushes the write buffer
+    /// to the store. Default 60 seconds.
+    pub snapshot_interval: Duration,
 }
 
 impl Default for NodeConfig {
@@ -248,6 +261,8 @@ impl Default for NodeConfig {
             fragment_map: HashMap::new(),
             members: HashMap::new(),
             worker_count: 4,
+            clean_interval: Duration::from_secs(30),
+            snapshot_interval: Duration::from_secs(60),
         }
     }
 }
@@ -316,29 +331,56 @@ impl Node {
                 .collect()
         };
 
-        // One actor per served fragment. With persistence, each fragment
-        // gets its own key namespace via PrefixedStore, sharing the one
-        // underlying store.
+        // One supervised subtree per served fragment. With persistence,
+        // each fragment gets its own key namespace via PrefixedStore,
+        // sharing the one underlying store. The supervisor owns the
+        // dispatcher, cleaner and snapshotter; the router talks to the
+        // dispatcher through the supervisor.
+        let mut supervisors = HashMap::with_capacity(my_fragments.len());
         let mut actors = HashMap::with_capacity(my_fragments.len());
         for fragment in my_fragments {
+            // Unique per supervisor: tests run nodes in parallel in one
+            // process, and the actor registry is process-global.
+            let worker_prefix = format!(
+                "{}-frag{}-{}",
+                node_id,
+                fragment.0,
+                NEXT_WORKER_PREFIX.fetch_add(1, Ordering::SeqCst)
+            );
             let store = config
                 .store
                 .clone()
                 .map(|inner| Arc::new(PrefixedStore::new(inner, fragment)) as Arc<dyn KvStore>);
-            let (actor, _actor_handle) = KvActor::spawn(
+            let (supervisor, _sup_handle) = FragmentSupervisor::spawn(
                 None,
-                KvActor,
-                KvArgs {
-                    store,
+                FragmentSupervisor,
+                SupervisorArgs {
                     fragment,
+                    worker_prefix,
+                    store,
                     worker_count: config.worker_count,
                     flush_batch_size: config.flush_batch_size,
                     flush_interval: config.flush_interval,
+                    clean_interval: config.clean_interval,
+                    snapshot_interval: config.snapshot_interval,
                 },
             )
             .await
             .map_err(|e| NodeError::Actor(e.to_string()))?;
-            actors.insert(fragment, actor);
+            let dispatcher = match supervisor
+                .call(|reply| SupervisorMessage::GetDispatcher { reply }, None)
+                .await
+                .map_err(|e| NodeError::Actor(e.to_string()))?
+            {
+                CallResult::Success(d) => d,
+                _ => {
+                    return Err(NodeError::Actor(
+                        "supervisor dropped dispatcher reply".to_string(),
+                    ))
+                }
+            };
+            supervisors.insert(fragment, supervisor);
+            actors.insert(fragment, dispatcher);
         }
 
         let (bound_addr, mut acceptor) = config
@@ -356,6 +398,7 @@ impl Node {
             boot_id: fresh_boot_id(),
             listen_addr: bound_addr,
             router: router.clone(),
+            supervisors,
             fragment_map: config.fragment_map.clone(),
             members: config.members.clone(),
             pending_gets: Arc::new(Mutex::new(HashMap::new())),
@@ -491,14 +534,35 @@ impl Node {
     /// to the owner (at-least-once; the owner replicates to the other
     /// holders).
     pub async fn put(&self, key: String, value: Vec<u8>) -> Result<(), NodeError> {
+        self.put_with_ttl(key, value, None).await
+    }
+
+    /// Write `value` under `key`, with an optional time-to-live. When
+    /// `ttl` is set, the key expires `ttl` after this call (wall-clock):
+    /// reads treat it as absent past expiry, and the fragment's cleaner
+    /// reaps it on its next sweep.
+    ///
+    /// Local puts are read-your-write: when `put_with_ttl` returns, the
+    /// op has been applied to the local copy. Forwarded puts are
+    /// fire-and-forget to the owner (at-least-once; the owner replicates
+    /// to the other holders).
+    pub async fn put_with_ttl(
+        &self,
+        key: String,
+        value: Vec<u8>,
+        ttl: Option<Duration>,
+    ) -> Result<(), NodeError> {
         let seq = {
             let mut guard = self.next_seq.lock().await;
             *guard += 1;
             *guard
         };
+        let now = now_ms();
+        let mut vv = VersionedValue::new(value, now, self.node_id.clone());
+        vv.expires_at_ms = ttl.map(|t| now + t.as_millis() as u64);
         let op = ReplicatedOp {
             key: key.clone(),
-            value: VersionedValue::new(value, now_ms(), self.node_id.clone()),
+            value: vv,
             seq,
             boot_id: self.boot_id,
         };
@@ -550,6 +614,7 @@ impl Node {
                     node_id: op.value.node_id,
                     seq: op.seq,
                     boot_id: op.boot_id,
+                    expires_at_ms: op.value.expires_at_ms.unwrap_or(0),
                 })),
             },
         )
@@ -637,11 +702,30 @@ impl Node {
         for t in tasks.drain(..) {
             t.abort();
         }
-        // The handlers never block, so this returns promptly. Failures
-        // just mean an actor was already dead.
-        for actor in self.router.actors.values() {
-            let _ = actor.stop_and_wait(None, None).await;
+        // Stop the supervisors; each drains its dispatcher pool (which
+        // flushes) and its background actors. Failures just mean an
+        // actor was already dead.
+        for supervisor in self.supervisors.values() {
+            let _ = supervisor.stop_and_wait(None, None).await;
         }
+    }
+
+    /// Health snapshots for every fragment this node serves.
+    pub async fn health(&self) -> Result<HashMap<FragmentId, FragmentHealth>, NodeError> {
+        let mut out = HashMap::with_capacity(self.supervisors.len());
+        for (frag, supervisor) in &self.supervisors {
+            let res = supervisor
+                .call(|reply| SupervisorMessage::GetHealth { reply }, None)
+                .await
+                .map_err(|e| NodeError::Actor(e.to_string()))?;
+            match res {
+                CallResult::Success(h) => {
+                    out.insert(*frag, h);
+                }
+                _ => return Err(NodeError::Actor("health check failed".to_string())),
+            }
+        }
+        Ok(out)
     }
 }
 
@@ -721,11 +805,19 @@ async fn handle_connection(ctx: ConnContext, stream: BoxStream, we_dialed: bool)
                 }
                 let replicated = ReplicatedOp {
                     key: op.key.clone(),
-                    value: VersionedValue::new(
-                        op.value.clone(),
-                        op.timestamp_ms,
-                        op.node_id.clone(),
-                    ),
+                    value: {
+                        let mut v = VersionedValue::new(
+                            op.value.clone(),
+                            op.timestamp_ms,
+                            op.node_id.clone(),
+                        );
+                        v.expires_at_ms = if op.expires_at_ms == 0 {
+                            None
+                        } else {
+                            Some(op.expires_at_ms)
+                        };
+                        v
+                    },
                     seq: op.seq,
                     boot_id: op.boot_id,
                 };
@@ -747,7 +839,16 @@ async fn handle_connection(ctx: ConnContext, stream: BoxStream, we_dialed: bool)
                 // out to the other replica holders (excluding the sender).
                 let replicated = ReplicatedOp {
                     key: p.key.clone(),
-                    value: VersionedValue::new(p.value.clone(), p.timestamp_ms, p.node_id.clone()),
+                    value: {
+                        let mut v =
+                            VersionedValue::new(p.value.clone(), p.timestamp_ms, p.node_id.clone());
+                        v.expires_at_ms = if p.expires_at_ms == 0 {
+                            None
+                        } else {
+                            Some(p.expires_at_ms)
+                        };
+                        v
+                    },
                     seq: p.seq,
                     boot_id: p.boot_id,
                 };
@@ -790,9 +891,15 @@ async fn handle_connection(ctx: ConnContext, stream: BoxStream, we_dialed: bool)
                     }
                     None => None,
                 };
-                let (found, bytes, timestamp_ms, origin) = match value {
-                    Some(v) => (true, v.value, v.timestamp_ms, v.node_id),
-                    None => (false, Vec::new(), 0, String::new()),
+                let (found, bytes, timestamp_ms, origin, expires_at_ms) = match value {
+                    Some(v) => (
+                        true,
+                        v.value,
+                        v.timestamp_ms,
+                        v.node_id,
+                        v.expires_at_ms.unwrap_or(0),
+                    ),
+                    None => (false, Vec::new(), 0, String::new(), 0),
                 };
                 send_envelope(
                     &tx,
@@ -803,6 +910,7 @@ async fn handle_connection(ctx: ConnContext, stream: BoxStream, we_dialed: bool)
                             value: bytes,
                             timestamp_ms,
                             node_id: origin,
+                            expires_at_ms,
                         })),
                     },
                 )
@@ -811,7 +919,14 @@ async fn handle_connection(ctx: ConnContext, stream: BoxStream, we_dialed: bool)
             Some(EnvelopeMsg::GetResponse(r)) => {
                 if let Some(resp_tx) = pending_gets.lock().await.remove(&r.req_id) {
                     let value = r.found.then(|| {
-                        VersionedValue::new(r.value.clone(), r.timestamp_ms, r.node_id.clone())
+                        let mut v =
+                            VersionedValue::new(r.value.clone(), r.timestamp_ms, r.node_id.clone());
+                        v.expires_at_ms = if r.expires_at_ms == 0 {
+                            None
+                        } else {
+                            Some(r.expires_at_ms)
+                        };
+                        v
                     });
                     let _ = resp_tx.send(value);
                 }
@@ -846,6 +961,7 @@ async fn handle_connection(ctx: ConnContext, stream: BoxStream, we_dialed: bool)
                             value: v.value,
                             timestamp_ms: v.timestamp_ms,
                             node_id: v.node_id,
+                            expires_at_ms: v.expires_at_ms.unwrap_or(0),
                         })
                         .collect();
                     send_envelope(
@@ -864,7 +980,15 @@ async fn handle_connection(ctx: ConnContext, stream: BoxStream, we_dialed: bool)
                 for e in resp.entries {
                     let op = ReplicatedOp {
                         key: e.key,
-                        value: VersionedValue::new(e.value, e.timestamp_ms, e.node_id),
+                        value: {
+                            let mut v = VersionedValue::new(e.value, e.timestamp_ms, e.node_id);
+                            v.expires_at_ms = if e.expires_at_ms == 0 {
+                                None
+                            } else {
+                                Some(e.expires_at_ms)
+                            };
+                            v
+                        },
                         seq: 0,     // seq/boot_id are propagation concerns;
                         boot_id: 0, // sync is not gossip
                     };
@@ -981,6 +1105,7 @@ async fn replicate_to_holders(
         node_id: op.value.node_id.clone(),
         seq: op.seq,
         boot_id: op.boot_id,
+        expires_at_ms: op.value.expires_at_ms.unwrap_or(0),
     };
     let peers = peers.lock().await;
     for target in targets {

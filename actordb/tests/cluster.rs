@@ -625,3 +625,105 @@ async fn worker_pool_concurrent_keys_and_ordering() {
 
     a.shutdown().await;
 }
+
+/// Phase 4: TTL expiry — a key with a TTL disappears without manual
+/// intervention (reads hide it past expiry; the cleaner reaps it).
+#[tokio::test]
+async fn ttl_expiry_removes_key() {
+    let config = NodeConfig {
+        clean_interval: Duration::from_millis(50),
+        ..NodeConfig::default()
+    };
+    let a = Node::start("a".to_string(), "127.0.0.1:0".parse().unwrap(), config)
+        .await
+        .unwrap();
+
+    a.put_with_ttl(
+        "temp".to_string(),
+        b"data".to_vec(),
+        Some(Duration::from_millis(150)),
+    )
+    .await
+    .unwrap();
+    // Visible before expiry.
+    assert!(a.get("temp".to_string()).await.unwrap().is_some());
+
+    // Past TTL + cleaner sweep: gone.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert!(a.get("temp".to_string()).await.unwrap().is_none());
+
+    // A key without TTL survives.
+    a.put("perm".to_string(), b"forever".to_vec())
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(a.get("perm".to_string()).await.unwrap().is_some());
+
+    a.shutdown().await;
+}
+
+/// Phase 4: killing a worker triggers a supervised restart; the
+/// fragment keeps serving and sibling fragments are unaffected.
+#[tokio::test]
+async fn worker_kill_triggers_supervised_restart() {
+    use ractor::registry::where_is;
+
+    let config = NodeConfig {
+        fragment_count: 2,
+        worker_count: 2,
+        ..NodeConfig::default()
+    };
+    let a = Node::start("a".to_string(), "127.0.0.1:0".parse().unwrap(), config)
+        .await
+        .unwrap();
+
+    // Find a key on fragment 0, worker 0.
+    let mut target_key = String::new();
+    for i in 0..100 {
+        let k = format!("wkill-{i}");
+        if actordb::shard::fragment_of(&k, 2) == actordb::shard::FragmentId(0)
+            && actordb::actor::worker_idx(&k, 2) == 0
+        {
+            target_key = k;
+            break;
+        }
+    }
+    assert!(!target_key.is_empty());
+
+    a.put(target_key.clone(), b"v1".to_vec()).await.unwrap();
+    assert!(a.get(target_key.clone()).await.unwrap().is_some());
+
+    // Kill worker 0 of fragment 0 (name via health report).
+    let health = a.health().await.unwrap();
+    let frag0_health = &health[&actordb::shard::FragmentId(0)];
+    let name: ractor::ActorName = frag0_health.worker_names[0].clone();
+    let worker = where_is(name).expect("worker should be registered");
+    worker.kill();
+
+    // Wait for the supervised restart.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Fragment 0 still serves (new worker in place).
+    a.put(target_key.clone(), b"v2".to_vec()).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let got = a.get(target_key.clone()).await.unwrap().unwrap();
+    assert_eq!(got.value, b"v2".to_vec());
+
+    // Sibling fragment (1) unaffected.
+    let mut frag1_key = String::new();
+    for i in 0..100 {
+        let k = format!("sib-{i}");
+        if actordb::shard::fragment_of(&k, 2) == actordb::shard::FragmentId(1) {
+            frag1_key = k;
+            break;
+        }
+    }
+    a.put(frag1_key.clone(), b"sib".to_vec()).await.unwrap();
+    assert!(a.get(frag1_key).await.unwrap().is_some());
+
+    // Health reports the fragment alive.
+    let health = a.health().await.unwrap();
+    assert!(health.contains_key(&actordb::shard::FragmentId(0)));
+
+    a.shutdown().await;
+}

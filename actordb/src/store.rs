@@ -115,7 +115,7 @@ impl KvStore for PrefixedStore {
 
 /// RocksDB-backed store. Available with the `rocksdb` cargo feature.
 ///
-/// Values are encoded as `[timestamp_ms: u64 BE][node_id_len: u32 BE][node_id][value]`.
+/// Values are encoded as `[timestamp_ms: u64 BE][expires_at_ms: u64 BE, 0 = none][node_id_len: u32 BE][node_id][value]`.
 #[cfg(feature = "rocksdb")]
 pub struct RocksDbStore {
     db: rocksdb::DB,
@@ -132,8 +132,10 @@ impl RocksDbStore {
     }
 
     fn encode(v: &VersionedValue) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(12 + v.node_id.len() + v.value.len());
+        let mut buf = Vec::with_capacity(20 + v.node_id.len() + v.value.len());
         buf.extend_from_slice(&v.timestamp_ms.to_be_bytes());
+        // 0 = no expiry.
+        buf.extend_from_slice(&v.expires_at_ms.unwrap_or(0).to_be_bytes());
         buf.extend_from_slice(&(v.node_id.len() as u32).to_be_bytes());
         buf.extend_from_slice(v.node_id.as_bytes());
         buf.extend_from_slice(&v.value);
@@ -141,24 +143,31 @@ impl RocksDbStore {
     }
 
     fn decode(bytes: &[u8]) -> Result<VersionedValue, String> {
-        if bytes.len() < 12 {
+        if bytes.len() < 20 {
             return Err(format!("value too short: {} bytes", bytes.len()));
         }
         let timestamp_ms = u64::from_be_bytes(bytes[0..8].try_into().unwrap());
-        let id_len = u32::from_be_bytes(bytes[8..12].try_into().unwrap()) as usize;
-        if bytes.len() < 12 + id_len {
+        let expires_raw = u64::from_be_bytes(bytes[8..16].try_into().unwrap());
+        let expires_at_ms = if expires_raw == 0 {
+            None
+        } else {
+            Some(expires_raw)
+        };
+        let id_len = u32::from_be_bytes(bytes[16..20].try_into().unwrap()) as usize;
+        if bytes.len() < 20 + id_len {
             return Err(format!(
                 "node_id overruns value: id_len={id_len} total={}",
                 bytes.len()
             ));
         }
-        let node_id = String::from_utf8(bytes[12..12 + id_len].to_vec())
+        let node_id = String::from_utf8(bytes[20..20 + id_len].to_vec())
             .map_err(|e| format!("node_id not UTF-8: {e}"))?;
-        let value = bytes[12 + id_len..].to_vec();
+        let value = bytes[20 + id_len..].to_vec();
         Ok(VersionedValue {
             value,
             timestamp_ms,
             node_id,
+            expires_at_ms,
         })
     }
 }
