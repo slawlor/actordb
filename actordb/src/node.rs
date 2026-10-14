@@ -42,12 +42,12 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::task::AbortHandle;
 
-use crate::actor::{HlcClock, KvMessage, ReplicatedOp, VersionedValue};
+use crate::actor::{HlcClock, KvMessage, OpPriority, PoolConfig, ReplicatedOp, VersionedValue};
 use crate::network::{BoxStream, Network, TcpNetwork};
 use crate::proto::{
     BatchAck, BatchGet, BatchGetResponse, BatchKeyValue, BatchPut, Envelope, EnvelopeMsg,
-    ForwardedGet, ForwardedPut, GetResponse, Hello, KeySummary, ReconcileData, ReconcileResponse,
-    SyncEntry, SyncResponse,
+    ForwardedGet, ForwardedPut, GetResponse, Hello, KeySummary, Priority as ProtoPriority,
+    ReconcileData, ReconcileResponse, SyncEntry, SyncResponse,
 };
 use crate::replication::{spawn_sender, SenderConfig, SenderDeps, SenderMsg, SenderStateReport};
 use crate::shard::{fragment_of, FragmentId};
@@ -74,6 +74,14 @@ type SenderReportMap = Arc<Mutex<HashMap<(FragmentId, String), Arc<Mutex<SenderS
 /// Senders currently in BufferReset, keyed by (fragment, peer).
 type ResetSenderSet = Arc<Mutex<HashSet<(FragmentId, String)>>>;
 
+/// Pending single-key forwarded reads: req_id -> reply channel. The
+/// reply is `Ok(value)` or `Err(shed_reason)` if the remote shed the
+/// read due to backpressure.
+type PendingGets =
+    Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Option<VersionedValue>, String>>>>>;
+/// Pending batched forwarded reads: req_id -> reply channel.
+type PendingBatchGets = Arc<Mutex<HashMap<u64, oneshot::Sender<Vec<BatchKeyValue>>>>>;
+
 /// Unique worker-name prefixes across supervisors in this process.
 static NEXT_WORKER_PREFIX: AtomicU64 = AtomicU64::new(0);
 
@@ -82,8 +90,8 @@ static NEXT_WORKER_PREFIX: AtomicU64 = AtomicU64::new(0);
 struct ConnContext {
     node_id: String,
     router: FragmentRouter,
-    pending_gets: Arc<Mutex<HashMap<u64, oneshot::Sender<Option<VersionedValue>>>>>,
-    pending_batch_gets: Arc<Mutex<HashMap<u64, oneshot::Sender<Vec<BatchKeyValue>>>>>,
+    pending_gets: PendingGets,
+    pending_batch_gets: PendingBatchGets,
     peers: PeerMap,
     tasks: Arc<Mutex<Vec<AbortHandle>>>,
     hlc: Arc<Mutex<HlcClock>>,
@@ -147,6 +155,10 @@ pub enum NodeError {
     Codec(String),
     Actor(String),
     Network(String),
+    /// The operation was shed due to backpressure (queue cap or rate
+    /// limit). The caller should retry with backoff or reduce load.
+    /// Distinct from "not found" — a shed Get never returns Ok(None).
+    Backpressure(String),
 }
 
 impl std::fmt::Display for NodeError {
@@ -156,7 +168,28 @@ impl std::fmt::Display for NodeError {
             NodeError::Codec(e) => write!(f, "codec error: {e}"),
             NodeError::Actor(e) => write!(f, "actor error: {e}"),
             NodeError::Network(e) => write!(f, "network error: {e}"),
+            NodeError::Backpressure(e) => write!(f, "backpressure shed: {e}"),
         }
+    }
+}
+
+/// Map an [`OpPriority`] to its stable wire value (see `Priority` in
+/// `meta.proto`).
+fn priority_to_proto(p: OpPriority) -> i32 {
+    match p {
+        OpPriority::Default => ProtoPriority::Default as i32,
+        OpPriority::High => ProtoPriority::High as i32,
+        OpPriority::Background => ProtoPriority::Background as i32,
+    }
+}
+
+/// Map a wire priority back to [`OpPriority`]. Unknown/absent values
+/// degrade to `Default` (never misroute to a more aggressive pool).
+fn priority_from_proto(v: i32) -> OpPriority {
+    match v {
+        x if x == ProtoPriority::High as i32 => OpPriority::High,
+        x if x == ProtoPriority::Background as i32 => OpPriority::Background,
+        _ => OpPriority::Default,
     }
 }
 
@@ -191,8 +224,9 @@ pub struct Node {
     /// Static membership (see `NodeConfig::members`).
     members: HashMap<String, SocketAddr>,
     /// In-flight forwarded reads: req_id -> reply channel.
-    pending_gets: Arc<Mutex<HashMap<u64, oneshot::Sender<Option<VersionedValue>>>>>,
-    pending_batch_gets: Arc<Mutex<HashMap<u64, oneshot::Sender<Vec<BatchKeyValue>>>>>,
+    pending_gets: PendingGets,
+    /// In-flight batched forwarded reads: req_id -> reply channel.
+    pending_batch_gets: PendingBatchGets,
     next_req_id: AtomicU64,
     peers: PeerMap,
     /// Per-node sequence number for locally originated ops.
@@ -264,10 +298,12 @@ pub struct NodeConfig {
     /// Static membership: node_id -> address, for dialing fragment
     /// owners. `Node::start` best-effort dials all members.
     pub members: HashMap<String, SocketAddr>,
-    /// Worker actors per fragment. Keys route sticky by
-    /// `hash(key) % worker_count`: per-key ordering holds, different
-    /// keys execute concurrently. Default 4.
-    pub worker_count: usize,
+    /// Worker pool configs by priority. The default pool handles normal
+    /// ops; high-priority is for latency-sensitive traffic; background
+    /// is for bulk/scan (rate-limited).
+    pub default_pool: PoolConfig,
+    pub high_pool: PoolConfig,
+    pub background_pool: PoolConfig,
     /// How often each fragment's cleaner sweeps for TTL-expired keys.
     /// Default 30 seconds.
     pub clean_interval: Duration,
@@ -298,7 +334,21 @@ impl Default for NodeConfig {
             fragment_count: 1,
             fragment_map: HashMap::new(),
             members: HashMap::new(),
-            worker_count: 4,
+            default_pool: PoolConfig {
+                workers: 4,
+                queue_cap: 10_000,
+                rate_limit_per_sec: None,
+            },
+            high_pool: PoolConfig {
+                workers: 2,
+                queue_cap: 5_000,
+                rate_limit_per_sec: None,
+            },
+            background_pool: PoolConfig {
+                workers: 2,
+                queue_cap: 5_000,
+                rate_limit_per_sec: Some(1000),
+            },
             clean_interval: Duration::from_secs(30),
             snapshot_interval: Duration::from_secs(60),
             tombstone_gc_age: Duration::from_secs(3600),
@@ -403,7 +453,9 @@ impl Node {
                     store,
                     tombstone_gc_age: config.tombstone_gc_age,
                     reset_senders: reset_senders.clone(),
-                    worker_count: config.worker_count,
+                    default_pool: config.default_pool.clone(),
+                    high_pool: config.high_pool.clone(),
+                    background_pool: config.background_pool.clone(),
                     flush_batch_size: config.flush_batch_size,
                     flush_interval: config.flush_interval,
                     clean_interval: config.clean_interval,
@@ -651,6 +703,55 @@ impl Node {
         self.put_with_ttl(key, value, None).await
     }
 
+    /// Write with explicit priority (Phase 7). High priority is for
+    /// latency-sensitive ops; background is for bulk (rate-limited).
+    /// The priority is honored end-to-end: forwarded puts carry it on
+    /// the wire and the owner applies them at the same priority.
+    ///
+    /// Read-your-write holds within a priority: the barrier read runs
+    /// in the write's pool, so a `get_with_priority` at the *same*
+    /// priority sees this write. A cross-priority read (e.g. background
+    /// write, default-priority get) is NOT ordered behind the write —
+    /// the pools are independent and make no cross-pool ordering
+    /// promise.
+    pub async fn put_with_priority(
+        &self,
+        key: String,
+        value: Vec<u8>,
+        priority: OpPriority,
+    ) -> Result<(), NodeError> {
+        self.put_with_ttl_and_priority(key, value, None, priority)
+            .await
+    }
+
+    /// Internal: put with TTL and priority. The priority is honored
+    /// on both paths: local applies go to the priority's pool, and
+    /// forwarded puts carry the priority on the wire so the owner
+    /// applies them at the same priority.
+    async fn put_with_ttl_and_priority(
+        &self,
+        key: String,
+        value: Vec<u8>,
+        ttl: Option<Duration>,
+        priority: OpPriority,
+    ) -> Result<(), NodeError> {
+        let seq = {
+            let mut guard = self.next_seq.lock().await;
+            *guard += 1;
+            *guard
+        };
+        let now = self.hlc.lock().await.tick();
+        let mut vv = VersionedValue::new(value, now, self.node_id.clone());
+        vv.expires_at_ms = ttl.map(|d| now + d.as_millis() as u64);
+        let op = ReplicatedOp {
+            key,
+            value: vv,
+            seq,
+            boot_id: self.boot_id,
+        };
+        self.apply_local_with_priority(op, priority).await
+    }
+
     /// Write `value` under `key`, with an optional time-to-live. When
     /// `ttl` is set, the key expires `ttl` after this call (wall-clock):
     /// reads treat it as absent past expiry, and the fragment's cleaner
@@ -666,21 +767,8 @@ impl Node {
         value: Vec<u8>,
         ttl: Option<Duration>,
     ) -> Result<(), NodeError> {
-        let seq = {
-            let mut guard = self.next_seq.lock().await;
-            *guard += 1;
-            *guard
-        };
-        let now = self.hlc.lock().await.tick();
-        let mut vv = VersionedValue::new(value, now, self.node_id.clone());
-        vv.expires_at_ms = ttl.map(|t| now + t.as_millis() as u64);
-        let op = ReplicatedOp {
-            key: key.clone(),
-            value: vv,
-            seq,
-            boot_id: self.boot_id,
-        };
-        self.apply_local(op).await
+        self.put_with_ttl_and_priority(key, value, ttl, OpPriority::Default)
+            .await
     }
 
     /// Delete `key`: writes a tombstone that propagates to all replicas
@@ -706,28 +794,47 @@ impl Node {
     /// Apply a locally-originated op: mark seen, route to the fragment
     /// actor, barrier on read-your-write, then replicate.
     async fn apply_local(&self, op: ReplicatedOp) -> Result<(), NodeError> {
+        self.apply_local_with_priority(op, OpPriority::Default)
+            .await
+    }
+
+    async fn apply_local_with_priority(
+        &self,
+        op: ReplicatedOp,
+        priority: OpPriority,
+    ) -> Result<(), NodeError> {
         let frag = fragment_of(&op.key, self.router.fragment_count);
         if let Some(actor) = self.fragment_actor(&op.key) {
             actor
-                .send_message(KvMessage::ApplyOp(op.clone()))
+                .send_message(KvMessage::ApplyOp {
+                    op: op.clone(),
+                    priority,
+                })
                 .map_err(|e| NodeError::Actor(e.to_string()))?;
 
             // Barrier: the actor drains its mailbox in FIFO order, so this
             // `call` returns only after the ApplyOp above has been applied.
             // (A `get` on the same key doubles as the read-your-write check.)
             // For tombstones the get returns None — the barrier still holds.
+            // The barrier read uses the write's priority: it must land in
+            // the same pool, or a cross-pool read would not be ordered
+            // behind the write.
             match actor
                 .call(
                     |reply| KvMessage::Get {
                         key: op.key.clone(),
                         reply,
+                        priority,
                     },
                     None,
                 )
                 .await
                 .map_err(|e| NodeError::Actor(e.to_string()))?
             {
-                CallResult::Success(_) => {}
+                CallResult::Success(Ok(_)) => {}
+                CallResult::Success(Err(shed)) => {
+                    return Err(NodeError::Backpressure(format!("put barrier shed: {shed}")))
+                }
                 CallResult::Timeout => return Err(NodeError::Actor("put timed out".to_string())),
                 CallResult::SenderError => {
                     return Err(NodeError::Actor("put reply channel dropped".to_string()))
@@ -757,6 +864,7 @@ impl Node {
                     boot_id: op.boot_id,
                     expires_at_ms: op.value.expires_at_ms.unwrap_or(0),
                     is_tombstone: op.value.is_tombstone,
+                    priority: priority_to_proto(priority),
                 })),
             },
         )
@@ -768,13 +876,36 @@ impl Node {
     /// fragment: read locally if we serve it, otherwise forwarded to a
     /// replica holder with the reply awaited.
     pub async fn get(&self, key: String) -> Result<Option<VersionedValue>, NodeError> {
+        self.get_with_priority(key, OpPriority::Default).await
+    }
+
+    /// Read a key with an explicit priority. High-priority reads go to
+    /// the high pool (isolated from background bulk traffic); background
+    /// reads go to the background pool (rate-limited, sheddable).
+    ///
+    /// Read-your-write pairs with [`put_with_priority`](Self::put_with_priority)
+    /// at the same priority. A high-priority read is not ordered behind
+    /// a background write to the same key.
+    pub async fn get_with_priority(
+        &self,
+        key: String,
+        priority: OpPriority,
+    ) -> Result<Option<VersionedValue>, NodeError> {
         if let Some(actor) = self.fragment_actor(&key) {
             let res = actor
-                .call(|reply| KvMessage::Get { key, reply }, None)
+                .call(
+                    |reply| KvMessage::Get {
+                        key,
+                        reply,
+                        priority,
+                    },
+                    None,
+                )
                 .await
                 .map_err(|e| NodeError::Actor(e.to_string()))?;
             return match res {
-                CallResult::Success(value) => Ok(value),
+                CallResult::Success(Ok(value)) => Ok(value),
+                CallResult::Success(Err(shed)) => Err(NodeError::Backpressure(shed)),
                 CallResult::Timeout => Err(NodeError::Actor("get timed out".to_string())),
                 CallResult::SenderError => {
                     Err(NodeError::Actor("get reply channel dropped".to_string()))
@@ -782,7 +913,8 @@ impl Node {
             };
         }
 
-        // Remote fragment: forward the read, await the reply.
+        // Remote fragment: forward the read, await the reply. The
+        // read executes at the caller's priority on the remote owner.
         let frag = fragment_of(&key, self.router.fragment_count);
         let owner = self
             .pick_replica(frag)
@@ -796,13 +928,18 @@ impl Node {
         send_envelope(
             &tx,
             Envelope {
-                msg: Some(EnvelopeMsg::ForwardedGet(ForwardedGet { key, req_id })),
+                msg: Some(EnvelopeMsg::ForwardedGet(ForwardedGet {
+                    key,
+                    req_id,
+                    priority: priority_to_proto(priority),
+                })),
             },
         )
         .await;
         // Bounded wait: a dead owner must not hang the caller forever.
         match tokio::time::timeout(Duration::from_secs(5), resp_rx).await {
-            Ok(Ok(value)) => Ok(value),
+            Ok(Ok(Ok(value))) => Ok(value),
+            Ok(Ok(Err(shed))) => Err(NodeError::Backpressure(shed)),
             Ok(Err(_)) => Err(NodeError::Actor("forwarded get dropped".to_string())),
             Err(_) => {
                 self.pending_gets.lock().await.remove(&req_id);
@@ -813,6 +950,7 @@ impl Node {
         }
     }
 
+    /// Read with explicit priority (Phase 7).
     /// Read the full local copy across all fragments (debugging / tests).
     pub async fn get_all(&self) -> Result<HashMap<String, VersionedValue>, NodeError> {
         let all = self.router.get_all().await?;
@@ -821,20 +959,32 @@ impl Node {
     }
 
     /// Put multiple keys. Each key is hashed to its fragment; keys are
-    /// grouped by fragment and each fragment's batch goes to one of its
-    /// replica holders in a single `BatchPut` message. Returns per-key
-    /// results in input order.
+    /// grouped by destination node and each remote node gets one
+    /// `BatchPut` message. Returns per-key results in input order.
     ///
     /// Local keys are read-your-write (like `put`); remote keys are
-    /// fire-and-forget to the fragment owner (like `put`): the send
-    /// returns once the batch is handed to the owner's connection, and
-    /// the owner applies it locally and replicates it to the other
-    /// holders via the async sender. There is no end-to-end ack — a
-    /// send that returns `Ok` may still be lost if the owner crashes
-    /// before applying it. If the preferred owner is not connected, the
-    /// batch fails over to the next replica holder in placement order;
-    /// a remote key fails only when no replica holder is reachable.
-    pub async fn put_multi(&self, kvs: Vec<(String, Vec<u8>)>) -> Vec<Result<(), NodeError>> {
+    /// fire-and-forget to the owner (like `put`). A remote key fails if
+    /// its owner is not connected.
+    /// Put multiple keys with an explicit priority (Phase 7). Bulk
+    /// callers should prefer [`OpPriority::Background`]; the priority is
+    /// carried on the wire and the owner applies the batch at the same
+    /// priority, so fan-out preserves traffic isolation end-to-end.
+    ///
+    /// Each key is hashed to its fragment; keys are grouped by fragment
+    /// and each fragment's keys are sent with one `BatchPut` message,
+    /// failing over across replica holders (self first) until one
+    /// accepts the batch. Returns per-key results in input order.
+    ///
+    /// Local keys are read-your-write (like `put`); remote keys are
+    /// fire-and-forget to the owner (like `put`): a remote key fails
+    /// only when no replica holder is connected
+    /// (`NodeError::Network`), or the fragment has no usable replica
+    /// (`NodeError::Actor`, misconfiguration).
+    pub async fn put_multi_with_priority(
+        &self,
+        kvs: Vec<(String, Vec<u8>)>,
+        priority: OpPriority,
+    ) -> Vec<Result<(), NodeError>> {
         // Partition into local ops and remote groups (by fragment).
         let mut local: Vec<(usize, String, Vec<u8>)> = Vec::new();
         let mut remote: HashMap<FragmentId, Vec<(usize, String, Vec<u8>)>> = HashMap::new();
@@ -856,11 +1006,12 @@ impl Node {
             }
         }
 
-        // Local puts: run concurrently, each with its own barrier.
+        // Local puts: run concurrently, each with its own barrier, at
+        // the requested priority.
         let local_futs = local.into_iter().map(|(i, key, value)| {
             let this = self;
             async move {
-                let r = this.put(key, value).await;
+                let r = this.put_with_priority(key, value, priority).await;
                 (i, r)
             }
         });
@@ -870,6 +1021,7 @@ impl Node {
 
         // Remote puts: one BatchPut per fragment, failing over across
         // replica holders until one accepts the batch.
+        let wire_priority = priority_to_proto(priority);
         for (frag, items) in remote {
             // Build the batch once, with HLC timestamps.
             let mut puts = Vec::with_capacity(items.len());
@@ -890,6 +1042,7 @@ impl Node {
                     boot_id: self.boot_id,
                     expires_at_ms: 0,
                     is_tombstone: false,
+                    priority: wire_priority,
                 });
                 indices.push(i);
             }
@@ -903,7 +1056,10 @@ impl Node {
                 send_envelope(
                     &tx,
                     Envelope {
-                        msg: Some(EnvelopeMsg::BatchPut(BatchPut { puts: puts.clone() })),
+                        msg: Some(EnvelopeMsg::BatchPut(BatchPut {
+                            puts: puts.clone(),
+                            priority: wire_priority,
+                        })),
                     },
                 )
                 .await;
@@ -926,9 +1082,28 @@ impl Node {
         results.into_iter().map(|r| r.unwrap()).collect()
     }
 
-    /// Get multiple keys. Each key is hashed to its fragment; keys are
-    /// grouped by fragment and each fragment's keys are fetched with one
-    /// `BatchGet` message. Returns per-key results in input order.
+    /// Put multiple keys. Each key is hashed to its fragment; keys are
+    /// grouped by fragment and each fragment's keys are sent with one
+    /// `BatchPut` message, failing over across replica holders.
+    /// Returns per-key results in input order.
+    ///
+    /// Bulk puts run at [`OpPriority::Background`]; see
+    /// [`put_multi_with_priority`](Self::put_multi_with_priority) for an
+    /// explicit priority. Local keys are read-your-write (like `put`);
+    /// remote keys are fire-and-forget to the owner (like `put`).
+    pub async fn put_multi(&self, kvs: Vec<(String, Vec<u8>)>) -> Vec<Result<(), NodeError>> {
+        self.put_multi_with_priority(kvs, OpPriority::Background)
+            .await
+    }
+
+    /// Get multiple keys with an explicit priority (Phase 7). Bulk
+    /// callers should prefer [`OpPriority::Background`]; the priority is
+    /// carried on the wire and the owner serves the batch at the same
+    /// priority, so fan-out preserves traffic isolation end-to-end.
+    ///
+    /// Each key is hashed to its fragment; keys are grouped by fragment
+    /// and each fragment's keys are fetched with one `BatchGet` message.
+    /// Returns per-key results in input order.
     ///
     /// Remote reads have a 5s timeout per replica attempt and fail over
     /// to the next replica holder when the preferred owner is
@@ -936,10 +1111,13 @@ impl Node {
     /// keys, and only when no replica holder answers. Errors are
     /// classified: `NodeError::Actor` for misconfiguration (no replica
     /// listed for a fragment), `NodeError::Network` for connectivity
-    /// failures (not connected, timed out, all replicas unreachable).
-    pub async fn get_multi(
+    /// failures (not connected, timed out, all replicas unreachable),
+    /// `NodeError::Backpressure` when the (local or remote) pool shed
+    /// the read — never confused with "not found".
+    pub async fn get_multi_with_priority(
         &self,
         keys: Vec<String>,
+        priority: OpPriority,
     ) -> Vec<Result<Option<VersionedValue>, NodeError>> {
         let mut local: Vec<(usize, String)> = Vec::new();
         let mut remote: HashMap<FragmentId, Vec<(usize, String)>> = HashMap::new();
@@ -961,11 +1139,11 @@ impl Node {
             }
         }
 
-        // Local gets: concurrent.
+        // Local gets: concurrent, at the requested priority.
         let local_futs = local.into_iter().map(|(i, key)| {
             let this = self;
             async move {
-                let r = this.get(key).await;
+                let r = this.get_with_priority(key, priority).await;
                 (i, r)
             }
         });
@@ -975,6 +1153,7 @@ impl Node {
 
         // Remote gets: one BatchGet per fragment, failing over across
         // replica holders on timeout or dropped replies.
+        let wire_priority = priority_to_proto(priority);
         for (frag, items) in remote {
             let keys: Vec<String> = items.iter().map(|(_, k)| k.clone()).collect();
             let indices: Vec<usize> = items.iter().map(|(i, _)| *i).collect();
@@ -994,6 +1173,7 @@ impl Node {
                         msg: Some(EnvelopeMsg::BatchGet(BatchGet {
                             req_id,
                             keys: keys.clone(),
+                            priority: wire_priority,
                         })),
                     },
                 )
@@ -1005,6 +1185,11 @@ impl Node {
                             kvs.into_iter().map(|kv| (kv.key.clone(), kv)).collect();
                         for (i, key) in indices.iter().zip(&keys) {
                             match by_key.get(key) {
+                                Some(kv) if kv.shed => {
+                                    results[*i] = Some(Err(NodeError::Backpressure(format!(
+                                        "batch get for key {key} shed by remote"
+                                    ))));
+                                }
                                 Some(kv) if kv.found => {
                                     let mut v = VersionedValue::new(
                                         kv.value.clone(),
@@ -1038,7 +1223,7 @@ impl Node {
             if !done {
                 for i in indices {
                     results[i] = Some(Err(NodeError::Network(format!(
-                        "batch get for fragment {frag}: no replica answered (tried {})",
+                        "no replica answered batch get for fragment {frag} (tried {})",
                         tried.join(",")
                     ))));
                 }
@@ -1046,6 +1231,24 @@ impl Node {
         }
 
         results.into_iter().map(|r| r.unwrap()).collect()
+    }
+
+    /// Get multiple keys. Each key is hashed to its fragment; keys are
+    /// grouped by fragment and each fragment's keys are fetched with one
+    /// `BatchGet` message, failing over across replica holders.
+    /// Returns per-key results in input order.
+    ///
+    /// Bulk gets run at [`OpPriority::Background`]; see
+    /// [`get_multi_with_priority`](Self::get_multi_with_priority) for an
+    /// explicit priority. Remote reads have a 5s timeout per replica
+    /// attempt; a dead owner fails only its keys, and only when no
+    /// replica holder answers.
+    pub async fn get_multi(
+        &self,
+        keys: Vec<String>,
+    ) -> Vec<Result<Option<VersionedValue>, NodeError>> {
+        self.get_multi_with_priority(keys, OpPriority::Background)
+            .await
     }
 
     /// This node's id.
@@ -1275,7 +1478,10 @@ async fn handle_connection(ctx: ConnContext, stream: BoxStream, we_dialed: bool)
                     // u64::MAX marks reconciliation batches (not ack-tracked);
                     // they still apply via LWW.
                     if let Some(actor) = router.route(&replicated.key) {
-                        let _ = actor.send_message(KvMessage::ApplyOp(replicated));
+                        let _ = actor.send_message(KvMessage::ApplyOp {
+                            op: replicated,
+                            priority: OpPriority::Default,
+                        });
                     }
                 }
                 // Ack unless this was a reconciliation batch.
@@ -1410,7 +1616,10 @@ async fn handle_connection(ctx: ConnContext, stream: BoxStream, we_dialed: bool)
                 };
                 let frag = fragment_of(&replicated.key, router.fragment_count);
                 if let Some(actor) = router.route(&replicated.key) {
-                    let _ = actor.send_message(KvMessage::ApplyOp(replicated.clone()));
+                    let _ = actor.send_message(KvMessage::ApplyOp {
+                        op: replicated.clone(),
+                        priority: priority_from_proto(p.priority),
+                    });
                     // Phase 5: async fan-out via senders.
                     let senders = senders.lock().await;
                     for ((f, _peer), tx) in senders.iter() {
@@ -1420,73 +1629,11 @@ async fn handle_connection(ctx: ConnContext, stream: BoxStream, we_dialed: bool)
                     }
                 }
             }
-            Some(EnvelopeMsg::ForwardedGet(g)) => {
-                // We own this fragment: read it and reply on this
-                // connection.
-                let value = match router.route(&g.key) {
-                    Some(actor) => {
-                        match actor
-                            .call(
-                                |reply| KvMessage::Get {
-                                    key: g.key.clone(),
-                                    reply,
-                                },
-                                None,
-                            )
-                            .await
-                        {
-                            Ok(CallResult::Success(v)) => v,
-                            _ => None,
-                        }
-                    }
-                    None => None,
-                };
-                let (found, bytes, timestamp_ms, origin, expires_at_ms, is_tombstone) = match value
-                {
-                    Some(v) => (
-                        true,
-                        v.value,
-                        v.timestamp_ms,
-                        v.node_id,
-                        v.expires_at_ms.unwrap_or(0),
-                        v.is_tombstone,
-                    ),
-                    None => (false, Vec::new(), 0, String::new(), 0, false),
-                };
-                send_envelope(
-                    &tx,
-                    Envelope {
-                        msg: Some(EnvelopeMsg::GetResponse(GetResponse {
-                            req_id: g.req_id,
-                            found,
-                            value: bytes,
-                            timestamp_ms,
-                            node_id: origin,
-                            expires_at_ms,
-                            is_tombstone,
-                        })),
-                    },
-                )
-                .await;
-            }
-            Some(EnvelopeMsg::GetResponse(r)) => {
-                if let Some(resp_tx) = pending_gets.lock().await.remove(&r.req_id) {
-                    let value = r.found.then(|| {
-                        let mut v =
-                            VersionedValue::new(r.value.clone(), r.timestamp_ms, r.node_id.clone());
-                        v.expires_at_ms = if r.expires_at_ms == 0 {
-                            None
-                        } else {
-                            Some(r.expires_at_ms)
-                        };
-                        v
-                    });
-                    let _ = resp_tx.send(value);
-                }
-            }
             Some(EnvelopeMsg::BatchPut(bp)) => {
                 // Phase 6: apply each put as coordinator, enqueue for
-                // async replication.
+                // async replication. Phase 7: the batch carries one
+                // priority applied to every put.
+                let batch_priority = priority_from_proto(bp.priority);
                 hlc.lock()
                     .await
                     .observe(bp.puts.iter().map(|p| p.timestamp_ms).max().unwrap_or(0));
@@ -1512,7 +1659,10 @@ async fn handle_connection(ctx: ConnContext, stream: BoxStream, we_dialed: bool)
                     };
                     let frag = fragment_of(&replicated.key, router.fragment_count);
                     if let Some(actor) = router.route(&replicated.key) {
-                        let _ = actor.send_message(KvMessage::ApplyOp(replicated.clone()));
+                        let _ = actor.send_message(KvMessage::ApplyOp {
+                            op: replicated.clone(),
+                            priority: batch_priority,
+                        });
                         let senders = senders.lock().await;
                         for ((f, _peer), tx) in senders.iter() {
                             if *f == frag {
@@ -1523,24 +1673,28 @@ async fn handle_connection(ctx: ConnContext, stream: BoxStream, we_dialed: bool)
                 }
             }
             Some(EnvelopeMsg::BatchGet(bg)) => {
-                // Phase 6: serve a batch of reads.
+                // Phase 6: serve a batch of reads. Phase 7: the batch
+                // carries one priority applied to every get.
+                let batch_priority = priority_from_proto(bg.priority);
                 let mut results = Vec::with_capacity(bg.keys.len());
                 for key in bg.keys {
-                    let value = match router.route(&key) {
+                    let (value, shed) = match router.route(&key) {
                         Some(actor) => match actor
                             .call(
                                 |reply| KvMessage::Get {
                                     key: key.clone(),
                                     reply,
+                                    priority: batch_priority,
                                 },
                                 None,
                             )
                             .await
                         {
-                            Ok(CallResult::Success(v)) => v,
-                            _ => None,
+                            Ok(CallResult::Success(Ok(v))) => (v, false),
+                            Ok(CallResult::Success(Err(_))) => (None, true),
+                            _ => (None, false),
                         },
-                        None => None,
+                        None => (None, false),
                     };
                     let (found, bytes, timestamp_ms, node_id, expires_at_ms, is_tombstone) =
                         match value {
@@ -1562,6 +1716,7 @@ async fn handle_connection(ctx: ConnContext, stream: BoxStream, we_dialed: bool)
                         node_id,
                         expires_at_ms,
                         is_tombstone,
+                        shed,
                     });
                 }
                 send_envelope(
@@ -1578,6 +1733,83 @@ async fn handle_connection(ctx: ConnContext, stream: BoxStream, we_dialed: bool)
             Some(EnvelopeMsg::BatchGetResponse(r)) => {
                 if let Some(resp_tx) = pending_batch_gets.lock().await.remove(&r.req_id) {
                     let _ = resp_tx.send(r.results);
+                }
+            }
+            Some(EnvelopeMsg::ForwardedGet(g)) => {
+                // We own this fragment: read it and reply on this
+                // connection, at the originator's priority.
+                let get_priority = priority_from_proto(g.priority);
+                let (value, shed) = match router.route(&g.key) {
+                    Some(actor) => {
+                        match actor
+                            .call(
+                                |reply| KvMessage::Get {
+                                    key: g.key.clone(),
+                                    reply,
+                                    priority: get_priority,
+                                },
+                                None,
+                            )
+                            .await
+                        {
+                            Ok(CallResult::Success(Ok(v))) => (v, false),
+                            Ok(CallResult::Success(Err(_))) => (None, true),
+                            _ => (None, false),
+                        }
+                    }
+                    None => (None, false),
+                };
+                let (found, bytes, timestamp_ms, origin, expires_at_ms, is_tombstone) = match value
+                {
+                    Some(v) => (
+                        true,
+                        v.value,
+                        v.timestamp_ms,
+                        v.node_id,
+                        v.expires_at_ms.unwrap_or(0),
+                        v.is_tombstone,
+                    ),
+                    None => (false, Vec::new(), 0, String::new(), 0, false),
+                };
+                send_envelope(
+                    &tx,
+                    Envelope {
+                        msg: Some(EnvelopeMsg::GetResponse(GetResponse {
+                            req_id: g.req_id,
+                            found,
+                            value: bytes,
+                            timestamp_ms,
+                            node_id: origin,
+                            expires_at_ms,
+                            is_tombstone,
+                            shed,
+                        })),
+                    },
+                )
+                .await;
+            }
+            Some(EnvelopeMsg::GetResponse(r)) => {
+                if let Some(resp_tx) = pending_gets.lock().await.remove(&r.req_id) {
+                    if r.shed {
+                        let _ = resp_tx.send(Err(
+                            "shed: remote pool at queue cap or rate limit".to_string()
+                        ));
+                    } else {
+                        let value = r.found.then(|| {
+                            let mut v = VersionedValue::new(
+                                r.value.clone(),
+                                r.timestamp_ms,
+                                r.node_id.clone(),
+                            );
+                            v.expires_at_ms = if r.expires_at_ms == 0 {
+                                None
+                            } else {
+                                Some(r.expires_at_ms)
+                            };
+                            v
+                        });
+                        let _ = resp_tx.send(Ok(value));
+                    }
                 }
             }
             Some(EnvelopeMsg::SyncRequest(req)) => {
@@ -1645,7 +1877,10 @@ async fn handle_connection(ctx: ConnContext, stream: BoxStream, we_dialed: bool)
                         boot_id: 0, // sync is not gossip
                     };
                     if let Some(actor) = router.route(&op.key) {
-                        let _ = actor.send_message(KvMessage::ApplyOp(op));
+                        let _ = actor.send_message(KvMessage::ApplyOp {
+                            op,
+                            priority: OpPriority::Background,
+                        });
                     }
                 }
             }

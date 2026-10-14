@@ -142,7 +142,11 @@ Multi-key semantics:
   answers.
 - Errors are per-key and classified: `NodeError::Actor` for
   misconfiguration (no replica listed for a fragment),
-  `NodeError::Network` for connectivity failures.
+  `NodeError::Network` for connectivity failures,
+  `NodeError::Backpressure` when a pool shed the op.
+- `put_multi_with_priority` / `get_multi_with_priority` set the
+  operation priority explicitly (default: `Background`); the priority
+  is carried on the wire and honored by the remote owner.
 
 Key `NodeConfig` knobs:
 
@@ -151,7 +155,9 @@ Key `NodeConfig` knobs:
 | `fragment_count` | 1 | Fragments in the keyspace (must agree cluster-wide) |
 | `fragment_map` | {} | Static placement: fragment → replica node ids (empty = serve all) |
 | `members` | {} | Static membership: node id → address |
-| `worker_count` | 4 | Worker actors per fragment |
+| `default_pool` / `high_pool` / `background_pool` | see below | Per-priority `PoolConfig { workers, queue_cap, rate_limit_per_sec }` |
+| `high_pool` defaults | 2 workers / cap 5_000 / no limit | Latency-sensitive traffic |
+| `background_pool` defaults | 2 workers / cap 5_000 / 1000 ops/s | Bulk/scan traffic (rate-limited) |
 | `flush_batch_size` / `flush_interval` | 1000 / 100ms | Persistence batching |
 | `clean_interval` | 30s | TTL/tombstone sweep period |
 | `snapshot_interval` | 60s | Periodic durable flush |
@@ -159,7 +165,8 @@ Key `NodeConfig` knobs:
 | `replication` | defaults | `SenderConfig`: batch size/interval, max in-flight, buffer capacity, consistency interval |
 | `store` | None | `Some(Arc<dyn KvStore>)`; `NodeConfig::with_rocksdb(path)` with the `rocksdb` feature |
 
-- Local writes are read-your-write; remote-fragment writes forward in
+- Local writes are read-your-write within a priority (the barrier
+  read runs in the write's pool); remote-fragment writes forward in
   one hop to a replica holder.
 - Conflicts resolve with last-writer-wins on HLC timestamps,
   tie-broken by `node_id`; tombstones win exact ties.
@@ -173,15 +180,42 @@ Key `NodeConfig` knobs:
   — a value plus its LWW version; `wins_over` implements the conflict
   rule, `is_expired` the TTL check.
 - `HlcClock` — hybrid logical clock behind all timestamps.
-- `KvMessage::{ApplyOp, Get, GetAll}` — for embedders driving the
-  dispatcher directly instead of through `Node`.
+- `KvMessage::{ApplyOp, Get, GetAll, GetShedCounts}` — for embedders
+  driving the dispatcher directly instead of through `Node`.
+
+#### Traffic isolation + backpressure (Phase 7)
+
+Each fragment runs **three isolated worker pools** instead of one:
+
+- `OpPriority::{High, Default, Background}` selects the pool.
+  `put_with_priority` / `get_with_priority` (and the
+  `put_multi_with_priority` / `get_multi_with_priority` variants) set
+  it; plain `put` / `get` / `put_multi` / `get_multi` use `Default`
+  (single-key) or `Background` (bulk).
+- Each `PoolConfig` sets `workers`, `queue_cap`, and an optional
+  token-bucket `rate_limit_per_sec`. When a pool is over its queue cap
+  or rate limit, the op is **shed explicitly**: counted in the pool's
+  shed counter, and the caller gets `NodeError::Backpressure` — a shed
+  `Get` never returns `Ok(None)`, so backpressure is never confused
+  with "not found".
+- Priority is preserved end-to-end: forwarded single-key ops and batch
+  messages carry the originator's priority on the wire, and the owner
+  applies/serves them in the matching pool.
+- Shed counts are surfaced per pool `(high, default, background)` via
+  `node.health()` → `FragmentHealth.shed_counts`.
+
+Ordering honesty: read-your-write holds **within a priority** — the
+write barrier reads in the write's pool, so a same-priority get sees
+the write. A cross-priority sequence (background write, then a
+default-priority get) makes **no** ordering promise; the pools are
+independent.
 
 ### `actordb::supervision` — per-fragment supervision
 
 - `FragmentSupervisor` — owns a fragment's dispatcher, `Cleaner`, and
   `Snapshotter`; restarts dead children in place.
 - `FragmentHealth` — per-fragment health snapshot (worker count/names,
-  restart counts).
+  restart counts, per-pool `shed_counts`).
 
 ### `actordb::replication` — async sender/receiver
 

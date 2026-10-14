@@ -42,7 +42,7 @@ use std::time::Duration;
 use ractor::rpc::CallResult;
 use tokio::sync::{mpsc, Mutex};
 
-use crate::actor::{KvMessage, VersionedValue};
+use crate::actor::{KvMessage, OpPriority, VersionedValue};
 use crate::node::FragmentRouter;
 use crate::proto::{
     Envelope, EnvelopeMsg, KeySummary, ReconcileFetch, ReconcileRequest, ReplicateBatch,
@@ -345,7 +345,10 @@ async fn sender_task(
                                     seq: 0,
                                     boot_id: 0,
                                 };
-                                let _ = actor.send_message(KvMessage::ApplyOp(op));
+                                let _ = actor.send_message(KvMessage::ApplyOp {
+                                    op,
+                                    priority: OpPriority::Default,
+                                });
                             }
                         }
                         // Reconciliation is complete once the data lands:

@@ -21,6 +21,15 @@ message Hello {
   string node_id = 1;
 }
 
+// Phase 7: operation priority for traffic isolation. Wire values are
+// stable; PRIORITY_DEFAULT = 0 so an absent/unknown field degrades to
+// normal priority rather than misrouting.
+enum Priority {
+  PRIORITY_DEFAULT = 0;
+  PRIORITY_HIGH = 1;
+  PRIORITY_BACKGROUND = 2;
+}
+
 // A single replicated write, sent from a fragment's coordinator to the
 // other replica holders. Delivery is at-least-once; receivers merge with
 // last-writer-wins on (timestamp_ms, node_id) and do NOT re-forward.
@@ -54,6 +63,8 @@ message ForwardedPut {
   uint64 expires_at_ms = 7;
   // True if this is a deletion tombstone.
   bool is_tombstone = 8;
+  // Phase 7: priority the receiving node should apply this op with.
+  Priority priority = 9;
 }
 
 // A client-routed read: "you own this key's fragment — read it and
@@ -61,6 +72,8 @@ message ForwardedPut {
 message ForwardedGet {
   string key = 1;
   uint64 req_id = 2;
+  // Phase 7: priority the receiving node should serve this read with.
+  Priority priority = 3;
 }
 
 message GetResponse {
@@ -73,6 +86,9 @@ message GetResponse {
   uint64 expires_at_ms = 6;
   // True if this is a deletion tombstone.
   bool is_tombstone = 7;
+  // Phase 7: true if the read was shed due to backpressure (distinct
+  // from not-found).
+  bool shed = 8;
 }
 
 // Ask a peer for the fragments listed (anti-entropy when a node joins
@@ -151,11 +167,15 @@ message ReconcileData {
 // Phase 6: multi-key fan-out. One message per destination node.
 message BatchPut {
   repeated ForwardedPut puts = 1;
+  // Phase 7: priority applied to every put in the batch.
+  Priority priority = 2;
 }
 
 message BatchGet {
   uint64 req_id = 1;
   repeated string keys = 2;
+  // Phase 7: priority applied to every get in the batch.
+  Priority priority = 3;
 }
 
 message BatchGetResponse {
@@ -168,6 +188,9 @@ message BatchGetResponse {
     string node_id = 5;
     uint64 expires_at_ms = 6;
     bool is_tombstone = 7;
+    // Phase 7: true if the read was shed due to backpressure (distinct
+    // from not-found).
+    bool shed = 8;
   }
   repeated KeyValue results = 2;
 }
