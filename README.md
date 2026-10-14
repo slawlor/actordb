@@ -330,7 +330,12 @@ as issues in the [issue tracker](https://github.com/slawlor/actordb/issues):
 - **Persistence is opt-in** — pass a `store` in `NodeConfig` for
   durability; without it the dataset lives in memory and a restart
   wipes it (recoverable only via peer sync).
-- **No TLS/authentication** — plaintext, unauthenticated TCP.
+- **No TLS** — plaintext TCP. Handshake authentication via a
+  pre-shared cluster secret (`NodeConfig::cluster_secret`): when set,
+  every `Hello` carries an HMAC-SHA256(secret, node_id) tag, mismatches
+  drop the connection, and non-`Hello` messages arriving before a
+  completed handshake are ignored. Without a secret the mesh is
+  unauthenticated (a warning is logged at startup).
 - **Full-state handshake anti-entropy** — in static mode every
   handshake ships the whole dataset (tombstones included);
   steady-state replication is incremental (batches + reconciliation).

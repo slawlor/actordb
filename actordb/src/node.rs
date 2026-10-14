@@ -125,6 +125,9 @@ struct ConnContext {
     /// Notify the placement driver on peer join/leave. `None` in
     /// static mode.
     membership_tx: Option<mpsc::UnboundedSender<()>>,
+    /// Pre-shared cluster secret for handshake authentication.
+    /// `None` = unauthenticated mesh.
+    cluster_secret: Option<Vec<u8>>,
 }
 
 /// Max re-forward hops for a routed op. Bounds the chain when peers'
@@ -308,6 +311,9 @@ pub struct Node {
     sync_entries_applied: Arc<AtomicU64>,
     /// Wake the placement driver on membership change (Phase 8).
     membership_tx: Option<mpsc::UnboundedSender<()>>,
+    /// Pre-shared cluster secret for handshake authentication.
+    /// `None` = unauthenticated mesh.
+    cluster_secret: Option<Vec<u8>>,
     tasks: Arc<Mutex<Vec<AbortHandle>>>,
     network: Arc<dyn Network>,
 }
@@ -442,6 +448,21 @@ pub struct NodeConfig {
     /// docs: not a tuning knob.
     #[doc(hidden)]
     pub clock_skew_ms: i64,
+    /// Maximum a remote timestamp may exceed this node's wall clock
+    /// before it is clamped in [`crate::actor::HlcClock::observe`].
+    /// Bounds the damage from a far-future timestamp (malicious or
+    /// from a badly-skewed peer): without it, one bad timestamp
+    /// permanently poisons last-writer-wins cluster-wide. Default
+    /// 5 minutes.
+    pub max_clock_skew: Duration,
+    /// Pre-shared cluster secret for handshake authentication. When
+    /// set, every `Hello` carries an HMAC-SHA256(secret, node_id) tag
+    /// which the receiver verifies; mismatches drop the connection,
+    /// and any non-`Hello` message arriving before a completed
+    /// handshake is ignored. `None` (default) = unauthenticated mesh
+    /// (anyone with TCP reachability can join); a warning is logged
+    /// at startup. Must be identical on every node.
+    pub cluster_secret: Option<Vec<u8>>,
     /// Phase 5 async replication tuning (batching, acks, buffers).
     pub replication: SenderConfig,
     /// Phase 8: dynamic placement controller. `None` (default) =
@@ -488,6 +509,8 @@ impl Default for NodeConfig {
             snapshot_interval: Duration::from_secs(60),
             tombstone_gc_age: Duration::from_secs(3600),
             clock_skew_ms: 0,
+            max_clock_skew: Duration::from_secs(300),
+            cluster_secret: None,
             replication: SenderConfig::default(),
             placement_controller: None,
             placement_poll_interval: Duration::from_secs(1),
@@ -522,6 +545,13 @@ impl Node {
             return Err(NodeError::Actor(
                 "fragment_count must be non-zero".to_string(),
             ));
+        }
+        if config.cluster_secret.is_none() {
+            tracing::warn!(
+                "no cluster_secret configured: the peer mesh is unauthenticated; \
+                 anyone with TCP reachability can join. Set \
+                 NodeConfig.cluster_secret in production."
+            );
         }
         let dynamic = config.placement_controller.is_some();
         // Initial placement: the controller's map in dynamic mode
@@ -633,13 +663,17 @@ impl Node {
             next_req_id: Arc::new(AtomicU64::new(1)),
             peers: Arc::new(Mutex::new(HashMap::new())),
             next_seq: Arc::new(Mutex::new(0)),
-            hlc: Arc::new(Mutex::new(HlcClock::with_offset(config.clock_skew_ms))),
+            hlc: Arc::new(Mutex::new(
+                HlcClock::with_offset(config.clock_skew_ms)
+                    .with_max_skew(config.max_clock_skew.as_millis().min(u64::MAX as u128) as u64),
+            )),
             senders: Arc::new(Mutex::new(HashMap::new())),
             reset_senders: reset_senders.clone(),
             sender_config: config.replication.clone(),
             sender_reports: Arc::new(Mutex::new(HashMap::new())),
             sync_entries_applied: Arc::new(AtomicU64::new(0)),
             membership_tx: membership_tx.clone(),
+            cluster_secret: config.cluster_secret.clone(),
             tasks: Arc::new(Mutex::new(Vec::new())),
             network: config.network.clone(),
         };
@@ -706,6 +740,7 @@ impl Node {
             sender_reports: node.sender_reports.clone(),
             sync_entries_applied: node.sync_entries_applied.clone(),
             membership_tx: node.membership_tx.clone(),
+            cluster_secret: node.cluster_secret.clone(),
         };
         let accept_task = tokio::spawn(async move {
             while let Ok(stream) = acceptor.accept().await {
@@ -763,6 +798,7 @@ impl Node {
             sender_reports: self.sender_reports.clone(),
             sync_entries_applied: self.sync_entries_applied.clone(),
             membership_tx: self.membership_tx.clone(),
+            cluster_secret: self.cluster_secret.clone(),
         };
         let network = self.network.clone();
         let h = tokio::spawn(async move {
@@ -1010,19 +1046,30 @@ impl Node {
                 .send_message(KvMessage::ApplyOp {
                     op: op.clone(),
                     priority,
+                    is_replication: false,
                 })
                 .map_err(|e| NodeError::Actor(e.to_string()))?;
 
             // Barrier: the actor drains its mailbox in FIFO order, so this
             // `call` returns only after the ApplyOp above has been applied.
-            // (A `get` on the same key doubles as the read-your-write check.)
-            // For tombstones the get returns None — the barrier still holds.
+            // The barrier uses a raw read (tombstones visible) and
+            // verifies the value is at least as new as our op in LWW
+            // order: if the ApplyOp was shed, the key holds an older
+            // value (or nothing) and we must report Backpressure rather
+            // than acking a write that never applied (adversarial
+            // review #1). A newer concurrent write passing the check is
+            // fine — our op was applied, then superseded.
             // The barrier read uses the write's priority: it must land in
             // the same pool, or a cross-pool read would not be ordered
             // behind the write.
+            let op_version = (
+                op.value.timestamp_ms,
+                op.value.node_id.clone(),
+                op.value.is_tombstone,
+            );
             match actor
                 .call(
-                    |reply| KvMessage::Get {
+                    |reply| KvMessage::GetRaw {
                         key: op.key.clone(),
                         reply,
                         priority,
@@ -1032,7 +1079,17 @@ impl Node {
                 .await
                 .map_err(|e| NodeError::Actor(e.to_string()))?
             {
-                CallResult::Success(Ok(_)) => {}
+                CallResult::Success(Ok(Some(v)))
+                    if (v.timestamp_ms, &v.node_id, v.is_tombstone)
+                        >= (op_version.0, &op_version.1, op_version.2) =>
+                {
+                    // Our op (or a newer one) is visible: barrier holds.
+                }
+                CallResult::Success(Ok(_)) => {
+                    return Err(NodeError::Backpressure(
+                        "put shed: barrier read did not observe the write".to_string(),
+                    ))
+                }
                 CallResult::Success(Err(shed)) => {
                     return Err(NodeError::Backpressure(format!("put barrier shed: {shed}")))
                 }
@@ -2004,6 +2061,7 @@ async fn handle_connection(ctx: ConnContext, stream: BoxStream, we_dialed: bool)
         sender_reports,
         sync_entries_applied,
         membership_tx,
+        cluster_secret,
     } = ctx;
     // Phase 5: current session per (peer, fragment) on this connection.
     // Sessions are per-connection: a new connection means a new pairing.
@@ -2028,7 +2086,7 @@ async fn handle_connection(ctx: ConnContext, stream: BoxStream, we_dialed: bool)
 
     // The dialer introduces itself first.
     if we_dialed {
-        send_hello(&tx, &node_id).await;
+        send_hello(&tx, &node_id, cluster_secret.as_deref()).await;
     }
 
     // Phase 8: shared re-forward context (migration safety).
@@ -2056,13 +2114,42 @@ async fn handle_connection(ctx: ConnContext, stream: BoxStream, we_dialed: bool)
             Err(_) => break,
         };
 
+        // Gate: only Hello may be processed before the handshake
+        // completes. Any other message arriving pre-handshake is
+        // ignored — an unauthenticated peer must not be able to issue
+        // reads, writes, or sync requests (adversarial review #3).
+        if peer_node_id.is_none() && !matches!(envelope.msg, Some(EnvelopeMsg::Hello(_))) {
+            tracing::debug!("ignoring pre-handshake non-Hello message");
+            continue;
+        }
+
         match envelope.msg {
-            Some(EnvelopeMsg::Hello(Hello { node_id: peer })) => {
+            Some(EnvelopeMsg::Hello(Hello {
+                node_id: peer,
+                auth_tag,
+            })) => {
+                // Reject Hellos claiming our own id (misconfiguration or
+                // impersonation attempt).
+                if peer == node_id {
+                    tracing::warn!("rejecting Hello claiming our own node_id; dropping connection");
+                    break;
+                }
+                // Authenticate the handshake when a cluster secret is
+                // configured. Without it, anyone with TCP reachability
+                // can join the mesh (adversarial review #3, #4).
+                if let Some(secret) = cluster_secret.as_deref() {
+                    if !verify_hello_auth_tag(secret, &peer, &auth_tag) {
+                        tracing::warn!(
+                            "Hello auth failed for claimed node_id={peer}; dropping connection"
+                        );
+                        break;
+                    }
+                }
                 peer_node_id = Some(peer.clone());
                 peers.lock().await.insert(peer.clone(), tx.clone());
                 if !we_dialed {
                     // The listener answers the handshake...
-                    send_hello(&tx, &node_id).await;
+                    send_hello(&tx, &node_id, cluster_secret.as_deref()).await;
                 }
                 // ...and both sides then pull the fragments they serve
                 // for anti-entropy — unless dynamic placement is on, in
@@ -2164,6 +2251,7 @@ async fn handle_connection(ctx: ConnContext, stream: BoxStream, we_dialed: bool)
                         let _ = actor.send_message(KvMessage::ApplyOp {
                             op: replicated,
                             priority: OpPriority::Default,
+                            is_replication: true,
                         });
                     }
                 }
@@ -2303,6 +2391,9 @@ async fn handle_connection(ctx: ConnContext, stream: BoxStream, we_dialed: bool)
                     let _ = actor.send_message(KvMessage::ApplyOp {
                         op: replicated.clone(),
                         priority: priority_from_proto(p.priority),
+                        // Client-originated (not acked replication):
+                        // subject to admission control.
+                        is_replication: false,
                     });
                     // Phase 5: async fan-out via senders.
                     let senders = senders.lock().await;
@@ -2473,6 +2564,9 @@ async fn handle_connection(ctx: ConnContext, stream: BoxStream, we_dialed: bool)
                         let _ = actor.send_message(KvMessage::ApplyOp {
                             op: replicated.clone(),
                             priority: batch_priority,
+                            // Client-originated (not acked replication):
+                            // subject to admission control.
+                            is_replication: false,
                         });
                         let senders = senders.lock().await;
                         for ((f, _peer), tx) in senders.iter() {
@@ -2615,6 +2709,7 @@ async fn handle_connection(ctx: ConnContext, stream: BoxStream, we_dialed: bool)
                         let _ = actor.send_message(KvMessage::ApplyOp {
                             op,
                             priority: OpPriority::Background,
+                            is_replication: true,
                         });
                     }
                 }
@@ -2801,16 +2896,36 @@ fn jitter(backoff: Duration) -> Duration {
 /// Legacy gossip: re-send an op to all peers except the connection it
 /// arrived on. Only used when no fragment_map is configured; the sharded
 /// path fans out from the coordinator instead.
-async fn send_hello(tx: &mpsc::Sender<Vec<u8>>, node_id: &str) {
+async fn send_hello(tx: &mpsc::Sender<Vec<u8>>, node_id: &str, cluster_secret: Option<&[u8]>) {
     send_envelope(
         tx,
         Envelope {
             msg: Some(EnvelopeMsg::Hello(Hello {
                 node_id: node_id.to_string(),
+                auth_tag: cluster_secret
+                    .map(|s| hello_auth_tag(s, node_id))
+                    .unwrap_or_default(),
             })),
         },
     )
     .await;
+}
+
+/// HMAC-SHA256(secret, node_id): proves knowledge of the cluster
+/// secret without revealing it. Compared in constant time.
+fn hello_auth_tag(secret: &[u8], node_id: &str) -> Vec<u8> {
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+    let mut mac = Hmac::<Sha256>::new_from_slice(secret).expect("HMAC accepts any key length");
+    mac.update(node_id.as_bytes());
+    mac.finalize().into_bytes().to_vec()
+}
+
+/// Constant-time verification of a Hello's auth tag.
+fn verify_hello_auth_tag(secret: &[u8], node_id: &str, tag: &[u8]) -> bool {
+    use subtle::ConstantTimeEq;
+    let expected = hello_auth_tag(secret, node_id);
+    expected.as_slice().ct_eq(tag).into()
 }
 
 async fn send_sync_request(tx: &mpsc::Sender<Vec<u8>>, fragments: Vec<u32>) {

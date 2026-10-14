@@ -28,11 +28,16 @@ still wins everywhere.
 
 ## Read-your-write — within a priority
 
-After applying a write, `Node` issues a **barrier read**: a `Get` sent to the
-same worker the write went to, at the **write's priority**. Ractor drains each
-worker's mailbox FIFO, so the barrier returns only after the write applied —
-the `put` future resolves with the write visible to subsequent reads *at that
-priority*.
+After applying a write, `Node` issues a **barrier read**: a raw `Get` (tombstones
+visible) sent to the same worker the write went to, at the **write's priority**.
+Ractor drains each worker's mailbox FIFO, so the barrier returns only after the
+write applied — and the barrier **verifies** the read-back value is at least as
+new as the write in LWW order. The `put` future resolves with the write visible
+to subsequent reads *at that priority*.
+
+If the write was shed under backpressure (the barrier read comes back stale or
+absent), `put` returns `Err(NodeError::Backpressure)` instead of acking a write
+that never landed. A shed write is never reported `Ok`.
 
 The scoping matters:
 

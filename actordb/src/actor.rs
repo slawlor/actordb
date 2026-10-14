@@ -181,14 +181,34 @@ pub struct ReplicatedOp {
 pub enum KvMessage {
     /// Apply a write — local or replicated. Merged with last-writer-wins,
     /// so applying the same op twice is harmless (idempotent).
+    ///
+    /// `is_replication`: true for ops arriving via acked replication
+    /// (`ReplicateBatch`) or anti-entropy (`SyncResponse`, reconcile
+    /// fetch). These bypass dispatcher admission control: the sender
+    /// side is already bounded (`max_in_flight` + `buffer_capacity`),
+    /// and shedding an acked op while the sender acks it would
+    /// silently lose acknowledged writes (adversarial review #2).
+    /// Client-forwarded writes (`ForwardedPut`, `BatchPut`) are NOT
+    /// replication: they stay subject to admission control (and shed
+    /// explicitly under backpressure).
     ApplyOp {
         op: ReplicatedOp,
         priority: OpPriority,
+        is_replication: bool,
     },
     /// Read a single key from the local copy. The reply is
     /// `Ok(value)` on success, `Err(shed_reason)` if the op was shed
     /// due to backpressure (never confused with "not found").
     Get {
+        key: String,
+        reply: RpcReplyPort<Result<Option<VersionedValue>, String>>,
+        priority: OpPriority,
+    },
+    /// Read the raw cached value, including tombstones. For the
+    /// write barrier only: a delete's barrier must observe the
+    /// tombstone to distinguish "applied" from "shed". Never served
+    /// to user reads.
+    GetRaw {
         key: String,
         reply: RpcReplyPort<Result<Option<VersionedValue>, String>>,
         priority: OpPriority,
@@ -294,7 +314,13 @@ impl FragmentState {
             }
         };
         if let Some(batch) = batch {
+            // Retain-then-commit: the batch stays buffered until the
+            // write succeeds, so a transient store error retries on the
+            // next flush instead of silently discarding acknowledged
+            // writes (adversarial review #7).
+            let n = batch.len();
             self.write_batch(batch).await?;
+            self.flush.lock().await.commit_batch(n);
         }
         Ok(())
     }
@@ -308,7 +334,10 @@ impl FragmentState {
             }
             flush.take_batch()
         };
-        self.write_batch(batch).await
+        let n = batch.len();
+        self.write_batch(batch).await?;
+        self.flush.lock().await.commit_batch(n);
+        Ok(())
     }
 
     async fn write_batch(
@@ -332,6 +361,14 @@ impl FragmentState {
             .get(key)
             .filter(|v| !v.is_tombstone && !v.is_expired(now))
             .cloned()
+    }
+
+    /// Read the raw cached value, including tombstones. For the
+    /// write barrier only: verifying a delete requires seeing the
+    /// tombstone, which [`Self::get`] filters out. Not for serving
+    /// user reads.
+    pub async fn get_raw(&self, key: &str) -> Option<VersionedValue> {
+        self.cache.read().await.get(key).cloned()
     }
 
     /// Read the full cache, excluding expired values but *including*
@@ -375,17 +412,32 @@ impl FragmentState {
 }
 
 impl FlushBuffer {
-    /// Drain the pending writes and stamp the flush time. Caller must
-    /// write the batch without holding the buffer lock.
+    /// Collect the pending writes for a flush attempt WITHOUT removing
+    /// them: the caller must call [`Self::commit_batch`] once the write
+    /// succeeds. On failure the batch stays buffered and is retried on
+    /// the next flush tick — a failed write must never silently discard
+    /// acknowledged data (adversarial review #7).
+    ///
+    /// The attempt time is stamped even on failure: this rate-limits
+    /// retries to the flush interval instead of hot-looping against a
+    /// sick store.
     fn take_batch(&mut self) -> Vec<(Vec<u8>, VersionedValue)> {
         let batch: Vec<(Vec<u8>, VersionedValue)> = self
             .pending
             .iter()
             .map(|(k, v)| (k.as_bytes().to_vec(), v.clone()))
             .collect();
-        self.pending.clear();
         self.last_flush = Instant::now();
         batch
+    }
+
+    /// Drop the first `n` buffered entries after a successful write.
+    /// New writes appended between `take_batch` and `commit_batch` land
+    /// after the batch, so draining the prefix removes exactly the
+    /// flushed entries.
+    fn commit_batch(&mut self, n: usize) {
+        let drain_n = n.min(self.pending.len());
+        self.pending.drain(..drain_n);
     }
 }
 
@@ -444,7 +496,11 @@ impl Actor for KvWorker {
         state: &mut Self::State,
     ) -> Result<(), ActorProcessingErr> {
         let result = match message {
-            KvMessage::ApplyOp { op, priority: _ } => {
+            KvMessage::ApplyOp {
+                op,
+                priority: _,
+                is_replication: _,
+            } => {
                 // Memory first (read-your-write never waits for disk),
                 // then buffer for the next batched flush. A DB error
                 // fails the actor loudly rather than diverging silently.
@@ -460,6 +516,16 @@ impl Actor for KvWorker {
             } => {
                 // The receiver may be gone (e.g. timed-out caller); that's fine.
                 let _ = reply.send(Ok(state.0.get(&key).await));
+                Ok(())
+            }
+            KvMessage::GetRaw {
+                key,
+                reply,
+                priority: _,
+            } => {
+                // Barrier-only: surface tombstones so a delete's barrier
+                // can distinguish "tombstone applied" from "op shed".
+                let _ = reply.send(Ok(state.0.get_raw(&key).await));
                 Ok(())
             }
             // GetAll is served by the dispatcher straight from shared state.
@@ -611,6 +677,16 @@ impl WorkerPool {
         self.shed_count.load(Ordering::Relaxed)
     }
 
+    /// Admit an op without cap/rate checks, only incrementing the
+    /// pending counter. For replication-path ops that bypass admission
+    /// control: the worker unconditionally releases one pending slot
+    /// per op, so the increment must still happen to keep the
+    /// accounting balanced (otherwise the counter underflows and the
+    /// pool sheds everything).
+    pub fn admit_unchecked(&self) {
+        self.pending.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Sticky route: pick a worker by key hash.
     pub fn route(&self, key: &str) -> &ActorRef<KvMessage> {
         let idx = worker_idx(key, self.workers.len());
@@ -705,21 +781,37 @@ impl Actor for KvActor {
         state: &mut Self::State,
     ) -> Result<(), ActorProcessingErr> {
         match message {
-            KvMessage::ApplyOp { op, priority } => {
+            KvMessage::ApplyOp {
+                op,
+                priority,
+                is_replication,
+            } => {
                 let pool = match priority {
                     OpPriority::High => &state.high_pool,
                     OpPriority::Default => &state.default_pool,
                     OpPriority::Background => &state.background_pool,
                 };
                 // Phase 7: admission control. Shed explicitly if the
-                // pool is over its queue cap or rate limit.
-                if !pool.try_admit().await {
+                // pool is over its queue cap or rate limit — unless this
+                // is a replicated op: the replication sender is already
+                // bounded, and shedding here while the sender acks would
+                // silently lose acknowledged writes (adversarial #2).
+                // Bypassed ops still take a pending slot (via
+                // admit_unchecked) to keep the worker's release accounting
+                // balanced.
+                if is_replication {
+                    pool.admit_unchecked();
+                } else if !pool.try_admit().await {
                     // Shed: counted in pool.shed_count, not silent.
                     // For fire-and-forget ApplyOp, we just drop.
                     return Ok(());
                 }
                 pool.route(&op.key)
-                    .send_message(KvMessage::ApplyOp { op, priority })
+                    .send_message(KvMessage::ApplyOp {
+                        op,
+                        priority,
+                        is_replication,
+                    })
                     .map_err(|e| ActorProcessingErr::from(e.to_string()))?;
                 Ok(())
             }
@@ -751,6 +843,40 @@ impl Actor for KvActor {
                 if let Ok(CallResult::Success(value)) = worker
                     .call(
                         |r| KvMessage::Get {
+                            key,
+                            reply: r,
+                            priority,
+                        },
+                        None,
+                    )
+                    .await
+                {
+                    let _ = reply.send(value);
+                }
+                Ok(())
+            }
+            KvMessage::GetRaw {
+                key,
+                reply,
+                priority,
+            } => {
+                // Barrier-only raw read (includes tombstones). Same
+                // sticky routing and admission control as Get: the
+                // barrier must land behind the write in the worker's
+                // FIFO mailbox, in the same pool.
+                let pool = match priority {
+                    OpPriority::High => &state.high_pool,
+                    OpPriority::Default => &state.default_pool,
+                    OpPriority::Background => &state.background_pool,
+                };
+                if !pool.try_admit().await {
+                    let _ = reply.send(Err("shed: pool at queue cap or rate limit".to_string()));
+                    return Ok(());
+                }
+                let worker = pool.route(&key);
+                if let Ok(CallResult::Success(value)) = worker
+                    .call(
+                        |r| KvMessage::GetRaw {
                             key,
                             reply: r,
                             priority,
@@ -851,6 +977,11 @@ pub struct HlcClock {
     /// Wall-clock offset in ms. Zero in production; tests use it to
     /// simulate clock skew between nodes.
     offset_ms: i64,
+    /// Maximum a remote timestamp may exceed our wall clock before it
+    /// is clamped. Bounds `observe()` so a single far-future timestamp
+    /// cannot permanently poison the clock (adversarial review #5).
+    /// `u64::MAX` = unbounded (legacy behavior).
+    max_skew_ms: u64,
 }
 
 impl HlcClock {
@@ -864,7 +995,16 @@ impl HlcClock {
         Self {
             last_ms: 0,
             offset_ms,
+            max_skew_ms: u64::MAX,
         }
+    }
+
+    /// Set the maximum accepted clock skew for remote timestamps.
+    /// Remote timestamps more than `max_skew_ms` ahead of our wall
+    /// clock are clamped to `wall + max_skew_ms` in [`Self::observe`].
+    pub fn with_max_skew(mut self, max_skew_ms: u64) -> Self {
+        self.max_skew_ms = max_skew_ms;
+        self
     }
 
     fn wall(&self) -> u64 {
@@ -884,8 +1024,15 @@ impl HlcClock {
     }
 
     /// Observe a remote timestamp: `max(wall, last + 1, remote + 1)`.
+    ///
+    /// The remote timestamp is clamped to `wall + max_skew_ms`: without
+    /// this bound, a single far-future timestamp (malicious or from a
+    /// badly-skewed peer) would permanently drag the HLC forward,
+    /// degrading all future last-writer-wins comparisons to `node_id`
+    /// string order and defeating tombstone GC cluster-wide.
     pub fn observe(&mut self, remote_ms: u64) {
         let wall = self.wall();
+        let remote_ms = remote_ms.min(wall.saturating_add(self.max_skew_ms));
         self.last_ms = wall
             .max(self.last_ms.saturating_add(1))
             .max(remote_ms.saturating_add(1));
@@ -942,7 +1089,8 @@ mod tombstone_hlc_tests {
         let t1 = hlc.tick();
         let t2 = hlc.tick();
         assert!(t2 >= t1, "ticks must be monotonic");
-        // Observing a far-future remote timestamp moves the clock past it.
+        // Observing a far-future remote timestamp moves the clock past it
+        // (unbounded by default, preserving legacy behavior).
         hlc.observe(t2 + 100_000);
         let t3 = hlc.tick();
         assert!(t3 > t2 + 100_000, "clock must move past observed remote");
@@ -950,5 +1098,106 @@ mod tombstone_hlc_tests {
         hlc.observe(1);
         let t4 = hlc.tick();
         assert!(t4 >= t3, "clock must never go backward");
+    }
+
+    #[test]
+    fn hlc_clamps_far_future_remote_timestamps() {
+        // Adversarial review #5: a far-future timestamp must not
+        // permanently poison the clock.
+        let mut hlc = HlcClock::new().with_max_skew(300_000); // 5 min
+        let t1 = hlc.tick();
+        // u64::MAX would previously drag the clock to u64::MAX forever.
+        hlc.observe(u64::MAX);
+        let t2 = hlc.tick();
+        // Clock advanced past the clamped remote (wall + 5 min), not past
+        // u64::MAX: it stays within a sane bound of the wall clock.
+        let wall = hlc.wall();
+        assert!(
+            t2 <= wall.saturating_add(300_000).saturating_add(10),
+            "far-future remote must be clamped, got t2={t2} wall={wall}"
+        );
+        assert!(t2 >= t1, "clock must still be monotonic");
+        // A moderately-ahead (within skew) remote still moves the clock.
+        hlc.observe(wall + 60_000);
+        let t3 = hlc.tick();
+        assert!(t3 > wall + 60_000, "in-skew remote must be observed");
+    }
+}
+
+#[cfg(test)]
+mod flush_retention_tests {
+    use super::*;
+    use crate::store::{KvStore, StoreError};
+    use std::collections::HashMap;
+    use std::sync::Mutex as StdMutex;
+    use std::time::Duration;
+
+    /// A store that fails the first `failures` writes, then succeeds,
+    /// recording everything it receives. Regression test for
+    /// adversarial review #7 (failed flush must not discard data).
+    struct FlakyStore {
+        failures_left: StdMutex<usize>,
+        written: StdMutex<Vec<(Vec<u8>, VersionedValue)>>,
+    }
+
+    impl KvStore for FlakyStore {
+        fn load(&self) -> Result<Vec<(Vec<u8>, VersionedValue)>, StoreError> {
+            Ok(Vec::new())
+        }
+
+        fn write_batch(&self, writes: &[(Vec<u8>, VersionedValue)]) -> Result<(), StoreError> {
+            {
+                let mut left = self.failures_left.lock().unwrap();
+                if *left > 0 {
+                    *left -= 1;
+                    return Err(StoreError("injected failure".to_string()));
+                }
+            }
+            self.written
+                .lock()
+                .unwrap()
+                .extend(writes.iter().map(|(k, v)| (k.clone(), v.clone())));
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_flush_retains_batch_for_retry() {
+        let store = Arc::new(FlakyStore {
+            failures_left: StdMutex::new(1), // first write fails
+            written: StdMutex::new(Vec::new()),
+        });
+        let state = FragmentState::new(
+            HashMap::new(),
+            Some(store.clone() as Arc<dyn KvStore>),
+            2, // flush every 2 buffered ops
+            Duration::from_secs(3600),
+        );
+
+        let v1 = VersionedValue::new(b"v1".to_vec(), 100, "n1".to_string());
+        let v2 = VersionedValue::new(b"v2".to_vec(), 101, "n1".to_string());
+        state.buffer("k1", &v1).await.unwrap();
+        // Second buffered op triggers the flush, which fails.
+        let err = state.buffer("k2", &v2).await.unwrap_err();
+        assert!(
+            err.to_string().contains("injected failure"),
+            "expected injected failure, got {err}"
+        );
+        // Nothing reached the store.
+        assert!(store.written.lock().unwrap().is_empty());
+
+        // Retry: the retained batch must flush successfully now.
+        state.flush().await.unwrap();
+        let written_count = store.written.lock().unwrap().len();
+        assert_eq!(written_count, 2, "retained batch must be retried");
+        {
+            let written = store.written.lock().unwrap();
+            assert!(written.iter().any(|(k, _)| k == b"k1"));
+            assert!(written.iter().any(|(k, _)| k == b"k2"));
+        }
+
+        // And the buffer is drained — a further flush is a no-op.
+        state.flush().await.unwrap();
+        assert_eq!(store.written.lock().unwrap().len(), 2);
     }
 }

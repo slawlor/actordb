@@ -391,6 +391,7 @@ async fn sender_task(
                                 let _ = actor.send_message(KvMessage::ApplyOp {
                                     op,
                                     priority: OpPriority::Default,
+                                    is_replication: true,
                                 });
                             }
                         }
