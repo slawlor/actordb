@@ -1400,3 +1400,265 @@ async fn forwarded_priority_preserved_end_to_end() {
     a.shutdown().await;
     b.shutdown().await;
 }
+/// Phase 8: migrate a fragment between two live nodes under continuous
+/// writes. Zero lost writes; reads stay correct throughout.
+#[tokio::test]
+async fn placement_migration_no_lost_writes() {
+    use actordb::placement::{FragmentPlacementState, ManualPlacement};
+    use actordb::replication::SenderConfig;
+    use actordb::shard::{fragment_of, FragmentId};
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::Arc;
+
+    let frag_count: usize = 2;
+    let mut initial = HashMap::new();
+    initial.insert(FragmentId(0), vec!["a".to_string()]);
+    initial.insert(FragmentId(1), vec!["a".to_string()]);
+    let controller = Arc::new(ManualPlacement::new(initial));
+
+    let mk = || NodeConfig {
+        fragment_count: frag_count,
+        placement_controller: Some(controller.clone()),
+        placement_poll_interval: Duration::from_millis(100),
+        replication: SenderConfig {
+            consistency_interval: Duration::from_millis(200),
+            ..SenderConfig::default()
+        },
+        ..NodeConfig::default()
+    };
+    let a = Arc::new(
+        Node::start("a".to_string(), "127.0.0.1:0".parse().unwrap(), mk())
+            .await
+            .unwrap(),
+    );
+    let b = Arc::new(
+        Node::start("b".to_string(), "127.0.0.1:0".parse().unwrap(), mk())
+            .await
+            .unwrap(),
+    );
+    a.connect(b.addr()).await.unwrap();
+    common::wait_for(
+        || async { a.peer_count().await == 1 && b.peer_count().await == 1 },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    // Keys homed on fragment 0 (the migrating fragment).
+    let keys: Vec<String> = (0..200)
+        .map(|i| format!("mig-key-{i}"))
+        .filter(|k| fragment_of(k, frag_count) == FragmentId(0))
+        .take(12)
+        .collect();
+    assert!(!keys.is_empty(), "need keys in fragment 0");
+
+    // Seed initial values via A.
+    for k in &keys {
+        a.put(k.clone(), b"v0".to_vec()).await.unwrap();
+    }
+
+    // Continuous writer via A (single writer, so HLC timestamps respect
+    // write order). Records the latest acknowledged value per key.
+    let expected: Arc<tokio::sync::Mutex<HashMap<String, Vec<u8>>>> =
+        Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    let max_round = Arc::new(AtomicU64::new(0));
+    let stop = Arc::new(AtomicBool::new(false));
+    let writer = {
+        let a = a.clone();
+        let expected = expected.clone();
+        let max_round = max_round.clone();
+        let stop = stop.clone();
+        let keys = keys.clone();
+        tokio::spawn(async move {
+            let mut round: u64 = 1;
+            while !stop.load(Ordering::Relaxed) {
+                for k in &keys {
+                    let v = format!("v{round}").into_bytes();
+                    // A may forward to B once it stops serving; the write
+                    // still lands.
+                    if a.put(k.clone(), v.clone()).await.is_ok() {
+                        expected.lock().await.insert(k.clone(), v);
+                        max_round.store(round, Ordering::Relaxed);
+                    }
+                }
+                round += 1;
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+    };
+
+    // Let the writer run, then start the migration: overlap [A, B].
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let mut overlap = HashMap::new();
+    overlap.insert(FragmentId(0), vec!["a".to_string(), "b".to_string()]);
+    overlap.insert(FragmentId(1), vec!["a".to_string()]);
+    controller.set_placement(overlap);
+
+    // Wait until B serves fragment 0 (bootstrap complete).
+    common::wait_for(
+        || async {
+            b.placement_report().await.states.get(&FragmentId(0))
+                == Some(&FragmentPlacementState::Serving)
+        },
+        Duration::from_secs(20),
+    )
+    .await;
+
+    // Reads during the overlap: every value must be one the writer
+    // actually wrote (well-formed, and not from the future).
+    for k in &keys {
+        let got = b.get(k.clone()).await.unwrap().expect("key missing");
+        let s = String::from_utf8(got.value.clone()).unwrap();
+        assert!(s.starts_with('v'), "unexpected value {s} for {k}");
+        let round: u64 = s[1..].parse().expect("value should be v<round>");
+        assert!(
+            round <= max_round.load(Ordering::Relaxed),
+            "read from the future for {k}: {s}"
+        );
+    }
+
+    // Revoke A: [B] only.
+    let mut final_map = HashMap::new();
+    final_map.insert(FragmentId(0), vec!["b".to_string()]);
+    final_map.insert(FragmentId(1), vec!["a".to_string()]);
+    controller.set_placement(final_map);
+
+    // Wait until A drops fragment 0.
+    common::wait_for(
+        || async {
+            a.placement_report().await.states.get(&FragmentId(0))
+                == Some(&FragmentPlacementState::Stopped)
+        },
+        Duration::from_secs(20),
+    )
+    .await;
+
+    // Stop the writer; B must converge to the final value of every key:
+    // zero lost writes.
+    stop.store(true, Ordering::Relaxed);
+    writer.await.unwrap();
+    let expected = expected.lock().await.clone();
+    assert!(!expected.is_empty());
+    common::wait_for(
+        || async {
+            for (k, v) in &expected {
+                match b.get(k.clone()).await.unwrap().map(|x| x.value) {
+                    Some(got) if got == *v => {}
+                    _ => return false,
+                }
+            }
+            true
+        },
+        Duration::from_secs(15),
+    )
+    .await;
+
+    a.shutdown().await;
+    b.shutdown().await;
+}
+
+/// Phase 8: rolling restart with dynamic placement. The survivor keeps
+/// serving; the restarted node catches up via delta reconciliation
+/// only — no full-state resync.
+#[tokio::test]
+async fn placement_rolling_restart_delta_reconcile_only() {
+    use actordb::placement::ManualPlacement;
+    use actordb::replication::SenderConfig;
+    use actordb::shard::FragmentId;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    let frag_count: usize = 2;
+    let mut map = HashMap::new();
+    map.insert(FragmentId(0), vec!["a".to_string(), "b".to_string()]);
+    map.insert(FragmentId(1), vec!["a".to_string(), "b".to_string()]);
+    let controller = Arc::new(ManualPlacement::new(map));
+
+    let mk = || NodeConfig {
+        fragment_count: frag_count,
+        placement_controller: Some(controller.clone()),
+        placement_poll_interval: Duration::from_millis(100),
+        replication: SenderConfig {
+            consistency_interval: Duration::from_millis(200),
+            ..SenderConfig::default()
+        },
+        ..NodeConfig::default()
+    };
+
+    let a = Node::start("a".to_string(), "127.0.0.1:0".parse().unwrap(), mk())
+        .await
+        .unwrap();
+    let b = Node::start("b".to_string(), "127.0.0.1:0".parse().unwrap(), mk())
+        .await
+        .unwrap();
+    a.connect(b.addr()).await.unwrap();
+    common::wait_for(
+        || async { a.peer_count().await == 1 && b.peer_count().await == 1 },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    // Write data and let it converge to both replicas.
+    for i in 0..50 {
+        a.put(format!("rk-{i}"), format!("rv-{i}").into_bytes())
+            .await
+            .unwrap();
+    }
+    common::wait_for(
+        || async {
+            let all = b.get_all().await.unwrap();
+            (0..50).all(|i| {
+                all.get(&format!("rk-{i}")).map(|v| v.value.clone())
+                    == Some(format!("rv-{i}").into_bytes())
+            })
+        },
+        Duration::from_secs(10),
+    )
+    .await;
+
+    // Restart A: same node_id, fresh (empty) state.
+    a.shutdown().await;
+    // The surviving replica keeps serving throughout.
+    assert_eq!(
+        b.get("rk-0".to_string())
+            .await
+            .unwrap()
+            .expect("b should serve during a's restart")
+            .value,
+        b"rv-0".to_vec()
+    );
+    let a2 = Node::start("a".to_string(), "127.0.0.1:0".parse().unwrap(), mk())
+        .await
+        .unwrap();
+    a2.connect(b.addr()).await.unwrap();
+    common::wait_for(
+        || async { a2.peer_count().await == 1 && b.peer_count().await == 1 },
+        Duration::from_secs(10),
+    )
+    .await;
+
+    // A2 must converge to the full dataset...
+    common::wait_for(
+        || async {
+            let all = a2.get_all().await.unwrap();
+            (0..50).all(|i| {
+                all.get(&format!("rk-{i}")).map(|v| v.value.clone())
+                    == Some(format!("rv-{i}").into_bytes())
+            })
+        },
+        Duration::from_secs(15),
+    )
+    .await;
+
+    // ...without any full-state resync: the handshake skips SyncRequest
+    // in dynamic mode, so all catch-up came from the Phase 5 delta
+    // reconciler.
+    assert_eq!(
+        a2.sync_entries_applied(),
+        0,
+        "restarted node used full-state sync instead of delta reconciliation"
+    );
+
+    a2.shutdown().await;
+    b.shutdown().await;
+}

@@ -41,5 +41,9 @@ pub mod supervision;
 /// senders with batching, acks, and reconciliation).
 pub mod replication;
 
+/// Phase 8: dynamic placement controller — runtime fragment lifecycle,
+/// chunked bootstrap, and controller-sequenced migration.
+pub mod placement;
+
 #[cfg(test)]
 pub(crate) mod common_test;

@@ -163,6 +163,8 @@ Key `NodeConfig` knobs:
 | `snapshot_interval` | 60s | Periodic durable flush |
 | `tombstone_gc_age` | 1h | Tombstone retention (must exceed longest expected partition) |
 | `replication` | defaults | `SenderConfig`: batch size/interval, max in-flight, buffer capacity, consistency interval |
+| `placement_controller` | None | Phase 8: `Some(Arc<dyn PlacementController>)` opts into dynamic placement |
+| `placement_poll_interval` | 1s | Phase 8: how often the driver re-evaluates desired placement |
 | `store` | None | `Some(Arc<dyn KvStore>)`; `NodeConfig::with_rocksdb(path)` with the `rocksdb` feature |
 
 - Local writes are read-your-write within a priority (the barrier
@@ -225,7 +227,65 @@ independent.
 - Session ids per pairing; stale batches discarded on reconnect.
 - Buffer overflow → `buffer_reset`: shed, block tombstone GC, and
   reconcile via timestamp/tombstone comparison when the peer returns.
-- Periodic anti-entropy repairs residual divergence.
+- Periodic anti-entropy repairs residual divergence, including in the
+  connected state (timestamp/tombstone compare, fetch in 500-key
+  chunks, ship winners back). Reconcile rounds are counted per sender
+  (`SenderStateReport::reconcile_rounds`).
+
+### `actordb::placement` — dynamic placement controller (Phase 8)
+
+Opt-in via `NodeConfig::placement_controller`. With no controller the
+node keeps static placement and behaves exactly as before.
+
+```rust
+use actordb::placement::ManualPlacement;
+use std::sync::Arc;
+
+let controller = Arc::new(ManualPlacement::new(initial_map));
+let config = NodeConfig {
+    placement_controller: Some(controller.clone()),
+    placement_poll_interval: Duration::from_millis(500),
+    ..NodeConfig::default()
+};
+// ... later, migrate fragment 0 from "a" to "b":
+let mut overlap = HashMap::new();
+overlap.insert(FragmentId(0), vec!["a".to_string(), "b".to_string()]);
+overlap.insert(FragmentId(1), vec!["a".to_string()]);
+controller.set_placement(overlap);
+// wait until b reports fragment 0 as Serving...
+let mut final_map = HashMap::new();
+final_map.insert(FragmentId(0), vec!["b".to_string()]);
+final_map.insert(FragmentId(1), vec!["a".to_string()]);
+controller.set_placement(final_map);
+```
+
+- `PlacementController` trait: `desired_placement()`,
+  `on_membership_change()`, `on_fragment_ready()`. Implement it for an
+  external cluster manager; `ManualPlacement` (interior-mutable map)
+  covers tests and operator-driven moves.
+- The driver polls the controller, publishes its map as the routing
+  table, and converges: gained fragments get a supervised subtree plus
+  a **chunked bootstrap** from a replica holder (on-demand reconcile,
+  500-key fetch chunks, 30s timeout); revoked fragments drain their
+  replication senders, then stop.
+- **Migration protocol** (controller-sequenced, with overlap): add the
+  new owner → wait for it to report `Serving` (bootstrap done) →
+  revoke the old owner. At least one node always serves the fragment;
+  LWW keeps the overlap consistent. A bootstrapping node forwards
+  reads/writes to the previous owner until it flips to serving.
+- A node that receives a routed op for a fragment it no longer serves
+  re-forwards it to the current owner (hop-limited, never bounced back
+  to the sender) instead of dropping it — this covers the window where
+  peers' placement maps disagree.
+- `node.placement_report()` — per-fragment lifecycle state
+  (`Bootstrapping` / `Serving` / `Draining` / `Stopped`) plus the
+  authoritative placement map.
+- In dynamic mode the handshake **skips the full-state sync**; the
+  Phase 5 reconciler owns anti-entropy (delta-only). A restarted node
+  therefore catches up via reconciliation, not a full copy
+  (`node.sync_entries_applied()` stays 0).
+- Assumes the peer mesh is established (`members` or manual
+  `connect()`); the driver does not dial.
 
 ### `actordb::proto` — wire protocol
 
@@ -244,9 +304,11 @@ as issues in the [issue tracker](https://github.com/slawlor/actordb/issues):
   durability; without it the dataset lives in memory and a restart
   wipes it (recoverable only via peer sync).
 - **No TLS/authentication** — plaintext, unauthenticated TCP.
-- **Full-state handshake anti-entropy** — every handshake ships the
-  whole dataset (tombstones included); steady-state replication is
-  incremental (batches + reconciliation).
+- **Full-state handshake anti-entropy** — in static mode every
+  handshake ships the whole dataset (tombstones included);
+  steady-state replication is incremental (batches + reconciliation).
+  With dynamic placement enabled the handshake skips the full-state
+  sync and the reconciler owns anti-entropy (delta-only).
 - **Tombstone GC is time-based** — a node partitioned longer than
   `tombstone_gc_age` can resurrect deleted keys on rejoin.
 

@@ -65,6 +65,11 @@ message ForwardedPut {
   bool is_tombstone = 8;
   // Phase 7: priority the receiving node should apply this op with.
   Priority priority = 9;
+  // Phase 8: re-forward count. A node that receives a ForwardedPut for a
+  // fragment it no longer serves (stale placement maps during
+  // migration) re-forwards it to the current owner instead of
+  // dropping it; hops bounds the chain.
+  uint32 hops = 10;
 }
 
 // A client-routed read: "you own this key's fragment — read it and
@@ -74,6 +79,9 @@ message ForwardedGet {
   uint64 req_id = 2;
   // Phase 7: priority the receiving node should serve this read with.
   Priority priority = 3;
+  // Phase 8: re-forward count, as with ForwardedPut. A non-serving node
+  // relays the read to the current owner and relays the response back.
+  uint32 hops = 4;
 }
 
 message GetResponse {
