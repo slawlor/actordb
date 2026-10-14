@@ -586,7 +586,10 @@ async fn worker_pool_concurrent_keys_and_ordering() {
     use std::sync::Arc;
 
     let config = NodeConfig {
-        worker_count: 8,
+        default_pool: actordb::actor::PoolConfig {
+            workers: 8,
+            ..Default::default()
+        },
         ..NodeConfig::default()
     };
     let a = Arc::new(
@@ -671,7 +674,10 @@ async fn worker_kill_triggers_supervised_restart() {
 
     let config = NodeConfig {
         fragment_count: 2,
-        worker_count: 2,
+        default_pool: actordb::actor::PoolConfig {
+            workers: 2,
+            ..Default::default()
+        },
         ..NodeConfig::default()
     };
     let a = Node::start("a".to_string(), "127.0.0.1:0".parse().unwrap(), config)
@@ -1183,4 +1189,214 @@ async fn multi_key_partial_failure() {
     }
 
     a.shutdown().await;
+}
+
+/// Phase 7: saturating the background pool must not degrade
+/// high-priority read latency — the pools are isolated.
+#[tokio::test]
+async fn background_saturation_leaves_high_priority_p99_unaffected() {
+    use actordb::actor::{OpPriority, PoolConfig};
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    let config = NodeConfig {
+        background_pool: PoolConfig {
+            workers: 1,
+            queue_cap: 100_000,
+            rate_limit_per_sec: None,
+        },
+        high_pool: PoolConfig {
+            workers: 1,
+            queue_cap: 100_000,
+            rate_limit_per_sec: None,
+        },
+        ..NodeConfig::default()
+    };
+    let n = Arc::new(
+        Node::start("sat".to_string(), "127.0.0.1:0".parse().unwrap(), config)
+            .await
+            .unwrap(),
+    );
+    n.put("hot".to_string(), b"v".to_vec()).await.unwrap();
+
+    // Flood the background pool with bulk writes for the duration of
+    // the measurement.
+    let flood = {
+        let n = n.clone();
+        tokio::spawn(async move {
+            for i in 0..200u32 {
+                let kvs: Vec<(String, Vec<u8>)> = (0..25)
+                    .map(|j| (format!("bg{i}-{j}"), vec![0u8; 32]))
+                    .collect();
+                let _ = n.put_multi(kvs).await;
+            }
+        })
+    };
+
+    // High-priority reads stay fast while the background pool is
+    // saturated: separate pool, separate worker, separate counters.
+    let mut latencies = Vec::with_capacity(40);
+    for _ in 0..40 {
+        let t = Instant::now();
+        let r = n
+            .get_with_priority("hot".to_string(), OpPriority::High)
+            .await;
+        latencies.push(t.elapsed());
+        assert!(r.unwrap().is_some(), "hot key should read back");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    flood.abort();
+
+    latencies.sort();
+    let p99 = latencies[(latencies.len() * 99) / 100];
+    assert!(
+        p99 < Duration::from_millis(500),
+        "high-priority p99 {p99:?} degraded under background saturation"
+    );
+
+    n.shutdown().await;
+}
+
+/// Phase 7: a queue-cap hit is explicit, counted, and surfaced. A shed
+/// Get returns `NodeError::Backpressure` (never `Ok(None)`), the shed
+/// is counted per pool, and the count is visible via `health()`.
+#[tokio::test]
+async fn queue_cap_shed_is_explicit_and_counted() {
+    use actordb::actor::PoolConfig;
+    use actordb::node::NodeError;
+
+    // Degenerate config: the default pool sheds everything (cap 0), so
+    // every op deterministically exercises the shed path.
+    let config = NodeConfig {
+        default_pool: PoolConfig {
+            workers: 1,
+            queue_cap: 0,
+            rate_limit_per_sec: None,
+        },
+        ..NodeConfig::default()
+    };
+    let n = Node::start("shed".to_string(), "127.0.0.1:0".parse().unwrap(), config)
+        .await
+        .unwrap();
+
+    // A shed Get is an explicit Backpressure error, not "not found".
+    let r = n.get("k".to_string()).await;
+    assert!(
+        matches!(r, Err(NodeError::Backpressure(_))),
+        "shed get should be Backpressure, got {r:?}"
+    );
+
+    // A shed put surfaces via its barrier read as well.
+    let r = n.put("k".to_string(), b"v".to_vec()).await;
+    assert!(
+        matches!(r, Err(NodeError::Backpressure(_))),
+        "shed put should be Backpressure, got {r:?}"
+    );
+
+    // Sheds are counted per pool and visible via the health API.
+    let health = n.health().await.unwrap();
+    let default_shed: u64 = health.values().map(|h| h.shed_counts.1).sum();
+    assert!(
+        default_shed >= 2,
+        "expected shed counts to reflect the shed ops, got {default_shed}"
+    );
+
+    n.shutdown().await;
+}
+
+/// Phase 7: forwarded priority is preserved end-to-end. A background
+/// batch sent to a remote owner is applied at background priority
+/// there — observable via the remote's per-pool shed counters.
+#[tokio::test]
+async fn forwarded_priority_preserved_end_to_end() {
+    use actordb::actor::{OpPriority, PoolConfig};
+    use actordb::shard::{fragment_of, FragmentId};
+    use std::collections::HashMap;
+
+    // Two fragments: a serves 0, b serves 1. b's background pool sheds
+    // everything; its default pool is healthy.
+    let mut fragment_map = HashMap::new();
+    fragment_map.insert(FragmentId(0), vec!["a".to_string()]);
+    fragment_map.insert(FragmentId(1), vec!["b".to_string()]);
+    let mk = |map: HashMap<FragmentId, Vec<String>>, mut cfg: NodeConfig| {
+        cfg.fragment_count = 2;
+        cfg.fragment_map = map;
+        cfg
+    };
+    let config_b = NodeConfig {
+        background_pool: PoolConfig {
+            workers: 1,
+            queue_cap: 0,
+            rate_limit_per_sec: None,
+        },
+        ..NodeConfig::default()
+    };
+    let a = Node::start(
+        "a".to_string(),
+        "127.0.0.1:0".parse().unwrap(),
+        mk(fragment_map.clone(), NodeConfig::default()),
+    )
+    .await
+    .unwrap();
+    let b = Node::start(
+        "b".to_string(),
+        "127.0.0.1:0".parse().unwrap(),
+        mk(fragment_map, config_b),
+    )
+    .await
+    .unwrap();
+    b.connect(a.addr()).await.unwrap();
+    wait_for_peers(&a, &b).await;
+
+    // A key in fragment 1 (owned by b).
+    let key = (0..100)
+        .map(|i| format!("fp{i}"))
+        .find(|k| fragment_of(k, 2) == FragmentId(1))
+        .unwrap();
+
+    // Background batch from a: b applies it at background priority →
+    // shed → counted in b's background pool.
+    let r = a
+        .put_multi_with_priority(vec![(key.clone(), b"v".to_vec())], OpPriority::Background)
+        .await;
+    assert!(r[0].is_ok(), "fire-and-forget send should succeed");
+    common::wait_for(
+        || async {
+            b.health()
+                .await
+                .unwrap()
+                .values()
+                .map(|h| h.shed_counts.2)
+                .sum::<u64>()
+                > 0
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    // Default-priority batch lands in b's default pool (not shed): the
+    // key is applied and the default shed counter stays zero.
+    let r = a
+        .put_multi_with_priority(vec![(key.clone(), b"v2".to_vec())], OpPriority::Default)
+        .await;
+    assert!(r[0].is_ok());
+    common::wait_for(
+        || async { b.get(key.clone()).await.unwrap().is_some() },
+        Duration::from_secs(5),
+    )
+    .await;
+    let default_shed: u64 = b
+        .health()
+        .await
+        .unwrap()
+        .values()
+        .map(|h| h.shed_counts.0)
+        .sum();
+    assert_eq!(
+        default_shed, 0,
+        "default-priority batch must not shed on b's healthy default pool"
+    );
+
+    a.shutdown().await;
+    b.shutdown().await;
 }

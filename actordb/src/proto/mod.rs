@@ -15,7 +15,7 @@ pub use meta::batch_get_response::KeyValue as BatchKeyValue;
 pub use meta::envelope::Msg as EnvelopeMsg;
 pub use meta::{
     BatchAck, BatchGet, BatchGetResponse, BatchPut, Envelope, ForwardedGet, ForwardedPut,
-    GetResponse, Hello, KeySummary, ReconcileData, ReconcileFetch, ReconcileRequest,
+    GetResponse, Hello, KeySummary, Priority, ReconcileData, ReconcileFetch, ReconcileRequest,
     ReconcileResponse, ReplicateBatch, ReplicateOp, SessionStart, SyncEntry, SyncRequest,
     SyncResponse,
 };

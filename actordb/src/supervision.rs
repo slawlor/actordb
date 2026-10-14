@@ -23,9 +23,10 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
 
+use ractor::rpc::CallResult;
 use ractor::{Actor, ActorCell, ActorProcessingErr, ActorRef, RpcReplyPort, SupervisionEvent};
 
-use crate::actor::{now_ms, FragmentState, KvActor, KvArgs, KvMessage, VersionedValue};
+use crate::actor::{now_ms, FragmentState, KvActor, KvArgs, KvMessage, PoolConfig, VersionedValue};
 use crate::shard::FragmentId;
 use crate::store::KvStore;
 
@@ -34,7 +35,7 @@ use crate::store::KvStore;
 pub struct FragmentHealth {
     /// Which fragment this reports on.
     pub fragment: FragmentId,
-    /// Workers currently in the dispatch pool.
+    /// Workers currently in the dispatch pools (high, default, background).
     pub worker_count: usize,
     /// Registered names of the dispatch pool workers.
     pub worker_names: Vec<String>,
@@ -43,6 +44,9 @@ pub struct FragmentHealth {
     pub restarts: HashMap<String, u64>,
     /// Keys reaped by the cleaner on its last sweep.
     pub last_reaped: usize,
+    /// Ops shed by backpressure, per pool (high, default, background).
+    /// Explicit and counted, never silent (Phase 7).
+    pub shed_counts: (u64, u64, u64),
 }
 
 /// Messages handled by the [`FragmentSupervisor`].
@@ -64,8 +68,10 @@ pub struct SupervisorArgs {
     pub worker_prefix: String,
     /// Durable storage behind the cache. `None` = purely in-memory.
     pub store: Option<Arc<dyn KvStore>>,
-    /// Worker actors in the dispatch pool.
-    pub worker_count: usize,
+    /// Worker pool configs by priority.
+    pub default_pool: PoolConfig,
+    pub high_pool: PoolConfig,
+    pub background_pool: PoolConfig,
     /// Flush the write buffer after this many buffered ops.
     pub flush_batch_size: usize,
     /// Flush the write buffer after this long, even if not full.
@@ -87,8 +93,6 @@ pub struct FragmentSupervisor;
 
 pub struct SupervisorState {
     fragment: FragmentId,
-    worker_prefix: String,
-    worker_count: usize,
     dispatcher: ActorRef<KvMessage>,
     cleaner: ActorRef<CleanerMessage>,
     snapshotter: ActorRef<SnapshotterMessage>,
@@ -156,7 +160,9 @@ impl Actor for FragmentSupervisor {
                 shared: shared.clone(),
                 fragment: args.fragment,
                 worker_prefix: args.worker_prefix.clone(),
-                worker_count: args.worker_count,
+                default_pool: args.default_pool.clone(),
+                high_pool: args.high_pool.clone(),
+                background_pool: args.background_pool.clone(),
             },
             cell.clone(),
         )
@@ -192,8 +198,6 @@ impl Actor for FragmentSupervisor {
 
         Ok(SupervisorState {
             fragment: args.fragment,
-            worker_prefix: args.worker_prefix.clone(),
-            worker_count: args.worker_count.max(1),
             dispatcher,
             cleaner,
             snapshotter,
@@ -228,15 +232,37 @@ impl Actor for FragmentSupervisor {
                 Ok(())
             }
             SupervisorMessage::GetHealth { reply } => {
-                let worker_names = (0..state.worker_count)
-                    .map(|slot| format!("{}-worker-{slot}", state.worker_prefix))
-                    .collect();
+                // Worker names follow the dispatcher's naming:
+                // {prefix}-{pool}-worker-{slot}.
+                let mut worker_names = Vec::new();
+                for (pool_cfg, suffix) in [
+                    (&state.args.high_pool, "high"),
+                    (&state.args.default_pool, "default"),
+                    (&state.args.background_pool, "bg"),
+                ] {
+                    for slot in 0..pool_cfg.workers.max(1) {
+                        worker_names.push(format!(
+                            "{}-{suffix}-worker-{slot}",
+                            state.args.worker_prefix
+                        ));
+                    }
+                }
+                // Query the dispatcher for per-pool shed counts.
+                let shed_counts = match state
+                    .dispatcher
+                    .call(|reply| KvMessage::GetShedCounts { reply }, None)
+                    .await
+                {
+                    Ok(CallResult::Success(counts)) => counts,
+                    _ => (0, 0, 0),
+                };
                 let _ = reply.send(FragmentHealth {
                     fragment: state.fragment,
-                    worker_count: state.worker_count,
+                    worker_count: worker_names.len(),
                     worker_names,
                     restarts: state.restarts.clone(),
                     last_reaped: state.last_reaped,
+                    shed_counts,
                 });
                 Ok(())
             }
@@ -265,7 +291,9 @@ impl Actor for FragmentSupervisor {
                         shared: state.shared.clone(),
                         fragment: state.fragment,
                         worker_prefix: state.args.worker_prefix.clone(),
-                        worker_count: state.args.worker_count,
+                        default_pool: state.args.default_pool.clone(),
+                        high_pool: state.args.high_pool.clone(),
+                        background_pool: state.args.background_pool.clone(),
                     },
                     myself_cell,
                 )

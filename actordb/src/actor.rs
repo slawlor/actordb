@@ -26,7 +26,78 @@ use std::time::{Duration, Instant};
 
 use ractor::rpc::CallResult;
 use ractor::{Actor, ActorCell, ActorProcessingErr, ActorRef, RpcReplyPort, SupervisionEvent};
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::{Mutex, RwLock};
+
+/// Priority for an operation. The dispatcher routes to separate worker
+/// pools by priority, so bulk/background traffic can never starve
+/// latency-sensitive ops.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum OpPriority {
+    /// Latency-sensitive reads/writes.
+    High,
+    /// Normal operations (default).
+    #[default]
+    Default,
+    /// Bulk/scan traffic.
+    Background,
+}
+
+/// Configuration for a worker pool.
+#[derive(Debug, Clone)]
+pub struct PoolConfig {
+    /// Number of worker actors.
+    pub workers: usize,
+    /// Max pending ops before shedding. Shed ops are dropped and counted
+    /// (explicit, not silent).
+    pub queue_cap: usize,
+    /// Token-bucket rate limit (ops/sec). `None` = unlimited.
+    pub rate_limit_per_sec: Option<u32>,
+}
+
+impl Default for PoolConfig {
+    fn default() -> Self {
+        Self {
+            workers: 4,
+            queue_cap: 10_000,
+            rate_limit_per_sec: None,
+        }
+    }
+}
+
+/// Token-bucket rate limiter.
+#[derive(Debug)]
+pub struct TokenBucket {
+    capacity: u32,
+    tokens: f64,
+    refill_per_sec: f64,
+    last_refill: Instant,
+}
+
+impl TokenBucket {
+    pub fn new(rate_per_sec: u32) -> Self {
+        Self {
+            capacity: rate_per_sec.max(1),
+            tokens: rate_per_sec as f64,
+            refill_per_sec: rate_per_sec as f64,
+            last_refill: Instant::now(),
+        }
+    }
+
+    /// Try to take a token. Returns `true` if allowed.
+    pub fn try_acquire(&mut self) -> bool {
+        let now = Instant::now();
+        let elapsed = now.duration_since(self.last_refill).as_secs_f64();
+        self.tokens = (self.tokens + elapsed * self.refill_per_sec).min(self.capacity as f64);
+        self.last_refill = now;
+        if self.tokens >= 1.0 {
+            self.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+}
 
 use crate::shard::{hash_key, FragmentId};
 use crate::store::KvStore;
@@ -110,15 +181,25 @@ pub struct ReplicatedOp {
 pub enum KvMessage {
     /// Apply a write — local or replicated. Merged with last-writer-wins,
     /// so applying the same op twice is harmless (idempotent).
-    ApplyOp(ReplicatedOp),
-    /// Read a single key from the local copy.
+    ApplyOp {
+        op: ReplicatedOp,
+        priority: OpPriority,
+    },
+    /// Read a single key from the local copy. The reply is
+    /// `Ok(value)` on success, `Err(shed_reason)` if the op was shed
+    /// due to backpressure (never confused with "not found").
     Get {
         key: String,
-        reply: RpcReplyPort<Option<VersionedValue>>,
+        reply: RpcReplyPort<Result<Option<VersionedValue>, String>>,
+        priority: OpPriority,
     },
     /// Read the full local copy (used for anti-entropy sync).
     GetAll {
         reply: RpcReplyPort<HashMap<String, VersionedValue>>,
+    },
+    /// Query per-pool shed counts (high, default, background).
+    GetShedCounts {
+        reply: RpcReplyPort<(u64, u64, u64)>,
     },
 }
 
@@ -320,9 +401,11 @@ pub struct KvArgs {
     /// Prefix for worker actor names (must be unique per dispatcher
     /// in the process; the supervisor generates it).
     pub worker_prefix: String,
-    /// Number of worker actors in this fragment's pool. Keys are
-    /// sticky-routed by `hash(key) % worker_count`.
-    pub worker_count: usize,
+    /// Worker pool configs by priority. Keys are sticky-routed by
+    /// `hash(key) % pool.workers` within the selected pool.
+    pub high_pool: PoolConfig,
+    pub default_pool: PoolConfig,
+    pub background_pool: PoolConfig,
 }
 
 /// A fragment's worker: applies ops and serves reads against the shared
@@ -336,11 +419,14 @@ pub struct KvWorker;
 pub struct KvWorkerArgs {
     /// The fragment state this worker shares with its siblings.
     pub shared: Arc<FragmentState>,
+    /// Pending-op counter for the pool (decremented after each op).
+    /// `None` for unsupervised test workers.
+    pub pending: Option<Arc<AtomicU64>>,
 }
 
 impl Actor for KvWorker {
     type Msg = KvMessage;
-    type State = Arc<FragmentState>;
+    type State = (Arc<FragmentState>, Option<Arc<AtomicU64>>);
     type Arguments = KvWorkerArgs;
 
     async fn pre_start(
@@ -348,7 +434,7 @@ impl Actor for KvWorker {
         _myself: ActorRef<Self::Msg>,
         args: Self::Arguments,
     ) -> Result<Self::State, ActorProcessingErr> {
-        Ok(args.shared)
+        Ok((args.shared, args.pending))
     }
 
     async fn handle(
@@ -357,24 +443,38 @@ impl Actor for KvWorker {
         message: Self::Msg,
         state: &mut Self::State,
     ) -> Result<(), ActorProcessingErr> {
-        match message {
-            KvMessage::ApplyOp(op) => {
+        let result = match message {
+            KvMessage::ApplyOp { op, priority: _ } => {
                 // Memory first (read-your-write never waits for disk),
                 // then buffer for the next batched flush. A DB error
                 // fails the actor loudly rather than diverging silently.
-                if state.apply(&op).await {
-                    state.buffer(&op.key, &op.value).await?;
+                if state.0.apply(&op).await {
+                    state.0.buffer(&op.key, &op.value).await?;
                 }
                 Ok(())
             }
-            KvMessage::Get { key, reply } => {
+            KvMessage::Get {
+                key,
+                reply,
+                priority: _,
+            } => {
                 // The receiver may be gone (e.g. timed-out caller); that's fine.
-                let _ = reply.send(state.get(&key).await);
+                let _ = reply.send(Ok(state.0.get(&key).await));
                 Ok(())
             }
             // GetAll is served by the dispatcher straight from shared state.
             KvMessage::GetAll { .. } => Ok(()),
+            // Shed counts are a dispatcher-level query; workers don't track them.
+            KvMessage::GetShedCounts { reply } => {
+                let _ = reply.send((0, 0, 0));
+                Ok(())
+            }
+        };
+        // Release the pool's pending slot.
+        if let Some(pending) = &state.1 {
+            pending.fetch_sub(1, Ordering::Relaxed);
         }
+        result
     }
 }
 
@@ -390,22 +490,30 @@ pub fn worker_idx(key: &str, worker_count: usize) -> usize {
 /// drains them on shutdown. The dispatcher holds a pool and does nothing
 /// else with worker lifecycle — this is the seam Phase 4's supervision
 /// (health checks, restarts) will build on.
+/// A pool of workers with explicit backpressure: bounded queue,
+/// token-bucket rate limiting, and counted sheds (never silent).
 pub struct WorkerPool {
     workers: Vec<ActorRef<KvMessage>>,
+    config: PoolConfig,
+    /// Ops currently pending (sent but not yet processed).
+    pending: Arc<AtomicU64>,
+    /// Ops shed due to queue cap or rate limit (explicit, counted).
+    shed_count: Arc<AtomicU64>,
+    rate_limiter: Option<Mutex<TokenBucket>>,
 }
 
 impl WorkerPool {
-    /// Spawn `worker_count` workers sharing `shared` state, linked to
-    /// `supervisor` so a dead worker raises a supervision event there.
-    /// Workers are named `frag-<fragment>-worker-<slot>` for registry
-    /// lookup (tests, debugging).
+    /// Spawn workers sharing `shared` state, linked to `supervisor`
+    /// so a dead worker raises a supervision event there. Workers are
+    /// named `<prefix>-worker-<slot>` for registry lookup.
     pub async fn spawn_linked(
-        worker_count: usize,
+        config: PoolConfig,
         shared: Arc<FragmentState>,
         supervisor: ActorCell,
         worker_prefix: &str,
     ) -> Result<Self, ActorProcessingErr> {
-        let worker_count = worker_count.max(1);
+        let worker_count = config.workers.max(1);
+        let pending = Arc::new(AtomicU64::new(0));
         let mut workers = Vec::with_capacity(worker_count);
         for slot in 0..worker_count {
             let name = format!("{worker_prefix}-worker-{slot}");
@@ -414,6 +522,7 @@ impl WorkerPool {
                 KvWorker,
                 KvWorkerArgs {
                     shared: shared.clone(),
+                    pending: Some(pending.clone()),
                 },
                 supervisor.clone(),
             )
@@ -421,17 +530,25 @@ impl WorkerPool {
             .map_err(|e| ActorProcessingErr::from(e.to_string()))?;
             workers.push(worker);
         }
-        Ok(Self { workers })
+        Ok(Self {
+            workers,
+            rate_limiter: config
+                .rate_limit_per_sec
+                .map(|r| Mutex::new(TokenBucket::new(r))),
+            shed_count: Arc::new(AtomicU64::new(0)),
+            pending,
+            config,
+        })
     }
 
-    /// Spawn `worker_count` workers sharing `shared` state, unsupervised.
+    /// Spawn workers sharing `shared` state, unsupervised.
     pub async fn spawn(
-        worker_count: usize,
+        config: PoolConfig,
         shared: Arc<FragmentState>,
     ) -> Result<Self, ActorProcessingErr> {
         // Unsupervised spawn: used only in tests. Production pools go
         // through `spawn_linked` so the dispatcher restarts dead workers.
-        let worker_count = worker_count.max(1);
+        let worker_count = config.workers.max(1);
         let mut workers = Vec::with_capacity(worker_count);
         for _ in 0..worker_count {
             let (worker, _handle) = KvWorker::spawn(
@@ -439,18 +556,20 @@ impl WorkerPool {
                 KvWorker,
                 KvWorkerArgs {
                     shared: shared.clone(),
+                    pending: None,
                 },
             )
             .await
             .map_err(|e| ActorProcessingErr::from(e.to_string()))?;
             workers.push(worker);
         }
-        Ok(Self { workers })
-    }
-
-    /// The worker serving `key` (sticky: `hash(key) % worker_count`).
-    pub fn route(&self, key: &str) -> &ActorRef<KvMessage> {
-        &self.workers[worker_idx(key, self.workers.len())]
+        Ok(Self {
+            workers,
+            config,
+            pending: Arc::new(AtomicU64::new(0)),
+            shed_count: Arc::new(AtomicU64::new(0)),
+            rate_limiter: None,
+        })
     }
 
     /// Find the pool slot holding `cell`, if any.
@@ -465,6 +584,37 @@ impl WorkerPool {
         if let Some(w) = self.workers.get_mut(slot) {
             *w = worker;
         }
+    }
+
+    /// Try to admit an op: checks rate limit and queue cap.
+    /// Returns `true` if admitted, `false` if shed (counted).
+    pub async fn try_admit(&self) -> bool {
+        // Rate limit first.
+        if let Some(limiter) = &self.rate_limiter {
+            if !limiter.lock().await.try_acquire() {
+                self.shed_count.fetch_add(1, Ordering::Relaxed);
+                return false;
+            }
+        }
+        // Queue cap.
+        let pending = self.pending.fetch_add(1, Ordering::Relaxed);
+        if pending >= self.config.queue_cap as u64 {
+            self.pending.fetch_sub(1, Ordering::Relaxed);
+            self.shed_count.fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+        true
+    }
+
+    /// Number of ops shed by this pool.
+    pub fn shed_count(&self) -> u64 {
+        self.shed_count.load(Ordering::Relaxed)
+    }
+
+    /// Sticky route: pick a worker by key hash.
+    pub fn route(&self, key: &str) -> &ActorRef<KvMessage> {
+        let idx = worker_idx(key, self.workers.len());
+        &self.workers[idx]
     }
 
     /// Stop every worker, waiting for each. Call before flushing shared
@@ -484,7 +634,9 @@ pub struct KvActor;
 
 /// The dispatcher's state: the worker pool and the state they share.
 pub struct KvState {
-    pool: WorkerPool,
+    high_pool: WorkerPool,
+    default_pool: WorkerPool,
+    background_pool: WorkerPool,
     shared: Arc<FragmentState>,
     worker_prefix: String,
 }
@@ -501,15 +653,32 @@ impl Actor for KvActor {
     ) -> Result<Self::State, ActorProcessingErr> {
         // Workers are linked to the dispatcher: a dead worker raises a
         // supervision event here and gets replaced in-place.
-        let pool = WorkerPool::spawn_linked(
-            args.worker_count,
+        // Phase 7: three isolated pools by priority.
+        let high_pool = WorkerPool::spawn_linked(
+            args.high_pool.clone(),
             args.shared.clone(),
             myself.get_cell(),
-            &args.worker_prefix,
+            &format!("{}-high", args.worker_prefix),
+        )
+        .await?;
+        let default_pool = WorkerPool::spawn_linked(
+            args.default_pool.clone(),
+            args.shared.clone(),
+            myself.get_cell(),
+            &format!("{}-default", args.worker_prefix),
+        )
+        .await?;
+        let background_pool = WorkerPool::spawn_linked(
+            args.background_pool.clone(),
+            args.shared.clone(),
+            myself.get_cell(),
+            &format!("{}-bg", args.worker_prefix),
         )
         .await?;
         Ok(KvState {
-            pool,
+            high_pool,
+            default_pool,
+            background_pool,
             shared: args.shared,
             worker_prefix: args.worker_prefix.clone(),
         })
@@ -523,7 +692,9 @@ impl Actor for KvActor {
         // Drain workers first so no new writes land mid-flush, then don't
         // leave buffered writes behind. (A kill -9 skips this; the
         // unflushed tail is recovered via peer sync on reconnect.)
-        state.pool.shutdown().await;
+        state.high_pool.shutdown().await;
+        state.default_pool.shutdown().await;
+        state.background_pool.shutdown().await;
         state.shared.flush().await
     }
 
@@ -534,24 +705,58 @@ impl Actor for KvActor {
         state: &mut Self::State,
     ) -> Result<(), ActorProcessingErr> {
         match message {
-            KvMessage::ApplyOp(op) => {
-                state
-                    .pool
-                    .route(&op.key)
-                    .send_message(KvMessage::ApplyOp(op))
+            KvMessage::ApplyOp { op, priority } => {
+                let pool = match priority {
+                    OpPriority::High => &state.high_pool,
+                    OpPriority::Default => &state.default_pool,
+                    OpPriority::Background => &state.background_pool,
+                };
+                // Phase 7: admission control. Shed explicitly if the
+                // pool is over its queue cap or rate limit.
+                if !pool.try_admit().await {
+                    // Shed: counted in pool.shed_count, not silent.
+                    // For fire-and-forget ApplyOp, we just drop.
+                    return Ok(());
+                }
+                pool.route(&op.key)
+                    .send_message(KvMessage::ApplyOp { op, priority })
                     .map_err(|e| ActorProcessingErr::from(e.to_string()))?;
                 Ok(())
             }
-            KvMessage::Get { key, reply } => {
+            KvMessage::Get {
+                key,
+                reply,
+                priority,
+            } => {
                 // Same sticky route as the write path, so a Get issued
-                // after an ApplyOp lands behind it in the worker's FIFO
-                // mailbox — the read-your-write barrier still holds.
+                // after an ApplyOp at the same priority lands behind it
+                // in the worker's FIFO mailbox — the read-your-write
+                // barrier holds within a priority pool. Cross-priority
+                // sequences make no ordering promise (separate pools).
                 // The worker replies through the caller's reply channel
                 // directly. On worker timeout/error the reply is dropped
                 // and the caller sees a SenderError.
-                let worker = state.pool.route(&key);
+                let pool = match priority {
+                    OpPriority::High => &state.high_pool,
+                    OpPriority::Default => &state.default_pool,
+                    OpPriority::Background => &state.background_pool,
+                };
+                if !pool.try_admit().await {
+                    // Shed: explicit error, not "not found". The caller
+                    // sees NodeError::Backpressure, distinct from Ok(None).
+                    let _ = reply.send(Err("shed: pool at queue cap or rate limit".to_string()));
+                    return Ok(());
+                }
+                let worker = pool.route(&key);
                 if let Ok(CallResult::Success(value)) = worker
-                    .call(|r| KvMessage::Get { key, reply: r }, None)
+                    .call(
+                        |r| KvMessage::Get {
+                            key,
+                            reply: r,
+                            priority,
+                        },
+                        None,
+                    )
                     .await
                 {
                     let _ = reply.send(value);
@@ -560,6 +765,15 @@ impl Actor for KvActor {
             }
             KvMessage::GetAll { reply } => {
                 let _ = reply.send(state.shared.get_all().await);
+                Ok(())
+            }
+            KvMessage::GetShedCounts { reply } => {
+                let counts = (
+                    state.high_pool.shed_count(),
+                    state.default_pool.shed_count(),
+                    state.background_pool.shed_count(),
+                );
+                let _ = reply.send(counts);
                 Ok(())
             }
         }
@@ -579,19 +793,32 @@ impl Actor for KvActor {
             _ => None,
         };
         if let Some(cell) = dead {
-            if let Some(slot) = state.pool.slot_of(&cell) {
-                let name = format!("{}-worker-{slot}", state.worker_prefix);
+            // Check all three pools for the dead worker.
+            let mut found = None;
+            for (pool, suffix) in [
+                (&mut state.high_pool, "high"),
+                (&mut state.default_pool, "default"),
+                (&mut state.background_pool, "bg"),
+            ] {
+                if let Some(slot) = pool.slot_of(&cell) {
+                    found = Some((pool, slot, suffix));
+                    break;
+                }
+            }
+            if let Some((pool, slot, suffix)) = found {
+                let name = format!("{}-{suffix}-worker-{slot}", state.worker_prefix);
                 let (worker, _handle) = KvWorker::spawn_linked(
                     Some(name),
                     KvWorker,
                     KvWorkerArgs {
                         shared: state.shared.clone(),
+                        pending: Some(pool.pending.clone()),
                     },
                     myself.get_cell(),
                 )
                 .await
                 .map_err(|e| ActorProcessingErr::from(e.to_string()))?;
-                state.pool.replace(slot, worker);
+                pool.replace(slot, worker);
             }
         }
         Ok(())
