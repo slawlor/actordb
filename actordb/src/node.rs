@@ -45,8 +45,9 @@ use tokio::task::AbortHandle;
 use crate::actor::{HlcClock, KvMessage, ReplicatedOp, VersionedValue};
 use crate::network::{BoxStream, Network, TcpNetwork};
 use crate::proto::{
-    BatchAck, Envelope, EnvelopeMsg, ForwardedGet, ForwardedPut, GetResponse, Hello, KeySummary,
-    ReconcileData, ReconcileResponse, SyncEntry, SyncResponse,
+    BatchAck, BatchGet, BatchGetResponse, BatchKeyValue, BatchPut, Envelope, EnvelopeMsg,
+    ForwardedGet, ForwardedPut, GetResponse, Hello, KeySummary, ReconcileData, ReconcileResponse,
+    SyncEntry, SyncResponse,
 };
 use crate::replication::{spawn_sender, SenderConfig, SenderDeps, SenderMsg, SenderStateReport};
 use crate::shard::{fragment_of, FragmentId};
@@ -82,6 +83,7 @@ struct ConnContext {
     node_id: String,
     router: FragmentRouter,
     pending_gets: Arc<Mutex<HashMap<u64, oneshot::Sender<Option<VersionedValue>>>>>,
+    pending_batch_gets: Arc<Mutex<HashMap<u64, oneshot::Sender<Vec<BatchKeyValue>>>>>,
     peers: PeerMap,
     tasks: Arc<Mutex<Vec<AbortHandle>>>,
     hlc: Arc<Mutex<HlcClock>>,
@@ -190,6 +192,7 @@ pub struct Node {
     members: HashMap<String, SocketAddr>,
     /// In-flight forwarded reads: req_id -> reply channel.
     pending_gets: Arc<Mutex<HashMap<u64, oneshot::Sender<Option<VersionedValue>>>>>,
+    pending_batch_gets: Arc<Mutex<HashMap<u64, oneshot::Sender<Vec<BatchKeyValue>>>>>,
     next_req_id: AtomicU64,
     peers: PeerMap,
     /// Per-node sequence number for locally originated ops.
@@ -444,6 +447,7 @@ impl Node {
             fragment_map: config.fragment_map.clone(),
             members: config.members.clone(),
             pending_gets: Arc::new(Mutex::new(HashMap::new())),
+            pending_batch_gets: Arc::new(Mutex::new(HashMap::new())),
             next_req_id: AtomicU64::new(1),
             peers: Arc::new(Mutex::new(HashMap::new())),
             next_seq: Arc::new(Mutex::new(0)),
@@ -497,6 +501,7 @@ impl Node {
             node_id: node.node_id.clone(),
             router: node.router.clone(),
             pending_gets: node.pending_gets.clone(),
+            pending_batch_gets: node.pending_batch_gets.clone(),
             peers: node.peers.clone(),
             tasks: node.tasks.clone(),
             hlc: node.hlc.clone(),
@@ -546,6 +551,7 @@ impl Node {
             node_id: self.node_id.clone(),
             router: self.router.clone(),
             pending_gets: self.pending_gets.clone(),
+            pending_batch_gets: self.pending_batch_gets.clone(),
             peers: self.peers.clone(),
             tasks: self.tasks.clone(),
             hlc: self.hlc.clone(),
@@ -575,17 +581,31 @@ impl Node {
     /// Pick a replica holder for `frag`, preferring this node. Returns
     /// `None` if the fragment has no usable replica (misconfiguration).
     fn pick_replica(&self, frag: FragmentId) -> Option<String> {
+        self.replica_order(frag).into_iter().next()
+    }
+
+    /// Replica holders for `frag` in preference order: this node first
+    /// (if it holds the fragment), then the others in map order. Empty
+    /// when the fragment has no usable replica (misconfiguration), or
+    /// when there is no placement map (everything is local).
+    fn replica_order(&self, frag: FragmentId) -> Vec<String> {
         if self.fragment_map.is_empty() {
-            return None; // no map: everything is local
+            return Vec::new(); // no map: everything is local
         }
-        let replicas = self.fragment_map.get(&frag)?;
-        // Prefer ourselves; otherwise the first listed replica.
+        let Some(replicas) = self.fragment_map.get(&frag) else {
+            return Vec::new();
+        };
+        // Prefer ourselves; otherwise map order.
         // (Load-aware selection is a later optimization.)
+        let mut order: Vec<String> = replicas
+            .iter()
+            .filter(|id| *id != &self.node_id)
+            .cloned()
+            .collect();
         if replicas.iter().any(|id| id == &self.node_id) {
-            Some(self.node_id.clone())
-        } else {
-            replicas.first().cloned()
+            order.insert(0, self.node_id.clone());
         }
+        order
     }
 
     /// Outbound channel to `node_id`, if connected.
@@ -800,6 +820,234 @@ impl Node {
         Ok(all.into_iter().filter(|(_, v)| !v.is_tombstone).collect())
     }
 
+    /// Put multiple keys. Each key is hashed to its fragment; keys are
+    /// grouped by fragment and each fragment's batch goes to one of its
+    /// replica holders in a single `BatchPut` message. Returns per-key
+    /// results in input order.
+    ///
+    /// Local keys are read-your-write (like `put`); remote keys are
+    /// fire-and-forget to the fragment owner (like `put`): the send
+    /// returns once the batch is handed to the owner's connection, and
+    /// the owner applies it locally and replicates it to the other
+    /// holders via the async sender. There is no end-to-end ack — a
+    /// send that returns `Ok` may still be lost if the owner crashes
+    /// before applying it. If the preferred owner is not connected, the
+    /// batch fails over to the next replica holder in placement order;
+    /// a remote key fails only when no replica holder is reachable.
+    pub async fn put_multi(&self, kvs: Vec<(String, Vec<u8>)>) -> Vec<Result<(), NodeError>> {
+        // Partition into local ops and remote groups (by fragment).
+        let mut local: Vec<(usize, String, Vec<u8>)> = Vec::new();
+        let mut remote: HashMap<FragmentId, Vec<(usize, String, Vec<u8>)>> = HashMap::new();
+        let mut results: Vec<Option<Result<(), NodeError>>> =
+            (0..kvs.len()).map(|_| None).collect();
+
+        for (i, (key, value)) in kvs.into_iter().enumerate() {
+            if self.fragment_actor(&key).is_some() {
+                local.push((i, key, value));
+            } else {
+                let frag = fragment_of(&key, self.router.fragment_count);
+                if self.replica_order(frag).is_empty() {
+                    results[i] = Some(Err(NodeError::Actor(format!(
+                        "no replica for fragment {frag}"
+                    ))));
+                } else {
+                    remote.entry(frag).or_default().push((i, key, value));
+                }
+            }
+        }
+
+        // Local puts: run concurrently, each with its own barrier.
+        let local_futs = local.into_iter().map(|(i, key, value)| {
+            let this = self;
+            async move {
+                let r = this.put(key, value).await;
+                (i, r)
+            }
+        });
+        for (i, r) in futures::future::join_all(local_futs).await {
+            results[i] = Some(r);
+        }
+
+        // Remote puts: one BatchPut per fragment, failing over across
+        // replica holders until one accepts the batch.
+        for (frag, items) in remote {
+            // Build the batch once, with HLC timestamps.
+            let mut puts = Vec::with_capacity(items.len());
+            let mut indices = Vec::with_capacity(items.len());
+            for (i, key, value) in items {
+                let seq = {
+                    let mut guard = self.next_seq.lock().await;
+                    *guard += 1;
+                    *guard
+                };
+                let now = self.hlc.lock().await.tick();
+                puts.push(ForwardedPut {
+                    key,
+                    value,
+                    timestamp_ms: now,
+                    node_id: self.node_id.clone(),
+                    seq,
+                    boot_id: self.boot_id,
+                    expires_at_ms: 0,
+                    is_tombstone: false,
+                });
+                indices.push(i);
+            }
+            let mut sent = false;
+            let mut tried: Vec<String> = Vec::new();
+            for owner in self.replica_order(frag) {
+                tried.push(owner.clone());
+                let Some(tx) = self.peer_sender(&owner).await else {
+                    continue;
+                };
+                send_envelope(
+                    &tx,
+                    Envelope {
+                        msg: Some(EnvelopeMsg::BatchPut(BatchPut { puts: puts.clone() })),
+                    },
+                )
+                .await;
+                for i in &indices {
+                    results[*i] = Some(Ok(()));
+                }
+                sent = true;
+                break;
+            }
+            if !sent {
+                for i in indices {
+                    results[i] = Some(Err(NodeError::Network(format!(
+                        "no connected replica for fragment {frag} (tried {})",
+                        tried.join(",")
+                    ))));
+                }
+            }
+        }
+
+        results.into_iter().map(|r| r.unwrap()).collect()
+    }
+
+    /// Get multiple keys. Each key is hashed to its fragment; keys are
+    /// grouped by fragment and each fragment's keys are fetched with one
+    /// `BatchGet` message. Returns per-key results in input order.
+    ///
+    /// Remote reads have a 5s timeout per replica attempt and fail over
+    /// to the next replica holder when the preferred owner is
+    /// unreachable or stops responding; a dead owner fails only its
+    /// keys, and only when no replica holder answers. Errors are
+    /// classified: `NodeError::Actor` for misconfiguration (no replica
+    /// listed for a fragment), `NodeError::Network` for connectivity
+    /// failures (not connected, timed out, all replicas unreachable).
+    pub async fn get_multi(
+        &self,
+        keys: Vec<String>,
+    ) -> Vec<Result<Option<VersionedValue>, NodeError>> {
+        let mut local: Vec<(usize, String)> = Vec::new();
+        let mut remote: HashMap<FragmentId, Vec<(usize, String)>> = HashMap::new();
+        let mut results: Vec<Option<Result<Option<VersionedValue>, NodeError>>> =
+            (0..keys.len()).map(|_| None).collect();
+
+        for (i, key) in keys.into_iter().enumerate() {
+            if self.fragment_actor(&key).is_some() {
+                local.push((i, key));
+            } else {
+                let frag = fragment_of(&key, self.router.fragment_count);
+                if self.replica_order(frag).is_empty() {
+                    results[i] = Some(Err(NodeError::Actor(format!(
+                        "no replica for fragment {frag}"
+                    ))));
+                } else {
+                    remote.entry(frag).or_default().push((i, key));
+                }
+            }
+        }
+
+        // Local gets: concurrent.
+        let local_futs = local.into_iter().map(|(i, key)| {
+            let this = self;
+            async move {
+                let r = this.get(key).await;
+                (i, r)
+            }
+        });
+        for (i, r) in futures::future::join_all(local_futs).await {
+            results[i] = Some(r);
+        }
+
+        // Remote gets: one BatchGet per fragment, failing over across
+        // replica holders on timeout or dropped replies.
+        for (frag, items) in remote {
+            let keys: Vec<String> = items.iter().map(|(_, k)| k.clone()).collect();
+            let indices: Vec<usize> = items.iter().map(|(i, _)| *i).collect();
+            let mut done = false;
+            let mut tried: Vec<String> = Vec::new();
+            for owner in self.replica_order(frag) {
+                tried.push(owner.clone());
+                let Some(tx) = self.peer_sender(&owner).await else {
+                    continue;
+                };
+                let req_id = self.next_req_id.fetch_add(1, Ordering::Relaxed);
+                let (resp_tx, resp_rx) = oneshot::channel();
+                self.pending_batch_gets.lock().await.insert(req_id, resp_tx);
+                send_envelope(
+                    &tx,
+                    Envelope {
+                        msg: Some(EnvelopeMsg::BatchGet(BatchGet {
+                            req_id,
+                            keys: keys.clone(),
+                        })),
+                    },
+                )
+                .await;
+                match tokio::time::timeout(Duration::from_secs(5), resp_rx).await {
+                    Ok(Ok(kvs)) => {
+                        // Map back by key.
+                        let by_key: HashMap<String, BatchKeyValue> =
+                            kvs.into_iter().map(|kv| (kv.key.clone(), kv)).collect();
+                        for (i, key) in indices.iter().zip(&keys) {
+                            match by_key.get(key) {
+                                Some(kv) if kv.found => {
+                                    let mut v = VersionedValue::new(
+                                        kv.value.clone(),
+                                        kv.timestamp_ms,
+                                        kv.node_id.clone(),
+                                    );
+                                    v.expires_at_ms = if kv.expires_at_ms == 0 {
+                                        None
+                                    } else {
+                                        Some(kv.expires_at_ms)
+                                    };
+                                    v.is_tombstone = kv.is_tombstone;
+                                    // Tombstones read as absent.
+                                    results[*i] =
+                                        Some(Ok(if v.is_tombstone { None } else { Some(v) }));
+                                }
+                                _ => results[*i] = Some(Ok(None)),
+                            }
+                        }
+                        done = true;
+                        break;
+                    }
+                    // Dropped reply or timeout: clean up and fail over
+                    // to the next replica. A late response for a
+                    // removed req_id is ignored by the handler.
+                    _ => {
+                        self.pending_batch_gets.lock().await.remove(&req_id);
+                    }
+                }
+            }
+            if !done {
+                for i in indices {
+                    results[i] = Some(Err(NodeError::Network(format!(
+                        "batch get for fragment {frag}: no replica answered (tried {})",
+                        tried.join(",")
+                    ))));
+                }
+            }
+        }
+
+        results.into_iter().map(|r| r.unwrap()).collect()
+    }
+
     /// This node's id.
     pub fn id(&self) -> &str {
         &self.node_id
@@ -881,6 +1129,7 @@ async fn handle_connection(ctx: ConnContext, stream: BoxStream, we_dialed: bool)
         node_id,
         router,
         pending_gets,
+        pending_batch_gets,
         peers,
         tasks,
         hlc,
@@ -1233,6 +1482,102 @@ async fn handle_connection(ctx: ConnContext, stream: BoxStream, we_dialed: bool)
                         v
                     });
                     let _ = resp_tx.send(value);
+                }
+            }
+            Some(EnvelopeMsg::BatchPut(bp)) => {
+                // Phase 6: apply each put as coordinator, enqueue for
+                // async replication.
+                hlc.lock()
+                    .await
+                    .observe(bp.puts.iter().map(|p| p.timestamp_ms).max().unwrap_or(0));
+                for p in bp.puts {
+                    let replicated = ReplicatedOp {
+                        key: p.key.clone(),
+                        value: {
+                            let mut v = VersionedValue::new(
+                                p.value.clone(),
+                                p.timestamp_ms,
+                                p.node_id.clone(),
+                            );
+                            v.expires_at_ms = if p.expires_at_ms == 0 {
+                                None
+                            } else {
+                                Some(p.expires_at_ms)
+                            };
+                            v.is_tombstone = p.is_tombstone;
+                            v
+                        },
+                        seq: p.seq,
+                        boot_id: p.boot_id,
+                    };
+                    let frag = fragment_of(&replicated.key, router.fragment_count);
+                    if let Some(actor) = router.route(&replicated.key) {
+                        let _ = actor.send_message(KvMessage::ApplyOp(replicated.clone()));
+                        let senders = senders.lock().await;
+                        for ((f, _peer), tx) in senders.iter() {
+                            if *f == frag {
+                                let _ = tx.send(SenderMsg::Enqueue(replicated.clone()));
+                            }
+                        }
+                    }
+                }
+            }
+            Some(EnvelopeMsg::BatchGet(bg)) => {
+                // Phase 6: serve a batch of reads.
+                let mut results = Vec::with_capacity(bg.keys.len());
+                for key in bg.keys {
+                    let value = match router.route(&key) {
+                        Some(actor) => match actor
+                            .call(
+                                |reply| KvMessage::Get {
+                                    key: key.clone(),
+                                    reply,
+                                },
+                                None,
+                            )
+                            .await
+                        {
+                            Ok(CallResult::Success(v)) => v,
+                            _ => None,
+                        },
+                        None => None,
+                    };
+                    let (found, bytes, timestamp_ms, node_id, expires_at_ms, is_tombstone) =
+                        match value {
+                            Some(v) => (
+                                true,
+                                v.value,
+                                v.timestamp_ms,
+                                v.node_id,
+                                v.expires_at_ms.unwrap_or(0),
+                                v.is_tombstone,
+                            ),
+                            None => (false, Vec::new(), 0, String::new(), 0, false),
+                        };
+                    results.push(BatchKeyValue {
+                        key,
+                        found,
+                        value: bytes,
+                        timestamp_ms,
+                        node_id,
+                        expires_at_ms,
+                        is_tombstone,
+                    });
+                }
+                send_envelope(
+                    &tx,
+                    Envelope {
+                        msg: Some(EnvelopeMsg::BatchGetResponse(BatchGetResponse {
+                            req_id: bg.req_id,
+                            results,
+                        })),
+                    },
+                )
+                .await;
+            }
+            Some(EnvelopeMsg::BatchGetResponse(r)) => {
+                if let Some(resp_tx) = pending_batch_gets.lock().await.remove(&r.req_id) {
+                    let _ = resp_tx.send(r.results);
                 }
             }
             Some(EnvelopeMsg::SyncRequest(req)) => {

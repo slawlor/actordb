@@ -112,10 +112,37 @@ node.delete("key".to_string()).await?;
 let value = node.get("key".to_string()).await?;  // local-only read, Option<VersionedValue>
 let all = node.get_all().await?;                  // full local copy (live keys)
 let health = node.health().await?;                // per-fragment supervision health
+
+// Bulk APIs: keys hash to fragments, group by fragment, one batch
+// message per destination node. Per-key Results in input order.
+let puts = node.put_multi(vec![
+    ("k1".to_string(), b"v1".to_vec()),
+    ("k2".to_string(), b"v2".to_vec()),
+]).await;
+let gets = node.get_multi(vec!["k1".to_string(), "k2".to_string()]).await;
 let peers = node.peer_count().await;
 
 node.shutdown().await;
 ```
+
+Multi-key semantics:
+
+- `put_multi` / `get_multi` partition keys by fragment and send one
+  `BatchPut` / `BatchGet` message per destination node, so a 1000-key
+  batch touching 4 nodes costs 4 messages instead of 1000.
+- Local keys are read-your-write (like `put`); remote `put_multi`
+  keys are fire-and-forget to the fragment owner (like `put`) — the
+  call returns once the batch is handed to the owner's connection, and
+  the owner applies it and replicates it to the other holders. There
+  is no end-to-end acknowledgement.
+- Both APIs fail over across replica holders in placement order: if
+  the preferred owner is unreachable (puts) or stops responding
+  within the 5s per-attempt timeout (gets), the batch is retried
+  against the next replica. A key fails only when no replica holder
+  answers.
+- Errors are per-key and classified: `NodeError::Actor` for
+  misconfiguration (no replica listed for a fragment),
+  `NodeError::Network` for connectivity failures.
 
 Key `NodeConfig` knobs:
 
@@ -170,7 +197,8 @@ Key `NodeConfig` knobs:
 
 Prost-generated protobuf types (`Envelope`, `Hello`, `ReplicateOp`,
 `ForwardedPut`, `ForwardedGet`, `GetResponse`, `SyncRequest`,
-`SyncResponse`, `SyncEntry`), sent as 4-byte length-prefixed frames
+`SyncResponse`, `SyncEntry`, `BatchPut`, `BatchGet`,
+`BatchGetResponse`), sent as 4-byte length-prefixed frames
 over TCP. Mostly of interest if you're implementing a compatible peer.
 
 ### Current limitations
