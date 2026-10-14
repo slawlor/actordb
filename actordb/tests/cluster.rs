@@ -2218,6 +2218,10 @@ async fn malformed_reconcile_data_is_rejected_and_retried() {
     }
     node.put("data-a".to_string(), b"a".to_vec()).await.unwrap();
     node.put("data-b".to_string(), b"b".to_vec()).await.unwrap();
+    // Tokio intervals tick immediately once. If that tick races with the
+    // first enqueue, it can move one write into the single in-flight slot;
+    // three writes still guarantee that the capacity-one buffer overflows.
+    node.put("data-c".to_string(), b"c".to_vec()).await.unwrap();
 
     let remote_timestamp = now_ms();
     let summary = KeySummary {
