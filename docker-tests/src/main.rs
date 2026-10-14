@@ -248,6 +248,43 @@ async fn wait_for_value(ctx: &Ctx, key: &str, value: &[u8], timeout: Duration) -
     Ok(())
 }
 
+/// Wait for a value, re-dialing peers if the connection drops.
+/// Used by replicate-reader to survive peer restarts.
+async fn wait_for_value_with_redial(
+    ctx: &Ctx,
+    key: &str,
+    value: &[u8],
+    timeout: Duration,
+    peers: &[String],
+) -> TestResult {
+    let r = tokio::time::timeout(timeout, async {
+        loop {
+            // Re-dial if we lost all peers (peer crashed/restarted).
+            if ctx.node.peer_count().await == 0 {
+                ctx.log("lost all peers, re-dialing");
+                for peer in peers {
+                    let _ = dial_with_retry(ctx, peer).await;
+                }
+            }
+            match ctx.node.get(key.to_string()).await {
+                Ok(Some(v)) if v.value == value => break,
+                Ok(_) => {}
+                Err(e) => ctx.warn(&format!("get failed: {e}")),
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    })
+    .await;
+    if r.is_err() {
+        return Err(format!(
+            "timed out waiting for key {key:?} [{}]",
+            ctx.describe_state().await
+        ));
+    }
+    ctx.log(&format!("converged: {key:?}"));
+    Ok(())
+}
+
 fn bind(port: u16) -> SocketAddr {
     SocketAddr::from(([0, 0, 0, 0], port))
 }
@@ -304,14 +341,17 @@ async fn replicate_reader(
     for peer in &peers {
         phase(&ctx, &format!("dial {peer}"), dial_with_retry(&ctx, peer)).await?;
     }
+    // Phase 5: if peers drop (e.g., crash/restart), re-dial. The wait
+    // loop checks peer count and reconnects as needed.
     phase(
         &ctx,
         "wait-value",
-        wait_for_value(
+        wait_for_value_with_redial(
             &ctx,
             &key,
             value.as_bytes(),
             Duration::from_secs(timeout_secs),
+            &peers,
         ),
     )
     .await?;
