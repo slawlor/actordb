@@ -50,18 +50,21 @@ matters is the trend on the *same* machine.
 
 | case | 100 B   | 10 KB   | 1 MB    |
 |------|---------|---------|---------|
-| put  | 25.8 µs | 23.5 µs | 298.6 µs|
-| get  | 15.7 µs | 18.5 µs | 88.8 µs |
+| put  | 20.0 µs | 23.1 µs | 243.9 µs|
+| get  | 14.0 µs | 15.1 µs | 74.7 µs |
+
+(Re-baselined 2026-10-14 after TCP_NODELAY; single-op path unaffected.)
 
 ### fanout (mean per-batch latency)
 
 | case      | 10 keys | 100 keys | 1000 keys |
 |-----------|---------|----------|-----------|
 | put_multi | 175 µs  | 1.41 ms  | 12.87 ms  |
-| get_multi | 99.9 ms | 105.6 ms | 120.8 ms  |
+| get_multi | 225 µs  | 790 µs   | 8.31 ms   |
 
-Note: `get_multi` has a ~100 ms floor from Nagle/delayed-ACK (finding #30);
-see `fanout.rs` doc comment.
+(Re-baselined 2026-10-14: `TCP_NODELAY` fixed the old ~100 ms floor —
+finding #30 closed. `get_multi` went from 99.9/105.6/120.8 ms to
+0.22/0.79/8.31 ms, a 93–99% reduction.)
 
 ### replication (mean ack-to-visible lag)
 
@@ -86,6 +89,9 @@ This is finding #25 — shipping full batches immediately would cut this ~10x.
 
 These are the first things to measure when they get fixed:
 
+- ~~#30 — no TCP_NODELAY~~ **fixed 2026-10-14** (`set_nodelay(true)` on
+  accept + connect in `network.rs`): `get_multi` 99.9/105.6/120.8 ms →
+  0.22/0.79/8.31 ms.
 - #14 — dispatcher is a serial funnel; the per-put barrier doubles its load
   → watch `put` in `put_get`.
 - #24 — `BatchGet` serves keys with sequential actor round-trips
