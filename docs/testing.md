@@ -13,7 +13,7 @@ integration tests rely on.
 
 ## Integration tests (`actordb/tests/cluster.rs`)
 
-More than 40 tests over real TCP on localhost with multiple `Node`s in one
+The cluster suite runs over real TCP on localhost with multiple `Node`s in one
 process — the bulk of behavioral coverage:
 
 - **Basics**: `single_node_put_get`, `two_nodes_replicate`,
@@ -31,11 +31,19 @@ process — the bulk of behavioral coverage:
 - **HLC**: `hlc_orders_writes_under_clock_skew` (simulated skew via the
   hidden `clock_skew_ms` knob).
 - **Replication internals**: `sender_buffer_reset_and_reconcile`,
+  `live_connected_overflow_reconciles_without_reconnect`,
   `stale_session_batches_discarded`,
+  `stale_reconcile_round_cannot_complete_live_reset`,
+  `malformed_reconcile_data_is_rejected_and_retried`,
+  `same_session_replay_does_not_clear_reconcile_failure`,
+  `silent_reconcile_phase_times_out_and_retries`,
+  `inbound_mutation_after_snapshot_invalidates_reset_completion`,
   `memory_applied_ack_does_not_force_a_receiver_store_flush`,
   `replication_ack_waits_for_the_receiver_store_fence`,
   `replication_rejects_an_ack_below_the_configured_durability`,
-  `replication_nack_retries_the_exact_batch_after_store_failure`.
+  `replication_nack_retries_the_exact_batch_after_store_failure`,
+  `failed_reconcile_repair_cannot_be_hidden_by_barrier_ack`,
+  `fetched_reconcile_value_retries_failed_local_store_fence`.
 - **Persistence**: `persistence_roundtrip`,
   `persistence_keeps_gossiped_winner`, `persistence_flushes_on_shutdown`,
   `memory_store_exercises_persistence_plumbing`.
@@ -52,7 +60,10 @@ process — the bulk of behavioral coverage:
 - **Placement**: `placement_migration_no_lost_writes` (single writer during a
   live migration asserts zero lost writes),
   `placement_rolling_restart_delta_reconcile_only` (restarted node converges
-  with zero full-state sync entries).
+  with zero full-state sync entries),
+  `placement_bootstrap_fetch_requires_verification_round`,
+  `placement_drain_waits_for_buffer_reset`, and
+  `placement_readd_while_draining_cancels_teardown`.
 
 Shared helpers (`wait_for` poll-until-timeout) live in
 `actordb/tests/common/mod.rs`.

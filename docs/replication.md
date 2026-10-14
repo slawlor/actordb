@@ -13,7 +13,7 @@ background.
    Disconnected ──────────────► Connected { session_id, next_batch_seq, in_flight }
         ▲                              │  buffer full on Enqueue
         │                              ▼
-        │                        BufferReset ──PeerConnected──► reconcile ──► Connected
+        │                        BufferReset ──correlated reconcile + ACK fence──► Connected
         └──────────────── PeerDisconnected (BufferReset survives disconnects)
 ```
 
@@ -25,30 +25,40 @@ background.
   for replay in the next session.
 - **BufferReset**: entered when an `Enqueue` arrives with the buffer already
   full. The buffer is shed, the op itself is still applied locally, and the
-  `(fragment, peer)` pair is recorded in `reset_senders`. On reconnect the
-  sender reconciles instead of replaying. `BufferReset` survives disconnects —
-  a response received while `Disconnected` belongs to a dead session and is
-  ignored.
+  `(fragment, peer)` pair is recorded in `reset_senders`. A live sender rotates
+  its session and starts reconciliation immediately; reconnect is not required.
+  Mutations arriving during reset are retained as post-snapshot deltas up to
+  the same bound. Another overflow advances the reset epoch, so an older round
+  cannot clear the guard. `BufferReset` also survives disconnects.
 
-Current overflow limitation: reset reconciliation starts from
-`PeerConnected`. If a sender overflows while its transport remains open, it
-stays in `BufferReset` until that session transitions; periodic reconciliation
-also pauses. Live-session overflow recovery is the next replication-hardening
-item.
+Reset completion is deliberately strict. The sender accepts only messages for
+the current nonzero `(session_id, round_id, chunk_seq)`, validates fetched data
+against the exact requested key set and fragment, awaits every local apply,
+fences outbound repairs with a tracked empty batch, and verifies that neither
+the reset epoch nor the fragment-wide mutation revision changed since the
+snapshot. Otherwise it starts another round. This revision fence includes
+inbound replication, reconciliation, expiry conversion, and tombstone
+reclamation—not only writes enqueued by this sender.
 
 Tuning lives in `SenderConfig` (see [Configuration](configuration.md)):
 `batch_size: 100`, `batch_interval: 100 ms`, `max_in_flight: 4`,
-`buffer_capacity: 10 000`, `consistency_interval: 300 s`, and
+`buffer_capacity: 10 000`, `consistency_interval: 300 s`,
+`reconcile_timeout: 30 s`, and
 `required_ack_durability: MemoryApplied`.
 
 ## Sessions and acks
 
-On `PeerConnected` the sender mints a fresh `session_id` (a non-cryptographic
+On a new peer channel the sender mints a fresh `session_id` (a non-cryptographic
 hash of time + thread + an atomic counter, never 0) and sends
 `SessionStart { session_id, fragment }`. The receiver stores it per
 (peer, fragment) and **discards batches from older sessions** — receiver
 admission is session-id-only; there is no per-batch sequence seen-set. Redelivered
 operations are safe anyway because application is an idempotent LWW merge.
+Repeated notifications for the same live channel are idempotent and do not
+rotate the session. Connect/disconnect notifications carry the exact peer
+queue identity, so an older connection cannot replace or clear a newer one.
+Replaying `SessionStart` with the same id also does not clear a failed-repair
+latch; only a genuinely new session does.
 
 A tracked batch carries the sender's `required_ack_level`. The receiver first
 verifies that every key belongs to the declared fragment and awaits every exact
@@ -64,8 +74,14 @@ actually achieved in
 The default `MemoryApplied` requirement therefore does not force one backend
 write per network batch. A `StoreCommitted` requirement forces a fragment
 flush; a storeless receiver can report only `APPLIED`, which is visible as a
-durability mismatch and cannot retire that batch. Untracked reconciliation
-batches always run a flush fence but send no ACK.
+durability mismatch and cannot retire that batch.
+
+Reconciliation repairs use untracked batches followed by one tracked empty
+barrier. If any untracked apply fails, the receiver poisons that
+`(peer, fragment, session)` and NACKs the barrier instead of falsely certifying
+the successfully applied prefix. The sender then rotates the session and
+retries. The barrier requests `StoreCommitted` only when configured; a
+`MemoryApplied` reconciliation does not force a store flush.
 
 The sender removes the matching `InflightBatch` only when the reported level meets
 `required_ack_durability`. Unknown/omitted levels and stale sessions are
@@ -82,50 +98,68 @@ that a new sender rejects; older senders omit the required ACK level and ignore
 the new receiver's NACK. Upgrade all nodes together until explicit Hello
 capability negotiation lands.
 
-**There is no ack timeout and no retransmission timer.** `max_in_flight` only
+**Ordinary streaming batches still have no ACK timeout or retransmission
+timer.** `max_in_flight` only
 gates *sending* new batches; an unacked batch sits in memory until a NACK or
 session transition. Detected disconnects, reconnect races, and failed sends all
 requeue every unacknowledged operation at the front before discarding the old
-session. ACK timeout/retransmission and bounded receiver ingress are separate
-hardening work; a connection that stays open but never replies can still fill
-`max_in_flight` and stall that sender.
+session. Reconciliation phases do have `reconcile_timeout`; a silent summary,
+data, or barrier phase rotates the session and retries after the one-second
+retry floor. Streaming ACK timeout/retransmission and bounded receiver ingress
+remain separate hardening work; a connection that stays open but never ACKs
+ordinary batches can still fill `max_in_flight` and stall that sender.
+The phase deadline starts after the outbound frame enters the bounded peer
+queue; queue admission itself still awaits without a timeout, so a blocked
+socket writer can delay both reconciliation timers and sender mailbox work.
 
 ## Periodic reconciliation (anti-entropy)
 
 Every `consistency_interval` (default 300 s) each connected sender sends
-`ReconcileRequest { fragment }`. The receiver replies with one `KeySummary`
+`ReconcileRequest { fragment, session_id, round_id }`. The receiver replies
+with the same correlation fields and one `KeySummary`
 per local key — `{ key, timestamp_ms, node_id, is_tombstone }`, built from a
 `GetAll` that **includes tombstones** (sync must ship deletes). The requester
 then, for each key, compares with `wins_over`:
 
 - peer wins → key goes to `fetch_keys`;
 - local wins → key is shipped to the peer in a `ReplicateBatch` with
-  `batch_seq: u64::MAX` — reconciliation batches are **not ack-tracked**
-  (the receiver still awaits their apply and flush fence, but sends no ACK);
+  `batch_seq: u64::MAX`; the following tracked barrier accounts for all
+  repairs and the requested durability fence;
 - keys only one side has are fetched or shipped accordingly.
 
 Fetches go out as `ReconcileFetch` (chunked at 500 keys per message;
-`RECONCILE_FETCH_CHUNK = 500`), values come back as `ReconcileData` and are
-merged locally at `OpPriority::Default`. A newer round supersedes an older
-still-fetching round — LWW makes the exchange idempotent. An on-demand
-`ReconcileNow` (used by the Phase 8 placement driver to bootstrap a newly
-assigned fragment without waiting for the timer) is a no-op unless Connected.
+`RECONCILE_FETCH_CHUNK = 500`) and values return in a matching
+`ReconcileData`. Missing, duplicate, unrequested, or wrong-fragment entries
+reject the whole chunk before any apply. Valid entries are merged locally at
+`OpPriority::Default`. Stale responses are ignored, and LWW makes a retried
+exchange idempotent.
 
-Per-state behavior: rounds run periodically only in `Connected`; on reconnect
-from `BufferReset` the sender reconciles *before* going Connected ("don't go
-Connected yet: reconcile first"); in `Disconnected` reconciliation is deferred
-to the next `PeerConnected`. `finish_reconcile` clears the pair from
-`reset_senders` and moves to `Connected` (fresh session) if the peer channel
-is present. Failure behavior is fail-open: if `GetAll` fails or the peer
-channel vanishes mid-fetch, the round is treated as complete rather than
-stalled (bootstrap is additionally bounded by `BOOTSTRAP_TIMEOUT` = 30 s —
-availability over consistency).
+When a requester with a configured store fetches winners under a
+`StoreCommitted` policy, it also flushes those local applies before sending the
+barrier; a failed flush obligation survives into a no-fetch retry. A storeless
+requester remains memory-only—the policy still describes the durability a
+remote batch receiver must report.
+
+Rounds run periodically only while streaming. `ReconcileNow` (used by dynamic
+placement bootstrap) is retained across a connection race and local failures
+retry on their own one-second timer rather than waiting for `batch_interval` or
+the next consistency tick. Reset rounds restart on reconnect before streaming
+resumes. Local, transport, NACK, and phase-timeout failures all fail closed:
+they never increment the completed-round counter or clear `reset_senders`.
+Placement drain likewise treats `BufferReset` as active work even when its
+ordinary buffer and in-flight counts are zero.
 
 When optional tombstone GC is enabled, it is **blocked while any sender for the
 fragment is in `BufferReset`**: the tombstone may not have reached the peer,
 and GC'ing it would let reconciliation resurrect the deleted key. GC defaults
 to disabled because this guard cannot prove convergence across an arbitrary
-partition.
+partition or protect every tombstone still sitting in an ordinary pre-overflow
+sender buffer. Time-based tombstone GC remains explicitly unsafe.
+
+Reconcile fetches are chunked by key count, but the summary response still
+describes the whole fragment in one frame and neither path is currently
+budgeted by encoded bytes. A large fragment or value can exceed the 16 MiB
+frame limit; byte-bounded pagination remains required.
 
 ## The Hello / full-state handshake
 

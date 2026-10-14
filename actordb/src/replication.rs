@@ -13,7 +13,7 @@
 //!        │                              │
 //!        │                         buffer overflow
 //!        │                              ▼
-//!        └─────────────────────▶ BufferReset ──PeerConnected──▶ reconciling ──▶ Connected
+//!        └─────────────────────▶ BufferReset ──reconcile + ACK fence──▶ Connected
 //! ```
 //!
 //! - **Connected**: mutations (writes + tombstoned deletes) accumulate
@@ -23,10 +23,12 @@
 //!   the receiver discards batches from stale sessions.
 //! - **Disconnected**: the peer is down; the buffer is retained for
 //!   resume on reconnect.
-//! - **BufferReset**: the buffer overflowed while the peer was down.
-//!   The buffer is shed; on reconnect the sender reconciles via
-//!   timestamp/tombstone comparison instead of replaying. While any
-//!   sender is in this state, tombstone GC is blocked (see below).
+//! - **BufferReset**: the bounded buffer overflowed. The buffer is shed and,
+//!   if the transport is live, reconciliation starts immediately. Every
+//!   round is correlated to its session and round id, fetched values are
+//!   awaited locally, and a tracked empty batch fences outbound repairs
+//!   before the reset completes. While any sender is in this state,
+//!   tombstone GC is blocked (see below).
 //!
 //! Tombstone GC blocking: if a tombstone were GC'd locally while a
 //! peer was down, reconciliation could resurrect the deleted key (the
@@ -40,9 +42,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use ractor::rpc::CallResult;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, oneshot, Mutex};
 
-use crate::actor::{KvMessage, OpPriority, VersionedValue};
+use crate::actor::{ApplyDurability, HlcClock, KvMessage, OpPriority, VersionedValue};
 use crate::node::FragmentRouter;
 use crate::proto::{
     Envelope, EnvelopeMsg, KeySummary, ReconcileFetch, ReconcileRequest, ReplicateBatch,
@@ -71,6 +73,11 @@ pub struct SenderConfig {
     /// How often a connected sender runs anti-entropy reconciliation
     /// to repair divergence.
     pub consistency_interval: Duration,
+    /// Maximum time to wait for one network reconciliation phase
+    /// (summary response, fetched-data chunk, or durability barrier ACK).
+    /// A timeout rotates the session and retries the round, so a connected
+    /// but silent peer cannot strand bootstrap or overflow recovery forever.
+    pub reconcile_timeout: Duration,
     /// Minimum receiver fence that may retire an in-flight batch.
     /// `MemoryApplied` accepts either acknowledgement level;
     /// `StoreCommitted` requires a receiver with a configured store.
@@ -85,6 +92,7 @@ impl Default for SenderConfig {
             max_in_flight: 4,
             buffer_capacity: 10_000,
             consistency_interval: Duration::from_secs(300),
+            reconcile_timeout: Duration::from_secs(30),
             required_ack_durability: ReplicationAckDurability::MemoryApplied,
         }
     }
@@ -96,8 +104,9 @@ pub enum SenderMsg {
     Enqueue(crate::actor::ReplicatedOp),
     /// The peer (re)connected; start a new session on this channel.
     PeerConnected { peer_tx: mpsc::Sender<Vec<u8>> },
-    /// The peer connection dropped; retain the buffer.
-    PeerDisconnected,
+    /// One peer connection dropped. Ignore it if a newer channel has already
+    /// replaced it; otherwise retain the buffer for reconnect.
+    PeerDisconnected { peer_tx: mpsc::Sender<Vec<u8>> },
     /// The peer acked a batch after reaching the reported durability fence.
     Ack {
         session_id: u64,
@@ -112,9 +121,24 @@ pub enum SenderMsg {
         error: String,
     },
     /// Response to our reconcile request.
-    ReconcileResponse { summaries: Vec<KeySummary> },
+    ReconcileResponse {
+        session_id: u64,
+        round_id: u64,
+        summaries: Vec<KeySummary>,
+        /// Tells the connection task whether the correlated frame passed
+        /// timestamp validation. Stale frames return `true` without touching
+        /// the HLC; an invalid current frame returns `false` so the connection
+        /// is closed.
+        connection_valid: oneshot::Sender<bool>,
+    },
     /// Full values for keys we asked to fetch.
-    ReconcileData { entries: Vec<SyncEntry> },
+    ReconcileData {
+        session_id: u64,
+        round_id: u64,
+        chunk_seq: u64,
+        entries: Vec<SyncEntry>,
+        connection_valid: oneshot::Sender<bool>,
+    },
     /// Trigger an anti-entropy reconcile round now (if connected).
     /// Used by the Phase 8 placement driver to bootstrap a newly
     /// assigned fragment without waiting for the periodic timer.
@@ -138,14 +162,44 @@ struct InflightBatch {
     ops: Vec<crate::actor::ReplicatedOp>,
 }
 
-enum SenderState {
-    Disconnected,
-    Connected {
-        session_id: u64,
-        next_batch_seq: u64,
-        in_flight: VecDeque<InflightBatch>,
+struct ActiveConnection {
+    peer_tx: mpsc::Sender<Vec<u8>>,
+    session_id: u64,
+    next_batch_seq: u64,
+    in_flight: VecDeque<InflightBatch>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DeliveryState {
+    Streaming,
+    Reset { epoch: u64 },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReconcilePurpose {
+    Routine,
+    Reset { epoch: u64 },
+}
+
+enum ReconcilePhase {
+    Response,
+    Data {
+        remaining_chunks: VecDeque<Vec<String>>,
+        next_chunk_seq: u64,
+        expected_keys: HashSet<String>,
     },
-    BufferReset,
+    Barrier {
+        batch_seq: u64,
+    },
+}
+
+struct ReconcileRound {
+    session_id: u64,
+    round_id: u64,
+    purpose: ReconcilePurpose,
+    phase: ReconcilePhase,
+    phase_deadline: Instant,
+    snapshot_revision: Option<u64>,
 }
 
 fn requeue_in_flight(
@@ -157,6 +211,18 @@ fn requeue_in_flight(
     while let Some(batch) = in_flight.pop_back() {
         for op in batch.ops.into_iter().rev() {
             buffer.push_front(op);
+        }
+    }
+}
+
+fn disconnect_transport(
+    connection: &mut Option<ActiveConnection>,
+    delivery: DeliveryState,
+    buffer: &mut VecDeque<crate::actor::ReplicatedOp>,
+) {
+    if let Some(mut connection) = connection.take() {
+        if matches!(delivery, DeliveryState::Streaming) {
+            requeue_in_flight(&mut connection.in_flight, buffer);
         }
     }
 }
@@ -187,9 +253,12 @@ pub struct SenderStateReport {
 /// Shared dependencies for a sender task.
 pub struct SenderDeps {
     pub router: FragmentRouter,
+    /// Node-wide HLC. Reconcile frames are observed here only after the sender
+    /// has authenticated their exact session/round/phase correlation.
+    pub hlc: Arc<Mutex<HlcClock>>,
     /// Senders currently in `BufferReset`, keyed by (fragment, peer).
     /// The cleaner consults this to block tombstone GC.
-    pub reset_senders: Arc<Mutex<HashSet<(FragmentId, String)>>>,
+    pub reset_senders: Arc<Mutex<HashMap<(FragmentId, String), u64>>>,
     /// Where the sender publishes its state.
     pub state_report: Arc<Mutex<SenderStateReport>>,
 }
@@ -238,139 +307,222 @@ async fn sender_task(
     deps: SenderDeps,
     mut rx: mpsc::UnboundedReceiver<SenderMsg>,
 ) {
-    let mut state = SenderState::Disconnected;
+    let mut delivery = DeliveryState::Streaming;
+    let mut connection: Option<ActiveConnection> = None;
     let mut buffer: VecDeque<crate::actor::ReplicatedOp> = VecDeque::new();
-    let mut peer_tx: Option<mpsc::Sender<Vec<u8>>> = None;
-    let mut batch_timer = tokio::time::interval(config.batch_interval);
+    // `interval()` ticks immediately once, which made the first batch race
+    // sender startup instead of consistently observing `batch_interval`.
+    let mut batch_timer = tokio::time::interval_at(
+        tokio::time::Instant::now() + config.batch_interval,
+        config.batch_interval,
+    );
     batch_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let mut consistency_timer = tokio::time::interval(config.consistency_interval);
+    let mut consistency_timer = tokio::time::interval_at(
+        tokio::time::Instant::now() + config.consistency_interval,
+        config.consistency_interval,
+    );
     consistency_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
-    // The sender only learns its session id on PeerConnected.
-    let mut session_id: u64 = 0;
-    // Remaining fetch chunks for the in-flight reconcile round.
-    // Chunking bounds the memory of a single ReconcileData message
-    // during bootstrap / anti-entropy on large fragments.
-    let mut fetch_queue: VecDeque<Vec<String>> = VecDeque::new();
-    // Completed reconcile rounds, published for health/tests (the
-    // Phase 8 placement driver polls this for bootstrap completion).
+    let mut active_reconcile: Option<ReconcileRound> = None;
+    let reset_generation = rand_session_id();
+    let mut next_round_id = 0_u64;
+    let mut next_reset_epoch = 0_u64;
     let mut reconcile_rounds: u64 = 0;
     let mut last_ack_durability = None;
     let mut ack_durability_mismatch = false;
     let mut retry_not_before: Option<Instant> = None;
+    let mut reconcile_retry: Option<(Instant, ReconcilePurpose)> = None;
+    // A fetched winner may have entered a configured local store's write
+    // buffer before a flush failed. Carry that obligation across retry
+    // rounds; ordinary no-fetch reconciliation on a storeless sender must not
+    // acquire a new local durability requirement.
+    let mut local_reconcile_flush_pending = false;
 
     loop {
         // Publish state for health checks and tests.
         {
-            let (state_str, in_flight) = match &state {
-                SenderState::Disconnected => ("disconnected".to_string(), 0),
-                SenderState::Connected { in_flight, .. } => {
-                    ("connected".to_string(), in_flight.len())
-                }
-                SenderState::BufferReset => ("buffer_reset".to_string(), 0),
+            let state = match delivery {
+                DeliveryState::Reset { .. } => "buffer_reset",
+                DeliveryState::Streaming if connection.is_some() => "connected",
+                DeliveryState::Streaming => "disconnected",
             };
             *deps.state_report.lock().await = SenderStateReport {
-                state: state_str,
-                session_id,
+                state: state.to_string(),
+                session_id: connection.as_ref().map_or(0, |c| c.session_id),
                 buffered: buffer.len(),
-                in_flight,
+                in_flight: connection.as_ref().map_or(0, |c| c.in_flight.len()),
                 last_ack_durability,
                 ack_durability_mismatch,
                 reconcile_rounds,
             };
         }
+        let reconcile_wakeup = active_reconcile
+            .as_ref()
+            .map(|round| round.phase_deadline)
+            .into_iter()
+            .chain(
+                reconcile_retry
+                    .filter(|_| connection.is_some())
+                    .map(|(deadline, _)| deadline),
+            )
+            .min();
         tokio::select! {
             msg = rx.recv() => {
                 let Some(msg) = msg else { break };
                 match msg {
                     SenderMsg::Enqueue(op) => {
-                        if buffer.len() >= config.buffer_capacity {
-                            // Shed the buffer and enter BufferReset. The op
-                            // itself is applied locally regardless; it will
-                            // be picked up by reconciliation.
-                            buffer.clear();
-                            if !matches!(state, SenderState::BufferReset) {
-                                state = SenderState::BufferReset;
-                                deps.reset_senders
-                                    .lock()
-                                    .await
-                                    .insert((fragment, peer_id.clone()));
+                        if let DeliveryState::Reset { epoch } = &mut delivery {
+                            // Preserve post-snapshot local deltas so a busy
+                            // fragment can finish reset without requiring a
+                            // completely quiet network round. A second
+                            // overflow invalidates the snapshot and falls back
+                            // to another full round.
+                            if buffer.len() >= config.buffer_capacity {
+                                buffer.clear();
+                                *epoch = next_nonzero(&mut next_reset_epoch);
+                            } else {
+                                buffer.push_back(op);
                             }
+                            continue;
+                        }
+                        if buffer.len() >= config.buffer_capacity {
+                            // Install the tombstone-GC guard before shedding
+                            // the only queued copies. The overflowing op is
+                            // already in local state and is recovered by the
+                            // correlated reconciliation snapshot.
+                            deps.reset_senders
+                                .lock()
+                                .await
+                                .insert((fragment, peer_id.clone()), reset_generation);
+                            buffer.clear();
+                            let epoch = next_nonzero(&mut next_reset_epoch);
+                            delivery = DeliveryState::Reset { epoch };
+                            active_reconcile = None;
+                            reconcile_retry = None;
+
+                            // Invalidate old streaming batches before taking
+                            // the reset snapshot. Delayed ACKs and reconcile
+                            // responses from that session are then harmless.
+                            let session_started = if let Some(conn) = connection.as_mut() {
+                                conn.in_flight.clear();
+                                conn.session_id = rand_session_id();
+                                conn.next_batch_seq = 0;
+                                send_session_start(fragment, conn).await
+                            } else {
+                                false
+                            };
+                            if session_started {
+                                let conn = connection.as_ref().expect("checked above");
+                                match begin_reconcile(
+                                    fragment,
+                                    ReconcilePurpose::Reset { epoch },
+                                    conn,
+                                    &mut next_round_id,
+                                    config.reconcile_timeout,
+                                )
+                                .await
+                                {
+                                    Ok(round) => active_reconcile = Some(round),
+                                    Err(()) => disconnect_transport(&mut connection, delivery, &mut buffer),
+                                }
+                            } else if connection.is_some() {
+                                disconnect_transport(&mut connection, delivery, &mut buffer);
+                            }
+                            continue;
                         }
                         buffer.push_back(op);
                     }
                     SenderMsg::PeerConnected { peer_tx: tx } => {
-                        session_id = rand_session_id();
-                        peer_tx = Some(tx.clone());
+                        if connection
+                            .as_ref()
+                            .map_or(false, |current| current.peer_tx.same_channel(&tx))
+                        {
+                            // Dynamic placement polls and duplicate
+                            // notifications must not rotate live sessions.
+                            continue;
+                        }
+                        if let Some(round) = active_reconcile.take() {
+                            reconcile_retry = Some((Instant::now(), round.purpose));
+                        }
+                        if let Some(mut old) = connection.take() {
+                            if matches!(delivery, DeliveryState::Streaming) {
+                                requeue_in_flight(&mut old.in_flight, &mut buffer);
+                            }
+                        }
                         retry_not_before = None;
                         last_ack_durability = None;
                         ack_durability_mismatch = false;
-                        // Requeue unacked ops at the front: the new session
-                        // must not lose them, and redelivery is idempotent.
-                        if let SenderState::Connected { in_flight, .. } = &mut state {
-                            requeue_in_flight(in_flight, &mut buffer);
+                        let mut conn = ActiveConnection {
+                            peer_tx: tx,
+                            session_id: rand_session_id(),
+                            next_batch_seq: 0,
+                            in_flight: VecDeque::new(),
+                        };
+                        if !send_session_start(fragment, &conn).await {
+                            continue;
                         }
-                        match state {
-                            SenderState::BufferReset => {
-                                // Don't go Connected yet: reconcile first.
-                                send_envelope(
-                                    &tx,
-                                    EnvelopeMsg::SessionStart(SessionStart {
-                                        session_id,
-                                        fragment: fragment.0,
-                                    }),
-                                )
-                                .await;
-                                send_envelope(
-                                    &tx,
-                                    EnvelopeMsg::ReconcileRequest(ReconcileRequest {
-                                        fragment: fragment.0,
-                                    }),
-                                )
-                                .await;
+                        let reconcile_purpose = match delivery {
+                            DeliveryState::Reset { epoch } => {
+                                Some(ReconcilePurpose::Reset { epoch })
                             }
-                            _ => {
-                                state = SenderState::Connected {
-                                    session_id,
-                                    next_batch_seq: 0,
-                                    in_flight: VecDeque::new(),
-                                };
-                                send_envelope(
-                                    &tx,
-                                    EnvelopeMsg::SessionStart(SessionStart {
-                                        session_id,
-                                        fragment: fragment.0,
-                                    }),
-                                )
-                                .await;
+                            DeliveryState::Streaming => {
+                                reconcile_retry.map(|(_, purpose)| purpose)
+                            }
+                        };
+                        if let Some(purpose) = reconcile_purpose {
+                            match begin_reconcile(
+                                fragment,
+                                purpose,
+                                &conn,
+                                &mut next_round_id,
+                                config.reconcile_timeout,
+                            )
+                            .await
+                            {
+                                Ok(round) => {
+                                    active_reconcile = Some(round);
+                                    reconcile_retry = None;
+                                }
+                                Err(()) => {
+                                    conn.in_flight.clear();
+                                    continue;
+                                }
                             }
                         }
+                        connection = Some(conn);
                     }
-                    SenderMsg::PeerDisconnected => {
-                        peer_tx = None;
-                        session_id = 0;
+                    SenderMsg::PeerDisconnected { peer_tx } => {
+                        if connection
+                            .as_ref()
+                            .map_or(true, |current| !current.peer_tx.same_channel(&peer_tx))
+                        {
+                            continue;
+                        }
+                        if let Some(round) = active_reconcile.take() {
+                            reconcile_retry = Some((Instant::now(), round.purpose));
+                        }
+                        if let Some(mut conn) = connection.take() {
+                            if matches!(delivery, DeliveryState::Streaming) {
+                                requeue_in_flight(&mut conn.in_flight, &mut buffer);
+                            }
+                        }
                         last_ack_durability = None;
                         ack_durability_mismatch = false;
-                        if let SenderState::Connected { in_flight, .. } = &mut state {
-                            // Preserve every unacknowledged operation before
-                            // discarding the dead session.
-                            requeue_in_flight(in_flight, &mut buffer);
-                            state = SenderState::Disconnected;
-                        }
-                        // BufferReset survives disconnects: we still need
-                        // to reconcile when the peer returns.
                     }
                     SenderMsg::Ack {
                         session_id: ack_session,
                         batch_seq,
                         durability,
                     } => {
-                        if ack_session != session_id {
-                            continue; // stale session ack
-                        }
-                        if let SenderState::Connected { in_flight, .. } = &mut state {
-                            if let Some(pos) =
-                                in_flight.iter().position(|b| b.batch_seq == batch_seq)
+                        let mut completed_round = None;
+                        if let Some(conn) = connection.as_mut() {
+                            if ack_session != conn.session_id {
+                                continue;
+                            }
+                            if let Some(pos) = conn
+                                .in_flight
+                                .iter()
+                                .position(|b| b.batch_seq == batch_seq)
                             {
                                 last_ack_durability = Some(durability);
                                 ack_durability_mismatch =
@@ -385,7 +537,180 @@ async fn sender_task(
                                         "replication ack did not meet the configured durability fence"
                                     );
                                 } else {
-                                    in_flight.remove(pos);
+                                    ack_durability_mismatch = false;
+                                    conn.in_flight.remove(pos);
+                                    let is_barrier = active_reconcile.as_ref().map_or(false, |round| {
+                                        round.session_id == ack_session
+                                            && matches!(
+                                                round.phase,
+                                                ReconcilePhase::Barrier { batch_seq: seq }
+                                                    if seq == batch_seq
+                                            )
+                                    });
+                                    if is_barrier {
+                                        completed_round = active_reconcile.take();
+                                    }
+                                }
+                            }
+                        }
+                        if let Some(mut round) = completed_round {
+                            reconcile_retry = None;
+                            match round.purpose {
+                                ReconcilePurpose::Routine => {
+                                    if round.snapshot_revision.is_some() {
+                                        reconcile_rounds = reconcile_rounds.saturating_add(1);
+                                    } else if let Some(conn) = connection.as_ref() {
+                                        // Fetched winners (and reset deltas)
+                                        // invalidate the snapshot that chose
+                                        // them. The barrier proves those
+                                        // writes were applied, but not that
+                                        // the two sides now agree. Require a
+                                        // fresh no-fetch round before
+                                        // reporting routine/bootstrap
+                                        // completion.
+                                        match begin_reconcile(
+                                            fragment,
+                                            ReconcilePurpose::Routine,
+                                            conn,
+                                            &mut next_round_id,
+                                            config.reconcile_timeout,
+                                        )
+                                        .await
+                                        {
+                                            Ok(next_round) => {
+                                                active_reconcile = Some(next_round)
+                                            }
+                                            Err(()) => {
+                                                reconcile_retry = Some((
+                                                    Instant::now() + NACK_RETRY_DELAY,
+                                                    ReconcilePurpose::Routine,
+                                                ));
+                                                disconnect_transport(
+                                                    &mut connection,
+                                                    delivery,
+                                                    &mut buffer,
+                                                );
+                                            }
+                                        }
+                                    } else {
+                                        reconcile_retry = Some((
+                                            Instant::now() + NACK_RETRY_DELAY,
+                                            ReconcilePurpose::Routine,
+                                        ));
+                                    }
+                                }
+                                ReconcilePurpose::Reset {
+                                    epoch: completed_epoch,
+                                } => {
+                                    if !buffer.is_empty() {
+                                        let deltas: Vec<_> = buffer.drain(..).collect();
+                                        let send_result = match connection.as_ref() {
+                                            Some(conn) => {
+                                                send_repair_ops(fragment, conn, &deltas).await
+                                            }
+                                            None => Err(ReconcileError::Transport),
+                                        };
+                                        if send_result.is_err() {
+                                            for op in deltas.into_iter().rev() {
+                                                buffer.push_front(op);
+                                            }
+                                            disconnect_transport(
+                                                &mut connection,
+                                                delivery,
+                                                &mut buffer,
+                                            );
+                                            reconcile_retry = Some((
+                                                Instant::now() + NACK_RETRY_DELAY,
+                                                round.purpose,
+                                            ));
+                                            continue;
+                                        }
+                                        // These deltas are now fenced, but a
+                                        // bare revision cannot distinguish
+                                        // them from unrelated concurrent
+                                        // mutations. Require one fresh
+                                        // no-change snapshot before clearing
+                                        // reset.
+                                        round.snapshot_revision = None;
+                                        let Some(conn) = connection.as_mut() else {
+                                            for op in deltas.into_iter().rev() {
+                                                buffer.push_front(op);
+                                            }
+                                            continue;
+                                        };
+                                        match send_reconcile_barrier(fragment, &config, conn).await {
+                                            Ok(batch_seq) => {
+                                                round.phase =
+                                                    ReconcilePhase::Barrier { batch_seq };
+                                                round.phase_deadline =
+                                                    Instant::now() + config.reconcile_timeout;
+                                                active_reconcile = Some(round);
+                                            }
+                                            Err(()) => {
+                                                for op in deltas.into_iter().rev() {
+                                                    buffer.push_front(op);
+                                                }
+                                                disconnect_transport(
+                                                    &mut connection,
+                                                    delivery,
+                                                    &mut buffer,
+                                                );
+                                                reconcile_retry = Some((
+                                                    Instant::now() + NACK_RETRY_DELAY,
+                                                    round.purpose,
+                                                ));
+                                            }
+                                        }
+                                        continue;
+                                    }
+
+                                    let snapshot_is_current = match (
+                                        round.snapshot_revision,
+                                        fragment_revision(fragment, &deps.router).await,
+                                    ) {
+                                        (Some(expected), Ok(current)) => expected == current,
+                                        _ => false,
+                                    };
+                                    match delivery {
+                                        DeliveryState::Reset { epoch }
+                                            if epoch == completed_epoch && snapshot_is_current =>
+                                        {
+                                        let key = (fragment, peer_id.clone());
+                                        let mut reset_senders = deps.reset_senders.lock().await;
+                                        if reset_senders.get(&key) == Some(&reset_generation) {
+                                            reset_senders.remove(&key);
+                                        }
+                                        delivery = DeliveryState::Streaming;
+                                        reconcile_rounds = reconcile_rounds.saturating_add(1);
+                                        }
+                                        DeliveryState::Reset { epoch } => {
+                                            if let Some(conn) = connection.as_ref() {
+                                                match begin_reconcile(
+                                                    fragment,
+                                                    ReconcilePurpose::Reset { epoch },
+                                                    conn,
+                                                    &mut next_round_id,
+                                                    config.reconcile_timeout,
+                                                )
+                                                .await
+                                                {
+                                                    Ok(round) => active_reconcile = Some(round),
+                                                    Err(()) => {
+                                                        reconcile_retry = Some((
+                                                            Instant::now() + NACK_RETRY_DELAY,
+                                                            ReconcilePurpose::Reset { epoch },
+                                                        ));
+                                                        disconnect_transport(
+                                                            &mut connection,
+                                                            delivery,
+                                                            &mut buffer,
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        DeliveryState::Streaming => {}
+                                    }
                                 }
                             }
                         }
@@ -395,14 +720,51 @@ async fn sender_task(
                         batch_seq,
                         error,
                     } => {
-                        if nack_session != session_id {
-                            continue; // stale session nack
-                        }
-                        if let SenderState::Connected { in_flight, .. } = &mut state {
-                            if let Some(pos) =
-                                in_flight.iter().position(|b| b.batch_seq == batch_seq)
+                        let mut restart_session = false;
+                        if let Some(conn) = connection.as_mut() {
+                            if nack_session != conn.session_id {
+                                continue;
+                            }
+                            if let Some(pos) = conn
+                                .in_flight
+                                .iter()
+                                .position(|b| b.batch_seq == batch_seq)
                             {
-                                if let Some(batch) = in_flight.remove(pos) {
+                                if let Some(batch) = conn.in_flight.remove(pos) {
+                                    let is_barrier = active_reconcile.as_ref().map_or(false, |round| {
+                                        round.session_id == nack_session
+                                            && matches!(
+                                                round.phase,
+                                                ReconcilePhase::Barrier { batch_seq: seq }
+                                                    if seq == batch_seq
+                                            )
+                                    });
+                                    if is_barrier {
+                                        let purpose = active_reconcile
+                                            .take()
+                                            .map(|round| round.purpose)
+                                            .unwrap_or(ReconcilePurpose::Routine);
+                                        reconcile_retry = Some((
+                                            Instant::now() + NACK_RETRY_DELAY,
+                                            purpose,
+                                        ));
+                                        // A reconciliation repair failure
+                                        // poisons the receiver's current
+                                        // session. Preserve unrelated
+                                        // streaming batches, then mint a new
+                                        // session before retrying the round.
+                                        if matches!(delivery, DeliveryState::Streaming) {
+                                            requeue_in_flight(
+                                                &mut conn.in_flight,
+                                                &mut buffer,
+                                            );
+                                        } else {
+                                            conn.in_flight.clear();
+                                        }
+                                        conn.session_id = rand_session_id();
+                                        conn.next_batch_seq = 0;
+                                        restart_session = true;
+                                    }
                                     for op in batch.ops.into_iter().rev() {
                                         buffer.push_front(op);
                                     }
@@ -413,154 +775,344 @@ async fn sender_task(
                                         %error,
                                         "replication batch rejected; queued for retry"
                                     );
-                                    retry_not_before = Some(Instant::now() + NACK_RETRY_DELAY);
+                                    if !is_barrier {
+                                        retry_not_before = Some(Instant::now() + NACK_RETRY_DELAY);
+                                    }
                                 }
+                            }
+                        }
+                        if restart_session {
+                            let restarted = match connection.as_ref() {
+                                Some(conn) => send_session_start(fragment, conn).await,
+                                None => false,
+                            };
+                            if !restarted {
+                                disconnect_transport(&mut connection, delivery, &mut buffer);
                             }
                         }
                     }
                     SenderMsg::ReconcileNow => {
-                        // On-demand anti-entropy (Phase 8 bootstrap).
-                        // A disconnected sender reconciles on the next
-                        // PeerConnected; a BufferReset sender already
-                        // has a round in flight.
-                        if matches!(state, SenderState::Connected { .. }) {
-                            if let Some(tx) = peer_tx.clone() {
-                                send_envelope(
-                                    &tx,
-                                    EnvelopeMsg::ReconcileRequest(ReconcileRequest {
-                                        fragment: fragment.0,
-                                    }),
+                        if matches!(delivery, DeliveryState::Streaming)
+                            && active_reconcile.is_none()
+                        {
+                            if let Some(conn) = connection.as_ref() {
+                                match begin_reconcile(
+                                    fragment,
+                                    ReconcilePurpose::Routine,
+                                    conn,
+                                    &mut next_round_id,
+                                    config.reconcile_timeout,
                                 )
-                                .await;
+                                .await
+                                {
+                                    Ok(round) => {
+                                        active_reconcile = Some(round);
+                                        reconcile_retry = None;
+                                    }
+                                    Err(()) => {
+                                        reconcile_retry = Some((
+                                            Instant::now() + NACK_RETRY_DELAY,
+                                            ReconcilePurpose::Routine,
+                                        ));
+                                        disconnect_transport(&mut connection, delivery, &mut buffer);
+                                    }
+                                }
+                            } else {
+                                // Preserve on-demand bootstrap across a
+                                // connection race instead of silently dropping
+                                // the request.
+                                reconcile_retry =
+                                    Some((Instant::now(), ReconcilePurpose::Routine));
                             }
                         }
                     }
-                    SenderMsg::ReconcileResponse { summaries } => {
-                        // Anti-entropy applies in BufferReset (recovery)
-                        // and in Connected (periodic repair): a response
-                        // received while Disconnected belongs to a dead
-                        // session and is ignored.
-                        let in_reset = matches!(state, SenderState::BufferReset);
-                        if !in_reset && !matches!(state, SenderState::Connected { .. }) {
+                    SenderMsg::ReconcileResponse {
+                        session_id,
+                        round_id,
+                        summaries,
+                        connection_valid,
+                    } => {
+                        let expected = active_reconcile.as_ref().map_or(false, |round| {
+                            round.session_id == session_id
+                                && round.round_id == round_id
+                                && matches!(round.phase, ReconcilePhase::Response)
+                        });
+                        if !expected {
+                            let _ = connection_valid.send(true);
                             continue;
                         }
-                        let Some(tx) = peer_tx.clone() else { continue };
-                        // A newer round supersedes an older one still
-                        // fetching: LWW makes the exchange idempotent.
-                        fetch_queue.clear();
-                        match reconcile(fragment, &deps.router, &tx, session_id, summaries).await
-                        {
-                            // No fetch needed: the round is complete.
-                            None => {
-                                reconcile_rounds += 1;
-                                if in_reset {
-                                    finish_reconcile(
-                                        fragment,
-                                        &peer_id,
-                                        &deps.reset_senders,
-                                        &mut state,
-                                        session_id,
-                                        peer_tx.clone(),
-                                    )
-                                    .await;
+                        if reconcile_summaries_are_well_formed(
+                            fragment,
+                            &deps.router,
+                            &summaries,
+                        ) {
+                            if let Some(timestamp_ms) =
+                                summaries.iter().map(|summary| summary.timestamp_ms).max()
+                            {
+                                if let Err(error) = deps.hlc.lock().await.observe(timestamp_ms) {
+                                    tracing::warn!(
+                                        peer = %peer_id,
+                                        fragment = fragment.0,
+                                        %error,
+                                        "rejecting correlated reconcile response timestamp"
+                                    );
+                                    let _ = connection_valid.send(false);
+                                    continue;
                                 }
                             }
-                            // First chunk sent; the rest wait for
-                            // ReconcileData.
-                            Some(remaining) => {
-                                fetch_queue = remaining;
+                        }
+                        let _ = connection_valid.send(true);
+                        let Some(mut round) = active_reconcile.take() else { continue };
+                        let Some(conn) = connection.as_mut() else { continue };
+                        match reconcile(
+                            fragment,
+                            &deps.router,
+                            conn,
+                            round.round_id,
+                            summaries,
+                        )
+                        .await
+                        {
+                            Ok((
+                                Some((
+                                    remaining_chunks,
+                                    expected_chunk_seq,
+                                    expected_keys,
+                                )),
+                                snapshot_revision,
+                            )) => {
+                                round.snapshot_revision = Some(snapshot_revision);
+                                round.phase = ReconcilePhase::Data {
+                                    remaining_chunks,
+                                    next_chunk_seq: expected_chunk_seq,
+                                    expected_keys,
+                                };
+                                round.phase_deadline =
+                                    Instant::now() + config.reconcile_timeout;
+                                active_reconcile = Some(round);
+                            }
+                            Ok((None, snapshot_revision)) => {
+                                round.snapshot_revision = Some(snapshot_revision);
+                                // A prior attempt may already have applied
+                                // fetched winners to the cache and then failed
+                                // its local store flush. The retry will see
+                                // equal summaries and need no fetch, so fence
+                                // local durability on every StoreCommitted
+                                // completion path, not only after fresh data.
+                                if local_reconcile_flush_pending {
+                                    if flush_reconcile(fragment, &deps.router).await.is_err() {
+                                        reconcile_retry = Some((
+                                            Instant::now() + NACK_RETRY_DELAY,
+                                            round.purpose,
+                                        ));
+                                        continue;
+                                    }
+                                    local_reconcile_flush_pending = false;
+                                }
+                                match send_reconcile_barrier(fragment, &config, conn).await {
+                                    Ok(batch_seq) => {
+                                        round.phase = ReconcilePhase::Barrier { batch_seq };
+                                        round.phase_deadline =
+                                            Instant::now() + config.reconcile_timeout;
+                                        active_reconcile = Some(round);
+                                    }
+                                    Err(()) => {
+                                        reconcile_retry = Some((
+                                            Instant::now() + NACK_RETRY_DELAY,
+                                            round.purpose,
+                                        ));
+                                        disconnect_transport(&mut connection, delivery, &mut buffer);
+                                    }
+                                }
+                            }
+                            Err(ReconcileError::Local) => {
+                                reconcile_retry = Some((
+                                    Instant::now() + NACK_RETRY_DELAY,
+                                    round.purpose,
+                                ));
+                            }
+                            Err(ReconcileError::Transport) => {
+                                reconcile_retry = Some((
+                                    Instant::now() + NACK_RETRY_DELAY,
+                                    round.purpose,
+                                ));
+                                disconnect_transport(&mut connection, delivery, &mut buffer);
                             }
                         }
                     }
-                    SenderMsg::ReconcileData { entries } => {
-                        // Merge fetched values locally via LWW.
-                        if let Some(actor) = deps.router.route_for_fragment(fragment) {
-                            for e in entries {
-                                let mut v = VersionedValue::new(
-                                    e.value,
-                                    e.timestamp_ms,
-                                    e.node_id,
-                                );
-                                v.expires_at_ms = if e.expires_at_ms == 0 {
-                                    None
-                                } else {
-                                    Some(e.expires_at_ms)
-                                };
-                                v.is_tombstone = e.is_tombstone;
-                                let op = crate::actor::ReplicatedOp {
-                                    key: e.key,
-                                    value: v,
-                                    seq: 0,
-                                    boot_id: 0,
-                                };
-                                let _ = actor.send_message(KvMessage::ApplyOp {
-                                    op,
-                                    priority: OpPriority::Default,
-                                    is_replication: true,
-                                    reply: None,
-                                });
-                            }
-                        }
-                        // More chunks? Send the next fetch; otherwise the
-                        // round is complete.
-                        let mut next_chunk = fetch_queue.pop_front();
-                        // A queued chunk with no peer is useless; drop it
-                        // and finish the round instead of stalling.
-                        if next_chunk.is_some() && peer_tx.is_none() {
-                            next_chunk = None;
-                            fetch_queue.clear();
-                        }
-                        if let Some(chunk) = next_chunk {
-                            if let Some(tx) = peer_tx.clone() {
-                                send_envelope(
-                                    &tx,
-                                    EnvelopeMsg::ReconcileFetch(ReconcileFetch {
-                                        fragment: fragment.0,
-                                        keys: chunk,
-                                    }),
+                    SenderMsg::ReconcileData {
+                        session_id,
+                        round_id,
+                        chunk_seq,
+                        entries,
+                        connection_valid,
+                    } => {
+                        let expected = active_reconcile.as_ref().map_or(false, |round| {
+                            round.session_id == session_id
+                                && round.round_id == round_id
+                                && matches!(
+                                    round.phase,
+                                    ReconcilePhase::Data { next_chunk_seq, .. }
+                                        if next_chunk_seq == chunk_seq
                                 )
-                                .await;
+                        });
+                        if !expected {
+                            let _ = connection_valid.send(true);
+                            continue;
+                        }
+                        let expected_keys = match active_reconcile.as_ref().map(|round| &round.phase)
+                        {
+                            Some(ReconcilePhase::Data { expected_keys, .. }) => {
+                                expected_keys
+                            }
+                            _ => {
+                                let _ = connection_valid.send(true);
                                 continue;
                             }
+                        };
+                        if reconcile_entries_are_exact(
+                            fragment,
+                            &deps.router,
+                            &entries,
+                            expected_keys,
+                        ) {
+                            if let Some(timestamp_ms) =
+                                entries.iter().map(|entry| entry.timestamp_ms).max()
+                            {
+                                if let Err(error) = deps.hlc.lock().await.observe(timestamp_ms) {
+                                    tracing::warn!(
+                                        peer = %peer_id,
+                                        fragment = fragment.0,
+                                        %error,
+                                        "rejecting correlated reconcile data timestamp"
+                                    );
+                                    let _ = connection_valid.send(false);
+                                    continue;
+                                }
+                            }
                         }
-                        reconcile_rounds += 1;
-                        // Reconciliation is complete once the data lands:
-                        // leave BufferReset and go Connected. A
-                        // Connected sender simply stays connected.
-                        if matches!(state, SenderState::BufferReset) {
-                            finish_reconcile(
-                                fragment,
-                                &peer_id,
-                                &deps.reset_senders,
-                                &mut state,
-                                session_id,
-                                peer_tx.clone(),
+                        let _ = connection_valid.send(true);
+                        let Some(mut round) = active_reconcile.take() else { continue };
+                        let ReconcilePhase::Data {
+                            mut remaining_chunks,
+                            next_chunk_seq,
+                            expected_keys,
+                        } = round.phase
+                        else {
+                            continue;
+                        };
+                        if config.required_ack_durability
+                            == ReplicationAckDurability::StoreCommitted
+                        {
+                            // Apply is not transactional: an error or lost RPC
+                            // reply may follow a successful prefix. Record the
+                            // flush obligation before the first mutation.
+                            local_reconcile_flush_pending = true;
+                        }
+                        if apply_reconcile_entries(
+                            fragment,
+                            &deps.router,
+                            entries,
+                            &expected_keys,
+                        )
+                            .await
+                            .is_err()
+                        {
+                            reconcile_retry = Some((
+                                Instant::now() + NACK_RETRY_DELAY,
+                                round.purpose,
+                            ));
+                            continue;
+                        }
+                        let Some(conn) = connection.as_mut() else { continue };
+                        if let Some(keys) = remaining_chunks.pop_front() {
+                            let next_seq = next_chunk_seq.saturating_add(1);
+                            let expected_keys = keys.iter().cloned().collect();
+                            let ok = send_envelope(
+                                &conn.peer_tx,
+                                EnvelopeMsg::ReconcileFetch(ReconcileFetch {
+                                    fragment: fragment.0,
+                                    keys,
+                                    session_id,
+                                    round_id,
+                                    chunk_seq: next_seq,
+                                }),
                             )
                             .await;
+                            if !ok {
+                                reconcile_retry = Some((
+                                    Instant::now() + NACK_RETRY_DELAY,
+                                    round.purpose,
+                                ));
+                                disconnect_transport(&mut connection, delivery, &mut buffer);
+                                continue;
+                            }
+                            round.phase = ReconcilePhase::Data {
+                                remaining_chunks,
+                                next_chunk_seq: next_seq,
+                                expected_keys,
+                            };
+                            round.phase_deadline =
+                                Instant::now() + config.reconcile_timeout;
+                            active_reconcile = Some(round);
+                            continue;
+                        }
+                        if local_reconcile_flush_pending {
+                            if flush_reconcile(fragment, &deps.router).await.is_err() {
+                                reconcile_retry = Some((
+                                    Instant::now() + NACK_RETRY_DELAY,
+                                    round.purpose,
+                                ));
+                                continue;
+                            }
+                            local_reconcile_flush_pending = false;
+                        }
+                        // A fetched apply changes the fragment revision, but
+                        // unrelated mutations may have raced with it. Force a
+                        // no-fetch verification round after this barrier
+                        // instead of rebasing to an ambiguous revision.
+                        round.snapshot_revision = None;
+                        match send_reconcile_barrier(fragment, &config, conn).await {
+                            Ok(batch_seq) => {
+                                round.phase = ReconcilePhase::Barrier { batch_seq };
+                                round.phase_deadline =
+                                    Instant::now() + config.reconcile_timeout;
+                                active_reconcile = Some(round);
+                            }
+                            Err(()) => {
+                                reconcile_retry = Some((
+                                    Instant::now() + NACK_RETRY_DELAY,
+                                    round.purpose,
+                                ));
+                                disconnect_transport(&mut connection, delivery, &mut buffer);
+                            }
                         }
                     }
                 }
             }
             _ = batch_timer.tick() => {
-                let (sid, tx) = match (&state, peer_tx.clone()) {
-                    (SenderState::Connected { session_id, in_flight, .. }, Some(tx))
+                if matches!(delivery, DeliveryState::Reset { .. }) {
+                    continue;
+                }
+                let (sid, tx) = match connection.as_ref() {
+                    Some(conn)
                         if !buffer.is_empty()
-                            && in_flight.len() < config.max_in_flight
+                            && conn.in_flight.len() < config.max_in_flight
                             && retry_not_before
                                 .map(|deadline| Instant::now() >= deadline)
                                 .unwrap_or(true) =>
                     {
-                        (*session_id, tx)
+                        (conn.session_id, conn.peer_tx.clone())
                     }
                     _ => continue,
                 };
-                let batch_seq = match &mut state {
-                    SenderState::Connected { next_batch_seq, .. } => {
-                        let s = *next_batch_seq;
-                        *next_batch_seq += 1;
-                        s
+                let batch_seq = match connection.as_mut() {
+                    Some(conn) => {
+                        let seq = conn.next_batch_seq;
+                        conn.next_batch_seq = conn.next_batch_seq.wrapping_add(1);
+                        seq
                     }
-                    _ => continue,
+                    None => continue,
                 };
                 let ops: Vec<_> = buffer
                     .drain(..config.batch_size.min(buffer.len()))
@@ -585,37 +1137,120 @@ async fn sender_task(
                 )
                 .await;
                 if ok {
-                    if let SenderState::Connected { in_flight, .. } = &mut state {
-                        in_flight.push_back(InflightBatch { batch_seq, ops });
+                    if let Some(conn) = connection.as_mut() {
+                        conn.in_flight.push_back(InflightBatch { batch_seq, ops });
                     }
                 } else {
-                    // Send failed: the peer is gone. Requeue and wait for
-                    // the disconnect notice.
                     for op in ops.into_iter().rev() {
                         buffer.push_front(op);
                     }
-                    peer_tx = None;
-                    session_id = 0;
                     last_ack_durability = None;
                     ack_durability_mismatch = false;
-                    if let SenderState::Connected { in_flight, .. } = &mut state {
-                        requeue_in_flight(in_flight, &mut buffer);
-                        state = SenderState::Disconnected;
+                    if let Some(mut conn) = connection.take() {
+                        requeue_in_flight(&mut conn.in_flight, &mut buffer);
+                    }
+                    if let Some(round) = active_reconcile.take() {
+                        reconcile_retry = Some((Instant::now(), round.purpose));
+                    }
+                }
+            }
+            _ = async {
+                match reconcile_wakeup {
+                    Some(deadline) => {
+                        tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await;
+                    }
+                    None => std::future::pending::<()>().await,
+                }
+            } => {
+                let now = Instant::now();
+                if active_reconcile
+                    .as_ref()
+                    .map_or(false, |round| now >= round.phase_deadline)
+                {
+                    let round = active_reconcile.take().expect("checked above");
+                    tracing::warn!(
+                        peer = %peer_id,
+                        fragment = fragment.0,
+                        session_id = round.session_id,
+                        round_id = round.round_id,
+                        "reconciliation phase timed out; rotating session"
+                    );
+                    reconcile_retry = Some((now + NACK_RETRY_DELAY, round.purpose));
+                    let restarted = if let Some(conn) = connection.as_mut() {
+                        if matches!(delivery, DeliveryState::Streaming) {
+                            requeue_in_flight(&mut conn.in_flight, &mut buffer);
+                        } else {
+                            conn.in_flight.clear();
+                        }
+                        conn.session_id = rand_session_id();
+                        conn.next_batch_seq = 0;
+                        send_session_start(fragment, conn).await
+                    } else {
+                        true
+                    };
+                    if !restarted {
+                        disconnect_transport(&mut connection, delivery, &mut buffer);
+                    }
+                    continue;
+                }
+
+                let Some((deadline, requested_purpose)) = reconcile_retry else {
+                    continue;
+                };
+                if now < deadline {
+                    continue;
+                }
+                let purpose = match delivery {
+                    DeliveryState::Reset { epoch } => ReconcilePurpose::Reset { epoch },
+                    DeliveryState::Streaming => requested_purpose,
+                };
+                if let Some(conn) = connection.as_ref() {
+                    match begin_reconcile(
+                        fragment,
+                        purpose,
+                        conn,
+                        &mut next_round_id,
+                        config.reconcile_timeout,
+                    )
+                    .await
+                    {
+                        Ok(round) => {
+                            active_reconcile = Some(round);
+                            reconcile_retry = None;
+                        }
+                        Err(()) => {
+                            reconcile_retry = Some((now + NACK_RETRY_DELAY, purpose));
+                            disconnect_transport(&mut connection, delivery, &mut buffer);
+                        }
                     }
                 }
             }
             _ = consistency_timer.tick() => {
-                // Periodic anti-entropy: if connected, run a reconciliation
-                // pass to repair any divergence the streaming path missed.
-                if matches!(state, SenderState::Connected { .. }) {
-                    if let Some(tx) = peer_tx.clone() {
-                        send_envelope(
-                            &tx,
-                            EnvelopeMsg::ReconcileRequest(ReconcileRequest {
-                                fragment: fragment.0,
-                            }),
+                if matches!(delivery, DeliveryState::Streaming)
+                    && active_reconcile.is_none()
+                {
+                    if let Some(conn) = connection.as_ref() {
+                        match begin_reconcile(
+                            fragment,
+                            ReconcilePurpose::Routine,
+                            conn,
+                            &mut next_round_id,
+                            config.reconcile_timeout,
                         )
-                        .await;
+                        .await
+                        {
+                            Ok(round) => {
+                                active_reconcile = Some(round);
+                                reconcile_retry = None;
+                            }
+                            Err(()) => {
+                                reconcile_retry = Some((
+                                    Instant::now() + NACK_RETRY_DELAY,
+                                    ReconcilePurpose::Routine,
+                                ));
+                                disconnect_transport(&mut connection, delivery, &mut buffer);
+                            }
+                        }
                     }
                 }
             }
@@ -627,6 +1262,151 @@ async fn sender_task(
 /// ReconcileData message during bootstrap / anti-entropy on large
 /// fragments (Phase 8 chunked bootstrap).
 const RECONCILE_FETCH_CHUNK: usize = 500;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReconcileError {
+    Local,
+    Transport,
+}
+
+fn next_nonzero(counter: &mut u64) -> u64 {
+    *counter = counter.wrapping_add(1);
+    if *counter == 0 {
+        *counter = 1;
+    }
+    *counter
+}
+
+fn allocate_batch_seq(connection: &mut ActiveConnection) -> u64 {
+    let seq = connection.next_batch_seq;
+    connection.next_batch_seq = if seq == u64::MAX - 1 { 0 } else { seq + 1 };
+    seq
+}
+
+async fn send_session_start(fragment: FragmentId, connection: &ActiveConnection) -> bool {
+    send_envelope(
+        &connection.peer_tx,
+        EnvelopeMsg::SessionStart(SessionStart {
+            session_id: connection.session_id,
+            fragment: fragment.0,
+        }),
+    )
+    .await
+}
+
+async fn begin_reconcile(
+    fragment: FragmentId,
+    purpose: ReconcilePurpose,
+    connection: &ActiveConnection,
+    next_round_id: &mut u64,
+    phase_timeout: Duration,
+) -> Result<ReconcileRound, ()> {
+    let round_id = next_nonzero(next_round_id);
+    let ok = send_envelope(
+        &connection.peer_tx,
+        EnvelopeMsg::ReconcileRequest(ReconcileRequest {
+            fragment: fragment.0,
+            session_id: connection.session_id,
+            round_id,
+        }),
+    )
+    .await;
+    if !ok {
+        return Err(());
+    }
+    Ok(ReconcileRound {
+        session_id: connection.session_id,
+        round_id,
+        purpose,
+        phase: ReconcilePhase::Response,
+        phase_deadline: Instant::now() + phase_timeout,
+        snapshot_revision: None,
+    })
+}
+
+async fn send_reconcile_barrier(
+    fragment: FragmentId,
+    config: &SenderConfig,
+    connection: &mut ActiveConnection,
+) -> Result<u64, ()> {
+    let batch_seq = allocate_batch_seq(connection);
+    let ok = send_envelope(
+        &connection.peer_tx,
+        EnvelopeMsg::ReplicateBatch(ReplicateBatch {
+            session_id: connection.session_id,
+            batch_seq,
+            fragment: fragment.0,
+            ops: Vec::new(),
+            required_ack_level: match config.required_ack_durability {
+                ReplicationAckDurability::MemoryApplied => ReplicationAckLevel::Applied as i32,
+                ReplicationAckDurability::StoreCommitted => {
+                    ReplicationAckLevel::StoreCommitted as i32
+                }
+            },
+        }),
+    )
+    .await;
+    if !ok {
+        return Err(());
+    }
+    connection.in_flight.push_back(InflightBatch {
+        batch_seq,
+        ops: Vec::new(),
+    });
+    Ok(batch_seq)
+}
+
+async fn send_repair_ops(
+    fragment: FragmentId,
+    connection: &ActiveConnection,
+    ops: &[crate::actor::ReplicatedOp],
+) -> Result<(), ReconcileError> {
+    for chunk in ops.chunks(100) {
+        let proto_ops = chunk.iter().map(proto_op).collect();
+        if !send_envelope(
+            &connection.peer_tx,
+            EnvelopeMsg::ReplicateBatch(ReplicateBatch {
+                session_id: connection.session_id,
+                batch_seq: u64::MAX,
+                fragment: fragment.0,
+                ops: proto_ops,
+                // Untracked repairs are apply-only. The following tracked
+                // empty barrier requests and reports the actual fence.
+                required_ack_level: ReplicationAckLevel::Applied as i32,
+            }),
+        )
+        .await
+        {
+            return Err(ReconcileError::Transport);
+        }
+    }
+    Ok(())
+}
+
+fn reconcile_summaries_are_well_formed(
+    fragment: FragmentId,
+    router: &FragmentRouter,
+    summaries: &[KeySummary],
+) -> bool {
+    let mut seen = HashSet::with_capacity(summaries.len());
+    summaries.iter().all(|summary| {
+        router.key_belongs_to(fragment, &summary.key) && seen.insert(summary.key.as_str())
+    })
+}
+
+fn reconcile_entries_are_exact(
+    fragment: FragmentId,
+    router: &FragmentRouter,
+    entries: &[SyncEntry],
+    expected_keys: &HashSet<String>,
+) -> bool {
+    let received_keys: HashSet<&str> = entries.iter().map(|entry| entry.key.as_str()).collect();
+    entries.len() == expected_keys.len()
+        && received_keys.len() == entries.len()
+        && entries.iter().all(|entry| {
+            expected_keys.contains(&entry.key) && router.key_belongs_to(fragment, &entry.key)
+        })
+}
 
 /// Run one reconciliation round: compare the peer's summaries against
 /// local state, fetch keys where the peer wins, and ship keys where we
@@ -641,23 +1421,34 @@ const RECONCILE_FETCH_CHUNK: usize = 500;
 async fn reconcile(
     fragment: FragmentId,
     router: &FragmentRouter,
-    peer_tx: &mpsc::Sender<Vec<u8>>,
-    session_id: u64,
+    connection: &ActiveConnection,
+    round_id: u64,
     summaries: Vec<KeySummary>,
-) -> Option<VecDeque<Vec<String>>> {
-    let actor = router.route_for_fragment(fragment)?;
-    let local: HashMap<String, VersionedValue> =
-        match actor.call(|reply| KvMessage::GetAll { reply }, None).await {
-            Ok(CallResult::Success(map)) => map,
-            _ => return None,
-        };
+) -> Result<(Option<(VecDeque<Vec<String>>, u64, HashSet<String>)>, u64), ReconcileError> {
+    let actor = router
+        .route_for_fragment(fragment)
+        .ok_or(ReconcileError::Local)?;
+    let (local, snapshot_revision): (HashMap<String, VersionedValue>, u64) = match actor
+        .call(|reply| KvMessage::GetSnapshot { reply }, None)
+        .await
+    {
+        Ok(CallResult::Success(snapshot)) => snapshot,
+        _ => return Err(ReconcileError::Local),
+    };
 
     let mut fetch_keys = Vec::new();
     let mut send_ops: Vec<crate::actor::ReplicatedOp> = Vec::new();
     let mut seen_remote = HashSet::new();
 
     for s in &summaries {
-        seen_remote.insert(s.key.clone());
+        if !router.key_belongs_to(fragment, &s.key) || !seen_remote.insert(s.key.clone()) {
+            tracing::warn!(
+                fragment = fragment.0,
+                key = %s.key,
+                "rejecting reconcile summary with wrong-fragment or duplicate key"
+            );
+            return Err(ReconcileError::Local);
+        }
         let remote_v = VersionedValue {
             value: Vec::new(),
             timestamp_ms: s.timestamp_ms,
@@ -696,25 +1487,10 @@ async fn reconcile(
         }
     }
 
-    // Ship our winning ops as (non-ack-tracked) reconciliation batches.
-    // The receiver applies them via LWW under the current session.
-    for chunk in send_ops.chunks(100) {
-        let proto_ops = chunk.iter().map(proto_op).collect();
-        send_envelope(
-            peer_tx,
-            EnvelopeMsg::ReplicateBatch(ReplicateBatch {
-                session_id,
-                batch_seq: u64::MAX, // reconciliation batch; not ack-tracked
-                fragment: fragment.0,
-                ops: proto_ops,
-                required_ack_level: ReplicationAckLevel::Applied as i32,
-            }),
-        )
-        .await;
-    }
+    send_repair_ops(fragment, connection, &send_ops).await?;
 
     if fetch_keys.is_empty() {
-        return None;
+        return Ok((None, snapshot_revision));
     }
     // Chunk the fetch so a large fragment doesn't materialize as one
     // giant ReconcileData message: send the first chunk now, queue the
@@ -724,39 +1500,109 @@ async fn reconcile(
         .map(|c| c.to_vec())
         .collect();
     let first = chunks.pop_front().unwrap_or_default();
-    send_envelope(
-        peer_tx,
+    let expected_keys = first.iter().cloned().collect();
+    if !send_envelope(
+        &connection.peer_tx,
         EnvelopeMsg::ReconcileFetch(ReconcileFetch {
             fragment: fragment.0,
             keys: first,
+            session_id: connection.session_id,
+            round_id,
+            chunk_seq: 0,
         }),
     )
-    .await;
-    Some(chunks)
+    .await
+    {
+        return Err(ReconcileError::Transport);
+    }
+    Ok((Some((chunks, 0, expected_keys)), snapshot_revision))
 }
 
-/// Leave `BufferReset` after reconciliation: clear the reset flag and
-/// go `Connected` with a fresh session.
-async fn finish_reconcile(
+async fn apply_reconcile_entries(
     fragment: FragmentId,
-    peer_id: &str,
-    reset_senders: &Arc<Mutex<HashSet<(FragmentId, String)>>>,
-    state: &mut SenderState,
-    session_id: u64,
-    peer_tx: Option<mpsc::Sender<Vec<u8>>>,
-) {
-    reset_senders
-        .lock()
-        .await
-        .remove(&(fragment, peer_id.to_string()));
-    if peer_tx.is_some() {
-        *state = SenderState::Connected {
-            session_id,
-            next_batch_seq: 0,
-            in_flight: VecDeque::new(),
+    router: &FragmentRouter,
+    entries: Vec<SyncEntry>,
+    expected_keys: &HashSet<String>,
+) -> Result<(), ReconcileError> {
+    if !reconcile_entries_are_exact(fragment, router, &entries, expected_keys) {
+        tracing::warn!(
+            fragment = fragment.0,
+            expected = expected_keys.len(),
+            received = entries.len(),
+            "rejecting incomplete, duplicate, unrequested, or wrong-fragment reconcile data"
+        );
+        return Err(ReconcileError::Local);
+    }
+    let actor = router
+        .route_for_fragment(fragment)
+        .ok_or(ReconcileError::Local)?;
+    for entry in entries {
+        let mut value = VersionedValue::new(entry.value, entry.timestamp_ms, entry.node_id);
+        value.expires_at_ms = (entry.expires_at_ms != 0).then_some(entry.expires_at_ms);
+        value.is_tombstone = entry.is_tombstone;
+        let op = crate::actor::ReplicatedOp {
+            key: entry.key,
+            value,
+            seq: 0,
+            boot_id: 0,
         };
-    } else {
-        *state = SenderState::Disconnected;
+        match actor
+            .call(
+                |reply| KvMessage::ApplyOp {
+                    op,
+                    priority: OpPriority::Default,
+                    is_replication: true,
+                    reply: Some(reply),
+                },
+                None,
+            )
+            .await
+        {
+            Ok(CallResult::Success(Ok(_))) => {}
+            Ok(CallResult::Success(Err(error))) => {
+                tracing::warn!(fragment = fragment.0, %error, "reconcile apply failed");
+                return Err(ReconcileError::Local);
+            }
+            Ok(CallResult::Timeout | CallResult::SenderError) | Err(_) => {
+                return Err(ReconcileError::Local);
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn fragment_revision(
+    fragment: FragmentId,
+    router: &FragmentRouter,
+) -> Result<u64, ReconcileError> {
+    let actor = router
+        .route_for_fragment(fragment)
+        .ok_or(ReconcileError::Local)?;
+    match actor
+        .call(|reply| KvMessage::GetRevision { reply }, None)
+        .await
+    {
+        Ok(CallResult::Success(revision)) => Ok(revision),
+        Ok(CallResult::Timeout | CallResult::SenderError) | Err(_) => Err(ReconcileError::Local),
+    }
+}
+
+async fn flush_reconcile(
+    fragment: FragmentId,
+    router: &FragmentRouter,
+) -> Result<(), ReconcileError> {
+    let actor = router
+        .route_for_fragment(fragment)
+        .ok_or(ReconcileError::Local)?;
+    match actor.call(|reply| KvMessage::Flush { reply }, None).await {
+        Ok(CallResult::Success(Ok(
+            ApplyDurability::StoreCommitted | ApplyDurability::MemoryApplied,
+        ))) => Ok(()),
+        Ok(CallResult::Success(Err(error))) => {
+            tracing::warn!(fragment = fragment.0, %error, "reconcile flush failed");
+            Err(ReconcileError::Local)
+        }
+        Ok(CallResult::Timeout | CallResult::SenderError) | Err(_) => Err(ReconcileError::Local),
     }
 }
 
