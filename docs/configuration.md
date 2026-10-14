@@ -31,10 +31,30 @@ of the defaults.
 `clock_skew_ms` exists but is `#[doc(hidden)]` — it is a test-only HLC skew
 simulator, not a tuning knob.
 
-`fragment_count`, `replication.batch_size`, and
-`replication.max_in_flight` must be nonzero. Replication and dynamic-placement
-intervals/timeouts must also be nonzero; `Node::start` rejects invalid values
-instead of allowing zero-sized batches or timer panics.
+`fragment_count`, `replication.batch_size`, `replication.max_in_flight`, and
+`replication.buffer_capacity` must be nonzero. Replication and
+dynamic-placement intervals/timeouts must also be nonzero; replication timer
+values must fit Tokio's clock. `Node::start` rejects invalid values instead of
+allowing zero-sized batches or timer panics.
+
+## `NodeRuntimeOptions`
+
+Transport queue and liveness policy is kept outside `NodeConfig` so new policy
+does not break exhaustive `NodeConfig` literals. `Node::start` uses
+`NodeRuntimeOptions::default()`; pass a builder-configured value to
+`Node::start_with_options` to override it.
+
+| Builder / getter | Default | Guidance |
+|---|---|---|
+| `with_peer_queue_frame_capacity` / `peer_queue_frame_capacity` | `256` frames | Capacity of the single outbound queue per peer connection. This is a frame-count bound, not a byte bound, and all traffic classes share it. |
+| `with_queue_admission_timeout` / `queue_admission_timeout` | `5 s` | Maximum wait to reserve one peer-queue slot. Expiry cancels that connection; an outbound peer is then redialed. |
+| `with_forwarded_attempt_timeout` / `forwarded_attempt_timeout` | `5 s` | Total budget for one forwarded owner attempt, including queue admission and response. Batch holder attempts and remote fragment groups remain sequential. |
+| `with_socket_write_timeout` / `socket_write_timeout` | `30 s` | Maximum time to write one complete length-prefixed frame. Expiry cancels the connection and allows redial. |
+| `with_replication_ack_timeout` / `replication_ack_timeout` | `30 s` | Maximum wait after queue admission for an acceptable ordinary streaming ACK. Expiry rotates the sender session and replays the exact unacknowledged LWW operations. Reconciliation barriers use `SenderConfig::reconcile_timeout` instead. |
+
+Capacity and every runtime timeout must be nonzero; startup rejects invalid
+values. Operation priority selects the local or remote actor pool, but it does
+not schedule the shared peer queue or socket writer.
 
 ## `SenderConfig` (replication)
 
@@ -42,11 +62,37 @@ instead of allowing zero-sized batches or timer panics.
 |---|---|---|
 | `batch_size` | `100` | Ops per replication batch. |
 | `batch_interval` | `100 ms` | Max batching delay — bounds steady-state replication lag. |
-| `max_in_flight` | `4` | Batches awaiting ACK before sending pauses. There is **no ACK timeout**; a NACK or session change retries, but a silent open peer can stall at this bound. |
-| `buffer_capacity` | `10_000` | Bounded per-sender buffer. Overflow enters `BufferReset`, rotates the live session, and immediately starts correlated reconciliation; reconnect is not required. |
+| `max_in_flight` | `4` | Ordinary batches awaiting ACK before sending pauses. Each gets the `NodeRuntimeOptions::replication_ack_timeout` deadline after queue admission. |
+| `buffer_capacity` | `10_000` | Bound on the sender-owned deque after commands are received. Overflow enters `BufferReset`, rotates the live session, and immediately starts correlated reconciliation; reconnect is not required. The command mailbox feeding this deque is still unbounded. |
 | `consistency_interval` | `300 s` | Periodic anti-entropy reconcile cadence per sender. |
-| `reconcile_timeout` | `30 s` | Max wait after enqueueing each reconcile summary, data, or barrier phase. Timeout rotates the session and retries. Outbound peer-queue admission is not yet separately timed. |
+| `reconcile_timeout` | `30 s` | Max wait after enqueueing each reconcile summary, data, or barrier phase. Timeout rotates the session and retries. This also governs reconciliation barrier ACKs; ordinary streaming ACKs use the runtime ACK timeout. |
 | `required_ack_durability` | `MemoryApplied` | Minimum receiver fence allowed to retire a batch. Set `StoreCommitted` only when every target has a configured store. Store acceptance does not imply fsync unless the backend guarantees it. |
+
+The batch size, in-flight limit, buffer capacity, intervals, and timeout must
+all be nonzero. Timer values must also be representable by Tokio's clock.
+`Node::start*` rejects an invalid replication configuration before binding;
+standalone callers get `SenderOptionsError` from
+`spawn_sender_with_options` (the legacy `spawn_sender` entry point panics on
+an invalid configuration).
+
+An ACK below `required_ack_durability` is observable but does not retire its
+batch or extend the batch's original ordinary ACK deadline. At expiry the
+sender rotates its session and restores every in-flight batch to the front in
+original operation order. Replays retain the original LWW versions, so a
+duplicate apply is idempotent; delayed ACKs from the previous session are
+ignored.
+
+## `SenderRuntimeOptions` (standalone senders)
+
+Direct users of `actordb::replication::spawn_sender` get a 30-second ordinary
+ACK timeout and 5-second peer-queue admission timeout. Use
+`spawn_sender_with_options` with a `SenderRuntimeOptions::default()` value
+modified by `with_ack_timeout` and `with_queue_admission_timeout` to override
+them; the function returns `SenderOptionsError` for invalid sender limits or
+timeouts, including values that Tokio's clock cannot represent.
+`SenderConfig::reconcile_timeout` still controls summary, data, and barrier
+phases. Node users normally configure the corresponding values through
+`NodeRuntimeOptions` instead.
 
 ## `PoolConfig`
 
@@ -63,11 +109,8 @@ These are `const`s, documented here so they don't surprise you:
 | Constant | Value | Meaning |
 |---|---|---|
 | `MAX_FORWARD_HOPS` | `4` | Bounds re-forward chains during placement disagreement. |
-| Remote-mutation deadline | `5 s` | Covers queueing plus response. Batch puts fail over; single puts currently select one owner. |
-| Remote-read response timeout | `5 s` | Starts after queueing. Batch gets fail over; single gets currently select one owner. |
 | `NACK_RETRY_DELAY` | `1 s` | Minimum delay before retrying a receiver-rejected replication batch. |
 | `BOOTSTRAP_TIMEOUT` | `30 s` | Max wait bootstrapping a gained fragment before going Serving anyway. |
 | `RECONCILE_FETCH_CHUNK` | `500` | Keys per `ReconcileFetch`/`ReconcileData` message. |
 | `MAX_FRAME_BYTES` | `16 MiB` | Max protobuf envelope frame. |
-| `PEER_CHANNEL_DEPTH` | `256` | Per-peer channel depth. |
 | `RECONNECT_BASE` | `100 ms` | Reconnect backoff base, doubling. |

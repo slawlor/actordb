@@ -1,8 +1,9 @@
 # Public API guide
 
-The entire public surface lives in `actordb::node` (re-exported at the crate
-root's `node` module). Start from `NodeConfig::default()` and set the fields
-you need — see [Configuration](configuration.md) for every knob.
+The main application surface lives in `actordb::node`. Start from
+`NodeConfig::default()` for database behavior and `NodeRuntimeOptions::default()`
+for transport/replication liveness policy — see
+[Configuration](configuration.md) for every knob.
 
 ## Starting a node
 
@@ -23,7 +24,36 @@ async fn main() -> Result<(), actordb::node::NodeError> {
 ```
 
 - `Node::start(node_id, listen_addr, config)` binds `listen_addr` (port `0`
-  picks an ephemeral port; the bound address is returned by `node.addr()`).
+  picks an ephemeral port; the bound address is returned by `node.addr()`) and
+  uses `NodeRuntimeOptions::default()`.
+- `Node::start_with_options(node_id, listen_addr, config, runtime_options)`
+  exposes the same startup path with explicit runtime liveness limits. For
+  example:
+
+  ```rust
+  use actordb::node::NodeRuntimeOptions;
+  use std::time::Duration;
+
+  let runtime = NodeRuntimeOptions::default()
+      .with_peer_queue_frame_capacity(512)
+      .with_queue_admission_timeout(Duration::from_secs(2))
+      .with_forwarded_attempt_timeout(Duration::from_secs(8))
+      .with_socket_write_timeout(Duration::from_secs(20))
+      .with_replication_ack_timeout(Duration::from_secs(20));
+  let node = Node::start_with_options(
+      "node-a".to_string(),
+      "127.0.0.1:7447".parse()?,
+      NodeConfig::default(),
+      runtime,
+  )
+  .await?;
+  ```
+
+  Defaults are 256 queued frames per peer, 5 seconds for queue admission,
+  5 seconds total per forwarded owner attempt (enqueue plus response), 30
+  seconds per socket frame write, and 30 seconds for an acceptable ordinary
+  replication ACK. All capacities/timeouts must be nonzero. The queue is
+  frame-bounded, not byte-bounded.
 - `node.connect(peer_addr)` dials one peer. Dialing is best-effort and
   retried by the redial supervisor; dropping a connection triggers redial.
 - `node.id()`, `node.addr()`, `node.peer_count()` are the basic inspectors.
@@ -68,7 +98,9 @@ node.put_multi_with_priority(batch, OpPriority::Background).await;
 shed operation surfaces as `NodeError::Backpressure` — never as a silent
 success or `Ok(None)`. Local and forwarded puts wait for the serving worker's
 exact apply outcome; once it returns `Ok`, reads at that owner observe that
-version or a newer winner. See
+version or a newer winner. The priority travels in the request and selects the
+remote actor pool, but it does not schedule the shared per-peer socket queue.
+See
 [Consistency](consistency.md) and [Traffic classes & backpressure](backpressure.md).
 
 ## Multi-key batching
@@ -86,14 +118,38 @@ Semantics (full detail in [Multi-key batching](batching.md)):
 - Plain `put_multi`/`get_multi` run at **`OpPriority::Background`**; the
   `_with_priority` variants take an explicit priority.
 - Keys are grouped by destination fragment; remote groups go out as **one
-  `BatchPut` / `BatchGet` message per fragment** (not per key).
-- Remote puts have a **5-second per-attempt deadline** including outbound
-  queueing. Remote gets use a 5-second reply timeout after enqueueing. Both
-  fail over on a closed connection or missing reply; put replies additionally
+  `BatchPut` / `BatchGet` message per fragment and owner attempt** (not per
+  key).
+- Remote puts and gets have one **configured per-attempt deadline** (5 seconds
+  by default) covering outbound queue admission and the response. Both fail over on a closed
+  connection or missing reply; put replies additionally
   require one ordered exact outcome per key, and an all-`Unavailable` put
   response tries the next holder.
+- Remote fragment groups are awaited sequentially, as are holder attempts
+  within a group; these APIs do not issue all fan-out attempts concurrently.
 - Per-key errors use `NodeError`: `Actor` = misconfiguration (no usable
   replica), `Network` = no replica reachable, `Backpressure` = shed.
+
+## Advanced replication embedding
+
+`actordb::replication::spawn_sender` starts one per-fragment/per-peer sender
+with `SenderRuntimeOptions::default()`. Embedders that construct senders
+directly can call `spawn_sender_with_options(fragment, peer_id, config, deps,
+options)` instead; it returns `SenderOptionsError` for zero or unrepresentable
+sender limits and timeouts. Its public options are:
+
+- `with_ack_timeout` (default 30 seconds): deadline for an acceptable ACK to an
+  ordinary streaming batch after queue admission;
+- `with_queue_admission_timeout` (default 5 seconds): maximum wait to reserve a
+  frame slot in the peer queue.
+
+An ordinary ACK timeout rotates the sender session, restores all unacknowledged
+exact stamped operations to the front of the buffer in original order, and
+replays them. LWW application makes duplicates idempotent; delayed ACKs from
+the old session are rejected. A well-formed ACK below
+`required_ack_durability` does not retire the batch or extend its original
+deadline. Reconciliation barriers use `SenderConfig::reconcile_timeout`, not
+`SenderRuntimeOptions::ack_timeout`.
 
 ## Health and observability
 

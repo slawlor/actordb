@@ -12,8 +12,8 @@ and results come back in input order.
    path — including the exact per-op apply outcome — concurrently via
    `join_all`, then are stamped back into their input positions.
 3. Remote keys are grouped by `FragmentId` and each group goes out as **one**
-   `BatchPut` / `BatchGet` message to the fragment's owner — one message per
-   fragment, not per key.
+   `BatchPut` / `BatchGet` message per owner attempt — one message for all of
+   that fragment's keys, not one message per key.
 4. Put responses must match the request's cardinality, key order, and explicit
    request indices before results are mapped into the input-aligned `Vec`:
    `Vec<Result<(), NodeError>>` for puts,
@@ -27,6 +27,14 @@ and results come back in input order.
   is carried on the wire (`BatchPut.priority` applies to every put in the
   batch; `BatchGet.priority` likewise). The remote owner executes at the
   caller's priority — "fan-out preserves traffic isolation end-to-end."
+- Priority chooses the destination actor pool. It does **not** prioritize the
+  shared per-peer outbound frame queue; control, replication, high-priority,
+  and background frames contend for the same queue and socket writer.
+
+Remote fan-out is currently sequential: the caller awaits one fragment group
+at a time, and each group's replica holders are attempted one at a time in
+placement order. A slow attempt therefore delays later holders and later
+remote fragments.
 
 ## Remote puts: exact outcomes and bounded failover
 
@@ -38,11 +46,18 @@ means the serving worker returned `Applied` or the idempotent
 `AlreadyPresent`; backpressure, storage failure, expiry, and supersession are
 returned per key.
 
-Each attempt has a **5-second deadline covering both outbound queueing and the
-reply**. A closed connection, timeout, dropped response, or invalid
-cardinality/order retries the same stamped versions at the next holder. LWW
-application makes that retry idempotent. Cancellation removes the pending
+Each attempt has one **configured total deadline (5 seconds by default)
+covering both outbound queue admission and the reply**. A closed connection,
+timeout, dropped response, or invalid cardinality/order retries the same
+stamped versions at the next holder.
+LWW application makes that retry idempotent. Cancellation removes the pending
 request, and late or wrong-peer responses are ignored.
+
+The peer queue separately defaults to a 5-second admission timeout. If queue
+admission itself expires, the node cancels that connection so its dialer can
+reconnect; if the total attempt expires while waiting for a response, the
+pending request is removed and failover continues without necessarily dropping
+the connection.
 
 Transport, timeout, malformed-response, and typed all-`Unavailable` failures
 try the next holder; if none succeeds, the key gets `NodeError::Network(..)`.
@@ -51,15 +66,15 @@ outcomes. A fragment with no usable replica is a configuration
 `NodeError::Actor(..)`.
 
 Single-key `put` also waits for the remote exact outcome, with the same
-5-second send-and-response deadline, but currently selects only the first
-owner rather than failing over.
+configured send-and-response deadline (5 seconds by default), but currently
+selects only the first owner rather than failing over.
 
 ## Remote gets: timeout + failover
 
-Remote gets carry a `req_id` and are awaited with a **5-second per-attempt
-response timeout after enqueueing**. On timeout or a dropped reply channel,
-the pending request is removed and the node fails over to the next replica
-holder. A key fails only when no replica holder answers:
+Remote gets carry a `req_id` and are awaited with the same **configured total
+per-attempt timeout for enqueue plus response** (5 seconds by default). On
+timeout or a dropped reply channel, the pending request is removed and the node
+fails over to the next replica holder. A key fails only when no replica holder answers:
 `NodeError::Network("no replica answered batch get for fragment {frag} (tried ...)")`.
 "A dead owner fails only its keys, and only when no replica holder answers."
 
