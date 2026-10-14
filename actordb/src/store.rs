@@ -144,7 +144,7 @@ impl RocksDbStore {
     }
 
     fn decode(bytes: &[u8]) -> Result<VersionedValue, String> {
-        if bytes.len() < 20 {
+        if bytes.len() < 21 {
             return Err(format!("value too short: {} bytes", bytes.len()));
         }
         let timestamp_ms = u64::from_be_bytes(bytes[0..8].try_into().unwrap());
@@ -154,8 +154,9 @@ impl RocksDbStore {
         } else {
             Some(expires_raw)
         };
-        let id_len = u32::from_be_bytes(bytes[16..20].try_into().unwrap()) as usize;
-        if bytes.len() < 20 + id_len {
+        let is_tombstone = bytes[16] != 0;
+        let id_len = u32::from_be_bytes(bytes[17..21].try_into().unwrap()) as usize;
+        if bytes.len() < 21 + id_len {
             return Err(format!(
                 "node_id overruns value: id_len={id_len} total={}",
                 bytes.len()
