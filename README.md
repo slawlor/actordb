@@ -58,6 +58,33 @@ converged local copy):
 cargo run --example three_node_demo
 ```
 
+## Documentation
+
+Comprehensive guides live in [`docs/`](docs/):
+
+- [Architecture](docs/architecture.md) — what actordb is, crate layout, the
+  fragment/supervisor/worker-pool hierarchy
+- [Public API guide](docs/api.md) — `Node`, `NodeConfig`, puts/gets/deletes,
+  `put_multi`/`get_multi`, TTLs, priorities, health APIs, with examples
+- [Persistence](docs/persistence.md) — RocksDB backend, on-disk format,
+  `PrefixedStore`, flush batching, crash semantics
+- [Routing & placement](docs/routing-placement.md) — key→fragment→owner,
+  `PlacementController`, migration protocol, `placement_report()`
+- [Replication](docs/replication.md) — sender/receiver state machine, sessions,
+  acks, periodic reconciliation, the Hello/full-state handshake
+- [Tombstones & deletes](docs/tombstones.md) — delete lifecycle, conflict
+  rules, GC limits (memory-only GC is documented honestly)
+- [Consistency model](docs/consistency.md) — LWW via HLC, read-your-write
+  within a priority, partitions
+- [Multi-key batching](docs/batching.md) — fan-out, failover, partial failures
+- [Traffic classes & backpressure](docs/backpressure.md) — `OpPriority`,
+  pool config, shed behavior and observability
+- [Configuration reference](docs/configuration.md) — every `NodeConfig`
+  field with defaults and guidance
+- [Operations](docs/operations.md) — crash/restart, rolling restart,
+  partitions, overload, what to monitor
+- [Test strategy](docs/testing.md) — unit vs integration vs Docker scenarios
+
 ## Docker integration tests
 
 Modeled on
@@ -309,8 +336,9 @@ as issues in the [issue tracker](https://github.com/slawlor/actordb/issues):
   steady-state replication is incremental (batches + reconciliation).
   With dynamic placement enabled the handshake skips the full-state
   sync and the reconciler owns anti-entropy (delta-only).
-- **Tombstone GC is time-based** — a node partitioned longer than
-  `tombstone_gc_age` can resurrect deleted keys on rejoin.
+- **Tombstone GC is time-based and memory-only** — a node partitioned longer than
+  `tombstone_gc_age` can resurrect deleted keys on rejoin, and GC'd tombstones
+  are re-loaded from RocksDB on the next boot (no durable delete path exists).
 
 ## Contributors
 
