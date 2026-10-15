@@ -195,6 +195,64 @@ impl KvStore for ToggleFailStore {
     }
 }
 
+struct SelectiveFailStore {
+    failing_fragment: u32,
+    failing: AtomicBool,
+    attempts: [AtomicUsize; 2],
+    entries: StdMutex<HashMap<Vec<u8>, VersionedValue>>,
+}
+
+impl SelectiveFailStore {
+    fn new(failing_fragment: u32) -> Self {
+        Self {
+            failing_fragment,
+            failing: AtomicBool::new(true),
+            attempts: [AtomicUsize::new(0), AtomicUsize::new(0)],
+            entries: StdMutex::new(HashMap::new()),
+        }
+    }
+
+    fn attempts_for(&self, fragment: u32) -> usize {
+        self.attempts[fragment as usize].load(Ordering::SeqCst)
+    }
+}
+
+impl KvStore for SelectiveFailStore {
+    fn load(&self) -> Result<Vec<(Vec<u8>, VersionedValue)>, StoreError> {
+        Ok(self
+            .entries
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect())
+    }
+
+    fn write_batch(&self, writes: &[(Vec<u8>, VersionedValue)]) -> Result<(), StoreError> {
+        let fragment = writes
+            .first()
+            .and_then(|(key, _)| key.get(..4))
+            .and_then(|prefix| prefix.try_into().ok())
+            .map(u32::from_be_bytes)
+            .expect("prefixed store supplied an empty or malformed batch");
+        assert!(
+            writes
+                .iter()
+                .all(|(key, _)| key.starts_with(&fragment.to_be_bytes())),
+            "a prefixed-store batch crossed fragment boundaries"
+        );
+        self.attempts[fragment as usize].fetch_add(1, Ordering::SeqCst);
+        if fragment == self.failing_fragment && self.failing.load(Ordering::SeqCst) {
+            return Err(StoreError("injected fragment-local failure".to_string()));
+        }
+        let mut entries = self.entries.lock().unwrap();
+        for (key, value) in writes {
+            entries.insert(key.clone(), value.clone());
+        }
+        Ok(())
+    }
+}
+
 #[derive(Default)]
 struct GatedStore {
     entered: AtomicBool,
@@ -1983,6 +2041,79 @@ async fn shutdown_flush_failure_is_retryable_across_all_fragments() {
     restarted.shutdown().await.unwrap();
 }
 
+#[tokio::test]
+async fn shutdown_retry_skips_fragments_that_already_reached_the_durability_fence() {
+    use actordb::shard::{fragment_of, FragmentId};
+
+    let store = Arc::new(SelectiveFailStore::new(0));
+    let config = || NodeConfig {
+        fragment_count: 2,
+        store: Some(store.clone()),
+        flush_batch_size: usize::MAX,
+        flush_interval: Duration::from_secs(3600),
+        snapshot_interval: Duration::from_secs(3600),
+        clean_interval: Duration::from_secs(3600),
+        ..NodeConfig::default()
+    };
+    let node = Node::start(
+        "partial-retry-shutdown".to_string(),
+        "127.0.0.1:0".parse().unwrap(),
+        config(),
+    )
+    .await
+    .unwrap();
+
+    let mut keys = HashMap::new();
+    for index in 0..10_000 {
+        let key = format!("partial-shutdown-fragment-{index}");
+        let fragment = fragment_of(&key, 2);
+        keys.entry(fragment).or_insert(key);
+        if keys.len() == 2 {
+            break;
+        }
+    }
+    for fragment in [FragmentId(0), FragmentId(1)] {
+        node.put(
+            keys[&fragment].clone(),
+            format!("value-{}", fragment.0).into_bytes(),
+        )
+        .await
+        .unwrap();
+    }
+
+    assert!(matches!(node.shutdown().await, Err(NodeError::Storage(_))));
+    let failed_attempts = store.attempts_for(0);
+    let prepared_attempts = store.attempts_for(1);
+    assert!(failed_attempts > 0);
+    assert!(prepared_attempts > 0);
+
+    store.failing.store(false, Ordering::SeqCst);
+    node.shutdown().await.unwrap();
+    assert!(store.attempts_for(0) > failed_attempts);
+    assert_eq!(
+        store.attempts_for(1),
+        prepared_attempts,
+        "retry flushed a fragment that had already completed its durability fence"
+    );
+
+    let restarted = Node::start(
+        "partial-retry-shutdown".to_string(),
+        "127.0.0.1:0".parse().unwrap(),
+        config(),
+    )
+    .await
+    .unwrap();
+    for fragment in [FragmentId(0), FragmentId(1)] {
+        let value = restarted
+            .get(keys[&fragment].clone())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(value.value, format!("value-{}", fragment.0).into_bytes());
+    }
+    restarted.shutdown().await.unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cancelled_shutdown_waiter_resumes_retained_final_flush() {
     let store = Arc::new(GatedStore::default());
@@ -2038,6 +2169,8 @@ async fn cancelled_shutdown_waiter_resumes_retained_final_flush() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn shutdown_rejects_new_calls_and_waits_for_an_admitted_put() {
+    use actordb::actor::OpPriority;
+
     let store = Arc::new(GatedStore::default());
     let node = Arc::new(
         Node::start(
@@ -2083,9 +2216,85 @@ async fn shutdown_rejects_new_calls_and_waits_for_an_admitted_put() {
     .expect("shutdown did not close public operation admission");
     assert!(!shutdown.is_finished(), "shutdown skipped an admitted put");
 
+    assert!(matches!(
+        node.connect("127.0.0.1:9".parse().unwrap()).await,
+        Err(NodeError::ShuttingDown)
+    ));
+    assert!(matches!(
+        node.put("rejected-put".to_string(), b"value".to_vec())
+            .await,
+        Err(NodeError::ShuttingDown)
+    ));
+    assert!(matches!(
+        node.put_with_priority(
+            "rejected-priority-put".to_string(),
+            b"value".to_vec(),
+            OpPriority::High,
+        )
+        .await,
+        Err(NodeError::ShuttingDown)
+    ));
+    assert!(matches!(
+        node.put_with_ttl(
+            "rejected-ttl-put".to_string(),
+            b"value".to_vec(),
+            Some(Duration::from_secs(1)),
+        )
+        .await,
+        Err(NodeError::ShuttingDown)
+    ));
+    assert!(matches!(
+        node.delete("rejected-delete".to_string()).await,
+        Err(NodeError::ShuttingDown)
+    ));
+    assert!(matches!(
+        node.get("rejected-get".to_string()).await,
+        Err(NodeError::ShuttingDown)
+    ));
+    assert!(matches!(
+        node.get_with_priority("rejected-priority-get".to_string(), OpPriority::High)
+            .await,
+        Err(NodeError::ShuttingDown)
+    ));
+    assert!(matches!(node.get_all().await, Err(NodeError::ShuttingDown)));
+
+    let put_results = node
+        .put_multi(vec![("rejected-batch-put".to_string(), b"value".to_vec())])
+        .await;
+    assert!(matches!(
+        put_results.as_slice(),
+        [Err(NodeError::ShuttingDown)]
+    ));
+    let priority_put_results = node
+        .put_multi_with_priority(
+            vec![("rejected-priority-batch-put".to_string(), b"value".to_vec())],
+            OpPriority::High,
+        )
+        .await;
+    assert!(matches!(
+        priority_put_results.as_slice(),
+        [Err(NodeError::ShuttingDown)]
+    ));
+    let get_results = node.get_multi(vec!["rejected-batch-get".to_string()]).await;
+    assert!(matches!(
+        get_results.as_slice(),
+        [Err(NodeError::ShuttingDown)]
+    ));
+    let priority_get_results = node
+        .get_multi_with_priority(
+            vec!["rejected-priority-batch-get".to_string()],
+            OpPriority::High,
+        )
+        .await;
+    assert!(matches!(
+        priority_get_results.as_slice(),
+        [Err(NodeError::ShuttingDown)]
+    ));
+
     store.release();
     put.await.unwrap().unwrap();
     shutdown.await.unwrap().unwrap();
+    node.shutdown().await.unwrap();
 }
 
 #[tokio::test]

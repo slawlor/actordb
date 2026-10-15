@@ -543,6 +543,13 @@ impl OperationGate {
         if self.phase.load(Ordering::SeqCst) != NODE_RUNNING {
             return Err(NodeError::ShuttingDown);
         }
+        self.finish_enter_after_running_check()
+    }
+
+    /// Complete admission after observing `NODE_RUNNING`. Shutdown may race
+    /// that first observation, so publish the operation and then recheck the
+    /// phase before allowing it to proceed.
+    fn finish_enter_after_running_check(self: &Arc<Self>) -> Result<OperationPermit, NodeError> {
         self.active.fetch_add(1, Ordering::SeqCst);
         if self.phase.load(Ordering::SeqCst) == NODE_RUNNING {
             return Ok(OperationPermit { gate: self.clone() });
@@ -7703,6 +7710,25 @@ mod tests {
         fn write_batch(&self, _writes: &[(Vec<u8>, VersionedValue)]) -> Result<(), StoreError> {
             Ok(())
         }
+    }
+
+    #[test]
+    fn operation_admission_loses_a_race_with_shutdown() {
+        let gate = OperationGate::new();
+
+        // Model shutdown winning immediately after try_enter's initial
+        // NODE_RUNNING observation but before it publishes the operation.
+        gate.begin_shutdown();
+        assert!(matches!(
+            gate.finish_enter_after_running_check(),
+            Err(NodeError::ShuttingDown)
+        ));
+        assert_eq!(gate.active.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn shutting_down_error_has_an_actionable_message() {
+        assert_eq!(NodeError::ShuttingDown.to_string(), "node is shutting down");
     }
 
     struct BlockingPageActor;

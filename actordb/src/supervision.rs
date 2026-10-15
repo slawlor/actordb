@@ -787,6 +787,18 @@ mod tests {
         }
     }
 
+    #[test]
+    fn fragment_shutdown_errors_identify_the_failed_phase() {
+        assert_eq!(
+            FragmentShutdownError::Actor("worker stopped".to_string()).to_string(),
+            "actor drain failed: worker stopped"
+        );
+        assert_eq!(
+            FragmentShutdownError::Storage("disk full".to_string()).to_string(),
+            "final persistence flush failed: disk full"
+        );
+    }
+
     #[tokio::test]
     async fn failed_supervisor_start_joins_partial_worker_tree() {
         let shared = Arc::new(FragmentState::new(
