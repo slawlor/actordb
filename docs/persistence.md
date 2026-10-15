@@ -123,6 +123,19 @@ the unflushed write-buffer tail. Recovery for that tail comes from correlated
 peer reconciliation after reconnect — which is why production deployments
 want at least two replicas per fragment.
 
+For a planned stop, `shutdown_with_replication_drain` can establish a bounded
+peer durability fence before that local flush. Each reported target completed a
+stable full reconciliation after the local mutation-admission cut and
+acknowledged `SenderConfig::required_ack_durability`. `MemoryApplied` still
+loses data if that receiver crashes. `StoreCommitted` means its `KvStore`
+accepted the flush; for the offered RocksDB implementation this is currently a
+default WAL-backed, non-sync write, not an fsync guarantee. A timeout leaves the
+origin's transport, senders, cache, and retryable persistence state alive;
+retry after peer/store recovery or explicitly fall back to local-only
+`shutdown`. If the peer fence succeeds but the origin's final store flush
+fails, the returned error retains the valid peer report and a retry performs
+only the local phase.
+
 Sender-ingress overflow recovery reads this same authoritative cache and
 revision; it never clears the persistence buffer. Because overflow commands
 represent writes that have already merged locally, a correlated reset can

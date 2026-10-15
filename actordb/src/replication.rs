@@ -36,7 +36,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use prost::Message as ProstMessage;
@@ -399,6 +399,7 @@ pub enum SenderMsg {
 struct NodeSenderSignals {
     overflow_generation: u64,
     reconcile_generation: u64,
+    drain_generation: u64,
     peer_generation: u64,
     peer: Option<NodeSenderPeer>,
 }
@@ -411,8 +412,15 @@ struct NodeSenderPeer {
 
 #[derive(Default)]
 struct NodeSenderIngress {
+    draining: StdMutex<bool>,
     pending_data: AtomicUsize,
+    issued_overflow_generation: AtomicU64,
     settled_overflow_generation: AtomicU64,
+}
+
+struct NodeSenderDrainRuntime {
+    completed: watch::Sender<u64>,
+    ingress: Arc<NodeSenderIngress>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -436,7 +444,23 @@ pub(crate) struct NodeSender {
     ingress: Arc<NodeSenderIngress>,
     abort: AbortHandle,
     stopped: watch::Receiver<bool>,
+    drain_completed: watch::Receiver<u64>,
     stop_lock: Arc<Mutex<()>>,
+}
+
+pub(crate) struct NodeSenderDrain {
+    pub(crate) generation: u64,
+    completed: watch::Receiver<u64>,
+}
+
+impl NodeSenderDrain {
+    pub(crate) fn is_complete(&self) -> bool {
+        *self.completed.borrow() >= self.generation
+    }
+
+    pub(crate) fn is_closed(&self) -> bool {
+        self.completed.has_changed().is_err()
+    }
 }
 
 impl NodeSender {
@@ -523,8 +547,12 @@ impl NodeSender {
     }
 
     fn send_data(&self, op: crate::actor::ReplicatedOp) -> Result<(), NodeSenderSendError> {
+        let draining = self.ingress.draining.lock().unwrap();
+        if *draining {
+            return Err(NodeSenderSendError::Closed);
+        }
         self.ingress.pending_data.fetch_add(1, Ordering::AcqRel);
-        match self.data_tx.try_send(op) {
+        let result = match self.data_tx.try_send(op) {
             Ok(()) => Ok(()),
             Err(mpsc::error::TrySendError::Full(_)) => {
                 self.ingress.pending_data.fetch_sub(1, Ordering::AcqRel);
@@ -535,7 +563,9 @@ impl NodeSender {
                 self.ingress.pending_data.fetch_sub(1, Ordering::AcqRel);
                 Err(NodeSenderSendError::Closed)
             }
-        }
+        };
+        drop(draining);
+        result
     }
 
     fn send_control(&self, control: SenderMsg) -> Result<(), NodeSenderSendError> {
@@ -553,14 +583,49 @@ impl NodeSender {
     pub(crate) fn schedule_reset(&self) {
         self.signals_tx.send_modify(|signals| {
             signals.overflow_generation = next_generation(signals.overflow_generation);
+            // `send_modify` notifies receivers only after this closure. Keep
+            // the placement/drain-visible issued watermark ordered before
+            // that notification so no observer can see the signal while the
+            // ingress still appears idle at the prior generation.
+            self.ingress
+                .issued_overflow_generation
+                .store(signals.overflow_generation, Ordering::Release);
         });
+    }
+
+    /// Request a stable, correlated full-fragment reconciliation followed by
+    /// the configured receiver durability barrier. The generation is private
+    /// to this exact sender task, so replacing a sender cannot satisfy an old
+    /// shutdown fence.
+    pub(crate) fn request_drain(&self) -> Result<NodeSenderDrain, NodeSenderSendError> {
+        // Serialize with data try_send so every accepted item is either ahead
+        // of this fence or rejected after it. The task consumes the admitted
+        // lane before taking its authoritative reconciliation snapshot.
+        let mut draining = self.ingress.draining.lock().unwrap();
+        if self.is_closed() {
+            return Err(NodeSenderSendError::Closed);
+        }
+        *draining = true;
+        let mut generation = 0;
+        self.signals_tx.send_modify(|signals| {
+            signals.drain_generation = next_generation(signals.drain_generation);
+            generation = signals.drain_generation;
+        });
+        debug_assert_ne!(generation, 0);
+        Ok(NodeSenderDrain {
+            generation,
+            completed: self.drain_completed.clone(),
+        })
     }
 
     /// True only after every admitted data item has been reflected in a
     /// published sender state and every coalesced overflow has completed its
     /// correlated reset reconciliation.
     pub(crate) fn ingress_is_idle(&self) -> bool {
-        let issued = self.signals_tx.borrow().overflow_generation;
+        let issued = self
+            .ingress
+            .issued_overflow_generation
+            .load(Ordering::Acquire);
         self.ingress.pending_data.load(Ordering::Acquire) == 0
             && self
                 .ingress
@@ -593,6 +658,7 @@ enum SenderInput {
     Overflow(u64, Arc<NodeSenderIngress>),
     PeerChanged(Option<NodeSenderPeer>),
     ReconcileNow,
+    Drain(u64),
     Closed,
 }
 
@@ -604,12 +670,23 @@ enum SenderInbox {
         signals_rx: watch::Receiver<NodeSenderSignals>,
         delivered_overflow_generation: u64,
         delivered_reconcile_generation: u64,
+        delivered_drain_generation: u64,
         delivered_peer_generation: u64,
         ingress: Arc<NodeSenderIngress>,
     },
 }
 
 impl SenderInbox {
+    fn settle_overflow_through(&mut self, generation: u64) {
+        if let Self::Node {
+            delivered_overflow_generation,
+            ..
+        } = self
+        {
+            *delivered_overflow_generation = generation;
+        }
+    }
+
     async fn recv(&mut self) -> SenderInput {
         match self {
             Self::Legacy(rx) => rx
@@ -623,6 +700,7 @@ impl SenderInbox {
                 signals_rx,
                 delivered_overflow_generation,
                 delivered_reconcile_generation,
+                delivered_drain_generation,
                 delivered_peer_generation,
                 ingress,
             } => loop {
@@ -641,6 +719,10 @@ impl SenderInbox {
                 if signals.reconcile_generation != *delivered_reconcile_generation {
                     *delivered_reconcile_generation = signals.reconcile_generation;
                     return SenderInput::ReconcileNow;
+                }
+                if signals.drain_generation != *delivered_drain_generation {
+                    *delivered_drain_generation = signals.drain_generation;
+                    return SenderInput::Drain(signals.drain_generation);
                 }
                 tokio::select! {
                     biased;
@@ -770,6 +852,7 @@ enum DeliveryState {
 enum ReconcilePurpose {
     Routine,
     Reset { epoch: u64 },
+    Drain { generation: u64 },
 }
 
 struct ReconcileSummaryState {
@@ -935,6 +1018,7 @@ pub fn spawn_sender_with_options(
         deps,
         options,
         SenderInbox::Legacy(rx),
+        None,
     ));
     Ok(tx)
 }
@@ -954,18 +1038,33 @@ pub(crate) fn spawn_node_sender(
     let (signals_tx, signals_rx) = watch::channel(NodeSenderSignals::default());
     let ingress = Arc::new(NodeSenderIngress::default());
     let (stopped_tx, stopped) = watch::channel(false);
+    let (drain_completed_tx, drain_completed) = watch::channel(0u64);
+    let task_ingress = ingress.clone();
     let inbox = SenderInbox::Node {
         data_rx,
         control_rx,
         signals_rx,
         delivered_overflow_generation: 0,
         delivered_reconcile_generation: 0,
+        delivered_drain_generation: 0,
         delivered_peer_generation: 0,
         ingress: ingress.clone(),
     };
     let task = tokio::spawn(async move {
         let _exit = NodeSenderTaskExit(stopped_tx);
-        sender_task(fragment, peer_id, config, deps, options, inbox).await;
+        sender_task(
+            fragment,
+            peer_id,
+            config,
+            deps,
+            options,
+            inbox,
+            Some(NodeSenderDrainRuntime {
+                completed: drain_completed_tx,
+                ingress: task_ingress,
+            }),
+        )
+        .await;
     });
     Ok(NodeSender {
         data_tx,
@@ -974,6 +1073,7 @@ pub(crate) fn spawn_node_sender(
         ingress,
         abort: task.abort_handle(),
         stopped,
+        drain_completed,
         stop_lock: Arc::new(Mutex::new(())),
     })
 }
@@ -1146,6 +1246,7 @@ async fn sender_task(
     deps: SenderDeps,
     runtime: SenderRuntimeOptions,
     mut inbox: SenderInbox,
+    node_drain: Option<NodeSenderDrainRuntime>,
 ) {
     let mut delivery = DeliveryState::Streaming;
     let mut connection: Option<ActiveConnection> = None;
@@ -1183,11 +1284,74 @@ async fn sender_task(
     let mut local_reconcile_flush_pending = false;
     let mut publish_data_completion: Option<Arc<NodeSenderIngress>> = None;
     let mut active_ingress_overflow: Option<(Arc<NodeSenderIngress>, u64)> = None;
+    let mut pending_drain_generation: Option<u64> = None;
+    let mut prepared_drain_generation: Option<u64> = None;
 
     loop {
         if connection.is_none() {
             reconcile_credit_rx = None;
             reconcile_ticket = None;
+        }
+        if let (Some(generation), Some(node_drain)) =
+            (pending_drain_generation, node_drain.as_ref())
+        {
+            let ingress = &node_drain.ingress;
+            if prepared_drain_generation != Some(generation)
+                && ingress.pending_data.load(Ordering::Acquire) == 0
+            {
+                // The cache is the authoritative source for Drain. Once every
+                // pre-fence data item has left the ingress lane, a fresh
+                // session makes delayed ACK/NACK/control frames harmless and
+                // the correlated reconciliation subsumes buffered deltas and
+                // every coalesced overflow reset.
+                let issued_overflow = ingress.issued_overflow_generation.load(Ordering::Acquire);
+                inbox.settle_overflow_through(issued_overflow);
+                active_ingress_overflow = None;
+                buffer.clear();
+                active_reconcile = None;
+                reconcile_retry = None;
+                reconcile_ticket = None;
+                retry_not_before = None;
+                pause_new_streaming = false;
+                delivery = DeliveryState::Streaming;
+
+                let restarted = match connection.as_mut() {
+                    Some(conn) => {
+                        conn.in_flight.clear();
+                        conn.session_id = rand_session_id();
+                        conn.next_batch_seq = 0;
+                        send_session_start(fragment, conn).await
+                    }
+                    None => true,
+                };
+                if restarted || disconnect_transport(&mut connection, delivery, &mut buffer) {
+                    session_retry = None;
+                } else {
+                    session_retry = Some(deadline_after(NACK_RETRY_DELAY));
+                }
+                prepared_drain_generation = Some(generation);
+            }
+        }
+        // A shutdown drain is stronger than ordinary queue emptiness: run a
+        // fresh stable full reconciliation after the producer fence so an op
+        // recovered from bounded-ingress overflow or a previously closed
+        // sender is covered by the same correlated durability barrier.
+        if let Some(generation) = pending_drain_generation {
+            if prepared_drain_generation == Some(generation)
+                && matches!(delivery, DeliveryState::Streaming)
+                && active_reconcile.is_none()
+            {
+                let scheduled = matches!(
+                    reconcile_retry,
+                    Some((_, ReconcilePurpose::Drain { generation: current }))
+                        if current == generation
+                );
+                if !scheduled {
+                    reconcile_retry =
+                        Some((Instant::now(), ReconcilePurpose::Drain { generation }));
+                }
+                pause_new_streaming = true;
+            }
         }
         // Publish state for health checks and tests.
         {
@@ -1216,6 +1380,11 @@ async fn sender_task(
         // resulting buffer/reset state above has been published.
         if let Some(ingress) = publish_data_completion.take() {
             ingress.pending_data.fetch_sub(1, Ordering::AcqRel);
+            if pending_drain_generation != prepared_drain_generation
+                && ingress.pending_data.load(Ordering::Acquire) == 0
+            {
+                continue;
+            }
         }
         let sender_wakeup = active_reconcile
             .as_ref()
@@ -1265,6 +1434,13 @@ async fn sender_task(
                         }
                     }),
                     SenderInput::ReconcileNow => Some(SenderMsg::ReconcileNow),
+                    SenderInput::Drain(generation) => {
+                        pending_drain_generation = Some(
+                            pending_drain_generation
+                                .map_or(generation, |current| current.max(generation)),
+                        );
+                        None
+                    }
                     SenderInput::Closed => break,
                 };
                 let data_overflow = msg.as_ref().map_or(false, |msg| {
@@ -1531,7 +1707,7 @@ async fn sender_task(
                             reconcile_retry = None;
                             pause_new_streaming = false;
                             match round.purpose {
-                                ReconcilePurpose::Routine => {
+                                ReconcilePurpose::Routine | ReconcilePurpose::Drain { .. } => {
                                     let snapshot_is_current = match (
                                         round.snapshot_revision,
                                         fragment_revision(fragment, &deps.router).await,
@@ -1541,6 +1717,30 @@ async fn sender_task(
                                     };
                                     if snapshot_is_current {
                                         reconcile_rounds = reconcile_rounds.saturating_add(1);
+                                        if let ReconcilePurpose::Drain { generation } = round.purpose
+                                        {
+                                            // The fresh session and stable
+                                            // barrier supersede every fenced
+                                            // buffered delta. No producer can
+                                            // enter this exact sender after
+                                            // request_drain closed ingress.
+                                            buffer.clear();
+                                            pending_drain_generation = None;
+                                            prepared_drain_generation = None;
+                                            if let Some(node_drain) = node_drain.as_ref() {
+                                                let issued = node_drain
+                                                    .ingress
+                                                    .issued_overflow_generation
+                                                    .load(Ordering::Acquire);
+                                                node_drain
+                                                    .ingress
+                                                    .settled_overflow_generation
+                                                    .store(issued, Ordering::Release);
+                                                node_drain.completed.send_modify(|current| {
+                                                    *current = (*current).max(generation);
+                                                });
+                                            }
+                                        }
                                     } else if let Some(conn) = connection.as_ref() {
                                         // Fetched winners or a concurrent
                                         // local mutation invalidate the
@@ -1551,7 +1751,7 @@ async fn sender_task(
                                         drop(round.connection_permit.take());
                                         match begin_reconcile(
                                             fragment,
-                                            ReconcilePurpose::Routine,
+                                            round.purpose,
                                             conn,
                                             &mut reconcile_ticket,
                                             &mut next_round_id,
@@ -1565,13 +1765,13 @@ async fn sender_task(
                                             Ok(None) => {
                                                 reconcile_retry = Some((
                                                     Instant::now() + NACK_RETRY_DELAY,
-                                                    ReconcilePurpose::Routine,
+                                                    round.purpose,
                                                 ));
                                             }
                                             Err(()) => {
                                                 reconcile_retry = Some((
                                                     Instant::now() + NACK_RETRY_DELAY,
-                                                    ReconcilePurpose::Routine,
+                                                    round.purpose,
                                                 ));
                                                 disconnect_transport(
                                                     &mut connection,
@@ -1583,7 +1783,7 @@ async fn sender_task(
                                     } else {
                                         reconcile_retry = Some((
                                             Instant::now() + NACK_RETRY_DELAY,
-                                            ReconcilePurpose::Routine,
+                                            round.purpose,
                                         ));
                                     }
                                 }
@@ -1799,7 +1999,8 @@ async fn sender_task(
                         }
                     }
                     SenderMsg::ReconcileNow => {
-                        if matches!(delivery, DeliveryState::Streaming)
+                        if pending_drain_generation.is_none()
+                            && matches!(delivery, DeliveryState::Streaming)
                             && active_reconcile.is_none()
                         {
                             if let Some(conn) = connection.as_ref() {
@@ -2547,7 +2748,8 @@ async fn sender_task(
                 }
             }
             _ = consistency_timer.tick() => {
-                if matches!(delivery, DeliveryState::Streaming)
+                if pending_drain_generation.is_none()
+                    && matches!(delivery, DeliveryState::Streaming)
                     && active_reconcile.is_none()
                     && reconcile_retry.is_none()
                 {
@@ -3532,6 +3734,7 @@ mod tests {
         let (signals_tx, signals_rx) = watch::channel(NodeSenderSignals::default());
         let ingress = Arc::new(NodeSenderIngress::default());
         let (stopped_tx, stopped) = watch::channel(false);
+        let (_drain_completed_tx, drain_completed) = watch::channel(0u64);
         let (started_tx, started_rx) = oneshot::channel();
         let (finish_tx, finish_rx) = oneshot::channel();
         let task = tokio::spawn(async move {
@@ -3546,6 +3749,7 @@ mod tests {
             ingress,
             abort: task.abort_handle(),
             stopped,
+            drain_completed,
             stop_lock: Arc::new(Mutex::new(())),
         };
         started_rx.await.unwrap();
@@ -3653,6 +3857,7 @@ mod tests {
             signals_rx,
             delivered_overflow_generation: 0,
             delivered_reconcile_generation: 0,
+            delivered_drain_generation: 0,
             delivered_peer_generation: 0,
             ingress: ingress.clone(),
         };
@@ -3701,6 +3906,7 @@ mod tests {
             signals_rx,
             delivered_overflow_generation: 0,
             delivered_reconcile_generation: 0,
+            delivered_drain_generation: 0,
             delivered_peer_generation: 0,
             ingress: Arc::new(NodeSenderIngress::default()),
         };
@@ -3768,6 +3974,22 @@ mod tests {
         .await
         .expect("overflow signal never reached the sender state machine");
         assert!(!sender.ingress_is_idle());
+        let drain = sender.request_drain().unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if report.lock().await.state != "buffer_reset" {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("drain did not subsume the pending overflow reset");
+        assert!(!drain.is_complete());
+        assert!(
+            !sender.ingress_is_idle(),
+            "drain preparation published overflow settlement before remote proof"
+        );
         sender.stop().await;
     }
 

@@ -11,7 +11,8 @@ use std::time::Duration;
 use actordb::actor::{now_ms, VersionedValue};
 use actordb::network::{BindFuture, ConnectFuture, Network, NetworkError, TcpNetwork};
 use actordb::node::{
-    Node, NodeConfig, NodeError, NodeRuntimeOptions, REQUIRED_WIRE_CAPABILITIES,
+    Node, NodeConfig, NodeError, NodeRuntimeOptions, ReplicationDrainOptions,
+    ReplicationDrainPhase, ReplicationDrainShutdownError, REQUIRED_WIRE_CAPABILITIES,
     WIRE_PROTOCOL_VERSION,
 };
 use actordb::proto::{Envelope, EnvelopeMsg, Hello, HelloAuth};
@@ -447,6 +448,104 @@ async fn complete_empty_reconcile(stream: &mut tokio::net::TcpStream, session_id
     }
 }
 
+async fn recv_session_start(stream: &mut tokio::net::TcpStream) -> actordb::proto::SessionStart {
+    loop {
+        if let Some(EnvelopeMsg::SessionStart(session)) = recv_frame(stream).await.msg {
+            return session;
+        }
+    }
+}
+
+async fn recv_reconcile_request(
+    stream: &mut tokio::net::TcpStream,
+    session_id: u64,
+) -> actordb::proto::ReconcileRequest {
+    loop {
+        if let Some(EnvelopeMsg::ReconcileRequest(request)) = recv_frame(stream).await.msg {
+            if request.session_id == session_id {
+                return request;
+            }
+        }
+    }
+}
+
+async fn send_reconcile_response(
+    stream: &mut tokio::net::TcpStream,
+    request: &actordb::proto::ReconcileRequest,
+    summaries: Vec<actordb::proto::KeySummary>,
+) {
+    send_frame(
+        stream,
+        Envelope {
+            msg: Some(EnvelopeMsg::ReconcileResponse(complete_reconcile_response(
+                request, summaries,
+            ))),
+        },
+    )
+    .await;
+}
+
+async fn ack_replication_batch(
+    stream: &mut tokio::net::TcpStream,
+    batch: &actordb::proto::ReplicateBatch,
+    session_id: u64,
+    level: actordb::proto::ReplicationAckLevel,
+) {
+    send_frame(
+        stream,
+        Envelope {
+            msg: Some(EnvelopeMsg::BatchAck(actordb::proto::BatchAck {
+                session_id,
+                batch_seq: batch.batch_seq,
+                fragment: batch.fragment,
+                level: level as i32,
+            })),
+        },
+    )
+    .await;
+}
+
+async fn raw_replication_drain_source(
+    source_id: &str,
+    peer_id: &str,
+    replication: actordb::replication::SenderConfig,
+) -> (Arc<Node>, tokio::net::TcpStream, u64) {
+    use actordb::shard::FragmentId;
+
+    let source = Arc::new(
+        test_node_with_config(
+            source_id,
+            NodeConfig {
+                fragment_map: HashMap::from([(
+                    FragmentId(0),
+                    vec![source_id.to_string(), peer_id.to_string()],
+                )]),
+                replication,
+                ..NodeConfig::default()
+            },
+        )
+        .await,
+    );
+    let mut stream = tokio::net::TcpStream::connect(source.addr()).await.unwrap();
+    complete_no_secret_handshake(&mut stream, peer_id).await;
+    let initial_session = recv_session_start(&mut stream).await;
+    assert_eq!(initial_session.fragment, 0);
+    complete_empty_reconcile(&mut stream, initial_session.session_id).await;
+    common::wait_for(
+        || async {
+            source
+                .sender_report(FragmentId(0), peer_id)
+                .await
+                .map_or(false, |report| {
+                    report.reconcile_rounds >= 1 && report.in_flight == 0
+                })
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+    (source, stream, initial_session.session_id)
+}
+
 /// Complete the protocol-v3 mutual handshake used by raw TCP peers in these
 /// tests. With no cluster secret configured, the second flight is explicit
 /// but carries an empty proof.
@@ -747,6 +846,988 @@ async fn two_nodes_replicate() {
     .await;
     a.shutdown().await.unwrap();
     b.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn replication_drained_shutdown_fences_an_immediate_write() {
+    use actordb::replication::ReplicationAckDurability;
+    use actordb::shard::FragmentId;
+
+    let a = test_node("drain-source").await;
+    let b = test_node("drain-target").await;
+    b.connect(a.addr()).await.unwrap();
+    wait_for_peers(&a, &b).await;
+    common::wait_for(
+        || async {
+            a.sender_report(FragmentId(0), "drain-target")
+                .await
+                .is_some()
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    a.put("drain-immediate".to_string(), b"fenced".to_vec())
+        .await
+        .unwrap();
+    let report = a
+        .shutdown_with_replication_drain(
+            ReplicationDrainOptions::default().with_timeout(Duration::from_secs(5)),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(report.durability(), ReplicationAckDurability::MemoryApplied);
+    assert_eq!(report.targets().len(), 1);
+    assert_eq!(report.targets()[0].fragment(), FragmentId(0));
+    assert_eq!(report.targets()[0].peer_id(), "drain-target");
+    assert_eq!(
+        b.get("drain-immediate".to_string())
+            .await
+            .unwrap()
+            .map(|value| value.value),
+        Some(b"fenced".to_vec())
+    );
+    assert!(matches!(
+        a.put("after-fence".to_string(), Vec::new()).await,
+        Err(NodeError::ShuttingDown)
+    ));
+    b.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn drain_requires_no_change_verification_round() {
+    use actordb::proto::ReplicationAckLevel;
+    use actordb::replication::SenderConfig;
+
+    let peer_id = "raw-stable-drain-peer";
+    let (source, mut stream, initial_session_id) = raw_replication_drain_source(
+        "stable-drain-source",
+        peer_id,
+        SenderConfig {
+            batch_interval: Duration::from_secs(3600),
+            consistency_interval: Duration::from_secs(3600),
+            reconcile_timeout: Duration::from_secs(5),
+            ..SenderConfig::default()
+        },
+    )
+    .await;
+    source
+        .put("stable-drain-key".to_string(), b"fenced".to_vec())
+        .await
+        .unwrap();
+
+    let drain_source = source.clone();
+    let drain = tokio::spawn(async move {
+        drain_source
+            .shutdown_with_replication_drain(
+                ReplicationDrainOptions::default().with_timeout(Duration::from_secs(10)),
+            )
+            .await
+    });
+
+    let drain_session = recv_session_start(&mut stream).await;
+    assert_ne!(drain_session.session_id, initial_session_id);
+    let first_request = recv_reconcile_request(&mut stream, drain_session.session_id).await;
+    send_reconcile_response(&mut stream, &first_request, Vec::new()).await;
+    let (repaired_summaries, first_barrier) = recv_reconcile_repairs_and_barrier(&mut stream).await;
+    assert_eq!(repaired_summaries.len(), 1);
+    assert_eq!(repaired_summaries[0].key, "stable-drain-key");
+    ack_replication_batch(
+        &mut stream,
+        &first_barrier,
+        drain_session.session_id,
+        ReplicationAckLevel::Applied,
+    )
+    .await;
+
+    let verification_request = recv_reconcile_request(&mut stream, drain_session.session_id).await;
+    assert_ne!(verification_request.round_id, first_request.round_id);
+    assert!(
+        !drain.is_finished(),
+        "the repair round's first barrier completed the shutdown drain"
+    );
+    send_reconcile_response(&mut stream, &verification_request, repaired_summaries).await;
+    let (verification_repairs, verification_barrier) =
+        recv_reconcile_repairs_and_barrier(&mut stream).await;
+    assert!(verification_repairs.is_empty());
+    assert!(
+        !drain.is_finished(),
+        "the drain completed before its stable barrier ACK"
+    );
+    ack_replication_batch(
+        &mut stream,
+        &verification_barrier,
+        drain_session.session_id,
+        ReplicationAckLevel::Applied,
+    )
+    .await;
+
+    let report = tokio::time::timeout(Duration::from_secs(5), drain)
+        .await
+        .expect("stable drain did not finish after its verification ACK")
+        .unwrap()
+        .unwrap();
+    assert_eq!(report.targets().len(), 1);
+    assert_eq!(report.targets()[0].peer_id(), peer_id);
+}
+
+#[tokio::test]
+async fn drain_ignores_stale_old_session_ack_after_rotation() {
+    use actordb::proto::{KeySummary, ReplicationAckLevel};
+    use actordb::replication::{ReplicationAckDurability, SenderConfig};
+    use actordb::shard::FragmentId;
+
+    let peer_id = "raw-stale-drain-peer";
+    let (source, mut stream, old_session_id) = raw_replication_drain_source(
+        "stale-drain-source",
+        peer_id,
+        SenderConfig {
+            batch_size: 1,
+            batch_interval: Duration::from_millis(10),
+            consistency_interval: Duration::from_secs(3600),
+            reconcile_timeout: Duration::from_secs(5),
+            required_ack_durability: ReplicationAckDurability::StoreCommitted,
+            ..SenderConfig::default()
+        },
+    )
+    .await;
+    source
+        .put("stale-drain-key".to_string(), b"fenced".to_vec())
+        .await
+        .unwrap();
+
+    let ordinary_batch = loop {
+        if let Some(EnvelopeMsg::ReplicateBatch(batch)) = recv_frame(&mut stream).await.msg {
+            if batch.session_id == old_session_id
+                && batch.batch_seq != u64::MAX
+                && !batch.ops.is_empty()
+            {
+                break batch;
+            }
+        }
+    };
+    let remote_summaries: Vec<KeySummary> = ordinary_batch
+        .ops
+        .iter()
+        .map(|op| KeySummary {
+            key: op.key.clone(),
+            timestamp_ms: op.timestamp_ms,
+            node_id: op.node_id.clone(),
+            is_tombstone: op.is_tombstone,
+        })
+        .collect();
+    ack_replication_batch(
+        &mut stream,
+        &ordinary_batch,
+        old_session_id,
+        ReplicationAckLevel::StoreCommitted,
+    )
+    .await;
+    common::wait_for(
+        || async {
+            source
+                .sender_report(FragmentId(0), peer_id)
+                .await
+                .map_or(false, |report| report.in_flight == 0)
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    let drain_source = source.clone();
+    let drain = tokio::spawn(async move {
+        drain_source
+            .shutdown_with_replication_drain(
+                ReplicationDrainOptions::default().with_timeout(Duration::from_secs(10)),
+            )
+            .await
+    });
+    let drain_session = recv_session_start(&mut stream).await;
+    assert_ne!(drain_session.session_id, old_session_id);
+    let request = recv_reconcile_request(&mut stream, drain_session.session_id).await;
+    send_reconcile_response(&mut stream, &request, remote_summaries).await;
+    let (repairs, barrier) = recv_reconcile_repairs_and_barrier(&mut stream).await;
+    assert!(repairs.is_empty());
+
+    // Reuse the live barrier sequence with the expired session. Follow it with
+    // a weak ACK on the current session: observing that mismatch proves the
+    // sender consumed both FIFO controls without accepting the stale one.
+    ack_replication_batch(
+        &mut stream,
+        &barrier,
+        old_session_id,
+        ReplicationAckLevel::StoreCommitted,
+    )
+    .await;
+    ack_replication_batch(
+        &mut stream,
+        &barrier,
+        drain_session.session_id,
+        ReplicationAckLevel::Applied,
+    )
+    .await;
+    common::wait_for(
+        || async {
+            source
+                .sender_report(FragmentId(0), peer_id)
+                .await
+                .map_or(false, |report| {
+                    report.session_id == drain_session.session_id
+                        && report.in_flight == 1
+                        && report.ack_durability_mismatch
+                        && report.last_ack_durability
+                            == Some(ReplicationAckDurability::MemoryApplied)
+                })
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+    assert!(
+        !drain.is_finished(),
+        "an ACK from the pre-drain session completed the rotated drain"
+    );
+
+    ack_replication_batch(
+        &mut stream,
+        &barrier,
+        drain_session.session_id,
+        ReplicationAckLevel::StoreCommitted,
+    )
+    .await;
+    let report = tokio::time::timeout(Duration::from_secs(5), drain)
+        .await
+        .expect("current-session durability ACK did not finish the drain")
+        .unwrap()
+        .unwrap();
+    assert_eq!(report.targets().len(), 1);
+    assert_eq!(report.targets()[0].peer_id(), peer_id);
+}
+
+#[tokio::test]
+async fn drain_disconnect_reconnect_retries_same_generation() {
+    use actordb::proto::ReplicationAckLevel;
+    use actordb::replication::SenderConfig;
+
+    let peer_id = "raw-reconnect-drain-peer";
+    let (source, mut first_stream, initial_session_id) = raw_replication_drain_source(
+        "reconnect-drain-source",
+        peer_id,
+        SenderConfig {
+            batch_interval: Duration::from_secs(3600),
+            consistency_interval: Duration::from_secs(3600),
+            reconcile_timeout: Duration::from_secs(5),
+            ..SenderConfig::default()
+        },
+    )
+    .await;
+    source
+        .put("reconnect-drain-key".to_string(), b"fenced".to_vec())
+        .await
+        .unwrap();
+
+    let drain_source = source.clone();
+    let drain = tokio::spawn(async move {
+        drain_source
+            .shutdown_with_replication_drain(
+                ReplicationDrainOptions::default().with_timeout(Duration::from_secs(10)),
+            )
+            .await
+    });
+    let interrupted_session = recv_session_start(&mut first_stream).await;
+    assert_ne!(interrupted_session.session_id, initial_session_id);
+    let _interrupted_request =
+        recv_reconcile_request(&mut first_stream, interrupted_session.session_id).await;
+    drop(first_stream);
+    common::wait_for(
+        || async { source.peer_count().await == 0 },
+        Duration::from_secs(5),
+    )
+    .await;
+    assert!(
+        !drain.is_finished(),
+        "disconnect completed or discarded the pending drain generation"
+    );
+
+    let mut replacement_stream = tokio::net::TcpStream::connect(source.addr()).await.unwrap();
+    complete_no_secret_handshake(&mut replacement_stream, peer_id).await;
+    let replacement_session = recv_session_start(&mut replacement_stream).await;
+    assert_ne!(
+        replacement_session.session_id,
+        interrupted_session.session_id
+    );
+    let first_request =
+        recv_reconcile_request(&mut replacement_stream, replacement_session.session_id).await;
+    send_reconcile_response(&mut replacement_stream, &first_request, Vec::new()).await;
+    let (repaired_summaries, first_barrier) =
+        recv_reconcile_repairs_and_barrier(&mut replacement_stream).await;
+    assert_eq!(repaired_summaries.len(), 1);
+    assert_eq!(repaired_summaries[0].key, "reconnect-drain-key");
+    ack_replication_batch(
+        &mut replacement_stream,
+        &first_barrier,
+        replacement_session.session_id,
+        ReplicationAckLevel::Applied,
+    )
+    .await;
+
+    let verification_request =
+        recv_reconcile_request(&mut replacement_stream, replacement_session.session_id).await;
+    send_reconcile_response(
+        &mut replacement_stream,
+        &verification_request,
+        repaired_summaries,
+    )
+    .await;
+    let (verification_repairs, verification_barrier) =
+        recv_reconcile_repairs_and_barrier(&mut replacement_stream).await;
+    assert!(verification_repairs.is_empty());
+    ack_replication_batch(
+        &mut replacement_stream,
+        &verification_barrier,
+        replacement_session.session_id,
+        ReplicationAckLevel::Applied,
+    )
+    .await;
+
+    let report = tokio::time::timeout(Duration::from_secs(5), drain)
+        .await
+        .expect("the original drain generation did not survive reconnect")
+        .unwrap()
+        .unwrap();
+    assert_eq!(report.targets().len(), 1);
+    assert_eq!(report.targets()[0].peer_id(), peer_id);
+}
+
+#[tokio::test]
+async fn manual_placement_drain_freezes_target_and_keeps_replication_runtime_alive() {
+    use actordb::placement::{FragmentPlacementState, ManualPlacement};
+    use actordb::proto::ReplicationAckLevel;
+    use actordb::replication::SenderConfig;
+    use actordb::shard::FragmentId;
+
+    let fragment = FragmentId(0);
+    let source_id = "dynamic-drain-source";
+    let peer_id = "dynamic-drain-peer";
+    let initial_placement = HashMap::from([(fragment, vec![source_id.to_string()])]);
+    let controller = Arc::new(ManualPlacement::new(initial_placement.clone()));
+    let source = Arc::new(
+        test_node_with_config(
+            source_id,
+            NodeConfig {
+                placement_controller: Some(controller.clone()),
+                placement_poll_interval: Duration::from_millis(10),
+                replication: SenderConfig {
+                    batch_interval: Duration::from_secs(3600),
+                    consistency_interval: Duration::from_secs(3600),
+                    reconcile_timeout: Duration::from_secs(5),
+                    ..SenderConfig::default()
+                },
+                ..NodeConfig::default()
+            },
+        )
+        .await,
+    );
+    common::wait_for(
+        || async {
+            let report = source.placement_report().await;
+            report.placement == initial_placement
+                && report.states.get(&fragment) == Some(&FragmentPlacementState::Serving)
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+    source
+        .put("dynamic-drain-key".to_string(), b"fenced".to_vec())
+        .await
+        .unwrap();
+
+    let mut stream = tokio::net::TcpStream::connect(source.addr()).await.unwrap();
+    complete_no_secret_handshake(&mut stream, peer_id).await;
+    common::wait_for(
+        || async { source.peer_count().await == 1 },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    let frozen_placement =
+        HashMap::from([(fragment, vec![source_id.to_string(), peer_id.to_string()])]);
+    controller.set_placement(frozen_placement.clone());
+    common::wait_for(
+        || async {
+            source.placement_report().await.placement == frozen_placement
+                && source
+                    .sender_report(fragment, peer_id)
+                    .await
+                    .map_or(false, |report| report.session_id != 0)
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+    let pre_drain_session = recv_session_start(&mut stream).await;
+
+    let drain_source = source.clone();
+    let drain = tokio::spawn(async move {
+        drain_source
+            .shutdown_with_replication_drain(
+                ReplicationDrainOptions::default().with_timeout(Duration::from_secs(10)),
+            )
+            .await
+    });
+    let drain_session = recv_session_start(&mut stream).await;
+    assert_ne!(drain_session.session_id, pre_drain_session.session_id);
+    let first_request = recv_reconcile_request(&mut stream, drain_session.session_id).await;
+
+    // A drain request is issued only after the placement task manager has
+    // stopped. Move the controller back to source-only and give several poll
+    // intervals a chance to expose an accidentally live placement driver.
+    controller.set_placement(initial_placement.clone());
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(controller.placement(), initial_placement);
+    let frozen_report = source.placement_report().await;
+    assert!(frozen_report.dynamic);
+    assert_eq!(frozen_report.placement, frozen_placement);
+    assert_eq!(
+        frozen_report.states.get(&fragment),
+        Some(&FragmentPlacementState::Serving)
+    );
+    assert_eq!(source.peer_count().await, 1);
+    assert!(!drain.is_finished());
+
+    // The connection and fragment dispatcher remain supervised after the
+    // placement plane freezes: the raw peer can drive reconciliation and the
+    // dispatcher supplies the locally authoritative winner as a repair.
+    send_reconcile_response(&mut stream, &first_request, Vec::new()).await;
+    let (repaired_summaries, first_barrier) = recv_reconcile_repairs_and_barrier(&mut stream).await;
+    assert_eq!(repaired_summaries.len(), 1);
+    assert_eq!(repaired_summaries[0].key, "dynamic-drain-key");
+    ack_replication_batch(
+        &mut stream,
+        &first_barrier,
+        drain_session.session_id,
+        ReplicationAckLevel::Applied,
+    )
+    .await;
+
+    let verification_request = recv_reconcile_request(&mut stream, drain_session.session_id).await;
+    send_reconcile_response(&mut stream, &verification_request, repaired_summaries).await;
+    let (verification_repairs, verification_barrier) =
+        recv_reconcile_repairs_and_barrier(&mut stream).await;
+    assert!(verification_repairs.is_empty());
+    ack_replication_batch(
+        &mut stream,
+        &verification_barrier,
+        drain_session.session_id,
+        ReplicationAckLevel::Applied,
+    )
+    .await;
+
+    let report = tokio::time::timeout(Duration::from_secs(5), drain)
+        .await
+        .expect("dynamic placement drain did not finish after the peer fence")
+        .unwrap()
+        .unwrap();
+    assert_eq!(report.targets().len(), 1);
+    assert_eq!(report.targets()[0].fragment(), fragment);
+    assert_eq!(report.targets()[0].peer_id(), peer_id);
+}
+
+#[tokio::test]
+async fn single_replica_drain_reports_no_remote_targets() {
+    use actordb::shard::FragmentId;
+
+    let node = test_node_with_config(
+        "single-replica",
+        NodeConfig {
+            fragment_map: HashMap::from([(FragmentId(0), vec!["single-replica".to_string()])]),
+            ..NodeConfig::default()
+        },
+    )
+    .await;
+    assert!(matches!(
+        node.shutdown_with_replication_drain(
+            ReplicationDrainOptions::default().with_timeout(Duration::ZERO)
+        )
+        .await,
+        Err(ReplicationDrainShutdownError::InvalidOptions(_))
+    ));
+    node.put("still-running".to_string(), b"value".to_vec())
+        .await
+        .unwrap();
+
+    let report = node
+        .shutdown_with_replication_drain(
+            ReplicationDrainOptions::default().with_timeout(Duration::from_secs(1)),
+        )
+        .await
+        .unwrap();
+    assert!(report.targets().is_empty());
+}
+
+#[tokio::test]
+async fn replication_drain_timeout_retries_the_fenced_overflow_snapshot() {
+    use actordb::replication::SenderConfig;
+    use actordb::shard::FragmentId;
+
+    let placement = HashMap::from([(
+        FragmentId(0),
+        vec!["overflow-source".to_string(), "overflow-target".to_string()],
+    )]);
+    let config = || NodeConfig {
+        fragment_map: placement.clone(),
+        replication: SenderConfig {
+            buffer_capacity: 1,
+            batch_interval: Duration::from_secs(3600),
+            consistency_interval: Duration::from_secs(3600),
+            ..SenderConfig::default()
+        },
+        ..NodeConfig::default()
+    };
+    let a = test_node_with_config("overflow-source", config()).await;
+    let b = test_node_with_config("overflow-target", config()).await;
+
+    for index in 0..25 {
+        a.put(
+            format!("overflow-{index}"),
+            format!("value-{index}").into_bytes(),
+        )
+        .await
+        .unwrap();
+    }
+    let first = a
+        .shutdown_with_replication_drain(
+            ReplicationDrainOptions::default().with_timeout(Duration::from_secs(1)),
+        )
+        .await
+        .unwrap_err();
+    match first {
+        ReplicationDrainShutdownError::Timeout {
+            phase,
+            completed,
+            pending,
+        } => {
+            assert_eq!(phase, ReplicationDrainPhase::PeerReconciliation);
+            assert!(completed.is_empty());
+            assert_eq!(pending.len(), 1);
+            assert_eq!(pending[0].fragment(), FragmentId(0));
+            assert_eq!(pending[0].peer_id(), "overflow-target");
+        }
+        other => panic!("unexpected drain result: {other}"),
+    }
+    assert!(matches!(
+        a.put("post-timeout".to_string(), Vec::new()).await,
+        Err(NodeError::ShuttingDown)
+    ));
+
+    b.connect(a.addr()).await.unwrap();
+    wait_for_peers(&a, &b).await;
+    let report = a
+        .shutdown_with_replication_drain(
+            ReplicationDrainOptions::default().with_timeout(Duration::from_secs(5)),
+        )
+        .await
+        .unwrap();
+    assert_eq!(report.targets().len(), 1);
+    for index in 0..25 {
+        assert_eq!(
+            b.get(format!("overflow-{index}"))
+                .await
+                .unwrap()
+                .map(|value| value.value),
+            Some(format!("value-{index}").into_bytes())
+        );
+    }
+    b.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn local_shutdown_abandons_a_timed_out_replication_drain() {
+    use actordb::shard::FragmentId;
+
+    let node = test_node_with_config(
+        "local-escape",
+        NodeConfig {
+            fragment_map: HashMap::from([(
+                FragmentId(0),
+                vec!["local-escape".to_string(), "absent-peer".to_string()],
+            )]),
+            ..NodeConfig::default()
+        },
+    )
+    .await;
+    node.put("local-only".to_string(), b"value".to_vec())
+        .await
+        .unwrap();
+    assert!(matches!(
+        node.shutdown_with_replication_drain(
+            ReplicationDrainOptions::default().with_timeout(Duration::from_millis(50))
+        )
+        .await,
+        Err(ReplicationDrainShutdownError::Timeout { .. })
+    ));
+    tokio::time::timeout(Duration::from_secs(1), node.shutdown())
+        .await
+        .expect("local-only shutdown waited for the absent peer")
+        .unwrap();
+}
+
+#[tokio::test]
+async fn concurrent_replication_drain_callers_keep_independent_deadlines() {
+    use actordb::shard::FragmentId;
+
+    let placement = HashMap::from([(
+        FragmentId(0),
+        vec![
+            "concurrent-source".to_string(),
+            "concurrent-target".to_string(),
+        ],
+    )]);
+    let source = Arc::new(
+        test_node_with_config(
+            "concurrent-source",
+            NodeConfig {
+                fragment_map: placement.clone(),
+                ..NodeConfig::default()
+            },
+        )
+        .await,
+    );
+    let target = test_node_with_config(
+        "concurrent-target",
+        NodeConfig {
+            fragment_map: placement,
+            ..NodeConfig::default()
+        },
+    )
+    .await;
+    source
+        .put("concurrent-fence".to_string(), b"value".to_vec())
+        .await
+        .unwrap();
+
+    let first_source = source.clone();
+    let first = tokio::spawn(async move {
+        first_source
+            .shutdown_with_replication_drain(
+                ReplicationDrainOptions::default().with_timeout(Duration::from_secs(30)),
+            )
+            .await
+    });
+    common::wait_for(
+        || async {
+            matches!(
+                source.get("concurrent-fence".to_string()).await,
+                Err(NodeError::ShuttingDown)
+            )
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    let started = std::time::Instant::now();
+    let second = source
+        .shutdown_with_replication_drain(
+            ReplicationDrainOptions::default().with_timeout(Duration::from_millis(25)),
+        )
+        .await
+        .unwrap_err();
+    assert!(started.elapsed() < Duration::from_secs(1));
+    assert!(matches!(
+        second,
+        ReplicationDrainShutdownError::Timeout {
+            phase: ReplicationDrainPhase::ShutdownCoordination,
+            ..
+        }
+    ));
+
+    first.abort();
+    assert!(first.await.unwrap_err().is_cancelled());
+    target.connect(source.addr()).await.unwrap();
+    wait_for_peers(&source, &target).await;
+    let report = source
+        .shutdown_with_replication_drain(
+            ReplicationDrainOptions::default().with_timeout(Duration::from_secs(5)),
+        )
+        .await
+        .unwrap();
+    assert_eq!(report.targets().len(), 1);
+    assert_eq!(
+        target
+            .get("concurrent-fence".to_string())
+            .await
+            .unwrap()
+            .map(|value| value.value),
+        Some(b"value".to_vec())
+    );
+    target.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn replication_drain_honors_store_committed_receiver_fence() {
+    use actordb::replication::{ReplicationAckDurability, SenderConfig};
+    use actordb::shard::FragmentId;
+
+    let target_store = Arc::new(PreloadedStore::default());
+    let source = test_node_with_config(
+        "durable-source",
+        NodeConfig {
+            replication: SenderConfig {
+                required_ack_durability: ReplicationAckDurability::StoreCommitted,
+                ..SenderConfig::default()
+            },
+            ..NodeConfig::default()
+        },
+    )
+    .await;
+    let target = test_node_with_config(
+        "durable-target",
+        NodeConfig {
+            store: Some(target_store.clone()),
+            flush_interval: Duration::from_secs(3600),
+            ..NodeConfig::default()
+        },
+    )
+    .await;
+    target.connect(source.addr()).await.unwrap();
+    wait_for_peers(&source, &target).await;
+    common::wait_for(
+        || async {
+            source
+                .sender_report(FragmentId(0), "durable-target")
+                .await
+                .is_some()
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    source
+        .put("store-fence".to_string(), b"committed".to_vec())
+        .await
+        .unwrap();
+    let report = source
+        .shutdown_with_replication_drain(
+            ReplicationDrainOptions::default().with_timeout(Duration::from_secs(5)),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        report.durability(),
+        ReplicationAckDurability::StoreCommitted
+    );
+    assert_eq!(
+        target_store
+            .get_fragment_zero("store-fence")
+            .map(|value| value.value),
+        Some(b"committed".to_vec())
+    );
+    target.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn store_committed_drain_rejects_a_storeless_receiver_ack() {
+    use actordb::replication::{ReplicationAckDurability, SenderConfig};
+    use actordb::shard::FragmentId;
+
+    let placement = HashMap::from([(
+        FragmentId(0),
+        vec!["strict-source".to_string(), "storeless-target".to_string()],
+    )]);
+    let source = test_node_with_config(
+        "strict-source",
+        NodeConfig {
+            fragment_map: placement.clone(),
+            replication: SenderConfig {
+                required_ack_durability: ReplicationAckDurability::StoreCommitted,
+                ..SenderConfig::default()
+            },
+            ..NodeConfig::default()
+        },
+    )
+    .await;
+    let target = test_node_with_config(
+        "storeless-target",
+        NodeConfig {
+            fragment_map: placement,
+            ..NodeConfig::default()
+        },
+    )
+    .await;
+    target.connect(source.addr()).await.unwrap();
+    wait_for_peers(&source, &target).await;
+    source
+        .put("strict-fence".to_string(), b"value".to_vec())
+        .await
+        .unwrap();
+
+    let error = source
+        .shutdown_with_replication_drain(
+            ReplicationDrainOptions::default().with_timeout(Duration::from_secs(1)),
+        )
+        .await
+        .unwrap_err();
+    match error {
+        ReplicationDrainShutdownError::Timeout {
+            phase: ReplicationDrainPhase::PeerReconciliation,
+            completed,
+            pending,
+        } => {
+            assert!(completed.is_empty());
+            assert_eq!(pending.len(), 1);
+            assert_eq!(pending[0].peer_id(), "storeless-target");
+        }
+        other => panic!("unexpected drain result: {other}"),
+    }
+    source.shutdown().await.unwrap();
+    target.shutdown().await.unwrap();
+}
+
+#[cfg(feature = "rocksdb")]
+#[tokio::test]
+async fn store_committed_drain_persists_to_the_offered_rocksdb_backend() {
+    use actordb::replication::{ReplicationAckDurability, SenderConfig};
+    use actordb::shard::FragmentId;
+    use actordb::store::{PrefixedStore, RocksDbStore};
+
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("drain-target");
+    let placement = HashMap::from([(
+        FragmentId(0),
+        vec!["rocks-source".to_string(), "rocks-target".to_string()],
+    )]);
+    let source = test_node_with_config(
+        "rocks-source",
+        NodeConfig {
+            fragment_map: placement.clone(),
+            replication: SenderConfig {
+                required_ack_durability: ReplicationAckDurability::StoreCommitted,
+                ..SenderConfig::default()
+            },
+            ..NodeConfig::default()
+        },
+    )
+    .await;
+    let target_store = Arc::new(RocksDbStore::open(&database).unwrap());
+    let target_config = NodeConfig {
+        store: Some(target_store.clone()),
+        fragment_map: placement.clone(),
+        flush_interval: Duration::from_secs(3600),
+        ..NodeConfig::default()
+    };
+    let target = test_node_with_config("rocks-target", target_config).await;
+    target.connect(source.addr()).await.unwrap();
+    wait_for_peers(&source, &target).await;
+
+    source
+        .put("rocks-drain".to_string(), b"durable".to_vec())
+        .await
+        .unwrap();
+    let report = source
+        .shutdown_with_replication_drain(
+            ReplicationDrainOptions::default().with_timeout(Duration::from_secs(5)),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        report.durability(),
+        ReplicationAckDurability::StoreCommitted
+    );
+    let persisted = PrefixedStore::new(target_store.clone(), FragmentId(0))
+        .load()
+        .unwrap();
+    assert!(persisted.iter().any(|(key, value)| {
+        key == b"rocks-drain" && value.value == b"durable" && !value.is_tombstone
+    }));
+    target.shutdown().await.unwrap();
+    drop(target);
+    drop(target_store);
+
+    let mut restart_config = NodeConfig::with_rocksdb(&database).unwrap();
+    restart_config.fragment_map = placement;
+    let restarted = test_node_with_config("rocks-target", restart_config).await;
+    assert_eq!(
+        restarted
+            .get("rocks-drain".to_string())
+            .await
+            .unwrap()
+            .map(|value| value.value),
+        Some(b"durable".to_vec())
+    );
+    restarted.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn replication_report_survives_a_later_local_flush_failure() {
+    use actordb::shard::FragmentId;
+
+    let placement = HashMap::from([(
+        FragmentId(0),
+        vec!["flush-source".to_string(), "flush-target".to_string()],
+    )]);
+    let source_store = Arc::new(ToggleFailStore::default());
+    let source = test_node_with_config(
+        "flush-source",
+        NodeConfig {
+            fragment_map: placement.clone(),
+            store: Some(source_store.clone()),
+            flush_batch_size: usize::MAX,
+            flush_interval: Duration::from_secs(3600),
+            snapshot_interval: Duration::from_secs(3600),
+            clean_interval: Duration::from_secs(3600),
+            ..NodeConfig::default()
+        },
+    )
+    .await;
+    let target = test_node_with_config(
+        "flush-target",
+        NodeConfig {
+            fragment_map: placement,
+            ..NodeConfig::default()
+        },
+    )
+    .await;
+    target.connect(source.addr()).await.unwrap();
+    wait_for_peers(&source, &target).await;
+    source
+        .put("flush-after-drain".to_string(), b"retained".to_vec())
+        .await
+        .unwrap();
+
+    let first_report = match source
+        .shutdown_with_replication_drain(
+            ReplicationDrainOptions::default().with_timeout(Duration::from_secs(5)),
+        )
+        .await
+        .unwrap_err()
+    {
+        ReplicationDrainShutdownError::Local { error, replication } => {
+            assert!(matches!(error, NodeError::Storage(_)));
+            replication
+        }
+        other => panic!("unexpected drain result: {other}"),
+    };
+    assert_eq!(first_report.targets().len(), 1);
+    assert_eq!(
+        target
+            .get("flush-after-drain".to_string())
+            .await
+            .unwrap()
+            .map(|value| value.value),
+        Some(b"retained".to_vec())
+    );
+
+    // The source has already stopped transport after completing the remote
+    // fence. Remove the target entirely: the retry must use the retained
+    // report and perform only the failed local persistence phase.
+    target.shutdown().await.unwrap();
+    source_store.failing.store(false, Ordering::SeqCst);
+    let retried_report = source
+        .shutdown_with_replication_drain(
+            ReplicationDrainOptions::default().with_timeout(Duration::from_secs(1)),
+        )
+        .await
+        .unwrap();
+    assert_eq!(retried_report, first_report);
 }
 
 #[tokio::test]
@@ -1748,6 +2829,129 @@ async fn reconcile_barrier_revokes_prior_fetch_authorization() {
     })
     .await
     .expect("post-barrier fetch did not close the connection");
+
+    node.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn reconcile_barrier_rejects_a_replaced_fragment_incarnation() {
+    use actordb::placement::{FragmentPlacementState, ManualPlacement};
+    use actordb::proto::{
+        BatchNack, EnvelopeMsg, ReconcileRequest, ReplicateBatch, ReplicationAckLevel, SessionStart,
+    };
+    use actordb::shard::FragmentId;
+
+    let fragment = FragmentId(0);
+    let controller = Arc::new(ManualPlacement::new(HashMap::from([(
+        fragment,
+        vec!["incarnation-node".to_string()],
+    )])));
+    let node = test_node_with_config(
+        "incarnation-node",
+        NodeConfig {
+            placement_controller: Some(controller.clone()),
+            placement_poll_interval: Duration::from_millis(10),
+            placement_drain_warn_interval: Duration::from_millis(10),
+            ..NodeConfig::default()
+        },
+    )
+    .await;
+    common::wait_for(
+        || async {
+            node.placement_report().await.states.get(&fragment)
+                == Some(&FragmentPlacementState::Serving)
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    let mut stream = tokio::net::TcpStream::connect(node.addr()).await.unwrap();
+    complete_no_secret_handshake(&mut stream, "incarnation-peer").await;
+    send_frame(
+        &mut stream,
+        Envelope {
+            msg: Some(EnvelopeMsg::SessionStart(SessionStart {
+                session_id: 77,
+                fragment: 0,
+            })),
+        },
+    )
+    .await;
+    send_frame(
+        &mut stream,
+        Envelope {
+            msg: Some(EnvelopeMsg::ReconcileRequest(ReconcileRequest {
+                fragment: 0,
+                session_id: 77,
+                round_id: 9,
+                page_seq: 0,
+                after_key: String::new(),
+                snapshot_revision: 0,
+                snapshot_time_ms: 0,
+            })),
+        },
+    )
+    .await;
+    loop {
+        if let Some(EnvelopeMsg::ReconcileResponse(response)) = recv_frame(&mut stream).await.msg {
+            if response.session_id == 77 && response.round_id == 9 {
+                break;
+            }
+        }
+    }
+
+    // Destroy the subtree which served the summaries, then create a new
+    // in-memory incarnation at the same fragment id before the old barrier.
+    controller.set_placement(HashMap::from([(
+        fragment,
+        vec!["replacement-owner".to_string()],
+    )]));
+    common::wait_for(
+        || async {
+            node.placement_report().await.states.get(&fragment)
+                == Some(&FragmentPlacementState::Stopped)
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+    controller.set_placement(HashMap::from([(
+        fragment,
+        vec!["incarnation-node".to_string()],
+    )]));
+    common::wait_for(
+        || async {
+            node.placement_report().await.states.get(&fragment)
+                == Some(&FragmentPlacementState::Serving)
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    send_frame(
+        &mut stream,
+        Envelope {
+            msg: Some(EnvelopeMsg::ReplicateBatch(ReplicateBatch {
+                session_id: 77,
+                batch_seq: 1,
+                fragment: 0,
+                ops: Vec::new(),
+                required_ack_level: ReplicationAckLevel::Applied as i32,
+            })),
+        },
+    )
+    .await;
+    loop {
+        if let Some(EnvelopeMsg::BatchNack(BatchNack {
+            session_id: 77,
+            batch_seq: 1,
+            error,
+            ..
+        })) = recv_frame(&mut stream).await.msg
+        {
+            assert!(error.contains("serving incarnation"));
+            break;
+        }
+    }
 
     node.shutdown().await.unwrap();
 }

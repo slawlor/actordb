@@ -79,7 +79,20 @@ process — the bulk of behavioral coverage:
   `replication_rejects_an_ack_below_the_configured_durability`,
   `replication_nack_retries_the_exact_batch_after_store_failure`,
   `failed_reconcile_repair_cannot_be_hidden_by_barrier_ack`,
-  `fetched_reconcile_value_retries_failed_local_store_fence`.
+  `fetched_reconcile_value_retries_failed_local_store_fence`, and
+  `reconcile_barrier_rejects_a_replaced_fragment_incarnation`.
+- **Replication-drained shutdown**:
+  `replication_drained_shutdown_fences_an_immediate_write`,
+  `drain_requires_no_change_verification_round`,
+  `drain_ignores_stale_old_session_ack_after_rotation`,
+  `drain_disconnect_reconnect_retries_same_generation`,
+  `manual_placement_drain_freezes_target_and_keeps_replication_runtime_alive`,
+  `replication_drain_timeout_retries_the_fenced_overflow_snapshot`,
+  `concurrent_replication_drain_callers_keep_independent_deadlines`,
+  `replication_drain_honors_store_committed_receiver_fence`,
+  `store_committed_drain_rejects_a_storeless_receiver_ack`,
+  `store_committed_drain_persists_to_the_offered_rocksdb_backend`, and
+  `replication_report_survives_a_later_local_flush_failure`.
 - **Persistence**: `persistence_roundtrip`,
   `persistence_keeps_gossiped_winner`, `persistence_flushes_on_shutdown`,
   `shutdown_flush_failure_is_retryable_across_all_fragments`,

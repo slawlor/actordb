@@ -99,6 +99,16 @@ original operation order. Replays retain the original LWW versions, so a
 duplicate apply is idempotent; delayed ACKs from the previous session are
 ignored.
 
+## `ReplicationDrainOptions` (call-specific shutdown policy)
+
+`ReplicationDrainOptions::default()` gives
+`Node::shutdown_with_replication_drain` one 30-second absolute budget for its
+remote phase. `with_timeout(Duration)` changes that budget and `timeout()`
+reads it; zero or a duration that cannot be represented by Tokio's clock is
+rejected by the call. This setting is intentionally not part of `NodeConfig`:
+ordinary `Node::shutdown()` remains a prompt local-only lifecycle operation,
+and each planned stop chooses its own tolerance for unavailable peers.
+
 ## `SenderRuntimeOptions` (standalone senders)
 
 Direct users of `actordb::replication::spawn_sender` get a 30-second ordinary

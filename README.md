@@ -118,7 +118,7 @@ CI runs both scenarios on every push/PR touching the relevant paths
 ### `actordb::node` — the main entry point
 
 ```rust
-use actordb::node::{Node, NodeConfig};
+use actordb::node::{Node, NodeConfig, ReplicationDrainOptions};
 use std::time::Duration;
 
 let node = Node::start(
@@ -151,9 +151,13 @@ let puts = node.put_multi(vec![
 let gets = node.get_multi(vec!["k1".to_string(), "k2".to_string()]).await;
 let peers = node.peer_count().await;
 
-// shutdown() closes public-operation admission, joins Node-owned transport
-// work, drains fragment actors, and reports the exact final store flush.
+// Local-only: prompt even when a replica is unavailable.
 node.shutdown().await?;
+
+// Alternatively, choose the bounded peer fence before local shutdown:
+// let report = node.shutdown_with_replication_drain(
+//     ReplicationDrainOptions::default().with_timeout(Duration::from_secs(30)),
+// ).await?;
 ```
 
 `Node::start` uses the default transport and replication liveness policy. Use
@@ -495,9 +499,19 @@ as issues in the [issue tracker](https://github.com/slawlor/actordb/issues):
   work, stops replication senders, drains every fragment mailbox, and reports
   the final local-store flush. A flush error retains the quiesced fragment and
   its batch; retry `shutdown` until it succeeds. The node does not resume after
-  an error. This local fence does not wait for replication ACKs. Dropping
-  `Node` only requests best-effort cancellation and stop; it cannot report a
-  flush failure or await a join. This pre-release change is a Rust source break:
+  an error. This local fence does not wait for replication ACKs.
+  `shutdown_with_replication_drain` is the opt-in bounded alternative: it
+  freezes placement, waits for admitted mutations, and requires a stable full
+  reconciliation plus the configured ACK durability from every frozen target
+  before entering the same local shutdown. Timeout/cancellation leaves the
+  quiesced node and transports alive for retry; ordinary `shutdown` explicitly
+  abandons the peer guarantee. `RetryableSender` requests a fresh exact sender
+  fence, while `Unavailable` means local-only shutdown has already made the
+  guarantee impossible. Its report proves a per-target fenced LWW version
+  floor, not exact/global cache equality, quorum, or fsync. Legacy empty-map
+  mode covers only senders known at the fence. Dropping `Node` only requests
+  best-effort cancellation and stop; it cannot report a flush failure or await
+  a join. This pre-release change is a Rust source break:
   callers must handle the new shutdown `Result`, and exhaustive matches over
   `NodeError` or the advanced `SupervisorMessage` API must include their new
   lifecycle variants.

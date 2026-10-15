@@ -250,6 +250,37 @@ bootstrap or unrelated fragments.
 Placement drain likewise treats `BufferReset` as active work even when its
 ordinary buffer and in-flight counts are zero.
 
+## Replication-drained node shutdown
+
+`Node::shutdown_with_replication_drain` reuses the correlated anti-entropy
+engine for a stronger, opt-in shutdown boundary. After the node closes local
+and inbound forwarded-mutation admission, joins placement work, and waits for
+admitted apply/fan-out work, each exact target sender closes its data ingress.
+It consumes every pre-fence data-lane item, subsumes any persistent overflow
+generation, discards superseded volatile streaming state, rotates the session,
+and runs a fresh full reconciliation. Completion is published only for that
+sender's private drain generation after a mutation-free, revision-stable pass
+and its tracked barrier ACK at `required_ack_durability`.
+
+This snapshot-based recovery is why queue emptiness is neither necessary nor
+sufficient: an overflowed or replaced volatile queue may be empty while the
+authoritative fragment cache still contains unreplicated winners. Conversely,
+old buffered and in-flight deltas can be retired after the fresh stable round
+has covered their LWW winners. Stale sessions, rounds, ACKs, replacement sender
+tasks, and weak durability levels cannot satisfy the retained generation.
+Disconnect, NACK, phase timeout, and reconnect retry that same generation.
+
+The result is a per-fragment/per-peer LWW version floor at the admission cut,
+not exact cache equality or a simultaneous global snapshot. Concurrent inbound
+replication can introduce newer winners, which are safe under LWW but do not
+turn the report into a quorum certificate. Timeout or caller cancellation
+leaves transport and any issued exact generations alive for retry. If an exact
+sender task itself stops, `RetryableSender` reports that a retry must replace it
+and take a fresh fence from the authoritative cache. Ordinary `Node::shutdown`
+is the explicit local-only escape. Socket response delivery is outside the
+barrier, so a client may need to retry an operation whose response was lost
+after its mutation became durable.
+
 Tombstones are retained: `Node::start` rejects time-based GC because neither a
 quiet sender nor an elapsed age proves that every current and future replica
 has durably observed the deletion. Safe reclamation requires durable
