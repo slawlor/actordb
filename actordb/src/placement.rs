@@ -34,8 +34,8 @@
 //!
 //! Dynamic placement is opt-in: set
 //! [`NodeConfig::placement_controller`](crate::node::NodeConfig::placement_controller).
-//! With no controller configured, the node behaves exactly as before
-//! (static placement, full-state handshake sync).
+//! With no controller configured, placement is static; established replica
+//! sessions still use the same correlated reconciliation engine.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;

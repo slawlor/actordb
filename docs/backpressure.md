@@ -42,7 +42,7 @@ Defaults per `NodeConfig`:
 | `background_pool` | 2 | 5 000 | Some(1000) |
 
 The background pool is rate-limited by default: bulk APIs (`put_multi`,
-`get_multi`, sync-merge applies) can't exceed 1000 ops/s even when idle
+`get_multi`) can't exceed 1000 ops/s even when idle
 capacity exists elsewhere.
 
 ## Admission and shedding
@@ -63,13 +63,32 @@ Shed behavior by operation:
 - **Replicated/reconciled write** → currently bypasses admission control. This
   avoids shedding an operation that the receiver must account for before ACK,
   but means the actor mailbox itself is not yet a node-wide bounded
-  replication queue. Each connection awaits replication and legacy sync
-  applies sequentially, and each outbound Node sender now has bounded mutation
-  and control lanes; those count bounds do not constitute a receiver-side byte
+  replication queue. Each connection awaits replication and reconciliation
+  applies sequentially, and each outbound Node sender has bounded mutation and
+  control lanes; those count bounds do not constitute a receiver-side byte
   budget across connections.
 - **Forwarded client write** → the remote owner returns an ordered typed
   mutation result. A shed single put or batch entry reaches the origin as
   `NodeError::Backpressure`; it is never reported as success.
+
+Wire-size admission is a separate safety boundary from queue depth. Before a
+mutation is applied locally, actordb verifies that the record can fit every
+required single-record protocol envelope. Summary, fetch, data, repair, and
+ordinary replication builders then measure exact encoded size, target 1 MiB
+pages, and enforce a 16 MiB hard frame limit. This prevents an irreducible
+record from wedging replication. The 256-frame peer queue is complemented by
+an independent 32 MiB default encoded-byte budget (configurable through
+`NodeRuntimeOptions`). Its frame slots are split evenly between ordinary data
+and a writer-priority response lane. Ordinary producers also leave 1 MiB of
+the shared byte budget reserved for responses. Connection-reader responses
+never await admission: a response larger than the available reserve, or a full
+response lane, closes the connection for correlated replay. Response priority
+is capped at 16 consecutive frames whenever data is ready.
+Anti-entropy additionally admits one peer-wide round at a time through a
+ticketed FIFO gate, and an
+allocation-free protobuf preflight caps repeated decode cardinality before
+allocating. Receiver actor mailboxes still count messages rather than payload
+bytes.
 
 The current custom pool does **not** provide lossless worker restart. Accepted
 jobs already queued in a dead worker's actor mailbox are dropped, and their

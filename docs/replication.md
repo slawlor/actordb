@@ -30,8 +30,8 @@ background.
   next session. Legacy map-empty mode instead discovers peer identities at
   runtime and reaps their senders on disconnect so sequential claimants cannot
   grow the sender maps without bound. Writes made during that legacy downtime
-  are recovered by the mandatory static-mode full-state exchange on reconnect,
-  including tombstones; that exchange is therefore part of the legacy mode's
+  are recovered by mandatory immediate correlated reconciliation on reconnect,
+  including tombstones; that round is therefore part of the legacy mode's
   safety contract, not an optional optimization.
 - **BufferReset**: entered when either the mutation-ingress lane or owned
   buffer is full. Shed commands name mutations already applied to authoritative
@@ -50,7 +50,7 @@ fences outbound repairs with a tracked empty batch, and verifies that neither
 the reset epoch nor the fragment-wide mutation revision changed since the
 snapshot. Otherwise it starts another round. This revision fence includes
 inbound replication, reconciliation, expiry conversion, and tombstone
-reclamation—not only writes enqueued by this sender.
+materialization—not only writes enqueued by this sender.
 
 Tuning lives in `SenderConfig` (see [Configuration](configuration.md)):
 `batch_size: 100`, `batch_interval: 100 ms`, `max_in_flight: 4`,
@@ -90,10 +90,10 @@ stalling replication until the ordinary ACK timeout. A tracked batch that
 arrives before actor installation receives a NACK and is replayed under the
 same session. Out-of-range fragments are rejected, which bounds the
 per-connection session table by `fragment_count`. Normal replication batches
-are processed sequentially per connection and await every actor apply. Legacy
-full-state `SyncResponse` entries now do the same and are counted only after
-successful application; a shed or failed apply closes the connection so
-handshake sync can retry instead of silently dropping a suffix.
+are processed sequentially per connection and await every actor apply.
+`SyncRequest` and `SyncResponse` are retired protocol-v3 frames; receiving
+either closes the connection rather than activating a second, unbounded sync
+engine.
 
 A tracked batch carries the sender's `required_ack_level`. The receiver first
 verifies that every key belongs to the declared fragment and awaits every exact
@@ -128,14 +128,14 @@ permanently failing store from becoming a tight write/log loop.
 ACK; the batch remains in flight. A weak ACK does not extend that batch's
 original deadline. ACK observations reset on every session.
 
-Protocol-v2 `Hello` advertises an inclusive protocol-version range, capability
+Protocol-v3 `Hello` advertises an inclusive protocol-version range, capability
 bits for exact mutation results, durability ACKs, correlated reconciliation,
-and challenge authentication, plus a fresh 256-bit challenge. Both endpoints
-then send `HelloAuth`. With `cluster_secret` configured, its HMAC-SHA256 binds
-the ordered dialer/listener roles, both complete Hello offers, the selected
-version/capabilities, and both challenges. A captured v2 exchange therefore
-cannot be replayed on a fresh connection, and an on-path peer without the key
-cannot rewrite an id or feature bit.
+challenge authentication, and paged anti-entropy, plus a fresh 256-bit
+challenge. Both endpoints then send `HelloAuth`. With `cluster_secret`
+configured, its HMAC-SHA256 binds the ordered dialer/listener roles, both
+complete Hello offers, the selected version/capabilities, and both challenges.
+A captured v3 exchange therefore cannot be replayed on a fresh connection, and
+an on-path peer without the key cannot rewrite an id or feature bit.
 
 The proof establishes fresh possession of a cluster-wide shared key, not
 individual node identity: any key holder can claim any node id. Plain TCP also
@@ -143,13 +143,13 @@ provides no confidentiality or post-handshake frame integrity. Without a
 secret, `HelloAuth` is empty and provides sequencing/freshness for connection
 election, not authentication. Missing challenge fields, the retired v1 Hello
 tag, and incompatible ranges/capabilities fail closed. The current binary
-supports only wire v2, which is wire-incompatible with v1, so upgrades require
-mutually compatible binaries rather than a rolling v1/v2 mix. Moving from v1
-to v2 is also a Rust source break for advanced users of the public generated
-`actordb::proto` types: `Hello` gained a
-`challenge` field and `EnvelopeMsg` gained a `HelloAuth` variant, so struct
-literals and exhaustive matches must change along with the coordinated wire
-deployment.
+supports only wire v3 and requires the paged-anti-entropy capability. V3 is
+wire-incompatible with v2, so upgrades require mutually compatible binaries
+rather than a mixed v2/v3 rolling deployment. It is also a Rust source break
+for advanced users of the public generated `actordb::proto` types:
+`ReconcileRequest`, `ReconcileResponse`, and `ReconcileData` gained pagination
+and snapshot-correlation fields, so struct literals and protocol assumptions
+must change with the coordinated deployment.
 
 Every ordinary streaming batch receives an ACK deadline after its frame enters
 the peer queue (30 seconds by default). If any ordinary batch expires, the
@@ -176,12 +176,24 @@ enqueue-plus-response attempt.
 
 ## Periodic reconciliation (anti-entropy)
 
-Every `consistency_interval` (default 300 s) each connected sender sends
-`ReconcileRequest { fragment, session_id, round_id }`. The receiver replies
-with the same correlation fields and one `KeySummary`
-per local key — `{ key, timestamp_ms, node_id, is_tombstone }`, built from a
-`GetAll` that **includes tombstones** (sync must ship deletes). The requester
-then, for each key, compares with `wins_over`:
+Every `consistency_interval` (default 300 s) each connected sender starts a
+correlated round. This is also the immediate catch-up path after connection in
+both static and dynamic placement. `ReconcileRequest` carries
+`(session_id, round_id, page_seq)` plus an exclusive key cursor, an observed
+revision, and a pinned TTL time. The responder walks its cache's ordered key
+index and returns byte- and count-bounded
+`KeySummary { key, timestamp_ms, node_id, is_tombstone }` pages. Expired live
+values are represented by their deterministic tombstone at the pinned time.
+
+Neither side holds a cache lock or clones a fragment-wide snapshot across
+network turns. A pass tolerates revision drift while walking monotonically by
+cursor and records whether either side changed or any repair was transferred.
+After its durability barrier, every changed or revision-drifted pass is
+followed immediately by a fresh pass from the beginning. A round is counted
+complete only after a mutation-free, revision-stable verification pass whose
+local revision still matches at barrier completion. This avoids both unbounded
+snapshots and the page-by-page restart storm that applying repairs would
+otherwise cause. The requester merge-compares the two ordered streams:
 
 - peer wins → key goes to `fetch_keys`;
 - local wins → key is shipped to the peer in a `ReplicateBatch` with
@@ -189,12 +201,30 @@ then, for each key, compares with `wins_over`:
   repairs and the requested durability fence;
 - keys only one side has are fetched or shipped accordingly.
 
-Fetches go out as `ReconcileFetch` (chunked at 500 keys per message;
-`RECONCILE_FETCH_CHUNK = 500`) and values return in a matching
-`ReconcileData`. Missing, duplicate, unrequested, or wrong-fragment entries
-reject the whole chunk before any apply. Valid entries are merged locally at
-`OpPriority::Default`. Stale responses are ignored, and LWW makes a retried
-exchange idempotent.
+Fetch keys are grouped into exact-byte-bounded `ReconcileFetch` chunks of at
+most 256 keys. The responder reads memory-bounded `GetVersionedPage` batches
+under one cache lock per value page, moves them into exact-byte-bounded
+`ReconcileData` pages, and streams correlated pages through the byte-budgeted
+writer. This avoids both one actor round trip per key and one network round
+trip per key without cloning the fragment or accumulating an unbounded value
+burst.
+Every requested key must appear exactly once before the terminal page;
+missing, duplicate, unrequested, or wrong-fragment data rejects the exchange
+before the barrier can certify it.
+Valid entries are merged locally at `OpPriority::Default`. Stale responses are
+ignored, and LWW makes a retried exchange idempotent.
+
+Summary, fetch, data, repair, and ordinary replication builders measure the
+exact encoded protobuf envelope. They target 1 MiB pages; a single valid record
+may exceed that soft target, but no frame may exceed the 16 MiB hard limit.
+One credit shared by all fragment senders on a physical connection admits one
+complete reconciliation round at a time. Credit release wakes queued retries;
+this bounds responder work without a fragment-count-dependent queue cliff.
+Multi-page fetch responses run in a connection-owned worker so both peers'
+socket readers remain live during symmetric large-value repair.
+An irreducible oversized mutation is rejected before local apply. Persisted
+records created by an older binary are checked during cache load and fail
+startup if they cannot traverse every required single-record envelope.
 
 When a requester with a configured store fetches winners under a
 `StoreCommitted` policy, it also flushes those local applies before sending the
@@ -216,39 +246,38 @@ quiet sender nor an elapsed age proves that every current and future replica
 has durably observed the deletion. Safe reclamation requires durable
 convergence watermarks and durable store deletion, which are not implemented.
 
-Reconcile fetches are chunked by key count, but the summary response still
-describes the whole fragment in one frame and neither path is currently
-budgeted by encoded bytes. A large fragment or value can exceed the 16 MiB
-frame limit; byte-bounded reconciliation pagination remains follow-up work.
+## The Hello handshake and unified catch-up
 
-## The Hello / full-state handshake
-
-The connection handshake is **not** replaced by the reconciler in static mode.
 Both endpoints send `Hello { node_id, protocol range, capabilities, challenge }`
 and then mutually prove the ordered transcript with `HelloAuth`. One absolute
 handshake deadline covers both flights. A configured member dialer also checks
 the claimed id against the id assigned to that address. Only after mutual proof
 does either side publish the connection. If crossed or duplicate dials race,
 both endpoints use the same transcript-derived rank to retain the same winner;
-the losing dialer waits while that winner remains live. Then,
-when dynamic placement is *off*, each side sends a full-state `SyncRequest`
-for its fragments and the peer answers with `SyncResponse` entries. With the
-Phase 8 placement driver active, the handshake skips `SyncRequest` entirely —
-the reconciler owns anti-entropy (the rolling-restart test asserts
-`sync_entries_applied() == 0` in that mode).
+the losing dialer waits while that winner remains live. After authentication,
+the sender state machines run immediate correlated reconciliation for every
+placement mode. `SyncRequest`/`SyncResponse` are retained only as generated
+compatibility types and are rejected on the v3 wire.
 
-This distinction is especially important when the static `fragment_map` is
-empty (legacy full replication). Its connection-discovered senders are removed
-on disconnect rather than retaining downtime writes. The mandatory full-state
-request/response restores the current LWW winners after reconnect. With an
-explicit placement map, senders are bounded by configured replica identities
-and remain present while disconnected, preserving their bounded buffers and
-reset/reconciliation state in addition to the static full-state exchange.
+When the static `fragment_map` is empty (legacy full replication),
+connection-discovered senders are removed on disconnect rather than retaining
+downtime writes or an unbounded set of discovered identities. Mandatory
+reconciliation after reconnect restores current LWW winners and tombstones.
+With an explicit placement map, senders are bounded by configured replica
+identities and remain present while disconnected, preserving their bounded
+buffers and reset state as well. `sync_entries_applied()` is a compatibility
+counter for the retired protocol and remains zero in every mode.
 
 ## Wire framing and transport notes
 
 - Messages are 4-byte length-prefixed protobuf `Envelope`s over TCP;
-  `MAX_FRAME_BYTES` is 16 MiB.
+  anti-entropy and ordinary replication target 1 MiB encoded bodies, and
+  `MAX_FRAME_BYTES` is the absolute 16 MiB body limit.
+- Before Prost allocates, an envelope preflight rejects retired/ambiguous
+  messages and caps repeated anti-entropy fields at 256 items and general
+  batch fields at 4096. Reader-generated responses use immediate bounded
+  admission; saturation closes the correlated connection for replay instead
+  of parking the reader behind its own writer.
 - Reconnect uses exponential backoff from `RECONNECT_BASE` (100 ms, doubling),
   capped at 30 seconds with jitter and managed by the redial supervisor in the
   node layer. Configured members retry from their first failed dial; manual
@@ -258,16 +287,28 @@ reset/reconciliation state in addition to the static full-state exchange.
   is capped at 4 KiB. Completed listener, handler, writer, dial, timer, and
   placement tasks are continuously reaped and are abort-and-joined at explicit
   Node shutdown.
-- The per-peer outbound queue defaults to 256 **frames** through
-  `NodeRuntimeOptions`; it is not byte-bounded. All protocol traffic shares the
-  same queue and socket writer. `OpPriority` selects the receiver's actor pool
-  but does not give its frame queue precedence.
+- The per-peer outbound writer pipeline defaults to 256 frames and 32 MiB of
+  admitted encoded data through `NodeRuntimeOptions`. Producers reserve the
+  data-lane ingress and exact byte permits before encoding; the permit remains
+  attached to the queued/current frame and is released by RAII on writes,
+  cancellation, or task failure. Reader-generated responses use a separately
+  bounded, writer-priority lane and retain a 1 MiB share of the total byte
+  budget. The writer forces one ready data frame after at most 16 responses.
+  Both lanes share the socket writer. `OpPriority` selects the
+  receiver's actor pool but does not reorder the ordinary data lane. Ordinary
+  frames use the 5-second queue admission default; streamed
+  reconciliation-data pages have an explicit 30-second default so a near-limit
+  value can wait behind another legal frame.
+- A ticketed FIFO gate admits one reconciliation round per physical connection
+  while guaranteeing that a fragment starting a follow-up round rejoins behind
+  fragments already waiting for bootstrap or repair.
 - Each fragment/peer Node sender separately retains at most
   `buffer_capacity` queued mutation commands, `buffer_capacity` owned deltas,
   `max_in_flight * batch_size` ordinary in-flight operations, and 64 queued
-  control messages by default. These are count bounds; values and control
-  payloads are not byte-budgeted. Standalone `spawn_sender*` callers retain the
-  source-compatible unbounded command channel.
+  control messages by default. These sender lanes remain count bounds even
+  though the downstream writer and each encoded frame are byte-capped.
+  Standalone `spawn_sender*` callers retain the source-compatible unbounded
+  command channel.
 - Remote fragment fan-out and per-fragment replica attempts are sequential;
   priority does not make those network attempts concurrent.
 - Every inbound version path, including `ReconcileData`, validates and observes
@@ -276,6 +317,6 @@ reset/reconciliation state in addition to the static full-state exchange.
 ## Tombstones over replication
 
 Tombstones are first-class replicated entries: they carry HLC timestamps, ride
-in `ReplicateBatch` ops and `SyncEntry`/`KeySummary` messages with their
+in `ReplicateBatch` ops and `ReconcileData`/`KeySummary` messages with their
 `is_tombstone` flag, and are compared by `wins_over` like any other write.
 See [Tombstones & deletes](tombstones.md).

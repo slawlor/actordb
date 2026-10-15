@@ -20,8 +20,8 @@ package meta;
 message Hello {
   string node_id = 1;
   // Retained at its original field number for safe protobuf field evolution.
-  // Protocol v2 is a coordinated source/wire break: this field must be empty
-  // and the challenge-bound proof is carried in HelloAuth.
+  // Since protocol v2 this field must be empty; the challenge-bound proof is
+  // carried in HelloAuth.
   bytes auth_tag = 2;
   // Inclusive wire-version range understood by this peer. Both are nonzero;
   // a connection proceeds only when the ranges overlap.
@@ -123,13 +123,13 @@ message GetResponse {
   bool shed = 8;
 }
 
-// Ask a peer for the fragments listed (anti-entropy when a node joins
-// or a peer returns). Empty = all fragments the peer holds.
+// Retired protocol-v1/v2 full-state frames. They remain generated for source
+// compatibility, but a protocol-v3 connection closes if either is received.
 message SyncRequest {
   repeated uint32 fragments = 1;
 }
 
-// A peer's full local state
+// Retired peer full-state response; see SyncRequest above.
 message SyncResponse {
   repeated SyncEntry entries = 1;
 }
@@ -207,6 +207,13 @@ message ReconcileRequest {
   uint64 session_id = 2;
   // Monotonic within a sender session. Responses from older rounds are stale.
   uint64 round_id = 3;
+  // V3 byte-bounded summary pagination. Page zero starts a pass; later pages
+  // echo its cursor, observed revision, and pinned TTL time. Revision drift is
+  // allowed during the bounded pass and forces a fresh verification pass.
+  uint64 page_seq = 4;
+  string after_key = 5;
+  uint64 snapshot_revision = 6;
+  uint64 snapshot_time_ms = 7;
 }
 
 message ReconcileResponse {
@@ -214,6 +221,15 @@ message ReconcileResponse {
   repeated KeySummary summaries = 2;
   uint64 session_id = 3;
   uint64 round_id = 4;
+  // V3 page correlation and continuation metadata.
+  uint64 page_seq = 5;
+  string next_after_key = 6;
+  uint64 snapshot_revision = 7;
+  uint64 snapshot_time_ms = 8;
+  bool done = 9;
+  // The responder could not continue this pass; discard its partial result
+  // and begin again with a fresh nonzero round id.
+  bool restart = 10;
 }
 
 message ReconcileFetch {
@@ -231,6 +247,10 @@ message ReconcileData {
   uint64 session_id = 3;
   uint64 round_id = 4;
   uint64 chunk_seq = 5;
+  // V3 page correlation within one bounded fetch chunk. Large value sets are
+  // streamed across exact-byte-bounded pages.
+  uint64 page_seq = 6;
+  bool done = 7;
 }
 
 // Phase 6: multi-key fan-out. One message per remote fragment/owner attempt.

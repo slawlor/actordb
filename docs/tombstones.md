@@ -15,10 +15,11 @@ serving the old value forever.
    enqueued for asynchronous replication.
 2. **Reads**: `get` filters tombstones — a tombstoned key reads as `Ok(None)`,
    indistinguishable from "never existed".
-3. **Replication**: tombstones ride in `ReplicateBatch` ops, `SyncEntry`s, and
-   `KeySummary`s with their `is_tombstone` flag. `get_all` (used for sync and
-   reconcile summaries) explicitly *includes* tombstones — "sync must ship
-   tombstones so deletes propagate."
+3. **Replication**: tombstones ride in `ReplicateBatch` ops, reconcile
+   `SyncEntry` data pages, and `KeySummary`s with their `is_tombstone` flag.
+   Ordered summary pages, `GetVersioned`, and bounded `GetVersionedPage`
+   explicitly include tombstones —
+   anti-entropy must ship tombstones so deletes propagate.
 4. **TTL expiry**: an expired live value becomes an expiry tombstone with the
    same `(timestamp_ms, node_id)` and a winning `is_tombstone` tie-break bit.
    It beats the TTL value and every older version without deleting a genuinely

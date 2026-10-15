@@ -11,9 +11,9 @@ and results come back in input order.
 2. Local keys (this node serves the fragment) run through the normal single-key
    path — including the exact per-op apply outcome — concurrently via
    `join_all`, then are stamped back into their input positions.
-3. Remote keys are grouped by `FragmentId` and each group goes out as **one**
-   `BatchPut` / `BatchGet` message per owner attempt — one message for all of
-   that fragment's keys, not one message per key.
+3. Remote keys are grouped by `FragmentId`, then split into chunks of at most
+   4096 items before `BatchPut` / `BatchGet` owner attempts. This matches the
+   receiver's allocation-safe pre-decode cardinality limit.
 4. Put responses must match the request's cardinality, key order, and explicit
    request indices before results are mapped into the input-aligned `Vec`:
    `Vec<Result<(), NodeError>>` for puts,
@@ -28,13 +28,17 @@ and results come back in input order.
   batch; `BatchGet.priority` likewise). The remote owner executes at the
   caller's priority — "fan-out preserves traffic isolation end-to-end."
 - Priority chooses the destination actor pool. It does **not** prioritize the
-  shared per-peer outbound frame queue; control, replication, high-priority,
-  and background frames contend for the same queue and socket writer.
+  per-peer outbound data lane; replication, high-priority, and background
+  producer frames contend there. Reader-generated protocol responses use a
+  separate writer-priority lane, independent of `OpPriority`.
 
 Remote fan-out is currently sequential: the caller awaits one fragment group
-at a time, and each group's replica holders are attempted one at a time in
-placement order. A slow attempt therefore delays later holders and later
-remote fragments.
+and count chunk at a time, and each chunk's replica holders are attempted one
+at a time in placement order. A slow attempt therefore delays later holders,
+chunks, and remote fragments. Chunks are not yet split by aggregate encoded
+bytes: a chunk of individually valid large records can exceed the 16 MiB frame
+limit and fail locally without being sent. Byte-based aggregate chunking is a
+separate follow-up.
 
 ## Remote puts: exact outcomes and bounded failover
 

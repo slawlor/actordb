@@ -23,8 +23,8 @@ credentials, multi-datacenter support, or transactional semantics.
   disconnect, and are repaired by periodic delta reconciliation
   (see [Replication](replication.md)).
 - **Opt-in persistence**: RocksDB behind the `rocksdb` cargo feature. Threshold,
-  write-age, periodic, requested `StoreCommitted` ACK, and reconciliation
-  fences flush ordered batches (see [Persistence](persistence.md)).
+  write-age, periodic, and requested `StoreCommitted` ACK or reconciliation
+  barrier flushes ordered batches (see [Persistence](persistence.md)).
 
 ## Crate layout
 
@@ -34,8 +34,8 @@ integration crate, and an `xtask` for coverage.
 | Module | Role |
 |---|---|
 | `actordb::node` | Public API: `Node`, `NodeConfig`, `NodeError`, peer mesh, routing, forwarding, replication wiring, placement driver |
-| `actordb::actor` | Per-fragment `KvActor` dispatcher, `WorkerPool`, `FragmentState` (the in-memory cache), `VersionedValue`, `wins_over`, `HlcClock`, priority enum |
-| `actordb::replication` | Phase 5 async sender/receiver: `ReplicationSender` state machine, sessions, acks, `ReconcileRequest/Response/Fetch/Data` anti-entropy |
+| `actordb::actor` | Per-fragment `KvActor` dispatcher, `WorkerPool`, indexed `FragmentState` cache, bounded summary/single-value primitives, `VersionedValue`, `wins_over`, `HlcClock`, priority enum |
+| `actordb::replication` | Phase 5 async sender/receiver: `ReplicationSender` state machine, sessions, acks, protocol-v3 paged `ReconcileRequest/Response/Fetch/Data` anti-entropy |
 | `actordb::supervision` | `FragmentSupervisor` + children: dispatcher, `Cleaner` (TTL-expiry markers), `Snapshotter` (periodic flush) |
 | `actordb::placement` | Phase 8 dynamic placement: `PlacementController` trait, `StaticPlacement`, `ManualPlacement`, migration lifecycle states |
 | `actordb::store` | `KvStore` trait, `MemoryStore`, `PrefixedStore`, `RocksDbStore` (feature-gated) |
@@ -91,7 +91,7 @@ Key design points:
 
 - No transactions, no multi-key atomicity (see [Multi-key batching](batching.md)
   for exactly what `put_multi` guarantees — it's fan-out, not a transaction).
-- Plain TCP by default and no built-in TLS. Protocol v2 uses two fresh
+- Plain TCP by default and no built-in TLS. Protocol v3 uses two fresh
   challenges when proving possession of the optional cluster-wide secret, but
   that shared key does not distinguish members and does not protect subsequent
   frames. Confidential, individually authenticated transports remain an
@@ -99,4 +99,5 @@ Key design points:
 - No consensus: conflict resolution is last-writer-wins by HLC timestamp, not
   Raft/Paxos (see [Consistency](consistency.md)).
 - Persistence is opt-in (`store: None` by default = pure in-memory) and crash
-  recovery for the unflushed tail relies on peer sync (see [Persistence](persistence.md)).
+  recovery for the unflushed tail relies on peer reconciliation (see
+  [Persistence](persistence.md)).

@@ -11,6 +11,23 @@ admission and shed counting, token-bucket behavior, seahash fragment mapping,
 and store encode/decode round-trips. These pin the semantics that the
 integration tests rely on.
 
+Protocol-v3 pagination tests cover lexicographically ordered/exclusive summary
+cursors (including the empty-string key), revision-drift detection, zero-limit
+clamping, metadata-byte bounds, pinned TTL tombstone synthesis shared by
+summaries and exact-value reads, bounded `GetVersionedPage` cloning, and
+summary-page metadata. Wire helpers separately
+test the exact encoded-size boundary, the 1 MiB soft-page/16 MiB hard-frame
+distinction, rejection before oversized encoding/allocation, repeated-field
+decode-amplification preflight, and parity with direct prost encoding.
+Replication tests also pin exact-byte streaming batch splits, peer-writer
+byte-budget backpressure, shared physical-connection reconciliation credits,
+FIFO handoff between competing fragments, nonblocking reader responses, their
+bounded-burst priority lane and byte reserve, and stale-session responder
+cancellation. A 4097-item remote batch regression crosses the allocation-safe
+wire cardinality boundary without dropping the connection. A
+bidirectional ten-fragment cluster test combines symmetric near-limit values,
+the minimum writer byte budget, and simultaneous reconciliation.
+
 Bounded replication-ingress unit tests additionally pin that a full mutation
 lane publishes a persistent reset generation, that the independent control
 lane fails fast at its cap, and that peer/reconcile signals remain available.
@@ -30,7 +47,11 @@ process — the bulk of behavioral coverage:
 - **Routing**: `fragments_route_and_isolate`,
   `disjoint_fragments_route_to_owner`, `replica_fanout_reaches_other_holder`.
 - **Failures**: `dropped_connection_redials`,
-  `restarted_node_writes_are_accepted`, `late_joiner_receives_full_state`,
+  `restarted_node_writes_are_accepted`,
+  `late_joiner_converges_via_immediate_reconciliation`,
+  `failed_immediate_reconciliation_is_not_counted_and_retries`,
+  `reconciliation_paginates_summaries_and_fetches_without_restart_storms`,
+  `reconcile_cursor_continues_after_revision_drift_for_verified_multi_pass`,
   `worker_kill_triggers_supervised_restart`, and
   `incompatible_hello_capabilities_are_rejected`.
 - **TTL/tombstones**: `ttl_expiry_removes_key`,
@@ -71,7 +92,7 @@ process — the bulk of behavioral coverage:
 - **Placement**: `placement_migration_no_lost_writes` (single writer during a
   live migration asserts zero lost writes),
   `placement_rolling_restart_delta_reconcile_only` (restarted node converges
-  with zero full-state sync entries),
+  through reconciliation with the retired sync counter still zero),
   `placement_bootstrap_fetch_requires_verification_round`,
   `placement_drain_waits_for_buffer_reset`, and
   `placement_readd_while_draining_cancels_teardown`.

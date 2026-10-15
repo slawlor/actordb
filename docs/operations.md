@@ -9,9 +9,9 @@
    an idle fragment is flushed on `snapshot_interval`.
 2. On restart with the same `node_id`, the node re-establishes sessions (new
    `session_id`; receivers discard the old session's batches) and the Phase 5
-   reconciler repairs the divergence — in static mode the full-state
-   `SyncRequest` handshake also runs; with the placement driver active only
-   delta reconciliation runs (`sync_entries_applied` stays 0).
+   reconciler repairs the divergence. Static and dynamic placement use the same
+   correlated, byte-bounded reconciliation path; `SyncRequest`/`SyncResponse`
+   are retired and `sync_entries_applied()` remains zero.
 3. The Docker `SIGKILL + restart reconvergence` scenario covers exactly this:
    a node is SIGKILLed mid-write, restarted, and must reconverge with its
    peers. A redial supervisor in the node layer re-establishes dropped
@@ -27,16 +27,28 @@ timestamp farther in the future than `max_clock_skew` fails startup rather
 than allowing that version to freeze its key; investigate clock rollback or
 poisoned data before widening the bound.
 
+Startup also preflights every durable record against the protocol's required
+single-record envelopes. A legacy key/value that cannot fit the 16 MiB hard
+frame limit fails startup instead of loading permanently unreplicable data.
+
 ### Rolling restart with placement
 
 With a `PlacementController` configured, a rolling restart is the migration
-gain path: the restarted node (same `node_id`) re-polls the controller, spawns
-its fragment subtrees, and bootstraps each fragment via an on-demand
-reconcile round from a surviving replica — chunked, bounded by
-`BOOTSTRAP_TIMEOUT` (30 s), availability-over-consistency on timeout. Surviving
+gain path: the restarted node (same `node_id`) synchronously reloads its
+durable fragment subtrees without serving them, re-polls the controller, and
+bootstraps each fragment via an on-demand
+reconcile round from a surviving serving replica. The exchange is paged,
+bounded by exact encoded bytes and `BOOTSTRAP_TIMEOUT` (30 s), and fails closed:
+a timeout leaves the fragment non-authoritative for a later retry. Surviving
 replicas keep serving throughout. Covered by
 `placement_rolling_restart_delta_reconcile_only`, which asserts the restarted
-node converges to the full dataset with zero full-state sync entries.
+node converges to the full dataset while the retired sync counter remains zero.
+
+For cold cluster genesis, publish one owner per fragment first and wait for it
+to report `Serving` before adding overlap replicas. If every member of a
+multi-replica placement starts non-authoritative at once, all remain
+`Bootstrapping`: actordb deliberately refuses to let equally unverified empty
+nodes certify one another.
 
 ### Network partition
 
@@ -57,10 +69,13 @@ node converges to the full dataset with zero full-state sync entries.
 
 ### Slow or non-reading peer
 
-- Each connection has one shared outbound queue, 256 frames by default. Queue
-  admission is capped at 5 seconds and each complete socket frame write at 30
-  seconds. Either expiry cancels that exact connection; its senders retain or
-  requeue outstanding work, and the configured dialer reconnects with backoff.
+- Each connection has one shared outbound pipeline, bounded by 256 frames and
+  32 MiB of admitted encoded data by default. Half the frame slots and 1 MiB
+  of bytes are reserved from ordinary producers for writer-priority protocol
+  responses. Queue admission is capped at 5 seconds and each complete socket
+  frame write at 30 seconds. Either expiry cancels that exact connection; its
+  senders retain or requeue outstanding work, and the configured dialer
+  reconnects with backoff.
 - At most 1024 accepted sockets are concurrently handshaking or serving as
   inbound peers by default; excess accepted sockets are closed. The complete
   `Hello`/`HelloAuth` exchange has one absolute 5-second deadline and pre-auth
@@ -86,13 +101,24 @@ node converges to the full dataset with zero full-state sync entries.
 - Reconciliation summary/data/barrier waits use
   `SenderConfig::reconcile_timeout` (also 30 seconds by default), not the
   ordinary ACK deadline.
+- Summary, fetch, data, repair, and ordinary replication frames are split by
+  exact encoded protobuf size. They target 1 MiB pages and never exceed the
+  16 MiB hard frame limit. A single record that cannot fit is rejected before
+  local apply, so reconnect cannot loop forever on an unsendable mutation.
 
 The peer queue, control-lane capacity, and timeout values are configurable
 through `NodeRuntimeOptions`; mutation ingress follows
 `SenderConfig::buffer_capacity`. Use
-`Node::start_with_options`. Queue capacity counts frames, not bytes: frames can
-approach the 16 MiB protocol limit, so 256 slots are not a fixed memory budget.
-Operation priority does not reorder this shared socket queue.
+`Node::start_with_options`. The shared writer pipeline defaults to both 256
+frames and 32 MiB of admitted encoded data; one ingress reservation bounds
+producers waiting to acquire byte permits before any encoded body is allocated.
+The owned permit then travels with the frame and releases on every write/drop path.
+Reader-generated responses have a separate priority lane and a 1 MiB byte
+reserve; operation priority does not reorder the ordinary producer lane.
+Ordinary queue admission defaults to 5 seconds; streamed reconciliation-data
+pages use the separate 30-second `reconcile_data_admission_timeout` so large
+legal frames do not churn an otherwise healthy slow connection. Configured
+frame capacity must be at least two and byte capacity at least 17 MiB.
 
 ### Peer startup, identity, and duplicate connections
 
@@ -104,7 +130,7 @@ Operation priority does not reorder this shared socket queue.
   rejected before it enters the peer map.
 - `Node::connect(address)` tries its first dial once. It returns after that
   successful transport is handed to the Node-owned redial supervisor, before
-  authentication and static-mode full-state sync complete. Concurrent calls for
+  authentication and immediate reconciliation complete. Concurrent calls for
   the same address wait for the pending initial dial instead of returning early.
   The supervisor pins the first successfully authenticated node id and rejects a
   different id on later reconnects. Later failures retry in the background.
@@ -112,7 +138,7 @@ Operation priority does not reorder this shared socket queue.
   challenge-bound transcript and direction, keep the same winner, cancel the
   loser, and park its dial supervisor while the winner remains healthy. This
   avoids continuously rotating replication sessions.
-- With `cluster_secret`, protocol v2 proves fresh possession of the shared key
+- With `cluster_secret`, protocol v3 proves fresh possession of the shared key
   using both peers' random challenges. It does not distinguish holders of that
   shared key, encrypt traffic, or integrity-protect post-handshake frames. Use a
   mutually authenticated protected `Network` on an untrusted network.
@@ -152,9 +178,10 @@ read as "not found" — the API makes that impossible by construction.
 The driver's fail-safes, in order: `validate_placement` rejects maps that drop
 a fragment's replicas or leave a fragment uncovered (keeps the current
 placement); a failed subtree spawn clears the `Bootstrapping` mark so the next
-tick retries; bootstrap timeout goes Serving anyway; an incomplete revoke
-remains `Draining` and warns every `placement_drain_warn_interval` rather than
-discarding recovery state. Re-adding the node cancels that stale teardown.
+tick retries; bootstrap timeout leaves the fragment non-authoritative for a
+later retry; an incomplete revoke remains `Draining` and warns every
+`placement_drain_warn_interval` rather than discarding recovery state.
+Re-adding the node cancels that stale teardown.
 During map disagreement, ops re-forward hop-limited
 (`MAX_FORWARD_HOPS = 4`) instead of being dropped. If a controller publishes a
 bad map, `placement_report()` shows the authoritative map and per-fragment
@@ -168,7 +195,7 @@ states (`Bootstrapping`/`Serving`/`Draining`/`Stopped`) for diagnosis.
 | Shed counters | `health()[frag].shed_counts` | `(high, default, background)` — backpressure pressure per traffic class |
 | Restarts | `health()[frag].restarts` | Repeated worker/dispatcher restarts = crash loop; investigate before it cascades |
 | Placement | `Node::placement_report()` | Authoritative map, lifecycle states, `dynamic` flag — is migration stuck in `Bootstrapping`/`Draining`? |
-| Sync entries | `Node::sync_entries_applied()` | Full-state sync volume since start; nonzero in dynamic mode = reconciler isn't owning anti-entropy |
+| Legacy sync entries | `Node::sync_entries_applied()` | Compatibility counter for retired `SyncResponse`; always zero in protocol v3 |
 | Replication lag | `batch_interval` + receiver apply/flush + peer RTT | ACKs follow the receiver fence; an unanswered ordinary batch rotates and replays at `replication_ack_timeout`, while barriers use `reconcile_timeout` |
 | Peer churn | `Node::peer_count()` and timeout/session-rotation warning logs | Repeated queue/write cancellation or ACK expiry usually means a non-reading, overloaded, or unhealthy peer |
 
@@ -183,6 +210,7 @@ Operational rules of thumb:
   durable, replica-aware reclamation protocol.
 - The background pool's default 1000 ops/s rate limit is a feature, not a bug
   — raise it deliberately if your bulk path needs more.
-- Size the peer frame queue with encoded message sizes in mind; it is not a
-  byte-bounded memory budget. Reconciliation fetches are chunked at 500 keys,
-  but the fragment summary and encoded bytes are not paginated yet.
+- Tune the peer frame and byte capacities together. Protocol messages are
+  individually exact-byte bounded (1 MiB soft target, 16 MiB hard frame), and
+  the writer defaults to a 32 MiB encoded-data budget regardless of its 256
+  frame slots.

@@ -101,7 +101,7 @@ On partition:
 - No atomicity across keys: `put_multi` is fan-out, not a transaction
   (see [Multi-key batching](batching.md)).
 - No durability for the unflushed write tail on `kill -9` (see
-  [Persistence](persistence.md)) — recovered via peer sync.
+  [Persistence](persistence.md)) — recovered via peer reconciliation.
 - Expired keys read as absent, but expiry is evaluated at read time against
   each node's clock; a heavily skewed clock can serve an expired key slightly
   longer or hide a live one slightly early. The cleaner eventually persists a
