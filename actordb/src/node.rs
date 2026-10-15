@@ -4932,17 +4932,12 @@ mod tests {
         .await;
         let hop_envelope = read_test_envelope(&mut client).await;
         assert!(matches!(
-            hop_envelope.msg.as_ref(),
-            Some(EnvelopeMsg::MutationResponse(_))
+            hop_envelope.msg,
+            Some(EnvelopeMsg::MutationResponse(ref response))
+                if response.req_id == 11
+                    && response.results.len() == 1
+                    && response.results[0].status == MutationStatus::Unavailable as i32
         ));
-        if let Some(EnvelopeMsg::MutationResponse(hop_response)) = hop_envelope.msg {
-            assert_eq!(hop_response.req_id, 11);
-            assert_eq!(hop_response.results.len(), 1);
-            assert_eq!(
-                hop_response.results[0].status,
-                MutationStatus::Unavailable as i32
-            );
-        }
 
         // This state is an invariant violation, but the defensive path must
         // fail the whole batch instead of applying without an owned actor.
@@ -4972,17 +4967,12 @@ mod tests {
         .await;
         let batch_envelope = read_test_envelope(&mut client).await;
         assert!(matches!(
-            batch_envelope.msg.as_ref(),
-            Some(EnvelopeMsg::MutationResponse(_))
+            batch_envelope.msg,
+            Some(EnvelopeMsg::MutationResponse(ref response))
+                if response.req_id == 12
+                    && response.results.len() == 1
+                    && response.results[0].status == MutationStatus::Unavailable as i32
         ));
-        if let Some(EnvelopeMsg::MutationResponse(batch_response)) = batch_envelope.msg {
-            assert_eq!(batch_response.req_id, 12);
-            assert_eq!(batch_response.results.len(), 1);
-            assert_eq!(
-                batch_response.results[0].status,
-                MutationStatus::Unavailable as i32
-            );
-        }
 
         drop(client);
         tokio::time::timeout(Duration::from_secs(1), connection)
@@ -5211,13 +5201,13 @@ mod tests {
 
         tokio::time::timeout(Duration::from_secs(1), async {
             loop {
-                if !serving.read().unwrap().contains(&fragment) && senders.try_lock().is_err() {
-                    tokio::task::yield_now().await;
-                    if senders.try_lock().is_err() {
-                        break;
-                    }
-                }
+                let revoked = !serving.read().unwrap().contains(&fragment);
+                let first_lock_is_held = senders.try_lock().is_err();
                 tokio::task::yield_now().await;
+                let second_lock_is_held = senders.try_lock().is_err();
+                if revoked && first_lock_is_held && second_lock_is_held {
+                    break;
+                }
             }
         })
         .await
@@ -5299,13 +5289,13 @@ mod tests {
 
         tokio::time::timeout(Duration::from_secs(1), async {
             loop {
-                if !serving.read().unwrap().contains(&fragment) && senders.try_lock().is_err() {
-                    tokio::task::yield_now().await;
-                    if senders.try_lock().is_err() {
-                        break;
-                    }
-                }
+                let revoked = !serving.read().unwrap().contains(&fragment);
+                let first_lock_is_held = senders.try_lock().is_err();
                 tokio::task::yield_now().await;
+                let second_lock_is_held = senders.try_lock().is_err();
+                if revoked && first_lock_is_held && second_lock_is_held {
+                    break;
+                }
             }
         })
         .await
