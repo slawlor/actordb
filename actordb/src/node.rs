@@ -826,7 +826,7 @@ impl FragmentRouter {
             .read()
             .unwrap()
             .get(&fragment)
-            .map_or(false, |route| {
+            .is_some_and(|route| {
                 route.generation == generation && route.actor.get_id() == expected.get_id()
             })
     }
@@ -835,7 +835,7 @@ impl FragmentRouter {
         let mut actors = self.actors.write().unwrap();
         if actors
             .get(&fragment)
-            .map_or(false, |route| route.generation == generation)
+            .is_some_and(|route| route.generation == generation)
         {
             actors.remove(&fragment);
         }
@@ -2893,7 +2893,7 @@ impl Node {
         if config
             .cluster_secret
             .as_ref()
-            .map_or(false, |secret| secret.len() < 32)
+            .is_some_and(|secret| secret.len() < 32)
         {
             return Err(NodeError::Actor(
                 "cluster_secret must contain at least 32 bytes when configured".to_string(),
@@ -5406,7 +5406,7 @@ async fn bootstrap_from(
             if deps
                 .sender_rounds(fragment, source)
                 .await
-                .map_or(false, |rounds| rounds > *before)
+                .is_some_and(|rounds| rounds > *before)
             {
                 return true;
             }
@@ -5518,9 +5518,7 @@ async fn lose_fragment(deps: &PlacementDriverDeps, fragment: FragmentId) {
                 .read()
                 .unwrap()
                 .get(&fragment)
-                .map_or(true, |replicas| {
-                    !replicas.iter().any(|node| node == &deps.node_id)
-                });
+                .is_none_or(|replicas| !replicas.iter().any(|node| node == &deps.node_id));
             if !still_revoked {
                 // A re-add raced the final drain check. Keep the subtree
                 // non-serving and let the top of the loop realign senders and
@@ -5961,7 +5959,7 @@ fn validate_peer_hello(
     if hello.node_id == local_node_id {
         return Err("peer claimed the local node_id");
     }
-    if expected_peer_id.map_or(false, |expected| expected != hello.node_id) {
+    if expected_peer_id.is_some_and(|expected| expected != hello.node_id) {
         return Err("peer identity did not match the configured member");
     }
     if !hello.auth_tag.is_empty() {
@@ -6352,7 +6350,7 @@ async fn handle_connection(
                     let peers_guard = peers.lock().await;
                     if !peers_guard
                         .get(&peer)
-                        .map_or(false, |current| current.same_channel(&tx))
+                        .is_some_and(|current| current.same_channel(&tx))
                     {
                         break;
                     }
@@ -6400,7 +6398,7 @@ async fn handle_connection(
                         let mut sessions = sessions.lock().await;
                         if sessions
                             .get(&key)
-                            .map_or(false, |session| session.session_id == s.session_id)
+                            .is_some_and(|session| session.session_id == s.session_id)
                         {
                             false
                         } else {
@@ -6496,8 +6494,8 @@ async fn handle_connection(
 
                 if failure.is_none() && reconcile_barrier {
                     let same_serving_incarnation = serving.read().unwrap().contains(&frag)
-                        && route.as_ref().map_or(false, |(generation, _)| {
-                            served_reconciles.get(&session_key).map_or(false, |state| {
+                        && route.as_ref().is_some_and(|(generation, _)| {
+                            served_reconciles.get(&session_key).is_some_and(|state| {
                                 state.session_id == b.session_id
                                     && state.route_generation == *generation
                             })
@@ -6725,7 +6723,7 @@ async fn handle_connection(
                     && !served_reconciles
                         .get(&reconcile_key)
                         .zip(route.as_ref())
-                        .map_or(false, |(state, (generation, _))| {
+                        .is_some_and(|(state, (generation, _))| {
                             state.route_generation == *generation
                         })
                 {
@@ -6737,16 +6735,14 @@ async fn handle_connection(
                     continue;
                 }
                 if !first_page
-                    && !served_reconciles
-                        .get(&reconcile_key)
-                        .map_or(false, |state| {
-                            state.session_id == r.session_id
-                                && state.round_id == r.round_id
-                                && state.next_page_seq == r.page_seq
-                                && state.next_after_key == r.after_key
-                                && state.snapshot_revision == r.snapshot_revision
-                                && state.snapshot_time_ms == r.snapshot_time_ms
-                        })
+                    && !served_reconciles.get(&reconcile_key).is_some_and(|state| {
+                        state.session_id == r.session_id
+                            && state.round_id == r.round_id
+                            && state.next_page_seq == r.page_seq
+                            && state.next_after_key == r.after_key
+                            && state.snapshot_revision == r.snapshot_revision
+                            && state.snapshot_time_ms == r.snapshot_time_ms
+                    })
                 {
                     tracing::warn!(
                         peer = %peer,
@@ -6945,7 +6941,7 @@ async fn handle_connection(
                 };
                 if served_reconciles
                     .get(&reconcile_key)
-                    .map_or(false, |state| state.route_generation != route_generation)
+                    .is_some_and(|state| state.route_generation != route_generation)
                 {
                     // A legitimate remove/re-add invalidates an otherwise
                     // authorized fetch without making the shared connection
@@ -7058,7 +7054,7 @@ async fn handle_connection(
                                     .lock()
                                     .await
                                     .get(&sender_key)
-                                    .map_or(false, |current| current.same_task(&tx));
+                                    .is_some_and(|current| current.same_task(&tx));
                                 if still_current {
                                     break;
                                 }
@@ -7113,7 +7109,7 @@ async fn handle_connection(
                                     .lock()
                                     .await
                                     .get(&sender_key)
-                                    .map_or(false, |current| current.same_task(&tx));
+                                    .is_some_and(|current| current.same_task(&tx));
                                 if still_current {
                                     break;
                                 }
@@ -9434,7 +9430,7 @@ mod tests {
                 if node
                     .router
                     .route_for_fragment(fragment)
-                    .map_or(false, |candidate| candidate.get_id() != replacement_id)
+                    .is_some_and(|candidate| candidate.get_id() != replacement_id)
                 {
                     break;
                 }
@@ -9449,7 +9445,7 @@ mod tests {
         assert!(node.health().await.unwrap()[&fragment]
             .restarts
             .get("dispatcher")
-            .map_or(false, |restarts| *restarts >= 2));
+            .is_some_and(|restarts| *restarts >= 2));
 
         node.shutdown().await.unwrap();
     }

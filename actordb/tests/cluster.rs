@@ -536,9 +536,7 @@ async fn raw_replication_drain_source(
             source
                 .sender_report(FragmentId(0), peer_id)
                 .await
-                .map_or(false, |report| {
-                    report.reconcile_rounds >= 1 && report.in_flight == 0
-                })
+                .is_some_and(|report| report.reconcile_rounds >= 1 && report.in_flight == 0)
         },
         Duration::from_secs(5),
     )
@@ -1046,7 +1044,7 @@ async fn drain_ignores_stale_old_session_ack_after_rotation() {
             source
                 .sender_report(FragmentId(0), peer_id)
                 .await
-                .map_or(false, |report| report.in_flight == 0)
+                .is_some_and(|report| report.in_flight == 0)
         },
         Duration::from_secs(5),
     )
@@ -1089,7 +1087,7 @@ async fn drain_ignores_stale_old_session_ack_after_rotation() {
             source
                 .sender_report(FragmentId(0), peer_id)
                 .await
-                .map_or(false, |report| {
+                .is_some_and(|report| {
                     report.session_id == drain_session.session_id
                         && report.in_flight == 1
                         && report.ack_durability_mismatch
@@ -1276,7 +1274,7 @@ async fn manual_placement_drain_freezes_target_and_keeps_replication_runtime_ali
                 && source
                     .sender_report(fragment, peer_id)
                     .await
-                    .map_or(false, |report| report.session_id != 0)
+                    .is_some_and(|report| report.session_id != 0)
         },
         Duration::from_secs(5),
     )
@@ -2424,7 +2422,7 @@ async fn late_joiner_converges_via_immediate_reconciliation() {
         || async {
             c.sender_report(FragmentId(0), "b")
                 .await
-                .map_or(false, |report| report.reconcile_rounds >= 1)
+                .is_some_and(|report| report.reconcile_rounds >= 1)
         },
         Duration::from_secs(5),
     )
@@ -2481,7 +2479,7 @@ async fn reconciliation_paginates_summaries_and_fetches_without_restart_storms()
             target
                 .sender_report(FragmentId(0), "paged-source")
                 .await
-                .map_or(false, |report| report.reconcile_rounds >= 1)
+                .is_some_and(|report| report.reconcile_rounds >= 1)
         },
         Duration::from_secs(20),
     )
@@ -2612,11 +2610,11 @@ async fn bidirectional_large_reconciliation_keeps_connection_reader_live() {
                 if !a
                     .sender_report(fragment, "large-b")
                     .await
-                    .map_or(false, |report| report.reconcile_rounds >= 1)
+                    .is_some_and(|report| report.reconcile_rounds >= 1)
                     || !b
                         .sender_report(fragment, "large-a")
                         .await
-                        .map_or(false, |report| report.reconcile_rounds >= 1)
+                        .is_some_and(|report| report.reconcile_rounds >= 1)
                 {
                     return false;
                 }
@@ -3690,7 +3688,7 @@ async fn ttl_expiry_is_persisted_as_a_versioned_tombstone() {
         || async {
             store
                 .get_fragment_zero("ephemeral")
-                .map_or(false, |value| value.is_tombstone)
+                .is_some_and(|value| value.is_tombstone)
         },
         Duration::from_secs(5),
     )
@@ -8126,9 +8124,7 @@ async fn replication_ack_waits_for_the_receiver_store_fence() {
         || async {
             a.sender_report(FragmentId(0), "ack-b")
                 .await
-                .map_or(false, |report| {
-                    report.reconcile_rounds >= 1 && report.in_flight == 0
-                })
+                .is_some_and(|report| report.reconcile_rounds >= 1 && report.in_flight == 0)
         },
         Duration::from_secs(5),
     )
@@ -8289,9 +8285,7 @@ async fn ordinary_ack_timeout_rotates_session_and_replays_exact_batch() {
         || async {
             node.sender_report(FragmentId(0), "raw-ack-timeout-peer")
                 .await
-                .map_or(false, |report| {
-                    report.reconcile_rounds >= 1 && report.in_flight == 0
-                })
+                .is_some_and(|report| report.reconcile_rounds >= 1 && report.in_flight == 0)
         },
         Duration::from_secs(5),
     )
@@ -8441,9 +8435,7 @@ async fn older_batch_timeout_replays_only_the_unacknowledged_batch() {
         || async {
             node.sender_report(FragmentId(0), "raw-out-of-order-ack-peer")
                 .await
-                .map_or(false, |report| {
-                    report.reconcile_rounds >= 1 && report.in_flight == 0
-                })
+                .is_some_and(|report| report.reconcile_rounds >= 1 && report.in_flight == 0)
         },
         Duration::from_secs(5),
     )
@@ -8609,9 +8601,7 @@ async fn weak_ack_does_not_prevent_timeout_and_exact_replay() {
         || async {
             node.sender_report(FragmentId(0), "raw-weak-ack-peer")
                 .await
-                .map_or(false, |report| {
-                    report.reconcile_rounds >= 1 && report.in_flight == 0
-                })
+                .is_some_and(|report| report.reconcile_rounds >= 1 && report.in_flight == 0)
         },
         Duration::from_secs(5),
     )
