@@ -182,6 +182,34 @@ peer-id set, so a burst may produce one callback rather than one callback per
 edge; controllers must treat it as a current-state notification, not an ordered
 membership event log. Periodic placement polling still continues independently.
 
+## Placement boundary during node drain
+
+`shutdown_with_replication_drain` first stops and joins the placement driver
+and any owned gain/loss transition before it snapshots peer targets. This
+freezes the router/sender topology while transport and reconnect supervisors
+remain alive. For a non-empty placement map, every configured remote replica
+of each fragment still present in the local router becomes a required target;
+the coordinator creates or replaces a missing/stopped sender from the
+authoritative cache before issuing its private drain generation. A sender task
+replacement cannot satisfy an older generation.
+
+Legacy empty-map mode has no configured closed-world membership. Its report
+therefore covers only fragment/peer senders already installed when the fence is
+taken, which may be an empty set. Deployments that need a complete target
+certificate should use explicit placement. The placement freeze is one-way:
+after timeout or cancellation the node rejects new operations and retains the
+frozen state for retry; ordinary `shutdown` abandons the remote requirement and
+finishes local-only.
+
+This is a local lifecycle freeze; it does not write a new desired map to an
+external `PlacementController`. For a rolling restart, drain one replica at a
+time and wait for it to restart and return to `Serving` before advancing to the
+next replica. For permanent decommissioning, first move its fragments through
+the placement controller and wait for each migration/revoke to finish; the
+subsequent node shutdown may correctly report no remote targets because the
+placement handoff already removed the local actors. The drain API does not
+coordinate simultaneous maintenance or prove that a quorum remains online.
+
 ## Worked example
 
 ```rust

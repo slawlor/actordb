@@ -58,8 +58,8 @@ use crate::proto::{
     ReconcileFetch, ReconcileResponse, ReplicationAckLevel, SyncEntry,
 };
 use crate::replication::{
-    spawn_node_sender, NodeSender, NodeSenderSendError, ReplicationAckDurability, SenderConfig,
-    SenderDeps, SenderMsg, SenderRuntimeOptions, SenderStateReport,
+    spawn_node_sender, NodeSender, NodeSenderDrain, NodeSenderSendError, ReplicationAckDurability,
+    SenderConfig, SenderDeps, SenderMsg, SenderRuntimeOptions, SenderStateReport,
 };
 use crate::runtime_tasks::RuntimeTasks;
 use crate::shard::{fragment_of, FragmentId};
@@ -375,6 +375,8 @@ struct SenderEntryDeps<'a> {
     retiring_senders: &'a Arc<RetiringSenderRegistry>,
     reports: &'a SenderReportMap,
     peer_failures: &'a PeerFailureSignals,
+    operation_gate: &'a Arc<OperationGate>,
+    allow_quiescing: bool,
 }
 
 /// Atomically install the one replication sender allowed to own a
@@ -384,6 +386,9 @@ struct SenderEntryDeps<'a> {
 async fn ensure_sender_entry(fragment: FragmentId, peer: &str, deps: SenderEntryDeps<'_>) {
     let key = (fragment, peer.to_string());
     let mut senders_guard = deps.senders.lock().await;
+    if !deps.allow_quiescing && !deps.operation_gate.is_running() {
+        return;
+    }
     // A connection or placement tick can have queued this ensure call while a
     // loss transition committed. The drainer removes the router entry before
     // releasing the sender-map lock; re-check here so the stale ensure cannot
@@ -453,6 +458,10 @@ struct MutationRelay {
     origin_tx: PeerChannel,
     origin_req_id: u64,
     timeout_cancel: oneshot::Sender<()>,
+    /// Keep shutdown admission open until the downstream attempt reaches a
+    /// response, timeout, or send failure. Response bytes may still be lost
+    /// after enqueue; the fence covers mutation completion, not socket flush.
+    _operation: OperationPermit,
 }
 
 struct MutationRelayRegistration {
@@ -461,6 +470,7 @@ struct MutationRelayRegistration {
     origin_tx: PeerChannel,
     origin_req_id: u64,
     deadline: Instant,
+    operation: OperationPermit,
 }
 
 struct GetRelay {
@@ -544,6 +554,10 @@ impl OperationGate {
             return Err(NodeError::ShuttingDown);
         }
         self.finish_enter_after_running_check()
+    }
+
+    fn is_running(&self) -> bool {
+        self.phase.load(Ordering::SeqCst) == NODE_RUNNING
     }
 
     /// Complete admission after observing `NODE_RUNNING`. Shutdown may race
@@ -642,6 +656,7 @@ struct ConnContext {
     peers: PeerMap,
     peer_failures: PeerFailureSignals,
     tasks: Weak<RuntimeTasks>,
+    operation_gate: Arc<OperationGate>,
     /// Monotonic wake-up signal for dial supervisors waiting behind another
     /// physical connection to the same authenticated peer.
     peer_changes: watch::Sender<u64>,
@@ -686,6 +701,30 @@ struct FragmentRoute {
     actor: ActorRef<KvMessage>,
 }
 
+/// Remove a newly published dynamic route if cancellation wins before its
+/// dispatcher monitor is durably registered with the core task manager.
+struct RouteMonitorRegistrationGuard {
+    router: FragmentRouter,
+    fragment: FragmentId,
+    generation: u64,
+    armed: bool,
+}
+
+impl RouteMonitorRegistrationGuard {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for RouteMonitorRegistrationGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.router
+                .remove_if_generation(self.fragment, self.generation);
+        }
+    }
+}
+
 impl FragmentRouter {
     pub(crate) fn new(fragment_count: usize, actor_capacity: usize) -> Self {
         Self {
@@ -720,6 +759,14 @@ impl FragmentRouter {
             .unwrap()
             .get(&fragment)
             .map(|route| route.actor.clone())
+    }
+
+    fn route_with_generation(&self, fragment: FragmentId) -> Option<(u64, ActorRef<KvMessage>)> {
+        self.actors
+            .read()
+            .unwrap()
+            .get(&fragment)
+            .map(|route| (route.generation, route.actor.clone()))
     }
 
     pub(crate) fn key_belongs_to(&self, fragment: FragmentId, key: &str) -> bool {
@@ -1323,6 +1370,175 @@ fn validate_record_wire_budget(
 
 impl std::error::Error for NodeError {}
 
+/// One exact fragment/peer sender covered by a replication-drained shutdown.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ReplicationDrainTarget {
+    fragment: FragmentId,
+    peer_id: String,
+}
+
+impl ReplicationDrainTarget {
+    /// Fragment whose fenced LWW versions were reconciled.
+    pub fn fragment(&self) -> FragmentId {
+        self.fragment
+    }
+
+    /// Replica which acknowledged the configured durability barrier.
+    pub fn peer_id(&self) -> &str {
+        &self.peer_id
+    }
+}
+
+/// Evidence returned after every frozen replication target acknowledged a
+/// stable reconciliation. A successful call also completes local shutdown;
+/// [`ReplicationDrainShutdownError::Local`] carries the same evidence when
+/// the later local persistence fence fails.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReplicationDrainReport {
+    targets: Vec<ReplicationDrainTarget>,
+    durability: ReplicationAckDurability,
+}
+
+impl ReplicationDrainReport {
+    /// Exact sender targets included in the fence, sorted by fragment/peer.
+    pub fn targets(&self) -> &[ReplicationDrainTarget] {
+        &self.targets
+    }
+
+    /// Receiver fence required from every target.
+    pub fn durability(&self) -> ReplicationAckDurability {
+        self.durability
+    }
+}
+
+/// Call-specific policy for [`Node::shutdown_with_replication_drain`].
+///
+/// The timeout is one absolute budget for freezing placement, waiting for
+/// admitted mutations, reconnecting peers, reconciliation, and durability
+/// barriers. Per-attempt ACK/reconciliation timeouts still govern retries
+/// inside that total budget.
+#[derive(Clone, Debug)]
+pub struct ReplicationDrainOptions {
+    timeout: Duration,
+}
+
+impl Default for ReplicationDrainOptions {
+    fn default() -> Self {
+        Self {
+            timeout: Duration::from_secs(30),
+        }
+    }
+}
+
+impl ReplicationDrainOptions {
+    /// Set the total replication-drain budget. Zero is rejected by the call.
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
+    }
+
+    /// Current total replication-drain budget.
+    pub fn timeout(&self) -> Duration {
+        self.timeout
+    }
+}
+
+/// Stage in which a bounded replication-drained shutdown exhausted its
+/// call-wide deadline.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum ReplicationDrainPhase {
+    /// Waiting to acquire the node's shutdown coordinator.
+    ShutdownCoordination,
+    /// Stopping and joining the placement driver to freeze the target set.
+    PlacementFreeze,
+    /// Waiting for mutations admitted before the fence to reach a terminal state.
+    MutationAdmissionDrain,
+    /// Resolving the frozen fragment/peer target set.
+    TargetSnapshot,
+    /// Installing senders and issuing their exact drain generations.
+    SenderPreparation,
+    /// Reconnecting, reconciling, and waiting for receiver durability barriers.
+    PeerReconciliation,
+}
+
+impl std::fmt::Display for ReplicationDrainPhase {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let name = match self {
+            Self::ShutdownCoordination => "shutdown coordination",
+            Self::PlacementFreeze => "placement freeze",
+            Self::MutationAdmissionDrain => "mutation admission drain",
+            Self::TargetSnapshot => "target snapshot",
+            Self::SenderPreparation => "sender preparation",
+            Self::PeerReconciliation => "peer reconciliation",
+        };
+        f.write_str(name)
+    }
+}
+
+/// A replication-drained shutdown did not reach its advertised boundary.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum ReplicationDrainShutdownError {
+    /// The call-specific policy is invalid.
+    InvalidOptions(String),
+    /// The absolute drain deadline elapsed. The node remains quiesced with
+    /// transport and fragment state intact; retry this method or explicitly
+    /// fall back to local-only [`Node::shutdown`].
+    Timeout {
+        phase: ReplicationDrainPhase,
+        completed: Vec<ReplicationDrainTarget>,
+        pending: Vec<ReplicationDrainTarget>,
+    },
+    /// An exact sender stopped or could not be prepared. The node remains
+    /// quiesced with authoritative fragment state intact; retrying this method
+    /// installs a replacement sender and establishes a fresh exact fence.
+    RetryableSender(String),
+    /// A local-only shutdown had already advanced beyond the point where a
+    /// remote replication guarantee could still be established.
+    Unavailable(String),
+    /// Replication completed, but the subsequent local shutdown failed. The
+    /// included report remains valid and a retry does not repeat remote work.
+    Local {
+        error: NodeError,
+        replication: ReplicationDrainReport,
+    },
+}
+
+impl std::fmt::Display for ReplicationDrainShutdownError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidOptions(error) => write!(f, "invalid replication drain options: {error}"),
+            Self::Timeout {
+                phase,
+                completed,
+                pending,
+            } => write!(
+                f,
+                "replication drain timed out during {phase}: {} completed, {} pending",
+                completed.len(),
+                pending.len()
+            ),
+            Self::RetryableSender(error) => {
+                write!(f, "replication drain sender must be retried: {error}")
+            }
+            Self::Unavailable(error) => write!(f, "replication drain unavailable: {error}"),
+            Self::Local { error, .. } => {
+                write!(f, "replication drained, but local shutdown failed: {error}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ReplicationDrainShutdownError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Local { error, .. } => Some(error),
+            _ => None,
+        }
+    }
+}
+
 impl From<std::io::Error> for NodeError {
     fn from(e: std::io::Error) -> Self {
         NodeError::Io(e)
@@ -1406,6 +1622,9 @@ pub struct Node {
     /// still has no confidentiality or per-frame integrity.
     /// `None` = no group-membership proof.
     cluster_secret: Option<Vec<u8>>,
+    /// Placement polling and gain/loss transitions are isolated so a drained
+    /// shutdown can freeze sender topology without aborting peer transports.
+    placement_tasks: Arc<RuntimeTasks>,
     tasks: Arc<RuntimeTasks>,
     inbound_connections: Arc<Semaphore>,
     dial_intents: Arc<StdMutex<HashMap<SocketAddr, DialIntentState>>>,
@@ -1413,15 +1632,24 @@ pub struct Node {
     peer_changes: watch::Sender<u64>,
     operation_gate: Arc<OperationGate>,
     shutdown_state: Mutex<ShutdownProgress>,
+    replication_drain_report: StdMutex<Option<ReplicationDrainReport>>,
     network: Arc<dyn Network>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ShutdownProgress {
     Running,
-    Quiescing,
+    FencingReplication,
+    DrainingReplication(Vec<ReplicationDrainWaiter>),
+    StoppingTransport,
+    QuiescingFragments,
     StoppingFragments,
     Stopped,
+}
+
+struct ReplicationDrainWaiter {
+    target: ReplicationDrainTarget,
+    sender: NodeSender,
+    drain: NodeSenderDrain,
 }
 
 impl Drop for Node {
@@ -1429,6 +1657,7 @@ impl Drop for Node {
         // Async cleanup still belongs to `shutdown`, but never leave task
         // admission open merely because a caller dropped the handle.
         self.operation_gate.begin_shutdown();
+        self.placement_tasks.request_shutdown();
         self.tasks.request_shutdown();
         if let Ok(senders) = self.senders.try_lock() {
             for sender in senders.values() {
@@ -2664,6 +2893,7 @@ impl Node {
                     .collect()
             }));
         let tasks = RuntimeTasks::new(TASK_COMMAND_CAPACITY);
+        let placement_tasks = RuntimeTasks::new(TASK_COMMAND_CAPACITY);
         let mut startup_supervisors = SupervisorStartupGuard::new(my_fragments.len());
         for fragment in my_fragments {
             let (supervisor, dispatcher) = match spawn_fragment_subtree_registered(
@@ -2748,6 +2978,7 @@ impl Node {
             sync_entries_applied: Arc::new(AtomicU64::new(0)),
             membership_tx: membership_tx.clone(),
             cluster_secret: config.cluster_secret.clone(),
+            placement_tasks,
             tasks,
             inbound_connections: Arc::new(Semaphore::new(
                 runtime_options.inbound_connection_capacity,
@@ -2757,6 +2988,7 @@ impl Node {
             peer_changes,
             operation_gate: OperationGate::new(),
             shutdown_state: Mutex::new(ShutdownProgress::Running),
+            replication_drain_report: StdMutex::new(None),
             network: config.network.clone(),
         };
 
@@ -2814,12 +3046,14 @@ impl Node {
                 sender_runtime: node.runtime_options.sender_options(),
                 peers: node.peers.clone(),
                 peer_failures: node.peer_failures.clone(),
-                tasks: Arc::downgrade(&node.tasks),
+                tasks: Arc::downgrade(&node.placement_tasks),
+                dispatcher_tasks: Arc::downgrade(&node.tasks),
+                operation_gate: node.operation_gate.clone(),
                 hlc: hlc.clone(),
             };
             let membership_rx = membership_rx.expect("checked above");
             if !node
-                .tasks
+                .placement_tasks
                 .spawn(placement_driver(deps, membership_rx))
                 .await
             {
@@ -3002,6 +3236,7 @@ impl Node {
             peers: self.peers.clone(),
             peer_failures: self.peer_failures.clone(),
             tasks: Arc::downgrade(&self.tasks),
+            operation_gate: self.operation_gate.clone(),
             peer_changes: self.peer_changes.clone(),
             hlc: self.hlc.clone(),
             senders: self.senders.clone(),
@@ -3077,6 +3312,8 @@ impl Node {
                 retiring_senders: &self.retiring_senders,
                 reports: &self.sender_reports,
                 peer_failures: &self.peer_failures,
+                operation_gate: &self.operation_gate,
+                allow_quiescing: false,
             },
         )
         .await;
@@ -3972,30 +4209,160 @@ impl Node {
         self.peers.lock().await.len()
     }
 
-    /// Shut the node down and report whether every local fragment reached its
-    /// final persistence fence.
-    ///
-    /// Shutdown is one-way: it first rejects new public operations, closes and
-    /// joins Node-owned runtime tasks, waits for already-admitted public work,
-    /// and stops replication senders. It then quiesces every fragment before
-    /// stopping any supervisor. A failed store flush leaves the fragment state
-    /// and retryable batch owned by its supervisor; this method returns the
-    /// error and a later call resumes shutdown. Only a successful return drops
-    /// all fragment state and releases a configured RocksDB lock.
-    ///
-    /// This local durability fence does not wait for peer replication ACKs;
-    /// transport convergence has its own lifecycle policy.
-    pub async fn shutdown(&self) -> Result<(), NodeError> {
-        let mut progress = self.shutdown_state.lock().await;
-        if *progress == ShutdownProgress::Stopped {
-            return Ok(());
-        }
-        if *progress == ShutdownProgress::Running {
-            self.operation_gate.begin_shutdown();
-            *progress = ShutdownProgress::Quiescing;
+    async fn replication_drain_targets(&self) -> Vec<ReplicationDrainTarget> {
+        let placement = self.fragment_map.read().unwrap().clone();
+        let mut targets = if placement.is_empty() {
+            // Legacy full-replication mode discovers peers from authenticated
+            // connections. Its only truthful closed-world boundary is the
+            // sender set already installed when admission and placement stop.
+            self.senders
+                .lock()
+                .await
+                .keys()
+                .map(|(fragment, peer_id)| ReplicationDrainTarget {
+                    fragment: *fragment,
+                    peer_id: peer_id.clone(),
+                })
+                .collect()
+        } else {
+            let mut targets = Vec::new();
+            for fragment in self.router.fragment_ids().into_iter().map(FragmentId) {
+                if let Some(replicas) = placement.get(&fragment) {
+                    targets.extend(
+                        replicas
+                            .iter()
+                            .filter(|peer_id| *peer_id != &self.node_id)
+                            .map(|peer_id| ReplicationDrainTarget {
+                                fragment,
+                                peer_id: peer_id.clone(),
+                            }),
+                    );
+                }
+            }
+            targets
+        };
+        targets.sort();
+        targets.dedup();
+        targets
+    }
+
+    async fn prepare_replication_drains(
+        &self,
+        targets: &[ReplicationDrainTarget],
+    ) -> Result<Vec<ReplicationDrainWaiter>, String> {
+        let sender_runtime = self.runtime_options.sender_options();
+        let mut senders = Vec::with_capacity(targets.len());
+        for target in targets {
+            ensure_sender_entry(
+                target.fragment,
+                &target.peer_id,
+                SenderEntryDeps {
+                    config: &self.sender_config,
+                    runtime: &sender_runtime,
+                    router: &self.router,
+                    hlc: &self.hlc,
+                    senders: &self.senders,
+                    retiring_senders: &self.retiring_senders,
+                    reports: &self.sender_reports,
+                    peer_failures: &self.peer_failures,
+                    operation_gate: &self.operation_gate,
+                    allow_quiescing: true,
+                },
+            )
+            .await;
+
+            let sender = self
+                .senders
+                .lock()
+                .await
+                .get(&(target.fragment, target.peer_id.clone()))
+                .cloned()
+                .ok_or_else(|| {
+                    format!(
+                        "no authoritative fragment sender is available for fragment {} peer {}",
+                        target.fragment, target.peer_id
+                    )
+                })?;
+            if sender.is_closed() {
+                return Err(format!(
+                    "replication sender stopped for fragment {} peer {}",
+                    target.fragment, target.peer_id
+                ));
+            }
+            if let Some(peer) = self.peers.lock().await.get(&target.peer_id).cloned() {
+                sender.connect_peer(peer.budgeted_sender()).map_err(|_| {
+                    format!(
+                        "replication sender stopped while reconnecting fragment {} peer {}",
+                        target.fragment, target.peer_id
+                    )
+                })?;
+            }
+            senders.push((target.clone(), sender));
         }
 
-        if *progress == ShutdownProgress::Quiescing {
+        senders
+            .into_iter()
+            .map(|(target, sender)| {
+                let drain = sender.request_drain().map_err(|_| {
+                    format!(
+                        "replication sender stopped while fencing fragment {} peer {}",
+                        target.fragment, target.peer_id
+                    )
+                })?;
+                Ok(ReplicationDrainWaiter {
+                    target,
+                    sender,
+                    drain,
+                })
+            })
+            .collect()
+    }
+
+    async fn replication_drain_partition(
+        &self,
+        waiters: &[ReplicationDrainWaiter],
+    ) -> Result<(Vec<ReplicationDrainTarget>, Vec<ReplicationDrainTarget>), String> {
+        let senders = self.senders.lock().await;
+        let mut completed = Vec::new();
+        let mut pending = Vec::new();
+        for waiter in waiters {
+            let current = senders
+                .get(&(waiter.target.fragment, waiter.target.peer_id.clone()))
+                .ok_or_else(|| {
+                    format!(
+                        "replication sender disappeared for fragment {} peer {}",
+                        waiter.target.fragment, waiter.target.peer_id
+                    )
+                })?;
+            if !current.same_task(&waiter.sender) {
+                return Err(format!(
+                    "replication sender was replaced for fragment {} peer {}",
+                    waiter.target.fragment, waiter.target.peer_id
+                ));
+            }
+            if waiter.drain.is_complete() {
+                completed.push(waiter.target.clone());
+            } else if waiter.drain.is_closed() || waiter.sender.is_closed() {
+                return Err(format!(
+                    "replication sender stopped before draining fragment {} peer {}",
+                    waiter.target.fragment, waiter.target.peer_id
+                ));
+            } else {
+                pending.push(waiter.target.clone());
+            }
+        }
+        Ok((completed, pending))
+    }
+
+    async fn finish_local_shutdown(
+        &self,
+        progress: &mut ShutdownProgress,
+    ) -> Result<(), NodeError> {
+        if matches!(progress, ShutdownProgress::StoppingTransport) {
+            // Placement owns fragment and sender topology. Join it before the
+            // general task set so no cancelled transition can publish work
+            // after the transport/sender snapshot below.
+            self.placement_tasks.shutdown().await;
             self.tasks.shutdown().await;
 
             // Release every request/relay waiter retained by a cancelled
@@ -4041,7 +4408,10 @@ impl Node {
                 sender.stop().await;
             }
             self.retiring_senders.clear();
+            *progress = ShutdownProgress::QuiescingFragments;
+        }
 
+        if matches!(progress, ShutdownProgress::QuiescingFragments) {
             // Prepare every fragment before destroying any fragment state. A
             // partial store outage therefore leaves all successful fragments
             // quiesced and every failed buffer available for an exact retry.
@@ -4111,7 +4481,7 @@ impl Node {
             *progress = ShutdownProgress::StoppingFragments;
         }
 
-        if *progress == ShutdownProgress::StoppingFragments {
+        if matches!(progress, ShutdownProgress::StoppingFragments) {
             let supervisors = self.supervisor_stops.snapshot();
             for (_, entry) in &supervisors {
                 if matches!(&*entry.startup.borrow(), SupervisorStartupState::Ready) {
@@ -4129,6 +4499,223 @@ impl Node {
             *progress = ShutdownProgress::Stopped;
         }
         Ok(())
+    }
+
+    /// Shut the node down and report whether every local fragment reached its
+    /// final persistence fence.
+    ///
+    /// Shutdown is one-way: it first rejects new public operations, closes and
+    /// joins Node-owned runtime tasks, waits for already-admitted public work,
+    /// and stops replication senders. It then quiesces every fragment before
+    /// stopping any supervisor. A failed store flush leaves the fragment state
+    /// and retryable batch owned by its supervisor; this method returns the
+    /// error and a later call resumes shutdown. Only a successful return drops
+    /// all fragment state and releases a configured RocksDB lock.
+    ///
+    /// This local durability fence does not wait for peer replication ACKs;
+    /// transport convergence has its own lifecycle policy. Calling this after
+    /// a timed-out or cancelled replication drain explicitly abandons that
+    /// remote guarantee and completes the local-only shutdown.
+    pub async fn shutdown(&self) -> Result<(), NodeError> {
+        let mut progress = self.shutdown_state.lock().await;
+        if matches!(*progress, ShutdownProgress::Stopped) {
+            return Ok(());
+        }
+        if matches!(
+            *progress,
+            ShutdownProgress::Running
+                | ShutdownProgress::FencingReplication
+                | ShutdownProgress::DrainingReplication(_)
+        ) {
+            self.operation_gate.begin_shutdown();
+            *self.replication_drain_report.lock().unwrap() = None;
+            *progress = ShutdownProgress::StoppingTransport;
+        }
+        self.finish_local_shutdown(&mut progress).await
+    }
+
+    /// Fence locally admitted mutations, reconcile every frozen peer target
+    /// through the configured ACK durability barrier, then complete the normal
+    /// local persistence shutdown.
+    ///
+    /// The remote guarantee is a per-target LWW version floor: for each
+    /// reported fragment/peer, the receiver acknowledged the fenced winner or
+    /// a newer winner. It is not a global cache-equality, quorum, or fsync
+    /// guarantee. `MemoryApplied` remains volatile; `StoreCommitted` means the
+    /// receiver store accepted its flush according to that store's contract.
+    ///
+    /// The single timeout covers placement freeze, admitted-mutation drain,
+    /// sender preparation, reconnect/reconciliation, and remote durability.
+    /// Timeout or caller cancellation leaves the node quiesced with transport,
+    /// senders, and fragment state alive; retrying this method resumes every
+    /// issued exact sender generation. A sender task that exits is replaced and
+    /// re-fenced from the still-authoritative fragment cache. [`Node::shutdown`]
+    /// is the explicit local-only escape. Mutation responses already queued to
+    /// a socket can still be lost, so clients must retry stamped operations
+    /// idempotently.
+    ///
+    /// With explicit placement, targets are the configured remote replicas of
+    /// every locally active fragment after placement tasks stop. Legacy empty-
+    /// map mode can cover only sender targets already installed at the fence.
+    pub async fn shutdown_with_replication_drain(
+        &self,
+        options: ReplicationDrainOptions,
+    ) -> Result<ReplicationDrainReport, ReplicationDrainShutdownError> {
+        if options.timeout.is_zero() {
+            return Err(ReplicationDrainShutdownError::InvalidOptions(
+                "timeout must be non-zero".to_string(),
+            ));
+        }
+        let Some(deadline) = Instant::now().checked_add(options.timeout) else {
+            return Err(ReplicationDrainShutdownError::InvalidOptions(
+                "timeout is too large".to_string(),
+            ));
+        };
+
+        let mut progress = tokio::time::timeout_at(deadline, self.shutdown_state.lock())
+            .await
+            .map_err(|_| ReplicationDrainShutdownError::Timeout {
+                phase: ReplicationDrainPhase::ShutdownCoordination,
+                completed: Vec::new(),
+                pending: Vec::new(),
+            })?;
+        let stored_report = || self.replication_drain_report.lock().unwrap().clone();
+        if matches!(*progress, ShutdownProgress::Stopped) {
+            return stored_report().ok_or_else(|| {
+                ReplicationDrainShutdownError::Unavailable(
+                    "node already completed a local-only shutdown".to_string(),
+                )
+            });
+        }
+        if stored_report().is_none()
+            && matches!(
+                *progress,
+                ShutdownProgress::StoppingTransport
+                    | ShutdownProgress::QuiescingFragments
+                    | ShutdownProgress::StoppingFragments
+            )
+        {
+            return Err(ReplicationDrainShutdownError::Unavailable(
+                "local-only shutdown has already stopped replication".to_string(),
+            ));
+        }
+
+        if matches!(*progress, ShutdownProgress::Running) {
+            self.operation_gate.begin_shutdown();
+            // Publish the topology freeze synchronously. Even an already-
+            // expired deadline must not return while the placement manager
+            // can still register a transition.
+            self.placement_tasks.request_shutdown();
+            *progress = ShutdownProgress::FencingReplication;
+        }
+
+        if matches!(*progress, ShutdownProgress::FencingReplication) {
+            self.placement_tasks.request_shutdown();
+            if tokio::time::timeout_at(deadline, self.placement_tasks.shutdown())
+                .await
+                .is_err()
+            {
+                return Err(ReplicationDrainShutdownError::Timeout {
+                    phase: ReplicationDrainPhase::PlacementFreeze,
+                    completed: Vec::new(),
+                    pending: Vec::new(),
+                });
+            }
+            if tokio::time::timeout_at(deadline, self.operation_gate.wait_for_drain())
+                .await
+                .is_err()
+            {
+                return Err(ReplicationDrainShutdownError::Timeout {
+                    phase: ReplicationDrainPhase::MutationAdmissionDrain,
+                    completed: Vec::new(),
+                    pending: Vec::new(),
+                });
+            }
+
+            let targets = tokio::time::timeout_at(deadline, self.replication_drain_targets())
+                .await
+                .map_err(|_| ReplicationDrainShutdownError::Timeout {
+                    phase: ReplicationDrainPhase::TargetSnapshot,
+                    completed: Vec::new(),
+                    pending: Vec::new(),
+                })?;
+            let waiters =
+                match tokio::time::timeout_at(deadline, self.prepare_replication_drains(&targets))
+                    .await
+                {
+                    Ok(Ok(waiters)) => waiters,
+                    Ok(Err(error)) => {
+                        return Err(ReplicationDrainShutdownError::RetryableSender(error));
+                    }
+                    Err(_) => {
+                        return Err(ReplicationDrainShutdownError::Timeout {
+                            phase: ReplicationDrainPhase::SenderPreparation,
+                            completed: Vec::new(),
+                            pending: targets,
+                        });
+                    }
+                };
+            *progress = ShutdownProgress::DrainingReplication(waiters);
+        }
+
+        if let ShutdownProgress::DrainingReplication(waiters) = &*progress {
+            loop {
+                let all_targets: Vec<_> =
+                    waiters.iter().map(|waiter| waiter.target.clone()).collect();
+                let partition =
+                    tokio::time::timeout_at(deadline, self.replication_drain_partition(waiters))
+                        .await
+                        .map_err(|_| ReplicationDrainShutdownError::Timeout {
+                            phase: ReplicationDrainPhase::PeerReconciliation,
+                            completed: Vec::new(),
+                            pending: all_targets,
+                        })?;
+                let (completed, pending) = match partition {
+                    Ok(partition) => partition,
+                    Err(error) => {
+                        // Exact-task correlation prevents a replacement from
+                        // satisfying the old waiter. Return to preparation so
+                        // a retry can install and fence a fresh sender from the
+                        // still-authoritative cache.
+                        *progress = ShutdownProgress::FencingReplication;
+                        return Err(ReplicationDrainShutdownError::RetryableSender(format!(
+                            "{error}; retry to replace and re-fence the sender"
+                        )));
+                    }
+                };
+                if pending.is_empty() {
+                    let report = ReplicationDrainReport {
+                        targets: completed,
+                        durability: self.sender_config.required_ack_durability,
+                    };
+                    *self.replication_drain_report.lock().unwrap() = Some(report);
+                    break;
+                }
+                if Instant::now() >= deadline {
+                    return Err(ReplicationDrainShutdownError::Timeout {
+                        phase: ReplicationDrainPhase::PeerReconciliation,
+                        completed,
+                        pending,
+                    });
+                }
+                tokio::time::sleep_until(deadline.min(deadline_after(Duration::from_millis(10))))
+                    .await;
+            }
+            *progress = ShutdownProgress::StoppingTransport;
+        }
+
+        let report = stored_report().ok_or_else(|| {
+            ReplicationDrainShutdownError::Unavailable(
+                "replication drain completed without a retained report".to_string(),
+            )
+        })?;
+        self.finish_local_shutdown(&mut progress)
+            .await
+            .map_err(|error| ReplicationDrainShutdownError::Local {
+                error,
+                replication: report.clone(),
+            })?;
+        Ok(report)
     }
 
     /// Health snapshots for every fragment this node serves.
@@ -4210,7 +4797,13 @@ struct PlacementDriverDeps {
     sender_runtime: SenderRuntimeOptions,
     peers: PeerMap,
     peer_failures: PeerFailureSignals,
+    /// Polling and gain/loss transitions, stopped to freeze placement before
+    /// a replication-drained shutdown snapshots targets.
     tasks: Weak<RuntimeTasks>,
+    /// Dispatcher restart monitors are core actor lifecycle work and must stay
+    /// alive while the frozen senders reconcile.
+    dispatcher_tasks: Weak<RuntimeTasks>,
+    operation_gate: Arc<OperationGate>,
     hlc: Arc<Mutex<HlcClock>>,
 }
 
@@ -4229,6 +4822,8 @@ impl PlacementDriverDeps {
                 retiring_senders: &self.retiring_senders,
                 reports: &self.sender_reports,
                 peer_failures: &self.peer_failures,
+                operation_gate: &self.operation_gate,
+                allow_quiescing: false,
             },
         )
         .await;
@@ -4350,7 +4945,7 @@ async fn placement_tick(deps: &PlacementDriverDeps) {
         (current, flight, transitions)
     };
 
-    // Register outside the placement-state commit mutex. The Node task manager
+    // Register outside the placement-state commit mutex. The placement task manager
     // owns and joins transitions directly, so aborting the polling driver
     // cannot detach a gain/loss child during shutdown.
     for (fragment, gaining, preloaded) in transitions {
@@ -4574,7 +5169,13 @@ async fn gain_fragment(deps: &PlacementDriverDeps, fragment: FragmentId, preload
         // The actor exists in the router now (so the reconciler can merge
         // into it), but the fragment is not serving yet.
         let generation = deps.router.insert(fragment, dispatcher.clone());
-        let monitor_registered = match deps.tasks.upgrade() {
+        let mut route_registration = RouteMonitorRegistrationGuard {
+            router: deps.router.clone(),
+            fragment,
+            generation,
+            armed: true,
+        };
+        let monitor_registered = match deps.dispatcher_tasks.upgrade() {
             Some(tasks) => {
                 register_fragment_dispatcher_monitor(
                     &tasks,
@@ -4589,7 +5190,7 @@ async fn gain_fragment(deps: &PlacementDriverDeps, fragment: FragmentId, preload
             None => false,
         };
         if !monitor_registered {
-            deps.router.remove_if_generation(fragment, generation);
+            drop(route_registration);
             deps.supervisors.lock().await.remove(&fragment);
             deps.placement_states
                 .lock()
@@ -4618,6 +5219,7 @@ async fn gain_fragment(deps: &PlacementDriverDeps, fragment: FragmentId, preload
             }
             return;
         }
+        route_registration.disarm();
     }
 
     if converge_fragment_gain(deps, fragment).await {
@@ -4960,6 +5562,10 @@ struct ServedReconcileState {
     snapshot_time_ms: u64,
     next_fetch_chunk_seq: u64,
     advertised_keys: HashSet<String>,
+    /// Subtree incarnation which produced the summaries/fetch authorization.
+    /// Dispatcher restarts preserve this generation because they share state;
+    /// destructive placement remove/re-add cycles allocate a new one.
+    route_generation: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -5268,6 +5874,7 @@ async fn handle_connection(
         peers,
         peer_failures,
         tasks,
+        operation_gate,
         peer_changes,
         hlc,
         senders,
@@ -5597,6 +6204,8 @@ async fn handle_connection(
                                 retiring_senders: &retiring_senders,
                                 reports: &sender_reports,
                                 peer_failures: &peer_failures,
+                                operation_gate: &operation_gate,
+                                allow_quiescing: false,
                             },
                         )
                         .await;
@@ -5735,7 +6344,8 @@ async fn handle_connection(
                     .iter()
                     .find(|op| fragment_of(&op.key, router.fragment_count) != frag)
                     .map(|op| op.key.clone());
-                let actor = router.route_for_fragment(frag);
+                let route = router.route_with_generation(frag);
+                let actor = route.as_ref().map(|(_, actor)| actor.clone());
                 let mut failure = prior_reconcile_failure.or_else(|| {
                     match (tracked, requested_ack, invalid_key, actor.as_ref()) {
                         (true, None, _, _) => Some(
@@ -5750,6 +6360,21 @@ async fn handle_connection(
                         (_, _, None, Some(_)) => None,
                     }
                 });
+
+                if failure.is_none() && reconcile_barrier {
+                    let same_serving_incarnation = serving.read().unwrap().contains(&frag)
+                        && route.as_ref().map_or(false, |(generation, _)| {
+                            served_reconciles.get(&session_key).map_or(false, |state| {
+                                state.session_id == b.session_id
+                                    && state.route_generation == *generation
+                            })
+                        });
+                    if !same_serving_incarnation {
+                        failure = Some(format!(
+                            "reconciliation barrier no longer matches the serving incarnation of fragment {frag}"
+                        ));
+                    }
+                }
 
                 if failure.is_none() {
                     if let Some(timestamp_ms) = b.ops.iter().map(|op| op.timestamp_ms).max() {
@@ -5962,6 +6587,22 @@ async fn handle_connection(
                     );
                     break;
                 }
+                let route = router.route_with_generation(frag);
+                if !first_page
+                    && !served_reconciles
+                        .get(&reconcile_key)
+                        .zip(route.as_ref())
+                        .map_or(false, |(state, (generation, _))| {
+                            state.route_generation == *generation
+                        })
+                {
+                    // A legitimate placement remove/re-add can invalidate a
+                    // paged round between frames. Drop its authorization and
+                    // let the correlated sender rotate/retry without closing
+                    // the multiplexed connection.
+                    served_reconciles.remove(&reconcile_key);
+                    continue;
+                }
                 if !first_page
                     && !served_reconciles
                         .get(&reconcile_key)
@@ -5983,7 +6624,7 @@ async fn handle_connection(
                     );
                     break;
                 }
-                if let Some(actor) = router.route_for_fragment(frag) {
+                if let Some((route_generation, actor)) = route {
                     if let Ok(CallResult::Success(page)) = actor
                         .call(
                             |reply| KvMessage::GetSummaryPage {
@@ -6047,19 +6688,29 @@ async fn handle_connection(
                             if encoded_len <= ANTI_ENTROPY_PAGE_BYTES
                                 || (response.summaries.len() <= 1 && encoded_len <= MAX_FRAME_BYTES)
                             {
-                                let (snapshot_revision, snapshot_time_ms, next_fetch_chunk_seq) =
-                                    if first_page {
-                                        (response.snapshot_revision, response.snapshot_time_ms, 0)
-                                    } else {
-                                        let state = served_reconciles
-                                            .get(&reconcile_key)
-                                            .expect("validated continuation");
-                                        (
-                                            state.snapshot_revision,
-                                            state.snapshot_time_ms,
-                                            state.next_fetch_chunk_seq,
-                                        )
-                                    };
+                                let (
+                                    snapshot_revision,
+                                    snapshot_time_ms,
+                                    next_fetch_chunk_seq,
+                                    served_route_generation,
+                                ) = if first_page {
+                                    (
+                                        response.snapshot_revision,
+                                        response.snapshot_time_ms,
+                                        0,
+                                        route_generation,
+                                    )
+                                } else {
+                                    let state = served_reconciles
+                                        .get(&reconcile_key)
+                                        .expect("validated continuation");
+                                    (
+                                        state.snapshot_revision,
+                                        state.snapshot_time_ms,
+                                        state.next_fetch_chunk_seq,
+                                        state.route_generation,
+                                    )
+                                };
                                 let served_state =
                                     (!response.restart).then(|| ServedReconcileState {
                                         session_id: response.session_id,
@@ -6074,6 +6725,7 @@ async fn handle_connection(
                                             .iter()
                                             .map(|summary| summary.key.clone())
                                             .collect(),
+                                        route_generation: served_route_generation,
                                     });
                                 let envelope = Envelope {
                                     msg: Some(EnvelopeMsg::ReconcileResponse(response)),
@@ -6154,6 +6806,22 @@ async fn handle_connection(
                     break;
                 }
                 let reconcile_key = (peer.clone(), frag);
+                let Some((route_generation, actor)) = router.route_with_generation(frag) else {
+                    served_reconciles.remove(&reconcile_key);
+                    continue;
+                };
+                if served_reconciles
+                    .get(&reconcile_key)
+                    .map_or(false, |state| state.route_generation != route_generation)
+                {
+                    // A legitimate remove/re-add invalidates an otherwise
+                    // authorized fetch without making the shared connection
+                    // malicious. An absent authorization, by contrast, falls
+                    // through to the strict correlation check below and
+                    // closes the connection.
+                    served_reconciles.remove(&reconcile_key);
+                    continue;
+                }
                 let snapshot_time_ms =
                     served_reconciles.get_mut(&reconcile_key).and_then(|state| {
                         if state.session_id != f.session_id
@@ -6179,22 +6847,20 @@ async fn handle_connection(
                     );
                     break;
                 };
-                if let Some(actor) = router.route_for_fragment(frag) {
-                    let job = ReconcileResponseJob {
-                        peer: peer.clone(),
-                        session: current.expect("validated reconcile fetch session"),
-                        actor,
-                        fetch: f,
-                        snapshot_time_ms,
-                    };
-                    if reconcile_response_tx.try_send(job).is_err() {
-                        tracing::warn!(
-                            peer = %peer,
-                            fragment = frag.0,
-                            "reconcile response queue is unavailable or at capacity"
-                        );
-                        break;
-                    }
+                let job = ReconcileResponseJob {
+                    peer: peer.clone(),
+                    session: current.expect("validated reconcile fetch session"),
+                    actor,
+                    fetch: f,
+                    snapshot_time_ms,
+                };
+                if reconcile_response_tx.try_send(job).is_err() {
+                    tracing::warn!(
+                        peer = %peer,
+                        fragment = frag.0,
+                        "reconcile response queue is unavailable or at capacity"
+                    );
+                    break;
                 }
             }
             Some(EnvelopeMsg::ReconcileResponse(r)) => {
@@ -6325,6 +6991,21 @@ async fn handle_connection(
                 }
             }
             Some(EnvelopeMsg::ForwardedPut(p)) => {
+                let operation = match operation_gate.try_enter() {
+                    Ok(operation) => operation,
+                    Err(NodeError::ShuttingDown) => {
+                        if !send_unavailable_mutation(
+                            &tx,
+                            p.req_id,
+                            vec![p.key],
+                            "node is shutting down",
+                        ) {
+                            break;
+                        }
+                        continue;
+                    }
+                    Err(_) => unreachable!("operation admission has one failure mode"),
+                };
                 if let Err(error) = validate_record_wire_budget(&p.key, p.value.len(), &p.node_id) {
                     tracing::warn!(%error, "rejecting irreducible forwarded mutation");
                     break;
@@ -6388,7 +7069,7 @@ async fn handle_connection(
                     }
                 } else if p.hops < MAX_FORWARD_HOPS {
                     drop(mutation_lease);
-                    relay_put(p, frag, &tx, &peer_node_id, &rfctx).await;
+                    relay_put(p, frag, &tx, &peer_node_id, &rfctx, operation).await;
                 } else {
                     drop(mutation_lease);
                     if !send_unavailable_mutation(
@@ -6592,6 +7273,18 @@ async fn handle_connection(
                 }
             }
             Some(EnvelopeMsg::BatchPut(bp)) => {
+                let operation = match operation_gate.try_enter() {
+                    Ok(operation) => operation,
+                    Err(NodeError::ShuttingDown) => {
+                        let keys = bp.puts.into_iter().map(|put| put.key).collect();
+                        if !send_unavailable_mutation(&tx, bp.req_id, keys, "node is shutting down")
+                        {
+                            break;
+                        }
+                        continue;
+                    }
+                    Err(_) => unreachable!("operation admission has one failure mode"),
+                };
                 if bp.puts.len() > MAX_WIRE_BATCH_ITEMS {
                     tracing::warn!(
                         item_count = bp.puts.len(),
@@ -6658,7 +7351,7 @@ async fn handle_connection(
                     drop(mutation_lease);
                     let max_hops = bp.puts.iter().map(|p| p.hops).max().unwrap_or(0);
                     if max_hops < MAX_FORWARD_HOPS {
-                        relay_batch(bp, frag, &tx, &peer_node_id, &rfctx).await;
+                        relay_batch(bp, frag, &tx, &peer_node_id, &rfctx, operation).await;
                     } else {
                         if !send_unavailable_mutation(
                             &tx,
@@ -6920,7 +7613,7 @@ async fn handle_connection(
                 guard.remove(&peer);
                 let legacy_full_replication = placement.read().unwrap().is_empty();
                 let mut senders_guard = senders.lock().await;
-                if legacy_full_replication {
+                if legacy_full_replication && operation_gate.is_running() {
                     let keys: Vec<(FragmentId, String)> = senders_guard
                         .keys()
                         .filter(|(_, sender_peer)| sender_peer == &peer)
@@ -6935,8 +7628,10 @@ async fn handle_connection(
                         reports_guard.remove(&key);
                     }
                 } else {
-                    // Explicitly placed senders retain their buffers for
-                    // resume. Only notify if this was the current channel.
+                    // Explicitly placed senders, plus legacy senders already
+                    // captured by a shutdown fence, retain their recovery
+                    // state for reconnect. Only notify if this was the
+                    // current channel.
                     for ((_, sender_peer), sender_tx) in senders_guard.iter() {
                         if sender_peer == &peer {
                             let _ = sender_tx.send(SenderMsg::PeerDisconnected {
@@ -7064,6 +7759,7 @@ async fn register_mutation_relay(
         origin_tx,
         origin_req_id,
         deadline,
+        operation,
     } = registration;
     let (timeout_cancel, cancelled) = oneshot::channel();
     let timeout_keys = expected_keys.clone();
@@ -7075,6 +7771,7 @@ async fn register_mutation_relay(
             origin_tx,
             origin_req_id,
             timeout_cancel,
+            _operation: operation,
         },
     );
 
@@ -7150,6 +7847,7 @@ async fn relay_put(
     origin_tx: &PeerChannel,
     peer_node_id: &Option<String>,
     ctx: &ReforwardCtx,
+    operation: OperationPermit,
 ) {
     let original_req_id = p.req_id;
     let keys = vec![p.key.clone()];
@@ -7174,6 +7872,7 @@ async fn relay_put(
             origin_tx: origin_tx.clone(),
             origin_req_id: original_req_id,
             deadline: attempt_deadline,
+            operation,
         },
     )
     .await;
@@ -7208,6 +7907,7 @@ async fn relay_batch(
     origin_tx: &PeerChannel,
     peer_node_id: &Option<String>,
     ctx: &ReforwardCtx,
+    operation: OperationPermit,
 ) {
     let original_req_id = bp.req_id;
     let keys: Vec<String> = bp.puts.iter().map(|put| put.key.clone()).collect();
@@ -7232,6 +7932,7 @@ async fn relay_batch(
             origin_tx: origin_tx.clone(),
             origin_req_id: original_req_id,
             deadline: attempt_deadline,
+            operation,
         },
     )
     .await;
@@ -7910,6 +8611,8 @@ mod tests {
             peers: Arc::new(Mutex::new(HashMap::new())),
             peer_failures: PeerFailureSignals::default(),
             tasks: Weak::new(),
+            dispatcher_tasks: Weak::new(),
+            operation_gate: OperationGate::new(),
             hlc: Arc::new(Mutex::new(HlcClock::new())),
         }
     }
@@ -7941,6 +8644,7 @@ mod tests {
                 peers,
                 peer_failures: PeerFailureSignals::default(),
                 tasks: Arc::downgrade(&tasks),
+                operation_gate: OperationGate::new(),
                 peer_changes,
                 hlc: Arc::new(Mutex::new(HlcClock::new())),
                 senders,
@@ -9325,6 +10029,7 @@ mod tests {
         let retiring_senders = Arc::new(RetiringSenderRegistry::default());
         let sender_config = SenderConfig::default();
         let runtime = SenderRuntimeOptions::default();
+        let operation_gate = OperationGate::new();
 
         ensure_sender_entry(
             fragment,
@@ -9338,6 +10043,8 @@ mod tests {
                 retiring_senders: &retiring_senders,
                 reports: &reports,
                 peer_failures: &peer_failures,
+                operation_gate: &operation_gate,
+                allow_quiescing: false,
             },
         )
         .await;
@@ -9361,6 +10068,8 @@ mod tests {
                 retiring_senders: &retiring_senders,
                 reports: &reports,
                 peer_failures: &peer_failures,
+                operation_gate: &operation_gate,
+                allow_quiescing: false,
             },
         )
         .await;
@@ -9377,6 +10086,71 @@ mod tests {
         replacement.stop().await;
         router.remove(fragment);
         let _ = supervisor.stop_and_wait(None, None).await;
+    }
+
+    #[tokio::test]
+    async fn stopped_drain_sender_returns_to_retryable_preparation() {
+        let fragment = FragmentId(0);
+        let node = Node::start(
+            "drain-replacement-source".to_string(),
+            "127.0.0.1:0".parse().unwrap(),
+            NodeConfig {
+                fragment_map: HashMap::from([(
+                    fragment,
+                    vec![
+                        "drain-replacement-source".to_string(),
+                        "absent-target".to_string(),
+                    ],
+                )]),
+                ..NodeConfig::default()
+            },
+        )
+        .await
+        .unwrap();
+        node.put("replacement-fence".to_string(), b"value".to_vec())
+            .await
+            .unwrap();
+        assert!(matches!(
+            node.shutdown_with_replication_drain(
+                ReplicationDrainOptions::default().with_timeout(Duration::from_secs(1))
+            )
+            .await,
+            Err(ReplicationDrainShutdownError::Timeout {
+                phase: ReplicationDrainPhase::PeerReconciliation,
+                ..
+            })
+        ));
+
+        let stopped = node
+            .senders
+            .lock()
+            .await
+            .get(&(fragment, "absent-target".to_string()))
+            .cloned()
+            .unwrap();
+        stopped.stop().await;
+        assert!(matches!(
+            node.shutdown_with_replication_drain(
+                ReplicationDrainOptions::default().with_timeout(Duration::from_secs(1))
+            )
+            .await,
+            Err(ReplicationDrainShutdownError::RetryableSender(_))
+        ));
+
+        // The failed exact waiter moved the coordinator back to preparation.
+        // A retry replaces the dead task and waits on a new generation rather
+        // than returning the same permanent Unavailable error.
+        assert!(matches!(
+            node.shutdown_with_replication_drain(
+                ReplicationDrainOptions::default().with_timeout(Duration::from_secs(1))
+            )
+            .await,
+            Err(ReplicationDrainShutdownError::Timeout {
+                phase: ReplicationDrainPhase::PeerReconciliation,
+                ..
+            })
+        ));
+        node.shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -9676,6 +10450,7 @@ mod tests {
         let config = SenderConfig::default();
         let runtime = SenderRuntimeOptions::default();
         let hlc = Arc::new(Mutex::new(HlcClock::new()));
+        let operation_gate = OperationGate::new();
 
         ensure_sender_entry(
             FragmentId(0),
@@ -9689,6 +10464,8 @@ mod tests {
                 retiring_senders: &retiring_senders,
                 reports: &reports,
                 peer_failures: &peer_failures,
+                operation_gate: &operation_gate,
+                allow_quiescing: false,
             },
         )
         .await;
@@ -10307,6 +11084,8 @@ mod tests {
         let (origin_tx, _origin_rx, mut origin_response_rx) = test_peer_channel(1);
         let tasks = RuntimeTasks::new(4);
         let task_ref = Arc::downgrade(&tasks);
+        let operation_gate = OperationGate::new();
+        let operation = operation_gate.try_enter().unwrap();
         register_mutation_relay(
             &task_ref,
             relays.clone(),
@@ -10316,11 +11095,19 @@ mod tests {
                 expected_keys: vec!["key".to_string()],
                 origin_tx,
                 origin_req_id: 9,
-                deadline: Instant::now() + Duration::from_millis(10),
+                deadline: Instant::now() + Duration::from_millis(50),
+                operation,
             },
         )
         .await;
         assert!(relays.lock().await.contains_key(&17));
+        operation_gate.begin_shutdown();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), operation_gate.wait_for_drain())
+                .await
+                .is_err(),
+            "relay released mutation admission before response or timeout"
+        );
 
         let bytes = tokio::time::timeout(Duration::from_secs(1), origin_response_rx.recv())
             .await
@@ -10338,6 +11125,9 @@ mod tests {
             Ok(MutationStatus::Unavailable)
         );
         assert!(relays.lock().await.is_empty());
+        tokio::time::timeout(Duration::from_secs(1), operation_gate.wait_for_drain())
+            .await
+            .expect("relay timeout did not release mutation admission");
         tasks.shutdown().await;
     }
 
@@ -10347,6 +11137,8 @@ mod tests {
         let (origin_tx, _origin_rx, mut origin_response_rx) = test_peer_channel(1);
         let tasks = RuntimeTasks::new(4);
         let task_ref = Arc::downgrade(&tasks);
+        let operation_gate = OperationGate::new();
+        let operation = operation_gate.try_enter().unwrap();
         register_mutation_relay(
             &task_ref,
             relays.clone(),
@@ -10357,11 +11149,28 @@ mod tests {
                 origin_tx,
                 origin_req_id: 9,
                 deadline: Instant::now() + Duration::from_millis(10),
+                operation,
             },
         )
         .await;
         let relay = relays.lock().await.remove(&17).expect("relay missing");
-        let _ = relay.timeout_cancel.send(());
+        let MutationRelay {
+            timeout_cancel,
+            _operation: operation,
+            ..
+        } = relay;
+        let _ = timeout_cancel.send(());
+        operation_gate.begin_shutdown();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), operation_gate.wait_for_drain())
+                .await
+                .is_err(),
+            "removed relay released mutation admission before response handling finished"
+        );
+        drop(operation);
+        tokio::time::timeout(Duration::from_secs(1), operation_gate.wait_for_drain())
+            .await
+            .expect("completed relay did not release mutation admission");
 
         tokio::time::sleep(Duration::from_millis(30)).await;
         assert!(origin_response_rx.try_recv().is_err());

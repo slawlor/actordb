@@ -111,11 +111,56 @@ This pre-release lifecycle hardening is source-breaking: `shutdown` now returns
 public `SupervisorMessage` enum includes `Quiesce`. Update ignored shutdown
 calls and exhaustive matches when upgrading.
 
-`shutdown` fences public Node data calls, but transport tasks are currently
-cancelled rather than convergence-drained: it does not wait for peer
-replication ACKs. Merely dropping a `Node` requests best-effort transport
-cancellation and actor stop, but cannot await or report a durable flush, task
-join, or RocksDB lock release.
+`shutdown` fences public Node data calls, but does not wait for peer replication
+ACKs. Use the separate bounded API when the node must establish a peer fence
+before stopping:
+
+```rust
+use actordb::node::{ReplicationDrainOptions, ReplicationDrainShutdownError};
+use std::time::Duration;
+
+let report = node
+    .shutdown_with_replication_drain(
+        ReplicationDrainOptions::default().with_timeout(Duration::from_secs(30)),
+    )
+    .await?;
+println!("fenced {} fragment/peer senders", report.targets().len());
+```
+
+`ReplicationDrainOptions` defaults to one 30-second absolute budget; a zero or
+unrepresentable timeout is rejected. The call first closes public and inbound
+forwarded-mutation admission, stops placement work, and waits for admitted
+local applies plus sender fan-out. It then retains one generation on each exact
+target sender and runs a fresh, stable full reconciliation through
+`SenderConfig::required_ack_durability`. Only after all targets acknowledge
+does it run the same local flush/stop path as `shutdown`.
+
+The report is deliberately narrow: each listed peer has the fenced LWW winner
+or a newer winner for that fragment. It does not prove byte-for-byte cache
+equality, a quorum, cluster-wide convergence, response delivery, or fsync.
+`MemoryApplied` is volatile; `StoreCommitted` means the receiver's configured
+store accepted its flush under that store's contract. Explicit placement
+targets every configured remote replica for each locally active fragment after
+placement freezes. Empty-map legacy mode can only target senders already known
+at the fence; an empty target report is therefore possible.
+
+On `ReplicationDrainShutdownError::Timeout`, the structured `completed` and
+`pending` targets describe the last observation. Transport, senders, and
+fragment state stay alive while new data calls remain rejected. Retry the
+method to resume retained generations, or call ordinary `shutdown` to abandon
+the remote guarantee and finish local-only. Cancellation has the same retained
+state. `RetryableSender` means an exact sender task stopped or could not be
+prepared; retry installs a replacement and takes a fresh fence from the
+authoritative cache. `Unavailable` is terminal for this guarantee because a
+local-only shutdown has already passed the replication boundary. If peer work
+succeeds but the later local flush fails, `Local` carries the valid
+`ReplicationDrainReport`; retry skips the remote phase. A mutation response
+queued just before disconnect can still be lost, so clients retry stamped
+operations idempotently.
+
+Merely dropping a `Node` requests best-effort transport cancellation and actor
+stop, but cannot await or report a peer fence, durable flush, task join, or
+RocksDB lock release.
 
 ## Single-key operations
 

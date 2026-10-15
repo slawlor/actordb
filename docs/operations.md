@@ -173,6 +173,33 @@ clients must retry stamped/idempotent requests after disconnect. Dropping
 `Node` remains best effort and cannot await or report flush, join, or RocksDB
 lock-release outcomes.
 
+When stopping a healthy replica intentionally, use
+`shutdown_with_replication_drain(ReplicationDrainOptions)` to request a bounded
+peer fence first. One absolute timeout (30 seconds by default) covers placement
+freeze, previously admitted mutations, target preparation, reconnect, stable
+full reconciliation, and the configured receiver durability barrier. On
+success it immediately continues through the local flush sequence above.
+
+On timeout, inspect the error's completed and pending fragment/peer targets.
+The node remains one-way quiesced, but its listener, dialers, connections,
+senders, and fragment state stay alive; restore connectivity or receiver-store
+health and retry. Caller cancellation retains any already-issued drain
+generation too. A `RetryableSender` error asks the caller to retry with a fresh
+exact sender fence; `Unavailable` instead means local shutdown already crossed
+the replication boundary and the peer guarantee can no longer be established.
+If availability is more important than the remote fence, call ordinary
+`shutdown()` afterward to abandon it and finish local-only. A later local flush
+error carries the already-valid replication report and does not repeat peer
+work on retry.
+
+This is not a cluster convergence or response-delivery certificate. For every
+reported target it proves the receiver acknowledged the LWW state at the
+mutation-admission fence or a newer winner, at `MemoryApplied` or
+`StoreCommitted` as configured. The latter is store acceptance, not necessarily
+fsync. Explicit placement supplies the closed target set; legacy empty-map mode
+can cover only authenticated peers whose senders existed at the fence. Clients
+must still retry a stamped mutation if its network response was lost.
+
 ### Overloaded node (backpressure)
 
 Shed operations are counted per pool in `FragmentHealth.shed_counts`
