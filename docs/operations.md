@@ -29,7 +29,9 @@ poisoned data before widening the bound.
 
 Startup also preflights every durable record against the protocol's required
 single-record envelopes. A legacy key/value that cannot fit the 16 MiB hard
-frame limit fails startup instead of loading permanently unreplicable data.
+frame limit, or whose provenance node id is empty or exceeds 255 UTF-8 bytes,
+fails startup instead of loading permanently unreplicable data. Repair or
+remove the record offline before restarting; actordb does not rewrite it.
 
 ### Rolling restart with placement
 
@@ -113,12 +115,13 @@ through `NodeRuntimeOptions`; mutation ingress follows
 frames and 32 MiB of admitted encoded data; one ingress reservation bounds
 producers waiting to acquire byte permits before any encoded body is allocated.
 The owned permit then travels with the frame and releases on every write/drop path.
-Reader-generated responses have a separate priority lane and a 1 MiB byte
-reserve; operation priority does not reorder the ordinary producer lane.
+Reader-generated responses have a separate priority lane and a full 16 MiB
+byte reserve, so one legal response remains admissible under producer
+saturation; operation priority does not reorder the ordinary producer lane.
 Ordinary queue admission defaults to 5 seconds; streamed reconciliation-data
 pages use the separate 30-second `reconcile_data_admission_timeout` so large
 legal frames do not churn an otherwise healthy slow connection. Configured
-frame capacity must be at least two and byte capacity at least 17 MiB.
+frame capacity must be at least two and byte capacity at least 32 MiB.
 
 ### Peer startup, identity, and duplicate connections
 

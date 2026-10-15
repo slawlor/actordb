@@ -80,8 +80,14 @@ process — the bulk of behavioral coverage:
   `persistence_keeps_gossiped_winner`, `persistence_flushes_on_shutdown`,
   `memory_store_exercises_persistence_plumbing`.
 - **Multi-key**: `multi_key_fanout`, `multi_key_partial_failure`,
-  `batch_put_fails_over_after_a_stale_owner_returns_unavailable`,
-  `mutation_relay_scans_past_the_origin_to_a_connected_owner`.
+  `batch_operations_fail_over_after_a_stale_owner_returns_unavailable`,
+  `mutation_relay_scans_past_the_origin_to_a_connected_owner`,
+  `remote_batches_split_at_wire_item_limit_without_dropping_connection`,
+  `remote_batches_split_at_encoded_byte_limits_without_false_misses`.
+  Node and wire unit tests separately verify exact Prost length accounting,
+  positional ordered-prefix validation with duplicate keys, the shed-bit hard
+  boundary, UTF-8-safe diagnostic truncation, valid provenance bounds, and the
+  reserved full-frame response lane under complete producer saturation.
 - **Backpressure**: `background_saturation_leaves_high_priority_p99_unaffected`,
   `queue_cap_shed_is_explicit_and_counted`,
   `forwarded_priority_preserved_end_to_end`,

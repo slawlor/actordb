@@ -19,7 +19,7 @@ use std::sync::Arc;
 use crate::actor::VersionedValue;
 use crate::shard::FragmentId;
 #[cfg(feature = "rocksdb")]
-use crate::wire::check_record_budget;
+use crate::wire::{check_node_id_budget, check_record_budget};
 
 /// Error from a [`KvStore`] operation.
 #[derive(Debug)]
@@ -45,6 +45,10 @@ impl std::error::Error for StoreError {}
 /// Keys are raw bytes. The actor works with `String` keys and converts
 /// at the boundary (failing boot loudly on non-UTF-8 data); the store
 /// itself never interprets key bytes.
+///
+/// Every persisted [`VersionedValue::node_id`] must contain 1 to 255 UTF-8
+/// bytes. Node actors validate this before calling the store and again while
+/// loading, but direct store users must preserve the same invariant.
 pub trait KvStore: Send + Sync + 'static {
     /// Load the full backing dataset. The default [`KvStore::load_prefix`]
     /// implementation filters this result during fragment startup.
@@ -253,6 +257,11 @@ impl KvStore for RocksDbStore {
     fn write_batch(&self, writes: &[(Vec<u8>, VersionedValue)]) -> Result<(), StoreError> {
         let mut batch = rocksdb::WriteBatch::default();
         for (key, value) in writes {
+            check_node_id_budget(value.node_id.len()).map_err(|error| {
+                StoreError(format!(
+                    "refusing to persist record with invalid provenance: {error}"
+                ))
+            })?;
             batch.put(key, Self::encode(value));
         }
         self.db.write(batch).map_err(|e| StoreError(e.to_string()))
@@ -327,7 +336,7 @@ mod tests {
     fn rocksdb_value_encoding_roundtrip() {
         let v = VersionedValue::new(vec![1, 2, 3], 123456789, "node-a".to_string());
         assert_eq!(RocksDbStore::decode(&RocksDbStore::encode(&v)).unwrap(), v);
-        let v = VersionedValue::new(vec![], 0, String::new());
+        let v = VersionedValue::new(vec![], 0, "n".to_string());
         assert_eq!(RocksDbStore::decode(&RocksDbStore::encode(&v)).unwrap(), v);
     }
 
@@ -358,5 +367,36 @@ mod tests {
             .load()
             .expect_err("oversized persisted key was accepted");
         assert!(error.to_string().contains("cannot be replicated"));
+    }
+
+    #[cfg(feature = "rocksdb")]
+    #[test]
+    fn rocksdb_rejects_invalid_provenance_before_persisting() {
+        use crate::wire::MAX_WIRE_NODE_ID_BYTES;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = RocksDbStore::open(dir.path()).unwrap();
+        for node_id in [String::new(), "n".repeat(MAX_WIRE_NODE_ID_BYTES + 1)] {
+            let error = store
+                .write_batch(&[(
+                    b"invalid".to_vec(),
+                    VersionedValue::new(Vec::new(), 1, node_id),
+                )])
+                .expect_err("invalid provenance was persisted");
+            assert!(error.to_string().contains("invalid provenance"));
+        }
+        assert!(store.load().unwrap().is_empty());
+
+        store
+            .db
+            .put(
+                b"legacy-invalid",
+                RocksDbStore::encode(&VersionedValue::new(Vec::new(), 1, String::new())),
+            )
+            .unwrap();
+        let error = store
+            .load()
+            .expect_err("invalid legacy provenance was loaded");
+        assert!(error.to_string().contains("record node id is 0 bytes"));
     }
 }

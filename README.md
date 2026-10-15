@@ -142,8 +142,8 @@ let value = node.get("key".to_string()).await?;  // routed read, Option<Versione
 let all = node.get_all().await?;                  // full local copy (live keys)
 let health = node.health().await?;                // per-fragment supervision health
 
-// Bulk APIs: keys hash to fragments, then count-bounded chunks per remote
-// fragment/owner attempt. Per-key Results remain in input order.
+// Bulk APIs: keys hash to fragments, then exact-byte/count-bounded chunks per
+// remote fragment/owner attempt. Per-key Results remain in input order.
 let puts = node.put_multi(vec![
     ("k1".to_string(), b"v1".to_vec()),
     ("k2".to_string(), b"v2".to_vec()),
@@ -207,8 +207,10 @@ addition to its frame-count limit.
 Multi-key semantics:
 
 - `put_multi` / `get_multi` partition keys by fragment and send one
-  `BatchPut` / `BatchGet` per remote fragment and owner attempt, rather than
-  one message per key.
+  or more exact-byte-bounded `BatchPut` / `BatchGet` requests per remote
+  fragment and owner attempt, rather than one message per key. Large get
+  responses advance as connection-correlated ordered prefixes; omitted suffixes are
+  requested under fresh ids without losing duplicate positions.
 - Local and remote puts await the serving fragment's exact per-key apply
   outcome. Remote batches preserve request order/cardinality and use the
   configured per-attempt deadline (5 seconds by default), including outbound
@@ -447,8 +449,8 @@ as issues in the [issue tracker](https://github.com/slawlor/actordb/issues):
   frame; the owned permit travels with the frame through the socket write and
   releases on every drop path. Queue admission and socket writes have bounded
   waits; expiry cancels the connection so the dialer can reconnect. The frame
-  budget is split between data and a writer-priority response lane, and 1 MiB
-  of the byte budget is reserved from ordinary producers. Responses produced
+  budget is split between data and a writer-priority response lane, and a full
+  16 MiB maximum response is reserved from ordinary producers. Responses produced
   by the sole connection reader use nonblocking admission and cancel on
   saturation, so the reader never waits behind its own writer. After at most
   16 consecutive responses, a ready data frame is written to prevent starvation.
@@ -457,10 +459,13 @@ as issues in the [issue tracker](https://github.com/slawlor/actordb/issues):
   mutation overflow advances a persistent reset generation, while control
   overflow closes the contributing connection for replay. Sender actor lanes
   remain operation/message-count bounds. Protocol builders separately enforce
-  exact encoded sizes: anti-entropy and ordinary replication target
-  1 MiB pages and no frame may exceed 16 MiB. An irreducible oversized record is
-  rejected before local apply; a legacy oversized persisted record fails node
-  startup instead of becoming permanently unreplicable. Before Prost decoding,
+  exact encoded sizes: anti-entropy, ordinary replication, and aggregate
+  batches target 1 MiB pages and no frame may exceed 16 MiB. Mutation batches
+  also reserve their worst-case complete replies; get responses use ordered
+  prefix pulls. An irreducible oversized record or a record with empty or
+  over-limit provenance is rejected before local apply; a legacy persisted
+  record violating either invariant fails node startup instead of becoming
+  permanently unreplicable. Before Prost decoding,
   an allocation-free scan caps anti-entropy pages at 256 repeated items and
   general batch fields at 4096, preventing empty-message decode amplification.
   One ticketed FIFO credit schedules anti-entropy rounds fairly across every
@@ -475,7 +480,9 @@ as issues in the [issue tracker](https://github.com/slawlor/actordb/issues):
   advertises an inclusive version range, required capability bits, and a fresh
   challenge; `HelloAuth` completes the transcript proof. Missing or
   incompatible fields fail closed before peer installation. The current binary
-  supports only wire v3 and requires the paged-anti-entropy capability. It is
+  supports only wire v3 and requires the paged-anti-entropy and
+  byte-bounded-batches capabilities. The latter changes batch-get responses to
+  ordered-prefix semantics, so binaries without it are rejected. It is
   incompatible with v2, so deploy compatible binaries together rather than
   performing a mixed v2/v3 rolling upgrade. This transition is also a Rust
   source break for advanced users of the public generated `actordb::proto` API

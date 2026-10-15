@@ -113,6 +113,10 @@ use crate::wire::check_versioned_value_budget;
 /// invisible to reads and converted to versioned tombstones by the fragment's
 /// cleaner.
 ///
+/// `node_id` is record provenance and must contain 1 to 255 UTF-8 bytes,
+/// matching the cluster identity bound. Actor apply and startup validation
+/// reject values outside that range without mutating state.
+///
 /// A tombstone (`is_tombstone`) marks a deleted key. Tombstones participate
 /// in LWW like writes: a tombstone with a higher timestamp shadows a live
 /// value, and a live write with a higher timestamp resurrects the key.
@@ -1724,33 +1728,35 @@ mod tests {
 
     #[tokio::test]
     async fn summary_pages_clamp_zero_limit_and_bound_cloned_metadata() {
-        let large_node_id = "n".repeat(SUMMARY_PAGE_TARGET_BYTES / 2 + 1);
+        let large_suffix = "k".repeat(SUMMARY_PAGE_TARGET_BYTES / 2);
+        let alpha = format!("alpha-{large_suffix}");
+        let bravo = format!("bravo-{large_suffix}");
         let state = test_state(HashMap::from([
             (
-                "alpha".to_string(),
-                VersionedValue::new(Vec::new(), 1, large_node_id.clone()),
+                alpha.clone(),
+                VersionedValue::new(Vec::new(), 1, "n".to_string()),
             ),
             (
-                "bravo".to_string(),
-                VersionedValue::new(Vec::new(), 2, large_node_id),
+                bravo.clone(),
+                VersionedValue::new(Vec::new(), 2, "n".to_string()),
             ),
         ]));
 
         let first = state.summary_page(None, None, Some(123), 0).await;
         assert_eq!(first.summaries.len(), 1);
-        assert_eq!(first.summaries[0].key, "alpha");
+        assert_eq!(first.summaries[0].key, alpha);
         assert!(!first.done);
 
         let second = state
             .summary_page(
-                Some("alpha"),
+                Some(&alpha),
                 Some(first.revision),
                 Some(first.snapshot_time_ms),
                 usize::MAX,
             )
             .await;
         assert_eq!(second.summaries.len(), 1);
-        assert_eq!(second.summaries[0].key, "bravo");
+        assert_eq!(second.summaries[0].key, bravo);
         assert!(second.done);
     }
 
@@ -1836,7 +1842,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn invalid_size_apply_is_nonfatal_to_worker() {
+    async fn invalid_wire_record_apply_is_nonfatal_to_worker() {
         let shared = Arc::new(test_state(HashMap::new()));
         let (worker, handle) = KvWorker::spawn(
             None,
@@ -1870,12 +1876,38 @@ mod tests {
             CallResult::Success(Err(ApplyError::InvalidInput(_)))
         ));
 
+        for node_id in [
+            String::new(),
+            "n".repeat(crate::wire::MAX_WIRE_NODE_ID_BYTES + 1),
+        ] {
+            let invalid = worker
+                .call(
+                    move |reply| KvMessage::ApplyOp {
+                        op: test_op(
+                            "invalid-provenance",
+                            VersionedValue::new(Vec::new(), 2, node_id),
+                        ),
+                        priority: OpPriority::Default,
+                        is_replication: false,
+                        reply: Some(reply),
+                    },
+                    None,
+                )
+                .await
+                .unwrap();
+            assert!(matches!(
+                invalid,
+                CallResult::Success(Err(ApplyError::InvalidInput(_)))
+            ));
+            assert!(shared.get("invalid-provenance").await.is_none());
+        }
+
         let valid = worker
             .call(
                 |reply| KvMessage::ApplyOp {
                     op: test_op(
                         "healthy",
-                        VersionedValue::new(b"value".to_vec(), 2, "node".to_string()),
+                        VersionedValue::new(b"value".to_vec(), 3, "node".to_string()),
                     ),
                     priority: OpPriority::Default,
                     is_replication: false,
