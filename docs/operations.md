@@ -61,10 +61,12 @@ node converges to the full dataset with zero full-state sync entries.
   admission is capped at 5 seconds and each complete socket frame write at 30
   seconds. Either expiry cancels that exact connection; its senders retain or
   requeue outstanding work, and the configured dialer reconnects with backoff.
-- Inbound connection-task admission is not yet bounded, completed task handles
-  are retained until shutdown, and a socket that never sends Hello has no
-  handshake deadline. Put an external connection/TLS proxy in front of an
-  untrusted network until the transport-lifecycle hardening lands.
+- At most 1024 accepted sockets are concurrently handshaking or serving as
+  inbound peers by default; excess accepted sockets are closed. The complete
+  `Hello`/`HelloAuth` exchange has one absolute 5-second deadline and pre-auth
+  frames are limited to 4 KiB. A frame body that follows an established
+  connection's prefix has a 30-second deadline. Completed Node-owned tasks are
+  reaped while the node runs rather than retained until shutdown.
 - Each fragment/peer sender also has a bounded local-mutation ingress lane
   sized by `SenderConfig::buffer_capacity` and a separate 64-message protocol
   control lane by default. Mutation-lane saturation coalesces a persistent
@@ -91,6 +93,50 @@ through `NodeRuntimeOptions`; mutation ingress follows
 `Node::start_with_options`. Queue capacity counts frames, not bytes: frames can
 approach the 16 MiB protocol limit, so 256 slots are not a fixed memory budget.
 Operation priority does not reorder this shared socket queue.
+
+### Peer startup, identity, and duplicate connections
+
+- Every configured `members` entry is a persistent dial intent. It starts even
+  when the peer is initially unavailable and retries transport, authentication,
+  and protocol failures with jittered exponential backoff (100 ms up to 30 s).
+  The configured member id is known before the first dial and is the expected
+  Hello id from the first authentication onward; a different claimant is
+  rejected before it enters the peer map.
+- `Node::connect(address)` tries its first dial once. It returns after that
+  successful transport is handed to the Node-owned redial supervisor, before
+  authentication and static-mode full-state sync complete. Concurrent calls for
+  the same address wait for the pending initial dial instead of returning early.
+  The supervisor pins the first successfully authenticated node id and rejects a
+  different id on later reconnects. Later failures retry in the background.
+- Simultaneous crossed dials are expected. Both endpoints rank the same
+  challenge-bound transcript and direction, keep the same winner, cancel the
+  loser, and park its dial supervisor while the winner remains healthy. This
+  avoids continuously rotating replication sessions.
+- With `cluster_secret`, protocol v2 proves fresh possession of the shared key
+  using both peers' random challenges. It does not distinguish holders of that
+  shared key, encrypt traffic, or integrity-protect post-handshake frames. Use a
+  mutually authenticated protected `Network` on an untrusted network.
+
+Use at least 32 independently generated, high-entropy random bytes for
+`cluster_secret`. Challenges make a captured proof stale on a new connection,
+but a low-entropy password can still be guessed offline by testing candidate
+keys against the captured transcript and HMAC.
+
+### Graceful shutdown
+
+Stop admitting application operations and await their futures before calling
+`node.shutdown().await`. Shutdown closes internal task admission, aborts and
+joins listener, connection, writer, dial, relay-timer, and placement work,
+releases pending network waiters, stops replication senders, and finally stops
+and joins fragment supervisors so their pools drain and stores flush. It is
+idempotent, and a cancelled shutdown waiter may call it again.
+
+The lifecycle fence covers Node-owned background tasks; it does not
+automatically wait for arbitrary `put`, `get`, batch, health, or other Node
+futures running in caller-owned tasks. Dropping `Node` requests best-effort
+cancellation and actor stop only. Because `Drop` cannot await, it is not a
+substitute for shutdown when durable flush, task join, or prompt RocksDB lock
+release matters.
 
 ### Overloaded node (backpressure)
 

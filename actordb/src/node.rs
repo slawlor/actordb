@@ -29,15 +29,16 @@
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex as StdMutex, RwLock};
+use std::sync::{Arc, Mutex as StdMutex, RwLock, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use prost::Message as ProstMessage;
 use ractor::rpc::CallResult;
 use ractor::{Actor, ActorRef};
 use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::sync::{mpsc, oneshot, watch, Mutex, RwLock as AsyncRwLock};
-use tokio::task::{AbortHandle, JoinSet};
+use tokio::sync::{
+    mpsc, oneshot, watch, Mutex, Notify, OwnedSemaphorePermit, RwLock as AsyncRwLock, Semaphore,
+};
 use tokio::time::Instant;
 
 use crate::actor::{
@@ -50,14 +51,15 @@ use crate::placement::{
 };
 use crate::proto::{
     BatchAck, BatchGet, BatchGetResponse, BatchKeyValue, BatchNack, BatchPut, Envelope,
-    EnvelopeMsg, ForwardedGet, ForwardedPut, GetResponse, Hello, KeySummary, MutationResponse,
-    MutationResult, MutationStatus, Priority as ProtoPriority, ReconcileData, ReconcileResponse,
-    ReplicationAckLevel, SyncEntry, SyncResponse,
+    EnvelopeMsg, ForwardedGet, ForwardedPut, GetResponse, Hello, HelloAuth, KeySummary,
+    MutationResponse, MutationResult, MutationStatus, Priority as ProtoPriority, ReconcileData,
+    ReconcileResponse, ReplicationAckLevel, SyncEntry, SyncResponse,
 };
 use crate::replication::{
-    spawn_node_sender, NodeSender, ReplicationAckDurability, SenderConfig, SenderDeps, SenderMsg,
-    SenderRuntimeOptions, SenderStateReport,
+    spawn_node_sender, NodeSender, NodeSenderSendError, ReplicationAckDurability, SenderConfig,
+    SenderDeps, SenderMsg, SenderRuntimeOptions, SenderStateReport,
 };
+use crate::runtime_tasks::RuntimeTasks;
 use crate::shard::{fragment_of, FragmentId};
 use crate::store::{KvStore, PrefixedStore};
 use crate::supervision::{FragmentHealth, FragmentSupervisor, SupervisorArgs, SupervisorMessage};
@@ -67,22 +69,37 @@ use crate::supervision::{FragmentHealth, FragmentSupervisor, SupervisorArgs, Sup
 const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 
 /// Current peer wire protocol version. Hello ranges must include this value.
-pub const WIRE_PROTOCOL_VERSION: u32 = 1;
+/// Version 2 is wire-incompatible with version 1 and also changed the public
+/// generated protocol types (`Hello::challenge` and `EnvelopeMsg::HelloAuth`).
+pub const WIRE_PROTOCOL_VERSION: u32 = 2;
 /// The peer returns exact forwarded-mutation outcomes.
 pub const CAPABILITY_MUTATION_RESULTS: u64 = 1 << 0;
 /// Replication ACKs carry an explicit receiver durability fence.
 pub const CAPABILITY_DURABILITY_ACKS: u64 = 1 << 1;
 /// Reconciliation frames carry session/round/chunk correlation.
 pub const CAPABILITY_CORRELATED_RECONCILIATION: u64 = 1 << 2;
+/// The handshake uses independent fresh challenges and mutual transcript
+/// proofs before publishing either side of a connection.
+pub const CAPABILITY_CHALLENGE_AUTH: u64 = 1 << 3;
 /// Capabilities required by this binary before it installs a peer connection.
-pub const REQUIRED_WIRE_CAPABILITIES: u64 =
-    CAPABILITY_MUTATION_RESULTS | CAPABILITY_DURABILITY_ACKS | CAPABILITY_CORRELATED_RECONCILIATION;
+pub const REQUIRED_WIRE_CAPABILITIES: u64 = CAPABILITY_MUTATION_RESULTS
+    | CAPABILITY_DURABILITY_ACKS
+    | CAPABILITY_CORRELATED_RECONCILIATION
+    | CAPABILITY_CHALLENGE_AUTH;
 
 /// Outbound queue depth per peer connection.
 const PEER_CHANNEL_DEPTH: usize = 256;
 /// Protocol-control messages retained per fragment/peer sender. Mutation
 /// ingress has its own lane sized by `SenderConfig::buffer_capacity`.
 const REPLICATION_CONTROL_CHANNEL_DEPTH: usize = 64;
+/// Concurrent inbound sockets admitted to handshake/connection processing.
+const INBOUND_CONNECTION_CAPACITY: usize = 1024;
+/// Total budget for both flights of the peer handshake.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Internal task-registration queue. Registration applies backpressure and is
+/// acknowledged before the caller treats a task as owned.
+const TASK_COMMAND_CAPACITY: usize = 64;
+const HANDSHAKE_CHALLENGE_BYTES: usize = 32;
 
 /// Reconnect backoff: first retry after this, doubling to the cap.
 const RECONNECT_BASE: Duration = Duration::from_millis(100);
@@ -102,6 +119,7 @@ struct PeerChannel {
     tx: mpsc::Sender<Vec<u8>>,
     cancel: watch::Sender<bool>,
     queue_admission_timeout: Duration,
+    rank: Option<ConnectionRank>,
 }
 
 impl PeerChannel {
@@ -122,12 +140,182 @@ impl PeerChannel {
     }
 }
 
+/// Both endpoints derive the same ordering from the authenticated transcript.
+/// A connection dialed by the lexicographically smaller node is preferred;
+/// the transcript digest breaks ties between duplicate sockets in the same
+/// direction without depending on arrival order at either endpoint.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct ConnectionRank {
+    preferred_direction: bool,
+    transcript_id: [u8; 32],
+}
+
 /// peer node_id -> outbound frame queue
 type PeerMap = Arc<Mutex<HashMap<String, PeerChannel>>>;
+type PeerFailurePending = Arc<StdMutex<HashMap<String, Vec<mpsc::Sender<Vec<u8>>>>>>;
+
+/// Synchronous signal path from replication sender callbacks to one Node-owned
+/// async worker. Duplicate signals for the same physical channel coalesce, but
+/// distinct stale/current channels are retained so one cannot overwrite the
+/// other before the worker performs exact-channel cancellation.
+#[derive(Clone, Default)]
+struct PeerFailureSignals {
+    pending: PeerFailurePending,
+    notify: Arc<Notify>,
+}
+
+impl PeerFailureSignals {
+    fn signal(&self, peer: String, failed_tx: mpsc::Sender<Vec<u8>>) {
+        let mut pending = self.pending.lock().unwrap();
+        let channels = pending.entry(peer).or_default();
+        if !channels
+            .iter()
+            .any(|channel| channel.same_channel(&failed_tx))
+        {
+            channels.push(failed_tx);
+        }
+        drop(pending);
+        self.notify.notify_one();
+    }
+
+    async fn run(self, peers: PeerMap) {
+        loop {
+            self.notify.notified().await;
+            let failures = std::mem::take(&mut *self.pending.lock().unwrap());
+            for (peer, failed_channels) in failures {
+                let current = peers.lock().await.get(&peer).cloned();
+                if let Some(current) = current {
+                    if failed_channels
+                        .iter()
+                        .any(|failed_tx| current.same_sender(failed_tx))
+                    {
+                        current.cancel();
+                    }
+                }
+            }
+        }
+    }
+}
+
+struct DialIntentGuard {
+    address: SocketAddr,
+    registry: Arc<StdMutex<HashMap<SocketAddr, DialIntentState>>>,
+    changes: watch::Sender<u64>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DialIntentState {
+    Pending,
+    Active,
+}
+
+impl DialIntentGuard {
+    fn reserve(
+        registry: Arc<StdMutex<HashMap<SocketAddr, DialIntentState>>>,
+        changes: watch::Sender<u64>,
+        address: SocketAddr,
+    ) -> Option<Self> {
+        let mut intents = registry.lock().unwrap();
+        if intents.contains_key(&address) {
+            return None;
+        }
+        intents.insert(address, DialIntentState::Pending);
+        drop(intents);
+        Some(Self {
+            address,
+            registry,
+            changes,
+        })
+    }
+
+    fn activate(&self) {
+        if let Some(state) = self.registry.lock().unwrap().get_mut(&self.address) {
+            *state = DialIntentState::Active;
+        }
+        self.changes.send_modify(|generation| {
+            *generation = generation.wrapping_add(1);
+        });
+    }
+}
+
+impl Drop for DialIntentGuard {
+    fn drop(&mut self) {
+        self.registry.lock().unwrap().remove(&self.address);
+        self.changes.send_modify(|generation| {
+            *generation = generation.wrapping_add(1);
+        });
+    }
+}
 /// Phase 5 senders, keyed by (fragment, peer node id).
 type SenderMap = Arc<Mutex<HashMap<(FragmentId, String), NodeSender>>>;
 /// Sender state reports, keyed by (fragment, peer node id).
 type SenderReportMap = Arc<Mutex<HashMap<(FragmentId, String), Arc<Mutex<SenderStateReport>>>>>;
+
+/// Join ownership for sender tasks detached from the active sender map by a
+/// cancellable connection or placement task. Normal cleanup removes an entry
+/// after joining it; cancellation leaves the entry here for Node shutdown.
+#[derive(Default)]
+struct RetiringSenderRegistry {
+    senders: StdMutex<Vec<NodeSender>>,
+}
+
+impl RetiringSenderRegistry {
+    fn retire(self: &Arc<Self>, sender: NodeSender) -> RetiringSender {
+        {
+            let mut retiring = self.senders.lock().unwrap();
+            if !retiring.iter().any(|current| current.same_task(&sender)) {
+                retiring.push(sender.clone());
+            }
+        }
+        sender.request_stop();
+        RetiringSender {
+            sender,
+            registry: self.clone(),
+        }
+    }
+
+    fn remove(&self, sender: &NodeSender) {
+        self.senders
+            .lock()
+            .unwrap()
+            .retain(|current| !current.same_task(sender));
+    }
+
+    fn snapshot(&self) -> Vec<NodeSender> {
+        self.senders.lock().unwrap().clone()
+    }
+
+    fn request_stop_all(&self) {
+        for sender in self.senders.lock().unwrap().iter() {
+            sender.request_stop();
+        }
+    }
+
+    fn clear(&self) {
+        self.senders.lock().unwrap().clear();
+    }
+}
+
+impl Drop for RetiringSenderRegistry {
+    fn drop(&mut self) {
+        for sender in self.senders.get_mut().unwrap().iter() {
+            sender.request_stop();
+        }
+    }
+}
+
+struct RetiringSender {
+    sender: NodeSender,
+    registry: Arc<RetiringSenderRegistry>,
+}
+
+impl RetiringSender {
+    async fn join(self) {
+        self.sender.stop().await;
+        self.registry.remove(&self.sender);
+    }
+}
+
 /// Relayed forwarded-gets keyed by their locally allocated request id.
 type RelayMap = Arc<Mutex<HashMap<u64, GetRelay>>>;
 /// Relayed forwarded mutations: relay req_id -> (origin peer_tx, origin req_id).
@@ -139,8 +327,9 @@ struct SenderEntryDeps<'a> {
     router: &'a FragmentRouter,
     hlc: &'a Arc<Mutex<HlcClock>>,
     senders: &'a SenderMap,
+    retiring_senders: &'a Arc<RetiringSenderRegistry>,
     reports: &'a SenderReportMap,
-    peers: &'a PeerMap,
+    peer_failures: &'a PeerFailureSignals,
 }
 
 /// Atomically install the one replication sender allowed to own a
@@ -157,15 +346,17 @@ async fn ensure_sender_entry(fragment: FragmentId, peer: &str, deps: SenderEntry
     if deps.router.route_for_fragment(fragment).is_none() {
         return;
     }
-    let replacing_stopped_sender = if let Some(sender) = senders_guard.get(&key) {
+    let (replacing_stopped_sender, retiring_sender) = if let Some(sender) = senders_guard.get(&key)
+    {
         if !sender.is_closed() {
             return;
         }
+        let retiring = deps.retiring_senders.retire(sender.clone());
         senders_guard.remove(&key);
         deps.reports.lock().await.remove(&key);
-        true
+        (true, Some(retiring))
     } else {
-        false
+        (false, None)
     };
     let report = Arc::new(Mutex::new(SenderStateReport {
         state: "disconnected".to_string(),
@@ -176,22 +367,13 @@ async fn ensure_sender_entry(fragment: FragmentId, peer: &str, deps: SenderEntry
         ack_durability_mismatch: false,
         reconcile_rounds: 0,
     }));
-    let peers = deps.peers.clone();
+    let peer_failures = deps.peer_failures.clone();
     let expected_peer = peer.to_string();
     let runtime = deps
         .runtime
         .clone()
         .with_queue_failure_handler(Arc::new(move |failed_tx| {
-            let peers = peers.clone();
-            let expected_peer = expected_peer.clone();
-            tokio::spawn(async move {
-                let current = peers.lock().await.get(&expected_peer).cloned();
-                if let Some(current) = current {
-                    if current.same_sender(&failed_tx) {
-                        current.cancel();
-                    }
-                }
-            });
+            peer_failures.signal(expected_peer.clone(), failed_tx);
         }));
     let sender = spawn_node_sender(
         fragment,
@@ -214,6 +396,10 @@ async fn ensure_sender_entry(fragment: FragmentId, peer: &str, deps: SenderEntry
     }
     deps.reports.lock().await.insert(key.clone(), report);
     senders_guard.insert(key, sender);
+    drop(senders_guard);
+    if let Some(retiring) = retiring_sender {
+        retiring.join().await;
+    }
 }
 
 struct MutationRelay {
@@ -222,6 +408,14 @@ struct MutationRelay {
     origin_tx: PeerChannel,
     origin_req_id: u64,
     timeout_cancel: oneshot::Sender<()>,
+}
+
+struct MutationRelayRegistration {
+    expected_peer: String,
+    expected_keys: Vec<String>,
+    origin_tx: PeerChannel,
+    origin_req_id: u64,
+    deadline: Instant,
 }
 
 struct GetRelay {
@@ -309,9 +503,14 @@ struct ConnContext {
     pending_mutation_relays: MutationRelayMap,
     next_req_id: Arc<AtomicU64>,
     peers: PeerMap,
-    tasks: Arc<Mutex<Vec<AbortHandle>>>,
+    peer_failures: PeerFailureSignals,
+    tasks: Weak<RuntimeTasks>,
+    /// Monotonic wake-up signal for dial supervisors waiting behind another
+    /// physical connection to the same authenticated peer.
+    peer_changes: watch::Sender<u64>,
     hlc: Arc<Mutex<HlcClock>>,
     senders: SenderMap,
+    retiring_senders: Arc<RetiringSenderRegistry>,
     sender_config: SenderConfig,
     sender_runtime: SenderRuntimeOptions,
     runtime_options: NodeRuntimeOptions,
@@ -322,10 +521,10 @@ struct ConnContext {
     sync_entries_applied: Arc<AtomicU64>,
     /// Notify the placement driver on peer join/leave. `None` in
     /// static mode.
-    membership_tx: Option<mpsc::UnboundedSender<()>>,
-    /// Pre-shared cluster secret for the static Hello integrity tag.
-    /// This is not replay-resistant peer authentication on plaintext TCP.
-    /// `None` = no group-membership tag.
+    membership_tx: Option<watch::Sender<u64>>,
+    /// Pre-shared cluster secret for fresh, challenge-bound mutual proofs.
+    /// This proves group-key possession, not individual identity, and does not
+    /// protect post-handshake plaintext frames. `None` = no membership proof.
     cluster_secret: Option<Vec<u8>>,
 }
 
@@ -734,6 +933,10 @@ pub struct Node {
     /// snapshotter). Stopped on shutdown. Shared with the Phase 8
     /// placement driver, which spawns/stops subtrees at runtime.
     supervisors: Arc<Mutex<HashMap<FragmentId, ActorRef<SupervisorMessage>>>>,
+    /// Synchronous stop/join ownership for both active and retiring fragment
+    /// supervisors. Ractor actors are self-running after ActorRef drop, so
+    /// this registry is also the reliable best-effort Node::drop stop path.
+    supervisor_stops: Arc<SupervisorRegistry>,
     /// Placement: fragment -> replica node_ids. Static unless a
     /// placement controller is configured, in which case the driver
     /// keeps it converged with the controller.
@@ -759,12 +962,15 @@ pub struct Node {
     pending_mutation_relays: MutationRelayMap,
     next_req_id: Arc<AtomicU64>,
     peers: PeerMap,
+    peer_failures: PeerFailureSignals,
     /// Per-node sequence number for locally originated ops.
     next_seq: Arc<Mutex<u64>>,
     /// Hybrid logical clock for LWW timestamps.
     hlc: Arc<Mutex<HlcClock>>,
     /// Phase 5 senders, keyed by (fragment, peer node id).
     senders: SenderMap,
+    /// Sender tasks removed by cancellable lifecycle work but not yet joined.
+    retiring_senders: Arc<RetiringSenderRegistry>,
     /// Phase 5 sender tuning.
     sender_config: SenderConfig,
     /// Transport and replication liveness policy.
@@ -774,14 +980,35 @@ pub struct Node {
     /// Full-state sync entries applied via SyncResponse (observability;
     /// stays 0 when dynamic placement owns anti-entropy).
     sync_entries_applied: Arc<AtomicU64>,
-    /// Wake the placement driver on membership change (Phase 8).
-    membership_tx: Option<mpsc::UnboundedSender<()>>,
-    /// Pre-shared cluster secret for the static Hello integrity tag.
-    /// This is not replay-resistant peer authentication on plaintext TCP.
-    /// `None` = no group-membership tag.
+    /// Coalesced wakeup for the placement driver on membership change (Phase 8).
+    membership_tx: Option<watch::Sender<u64>>,
+    /// Pre-shared cluster secret for the challenge-bound Hello transcript proof.
+    /// This proves fresh possession during the handshake, but plaintext TCP
+    /// still has no confidentiality or per-frame integrity.
+    /// `None` = no group-membership proof.
     cluster_secret: Option<Vec<u8>>,
-    tasks: Arc<Mutex<Vec<AbortHandle>>>,
+    tasks: Arc<RuntimeTasks>,
+    inbound_connections: Arc<Semaphore>,
+    dial_intents: Arc<StdMutex<HashMap<SocketAddr, DialIntentState>>>,
+    dial_intent_changes: watch::Sender<u64>,
+    peer_changes: watch::Sender<u64>,
+    shutdown_state: Mutex<bool>,
     network: Arc<dyn Network>,
+}
+
+impl Drop for Node {
+    fn drop(&mut self) {
+        // Async cleanup still belongs to `shutdown`, but never leave task
+        // admission open merely because a caller dropped the handle.
+        self.tasks.request_shutdown();
+        if let Ok(senders) = self.senders.try_lock() {
+            for sender in senders.values() {
+                sender.request_stop();
+            }
+        }
+        self.retiring_senders.request_stop_all();
+        self.supervisor_stops.stop_all();
+    }
 }
 
 /// Mint a fresh boot id. Wall-clock nanos mixed with the pid: two boots
@@ -820,10 +1047,14 @@ async fn run_peer_writer<W>(
             writer.write_u32(frame.len() as u32).await?;
             writer.write_all(&frame).await
         };
-        if !matches!(
-            tokio::time::timeout(socket_write_timeout, write).await,
-            Ok(Ok(()))
-        ) {
+        let result = tokio::select! {
+            changed = cancel_rx.changed() => {
+                let _ = changed;
+                break;
+            }
+            result = tokio::time::timeout(socket_write_timeout, write) => result,
+        };
+        if !matches!(result, Ok(Ok(()))) {
             break;
         }
     }
@@ -834,11 +1065,12 @@ async fn run_peer_writer<W>(
 /// and return both. Shared by startup and the Phase 8 placement
 /// driver (which spawns subtrees for newly assigned fragments at
 /// runtime).
-async fn spawn_fragment_subtree(
+async fn spawn_fragment_subtree_registered(
     node_id: &str,
     fragment: FragmentId,
     config: &NodeConfig,
     hlc: &Arc<Mutex<HlcClock>>,
+    registry: &Arc<SupervisorRegistry>,
 ) -> Result<(ActorRef<SupervisorMessage>, ActorRef<KvMessage>), NodeError> {
     // Unique per supervisor: tests run nodes in parallel in one
     // process, and the actor registry is process-global.
@@ -873,19 +1105,144 @@ async fn spawn_fragment_subtree(
     )
     .await
     .map_err(|e| NodeError::Actor(e.to_string()))?;
-    let dispatcher = match supervisor
+    registry.insert(fragment, supervisor.clone());
+    let mut startup_guard = SupervisorStartupGuard::new(1);
+    startup_guard.push(supervisor.clone());
+    let dispatcher_result = supervisor
         .call(|reply| SupervisorMessage::GetDispatcher { reply }, None)
-        .await
-        .map_err(|e| NodeError::Actor(e.to_string()))?
-    {
-        CallResult::Success(d) => d,
-        _ => {
+        .await;
+    let dispatcher = match dispatcher_result {
+        Ok(CallResult::Success(dispatcher)) => dispatcher,
+        Ok(_) => {
+            supervisor.stop(None);
+            let _ = supervisor.wait(None).await;
+            registry.remove(fragment);
+            startup_guard.disarm();
             return Err(NodeError::Actor(
                 "supervisor dropped dispatcher reply".to_string(),
-            ))
+            ));
+        }
+        Err(error) => {
+            supervisor.stop(None);
+            let _ = supervisor.wait(None).await;
+            registry.remove(fragment);
+            startup_guard.disarm();
+            return Err(NodeError::Actor(error.to_string()));
         }
     };
+    startup_guard.disarm();
     Ok((supervisor, dispatcher))
+}
+
+#[cfg(test)]
+async fn spawn_fragment_subtree(
+    node_id: &str,
+    fragment: FragmentId,
+    config: &NodeConfig,
+    hlc: &Arc<Mutex<HlcClock>>,
+) -> Result<(ActorRef<SupervisorMessage>, ActorRef<KvMessage>), NodeError> {
+    let registry = Arc::new(SupervisorRegistry::new(1));
+    let result = spawn_fragment_subtree_registered(node_id, fragment, config, hlc, &registry).await;
+    if result.is_ok() {
+        registry.remove(fragment);
+    }
+    result
+}
+
+/// Synchronous ownership of every self-running fragment supervisor. Its Drop
+/// implementation closes the late-publication race when a Node is dropped
+/// while a placement task is still unwinding.
+struct SupervisorRegistry {
+    supervisors: StdMutex<HashMap<FragmentId, ActorRef<SupervisorMessage>>>,
+}
+
+impl SupervisorRegistry {
+    fn new(capacity: usize) -> Self {
+        Self {
+            supervisors: StdMutex::new(HashMap::with_capacity(capacity)),
+        }
+    }
+
+    fn insert(&self, fragment: FragmentId, supervisor: ActorRef<SupervisorMessage>) {
+        self.supervisors
+            .lock()
+            .unwrap()
+            .insert(fragment, supervisor);
+    }
+
+    fn remove(&self, fragment: FragmentId) {
+        self.supervisors.lock().unwrap().remove(&fragment);
+    }
+
+    fn snapshot(&self) -> Vec<ActorRef<SupervisorMessage>> {
+        self.supervisors.lock().unwrap().values().cloned().collect()
+    }
+
+    fn stop_all(&self) {
+        for supervisor in self.supervisors.lock().unwrap().values() {
+            supervisor.stop(None);
+        }
+    }
+
+    fn clear(&self) {
+        self.supervisors.lock().unwrap().clear();
+    }
+}
+
+impl Drop for SupervisorRegistry {
+    fn drop(&mut self) {
+        for supervisor in self.supervisors.get_mut().unwrap().values() {
+            supervisor.stop(None);
+        }
+    }
+}
+
+/// Stops partially constructed fragment trees if startup fails or the startup
+/// future is cancelled before ownership transfers to a returned Node.
+struct SupervisorStartupGuard {
+    supervisors: Vec<ActorRef<SupervisorMessage>>,
+    armed: bool,
+}
+
+impl SupervisorStartupGuard {
+    fn new(capacity: usize) -> Self {
+        Self {
+            supervisors: Vec::with_capacity(capacity),
+            armed: true,
+        }
+    }
+
+    fn push(&mut self, supervisor: ActorRef<SupervisorMessage>) {
+        self.supervisors.push(supervisor);
+    }
+
+    async fn rollback(&mut self) {
+        if !self.armed {
+            return;
+        }
+        for supervisor in &self.supervisors {
+            supervisor.stop(None);
+        }
+        for supervisor in self.supervisors.drain(..) {
+            let _ = supervisor.wait(None).await;
+        }
+        self.armed = false;
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+        self.supervisors.clear();
+    }
+}
+
+impl Drop for SupervisorStartupGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            for supervisor in &self.supervisors {
+                supervisor.stop(None);
+            }
+        }
+    }
 }
 
 /// Runtime liveness and queue policy for a [`Node`].
@@ -897,8 +1254,12 @@ async fn spawn_fragment_subtree(
 pub struct NodeRuntimeOptions {
     peer_queue_frame_capacity: usize,
     replication_control_message_capacity: usize,
+    inbound_connection_capacity: usize,
     queue_admission_timeout: Duration,
     forwarded_attempt_timeout: Duration,
+    connect_timeout: Duration,
+    handshake_timeout: Duration,
+    socket_read_timeout: Duration,
     socket_write_timeout: Duration,
     replication_ack_timeout: Duration,
 }
@@ -908,8 +1269,12 @@ impl Default for NodeRuntimeOptions {
         Self {
             peer_queue_frame_capacity: PEER_CHANNEL_DEPTH,
             replication_control_message_capacity: REPLICATION_CONTROL_CHANNEL_DEPTH,
+            inbound_connection_capacity: INBOUND_CONNECTION_CAPACITY,
             queue_admission_timeout: REMOTE_RPC_TIMEOUT,
             forwarded_attempt_timeout: REMOTE_RPC_TIMEOUT,
+            connect_timeout: REMOTE_RPC_TIMEOUT,
+            handshake_timeout: HANDSHAKE_TIMEOUT,
+            socket_read_timeout: SOCKET_WRITE_TIMEOUT,
             socket_write_timeout: SOCKET_WRITE_TIMEOUT,
             replication_ack_timeout: Duration::from_secs(30),
         }
@@ -931,6 +1296,14 @@ impl NodeRuntimeOptions {
         self
     }
 
+    /// Set the maximum number of accepted sockets concurrently running the
+    /// handshake or serving as inbound peer connections. Excess sockets are
+    /// closed immediately after accept.
+    pub fn with_inbound_connection_capacity(mut self, capacity: usize) -> Self {
+        self.inbound_connection_capacity = capacity;
+        self
+    }
+
     /// Set the maximum wait to reserve a peer queue slot.
     pub fn with_queue_admission_timeout(mut self, timeout: Duration) -> Self {
         self.queue_admission_timeout = timeout;
@@ -941,6 +1314,26 @@ impl NodeRuntimeOptions {
     /// attempt.
     pub fn with_forwarded_attempt_timeout(mut self, timeout: Duration) -> Self {
         self.forwarded_attempt_timeout = timeout;
+        self
+    }
+
+    /// Set the maximum duration of one outbound transport dial attempt.
+    pub fn with_connect_timeout(mut self, timeout: Duration) -> Self {
+        self.connect_timeout = timeout;
+        self
+    }
+
+    /// Set the total deadline for the Hello and HelloAuth flights.
+    pub fn with_handshake_timeout(mut self, timeout: Duration) -> Self {
+        self.handshake_timeout = timeout;
+        self
+    }
+
+    /// Set the maximum time to receive a frame body after its length prefix.
+    /// Idle established connections have no read deadline until a prefix
+    /// arrives.
+    pub fn with_socket_read_timeout(mut self, timeout: Duration) -> Self {
+        self.socket_read_timeout = timeout;
         self
     }
 
@@ -967,6 +1360,11 @@ impl NodeRuntimeOptions {
         self.replication_control_message_capacity
     }
 
+    /// Current concurrent inbound-connection limit.
+    pub fn inbound_connection_capacity(&self) -> usize {
+        self.inbound_connection_capacity
+    }
+
     /// Current peer-queue admission timeout.
     pub fn queue_admission_timeout(&self) -> Duration {
         self.queue_admission_timeout
@@ -975,6 +1373,21 @@ impl NodeRuntimeOptions {
     /// Current total forwarded-attempt timeout.
     pub fn forwarded_attempt_timeout(&self) -> Duration {
         self.forwarded_attempt_timeout
+    }
+
+    /// Current outbound transport-dial timeout.
+    pub fn connect_timeout(&self) -> Duration {
+        self.connect_timeout
+    }
+
+    /// Current total handshake timeout.
+    pub fn handshake_timeout(&self) -> Duration {
+        self.handshake_timeout
+    }
+
+    /// Current per-frame body-read timeout.
+    pub fn socket_read_timeout(&self) -> Duration {
+        self.socket_read_timeout
     }
 
     /// Current per-frame socket-write timeout.
@@ -1005,6 +1418,11 @@ impl NodeRuntimeOptions {
                 "replication control message capacity must be non-zero".to_string(),
             ));
         }
+        if self.inbound_connection_capacity == 0 {
+            return Err(NodeError::Actor(
+                "inbound connection capacity must be non-zero".to_string(),
+            ));
+        }
         if self.peer_queue_frame_capacity > tokio::sync::Semaphore::MAX_PERMITS {
             return Err(NodeError::Actor(format!(
                 "peer queue frame capacity exceeds maximum {}",
@@ -1017,8 +1435,17 @@ impl NodeRuntimeOptions {
                 tokio::sync::Semaphore::MAX_PERMITS
             )));
         }
+        if self.inbound_connection_capacity > tokio::sync::Semaphore::MAX_PERMITS {
+            return Err(NodeError::Actor(format!(
+                "inbound connection capacity exceeds maximum {}",
+                tokio::sync::Semaphore::MAX_PERMITS
+            )));
+        }
         if self.queue_admission_timeout.is_zero()
             || self.forwarded_attempt_timeout.is_zero()
+            || self.connect_timeout.is_zero()
+            || self.handshake_timeout.is_zero()
+            || self.socket_read_timeout.is_zero()
             || self.socket_write_timeout.is_zero()
             || self.replication_ack_timeout.is_zero()
         {
@@ -1030,6 +1457,9 @@ impl NodeRuntimeOptions {
         if [
             self.queue_admission_timeout,
             self.forwarded_attempt_timeout,
+            self.connect_timeout,
+            self.handshake_timeout,
+            self.socket_read_timeout,
             self.socket_write_timeout,
             self.replication_ack_timeout,
         ]
@@ -1077,11 +1507,17 @@ pub struct NodeConfig {
     /// `fragment_of(key)`, or keys become unreachable.
     pub fragment_count: usize,
     /// Static placement: fragment -> replica node_ids. Must be identical
-    /// on every node. Empty (default) = this node serves all fragments
-    /// (single-node / legacy full replication).
+    /// on every node. A non-empty map must cover exactly
+    /// `0..fragment_count`; every replica list must be non-empty and
+    /// duplicate-free, and every replica id must contain 1 to 255 bytes.
+    /// Empty (default) = this node serves all fragments (single-node / legacy
+    /// full replication).
     pub fragment_map: HashMap<FragmentId, Vec<String>>,
-    /// Static membership: node_id -> address, for dialing fragment
-    /// owners. `Node::start` best-effort dials all members.
+    /// Static membership: node_id -> address, for dialing fragment owners.
+    /// Every id must contain 1 to 255 bytes and addresses must be unique.
+    /// [`Node::start`] registers a persistent dial supervisor for every
+    /// non-local entry, so its expected id is enforced on the first
+    /// authentication attempt and every retry.
     pub members: HashMap<String, SocketAddr>,
     /// Worker pool configs by priority. The default pool handles normal
     /// ops; high-priority is for latency-sensitive traffic; background
@@ -1111,13 +1547,17 @@ pub struct NodeConfig {
     /// timestamp permanently poisons last-writer-wins cluster-wide. Default
     /// 5 minutes.
     pub max_clock_skew: Duration,
-    /// Pre-shared secret for a static Hello HMAC over identity, protocol range,
-    /// and capabilities. Mismatches drop the connection and pre-Hello messages
-    /// are ignored. The tag prevents accidental mismatch and unauthenticated
-    /// capability rewriting, but has no fresh challenge: a captured Hello can
-    /// be replayed to impersonate that node on plaintext TCP. Use a protected
-    /// custom [`Network`] transport when peer identity matters. Must be
-    /// non-empty and identical on every node. `None` (default) sends no tag.
+    /// Pre-shared secret for mutual HMAC proofs over both peers' fresh
+    /// challenges, identities, protocol ranges, capabilities, and connection
+    /// roles. A captured handshake cannot be replayed against a new challenge.
+    /// This is cluster-wide membership authentication, not per-node keys, and
+    /// plaintext TCP still provides neither confidentiality nor integrity for
+    /// post-handshake frames; use a protected custom [`Network`] transport
+    /// when those properties matter. Must contain at least 32 independently
+    /// generated, high-entropy random bytes and be identical on every node.
+    /// A guessable password remains vulnerable to offline guessing from a
+    /// captured transcript even though challenges prevent replay. `None`
+    /// (default) sends no proof.
     pub cluster_secret: Option<Vec<u8>>,
     /// Phase 5 async replication tuning (batching, acks, buffers).
     pub replication: SenderConfig,
@@ -1130,6 +1570,8 @@ pub struct NodeConfig {
     /// spawns/drains fragment subtrees at runtime, bootstraps newly
     /// assigned fragments via the Phase 5 reconciler, and skips the
     /// full-state handshake sync (the reconciler owns anti-entropy).
+    /// Membership-change callbacks are coalesced current-peer-set
+    /// notifications, not a lossless ordered event stream.
     pub placement_controller: Option<Arc<dyn PlacementController>>,
     /// How often the Phase 8 placement driver re-evaluates desired
     /// placement. Ignored in static mode. Default 1 second.
@@ -1198,6 +1640,7 @@ impl Node {
     /// Start a node: spawn its [crate::actor::KvActor] and begin
     /// listening for peer connections. Binds `listen_addr` (use port 0
     /// for an ephemeral port) and returns the bound address via [Node::addr].
+    /// `node_id` must contain 1 to 255 bytes.
     pub async fn start(
         node_id: String,
         listen_addr: SocketAddr,
@@ -1215,6 +1658,20 @@ impl Node {
         runtime_options: NodeRuntimeOptions,
     ) -> Result<Self, NodeError> {
         runtime_options.validate()?;
+        if node_id.is_empty() || node_id.len() > 255 {
+            return Err(NodeError::Actor(
+                "node_id must contain 1 to 255 bytes".to_string(),
+            ));
+        }
+        if let Some(invalid_member) = config
+            .members
+            .keys()
+            .find(|member_id| member_id.is_empty() || member_id.len() > 255)
+        {
+            return Err(NodeError::Actor(format!(
+                "member node_id {invalid_member:?} must contain 1 to 255 bytes"
+            )));
+        }
         let dynamic = config.placement_controller.is_some();
         if config.fragment_count == 0 {
             return Err(NodeError::Actor(
@@ -1243,9 +1700,13 @@ impl Node {
                     .to_string(),
             ));
         }
-        if config.cluster_secret.as_ref().map_or(false, Vec::is_empty) {
+        if config
+            .cluster_secret
+            .as_ref()
+            .map_or(false, |secret| secret.len() < 32)
+        {
             return Err(NodeError::Actor(
-                "cluster_secret must be non-empty when configured".to_string(),
+                "cluster_secret must contain at least 32 bytes when configured".to_string(),
             ));
         }
         if config.cluster_secret.is_none() {
@@ -1254,9 +1715,20 @@ impl Node {
             );
         } else {
             tracing::warn!(
-                "cluster_secret uses a static, replayable Hello tag; use a protected custom \
-                 Network transport when replay-resistant peer identity is required"
+                "cluster_secret proves fresh cluster-key possession during handshake but does \
+                 not protect post-handshake plaintext frames; use a protected custom Network \
+                 transport when channel confidentiality or integrity is required"
             );
+        }
+        let mut member_addresses: HashMap<SocketAddr, &str> = HashMap::new();
+        for (member_id, member_addr) in &config.members {
+            if let Some(previous_id) = member_addresses.insert(*member_addr, member_id) {
+                if previous_id != member_id {
+                    return Err(NodeError::Actor(format!(
+                        "members {previous_id} and {member_id} share address {member_addr}"
+                    )));
+                }
+            }
         }
         // Initial placement: the controller's map in dynamic mode
         // (validated), the static fragment_map otherwise.
@@ -1270,17 +1742,8 @@ impl Node {
             map
         } else {
             if !config.fragment_map.is_empty() {
-                for i in 0..config.fragment_count {
-                    let frag = FragmentId(i as u32);
-                    match config.fragment_map.get(&frag) {
-                        Some(replicas) if !replicas.is_empty() => {}
-                        _ => {
-                            return Err(NodeError::Actor(format!(
-                                "fragment_map leaves {frag} with no replicas"
-                            )))
-                        }
-                    }
-                }
+                validate_placement(&config.fragment_map, config.fragment_count)
+                    .map_err(NodeError::Actor)?;
             }
             config.fragment_map.clone()
         };
@@ -1306,6 +1769,14 @@ impl Node {
                 .collect()
         };
 
+        // Bind before creating any actors so a transport startup error has no
+        // fragment trees or durable-store users to roll back.
+        let (bound_addr, mut acceptor) = config
+            .network
+            .bind(listen_addr)
+            .await
+            .map_err(|e| NodeError::Network(e.to_string()))?;
+
         // One supervised subtree per served fragment. With persistence,
         // each fragment gets its own key namespace via PrefixedStore,
         // sharing the one underlying store. The supervisor owns the
@@ -1317,6 +1788,7 @@ impl Node {
         ));
         let supervisors: Arc<Mutex<HashMap<FragmentId, ActorRef<SupervisorMessage>>>> =
             Arc::new(Mutex::new(HashMap::with_capacity(my_fragments.len())));
+        let supervisor_stops = Arc::new(SupervisorRegistry::new(my_fragments.len()));
         let router = FragmentRouter::new(config.fragment_count, my_fragments.len());
         let serving: Arc<RwLock<HashSet<FragmentId>>> =
             Arc::new(RwLock::new(my_fragments.iter().copied().collect()));
@@ -1327,27 +1799,39 @@ impl Node {
                     .map(|f| (*f, FragmentPlacementState::Serving))
                     .collect(),
             ));
+        let mut startup_supervisors = SupervisorStartupGuard::new(my_fragments.len());
         for fragment in my_fragments {
-            let (supervisor, dispatcher) =
-                spawn_fragment_subtree(&node_id, fragment, &config, &hlc).await?;
+            let (supervisor, dispatcher) = match spawn_fragment_subtree_registered(
+                &node_id,
+                fragment,
+                &config,
+                &hlc,
+                &supervisor_stops,
+            )
+            .await
+            {
+                Ok(subtree) => subtree,
+                Err(error) => {
+                    startup_supervisors.rollback().await;
+                    return Err(error);
+                }
+            };
+            startup_supervisors.push(supervisor.clone());
             supervisors.lock().await.insert(fragment, supervisor);
             router.insert(fragment, dispatcher);
         }
 
-        let (bound_addr, mut acceptor) = config
-            .network
-            .bind(listen_addr)
-            .await
-            .map_err(|e| NodeError::Network(e.to_string()))?;
-
         let fragment_map: Arc<RwLock<HashMap<FragmentId, Vec<String>>>> =
             Arc::new(RwLock::new(initial_placement));
         let (membership_tx, membership_rx) = if dynamic {
-            let (tx, rx) = mpsc::unbounded_channel();
+            let (tx, rx) = watch::channel(0u64);
             (Some(tx), Some(rx))
         } else {
             (None, None)
         };
+        let (peer_changes, _) = watch::channel(0u64);
+        let (dial_intent_changes, _) = watch::channel(0u64);
+        let tasks = RuntimeTasks::new(TASK_COMMAND_CAPACITY);
         let node = Self {
             node_id: node_id.clone(),
             boot_id: fresh_boot_id(),
@@ -1355,6 +1839,7 @@ impl Node {
             router: router.clone(),
             serving: serving.clone(),
             supervisors: supervisors.clone(),
+            supervisor_stops: supervisor_stops.clone(),
             fragment_map: fragment_map.clone(),
             placement_states: placement_states.clone(),
             placement_controller: config.placement_controller.clone(),
@@ -1367,18 +1852,38 @@ impl Node {
             pending_mutation_relays: Arc::new(Mutex::new(HashMap::new())),
             next_req_id: Arc::new(AtomicU64::new(1)),
             peers: Arc::new(Mutex::new(HashMap::new())),
+            peer_failures: PeerFailureSignals::default(),
             next_seq: Arc::new(Mutex::new(0)),
             hlc: hlc.clone(),
             senders: Arc::new(Mutex::new(HashMap::new())),
+            retiring_senders: Arc::new(RetiringSenderRegistry::default()),
             sender_config: config.replication.clone(),
             runtime_options: runtime_options.clone(),
             sender_reports: Arc::new(Mutex::new(HashMap::new())),
             sync_entries_applied: Arc::new(AtomicU64::new(0)),
             membership_tx: membership_tx.clone(),
             cluster_secret: config.cluster_secret.clone(),
-            tasks: Arc::new(Mutex::new(Vec::new())),
+            tasks,
+            inbound_connections: Arc::new(Semaphore::new(
+                runtime_options.inbound_connection_capacity,
+            )),
+            dial_intents: Arc::new(StdMutex::new(HashMap::new())),
+            dial_intent_changes,
+            peer_changes,
+            shutdown_state: Mutex::new(false),
             network: config.network.clone(),
         };
+
+        if !node
+            .tasks
+            .spawn(node.peer_failures.clone().run(node.peers.clone()))
+            .await
+        {
+            node.shutdown().await;
+            return Err(NodeError::Actor(
+                "node runtime stopped during peer-failure worker startup".to_string(),
+            ));
+        }
 
         // Phase 5: spawn a sender per (fragment, replica peer).
         // Legacy mode (no fragment map) spawns senders lazily on connect.
@@ -1411,82 +1916,187 @@ impl Node {
                 serving: serving.clone(),
                 placement: fragment_map.clone(),
                 supervisors: supervisors.clone(),
+                supervisor_stops: supervisor_stops.clone(),
                 placement_states: placement_states.clone(),
+                placement_generation: Arc::new(AtomicU64::new(0)),
                 senders: node.senders.clone(),
+                retiring_senders: node.retiring_senders.clone(),
                 sender_reports: node.sender_reports.clone(),
                 sender_config: node.sender_config.clone(),
                 sender_runtime: node.runtime_options.sender_options(),
                 peers: node.peers.clone(),
+                peer_failures: node.peer_failures.clone(),
+                tasks: Arc::downgrade(&node.tasks),
                 hlc: hlc.clone(),
             };
             let membership_rx = membership_rx.expect("checked above");
-            let h = tokio::spawn(placement_driver(deps, membership_rx));
-            node.tasks.lock().await.push(h.abort_handle());
+            if !node
+                .tasks
+                .spawn(placement_driver(deps, membership_rx))
+                .await
+            {
+                node.shutdown().await;
+                return Err(NodeError::Actor(
+                    "node runtime stopped during placement-driver startup".to_string(),
+                ));
+            }
         }
 
         // Accept loop: every inbound connection gets a handler task.
-        let ctx = ConnContext {
-            node_id: node.node_id.clone(),
-            router: node.router.clone(),
-            serving: node.serving.clone(),
-            placement: node.fragment_map.clone(),
-            dynamic_placement: dynamic,
-            pending_gets: node.pending_gets.clone(),
-            pending_batch_gets: node.pending_batch_gets.clone(),
-            pending_mutations: node.pending_mutations.clone(),
-            pending_relays: node.pending_relays.clone(),
-            pending_mutation_relays: node.pending_mutation_relays.clone(),
-            next_req_id: node.next_req_id.clone(),
-            peers: node.peers.clone(),
-            tasks: node.tasks.clone(),
-            hlc: node.hlc.clone(),
-            senders: node.senders.clone(),
-            sender_config: node.sender_config.clone(),
-            sender_runtime: node.runtime_options.sender_options(),
-            runtime_options: node.runtime_options.clone(),
-            sender_reports: node.sender_reports.clone(),
-            sync_entries_applied: node.sync_entries_applied.clone(),
-            membership_tx: node.membership_tx.clone(),
-            cluster_secret: node.cluster_secret.clone(),
-        };
-        let accept_task = tokio::spawn(async move {
-            while let Ok(stream) = acceptor.accept().await {
-                let h = tokio::spawn(handle_connection(
-                    ctx.clone(),
-                    stream,
-                    /* we_dialed = */ false,
-                ));
-                ctx.tasks.lock().await.push(h.abort_handle());
-            }
-        });
-        node.tasks.lock().await.push(accept_task.abort_handle());
+        let ctx = node.connection_context();
+        let tasks = Arc::downgrade(&node.tasks);
+        let inbound_connections = node.inbound_connections.clone();
+        if !node
+            .tasks
+            .spawn(async move {
+                loop {
+                    match acceptor.accept().await {
+                        Ok(stream) => {
+                            let permit = match inbound_connections.clone().try_acquire_owned() {
+                                Ok(permit) => permit,
+                                Err(_) => {
+                                    tracing::warn!(
+                                        "inbound connection limit reached; dropping accepted socket"
+                                    );
+                                    continue;
+                                }
+                            };
+                            let connection_ctx = ctx.clone();
+                            let registered = match tasks.upgrade() {
+                                Some(tasks) => {
+                                    tasks
+                                        .spawn(async move {
+                                            let _ = handle_connection(
+                                                connection_ctx,
+                                                stream,
+                                                /* we_dialed = */ false,
+                                                None,
+                                                Some(Arc::new(permit)),
+                                            )
+                                            .await;
+                                        })
+                                        .await
+                                }
+                                None => false,
+                            };
+                            if !registered {
+                                break;
+                            }
+                        }
+                        Err(error) => {
+                            tracing::warn!(%error, "peer accept failed; retrying");
+                            tokio::time::sleep(RECONNECT_BASE).await;
+                        }
+                    }
+                }
+            })
+            .await
+        {
+            node.shutdown().await;
+            return Err(NodeError::Actor(
+                "node runtime stopped during listener startup".to_string(),
+            ));
+        }
 
-        // Best-effort mesh: dial every known member. Whoever starts
-        // later dials us back, so the mesh converges without manual
-        // connect() calls.
+        // Configured dial intents start even when the peer is initially down;
+        // unlike address-only `connect`, they retain the expected identity and
+        // retry with bounded backoff from the first failure.
         for (id, addr) in &node.members {
-            if id != &node.node_id {
-                let _ = node.connect(*addr).await;
+            if id != &node.node_id
+                && !node
+                    .start_dial_supervisor(*addr, Some(id.clone()), None)
+                    .await
+            {
+                node.shutdown().await;
+                return Err(NodeError::Actor(
+                    "node runtime stopped during member-dialer startup".to_string(),
+                ));
             }
         }
 
+        startup_supervisors.disarm();
         Ok(node)
     }
 
-    /// Dial a peer and run the handshake. After the handshake both sides
-    /// exchange full state, so a late joiner converges immediately.
+    /// Dial a peer and start a supervised connection. After authentication,
+    /// both sides exchange full state, so a late joiner converges immediately.
     ///
-    /// The dial is tried once: an unreachable peer returns an error.
-    /// Once connected, the dialer side owns the connection — if it
-    /// drops, it is redialed with exponential backoff until
-    /// [Node::shutdown].
+    /// The initial dial is tried once: an unreachable peer returns an error.
+    /// This method returns `Ok` only after that transport dial succeeds and a
+    /// Node-owned supervisor owns the stream; authentication completes
+    /// asynchronously. Concurrent calls for the same address wait on the
+    /// pending initial dial instead of reporting success early, then share the
+    /// same active supervisor. After its first successful authentication, an
+    /// address-only supervisor pins that peer id and rejects a different id on
+    /// every later reconnect. Dropped connections are redialed with
+    /// exponential backoff until [Node::shutdown].
     pub async fn connect(&self, peer_addr: SocketAddr) -> Result<(), NodeError> {
-        let stream = self
-            .network
-            .connect(peer_addr)
+        if !self.tasks.is_accepting() {
+            return Err(NodeError::Network("node is shutting down".to_string()));
+        }
+        let mut shutdown = self.tasks.shutdown_signal();
+        let intent = loop {
+            // Subscribe before inspecting the registry so activation/removal
+            // cannot be lost between the check and the wait.
+            let mut changes = self.dial_intent_changes.subscribe();
+            let state = self.dial_intents.lock().unwrap().get(&peer_addr).copied();
+            match state {
+                Some(DialIntentState::Active) => return Ok(()),
+                Some(DialIntentState::Pending) => {
+                    tokio::select! {
+                        biased;
+                        changed = shutdown.changed() => {
+                            let _ = changed;
+                            return Err(NodeError::Network("node is shutting down".to_string()));
+                        }
+                        changed = changes.changed() => {
+                            if changed.is_err() {
+                                return Err(NodeError::Network("node is shutting down".to_string()));
+                            }
+                        }
+                    }
+                }
+                None => {
+                    if let Some(intent) = DialIntentGuard::reserve(
+                        self.dial_intents.clone(),
+                        self.dial_intent_changes.clone(),
+                        peer_addr,
+                    ) {
+                        break intent;
+                    }
+                }
+            }
+        };
+        if *shutdown.borrow() {
+            return Err(NodeError::Network("node is shutting down".to_string()));
+        }
+        let stream = tokio::select! {
+            biased;
+            changed = shutdown.changed() => {
+                let _ = changed;
+                return Err(NodeError::Network("node is shutting down".to_string()));
+            }
+            result = tokio::time::timeout(
+                self.runtime_options.connect_timeout,
+                self.network.connect(peer_addr),
+            ) => {
+                result
+                    .map_err(|_| NodeError::Network("peer connection attempt timed out".to_string()))?
+                    .map_err(|e| NodeError::Network(e.to_string()))?
+            }
+        };
+        if self
+            .start_reserved_dial_supervisor(intent, None, Some(stream))
             .await
-            .map_err(|e| NodeError::Network(e.to_string()))?;
-        let ctx = ConnContext {
+        {
+            Ok(())
+        } else {
+            Err(NodeError::Network("node is shutting down".to_string()))
+        }
+    }
+
+    fn connection_context(&self) -> ConnContext {
+        ConnContext {
             node_id: self.node_id.clone(),
             router: self.router.clone(),
             serving: self.serving.clone(),
@@ -1499,9 +2109,12 @@ impl Node {
             pending_mutation_relays: self.pending_mutation_relays.clone(),
             next_req_id: self.next_req_id.clone(),
             peers: self.peers.clone(),
-            tasks: self.tasks.clone(),
+            peer_failures: self.peer_failures.clone(),
+            tasks: Arc::downgrade(&self.tasks),
+            peer_changes: self.peer_changes.clone(),
             hlc: self.hlc.clone(),
             senders: self.senders.clone(),
+            retiring_senders: self.retiring_senders.clone(),
             sender_config: self.sender_config.clone(),
             sender_runtime: self.runtime_options.sender_options(),
             runtime_options: self.runtime_options.clone(),
@@ -1509,18 +2122,43 @@ impl Node {
             sync_entries_applied: self.sync_entries_applied.clone(),
             membership_tx: self.membership_tx.clone(),
             cluster_secret: self.cluster_secret.clone(),
+        }
+    }
+
+    async fn start_dial_supervisor(
+        &self,
+        peer_addr: SocketAddr,
+        expected_peer_id: Option<String>,
+        initial_stream: Option<BoxStream>,
+    ) -> bool {
+        let Some(intent) = DialIntentGuard::reserve(
+            self.dial_intents.clone(),
+            self.dial_intent_changes.clone(),
+            peer_addr,
+        ) else {
+            return true;
         };
+        self.start_reserved_dial_supervisor(intent, expected_peer_id, initial_stream)
+            .await
+    }
+
+    async fn start_reserved_dial_supervisor(
+        &self,
+        intent: DialIntentGuard,
+        expected_peer_id: Option<String>,
+        initial_stream: Option<BoxStream>,
+    ) -> bool {
+        let peer_addr = intent.address;
+        let ctx = self.connection_context();
         let network = self.network.clone();
-        let h = tokio::spawn(async move {
-            // Run the initial connection to completion...
-            handle_connection(ctx.clone(), stream, /* we_dialed = */ true).await;
-            // ...then redial forever. Only the dialer side redials; the
-            // listener side just waits for the next inbound connection.
-            // This task is aborted by shutdown() with all the rest.
-            reconnect_loop(ctx, network, peer_addr).await;
-        });
-        self.tasks.lock().await.push(h.abort_handle());
-        Ok(())
+        self.tasks
+            .spawn(async move {
+                let intent_guard = intent;
+                intent_guard.activate();
+                dial_supervisor(ctx, network, peer_addr, expected_peer_id, initial_stream).await;
+                drop(intent_guard);
+            })
+            .await
     }
 
     /// The fragment actor serving `key` (`None` if remote or not yet
@@ -1546,8 +2184,9 @@ impl Node {
                 router: &self.router,
                 hlc: &self.hlc,
                 senders: &self.senders,
+                retiring_senders: &self.retiring_senders,
                 reports: &self.sender_reports,
-                peers: &self.peers,
+                peer_failures: &self.peer_failures,
             },
         )
         .await;
@@ -2277,28 +2916,69 @@ impl Node {
         self.peers.lock().await.len()
     }
 
-    /// Shut the node down: abort all connection tasks and stop every fragment
-    /// supervisor. Stopping the actors drops their state, which releases the
-    /// RocksDB lock (when persistence is enabled) so the database can
-    /// be reopened — e.g. by a restarted node on the same path.
+    /// Shut the node down: close task admission, abort and join all Node-owned
+    /// runtime tasks, disconnect senders, and stop every fragment supervisor.
+    /// Stopping the actors drops their state, which releases the RocksDB lock
+    /// (when persistence is enabled) so the database can be reopened — e.g. by
+    /// a restarted node on the same path. Repeated calls are idempotent.
     pub async fn shutdown(&self) {
-        let mut tasks = self.tasks.lock().await;
-        for t in tasks.drain(..) {
-            t.abort();
+        let mut stopped = self.shutdown_state.lock().await;
+        if *stopped {
+            return;
         }
-        drop(tasks);
+        self.tasks.shutdown().await;
+
+        // Release every request/relay waiter retained by a cancelled handler.
+        self.pending_gets.lock().unwrap().clear();
+        self.pending_batch_gets.lock().unwrap().clear();
+        self.pending_mutations.lock().unwrap().clear();
+        self.pending_relays.lock().await.clear();
+        self.pending_mutation_relays.lock().await.clear();
+
+        // A hard shutdown can cancel a handler before its normal exact-channel
+        // cleanup tail. Clear every remaining current entry explicitly before
+        // stopping the long-lived replication senders.
+        let peers: Vec<(String, PeerChannel)> = self.peers.lock().await.drain().collect();
+        for (_, channel) in &peers {
+            channel.cancel();
+        }
+        {
+            let senders = self.senders.lock().await;
+            for (peer, channel) in &peers {
+                for ((_, sender_peer), sender) in senders.iter() {
+                    if sender_peer == peer {
+                        let _ = sender.send(SenderMsg::PeerDisconnected {
+                            peer_tx: channel.raw_sender(),
+                        });
+                    }
+                }
+            }
+        }
+        self.peer_changes.send_modify(|generation| {
+            *generation = generation.wrapping_add(1);
+        });
+
         let senders: Vec<NodeSender> = self.senders.lock().await.values().cloned().collect();
         for sender in senders {
             sender.stop().await;
         }
-        // Stop the supervisors; each drains its dispatcher pool (which
-        // flushes) and its background actors. Failures just mean an
-        // actor was already dead.
-        let supervisors: Vec<ActorRef<SupervisorMessage>> =
-            self.supervisors.lock().await.values().cloned().collect();
-        for supervisor in supervisors {
-            let _ = supervisor.stop_and_wait(None, None).await;
+        let retiring_senders = self.retiring_senders.snapshot();
+        for sender in retiring_senders {
+            sender.stop().await;
         }
+        self.retiring_senders.clear();
+        // Two-phase and retry-safe: signal every active/retiring supervisor
+        // before awaiting any one of them. `wait` remains valid after a prior
+        // stop or a cancelled earlier shutdown waiter.
+        let supervisors = self.supervisor_stops.snapshot();
+        for supervisor in &supervisors {
+            supervisor.stop(None);
+        }
+        for supervisor in supervisors {
+            let _ = supervisor.wait(None).await;
+        }
+        self.supervisor_stops.clear();
+        *stopped = true;
     }
 
     /// Health snapshots for every fragment this node serves.
@@ -2361,12 +3041,21 @@ struct PlacementDriverDeps {
     serving: Arc<RwLock<HashSet<FragmentId>>>,
     placement: Arc<RwLock<HashMap<FragmentId, Vec<String>>>>,
     supervisors: Arc<Mutex<HashMap<FragmentId, ActorRef<SupervisorMessage>>>>,
+    supervisor_stops: Arc<SupervisorRegistry>,
     placement_states: Arc<Mutex<HashMap<FragmentId, FragmentPlacementState>>>,
+    /// Increments only when the published placement map actually changes.
+    /// A global generation is conservative: unrelated fragment movement can
+    /// retry an in-flight bootstrap, but a P -> Q -> P ABA cannot publish work
+    /// completed against the first P.
+    placement_generation: Arc<AtomicU64>,
     senders: SenderMap,
+    retiring_senders: Arc<RetiringSenderRegistry>,
     sender_reports: SenderReportMap,
     sender_config: SenderConfig,
     sender_runtime: SenderRuntimeOptions,
     peers: PeerMap,
+    peer_failures: PeerFailureSignals,
+    tasks: Weak<RuntimeTasks>,
     hlc: Arc<Mutex<HlcClock>>,
 }
 
@@ -2382,8 +3071,9 @@ impl PlacementDriverDeps {
                 router: &self.router,
                 hlc: &self.hlc,
                 senders: &self.senders,
+                retiring_senders: &self.retiring_senders,
                 reports: &self.sender_reports,
-                peers: &self.peers,
+                peer_failures: &self.peer_failures,
             },
         )
         .await;
@@ -2404,36 +3094,24 @@ impl PlacementDriverDeps {
 /// Phase 8 placement driver: polls the controller and converges local
 /// state (fragment subtrees, senders, routing) toward the desired
 /// placement. Also wakes on membership change.
-async fn placement_driver(
-    deps: PlacementDriverDeps,
-    mut membership_rx: mpsc::UnboundedReceiver<()>,
-) {
-    // Structured ownership matters here: gain/loss transitions may wait on
-    // remote peers. Dropping the driver must abort those children instead of
-    // leaving detached tasks holding fragment state after node shutdown.
-    let mut transitions = JoinSet::new();
+async fn placement_driver(deps: PlacementDriverDeps, mut membership_rx: watch::Receiver<u64>) {
     // Converge immediately at startup; then on interval / membership.
-    placement_tick(&deps, &mut transitions).await;
+    placement_tick(&deps).await;
     let mut interval = tokio::time::interval(deps.poll_interval);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tokio::select! {
             _ = interval.tick() => {
-                placement_tick(&deps, &mut transitions).await;
+                placement_tick(&deps).await;
             }
-            msg = membership_rx.recv() => {
-                if msg.is_none() {
+            changed = membership_rx.changed() => {
+                if changed.is_err() {
                     break; // node shutting down
                 }
                 let members: Vec<String> =
                     deps.peers.lock().await.keys().cloned().collect();
                 deps.controller.on_membership_change(&members);
-                placement_tick(&deps, &mut transitions).await;
-            }
-            completed = transitions.join_next(), if !transitions.is_empty() => {
-                if let Some(Err(error)) = completed {
-                    tracing::warn!(%error, "placement transition task failed");
-                }
+                placement_tick(&deps).await;
             }
         }
     }
@@ -2441,7 +3119,7 @@ async fn placement_driver(
 
 /// One driver tick: publish the controller's map as the authoritative
 /// routing table, then gain/lose fragments to match.
-async fn placement_tick(deps: &PlacementDriverDeps, transitions: &mut JoinSet<()>) {
+async fn placement_tick(deps: &PlacementDriverDeps) {
     let desired = deps.controller.desired_placement();
     if let Err(e) = validate_placement(&desired, deps.fragment_count) {
         eprintln!("[placement] invalid desired placement ({e}); keeping current");
@@ -2457,13 +3135,23 @@ async fn placement_tick(deps: &PlacementDriverDeps, transitions: &mut JoinSet<()
     // controller map and marking its gain/loss transitions in one critical
     // section prevents a stale drainer from validating the old map and then
     // tearing down state after a re-add has already been published.
-    let (mine_current, in_flight): (HashSet<FragmentId>, HashSet<FragmentId>) = {
+    let (mine_current, in_flight, transitions): (
+        HashSet<FragmentId>,
+        HashSet<FragmentId>,
+        Vec<(FragmentId, bool)>,
+    ) = {
         let mut states = deps.placement_states.lock().await;
         // Canonical lock order is placement_states -> placement. The sync map
         // guard never crosses an await.
-        *deps.placement.write().unwrap() = desired.clone();
+        let mut published = deps.placement.write().unwrap();
+        if *published != desired {
+            *published = desired.clone();
+            deps.placement_generation.fetch_add(1, Ordering::AcqRel);
+        }
+        drop(published);
         let mut current = HashSet::new();
         let mut flight = HashSet::new();
+        let mut transitions = Vec::new();
         for (f, s) in states.iter() {
             match s {
                 FragmentPlacementState::Stopped => {}
@@ -2481,21 +3169,41 @@ async fn placement_tick(deps: &PlacementDriverDeps, transitions: &mut JoinSet<()
         // duplicate while the child task is waiting to be scheduled.
         for f in mine_desired.difference(&current) {
             states.insert(*f, FragmentPlacementState::Bootstrapping);
-            let d = deps.clone();
-            let frag = *f;
-            transitions.spawn(async move { gain_fragment(&d, frag).await });
+            transitions.push((*f, true));
         }
         for f in current.difference(&mine_desired) {
             if flight.contains(f) {
                 continue;
             }
             states.insert(*f, FragmentPlacementState::Draining);
-            let d = deps.clone();
-            let frag = *f;
-            transitions.spawn(async move { lose_fragment(&d, frag).await });
+            transitions.push((*f, false));
         }
-        (current, flight)
+        (current, flight, transitions)
     };
+
+    // Register outside the placement-state commit mutex. The Node task manager
+    // owns and joins transitions directly, so aborting the polling driver
+    // cannot detach a gain/loss child during shutdown.
+    for (fragment, gaining) in transitions {
+        let transition_deps = deps.clone();
+        let transition = async move {
+            if gaining {
+                gain_fragment(&transition_deps, fragment).await;
+            } else {
+                lose_fragment(&transition_deps, fragment).await;
+            }
+        };
+        let registered = match deps.tasks.upgrade() {
+            Some(tasks) => tasks.spawn(transition).await,
+            None => false,
+        };
+        if !registered {
+            tracing::debug!(
+                fragment = fragment.0,
+                "node stopped before placement transition registered"
+            );
+        }
+    }
 
     // Steady state: keep senders aligned with the replica sets.
     for f in mine_desired.intersection(&mine_current) {
@@ -2554,17 +3262,18 @@ async fn ensure_fragment_senders(
     if !stale.is_empty() {
         let mut senders = deps.senders.lock().await;
         let mut reports = deps.sender_reports.lock().await;
-        let mut removed = Vec::with_capacity(stale.len());
+        let mut retiring = Vec::with_capacity(stale.len());
         for key in stale {
-            if let Some(sender) = senders.remove(&key) {
-                removed.push(sender);
+            if let Some(sender) = senders.get(&key).cloned() {
+                retiring.push(deps.retiring_senders.retire(sender));
+                senders.remove(&key);
             }
             reports.remove(&key);
         }
         drop(reports);
         drop(senders);
-        for sender in removed {
-            sender.stop().await;
+        for sender in retiring {
+            sender.join().await;
         }
     }
 }
@@ -2574,17 +3283,98 @@ async fn ensure_fragment_senders(
 /// over consistency); LWW + periodic reconcile converge it later.
 const BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(30);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FragmentGainCommit {
+    Serving,
+    Retry,
+    Revoked,
+}
+
+/// Commit a completed gain only if the exact replica set which was reconciled
+/// is still current. `placement_states` is the publication mutex used by
+/// placement ticks, so this check and the Serving transition are atomic with
+/// both revocation and replica-set replacement.
+async fn commit_fragment_gain(
+    deps: &PlacementDriverDeps,
+    fragment: FragmentId,
+    expected_replicas: &[String],
+    expected_generation: u64,
+) -> FragmentGainCommit {
+    let mut states = deps.placement_states.lock().await;
+    let current = deps
+        .placement
+        .read()
+        .unwrap()
+        .get(&fragment)
+        .cloned()
+        .unwrap_or_default();
+    if !current.iter().any(|node| node == &deps.node_id) {
+        states.insert(fragment, FragmentPlacementState::Draining);
+        return FragmentGainCommit::Revoked;
+    }
+    if current != expected_replicas
+        || deps.placement_generation.load(Ordering::Acquire) != expected_generation
+    {
+        states.insert(fragment, FragmentPlacementState::Bootstrapping);
+        return FragmentGainCommit::Retry;
+    }
+
+    deps.serving.write().unwrap().insert(fragment);
+    states.insert(fragment, FragmentPlacementState::Serving);
+    FragmentGainCommit::Serving
+}
+
+/// Align replication senders and reconcile against one placement snapshot.
+/// If placement changes while reconciliation is in flight, repeat against the
+/// new replica set before publishing the fragment as authoritative.
+async fn converge_fragment_gain(deps: &PlacementDriverDeps, fragment: FragmentId) -> bool {
+    loop {
+        let (desired, replicas, generation) = {
+            let mut states = deps.placement_states.lock().await;
+            let desired = deps.placement.read().unwrap().clone();
+            let generation = deps.placement_generation.load(Ordering::Acquire);
+            let replicas = desired.get(&fragment).cloned().unwrap_or_default();
+            if !replicas.iter().any(|node| node == &deps.node_id) {
+                states.insert(fragment, FragmentPlacementState::Draining);
+                return false;
+            }
+            states.insert(fragment, FragmentPlacementState::Bootstrapping);
+            (desired, replicas, generation)
+        };
+
+        ensure_fragment_senders(deps, fragment, &desired).await;
+        let sources: Vec<String> = replicas
+            .iter()
+            .filter(|peer| *peer != &deps.node_id)
+            .cloned()
+            .collect();
+        if !sources.is_empty() && !bootstrap_from(deps, fragment, &sources).await {
+            tracing::warn!(
+                fragment = fragment.0,
+                "fragment bootstrap timed out; serving retained state if placement is unchanged"
+            );
+        }
+
+        match commit_fragment_gain(deps, fragment, &replicas, generation).await {
+            FragmentGainCommit::Serving => return true,
+            FragmentGainCommit::Retry => continue,
+            FragmentGainCommit::Revoked => return false,
+        }
+    }
+}
+
 /// Gain a fragment: spawn the subtree, bootstrap state from a replica
 /// holder via the Phase 5 reconciler (chunked, bounded), then go
 /// Serving. The fragment is NOT authoritative until bootstrap
 /// completes (or times out): local reads/writes forward to the
 /// previous owner meanwhile.
 async fn gain_fragment(deps: &PlacementDriverDeps, fragment: FragmentId) {
-    let (supervisor, dispatcher) = match spawn_fragment_subtree(
+    let (supervisor, dispatcher) = match spawn_fragment_subtree_registered(
         &deps.node_id,
         fragment,
         &deps.subtree_config,
         &deps.hlc,
+        &deps.supervisor_stops,
     )
     .await
     {
@@ -2596,55 +3386,19 @@ async fn gain_fragment(deps: &PlacementDriverDeps, fragment: FragmentId) {
             return;
         }
     };
+    let mut startup_supervisor = SupervisorStartupGuard::new(1);
+    startup_supervisor.push(supervisor.clone());
     deps.supervisors.lock().await.insert(fragment, supervisor);
+    startup_supervisor.disarm();
     // The actor exists in the router now (so the reconciler can merge
     // into it), but the fragment is not serving yet.
     deps.router.insert(fragment, dispatcher);
 
-    let replicas: Vec<String> = deps
-        .placement
-        .read()
-        .unwrap()
-        .get(&fragment)
-        .cloned()
-        .unwrap_or_default();
-    let sources: Vec<String> = replicas
-        .iter()
-        .filter(|p| *p != &deps.node_id)
-        .cloned()
-        .collect();
-    for peer in &replicas {
-        if peer != &deps.node_id {
-            deps.ensure_sender(fragment, peer).await;
-        }
+    if converge_fragment_gain(deps, fragment).await {
+        deps.controller.on_fragment_ready(fragment);
+    } else {
+        lose_fragment(deps, fragment).await;
     }
-    // (Re)connect the senders whose peers are up.
-    {
-        let peers = deps.peers.lock().await;
-        let senders = deps.senders.lock().await;
-        for peer in &sources {
-            if let (Some(tx), Some(sender)) =
-                (peers.get(peer), senders.get(&(fragment, peer.clone())))
-            {
-                let _ = sender.send(SenderMsg::PeerConnected {
-                    peer_tx: tx.raw_sender(),
-                });
-            }
-        }
-    }
-
-    // Bootstrap: wait for a source peer, trigger an on-demand
-    // reconcile round, and wait for it to complete.
-    let bootstrapped = bootstrap_from(deps, fragment, &sources).await;
-    if !bootstrapped {
-        eprintln!("[placement] bootstrap for {fragment} timed out; serving anyway");
-    }
-    deps.serving.write().unwrap().insert(fragment);
-    deps.placement_states
-        .lock()
-        .await
-        .insert(fragment, FragmentPlacementState::Serving);
-    deps.controller.on_fragment_ready(fragment);
 }
 
 /// Run one reconcile round against a source holder and wait for it to
@@ -2721,20 +3475,13 @@ async fn fragment_sender_set_is_drained(
 }
 
 async fn restore_fragment_if_readded(deps: &PlacementDriverDeps, fragment: FragmentId) -> bool {
-    let mut states = deps.placement_states.lock().await;
-    let is_desired = deps
-        .placement
-        .read()
-        .unwrap()
-        .get(&fragment)
-        .map_or(false, |replicas| {
-            replicas.iter().any(|node| node == &deps.node_id)
-        });
-    if is_desired {
-        deps.serving.write().unwrap().insert(fragment);
-        states.insert(fragment, FragmentPlacementState::Serving);
+    // Remain non-authoritative while the sender set is realigned and the
+    // retained subtree catches up on writes forwarded during Draining.
+    let restored = converge_fragment_gain(deps, fragment).await;
+    if restored {
+        deps.controller.on_fragment_ready(fragment);
     }
-    is_desired
+    restored
 }
 
 /// Lose a fragment: stop serving new local ops (they forward to the
@@ -2805,9 +3552,12 @@ async fn lose_fragment(deps: &PlacementDriverDeps, fragment: FragmentId) {
                     !replicas.iter().any(|node| node == &deps.node_id)
                 });
             if !still_revoked {
-                deps.serving.write().unwrap().insert(fragment);
-                states.insert(fragment, FragmentPlacementState::Serving);
-                return;
+                // A re-add raced the final drain check. Keep the subtree
+                // non-serving and let the top of the loop realign senders and
+                // reconcile before publishing it again.
+                states.insert(fragment, FragmentPlacementState::Bootstrapping);
+                drop(states);
+                continue;
             }
 
             // Fence every dynamic mutation path before the destructive commit.
@@ -2829,15 +3579,13 @@ async fn lose_fragment(deps: &PlacementDriverDeps, fragment: FragmentId) {
                 .filter(|(sender_fragment, _)| *sender_fragment == fragment)
                 .cloned()
                 .collect();
-            let mut removed_senders = Vec::with_capacity(keys.len());
+            let mut retiring_senders = Vec::with_capacity(keys.len());
             for key in keys {
-                if let Some(sender) = senders.remove(&key) {
-                    removed_senders.push(sender);
+                if let Some(sender) = senders.get(&key).cloned() {
+                    retiring_senders.push(deps.retiring_senders.retire(sender));
+                    senders.remove(&key);
                 }
                 reports.remove(&key);
-            }
-            for sender in &removed_senders {
-                sender.request_stop();
             }
 
             // Detach every admission/recreation path before the first teardown
@@ -2845,17 +3593,23 @@ async fn lose_fragment(deps: &PlacementDriverDeps, fragment: FragmentId) {
             // the router is absent, and an inbound mutation cannot acquire its
             // shared lease until after the same point.
             let supervisor = deps.supervisors.lock().await.remove(&fragment);
+            if let Some(supervisor) = &supervisor {
+                // The synchronous registry retains join ownership if this
+                // transition is cancelled after the stop signal.
+                supervisor.stop(None);
+            }
             deps.router.remove(fragment);
             drop(reports);
             drop(senders);
             drop(mutation_commit);
             drop(states);
 
-            for sender in removed_senders {
-                sender.stop().await;
+            for sender in retiring_senders {
+                sender.join().await;
             }
             if let Some(supervisor) = supervisor {
-                let _ = supervisor.stop_and_wait(None, None).await;
+                let _ = supervisor.wait(None).await;
+                deps.supervisor_stops.remove(fragment);
             }
             deps.placement_states
                 .lock()
@@ -2879,10 +3633,130 @@ async fn lose_fragment(deps: &PlacementDriverDeps, fragment: FragmentId) {
 /// `we_dialed` distinguishes the dialer (sends `Hello` immediately) from
 /// the listener (replies to the dialer's `Hello`).
 ///
-/// The writer task is registered in `tasks` alongside everything else:
-/// aborting the read loop alone must not orphan it, or the socket's
-/// write half stays open and the peer never observes the disconnect.
-async fn handle_connection(ctx: ConnContext, stream: BoxStream, we_dialed: bool) {
+/// The writer is registered as a sibling in the Node task manager. Cancelling
+/// the handler therefore cannot detach the socket's write half from shutdown.
+#[derive(Debug)]
+enum HandshakeState {
+    AwaitingHello,
+    AwaitingAuth { peer: Hello },
+    Established { peer: String },
+}
+
+impl HandshakeState {
+    fn is_established(&self) -> bool {
+        matches!(self, Self::Established { .. })
+    }
+
+    fn established_peer_id(&self) -> Option<&str> {
+        match self {
+            Self::Established { peer } => Some(peer),
+            Self::AwaitingHello | Self::AwaitingAuth { .. } => None,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ConnectionOutcome {
+    peer_id: Option<String>,
+    was_established: bool,
+}
+
+async fn read_connection_frame<R>(
+    reader: &mut R,
+    cancel: &mut watch::Receiver<bool>,
+    established: bool,
+    handshake_deadline: Instant,
+    frame_body_timeout: Duration,
+) -> Option<Vec<u8>>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let prefix = if established {
+        tokio::select! {
+            changed = cancel.changed() => {
+                let _ = changed;
+                return None;
+            }
+            result = reader.read_u32() => result.ok()?,
+        }
+    } else {
+        tokio::select! {
+            changed = cancel.changed() => {
+                let _ = changed;
+                return None;
+            }
+            _ = tokio::time::sleep_until(handshake_deadline) => return None,
+            result = reader.read_u32() => result.ok()?,
+        }
+    };
+    let len = prefix as usize;
+    let max_len = if established {
+        MAX_FRAME_BYTES
+    } else {
+        4 * 1024
+    };
+    if len > max_len {
+        return None;
+    }
+
+    let mut frame = vec![0u8; len];
+    let body_deadline = if established {
+        deadline_after(frame_body_timeout)
+    } else {
+        handshake_deadline
+    };
+    tokio::select! {
+        changed = cancel.changed() => {
+            let _ = changed;
+            None
+        }
+        _ = tokio::time::sleep_until(body_deadline) => None,
+        result = reader.read_exact(&mut frame) => result.ok().map(|_| frame),
+    }
+}
+
+fn validate_peer_hello(
+    local_node_id: &str,
+    expected_peer_id: Option<&str>,
+    hello: &Hello,
+) -> Result<(), &'static str> {
+    if hello.node_id.is_empty() || hello.node_id.len() > 255 {
+        return Err("peer node_id is empty or exceeds 255 bytes");
+    }
+    if hello.node_id == local_node_id {
+        return Err("peer claimed the local node_id");
+    }
+    if expected_peer_id.map_or(false, |expected| expected != hello.node_id) {
+        return Err("peer identity did not match the configured member");
+    }
+    if !hello.auth_tag.is_empty() {
+        return Err("peer used the retired replayable Hello auth_tag");
+    }
+    if hello.challenge.len() != HANDSHAKE_CHALLENGE_BYTES
+        || hello.challenge.iter().all(|byte| *byte == 0)
+    {
+        return Err("peer challenge is missing, invalid, or all-zero");
+    }
+    if hello.min_protocol_version == 0
+        || hello.min_protocol_version > WIRE_PROTOCOL_VERSION
+        || hello.max_protocol_version < WIRE_PROTOCOL_VERSION
+    {
+        return Err("peer wire-version range is incompatible");
+    }
+    if REQUIRED_WIRE_CAPABILITIES & !hello.capabilities != 0 {
+        return Err("peer omitted required wire capabilities");
+    }
+    Ok(())
+}
+
+async fn handle_connection(
+    ctx: ConnContext,
+    stream: BoxStream,
+    we_dialed: bool,
+    expected_peer_id: Option<String>,
+    connection_lease: Option<Arc<OwnedSemaphorePermit>>,
+) -> ConnectionOutcome {
+    let handshake_deadline = deadline_after(ctx.runtime_options.handshake_timeout);
     let ConnContext {
         node_id,
         router,
@@ -2896,9 +3770,12 @@ async fn handle_connection(ctx: ConnContext, stream: BoxStream, we_dialed: bool)
         pending_mutation_relays,
         next_req_id,
         peers,
+        peer_failures,
         tasks,
+        peer_changes,
         hlc,
         senders,
+        retiring_senders,
         sender_config,
         sender_runtime,
         runtime_options,
@@ -2907,6 +3784,16 @@ async fn handle_connection(ctx: ConnContext, stream: BoxStream, we_dialed: bool)
         membership_tx,
         cluster_secret,
     } = ctx;
+    let local_hello = match fresh_hello(&node_id) {
+        Ok(hello) => hello,
+        Err(error) => {
+            tracing::error!(%error, "failed to generate a handshake challenge");
+            return ConnectionOutcome {
+                peer_id: None,
+                was_established: false,
+            };
+        }
+    };
     // Phase 5: current session per (peer, fragment) on this connection.
     // Sessions are per-connection: a new connection means a new pairing.
     let sessions: Arc<Mutex<HashMap<(String, FragmentId), u64>>> =
@@ -2919,10 +3806,11 @@ async fn handle_connection(ctx: ConnContext, stream: BoxStream, we_dialed: bool)
     let (mut reader, writer) = tokio::io::split(stream);
     let (raw_tx, rx) = mpsc::channel::<Vec<u8>>(runtime_options.peer_queue_frame_capacity);
     let (cancel, _) = watch::channel(false);
-    let tx = PeerChannel {
+    let mut tx = PeerChannel {
         tx: raw_tx,
         cancel: cancel.clone(),
         queue_admission_timeout: runtime_options.queue_admission_timeout,
+        rank: None,
     };
     let writer_cancel = cancel.subscribe();
     // Subscribe before the writer or handshake can signal cancellation;
@@ -2932,19 +3820,46 @@ async fn handle_connection(ctx: ConnContext, stream: BoxStream, we_dialed: bool)
     let writer_cancel_tx = cancel.clone();
     let socket_write_timeout = runtime_options.socket_write_timeout;
 
-    // Writer task: owns the socket's write half, drains the queue.
-    let writer_task = tokio::spawn(run_peer_writer(
-        writer,
-        rx,
-        writer_cancel,
-        writer_cancel_tx,
-        socket_write_timeout,
-    ));
-    tasks.lock().await.push(writer_task.abort_handle());
+    // The writer is independently registered with the Node task manager. The
+    // context carries only a Weak reference, avoiding a manager→handler→manager
+    // ownership cycle while still making shutdown join both halves.
+    let writer_registered = match tasks.upgrade() {
+        Some(tasks) => {
+            let writer_lease = connection_lease.clone();
+            tokio::time::timeout_at(
+                handshake_deadline,
+                tasks.spawn(async move {
+                    let _writer_lease = writer_lease;
+                    run_peer_writer(
+                        writer,
+                        rx,
+                        writer_cancel,
+                        writer_cancel_tx,
+                        socket_write_timeout,
+                    )
+                    .await;
+                }),
+            )
+            .await
+            .unwrap_or(false)
+        }
+        None => false,
+    };
+    if !writer_registered {
+        return ConnectionOutcome {
+            peer_id: None,
+            was_established: false,
+        };
+    }
 
-    // The dialer introduces itself first.
-    if we_dialed {
-        send_hello(&tx, &node_id, cluster_secret.as_deref()).await;
+    // Both endpoints contribute a fresh challenge before either can prove the
+    // ordered transcript. Every required handshake enqueue is checked.
+    if !send_hello_until(&tx, local_hello.clone(), handshake_deadline).await {
+        tx.cancel();
+        return ConnectionOutcome {
+            peer_id: None,
+            was_established: false,
+        };
     }
 
     // Phase 8: shared re-forward context (migration safety).
@@ -2952,131 +3867,130 @@ async fn handle_connection(ctx: ConnContext, stream: BoxStream, we_dialed: bool)
         node_id: node_id.clone(),
         placement: placement.clone(),
         peers: peers.clone(),
+        tasks: tasks.clone(),
         pending_relays: pending_relays.clone(),
         pending_mutation_relays: pending_mutation_relays.clone(),
         next_req_id: next_req_id.clone(),
         forwarded_attempt_timeout: runtime_options.forwarded_attempt_timeout,
     };
 
-    let mut peer_node_id: Option<String> = None;
+    let mut handshake = HandshakeState::AwaitingHello;
+    let mut authenticated_peer_id = None;
+    let mut was_established = false;
     // Length-delimited framing: 4-byte big-endian length prefix.
     loop {
-        let n = tokio::select! {
-            changed = read_cancel.changed() => {
-                let _ = changed;
-                break;
-            }
-            result = reader.read_u32() => {
-                let Ok(n) = result else { break };
-                n
-            }
-        };
-        let len = n as usize;
-        if len > MAX_FRAME_BYTES {
-            break; // corrupt stream; drop the connection
-        }
-        let mut buf = vec![0u8; len];
-        let read_result = tokio::select! {
-            changed = read_cancel.changed() => {
-                let _ = changed;
-                break;
-            }
-            result = reader.read_exact(&mut buf) => result,
-        };
-        if read_result.is_err() {
+        let Some(buf) = read_connection_frame(
+            &mut reader,
+            &mut read_cancel,
+            handshake.is_established(),
+            handshake_deadline,
+            runtime_options.socket_read_timeout,
+        )
+        .await
+        else {
             break;
-        }
+        };
         let envelope = match Envelope::decode(&buf[..]) {
             Ok(e) => e,
             Err(_) => break,
         };
+        let peer_node_id = handshake.established_peer_id().map(str::to_owned);
 
-        // Gate: only Hello may be processed before the handshake
-        // completes. Any other message arriving pre-handshake is
-        // ignored — an unauthenticated peer must not be able to issue
-        // reads, writes, or sync requests (adversarial review #3).
-        if peer_node_id.is_none() && !matches!(envelope.msg, Some(EnvelopeMsg::Hello(_))) {
-            tracing::debug!("ignoring pre-handshake non-Hello message");
-            continue;
+        // A small, absolute-deadline handshake accepts only its two flights.
+        // Unexpected application traffic fails closed instead of allowing an
+        // unauthenticated peer to consume decode/loop work until timeout.
+        if !handshake.is_established()
+            && !matches!(
+                envelope.msg,
+                Some(EnvelopeMsg::Hello(_)) | Some(EnvelopeMsg::HelloAuth(_))
+            )
+        {
+            tracing::warn!("rejecting application frame before handshake completion");
+            break;
         }
 
         match envelope.msg {
-            Some(EnvelopeMsg::Hello(Hello {
-                node_id: peer,
-                auth_tag,
-                min_protocol_version,
-                max_protocol_version,
-                capabilities,
-            })) => {
-                // A connection has exactly one immutable peer identity. A
-                // second Hello could otherwise replace `peer_node_id`, churn
-                // every sender session, and leave the old peer-map entry
-                // pointing at this connection.
-                if peer_node_id.is_some() {
-                    tracing::warn!(
-                        claimed_node_id = %peer,
-                        "rejecting second Hello on an established connection"
-                    );
+            Some(EnvelopeMsg::Hello(peer_hello)) => {
+                if !matches!(handshake, HandshakeState::AwaitingHello) {
+                    tracing::warn!("rejecting duplicate or post-handshake Hello");
                     break;
                 }
-                // Reject Hellos claiming our own id (misconfiguration or
-                // impersonation attempt).
-                if peer == node_id {
-                    tracing::warn!("rejecting Hello claiming our own node_id; dropping connection");
-                    break;
-                }
-                if min_protocol_version == 0
-                    || min_protocol_version > WIRE_PROTOCOL_VERSION
-                    || max_protocol_version < WIRE_PROTOCOL_VERSION
+                if let Err(reason) =
+                    validate_peer_hello(&node_id, expected_peer_id.as_deref(), &peer_hello)
                 {
-                    tracing::warn!(
-                        claimed_node_id = %peer,
-                        min_protocol_version,
-                        max_protocol_version,
-                        local_protocol_version = WIRE_PROTOCOL_VERSION,
-                        "peer wire-version range is incompatible; dropping connection"
-                    );
+                    tracing::warn!(claimed_node_id = %peer_hello.node_id, %reason, "rejecting Hello");
                     break;
                 }
-                let missing_capabilities = REQUIRED_WIRE_CAPABILITIES & !capabilities;
-                if missing_capabilities != 0 {
-                    tracing::warn!(
-                        claimed_node_id = %peer,
-                        capabilities,
-                        missing_capabilities,
-                        "peer omitted required wire capabilities; dropping connection"
-                    );
+                let (dialer, listener) = if we_dialed {
+                    (&local_hello, &peer_hello)
+                } else {
+                    (&peer_hello, &local_hello)
+                };
+                let auth_tag = cluster_secret
+                    .as_deref()
+                    .map(|secret| handshake_auth_tag(secret, we_dialed, dialer, listener))
+                    .unwrap_or_default();
+                if !send_hello_auth_until(&tx, auth_tag, handshake_deadline).await {
                     break;
                 }
-                // Authenticate the handshake when a cluster secret is
-                // configured. Without it, anyone with TCP reachability
-                // can join the mesh (adversarial review #3, #4).
-                if let Some(secret) = cluster_secret.as_deref() {
-                    if !verify_hello_auth_tag(
-                        secret,
-                        &peer,
-                        min_protocol_version,
-                        max_protocol_version,
-                        capabilities,
-                        &auth_tag,
-                    ) {
-                        tracing::warn!(
-                            "Hello auth failed for claimed node_id={peer}; dropping connection"
-                        );
+                handshake = HandshakeState::AwaitingAuth { peer: peer_hello };
+            }
+            Some(EnvelopeMsg::HelloAuth(HelloAuth { auth_tag })) => {
+                let peer_hello = match &handshake {
+                    HandshakeState::AwaitingAuth { peer } => peer.clone(),
+                    HandshakeState::AwaitingHello | HandshakeState::Established { .. } => {
+                        tracing::warn!("rejecting out-of-order or duplicate HelloAuth");
                         break;
                     }
+                };
+                let (dialer, listener) = if we_dialed {
+                    (&local_hello, &peer_hello)
+                } else {
+                    (&peer_hello, &local_hello)
+                };
+                if !verify_handshake_auth(
+                    cluster_secret.as_deref(),
+                    !we_dialed,
+                    dialer,
+                    listener,
+                    &auth_tag,
+                ) {
+                    tracing::warn!(
+                        claimed_node_id = %peer_hello.node_id,
+                        "challenge-bound handshake proof failed"
+                    );
+                    break;
                 }
-                peer_node_id = Some(peer.clone());
-                if let Some(previous) = peers.lock().await.insert(peer.clone(), tx.clone()) {
-                    if !previous.same_channel(&tx) {
-                        previous.cancel();
+
+                let peer = peer_hello.node_id.clone();
+                authenticated_peer_id = Some(peer.clone());
+                tx.rank = Some(connection_rank(dialer, listener));
+                let (won_election, previous) = {
+                    let mut peer_guard = peers.lock().await;
+                    match peer_guard.get(&peer) {
+                        Some(current) if current.same_channel(&tx) => (true, None),
+                        Some(current) if current.rank.as_ref() >= tx.rank.as_ref() => (false, None),
+                        Some(_) => (true, peer_guard.insert(peer.clone(), tx.clone())),
+                        None => {
+                            peer_guard.insert(peer.clone(), tx.clone());
+                            (true, None)
+                        }
                     }
+                };
+                if !won_election {
+                    tracing::debug!(%peer, "authenticated duplicate connection lost election");
+                    break;
                 }
-                if !we_dialed {
-                    // The listener answers the handshake...
-                    send_hello(&tx, &node_id, cluster_secret.as_deref()).await;
+                if let Some(previous) = previous {
+                    previous.cancel();
                 }
-                // ...and both sides then pull the fragments they serve
+                peer_changes.send_modify(|generation| {
+                    *generation = generation.wrapping_add(1);
+                });
+                handshake = HandshakeState::Established { peer: peer.clone() };
+                was_established = true;
+
+                // Both sides then pull the fragments they serve
                 // for anti-entropy — unless dynamic placement is on, in
                 // which case the Phase 5 reconciler owns anti-entropy
                 // (delta-only; no full-state copy).
@@ -3086,7 +4000,9 @@ async fn handle_connection(ctx: ConnContext, stream: BoxStream, we_dialed: bool)
                 // Phase 8: wake the placement driver so the controller
                 // sees the membership change promptly.
                 if let Some(mtx) = membership_tx.clone() {
-                    let _ = mtx.send(());
+                    mtx.send_modify(|generation| {
+                        *generation = generation.wrapping_add(1);
+                    });
                 }
                 // Phase 5: (re)connect the senders for this peer. Legacy
                 // mode (no fragment map) spawns senders lazily here.
@@ -3100,7 +4016,13 @@ async fn handle_connection(ctx: ConnContext, stream: BoxStream, we_dialed: bool)
                                 .map(|replicas| replicas.iter().any(|id| id == &peer))
                                 .unwrap_or(false)
                     };
-                    if is_replica {
+                    // Dynamic sender creation is placement-owned. Letting a
+                    // connection handler create one from an earlier placement
+                    // snapshot can reinsert a revoked peer after a gain has
+                    // aligned and pruned its exact sender set. The placement
+                    // path also reconnects newly-created senders to live peers;
+                    // this handler only notifies senders that already exist.
+                    if is_replica && !dynamic_placement {
                         ensure_sender_entry(
                             frag,
                             &peer,
@@ -3110,8 +4032,9 @@ async fn handle_connection(ctx: ConnContext, stream: BoxStream, we_dialed: bool)
                                 router: &router,
                                 hlc: &hlc,
                                 senders: &senders,
+                                retiring_senders: &retiring_senders,
                                 reports: &sender_reports,
-                                peers: &peers,
+                                peer_failures: &peer_failures,
                             },
                         )
                         .await;
@@ -3127,7 +4050,7 @@ async fn handle_connection(ctx: ConnContext, stream: BoxStream, we_dialed: bool)
                         .get(&peer)
                         .map_or(false, |current| current.same_channel(&tx))
                     {
-                        continue;
+                        break;
                     }
                     let senders_guard = senders.lock().await;
                     for ((_, sender_peer), sender_tx) in senders_guard.iter() {
@@ -3152,10 +4075,17 @@ async fn handle_connection(ctx: ConnContext, stream: BoxStream, we_dialed: bool)
                     continue;
                 }
                 let fragment = FragmentId(s.fragment);
-                if router.route_for_fragment(fragment).is_none() {
+                // Placement controllers are observed independently. A source
+                // can therefore publish the overlap and start this session
+                // just before the destination has attached its actor. Adopt
+                // the bounded transport session now; batches arriving before
+                // actor installation receive a NACK below and are retried.
+                // Requiring an actor here would silently lose the only
+                // SessionStart and stall the sender until its ACK timeout.
+                if fragment.0 as usize >= router.fragment_count {
                     tracing::warn!(
                         fragment = s.fragment,
-                        "ignoring SessionStart for a fragment this node does not host"
+                        "ignoring SessionStart for an invalid fragment"
                     );
                     continue;
                 }
@@ -3490,29 +4420,44 @@ async fn handle_connection(ctx: ConnContext, stream: BoxStream, we_dialed: bool)
                 // it validate correlation before this frame may advance the
                 // HLC; stale responses must be side-effect free.
                 if let Some(peer) = peer_node_id.clone() {
-                    let sender = senders
-                        .lock()
-                        .await
-                        .get(&(FragmentId(r.fragment), peer))
-                        .cloned();
+                    let sender_key = (FragmentId(r.fragment), peer);
+                    let sender = senders.lock().await.get(&sender_key).cloned();
                     if let Some(tx) = sender {
                         let (connection_valid, validation) = oneshot::channel();
-                        if tx
-                            .send(SenderMsg::ReconcileResponse {
-                                session_id: r.session_id,
-                                round_id: r.round_id,
-                                summaries: r.summaries,
-                                connection_valid,
-                            })
-                            .is_err()
-                        {
-                            break;
+                        match tx.send(SenderMsg::ReconcileResponse {
+                            session_id: r.session_id,
+                            round_id: r.round_id,
+                            summaries: r.summaries,
+                            connection_valid,
+                        }) {
+                            Ok(()) => {}
+                            // Placement may retire the sender after the map
+                            // lookup above. That is a stale local consumer,
+                            // not a protocol failure on this multiplexed peer
+                            // connection.
+                            Err(NodeSenderSendError::Closed) => continue,
+                            Err(NodeSenderSendError::Full) => break,
                         }
-                        if !matches!(
-                            tokio::time::timeout(REMOTE_RPC_TIMEOUT, validation).await,
-                            Ok(Ok(true))
-                        ) {
-                            break;
+                        match tokio::time::timeout(REMOTE_RPC_TIMEOUT, validation).await {
+                            Ok(Ok(true)) => {}
+                            Ok(Ok(false)) => break,
+                            // The sender can be retired after accepting the
+                            // message but before answering its oneshot.
+                            Ok(Err(_)) => continue,
+                            Err(_) => {
+                                // A live sender that stops validating control
+                                // traffic is unhealthy. A removed/replaced
+                                // sender merely lost a placement race.
+                                let still_current = senders
+                                    .lock()
+                                    .await
+                                    .get(&sender_key)
+                                    .map_or(false, |current| current.same_task(&tx));
+                                if still_current {
+                                    break;
+                                }
+                                continue;
+                            }
                         }
                     }
                 }
@@ -3529,30 +4474,36 @@ async fn handle_connection(ctx: ConnContext, stream: BoxStream, we_dialed: bool)
                     continue;
                 }
                 if let Some(peer) = peer_node_id.clone() {
-                    let sender = senders
-                        .lock()
-                        .await
-                        .get(&(FragmentId(d.fragment), peer))
-                        .cloned();
+                    let sender_key = (FragmentId(d.fragment), peer);
+                    let sender = senders.lock().await.get(&sender_key).cloned();
                     if let Some(tx) = sender {
                         let (connection_valid, validation) = oneshot::channel();
-                        if tx
-                            .send(SenderMsg::ReconcileData {
-                                session_id: d.session_id,
-                                round_id: d.round_id,
-                                chunk_seq: d.chunk_seq,
-                                entries: d.entries,
-                                connection_valid,
-                            })
-                            .is_err()
-                        {
-                            break;
+                        match tx.send(SenderMsg::ReconcileData {
+                            session_id: d.session_id,
+                            round_id: d.round_id,
+                            chunk_seq: d.chunk_seq,
+                            entries: d.entries,
+                            connection_valid,
+                        }) {
+                            Ok(()) => {}
+                            Err(NodeSenderSendError::Closed) => continue,
+                            Err(NodeSenderSendError::Full) => break,
                         }
-                        if !matches!(
-                            tokio::time::timeout(REMOTE_RPC_TIMEOUT, validation).await,
-                            Ok(Ok(true))
-                        ) {
-                            break;
+                        match tokio::time::timeout(REMOTE_RPC_TIMEOUT, validation).await {
+                            Ok(Ok(true)) => {}
+                            Ok(Ok(false)) => break,
+                            Ok(Err(_)) => continue,
+                            Err(_) => {
+                                let still_current = senders
+                                    .lock()
+                                    .await
+                                    .get(&sender_key)
+                                    .map_or(false, |current| current.same_task(&tx));
+                                if still_current {
+                                    break;
+                                }
+                                continue;
+                            }
                         }
                     }
                 }
@@ -4079,34 +5030,69 @@ async fn handle_connection(ctx: ConnContext, stream: BoxStream, we_dialed: bool)
         }
     }
 
-    // Connection dropped: forget the peer and stop the writer.
-    if let Some(peer) = peer_node_id {
+    // Connection dropped: forget the peer only if this exact physical channel
+    // is still current. Legacy full-replication peers are discovered at
+    // runtime, so reap their per-fragment senders on disconnect rather than
+    // letting sequential claimed identities grow the sender maps forever.
+    // The next handshake's mandatory full-state exchange covers writes made
+    // while that peer is absent. Explicit placement maps retain sender buffers
+    // because their peer cardinality is configured and bounded.
+    let mut disconnected_senders = Vec::new();
+    if let Some(peer) = handshake.established_peer_id().map(str::to_owned) {
         let mut guard = peers.lock().await;
         // Only remove if it's still our entry (a newer connection may
         // have replaced it).
         if let Some(tx_existing) = guard.get(&peer) {
             if tx_existing.same_channel(&tx) {
                 guard.remove(&peer);
-                // Phase 5: the senders retain their buffers for resume.
-                // Only notify if we were the current connection.
-                let senders_guard = senders.lock().await;
-                for ((_, p), sender_tx) in senders_guard.iter() {
-                    if p == &peer {
-                        let _ = sender_tx.send(SenderMsg::PeerDisconnected {
-                            peer_tx: tx.raw_sender(),
-                        });
+                let legacy_full_replication = placement.read().unwrap().is_empty();
+                let mut senders_guard = senders.lock().await;
+                if legacy_full_replication {
+                    let keys: Vec<(FragmentId, String)> = senders_guard
+                        .keys()
+                        .filter(|(_, sender_peer)| sender_peer == &peer)
+                        .cloned()
+                        .collect();
+                    let mut reports_guard = sender_reports.lock().await;
+                    for key in keys {
+                        if let Some(sender) = senders_guard.get(&key).cloned() {
+                            disconnected_senders.push(retiring_senders.retire(sender));
+                            senders_guard.remove(&key);
+                        }
+                        reports_guard.remove(&key);
+                    }
+                } else {
+                    // Explicitly placed senders retain their buffers for
+                    // resume. Only notify if this was the current channel.
+                    for ((_, sender_peer), sender_tx) in senders_guard.iter() {
+                        if sender_peer == &peer {
+                            let _ = sender_tx.send(SenderMsg::PeerDisconnected {
+                                peer_tx: tx.raw_sender(),
+                            });
+                        }
                     }
                 }
                 // Phase 8: wake the placement driver so the controller
                 // sees the membership change promptly.
                 if let Some(mtx) = membership_tx {
-                    let _ = mtx.send(());
+                    mtx.send_modify(|generation| {
+                        *generation = generation.wrapping_add(1);
+                    });
                 }
+                peer_changes.send_modify(|generation| {
+                    *generation = generation.wrapping_add(1);
+                });
             }
         }
     }
     tx.cancel();
-    writer_task.abort();
+    for sender in disconnected_senders {
+        sender.join().await;
+    }
+    ConnectionOutcome {
+        peer_id: authenticated_peer_id,
+        was_established,
+    }
 }
 
 /// Shared context for re-forwarding ops during migration (Phase 8).
@@ -4116,6 +5102,7 @@ struct ReforwardCtx {
     node_id: String,
     placement: Arc<RwLock<HashMap<FragmentId, Vec<String>>>>,
     peers: PeerMap,
+    tasks: Weak<RuntimeTasks>,
     pending_relays: RelayMap,
     pending_mutation_relays: MutationRelayMap,
     next_req_id: Arc<AtomicU64>,
@@ -4177,14 +5164,18 @@ async fn send_mutation_response(tx: &PeerChannel, response: MutationResponse) ->
 }
 
 async fn register_mutation_relay(
+    tasks: &Weak<RuntimeTasks>,
     relays: MutationRelayMap,
     relay_id: u64,
-    expected_peer: String,
-    expected_keys: Vec<String>,
-    origin_tx: PeerChannel,
-    origin_req_id: u64,
-    deadline: Instant,
+    registration: MutationRelayRegistration,
 ) {
+    let MutationRelayRegistration {
+        expected_peer,
+        expected_keys,
+        origin_tx,
+        origin_req_id,
+        deadline,
+    } = registration;
     let (timeout_cancel, cancelled) = oneshot::channel();
     let timeout_keys = expected_keys.clone();
     relays.lock().await.insert(
@@ -4200,10 +5191,11 @@ async fn register_mutation_relay(
 
     // Register before spawning the timer. The cancellation sender is already
     // in the map, so every registered relay has exactly one live deadline.
-    tokio::spawn(async move {
+    let timeout_relays = relays.clone();
+    let timeout_task = async move {
         tokio::select! {
             _ = tokio::time::sleep_until(deadline) => {
-                let relay = { relays.lock().await.remove(&relay_id) };
+                let relay = { timeout_relays.lock().await.remove(&relay_id) };
                 if let Some(relay) = relay {
                     send_unavailable_mutation(
                         &relay.origin_tx,
@@ -4216,10 +5208,18 @@ async fn register_mutation_relay(
             }
             _ = cancelled => {}
         }
-    });
+    };
+    let registered = match tasks.upgrade() {
+        Some(tasks) => tasks.spawn(timeout_task).await,
+        None => false,
+    };
+    if !registered {
+        relays.lock().await.remove(&relay_id);
+    }
 }
 
 async fn register_get_relay(
+    tasks: &Weak<RuntimeTasks>,
     relays: RelayMap,
     relay_id: u64,
     origin_tx: PeerChannel,
@@ -4235,14 +5235,22 @@ async fn register_get_relay(
             timeout_cancel,
         },
     );
-    tokio::spawn(async move {
+    let timeout_relays = relays.clone();
+    let timeout_task = async move {
         tokio::select! {
             _ = tokio::time::sleep_until(deadline) => {
-                relays.lock().await.remove(&relay_id);
+                timeout_relays.lock().await.remove(&relay_id);
             }
             _ = cancelled => {}
         }
-    });
+    };
+    let registered = match tasks.upgrade() {
+        Some(tasks) => tasks.spawn(timeout_task).await,
+        None => false,
+    };
+    if !registered {
+        relays.lock().await.remove(&relay_id);
+    }
 }
 
 /// Relay a write to the fragment's current owner and preserve the exact
@@ -4270,13 +5278,16 @@ async fn relay_put(
     let relay_id = ctx.next_req_id.fetch_add(1, Ordering::Relaxed);
     let attempt_deadline = deadline_after(ctx.forwarded_attempt_timeout);
     register_mutation_relay(
+        &ctx.tasks,
         ctx.pending_mutation_relays.clone(),
         relay_id,
-        owner,
-        keys.clone(),
-        origin_tx.clone(),
-        original_req_id,
-        attempt_deadline,
+        MutationRelayRegistration {
+            expected_peer: owner,
+            expected_keys: keys.clone(),
+            origin_tx: origin_tx.clone(),
+            origin_req_id: original_req_id,
+            deadline: attempt_deadline,
+        },
     )
     .await;
     p.req_id = relay_id;
@@ -4327,13 +5338,16 @@ async fn relay_batch(
     let relay_id = ctx.next_req_id.fetch_add(1, Ordering::Relaxed);
     let attempt_deadline = deadline_after(ctx.forwarded_attempt_timeout);
     register_mutation_relay(
+        &ctx.tasks,
         ctx.pending_mutation_relays.clone(),
         relay_id,
-        owner,
-        keys.clone(),
-        origin_tx.clone(),
-        original_req_id,
-        attempt_deadline,
+        MutationRelayRegistration {
+            expected_peer: owner,
+            expected_keys: keys.clone(),
+            origin_tx: origin_tx.clone(),
+            origin_req_id: original_req_id,
+            deadline: attempt_deadline,
+        },
     )
     .await;
     bp.req_id = relay_id;
@@ -4379,6 +5393,7 @@ async fn relay_get(
     let relay_id = ctx.next_req_id.fetch_add(1, Ordering::Relaxed);
     let attempt_deadline = deadline_after(ctx.forwarded_attempt_timeout);
     register_get_relay(
+        &ctx.tasks,
         ctx.pending_relays.clone(),
         relay_id,
         origin_tx.clone(),
@@ -4407,22 +5422,80 @@ async fn relay_get(
     }
 }
 
-/// Redial `addr` until a connection sticks, with exponential backoff.
-/// Each successful dial is run to completion (i.e. until it drops),
-/// then the loop redials. Runs until the task is aborted by shutdown.
-async fn reconnect_loop(ctx: ConnContext, network: Arc<dyn Network>, addr: SocketAddr) {
+/// Own one outbound dial intent until shutdown. Authentication/protocol
+/// failures back off just like transport failures. A duplicate loser parks on
+/// peer-map changes while the elected connection is healthy instead of
+/// continuously rotating replication sessions.
+async fn dial_supervisor(
+    ctx: ConnContext,
+    network: Arc<dyn Network>,
+    addr: SocketAddr,
+    mut expected_peer_id: Option<String>,
+    mut initial_stream: Option<BoxStream>,
+) {
     let mut backoff = RECONNECT_BASE;
     loop {
-        tokio::time::sleep(backoff + jitter(backoff)).await;
-        match network.connect(addr).await {
-            Ok(stream) => {
+        let stream = match initial_stream.take() {
+            Some(stream) => stream,
+            None => match tokio::time::timeout(
+                ctx.runtime_options.connect_timeout,
+                network.connect(addr),
+            )
+            .await
+            {
+                Ok(Ok(stream)) => stream,
+                Ok(Err(error)) => {
+                    tracing::debug!(%addr, %error, "peer dial failed");
+                    tokio::time::sleep(backoff + jitter(backoff)).await;
+                    backoff = (backoff * 2).min(RECONNECT_MAX);
+                    continue;
+                }
+                Err(_) => {
+                    tracing::debug!(%addr, "peer dial timed out");
+                    tokio::time::sleep(backoff + jitter(backoff)).await;
+                    backoff = (backoff * 2).min(RECONNECT_MAX);
+                    continue;
+                }
+            },
+        };
+
+        let outcome = handle_connection(
+            ctx.clone(),
+            stream,
+            /* we_dialed = */ true,
+            expected_peer_id.clone(),
+            None,
+        )
+        .await;
+
+        // Address-only `connect` pins the first authenticated identity for
+        // every later reconnect. Otherwise an address reused by a different
+        // node could make the dial intent look healthy while the original
+        // routing/replication target remained permanently absent.
+        if expected_peer_id.is_none() {
+            expected_peer_id.clone_from(&outcome.peer_id);
+        }
+
+        if let Some(peer) = outcome.peer_id.as_deref() {
+            let mut changes = ctx.peer_changes.subscribe();
+            let winner_is_live = ctx.peers.lock().await.contains_key(peer);
+            if winner_is_live {
+                while ctx.peers.lock().await.contains_key(peer) {
+                    if changes.changed().await.is_err() {
+                        return;
+                    }
+                }
                 backoff = RECONNECT_BASE;
-                handle_connection(ctx.clone(), stream, /* we_dialed = */ true).await;
-                // Dropped: loop around and redial.
+                continue;
             }
-            Err(_) => {
-                backoff = (backoff * 2).min(RECONNECT_MAX);
-            }
+        }
+
+        if outcome.was_established {
+            backoff = RECONNECT_BASE;
+        }
+        tokio::time::sleep(backoff + jitter(backoff)).await;
+        if !outcome.was_established {
+            backoff = (backoff * 2).min(RECONNECT_MAX);
         }
     }
 }
@@ -4444,75 +5517,125 @@ fn jitter(backoff: Duration) -> Duration {
 /// Legacy gossip: re-send an op to all peers except the connection it
 /// arrived on. Only used when no fragment_map is configured; the sharded
 /// path fans out from the coordinator instead.
-async fn send_hello(tx: &PeerChannel, node_id: &str, cluster_secret: Option<&[u8]>) {
-    let min_protocol_version = WIRE_PROTOCOL_VERSION;
-    let max_protocol_version = WIRE_PROTOCOL_VERSION;
-    let capabilities = REQUIRED_WIRE_CAPABILITIES;
-    send_envelope(
-        tx,
-        Envelope {
-            msg: Some(EnvelopeMsg::Hello(Hello {
-                node_id: node_id.to_string(),
-                auth_tag: cluster_secret
-                    .map(|s| {
-                        hello_auth_tag(
-                            s,
-                            node_id,
-                            min_protocol_version,
-                            max_protocol_version,
-                            capabilities,
-                        )
-                    })
-                    .unwrap_or_default(),
-                min_protocol_version,
-                max_protocol_version,
-                capabilities,
-            })),
-        },
-    )
-    .await;
+fn fresh_hello(node_id: &str) -> Result<Hello, getrandom::Error> {
+    let mut challenge = vec![0u8; HANDSHAKE_CHALLENGE_BYTES];
+    getrandom::getrandom(&mut challenge)?;
+    Ok(Hello {
+        node_id: node_id.to_string(),
+        auth_tag: Vec::new(),
+        min_protocol_version: WIRE_PROTOCOL_VERSION,
+        max_protocol_version: WIRE_PROTOCOL_VERSION,
+        capabilities: REQUIRED_WIRE_CAPABILITIES,
+        challenge,
+    })
 }
 
-/// HMAC-SHA256 over the complete, length-delimited Hello transcript. Binding
-/// capabilities prevents unauthenticated feature rewriting when the optional
-/// static tag is configured. The transcript has no freshness and is replayable.
-fn hello_auth_tag(
+async fn send_hello_until(tx: &PeerChannel, hello: Hello, deadline: Instant) -> bool {
+    try_send_envelope_until(
+        tx,
+        Envelope {
+            msg: Some(EnvelopeMsg::Hello(hello)),
+        },
+        deadline,
+    )
+    .await
+}
+
+async fn send_hello_auth_until(tx: &PeerChannel, auth_tag: Vec<u8>, deadline: Instant) -> bool {
+    try_send_envelope_until(
+        tx,
+        Envelope {
+            msg: Some(EnvelopeMsg::HelloAuth(HelloAuth { auth_tag })),
+        },
+        deadline,
+    )
+    .await
+}
+
+/// Canonical manual encoding used by both HMAC and connection election. It is
+/// deliberately independent of protobuf encoding and binds both advertised
+/// offers plus the selected protocol/capabilities.
+fn handshake_transcript(dialer: &Hello, listener: &Hello) -> Vec<u8> {
+    fn append_hello(out: &mut Vec<u8>, role: &[u8], hello: &Hello) {
+        out.extend_from_slice(&(role.len() as u64).to_be_bytes());
+        out.extend_from_slice(role);
+        out.extend_from_slice(&(hello.node_id.len() as u64).to_be_bytes());
+        out.extend_from_slice(hello.node_id.as_bytes());
+        out.extend_from_slice(&hello.min_protocol_version.to_be_bytes());
+        out.extend_from_slice(&hello.max_protocol_version.to_be_bytes());
+        out.extend_from_slice(&hello.capabilities.to_be_bytes());
+        out.extend_from_slice(&(hello.challenge.len() as u64).to_be_bytes());
+        out.extend_from_slice(&hello.challenge);
+    }
+
+    let mut transcript = Vec::with_capacity(256);
+    transcript.extend_from_slice(b"actordb-handshake-transcript-v2\0");
+    append_hello(&mut transcript, b"dialer", dialer);
+    append_hello(&mut transcript, b"listener", listener);
+    transcript.extend_from_slice(&WIRE_PROTOCOL_VERSION.to_be_bytes());
+    transcript.extend_from_slice(&(dialer.capabilities & listener.capabilities).to_be_bytes());
+    transcript
+}
+
+fn handshake_auth_tag(
     secret: &[u8],
-    node_id: &str,
-    min_protocol_version: u32,
-    max_protocol_version: u32,
-    capabilities: u64,
+    prover_is_dialer: bool,
+    dialer: &Hello,
+    listener: &Hello,
 ) -> Vec<u8> {
     use hmac::{Hmac, Mac};
     use sha2::Sha256;
+
     let mut mac = Hmac::<Sha256>::new_from_slice(secret).expect("HMAC accepts any key length");
-    mac.update(b"actordb-hello-v1\0");
-    mac.update(&(node_id.len() as u64).to_be_bytes());
-    mac.update(node_id.as_bytes());
-    mac.update(&min_protocol_version.to_be_bytes());
-    mac.update(&max_protocol_version.to_be_bytes());
-    mac.update(&capabilities.to_be_bytes());
+    mac.update(b"actordb-handshake-proof-v2\0");
+    mac.update(if prover_is_dialer {
+        b"dialer"
+    } else {
+        b"listener"
+    });
+    mac.update(&handshake_transcript(dialer, listener));
     mac.finalize().into_bytes().to_vec()
 }
 
-/// Constant-time verification of a Hello's auth tag.
-fn verify_hello_auth_tag(
-    secret: &[u8],
-    node_id: &str,
-    min_protocol_version: u32,
-    max_protocol_version: u32,
-    capabilities: u64,
+fn verify_handshake_auth(
+    secret: Option<&[u8]>,
+    prover_is_dialer: bool,
+    dialer: &Hello,
+    listener: &Hello,
     tag: &[u8],
 ) -> bool {
-    use subtle::ConstantTimeEq;
-    let expected = hello_auth_tag(
-        secret,
-        node_id,
-        min_protocol_version,
-        max_protocol_version,
-        capabilities,
-    );
-    expected.as_slice().ct_eq(tag).into()
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+
+    match secret {
+        Some(secret) => {
+            if tag.len() != 32 {
+                return false;
+            }
+            // `verify_slice` is constant-time.
+            let mut verifier =
+                Hmac::<Sha256>::new_from_slice(secret).expect("HMAC accepts any key length");
+            verifier.update(b"actordb-handshake-proof-v2\0");
+            verifier.update(if prover_is_dialer {
+                b"dialer"
+            } else {
+                b"listener"
+            });
+            verifier.update(&handshake_transcript(dialer, listener));
+            verifier.verify_slice(tag).is_ok()
+        }
+        None => tag.is_empty(),
+    }
+}
+
+fn connection_rank(dialer: &Hello, listener: &Hello) -> ConnectionRank {
+    use sha2::{Digest, Sha256};
+
+    let transcript_id: [u8; 32] = Sha256::digest(handshake_transcript(dialer, listener)).into();
+    ConnectionRank {
+        preferred_direction: dialer.node_id < listener.node_id,
+        transcript_id,
+    }
 }
 
 async fn send_sync_request(tx: &PeerChannel, fragments: Vec<u32>) {
@@ -4590,6 +5713,7 @@ mod tests {
                 tx,
                 cancel,
                 queue_admission_timeout: Duration::from_millis(10),
+                rank: None,
             },
             rx,
         )
@@ -4626,15 +5750,20 @@ mod tests {
             serving,
             placement,
             supervisors,
+            supervisor_stops: Arc::new(SupervisorRegistry::new(1)),
             placement_states: Arc::new(Mutex::new(HashMap::from([(
                 FragmentId(0),
                 FragmentPlacementState::Draining,
             )]))),
+            placement_generation: Arc::new(AtomicU64::new(0)),
             senders,
+            retiring_senders: Arc::new(RetiringSenderRegistry::default()),
             sender_reports,
             sender_config: SenderConfig::default(),
             sender_runtime: SenderRuntimeOptions::default(),
             peers: Arc::new(Mutex::new(HashMap::new())),
+            peer_failures: PeerFailureSignals::default(),
+            tasks: Weak::new(),
             hlc: Arc::new(Mutex::new(HlcClock::new())),
         }
     }
@@ -4647,31 +5776,73 @@ mod tests {
         senders: SenderMap,
         sender_reports: SenderReportMap,
         peers: PeerMap,
-    ) -> ConnContext {
-        ConnContext {
-            node_id: "local".to_string(),
-            router,
-            serving,
-            placement,
-            dynamic_placement,
-            pending_gets: Arc::new(StdMutex::new(HashMap::new())),
-            pending_batch_gets: Arc::new(StdMutex::new(HashMap::new())),
-            pending_mutations: Arc::new(StdMutex::new(HashMap::new())),
-            pending_relays: Arc::new(Mutex::new(HashMap::new())),
-            pending_mutation_relays: Arc::new(Mutex::new(HashMap::new())),
-            next_req_id: Arc::new(AtomicU64::new(1)),
-            peers,
-            tasks: Arc::new(Mutex::new(Vec::new())),
-            hlc: Arc::new(Mutex::new(HlcClock::new())),
-            senders,
-            sender_config: SenderConfig::default(),
-            sender_runtime: SenderRuntimeOptions::default(),
-            runtime_options: NodeRuntimeOptions::default(),
-            sender_reports,
-            sync_entries_applied: Arc::new(AtomicU64::new(0)),
-            membership_tx: None,
-            cluster_secret: None,
-        }
+    ) -> (ConnContext, Arc<RuntimeTasks>) {
+        let tasks = RuntimeTasks::new(8);
+        let (peer_changes, _) = watch::channel(0u64);
+        (
+            ConnContext {
+                node_id: "local".to_string(),
+                router,
+                serving,
+                placement,
+                dynamic_placement,
+                pending_gets: Arc::new(StdMutex::new(HashMap::new())),
+                pending_batch_gets: Arc::new(StdMutex::new(HashMap::new())),
+                pending_mutations: Arc::new(StdMutex::new(HashMap::new())),
+                pending_relays: Arc::new(Mutex::new(HashMap::new())),
+                pending_mutation_relays: Arc::new(Mutex::new(HashMap::new())),
+                next_req_id: Arc::new(AtomicU64::new(1)),
+                peers,
+                peer_failures: PeerFailureSignals::default(),
+                tasks: Arc::downgrade(&tasks),
+                peer_changes,
+                hlc: Arc::new(Mutex::new(HlcClock::new())),
+                senders,
+                retiring_senders: Arc::new(RetiringSenderRegistry::default()),
+                sender_config: SenderConfig::default(),
+                sender_runtime: SenderRuntimeOptions::default(),
+                runtime_options: NodeRuntimeOptions::default(),
+                sender_reports,
+                sync_entries_applied: Arc::new(AtomicU64::new(0)),
+                membership_tx: None,
+                cluster_secret: None,
+            },
+            tasks,
+        )
+    }
+
+    async fn complete_test_handshake(stream: &mut tokio::io::DuplexStream, peer_id: &str) {
+        assert!(matches!(
+            read_test_envelope(stream).await.msg,
+            Some(EnvelopeMsg::Hello(_))
+        ));
+        write_test_envelope(
+            stream,
+            Envelope {
+                msg: Some(EnvelopeMsg::Hello(Hello {
+                    node_id: peer_id.to_string(),
+                    auth_tag: Vec::new(),
+                    min_protocol_version: WIRE_PROTOCOL_VERSION,
+                    max_protocol_version: WIRE_PROTOCOL_VERSION,
+                    capabilities: REQUIRED_WIRE_CAPABILITIES,
+                    challenge: vec![7; HANDSHAKE_CHALLENGE_BYTES],
+                })),
+            },
+        )
+        .await;
+        assert!(matches!(
+            read_test_envelope(stream).await.msg,
+            Some(EnvelopeMsg::HelloAuth(HelloAuth { auth_tag })) if auth_tag.is_empty()
+        ));
+        write_test_envelope(
+            stream,
+            Envelope {
+                msg: Some(EnvelopeMsg::HelloAuth(HelloAuth {
+                    auth_tag: Vec::new(),
+                })),
+            },
+        )
+        .await;
     }
 
     fn result(key: &str, request_index: u32) -> MutationResult {
@@ -4717,8 +5888,12 @@ mod tests {
         let options = NodeRuntimeOptions::default();
         assert_eq!(options.peer_queue_frame_capacity(), 256);
         assert_eq!(options.replication_control_message_capacity(), 64);
+        assert_eq!(options.inbound_connection_capacity(), 1024);
         assert_eq!(options.queue_admission_timeout(), Duration::from_secs(5));
         assert_eq!(options.forwarded_attempt_timeout(), Duration::from_secs(5));
+        assert_eq!(options.connect_timeout(), Duration::from_secs(5));
+        assert_eq!(options.handshake_timeout(), Duration::from_secs(5));
+        assert_eq!(options.socket_read_timeout(), Duration::from_secs(30));
         assert_eq!(options.socket_write_timeout(), Duration::from_secs(30));
         assert_eq!(options.replication_ack_timeout(), Duration::from_secs(30));
     }
@@ -4738,38 +5913,133 @@ mod tests {
             .validate()
             .is_err());
         assert!(NodeRuntimeOptions::default()
+            .with_inbound_connection_capacity(0)
+            .validate()
+            .is_err());
+        assert!(NodeRuntimeOptions::default()
             .with_replication_control_message_capacity(
                 tokio::sync::Semaphore::MAX_PERMITS.saturating_add(1),
             )
             .validate()
             .is_err());
+        assert!(
+            NodeRuntimeOptions::default()
+                .with_inbound_connection_capacity(
+                    tokio::sync::Semaphore::MAX_PERMITS.saturating_add(1),
+                )
+                .validate()
+                .is_err()
+        );
+        for options in [
+            NodeRuntimeOptions::default().with_connect_timeout(Duration::ZERO),
+            NodeRuntimeOptions::default().with_handshake_timeout(Duration::ZERO),
+            NodeRuntimeOptions::default().with_socket_read_timeout(Duration::ZERO),
+        ] {
+            assert!(options.validate().is_err());
+        }
     }
 
     #[test]
-    fn static_hello_hmac_binds_wire_capabilities() {
-        let authenticated = hello_auth_tag(
-            b"secret",
-            "peer",
-            WIRE_PROTOCOL_VERSION,
-            WIRE_PROTOCOL_VERSION,
-            REQUIRED_WIRE_CAPABILITIES,
-        );
-        assert!(verify_hello_auth_tag(
-            b"secret",
-            "peer",
-            WIRE_PROTOCOL_VERSION,
-            WIRE_PROTOCOL_VERSION,
-            REQUIRED_WIRE_CAPABILITIES,
+    fn challenge_hmac_binds_both_offers_roles_and_freshness() {
+        let dialer = Hello {
+            node_id: "dialer".to_string(),
+            auth_tag: Vec::new(),
+            min_protocol_version: WIRE_PROTOCOL_VERSION,
+            max_protocol_version: WIRE_PROTOCOL_VERSION,
+            capabilities: REQUIRED_WIRE_CAPABILITIES,
+            challenge: vec![1; HANDSHAKE_CHALLENGE_BYTES],
+        };
+        let listener = Hello {
+            node_id: "listener".to_string(),
+            auth_tag: Vec::new(),
+            min_protocol_version: WIRE_PROTOCOL_VERSION,
+            max_protocol_version: WIRE_PROTOCOL_VERSION,
+            capabilities: REQUIRED_WIRE_CAPABILITIES,
+            challenge: vec![2; HANDSHAKE_CHALLENGE_BYTES],
+        };
+        let authenticated = handshake_auth_tag(b"secret", true, &dialer, &listener);
+        assert!(verify_handshake_auth(
+            Some(b"secret"),
+            true,
+            &dialer,
+            &listener,
             &authenticated,
         ));
-        assert!(!verify_hello_auth_tag(
-            b"secret",
-            "peer",
-            WIRE_PROTOCOL_VERSION,
-            WIRE_PROTOCOL_VERSION,
-            REQUIRED_WIRE_CAPABILITIES & !CAPABILITY_DURABILITY_ACKS,
+        assert!(!verify_handshake_auth(
+            Some(b"secret"),
+            false,
+            &dialer,
+            &listener,
             &authenticated,
         ));
+        let mut fresh_listener = listener.clone();
+        fresh_listener.challenge[0] ^= 1;
+        assert!(!verify_handshake_auth(
+            Some(b"secret"),
+            true,
+            &dialer,
+            &fresh_listener,
+            &authenticated,
+        ));
+
+        let mut tampered_dialer = dialer.clone();
+        tampered_dialer.capabilities ^= CAPABILITY_MUTATION_RESULTS;
+        assert!(!verify_handshake_auth(
+            Some(b"secret"),
+            true,
+            &tampered_dialer,
+            &listener,
+            &authenticated,
+        ));
+        let reflected = handshake_auth_tag(b"secret", false, &listener, &dialer);
+        assert!(!verify_handshake_auth(
+            Some(b"secret"),
+            true,
+            &dialer,
+            &listener,
+            &reflected,
+        ));
+    }
+
+    #[test]
+    fn each_hello_uses_a_fresh_nonzero_os_challenge() {
+        let first = fresh_hello("node").unwrap();
+        let second = fresh_hello("node").unwrap();
+        assert_eq!(first.challenge.len(), HANDSHAKE_CHALLENGE_BYTES);
+        assert_eq!(second.challenge.len(), HANDSHAKE_CHALLENGE_BYTES);
+        assert!(first.challenge.iter().any(|byte| *byte != 0));
+        assert!(second.challenge.iter().any(|byte| *byte != 0));
+        assert_ne!(first.challenge, second.challenge);
+    }
+
+    #[test]
+    fn connection_rank_prefers_one_crossed_dial_and_totally_orders_duplicates() {
+        let a = Hello {
+            node_id: "a".to_string(),
+            auth_tag: Vec::new(),
+            min_protocol_version: WIRE_PROTOCOL_VERSION,
+            max_protocol_version: WIRE_PROTOCOL_VERSION,
+            capabilities: REQUIRED_WIRE_CAPABILITIES,
+            challenge: vec![1; HANDSHAKE_CHALLENGE_BYTES],
+        };
+        let b = Hello {
+            node_id: "b".to_string(),
+            auth_tag: Vec::new(),
+            min_protocol_version: WIRE_PROTOCOL_VERSION,
+            max_protocol_version: WIRE_PROTOCOL_VERSION,
+            capabilities: REQUIRED_WIRE_CAPABILITIES,
+            challenge: vec![2; HANDSHAKE_CHALLENGE_BYTES],
+        };
+
+        let canonical = connection_rank(&a, &b);
+        let reverse = connection_rank(&b, &a);
+        assert!(canonical.preferred_direction);
+        assert!(!reverse.preferred_direction);
+        assert!(canonical > reverse);
+
+        let mut second_b = b.clone();
+        second_b.challenge[0] ^= 1;
+        assert_ne!(canonical, connection_rank(&a, &second_b));
     }
 
     #[tokio::test]
@@ -4808,7 +6078,7 @@ mod tests {
                 report.clone(),
             )])));
             let peers: PeerMap = Arc::new(Mutex::new(HashMap::new()));
-            let ctx = test_connection_context(
+            let (ctx, runtime_tasks) = test_connection_context(
                 FragmentRouter::new(1, 0),
                 Arc::new(RwLock::new(HashSet::new())),
                 Arc::new(RwLock::new(HashMap::new())),
@@ -4818,20 +6088,9 @@ mod tests {
                 peers.clone(),
             );
             let (mut client, server) = tokio::io::duplex(4096);
-            let connection = tokio::spawn(handle_connection(ctx, Box::pin(server), false));
-            write_test_envelope(
-                &mut client,
-                Envelope {
-                    msg: Some(EnvelopeMsg::Hello(Hello {
-                        node_id: "peer".to_string(),
-                        auth_tag: Vec::new(),
-                        min_protocol_version: WIRE_PROTOCOL_VERSION,
-                        max_protocol_version: WIRE_PROTOCOL_VERSION,
-                        capabilities: REQUIRED_WIRE_CAPABILITIES,
-                    })),
-                },
-            )
-            .await;
+            let connection =
+                tokio::spawn(handle_connection(ctx, Box::pin(server), false, None, None));
+            complete_test_handshake(&mut client, "peer").await;
             tokio::time::timeout(Duration::from_secs(1), async {
                 loop {
                     if peers.lock().await.contains_key("peer") {
@@ -4870,9 +6129,128 @@ mod tests {
                 .expect("saturated sender control lane did not close the connection")
                 .unwrap();
             assert!(peers.lock().await.is_empty());
+            runtime_tasks.shutdown().await;
 
             drop(report_guard);
             sender.stop().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn retiring_reconcile_consumer_does_not_close_shared_connection() {
+        for data in [false, true] {
+            let fragment = FragmentId(0);
+            let key = (fragment, "peer".to_string());
+            let report = test_sender_report();
+            // Keep the sender from consuming the reconcile control message so
+            // the test can retire it at the exact admission boundary.
+            let report_guard = report.lock().await;
+            let sender = spawn_node_sender(
+                fragment,
+                "peer".to_string(),
+                SenderConfig::default(),
+                SenderDeps {
+                    router: FragmentRouter::new(1, 0),
+                    hlc: Arc::new(Mutex::new(HlcClock::new())),
+                    reset_senders: Arc::new(Mutex::new(HashMap::new())),
+                    state_report: report.clone(),
+                },
+                SenderRuntimeOptions::default().with_control_channel_capacity(1),
+            )
+            .unwrap();
+            let senders = Arc::new(Mutex::new(HashMap::from([(key.clone(), sender.clone())])));
+            let sender_reports =
+                Arc::new(Mutex::new(HashMap::from([(key.clone(), report.clone())])));
+            let peers: PeerMap = Arc::new(Mutex::new(HashMap::new()));
+            let (ctx, runtime_tasks) = test_connection_context(
+                FragmentRouter::new(1, 0),
+                Arc::new(RwLock::new(HashSet::new())),
+                Arc::new(RwLock::new(HashMap::new())),
+                true,
+                senders.clone(),
+                sender_reports,
+                peers.clone(),
+            );
+            let (mut client, server) = tokio::io::duplex(4096);
+            let connection =
+                tokio::spawn(handle_connection(ctx, Box::pin(server), false, None, None));
+            complete_test_handshake(&mut client, "peer").await;
+            tokio::time::timeout(Duration::from_secs(1), async {
+                loop {
+                    if peers.lock().await.contains_key("peer") {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("peer Hello was not installed");
+
+            let reconcile = if data {
+                EnvelopeMsg::ReconcileData(ReconcileData {
+                    fragment: fragment.0,
+                    entries: Vec::new(),
+                    session_id: 1,
+                    round_id: 1,
+                    chunk_seq: 1,
+                })
+            } else {
+                EnvelopeMsg::ReconcileResponse(ReconcileResponse {
+                    fragment: fragment.0,
+                    summaries: Vec::new(),
+                    session_id: 1,
+                    round_id: 1,
+                })
+            };
+            write_test_envelope(
+                &mut client,
+                Envelope {
+                    msg: Some(reconcile),
+                },
+            )
+            .await;
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while sender.control_capacity() != 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("reconcile frame was not admitted to the sender");
+
+            let retired = senders.lock().await.remove(&key).unwrap();
+            retired.request_stop();
+            drop(report_guard);
+
+            // A per-fragment consumer disappearing is a local placement race,
+            // not grounds to discard the multiplexed connection. Exercise a
+            // subsequent request to prove that both read and write halves are
+            // still usable.
+            write_test_envelope(
+                &mut client,
+                Envelope {
+                    msg: Some(EnvelopeMsg::SyncRequest(crate::proto::SyncRequest {
+                        fragments: Vec::new(),
+                    })),
+                },
+            )
+            .await;
+            loop {
+                if matches!(
+                    read_test_envelope(&mut client).await.msg,
+                    Some(EnvelopeMsg::SyncResponse(_))
+                ) {
+                    break;
+                }
+            }
+            assert!(peers.lock().await.contains_key("peer"));
+
+            drop(client);
+            tokio::time::timeout(Duration::from_secs(1), connection)
+                .await
+                .expect("connection did not stop after its stream closed")
+                .unwrap();
+            runtime_tasks.shutdown().await;
+            retired.stop().await;
         }
     }
 
@@ -4882,7 +6260,7 @@ mod tests {
         let router = FragmentRouter::new(1, 0);
         let serving = Arc::new(RwLock::new(HashSet::new()));
         let peers: PeerMap = Arc::new(Mutex::new(HashMap::new()));
-        let ctx = test_connection_context(
+        let (ctx, runtime_tasks) = test_connection_context(
             router,
             serving.clone(),
             Arc::new(RwLock::new(HashMap::new())),
@@ -4892,24 +6270,8 @@ mod tests {
             peers.clone(),
         );
         let (mut client, server) = tokio::io::duplex(4096);
-        let connection = tokio::spawn(handle_connection(ctx, Box::pin(server), false));
-        write_test_envelope(
-            &mut client,
-            Envelope {
-                msg: Some(EnvelopeMsg::Hello(Hello {
-                    node_id: "peer".to_string(),
-                    auth_tag: Vec::new(),
-                    min_protocol_version: WIRE_PROTOCOL_VERSION,
-                    max_protocol_version: WIRE_PROTOCOL_VERSION,
-                    capabilities: REQUIRED_WIRE_CAPABILITIES,
-                })),
-            },
-        )
-        .await;
-        assert!(matches!(
-            read_test_envelope(&mut client).await.msg,
-            Some(EnvelopeMsg::Hello(_))
-        ));
+        let connection = tokio::spawn(handle_connection(ctx, Box::pin(server), false, None, None));
+        complete_test_handshake(&mut client, "peer").await;
 
         write_test_envelope(
             &mut client,
@@ -4980,6 +6342,128 @@ mod tests {
             .expect("connection did not close after its stream was dropped")
             .unwrap();
         assert!(peers.lock().await.is_empty());
+        runtime_tasks.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn dynamic_connection_handler_does_not_create_placement_senders() {
+        let fragment = FragmentId(0);
+        let router = FragmentRouter::new(1, 0);
+        let hlc = Arc::new(Mutex::new(HlcClock::new()));
+        let (supervisor, dispatcher) = spawn_fragment_subtree(
+            "dynamic-sender-ownership-test",
+            fragment,
+            &NodeConfig::default(),
+            &hlc,
+        )
+        .await
+        .unwrap();
+        router.insert(fragment, dispatcher);
+
+        let senders: SenderMap = Arc::new(Mutex::new(HashMap::new()));
+        let reports: SenderReportMap = Arc::new(Mutex::new(HashMap::new()));
+        let peers: PeerMap = Arc::new(Mutex::new(HashMap::new()));
+        let placement = Arc::new(RwLock::new(HashMap::from([(
+            fragment,
+            vec!["local".to_string(), "peer".to_string()],
+        )])));
+        let (mut ctx, runtime_tasks) = test_connection_context(
+            router.clone(),
+            Arc::new(RwLock::new(HashSet::from([fragment]))),
+            placement,
+            true,
+            senders.clone(),
+            reports.clone(),
+            peers.clone(),
+        );
+        ctx.node_id = "local".to_string();
+
+        let (mut client, server) = tokio::io::duplex(4096);
+        let connection = tokio::spawn(handle_connection(ctx, Box::pin(server), false, None, None));
+        complete_test_handshake(&mut client, "peer").await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !peers.lock().await.contains_key("peer") {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("dynamic peer was not authenticated");
+
+        assert!(senders.lock().await.is_empty());
+        assert!(reports.lock().await.is_empty());
+
+        drop(client);
+        tokio::time::timeout(Duration::from_secs(1), connection)
+            .await
+            .expect("dynamic connection did not finish")
+            .unwrap();
+        runtime_tasks.shutdown().await;
+        router.remove(fragment);
+        supervisor.stop(None);
+        let _ = supervisor.wait(None).await;
+    }
+
+    #[tokio::test]
+    async fn legacy_disconnected_peer_identities_reap_their_senders() {
+        let fragment = FragmentId(0);
+        let router = FragmentRouter::new(1, 0);
+        let hlc = Arc::new(Mutex::new(HlcClock::new()));
+        let (supervisor, dispatcher) = spawn_fragment_subtree(
+            "legacy-sender-reap-test",
+            fragment,
+            &NodeConfig::default(),
+            &hlc,
+        )
+        .await
+        .unwrap();
+        router.insert(fragment, dispatcher);
+
+        let senders: SenderMap = Arc::new(Mutex::new(HashMap::new()));
+        let reports: SenderReportMap = Arc::new(Mutex::new(HashMap::new()));
+        let peers: PeerMap = Arc::new(Mutex::new(HashMap::new()));
+        let (ctx, runtime_tasks) = test_connection_context(
+            router.clone(),
+            Arc::new(RwLock::new(HashSet::from([fragment]))),
+            Arc::new(RwLock::new(HashMap::new())),
+            false,
+            senders.clone(),
+            reports.clone(),
+            peers.clone(),
+        );
+
+        for index in 0..3 {
+            let peer = format!("ephemeral-peer-{index}");
+            let (mut client, server) = tokio::io::duplex(16 * 1024);
+            let connection = tokio::spawn(handle_connection(
+                ctx.clone(),
+                Box::pin(server),
+                false,
+                None,
+                None,
+            ));
+            complete_test_handshake(&mut client, &peer).await;
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while !senders.lock().await.contains_key(&(fragment, peer.clone())) {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("legacy sender was not created");
+
+            drop(client);
+            tokio::time::timeout(Duration::from_secs(1), connection)
+                .await
+                .expect("legacy connection did not finish")
+                .unwrap();
+            assert!(peers.lock().await.is_empty());
+            assert!(senders.lock().await.is_empty());
+            assert!(reports.lock().await.is_empty());
+        }
+
+        runtime_tasks.shutdown().await;
+        router.remove(fragment);
+        supervisor.stop(None);
+        let _ = supervisor.wait(None).await;
     }
 
     #[tokio::test]
@@ -5041,6 +6525,103 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn completed_bootstrap_cannot_publish_after_placement_revocation() {
+        let fragment = FragmentId(0);
+        let serving = Arc::new(RwLock::new(HashSet::new()));
+        let placement = Arc::new(RwLock::new(HashMap::from([(
+            fragment,
+            vec!["node-b".to_string()],
+        )])));
+        let deps = test_placement_deps(
+            FragmentRouter::new(1, 0),
+            serving.clone(),
+            placement,
+            Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(Mutex::new(HashMap::new())),
+        );
+        deps.placement_states
+            .lock()
+            .await
+            .insert(fragment, FragmentPlacementState::Bootstrapping);
+
+        let expected = vec!["node-a".to_string(), "node-b".to_string()];
+        assert_eq!(
+            commit_fragment_gain(&deps, fragment, &expected, 0).await,
+            FragmentGainCommit::Revoked
+        );
+        assert!(!serving.read().unwrap().contains(&fragment));
+        assert_eq!(
+            deps.placement_states.lock().await.get(&fragment),
+            Some(&FragmentPlacementState::Draining)
+        );
+    }
+
+    #[tokio::test]
+    async fn completed_bootstrap_retries_after_replica_set_replacement() {
+        let fragment = FragmentId(0);
+        let serving = Arc::new(RwLock::new(HashSet::new()));
+        let current = vec!["node-a".to_string(), "node-c".to_string()];
+        let placement = Arc::new(RwLock::new(HashMap::from([(fragment, current.clone())])));
+        let deps = test_placement_deps(
+            FragmentRouter::new(1, 0),
+            serving.clone(),
+            placement,
+            Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(Mutex::new(HashMap::new())),
+        );
+        deps.placement_states
+            .lock()
+            .await
+            .insert(fragment, FragmentPlacementState::Bootstrapping);
+
+        let stale = vec!["node-a".to_string(), "node-b".to_string()];
+        assert_eq!(
+            commit_fragment_gain(&deps, fragment, &stale, 0).await,
+            FragmentGainCommit::Retry
+        );
+        assert!(!serving.read().unwrap().contains(&fragment));
+        assert_eq!(
+            deps.placement_states.lock().await.get(&fragment),
+            Some(&FragmentPlacementState::Bootstrapping)
+        );
+
+        assert_eq!(
+            commit_fragment_gain(&deps, fragment, &current, 0).await,
+            FragmentGainCommit::Serving
+        );
+        assert!(serving.read().unwrap().contains(&fragment));
+    }
+
+    #[tokio::test]
+    async fn completed_bootstrap_retries_after_placement_aba() {
+        let fragment = FragmentId(0);
+        let serving = Arc::new(RwLock::new(HashSet::new()));
+        let replicas = vec!["node-a".to_string(), "node-b".to_string()];
+        let placement = Arc::new(RwLock::new(HashMap::from([(fragment, replicas.clone())])));
+        let deps = test_placement_deps(
+            FragmentRouter::new(1, 0),
+            serving.clone(),
+            placement,
+            Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(Mutex::new(HashMap::new())),
+        );
+        deps.placement_generation.store(2, Ordering::Release);
+
+        assert_eq!(
+            commit_fragment_gain(&deps, fragment, &replicas, 0).await,
+            FragmentGainCommit::Retry
+        );
+        assert!(!serving.read().unwrap().contains(&fragment));
+        assert_eq!(
+            deps.placement_states.lock().await.get(&fragment),
+            Some(&FragmentPlacementState::Bootstrapping)
+        );
+    }
+
+    #[tokio::test]
     async fn stopped_sender_entry_is_replaced_in_snapshot_recovery() {
         let fragment = FragmentId(0);
         let router = FragmentRouter::new(1, 0);
@@ -5053,7 +6634,8 @@ mod tests {
         router.insert(fragment, dispatcher);
         let senders: SenderMap = Arc::new(Mutex::new(HashMap::new()));
         let reports: SenderReportMap = Arc::new(Mutex::new(HashMap::new()));
-        let peers: PeerMap = Arc::new(Mutex::new(HashMap::new()));
+        let peer_failures = PeerFailureSignals::default();
+        let retiring_senders = Arc::new(RetiringSenderRegistry::default());
         let sender_config = SenderConfig::default();
         let runtime = SenderRuntimeOptions::default();
 
@@ -5066,8 +6648,9 @@ mod tests {
                 router: &router,
                 hlc: &hlc,
                 senders: &senders,
+                retiring_senders: &retiring_senders,
                 reports: &reports,
-                peers: &peers,
+                peer_failures: &peer_failures,
             },
         )
         .await;
@@ -5088,8 +6671,9 @@ mod tests {
                 router: &router,
                 hlc: &hlc,
                 senders: &senders,
+                retiring_senders: &retiring_senders,
                 reports: &reports,
-                peers: &peers,
+                peer_failures: &peer_failures,
             },
         )
         .await;
@@ -5341,7 +6925,7 @@ mod tests {
             deps.placement_states.lock().await.get(&fragment),
             Some(&FragmentPlacementState::Serving)
         );
-        assert!(senders
+        assert!(!senders
             .lock()
             .await
             .contains_key(&(fragment, "peer".to_string())));
@@ -5397,7 +6981,8 @@ mod tests {
         let router = FragmentRouter::new(1, 0);
         let senders: SenderMap = Arc::new(Mutex::new(HashMap::new()));
         let reports: SenderReportMap = Arc::new(Mutex::new(HashMap::new()));
-        let peers: PeerMap = Arc::new(Mutex::new(HashMap::new()));
+        let peer_failures = PeerFailureSignals::default();
+        let retiring_senders = Arc::new(RetiringSenderRegistry::default());
         let config = SenderConfig::default();
         let runtime = SenderRuntimeOptions::default();
         let hlc = Arc::new(Mutex::new(HlcClock::new()));
@@ -5411,8 +6996,9 @@ mod tests {
                 router: &router,
                 hlc: &hlc,
                 senders: &senders,
+                retiring_senders: &retiring_senders,
                 reports: &reports,
-                peers: &peers,
+                peer_failures: &peer_failures,
             },
         )
         .await;
@@ -5548,6 +7134,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stale_peer_failure_cannot_overwrite_current_channel_failure() {
+        let (current, _current_rx) = test_peer_channel(1);
+        let (stale, _stale_rx) = test_peer_channel(1);
+        let mut cancelled = current.cancel.subscribe();
+        let peers = Arc::new(Mutex::new(HashMap::from([(
+            "peer".to_string(),
+            current.clone(),
+        )])));
+        let failures = PeerFailureSignals::default();
+
+        // Queue both before the worker starts so the stale signal is
+        // guaranteed to arrive last. A single-value map used to lose the
+        // current-channel failure here and leave replication disconnected.
+        failures.signal("peer".to_string(), current.raw_sender());
+        failures.signal("peer".to_string(), stale.raw_sender());
+        let worker = tokio::spawn(failures.run(peers));
+
+        tokio::time::timeout(Duration::from_secs(1), cancelled.changed())
+            .await
+            .expect("current connection failure was overwritten")
+            .expect("current cancellation sender dropped");
+        assert!(*cancelled.borrow());
+        worker.abort();
+        let _ = worker.await;
+    }
+
+    #[tokio::test]
+    async fn cancelled_sender_retirement_remains_owned_for_shutdown_join() {
+        let sender = spawn_node_sender(
+            FragmentId(0),
+            "retiring-peer".to_string(),
+            SenderConfig::default(),
+            SenderDeps {
+                router: FragmentRouter::new(1, 0),
+                hlc: Arc::new(Mutex::new(HlcClock::new())),
+                reset_senders: Arc::new(Mutex::new(HashMap::new())),
+                state_report: test_sender_report(),
+            },
+            SenderRuntimeOptions::default(),
+        )
+        .unwrap();
+        let registry = Arc::new(RetiringSenderRegistry::default());
+        let retirement = registry.retire(sender);
+        drop(retirement); // model cancellation before the normal join path
+
+        let retained = registry.snapshot();
+        assert_eq!(retained.len(), 1);
+        tokio::time::timeout(Duration::from_secs(1), retained[0].stop())
+            .await
+            .expect("retiring sender was not joinable after owner cancellation");
+        registry.clear();
+    }
+
+    #[tokio::test]
     async fn socket_write_timeout_signals_connection_cancellation() {
         let (_reader, writer) = tokio::io::duplex(1);
         let (frame_tx, frame_rx) = mpsc::channel(1);
@@ -5569,17 +7209,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn connection_cancellation_interrupts_a_blocked_socket_write() {
+        let (_reader, writer) = tokio::io::duplex(1);
+        let (frame_tx, frame_rx) = mpsc::channel(1);
+        let (cancel_tx, _) = watch::channel(false);
+        frame_tx.send(vec![0; 1024]).await.unwrap();
+        let task = tokio::spawn(run_peer_writer(
+            writer,
+            frame_rx,
+            cancel_tx.subscribe(),
+            cancel_tx.clone(),
+            Duration::from_secs(30),
+        ));
+        tokio::task::yield_now().await;
+        let _ = cancel_tx.send(true);
+
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("cancelled writer waited for the socket write timeout")
+            .unwrap();
+    }
+
+    #[tokio::test]
     async fn mutation_relay_timeout_removes_entry_and_replies_unavailable() {
         let relays: MutationRelayMap = Arc::new(Mutex::new(HashMap::new()));
         let (origin_tx, mut origin_rx) = test_peer_channel(1);
+        let tasks = RuntimeTasks::new(4);
+        let task_ref = Arc::downgrade(&tasks);
         register_mutation_relay(
+            &task_ref,
             relays.clone(),
             17,
-            "owner".to_string(),
-            vec!["key".to_string()],
-            origin_tx,
-            9,
-            Instant::now() + Duration::from_millis(10),
+            MutationRelayRegistration {
+                expected_peer: "owner".to_string(),
+                expected_keys: vec!["key".to_string()],
+                origin_tx,
+                origin_req_id: 9,
+                deadline: Instant::now() + Duration::from_millis(10),
+            },
         )
         .await;
         assert!(relays.lock().await.contains_key(&17));
@@ -5600,20 +7267,26 @@ mod tests {
             Ok(MutationStatus::Unavailable)
         );
         assert!(relays.lock().await.is_empty());
+        tasks.shutdown().await;
     }
 
     #[tokio::test]
     async fn completed_mutation_relay_cancels_timeout() {
         let relays: MutationRelayMap = Arc::new(Mutex::new(HashMap::new()));
         let (origin_tx, mut origin_rx) = test_peer_channel(1);
+        let tasks = RuntimeTasks::new(4);
+        let task_ref = Arc::downgrade(&tasks);
         register_mutation_relay(
+            &task_ref,
             relays.clone(),
             17,
-            "owner".to_string(),
-            vec!["key".to_string()],
-            origin_tx,
-            9,
-            Instant::now() + Duration::from_millis(10),
+            MutationRelayRegistration {
+                expected_peer: "owner".to_string(),
+                expected_keys: vec!["key".to_string()],
+                origin_tx,
+                origin_req_id: 9,
+                deadline: Instant::now() + Duration::from_millis(10),
+            },
         )
         .await;
         let relay = relays.lock().await.remove(&17).expect("relay missing");
@@ -5622,13 +7295,17 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(30)).await;
         assert!(origin_rx.try_recv().is_err());
         assert!(relays.lock().await.is_empty());
+        tasks.shutdown().await;
     }
 
     #[tokio::test]
     async fn read_relay_timeout_removes_registry_entry() {
         let relays: RelayMap = Arc::new(Mutex::new(HashMap::new()));
         let (origin_tx, _origin_rx) = test_peer_channel(1);
+        let tasks = RuntimeTasks::new(4);
+        let task_ref = Arc::downgrade(&tasks);
         register_get_relay(
+            &task_ref,
             relays.clone(),
             23,
             origin_tx,
@@ -5647,6 +7324,7 @@ mod tests {
         })
         .await
         .expect("relay deadline did not remove the entry");
+        tasks.shutdown().await;
     }
 
     #[tokio::test]

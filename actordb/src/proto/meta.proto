@@ -19,10 +19,9 @@ package meta;
 // Handshake: identifies the connecting node
 message Hello {
   string node_id = 1;
-  // HMAC-SHA256 over the complete handshake transcript (identity, protocol
-  // range, and capabilities). Present iff the cluster is configured with a
-  // secret; the receiver recomputes and compares in constant time. Empty = no
-  // secret configured (unauthenticated).
+  // Retained at its original field number for safe protobuf field evolution.
+  // Protocol v2 is a coordinated source/wire break: this field must be empty
+  // and the challenge-bound proof is carried in HelloAuth.
   bytes auth_tag = 2;
   // Inclusive wire-version range understood by this peer. Both are nonzero;
   // a connection proceeds only when the ranges overlap.
@@ -32,6 +31,17 @@ message Hello {
   // connection, so mixed binaries fail closed rather than mis-acknowledging
   // mutations or replication.
   uint64 capabilities = 5;
+  // Fresh 256-bit challenge generated independently for every physical
+  // connection. Both peers' complete Hellos are bound into each HelloAuth.
+  bytes challenge = 6;
+}
+
+// Second handshake flight. With a configured cluster secret, auth_tag is an
+// HMAC-SHA256 over the ordered dialer/listener Hello transcript and the
+// proving role. Without a secret it is empty, but the flight still makes
+// handshake completion explicit before either peer publishes the connection.
+message HelloAuth {
+  bytes auth_tag = 1;
 }
 
 // Phase 7: operation priority for traffic isolation. Wire values are
@@ -306,5 +316,6 @@ message Envelope {
     BatchGetResponse batch_get_response = 17;
     MutationResponse mutation_response = 18;
     BatchNack batch_nack = 19;
+    HelloAuth hello_auth = 20;
   }
 }

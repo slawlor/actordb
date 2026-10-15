@@ -15,7 +15,8 @@ pub use meta::batch_get_response::KeyValue as BatchKeyValue;
 pub use meta::envelope::Msg as EnvelopeMsg;
 pub use meta::{
     BatchAck, BatchGet, BatchGetResponse, BatchNack, BatchPut, Envelope, ForwardedGet,
-    ForwardedPut, GetResponse, Hello, KeySummary, MutationResponse, MutationResult, MutationStatus,
-    Priority, ReconcileData, ReconcileFetch, ReconcileRequest, ReconcileResponse, ReplicateBatch,
-    ReplicateOp, ReplicationAckLevel, SessionStart, SyncEntry, SyncRequest, SyncResponse,
+    ForwardedPut, GetResponse, Hello, HelloAuth, KeySummary, MutationResponse, MutationResult,
+    MutationStatus, Priority, ReconcileData, ReconcileFetch, ReconcileRequest, ReconcileResponse,
+    ReplicateBatch, ReplicateOp, ReplicationAckLevel, SessionStart, SyncEntry, SyncRequest,
+    SyncResponse,
 };

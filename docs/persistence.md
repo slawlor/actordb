@@ -99,10 +99,12 @@ Despite the name, the `Snapshotter` is **not** a RocksDB checkpoint — it is a
 periodic durable-flush actor (`SnapshotterMessage::Snap` → `shared.flush()`).
 There are no checkpoints or point-in-time snapshots in the current design.
 
-Crash semantics: a clean `shutdown()` flushes (and releases the RocksDB lock),
-but `kill -9` can lose the unflushed write-buffer tail. Recovery for that tail
-comes from peer sync on reconnect — which is why production deployments want
-at least two replicas per fragment.
+Crash semantics: after callers quiesce and await their operation futures, an
+explicit `shutdown().await` flushes and releases the RocksDB lock. Dropping
+`Node` requests a best-effort stop but cannot await that flush or lock release;
+`kill -9` can lose the unflushed write-buffer tail. Recovery for that tail comes
+from peer sync on reconnect — which is why production deployments want at least
+two replicas per fragment.
 
 Sender-ingress overflow recovery reads this same authoritative cache and
 revision; it never clears the persistence buffer. Because overflow commands

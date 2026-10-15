@@ -130,7 +130,9 @@ let node = Node::start(
 // port 0 picks an ephemeral port; the bound address is available via `node.addr()`
 
 node.connect("127.0.0.1:7447".parse().unwrap()).await?;
-// handshake runs a full-state sync, so a joining node converges immediately.
+// connect() returns after the transport dial is owned by the redial supervisor;
+// authentication and static-mode full-state sync finish asynchronously. The
+// first authenticated peer id at this address is pinned for later reconnects.
 
 node.put("key".to_string(), b"value".to_vec()).await?;
 node.put_with_ttl("temp".to_string(), b"value".to_vec(), Some(Duration::from_secs(60))).await?;
@@ -149,6 +151,8 @@ let puts = node.put_multi(vec![
 let gets = node.get_multi(vec!["k1".to_string(), "k2".to_string()]).await;
 let peers = node.peer_count().await;
 
+// Stop admitting application work and await it before this call. shutdown()
+// then joins Node-owned transport work and flushes/stops fragment actors.
 node.shutdown().await;
 ```
 
@@ -162,8 +166,12 @@ use std::time::Duration;
 let runtime = NodeRuntimeOptions::default()
     .with_peer_queue_frame_capacity(512)
     .with_replication_control_message_capacity(128)
+    .with_inbound_connection_capacity(512)
     .with_queue_admission_timeout(Duration::from_secs(2))
     .with_forwarded_attempt_timeout(Duration::from_secs(8))
+    .with_connect_timeout(Duration::from_secs(3))
+    .with_handshake_timeout(Duration::from_secs(3))
+    .with_socket_read_timeout(Duration::from_secs(20))
     .with_socket_write_timeout(Duration::from_secs(20))
     .with_replication_ack_timeout(Duration::from_secs(20));
 
@@ -177,14 +185,17 @@ let node = Node::start_with_options(
 ```
 
 The defaults are a 256-frame queue per peer, 64 protocol-control messages per
-fragment/peer sender, 5 seconds to reserve a queue slot, 5 seconds total for
-each forwarded owner attempt (enqueue plus response), 30 seconds for one
-socket frame write, and 30 seconds for an acceptable ordinary replication ACK.
-Locally applied mutations have a separate per-sender ingress lane sized by
-`SenderConfig::buffer_capacity`; saturation schedules lossless reset
+fragment/peer sender, and at most 1024 concurrent inbound handshakes or
+connections. Queue admission, a complete forwarded owner attempt, one dial,
+and the absolute two-flight handshake each have 5-second deadlines. Reading a
+frame body after its length prefix and writing a complete frame each have a
+30-second deadline; an idle established connection has no read deadline until
+it sends a prefix. An acceptable ordinary replication ACK is due within 30
+seconds. Locally applied mutations have a separate per-sender ingress lane
+sized by `SenderConfig::buffer_capacity`; saturation schedules lossless reset
 reconciliation without blocking the write path. Reconciliation barriers use
-`SenderConfig::reconcile_timeout` instead of the ordinary ACK timeout. The
-queue limit counts frames, not encoded bytes.
+`SenderConfig::reconcile_timeout` instead of the ordinary ACK timeout. Queue
+and connection limits count items, not encoded bytes.
 
 Multi-key semantics:
 
@@ -214,8 +225,8 @@ Key `NodeConfig` knobs:
 | Field | Default | Meaning |
 |---|---|---|
 | `fragment_count` | 1 | Fragments in the keyspace (must agree cluster-wide) |
-| `fragment_map` | {} | Static placement: fragment → replica node ids (empty = serve all) |
-| `members` | {} | Static membership: node id → address |
+| `fragment_map` | {} | Static placement: fragment → replica node ids (empty = serve all); non-empty maps must cover every in-range fragment with a non-empty, duplicate-free replica list |
+| `members` | {} | Static membership: node id → unique address; each configured id is enforced from the first authentication attempt |
 | `default_pool` / `high_pool` / `background_pool` | see below | Per-priority `PoolConfig { workers, queue_cap, rate_limit_per_sec }` |
 | `high_pool` defaults | 2 workers / cap 5_000 / no limit | Latency-sensitive traffic |
 | `background_pool` defaults | 2 workers / cap 5_000 / 1000 ops/s | Bulk/scan traffic (rate-limited) |
@@ -228,6 +239,9 @@ Key `NodeConfig` knobs:
 | `placement_poll_interval` | 1s | Phase 8: how often the driver re-evaluates desired placement |
 | `placement_drain_warn_interval` | 10s | Warning cadence for a safe, non-destructive stalled drain |
 | `store` | None | `Some(Arc<dyn KvStore>)`; `NodeConfig::with_rocksdb(path)` with the `rocksdb` feature |
+
+The local node id, every `members` key, and every placement replica id must
+contain 1 to 255 UTF-8 bytes. Placement replica lists must be duplicate-free.
 
 - Local and remote writes await the serving worker's exact apply outcome;
   after `Ok`, that owner reads the version or a newer winner. Replication to
@@ -362,7 +376,7 @@ controller.set_placement(final_map);
 
 ### `actordb::proto` — wire protocol
 
-Prost-generated protobuf types (`Envelope`, `Hello`, `ReplicateOp`,
+Prost-generated protobuf types (`Envelope`, `Hello`, `HelloAuth`, `ReplicateOp`,
 `ForwardedPut`, `ForwardedGet`, `GetResponse`, `SyncRequest`,
 `SyncResponse`, `SyncEntry`, `BatchPut`, `BatchGet`,
 `BatchGetResponse`, `MutationResponse`, `BatchAck`, `BatchNack`), sent as 4-byte length-prefixed frames
@@ -376,15 +390,26 @@ as issues in the [issue tracker](https://github.com/slawlor/actordb/issues):
 - **Persistence is opt-in** — pass a `store` in `NodeConfig` for
   durability; without it the dataset lives in memory and a restart
   wipes it (recoverable only via peer sync).
-- **No TLS or replay-resistant peer identity** — plaintext TCP. A non-empty
-  pre-shared `NodeConfig::cluster_secret` adds a static HMAC-SHA256 tag over a
-  Hello's identity, protocol range, and capabilities; mismatches drop the
-  connection and pre-Hello messages are ignored. The tag has no fresh
-  challenge, so a captured Hello can be replayed to impersonate its node. Use a
-  protected custom `Network` transport when peer identity matters.
+- **No built-in TLS or individual peer identity** — plaintext TCP. Protocol v2
+  gives each physical connection two fresh 256-bit challenges. With a
+  `NodeConfig::cluster_secret` containing at least 32 independently generated,
+  high-entropy random bytes, both peers prove fresh possession by
+  HMAC-SHA256 over the ordered dialer/listener transcript, roles, ids, version
+  ranges, capabilities, and challenges. This prevents replay of a captured v2
+  handshake, but a shared secret proves cluster membership, not which member is
+  speaking: any holder can claim any node id. A guessable password can also be
+  tested offline against a captured transcript. The proof provides no
+  confidentiality or integrity for application frames after the handshake. Use
+  a protected, mutually authenticated custom `Network` when those properties
+  matter.
 - **Full-state handshake anti-entropy** — in static mode every
   handshake ships the whole dataset (tombstones included);
   steady-state replication is incremental (batches + reconciliation).
+  In legacy map-empty mode, per-peer senders are reaped on disconnect instead
+  of retaining an unbounded set of discovered identities; the mandatory
+  full-state exchange recovers LWW winners, including downtime writes and
+  tombstones, on reconnect. Senders named by an explicit placement map remain
+  allocated while disconnected and retain their bounded replay/reset state.
   With dynamic placement enabled the handshake skips the full-state
   sync and the reconciler owns anti-entropy (delta-only).
 - **Transport bounds are count based** — the shared per-peer outbound
@@ -396,19 +421,29 @@ as issues in the [issue tracker](https://github.com/slawlor/actordb/issues):
   overflow closes the contributing connection for replay. These are item-count
   bounds, not byte bounds: receiver actor mailboxes and individual values or
   control frames are not byte-budgeted. Reconciliation fetches use 500-key
-  chunks, but the summary and encoded byte size are not paginated yet. Accepted
-  connection tasks are also not yet capped or reaped until shutdown, and a
-  pre-Hello socket currently has no handshake deadline.
+  chunks, but the summary and encoded byte size are not paginated yet. Inbound
+  handlers are capped at 1024 by default, the two-flight handshake has one
+  absolute 5-second deadline, and completed Node-owned tasks are reaped while
+  the node runs.
 - **Fan-out is sequential** — remote fragment groups and their replica-holder
   attempts are currently awaited one at a time. Operation priority chooses the
   destination actor pool but does not schedule the shared socket queue.
-- **Wire upgrades are negotiated but coordinated** — `Hello` advertises an
-  inclusive protocol-version range and required capability bits for exact
-  mutation results, durability ACKs, and correlated reconciliation. Missing or
-  incompatible fields fail closed before peer installation. When configured,
-  the static Hello HMAC also binds the range and bits against rewriting (but
-  remains replayable as described above). The current binary supports one wire
-  version, so deploy compatible binaries together.
+- **Wire upgrades are negotiated but coordinated** — protocol-v2 `Hello`
+  advertises an inclusive version range, required capability bits, and a fresh
+  challenge; `HelloAuth` completes the transcript proof. Missing or
+  incompatible fields fail closed before peer installation. The current binary
+  supports only wire v2, which is wire-incompatible with v1, so deploy
+  compatible binaries together rather than performing a rolling v1/v2 upgrade.
+  This v2 transition is also a Rust source break for advanced users of the
+  public generated `actordb::proto` API:
+  `Hello` gained `challenge` and `EnvelopeMsg` gained `HelloAuth`, so struct
+  literals and exhaustive matches must be updated.
+- **Shutdown is explicit** — `Node::shutdown().await` closes Node-owned task
+  admission, joins listener/connection/dial work, stops replication senders,
+  and waits for fragment supervisors to flush and exit. Dropping `Node` only
+  requests best-effort cancellation and stop; it cannot await a flush or join.
+  The Node does not fence arbitrary calls already executing in other tasks, so
+  callers must stop admitting operations and await them before shutdown.
 - **Tombstones are retained** — `Node::start` rejects every
   `tombstone_gc_age: Some(..)` setting. Safe reclamation needs durable
   per-replica convergence evidence plus a durable store delete path; elapsed

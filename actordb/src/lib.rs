@@ -45,5 +45,7 @@ pub mod replication;
 /// chunked bootstrap, and controller-sequenced migration.
 pub mod placement;
 
+mod runtime_tasks;
+
 #[cfg(test)]
 pub(crate) mod common_test;

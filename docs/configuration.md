@@ -13,8 +13,8 @@ of the defaults.
 | `flush_batch_size` | `usize` | `1000` | Ops buffered before a store flush. Ignored when `store` is `None`. Larger = fewer, bigger RocksDB write batches. |
 | `flush_interval` | `Duration` | `100 ms` | A new write triggers a flush when the previous attempt is this old; idle fragments are bounded by `snapshot_interval`. |
 | `fragment_count` | `usize` | `1` | Number of keyspace fragments. **Must be identical on every node** or keys become unreachable. |
-| `fragment_map` | `HashMap<FragmentId, Vec<String>>` | empty | Fragment → replica node ids. Empty = this node serves all fragments. **Must be identical on every node** (static mode). |
-| `members` | `HashMap<String, SocketAddr>` | empty | Static membership; `Node::start` best-effort dials all members. |
+| `fragment_map` | `HashMap<FragmentId, Vec<String>>` | empty | Fragment → replica node ids. Empty = this node serves all fragments. A non-empty map must contain exactly `0..fragment_count`, with a non-empty, duplicate-free replica list per fragment. **Must be identical on every node** (static mode). |
+| `members` | `HashMap<String, SocketAddr>` | empty | Static membership. Each non-local `(node_id, address)` becomes a persistent dial intent at startup, retries from the first failure, and knows the expected Hello id before its first authentication attempt. Member ids and addresses must map one-to-one. |
 | `default_pool` | `PoolConfig` | `4` workers, cap `10_000`, no rate limit | Normal traffic. |
 | `high_pool` | `PoolConfig` | `2` workers, cap `5_000`, no rate limit | Latency-sensitive traffic. |
 | `background_pool` | `PoolConfig` | `2` workers, cap `5_000`, `1000`/s | Bulk traffic; rate-limited by default. |
@@ -26,7 +26,7 @@ of the defaults.
 | `placement_poll_interval` | `Duration` | `1 s` | Driver re-evaluation cadence. Ignored in static mode. |
 | `placement_drain_warn_interval` | `Duration` | `10 s` | Warning cadence while a revoked fragment cannot safely drain. This never forces destructive teardown; the node remains `Draining` until recovery completes. |
 | `max_clock_skew` | `Duration` | `300 s` (5 min) | Peer and persisted timestamps farther ahead than this are rejected before storage. A violating peer connection is closed; poisoned durable state fails startup. |
-| `cluster_secret` | `Option<Vec<u8>>` | `None` | Non-empty pre-shared secret for a static Hello HMAC over identity, protocol range, and capabilities. Mismatches drop the connection and pre-Hello messages are ignored, but the tag has no fresh challenge and a captured Hello is replayable. Use a protected custom `Network` transport for peer identity. Must be identical on every node. |
+| `cluster_secret` | `Option<Vec<u8>>` | `None` | At least 32 independently generated, high-entropy random bytes for protocol-v2 mutual HMAC proofs. Each physical connection uses two fresh challenges, and the proof binds the ordered roles, ids, version ranges, capabilities, and challenges, so a captured v2 handshake cannot be replayed. The shared key proves fresh cluster-key possession, not individual member identity, and does not encrypt or integrity-protect later frames. Use a protected, mutually authenticated custom `Network` when those properties matter. Must be identical on every node. |
 
 `clock_skew_ms` exists but is `#[doc(hidden)]` — it is a test-only HLC skew
 simulator, not a tuning knob.
@@ -36,8 +36,13 @@ simulator, not a tuning knob.
 dynamic-placement intervals/timeouts must also be nonzero; replication timer
 values must fit Tokio's clock, and bounded-channel capacities may not exceed
 Tokio's semaphore maximum. `Node::start` rejects invalid values instead of
-allowing channel or timer panics. An explicitly configured `cluster_secret`
-must not be empty.
+allowing channel or timer panics. The local node id, every `members` key, and
+every placement replica id must contain 1 to 255 UTF-8 bytes. Placement replica
+lists must be duplicate-free, and placement fragment ids must be in range. An
+explicitly configured `cluster_secret` must contain at least 32 bytes; generate
+it with a cryptographically secure random source. Fresh challenges prevent
+replay, but because a captured transcript includes a verifiable HMAC over known
+fields, a low-entropy password remains vulnerable to offline guessing.
 
 ## `NodeRuntimeOptions`
 
@@ -49,9 +54,13 @@ does not break exhaustive `NodeConfig` literals. `Node::start` uses
 | Builder / getter | Default | Guidance |
 |---|---|---|
 | `with_peer_queue_frame_capacity` / `peer_queue_frame_capacity` | `256` frames | Capacity of the single outbound queue per peer connection. This is a frame-count bound, not a byte bound, and all traffic classes share it. |
-| `with_replication_control_message_capacity` / `replication_control_message_capacity` | `64` messages | Capacity of the separate ACK/NACK/reconciliation-response lane per fragment/peer sender. Full or closed admission fails the contributing connection so session replay/reconciliation recovers it. Peer lifecycle and on-demand reconcile signals are coalesced out of band. |
+| `with_replication_control_message_capacity` / `replication_control_message_capacity` | `64` messages | Capacity of the separate ACK/NACK/reconciliation-response lane per fragment/peer sender. Full admission fails the contributing connection so session replay/reconciliation recovers it. A reconcile reply targeting a sender already retired by placement is ignored without dropping the shared peer connection. Peer lifecycle and on-demand reconcile signals are coalesced out of band. |
+| `with_inbound_connection_capacity` / `inbound_connection_capacity` | `1024` connections | Maximum accepted sockets concurrently handshaking or serving as inbound peers. Excess accepted sockets are closed immediately. |
 | `with_queue_admission_timeout` / `queue_admission_timeout` | `5 s` | Maximum wait to reserve one peer-queue slot. Expiry cancels that connection; an outbound peer is then redialed. |
 | `with_forwarded_attempt_timeout` / `forwarded_attempt_timeout` | `5 s` | Total budget for one forwarded owner attempt, including queue admission and response. Batch holder attempts and remote fragment groups remain sequential. |
+| `with_connect_timeout` / `connect_timeout` | `5 s` | Maximum duration of one outbound transport dial. Configured member dialers retry failures with exponential backoff; manual `connect` returns the initial failure. |
+| `with_handshake_timeout` / `handshake_timeout` | `5 s` | One absolute deadline for both `Hello` and `HelloAuth` flights. A peer cannot extend it by sending partial handshake data. |
+| `with_socket_read_timeout` / `socket_read_timeout` | `30 s` | Maximum time to receive a frame body after its length prefix. An idle established connection has no read deadline until a prefix arrives. |
 | `with_socket_write_timeout` / `socket_write_timeout` | `30 s` | Maximum time to write one complete length-prefixed frame. Expiry cancels the connection and allows redial. |
 | `with_replication_ack_timeout` / `replication_ack_timeout` | `30 s` | Maximum wait after queue admission for an acceptable ordinary streaming ACK. Expiry rotates the sender session and replays the exact unacknowledged LWW operations. Reconciliation barriers use `SenderConfig::reconcile_timeout` instead. |
 
@@ -119,3 +128,4 @@ These are `const`s, documented here so they don't surprise you:
 | `RECONCILE_FETCH_CHUNK` | `500` | Keys per `ReconcileFetch`/`ReconcileData` message. |
 | `MAX_FRAME_BYTES` | `16 MiB` | Max protobuf envelope frame. |
 | `RECONNECT_BASE` | `100 ms` | Reconnect backoff base, doubling. |
+| `RECONNECT_MAX` | `30 s` | Reconnect backoff cap; attempts add up to 50% jitter. |

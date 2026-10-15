@@ -52,8 +52,10 @@ pub trait PlacementController: Debug + Send + Sync {
 A placement driver polls `desired_placement()` every `placement_poll_interval`
 (default 1 s; ignored in static mode). Each poll runs `validate_placement`, and
 on invalid output the driver **keeps the current placement** (fail-safe).
-The map must cover every fragment `0..fragment_count` with a non-empty replica
-list.
+The map must cover exactly the in-range fragments `0..fragment_count`, with a
+non-empty, duplicate-free replica list for each. Every replica node id must
+contain 1 to 255 UTF-8 bytes, matching the handshake limit; the local node id
+and configured member ids have the same byte-length constraint.
 
 Two implementations ship with the crate:
 
@@ -89,7 +91,10 @@ authoritative and tears down local state for revoked fragments.
    failure clears the mark so the next tick retries).
 2. Make the dispatcher routable immediately so the reconciler can merge into
    it — but the fragment is **not serving** yet, so local ops forward to the
-   previous owner instead of being applied to possibly-stale state.
+   previous owner instead of being applied to possibly-stale state. If the
+   previous owner observed the overlap first, this node retains its in-range
+   replication session before the dispatcher exists; early tracked batches
+   NACK and replay instead of losing the one-time `SessionStart`.
 3. Ensure replication senders to each replica peer.
 4. `bootstrap_from`: wait up to `BOOTSTRAP_TIMEOUT` (30 s) for a source peer,
    fire one on-demand reconcile round (`ReconcileNow`), and wait for the
@@ -97,9 +102,14 @@ authoritative and tears down local state for revoked fragments.
    **chunked delta reconcile** (500 keys per `ReconcileFetch` chunk), not a
    monolithic snapshot. If it fetches remote winners, their barrier is followed
    by a fresh correlated no-fetch verification round before the counter can
-   advance. On timeout the fragment goes Serving anyway —
+   advance. On timeout the fragment can go Serving anyway —
    **availability over consistency**; LWW plus periodic reconcile converge it
-   later.
+   later. Before publication, the driver verifies that both the placement
+   generation and complete replica list still match the snapshot used for
+   sender alignment and bootstrap. If placement changed — including a
+   `P -> Q -> P` change back to the same list — the fragment remains
+   non-authoritative and repeats these steps; if this node was removed, it
+   transitions to draining.
 5. Mark `Serving`, add to the serving set, call
    `controller.on_fragment_ready(fragment)` so an in-process controller can
    sequence the next step (revoking the old owner).
@@ -153,8 +163,11 @@ authoritative; local ops forwarded to the previous owner), `Serving`,
 senders drain, then the subtree stops), or `Stopped`.
 
 `Node::health()` complements it with per-fragment worker health (see
-[API guide](api.md)); on peer join/disconnect the driver notifies the
-controller via `on_membership_change`.
+[API guide](api.md)). Peer joins and disconnects wake the driver through a
+coalescing signal. The next wake calls `on_membership_change` with the current
+peer-id set, so a burst may produce one callback rather than one callback per
+edge; controllers must treat it as a current-state notification, not an ordered
+membership event log. Periodic placement polling still continues independently.
 
 ## Worked example
 
