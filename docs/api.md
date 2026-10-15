@@ -39,9 +39,11 @@ async fn main() -> Result<(), actordb::node::NodeError> {
 
   let runtime = NodeRuntimeOptions::default()
       .with_peer_queue_frame_capacity(512)
+      .with_peer_queue_byte_capacity(64 * 1024 * 1024)
       .with_replication_control_message_capacity(128)
       .with_inbound_connection_capacity(512)
       .with_queue_admission_timeout(Duration::from_secs(2))
+      .with_reconcile_data_admission_timeout(Duration::from_secs(20))
       .with_forwarded_attempt_timeout(Duration::from_secs(8))
       .with_connect_timeout(Duration::from_secs(3))
       .with_handshake_timeout(Duration::from_secs(3))
@@ -57,21 +59,26 @@ async fn main() -> Result<(), actordb::node::NodeError> {
   .await?;
   ```
 
-  Defaults are 256 queued frames per peer, 64 protocol-control messages per
-  fragment/peer sender, and 1024 concurrent inbound connections. Queue
+  Defaults are 256 queued frames and 32 MiB of admitted encoded bytes per peer,
+  64 protocol-control messages per fragment/peer sender, and 1024 concurrent
+  inbound connections. Queue
   admission, a forwarded owner attempt, a dial, and the complete two-flight
   handshake each default to 5 seconds. Frame-body reads after a prefix, complete
   frame writes, and acceptable ordinary replication ACKs each default to 30
   seconds. Idle established connections have no read deadline until a prefix
   arrives. Locally applied mutations have a separate lane sized by
-  `SenderConfig::buffer_capacity`. All capacities/timeouts must be nonzero;
-  capacities are item counts, not byte bounds.
+  `SenderConfig::buffer_capacity`. The peer frame budget must be at least two
+  and is split between data and priority responses; the byte budget must be at
+  least 17 MiB so ordinary producers can leave a 1 MiB response reserve beside
+  one maximum-size frame. Other capacities/timeouts must be nonzero. Actor
+  lanes remain item-count bounded. Every encoded frame is separately limited
+  to 16 MiB, with 1 MiB soft pages for anti-entropy and ordinary replication.
 - `node.connect(peer_addr)` tries the first transport dial once and returns an
   error if it cannot connect within the dial deadline. `Ok` means the successful
   stream has been handed to a Node-owned redial supervisor, not that
-  authentication or static full-state sync has completed. Concurrent calls for
-  the same address wait for that pending initial dial and do not return early
-  merely because a dial is in progress. On success they share the active
+  authentication or immediate reconciliation have completed. Concurrent calls
+  for the same address wait for that pending initial dial and do not return
+  early merely because a dial is in progress. On success they share the active
   supervisor; after an initial failure, a waiter may reserve and make the next
   attempt. After the first successful authentication, the supervisor pins that
   node id, rejects any different claimant at the address on later reconnects,
@@ -120,6 +127,9 @@ let v: Option<actordb::actor::VersionedValue> = node.get("user:42".to_string()).
 
 `VersionedValue` carries `value: Vec<u8>`, `timestamp_ms: u64` (HLC),
 `node_id: String`, `expires_at_ms: Option<u64>`, and `is_tombstone: bool`.
+Every mutation is preflighted against all required single-record wire
+envelopes before local apply. A key/value that cannot fit the 16 MiB hard frame
+limit returns `NodeError::Codec` rather than creating unreplicable local state.
 
 ### Priorities
 
@@ -138,7 +148,8 @@ shed operation surfaces as `NodeError::Backpressure` — never as a silent
 success or `Ok(None)`. Local and forwarded puts wait for the serving worker's
 exact apply outcome; once it returns `Ok`, reads at that owner observe that
 version or a newer winner. The priority travels in the request and selects the
-remote actor pool, but it does not schedule the shared per-peer socket queue.
+remote actor pool, but it does not schedule the per-peer socket's ordinary
+data lane.
 See
 [Consistency](consistency.md) and [Traffic classes & backpressure](backpressure.md).
 
@@ -156,9 +167,8 @@ Semantics (full detail in [Multi-key batching](batching.md)):
 
 - Plain `put_multi`/`get_multi` run at **`OpPriority::Background`**; the
   `_with_priority` variants take an explicit priority.
-- Keys are grouped by destination fragment; remote groups go out as **one
-  `BatchPut` / `BatchGet` message per fragment and owner attempt** (not per
-  key).
+- Keys are grouped by destination fragment and split into messages of at most
+  4096 items before each `BatchPut` / `BatchGet` owner attempt.
 - Remote puts and gets have one **configured per-attempt deadline** (5 seconds
   by default) covering outbound queue admission and the response. Both fail over on a closed
   connection or missing reply; put replies additionally
@@ -190,6 +200,28 @@ the old session are rejected. A well-formed ACK below
 deadline. Reconciliation barriers use `SenderConfig::reconcile_timeout`, not
 `SenderRuntimeOptions::ack_timeout`.
 
+Protocol v3 uses the same correlated reconciliation engine for static and
+dynamic placement. Summary, fetch, data, repair, and ordinary replication
+frames are split using their exact protobuf-encoded size, with a 1 MiB soft
+page target and 16 MiB hard limit. The public actor surface includes
+`SnapshotSummary`, `SummaryPage`, `VersionedPage`, and
+`KvMessage::{GetSummaryPage, GetVersioned, GetVersionedPage}` for embedders
+that need ordered, revision-guarded, pinned-TTL and memory-bounded exact-value
+primitives. `GetAll` and `GetSnapshot` remain source-compatible, but the
+network responder no longer uses them to clone an entire fragment. Because
+`KvMessage` is public, embedders with exhaustive matches must add the new
+variants. Direct `ApplyOp` calls return `ApplyError::InvalidInput` for a record
+that cannot traverse the wire; this is nonfatal and does not restart a worker.
+
+Advanced users of public `actordb::proto` types must upgrade in lockstep with
+the cluster: wire v3 requires the paged-anti-entropy capability and adds cursor,
+revision, page-sequence, completion, and restart fields to reconciliation
+messages. The generated `SyncRequest`/`SyncResponse` types remain for source
+compatibility, but a v3 connection rejects either envelope variant.
+The public `replication::SenderMsg::{ReconcileResponse, ReconcileData}` variants
+also gained correlation/page fields, so direct `spawn_sender*` users must update
+struct construction and exhaustive matches.
+
 ## Health and observability
 
 ```rust
@@ -213,15 +245,15 @@ counted, never silent.
 
 `sender_report(fragment, peer)` is a `#[doc(hidden)]` test hook; production
 monitoring should use `health()` and `placement_report()`. There is also
-`sync_entries_applied()` — the count of full-state sync entries applied since
-start (stays 0 when dynamic placement owns anti-entropy).
+`sync_entries_applied()` — a compatibility counter for the retired
+`SyncResponse` path. It remains zero in protocol v3 for every placement mode.
 
 ## Errors
 
 ```rust
 pub enum NodeError {
     Io(std::io::Error),        // transport / bind failures
-    Codec(String),             // protobuf decode failures
+    Codec(String),             // protobuf/encoded-size failures
     Actor(String),             // misconfiguration, timeouts talking to actors
     Network(String),           // no peer / no replica reachable
     Backpressure(String),      // shed by queue cap or rate limit — retry with backoff

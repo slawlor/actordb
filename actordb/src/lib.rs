@@ -47,5 +47,9 @@ pub mod placement;
 
 mod runtime_tasks;
 
+// Shared protobuf framing limits and encoding helpers. Node and replication
+// consume this module as part of the v3 paginated anti-entropy protocol.
+pub(crate) mod wire;
+
 #[cfg(test)]
 pub(crate) mod common_test;

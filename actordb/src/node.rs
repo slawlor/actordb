@@ -53,7 +53,7 @@ use crate::proto::{
     BatchAck, BatchGet, BatchGetResponse, BatchKeyValue, BatchNack, BatchPut, Envelope,
     EnvelopeMsg, ForwardedGet, ForwardedPut, GetResponse, Hello, HelloAuth, KeySummary,
     MutationResponse, MutationResult, MutationStatus, Priority as ProtoPriority, ReconcileData,
-    ReconcileResponse, ReplicationAckLevel, SyncEntry, SyncResponse,
+    ReconcileFetch, ReconcileResponse, ReplicationAckLevel, SyncEntry,
 };
 use crate::replication::{
     spawn_node_sender, NodeSender, NodeSenderSendError, ReplicationAckDurability, SenderConfig,
@@ -63,15 +63,17 @@ use crate::runtime_tasks::RuntimeTasks;
 use crate::shard::{fragment_of, FragmentId};
 use crate::store::{KvStore, PrefixedStore};
 use crate::supervision::{FragmentHealth, FragmentSupervisor, SupervisorArgs, SupervisorMessage};
-
-/// Maximum wire frame size (16 MiB). Anything larger is treated as a
-/// corrupt stream and the connection is dropped.
-const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
+use crate::wire::{
+    check_envelope_budget, check_record_budget, encode_envelope, message_field_len,
+    preflight_envelope_decode, BudgetedFrame, BudgetedPeerTx, ReconcileGate,
+    ANTI_ENTROPY_PAGE_BYTES, MAX_FRAME_BYTES, MAX_RECONCILE_FETCH_KEYS, MAX_RECONCILE_PAGE_ITEMS,
+    MAX_WIRE_BATCH_ITEMS,
+};
 
 /// Current peer wire protocol version. Hello ranges must include this value.
-/// Version 2 is wire-incompatible with version 1 and also changed the public
-/// generated protocol types (`Hello::challenge` and `EnvelopeMsg::HelloAuth`).
-pub const WIRE_PROTOCOL_VERSION: u32 = 2;
+/// Version 3 replaces monolithic full-state sync with byte-bounded,
+/// cursor-correlated reconciliation pages.
+pub const WIRE_PROTOCOL_VERSION: u32 = 3;
 /// The peer returns exact forwarded-mutation outcomes.
 pub const CAPABILITY_MUTATION_RESULTS: u64 = 1 << 0;
 /// Replication ACKs carry an explicit receiver durability fence.
@@ -81,14 +83,27 @@ pub const CAPABILITY_CORRELATED_RECONCILIATION: u64 = 1 << 2;
 /// The handshake uses independent fresh challenges and mutual transcript
 /// proofs before publishing either side of a connection.
 pub const CAPABILITY_CHALLENGE_AUTH: u64 = 1 << 3;
+/// Anti-entropy uses stable cursor pages with exact encoded-byte bounds.
+pub const CAPABILITY_PAGED_ANTI_ENTROPY: u64 = 1 << 4;
 /// Capabilities required by this binary before it installs a peer connection.
 pub const REQUIRED_WIRE_CAPABILITIES: u64 = CAPABILITY_MUTATION_RESULTS
     | CAPABILITY_DURABILITY_ACKS
     | CAPABILITY_CORRELATED_RECONCILIATION
-    | CAPABILITY_CHALLENGE_AUTH;
+    | CAPABILITY_CHALLENGE_AUTH
+    | CAPABILITY_PAGED_ANTI_ENTROPY;
 
 /// Outbound queue depth per peer connection.
 const PEER_CHANNEL_DEPTH: usize = 256;
+/// Encoded bytes admitted to one peer's writer pipeline, including the frame
+/// currently blocked on the socket.
+const PEER_CHANNEL_BYTE_CAPACITY: usize = 32 * 1024 * 1024;
+/// Bound control preference so sustained replies cannot starve ordinary RPC
+/// and replication traffic on the shared socket.
+const PEER_RESPONSE_BURST_LIMIT: usize = 16;
+/// Bytes unavailable to ordinary producers so reader-generated ACKs and
+/// reconciliation summaries can still enter the priority lane under load.
+const PEER_RESPONSE_BYTE_RESERVE: usize = ANTI_ENTROPY_PAGE_BYTES;
+const MIN_PEER_CHANNEL_BYTE_CAPACITY: usize = MAX_FRAME_BYTES + PEER_RESPONSE_BYTE_RESERVE;
 /// Protocol-control messages retained per fragment/peer sender. Mutation
 /// ingress has its own lane sized by `SenderConfig::buffer_capacity`.
 const REPLICATION_CONTROL_CHANNEL_DEPTH: usize = 64;
@@ -100,12 +115,18 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 /// acknowledged before the caller treats a task as owned.
 const TASK_COMMAND_CAPACITY: usize = 64;
 const HANDSHAKE_CHALLENGE_BYTES: usize = 32;
+const RECONCILE_SUMMARY_PAGE_ITEMS: usize = 256;
+/// Fetch-response jobs retained per physical connection. Each job contains at
+/// most one soft-page of advertised keys; overload fails the connection closed
+/// so a peer can retry instead of blocking the sole socket reader.
+const RECONCILE_RESPONSE_QUEUE_DEPTH: usize = 1;
 
 /// Reconnect backoff: first retry after this, doubling to the cap.
 const RECONNECT_BASE: Duration = Duration::from_millis(100);
 const RECONNECT_MAX: Duration = Duration::from_secs(30);
 const REMOTE_RPC_TIMEOUT: Duration = Duration::from_secs(5);
 const SOCKET_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+const RECONCILE_DATA_ADMISSION_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn deadline_after(timeout: Duration) -> Instant {
     let now = Instant::now();
@@ -116,7 +137,7 @@ fn deadline_after(timeout: Duration) -> Instant {
 /// shared by every producer and the socket reader/writer tasks.
 #[derive(Clone)]
 struct PeerChannel {
-    tx: mpsc::Sender<Vec<u8>>,
+    outbound: BudgetedPeerTx,
     cancel: watch::Sender<bool>,
     queue_admission_timeout: Duration,
     rank: Option<ConnectionRank>,
@@ -124,18 +145,25 @@ struct PeerChannel {
 
 impl PeerChannel {
     fn same_channel(&self, other: &Self) -> bool {
-        self.tx.same_channel(&other.tx)
+        self.outbound.same_channel(&other.outbound)
     }
 
     fn same_sender(&self, other: &mpsc::Sender<Vec<u8>>) -> bool {
-        self.tx.same_channel(other)
+        self.outbound.identity.same_channel(other)
     }
 
     fn raw_sender(&self) -> mpsc::Sender<Vec<u8>> {
-        self.tx.clone()
+        self.outbound.identity.clone()
+    }
+
+    fn budgeted_sender(&self) -> BudgetedPeerTx {
+        self.outbound.clone()
     }
 
     fn cancel(&self) {
+        // Wake producers blocked on the encoded-byte gate immediately; this
+        // budget belongs only to this physical connection and is never reused.
+        self.outbound.close();
         let _ = self.cancel.send(true);
     }
 }
@@ -492,8 +520,8 @@ struct ConnContext {
     /// driver; static otherwise). Used to re-forward ops for fragments
     /// this node no longer serves.
     placement: Arc<RwLock<HashMap<FragmentId, Vec<String>>>>,
-    /// When true, the handshake skips the full-state SyncRequest: the
-    /// Phase 5 reconciler owns anti-entropy.
+    /// Whether placement lifecycles are controller-driven. Both modes use
+    /// the same protocol-v3 reconciler for anti-entropy.
     dynamic_placement: bool,
     pending_gets: PendingGets,
     pending_batch_gets: PendingBatchGets,
@@ -515,10 +543,6 @@ struct ConnContext {
     sender_runtime: SenderRuntimeOptions,
     runtime_options: NodeRuntimeOptions,
     sender_reports: SenderReportMap,
-    /// Full-state sync entries applied (observability for the Phase 8
-    /// rolling-restart test: must stay 0 when dynamic placement owns
-    /// anti-entropy).
-    sync_entries_applied: Arc<AtomicU64>,
     /// Notify the placement driver on peer join/leave. `None` in
     /// static mode.
     membership_tx: Option<watch::Sender<u64>>,
@@ -729,6 +753,7 @@ async fn call_apply(
         CallResult::Success(Err(ApplyError::Backpressure)) => Err(NodeError::Backpressure(
             "fragment worker pool is at capacity".to_string(),
         )),
+        CallResult::Success(Err(ApplyError::InvalidInput(error))) => Err(NodeError::Codec(error)),
         CallResult::Success(Err(ApplyError::Storage(error))) => Err(NodeError::Storage(error)),
         CallResult::Timeout => Err(NodeError::Actor("apply timed out".to_string())),
         CallResult::SenderError => Err(NodeError::Actor("apply reply channel dropped".to_string())),
@@ -745,6 +770,9 @@ async fn flush_fence(actor: &ActorRef<KvMessage>) -> Result<ApplyDurability, Nod
         CallResult::Success(Err(ApplyError::Storage(error))) => Err(NodeError::Storage(error)),
         CallResult::Success(Err(ApplyError::Backpressure)) => Err(NodeError::Actor(
             "flush fence unexpectedly hit admission control".to_string(),
+        )),
+        CallResult::Success(Err(ApplyError::InvalidInput(error))) => Err(NodeError::Actor(
+            format!("flush fence unexpectedly returned invalid input: {error}"),
         )),
         CallResult::Timeout => Err(NodeError::Actor("flush fence timed out".to_string())),
         CallResult::SenderError => Err(NodeError::Actor(
@@ -886,6 +914,9 @@ async fn apply_forwarded_mutation(
     request_index: usize,
 ) -> MutationResult {
     let key = op.key.clone();
+    if let Err(error) = validate_replicated_op(&op) {
+        return mutation_result(key, request_index, Err(error));
+    }
     let result = call_apply(actor, op.clone(), priority, false).await;
     if let Ok(outcome) = &result {
         match outcome {
@@ -901,6 +932,22 @@ async fn apply_forwarded_mutation(
         }
     }
     mutation_result(key, request_index, result)
+}
+
+fn validate_replicated_op(op: &ReplicatedOp) -> Result<(), NodeError> {
+    validate_record_wire_budget(&op.key, op.value.value.len(), &op.value.node_id)
+}
+
+fn validate_record_wire_budget(
+    key: &str,
+    value_len: usize,
+    node_id: &str,
+) -> Result<(), NodeError> {
+    check_record_budget(key.len(), value_len, node_id.len()).map_err(|error| {
+        NodeError::Codec(format!(
+            "key/value cannot fit every required peer frame: {error}"
+        ))
+    })
 }
 
 impl std::error::Error for NodeError {}
@@ -977,8 +1024,9 @@ pub struct Node {
     runtime_options: NodeRuntimeOptions,
     /// State reports for each sender, keyed by (fragment, peer).
     sender_reports: SenderReportMap,
-    /// Full-state sync entries applied via SyncResponse (observability;
-    /// stays 0 when dynamic placement owns anti-entropy).
+    /// Compatibility counter for the retired full-state sync protocol.
+    /// Protocol v3 leaves it at zero; sender reconciliation metrics report
+    /// anti-entropy progress.
     sync_entries_applied: Arc<AtomicU64>,
     /// Coalesced wakeup for the placement driver on membership change (Phase 8).
     membership_tx: Option<watch::Sender<u64>>,
@@ -1023,38 +1071,160 @@ fn fresh_boot_id() -> u64 {
     nanos ^ ((std::process::id() as u64) << 32)
 }
 
+#[cfg(test)]
 async fn run_peer_writer<W>(
+    writer: W,
+    rx: mpsc::Receiver<BudgetedFrame>,
+    byte_budget: Arc<Semaphore>,
+    cancel_rx: watch::Receiver<bool>,
+    cancel_tx: watch::Sender<bool>,
+    socket_write_timeout: Duration,
+) where
+    W: AsyncWrite + Unpin,
+{
+    let (response_tx, response_rx) = mpsc::channel(1);
+    drop(response_tx);
+    let producer_byte_budget = Arc::new(Semaphore::new(byte_budget.available_permits()));
+    run_bounded_peer_writer(
+        writer,
+        PeerWriterPipeline {
+            data_rx: rx,
+            response_rx,
+            byte_budget,
+            producer_byte_budget,
+        },
+        cancel_rx,
+        cancel_tx,
+        socket_write_timeout,
+    )
+    .await;
+}
+
+struct PeerWriterExitGuard {
+    byte_budget: Arc<Semaphore>,
+    producer_byte_budget: Arc<Semaphore>,
+    cancel: watch::Sender<bool>,
+}
+
+struct PeerWriterPipeline {
+    data_rx: mpsc::Receiver<BudgetedFrame>,
+    response_rx: mpsc::Receiver<BudgetedFrame>,
+    byte_budget: Arc<Semaphore>,
+    producer_byte_budget: Arc<Semaphore>,
+}
+
+impl Drop for PeerWriterExitGuard {
+    fn drop(&mut self) {
+        self.byte_budget.close();
+        self.producer_byte_budget.close();
+        let _ = self.cancel.send(true);
+    }
+}
+
+async fn run_bounded_peer_writer<W>(
+    writer: W,
+    pipeline: PeerWriterPipeline,
+    cancel_rx: watch::Receiver<bool>,
+    cancel_tx: watch::Sender<bool>,
+    socket_write_timeout: Duration,
+) where
+    W: AsyncWrite + Unpin,
+{
+    let PeerWriterPipeline {
+        data_rx,
+        response_rx,
+        byte_budget,
+        producer_byte_budget,
+    } = pipeline;
+    let _exit_guard = PeerWriterExitGuard {
+        byte_budget,
+        producer_byte_budget,
+        cancel: cancel_tx.clone(),
+    };
+    run_queued_peer_writer(
+        writer,
+        data_rx,
+        response_rx,
+        cancel_rx,
+        cancel_tx.clone(),
+        socket_write_timeout,
+    )
+    .await;
+    let _ = cancel_tx.send(true);
+}
+
+async fn run_queued_peer_writer<W>(
     mut writer: W,
-    mut rx: mpsc::Receiver<Vec<u8>>,
+    mut rx: mpsc::Receiver<BudgetedFrame>,
+    mut response_rx: mpsc::Receiver<BudgetedFrame>,
     mut cancel_rx: watch::Receiver<bool>,
     cancel_tx: watch::Sender<bool>,
     socket_write_timeout: Duration,
 ) where
     W: AsyncWrite + Unpin,
 {
-    loop {
-        let frame = tokio::select! {
-            changed = cancel_rx.changed() => {
-                let _ = changed;
-                break;
+    let mut data_open = true;
+    let mut response_open = true;
+    let mut response_burst = 0usize;
+    'writer: while data_open || response_open {
+        let (frame, is_response) = loop {
+            if !data_open && !response_open {
+                break 'writer;
             }
-            frame = rx.recv() => {
-                let Some(frame) = frame else { break };
-                frame
+            if *cancel_rx.borrow() {
+                break 'writer;
+            }
+            if data_open && response_burst >= PEER_RESPONSE_BURST_LIMIT {
+                match rx.try_recv() {
+                    Ok(frame) => break (frame, false),
+                    Err(mpsc::error::TryRecvError::Empty) => {}
+                    Err(mpsc::error::TryRecvError::Disconnected) => data_open = false,
+                }
+            }
+            tokio::select! {
+                biased;
+                changed = cancel_rx.changed() => {
+                    let _ = changed;
+                    break 'writer;
+                }
+                frame = response_rx.recv(), if response_open => {
+                    match frame {
+                        Some(frame) => break (frame, true),
+                        None => response_open = false,
+                    }
+                }
+                frame = rx.recv(), if data_open => {
+                    match frame {
+                        Some(frame) => break (frame, false),
+                        None => data_open = false,
+                    }
+                }
             }
         };
+        if is_response {
+            response_burst = response_burst.saturating_add(1);
+        } else {
+            response_burst = 0;
+        }
+        if frame.len() > MAX_FRAME_BYTES || u32::try_from(frame.len()).is_err() {
+            tracing::warn!(
+                encoded_len = frame.len(),
+                "closing peer transport before writing an oversized frame"
+            );
+            break;
+        }
         let write = async {
             writer.write_u32(frame.len() as u32).await?;
-            writer.write_all(&frame).await
+            writer.write_all(frame.bytes()).await
         };
         let result = tokio::select! {
             changed = cancel_rx.changed() => {
                 let _ = changed;
-                break;
+                None
             }
-            result = tokio::time::timeout(socket_write_timeout, write) => result,
+            result = tokio::time::timeout(socket_write_timeout, write) => Some(result),
         };
-        if !matches!(result, Ok(Ok(()))) {
+        if !matches!(result, Some(Ok(Ok(())))) {
             break;
         }
     }
@@ -1253,9 +1423,11 @@ impl Drop for SupervisorStartupGuard {
 #[derive(Clone, Debug)]
 pub struct NodeRuntimeOptions {
     peer_queue_frame_capacity: usize,
+    peer_queue_byte_capacity: usize,
     replication_control_message_capacity: usize,
     inbound_connection_capacity: usize,
     queue_admission_timeout: Duration,
+    reconcile_data_admission_timeout: Duration,
     forwarded_attempt_timeout: Duration,
     connect_timeout: Duration,
     handshake_timeout: Duration,
@@ -1268,9 +1440,11 @@ impl Default for NodeRuntimeOptions {
     fn default() -> Self {
         Self {
             peer_queue_frame_capacity: PEER_CHANNEL_DEPTH,
+            peer_queue_byte_capacity: PEER_CHANNEL_BYTE_CAPACITY,
             replication_control_message_capacity: REPLICATION_CONTROL_CHANNEL_DEPTH,
             inbound_connection_capacity: INBOUND_CONNECTION_CAPACITY,
             queue_admission_timeout: REMOTE_RPC_TIMEOUT,
+            reconcile_data_admission_timeout: RECONCILE_DATA_ADMISSION_TIMEOUT,
             forwarded_attempt_timeout: REMOTE_RPC_TIMEOUT,
             connect_timeout: REMOTE_RPC_TIMEOUT,
             handshake_timeout: HANDSHAKE_TIMEOUT,
@@ -1282,9 +1456,18 @@ impl Default for NodeRuntimeOptions {
 }
 
 impl NodeRuntimeOptions {
-    /// Set the number of frames buffered per peer connection.
+    /// Set the total number of frames buffered per peer connection. At least
+    /// two slots are required so data and reader-generated responses each
+    /// retain a bounded lane.
     pub fn with_peer_queue_frame_capacity(mut self, capacity: usize) -> Self {
         self.peer_queue_frame_capacity = capacity;
+        self
+    }
+
+    /// Set the encoded-byte budget for one peer's outbound writer pipeline.
+    /// It must fit the hard maximum frame plus the reserved response budget.
+    pub fn with_peer_queue_byte_capacity(mut self, capacity: usize) -> Self {
+        self.peer_queue_byte_capacity = capacity;
         self
     }
 
@@ -1304,9 +1487,19 @@ impl NodeRuntimeOptions {
         self
     }
 
-    /// Set the maximum wait to reserve a peer queue slot.
+    /// Set one absolute maximum wait to reserve a peer queue slot and its
+    /// exact encoded-byte permits.
     pub fn with_queue_admission_timeout(mut self, timeout: Duration) -> Self {
         self.queue_admission_timeout = timeout;
+        self
+    }
+
+    /// Set the admission wait for each streamed reconciliation-data page.
+    /// This is deliberately separate from ordinary control/RPC admission: a
+    /// legal near-limit value may need to wait behind another near-limit frame
+    /// while the socket writer is still within its own liveness deadline.
+    pub fn with_reconcile_data_admission_timeout(mut self, timeout: Duration) -> Self {
+        self.reconcile_data_admission_timeout = timeout;
         self
     }
 
@@ -1355,6 +1548,11 @@ impl NodeRuntimeOptions {
         self.peer_queue_frame_capacity
     }
 
+    /// Current encoded-byte budget for one peer's outbound writer pipeline.
+    pub fn peer_queue_byte_capacity(&self) -> usize {
+        self.peer_queue_byte_capacity
+    }
+
     /// Current per-sender protocol-control message capacity.
     pub fn replication_control_message_capacity(&self) -> usize {
         self.replication_control_message_capacity
@@ -1368,6 +1566,11 @@ impl NodeRuntimeOptions {
     /// Current peer-queue admission timeout.
     pub fn queue_admission_timeout(&self) -> Duration {
         self.queue_admission_timeout
+    }
+
+    /// Current admission timeout for one reconciliation-data page.
+    pub fn reconcile_data_admission_timeout(&self) -> Duration {
+        self.reconcile_data_admission_timeout
     }
 
     /// Current total forwarded-attempt timeout.
@@ -1408,10 +1611,15 @@ impl NodeRuntimeOptions {
     }
 
     fn validate(&self) -> Result<(), NodeError> {
-        if self.peer_queue_frame_capacity == 0 {
+        if self.peer_queue_frame_capacity < 2 {
             return Err(NodeError::Actor(
-                "peer queue frame capacity must be non-zero".to_string(),
+                "peer queue frame capacity must be at least 2".to_string(),
             ));
+        }
+        if self.peer_queue_byte_capacity < MIN_PEER_CHANNEL_BYTE_CAPACITY {
+            return Err(NodeError::Actor(format!(
+                "peer queue byte capacity must be at least {MIN_PEER_CHANNEL_BYTE_CAPACITY}"
+            )));
         }
         if self.replication_control_message_capacity == 0 {
             return Err(NodeError::Actor(
@@ -1429,6 +1637,12 @@ impl NodeRuntimeOptions {
                 tokio::sync::Semaphore::MAX_PERMITS
             )));
         }
+        if self.peer_queue_byte_capacity > tokio::sync::Semaphore::MAX_PERMITS {
+            return Err(NodeError::Actor(format!(
+                "peer queue byte capacity exceeds maximum {}",
+                tokio::sync::Semaphore::MAX_PERMITS
+            )));
+        }
         if self.replication_control_message_capacity > tokio::sync::Semaphore::MAX_PERMITS {
             return Err(NodeError::Actor(format!(
                 "replication control message capacity exceeds maximum {}",
@@ -1442,6 +1656,7 @@ impl NodeRuntimeOptions {
             )));
         }
         if self.queue_admission_timeout.is_zero()
+            || self.reconcile_data_admission_timeout.is_zero()
             || self.forwarded_attempt_timeout.is_zero()
             || self.connect_timeout.is_zero()
             || self.handshake_timeout.is_zero()
@@ -1456,6 +1671,7 @@ impl NodeRuntimeOptions {
         let now = Instant::now();
         if [
             self.queue_admission_timeout,
+            self.reconcile_data_admission_timeout,
             self.forwarded_attempt_timeout,
             self.connect_timeout,
             self.handshake_timeout,
@@ -1563,13 +1779,13 @@ pub struct NodeConfig {
     pub replication: SenderConfig,
     /// Phase 8: dynamic placement controller. `None` (default) =
     /// static placement: the node's fragments are fixed at startup
-    /// from `fragment_map` and the full-state handshake sync runs as
-    /// before. Set to an `Arc<dyn PlacementController>` (e.g.
+    /// from `fragment_map`; every established replica session starts
+    /// correlated reconciliation. Set to an `Arc<dyn PlacementController>` (e.g.
     /// [`ManualPlacement`](crate::placement::ManualPlacement)) to opt
     /// into dynamic placement: a driver task polls the controller,
     /// spawns/drains fragment subtrees at runtime, bootstraps newly
-    /// assigned fragments via the Phase 5 reconciler, and skips the
-    /// full-state handshake sync (the reconciler owns anti-entropy).
+    /// assigned fragments via the same reconciler, and publishes only
+    /// after an authoritative serving source completes verification.
     /// Membership-change callbacks are coalesced current-peer-set
     /// notifications, not a lossless ordered event stream.
     pub placement_controller: Option<Arc<dyn PlacementController>>,
@@ -1790,15 +2006,29 @@ impl Node {
             Arc::new(Mutex::new(HashMap::with_capacity(my_fragments.len())));
         let supervisor_stops = Arc::new(SupervisorRegistry::new(my_fragments.len()));
         let router = FragmentRouter::new(config.fragment_count, my_fragments.len());
-        let serving: Arc<RwLock<HashSet<FragmentId>>> =
-            Arc::new(RwLock::new(my_fragments.iter().copied().collect()));
+        // Dynamic placement preloads assigned subtrees synchronously so a
+        // corrupt durable record still fails Node::start. Authority is not
+        // published until the placement driver reconciles each preload.
+        let preloaded_fragments: Arc<StdMutex<HashSet<FragmentId>>> =
+            Arc::new(StdMutex::new(if dynamic {
+                my_fragments.iter().copied().collect()
+            } else {
+                HashSet::new()
+            }));
+        let serving: Arc<RwLock<HashSet<FragmentId>>> = Arc::new(RwLock::new(if dynamic {
+            HashSet::new()
+        } else {
+            my_fragments.iter().copied().collect()
+        }));
         let placement_states: Arc<Mutex<HashMap<FragmentId, FragmentPlacementState>>> =
-            Arc::new(Mutex::new(
+            Arc::new(Mutex::new(if dynamic {
+                HashMap::new()
+            } else {
                 my_fragments
                     .iter()
                     .map(|f| (*f, FragmentPlacementState::Serving))
-                    .collect(),
-            ));
+                    .collect()
+            }));
         let mut startup_supervisors = SupervisorStartupGuard::new(my_fragments.len());
         for fragment in my_fragments {
             let (supervisor, dispatcher) = match spawn_fragment_subtree_registered(
@@ -1918,6 +2148,7 @@ impl Node {
                 supervisors: supervisors.clone(),
                 supervisor_stops: supervisor_stops.clone(),
                 placement_states: placement_states.clone(),
+                preloaded_fragments,
                 placement_generation: Arc::new(AtomicU64::new(0)),
                 senders: node.senders.clone(),
                 retiring_senders: node.retiring_senders.clone(),
@@ -2019,7 +2250,8 @@ impl Node {
     }
 
     /// Dial a peer and start a supervised connection. After authentication,
-    /// both sides exchange full state, so a late joiner converges immediately.
+    /// both sides start paged reconciliation, so a late joiner converges
+    /// without constructing a monolithic full-state frame.
     ///
     /// The initial dial is tried once: an unreachable peer returns an error.
     /// This method returns `Ok` only after that transport dial succeeds and a
@@ -2119,7 +2351,6 @@ impl Node {
             sender_runtime: self.runtime_options.sender_options(),
             runtime_options: self.runtime_options.clone(),
             sender_reports: self.sender_reports.clone(),
-            sync_entries_applied: self.sync_entries_applied.clone(),
             membership_tx: self.membership_tx.clone(),
             cluster_secret: self.cluster_secret.clone(),
         }
@@ -2351,6 +2582,7 @@ impl Node {
         op: ReplicatedOp,
         priority: OpPriority,
     ) -> Result<(), NodeError> {
+        validate_replicated_op(&op)?;
         let frag = fragment_of(&op.key, self.router.fragment_count);
         let mutation_lease = if self.placement_controller.is_some() {
             Some(self.router.mutation_gate(frag).read_owned().await)
@@ -2555,7 +2787,7 @@ impl Node {
     /// priority, so fan-out preserves traffic isolation end-to-end.
     ///
     /// Each key is hashed to its fragment; keys are grouped by fragment
-    /// and each fragment's keys are sent with one `BatchPut` message,
+    /// and each fragment's keys are sent in count-bounded `BatchPut` messages,
     /// failing over across replica holders (self first) until one
     /// accepts the batch. Returns per-key results in input order.
     ///
@@ -2602,106 +2834,122 @@ impl Node {
             results[i] = Some(r);
         }
 
-        // Remote puts: one BatchPut per fragment, failing over across
-        // replica holders until one accepts the batch.
+        // Remote puts: count-bounded BatchPut chunks per fragment, each
+        // failing over across replica holders until one accepts it.
         let wire_priority = priority_to_proto(priority);
         for (frag, items) in remote {
-            // Build the batch once, with HLC timestamps.
-            let mut puts = Vec::with_capacity(items.len());
-            let mut indices = Vec::with_capacity(items.len());
-            for (i, key, value) in items {
-                let seq = {
-                    let mut guard = self.next_seq.lock().await;
-                    *guard += 1;
-                    *guard
-                };
-                let now = self.hlc.lock().await.tick();
-                puts.push(ForwardedPut {
-                    key,
-                    value,
-                    timestamp_ms: now,
-                    node_id: self.node_id.clone(),
-                    seq,
-                    boot_id: self.boot_id,
-                    expires_at_ms: 0,
-                    is_tombstone: false,
-                    priority: wire_priority,
-                    hops: 0,
-                    req_id: 0,
-                });
-                indices.push(i);
-            }
-            let expected_keys: Vec<String> = puts.iter().map(|put| put.key.clone()).collect();
-            let mut done = false;
-            let mut tried: Vec<String> = Vec::new();
-            for owner in self.replica_order(frag) {
-                tried.push(owner.clone());
-                let Some(tx) = self.peer_sender(&owner).await else {
-                    continue;
-                };
-                let req_id = self.next_req_id.fetch_add(1, Ordering::Relaxed);
-                let (resp_tx, resp_rx) = oneshot::channel();
-                self.pending_mutations.lock().unwrap().insert(
-                    req_id,
-                    PendingMutation {
-                        expected_peer: owner.clone(),
-                        expected_keys: expected_keys.clone(),
-                        reply: resp_tx,
-                    },
-                );
-                let _pending_guard = PendingMutationGuard {
-                    req_id,
-                    pending: self.pending_mutations.clone(),
-                };
-                let attempt_deadline =
-                    deadline_after(self.runtime_options.forwarded_attempt_timeout);
-                if !try_send_envelope_until(
-                    &tx,
-                    Envelope {
-                        msg: Some(EnvelopeMsg::BatchPut(BatchPut {
-                            puts: puts.clone(),
-                            priority: wire_priority,
-                            req_id,
-                        })),
-                    },
-                    attempt_deadline,
-                )
-                .await
-                {
-                    continue;
+            let mut remaining = items.into_iter();
+            loop {
+                let items: Vec<_> = remaining.by_ref().take(MAX_WIRE_BATCH_ITEMS).collect();
+                if items.is_empty() {
+                    break;
                 }
-                let response = tokio::time::timeout_at(attempt_deadline, resp_rx).await;
-                match response {
-                    Ok(Ok(wire_results))
-                        if validate_mutation_results(&expected_keys, &wire_results).is_ok() =>
+                // Build the batch once, with HLC timestamps.
+                let mut puts = Vec::with_capacity(items.len());
+                let mut indices = Vec::with_capacity(items.len());
+                for (i, key, value) in items {
+                    if let Err(error) =
+                        validate_record_wire_budget(&key, value.len(), &self.node_id)
                     {
-                        // A stale/non-serving holder or failed relay returns a
-                        // typed routing failure for every key. Retry the exact
-                        // stamped batch at the next configured replica.
-                        if wire_results.iter().all(|result| {
-                            MutationStatus::try_from(result.status)
-                                == Ok(MutationStatus::Unavailable)
-                        }) {
-                            continue;
-                        }
-                        for (index, result) in indices.iter().zip(wire_results) {
-                            results[*index] = Some(decode_mutation_result(result));
-                        }
-                        done = true;
-                        break;
+                        results[i] = Some(Err(error));
+                        continue;
                     }
-                    // A timeout or malformed/dropped response may follow a
-                    // successful apply. Retrying the exact stamped versions
-                    // at another holder is safe under the idempotent merge.
-                    _ => {}
+                    let seq = {
+                        let mut guard = self.next_seq.lock().await;
+                        *guard += 1;
+                        *guard
+                    };
+                    let now = self.hlc.lock().await.tick();
+                    puts.push(ForwardedPut {
+                        key,
+                        value,
+                        timestamp_ms: now,
+                        node_id: self.node_id.clone(),
+                        seq,
+                        boot_id: self.boot_id,
+                        expires_at_ms: 0,
+                        is_tombstone: false,
+                        priority: wire_priority,
+                        hops: 0,
+                        req_id: 0,
+                    });
+                    indices.push(i);
                 }
-            }
-            if !done {
-                for i in indices {
-                    results[i] = Some(Err(NodeError::Network(format!(
-                        "no replica acknowledged batch put for fragment {frag} (tried {})",
-                        tried.join(",")
-                    ))));
+                if puts.is_empty() {
+                    continue;
+                }
+                let expected_keys: Vec<String> = puts.iter().map(|put| put.key.clone()).collect();
+                let mut done = false;
+                let mut tried: Vec<String> = Vec::new();
+                for owner in self.replica_order(frag) {
+                    tried.push(owner.clone());
+                    let Some(tx) = self.peer_sender(&owner).await else {
+                        continue;
+                    };
+                    let req_id = self.next_req_id.fetch_add(1, Ordering::Relaxed);
+                    let (resp_tx, resp_rx) = oneshot::channel();
+                    self.pending_mutations.lock().unwrap().insert(
+                        req_id,
+                        PendingMutation {
+                            expected_peer: owner.clone(),
+                            expected_keys: expected_keys.clone(),
+                            reply: resp_tx,
+                        },
+                    );
+                    let _pending_guard = PendingMutationGuard {
+                        req_id,
+                        pending: self.pending_mutations.clone(),
+                    };
+                    let attempt_deadline =
+                        deadline_after(self.runtime_options.forwarded_attempt_timeout);
+                    if !try_send_envelope_until(
+                        &tx,
+                        Envelope {
+                            msg: Some(EnvelopeMsg::BatchPut(BatchPut {
+                                puts: puts.clone(),
+                                priority: wire_priority,
+                                req_id,
+                            })),
+                        },
+                        attempt_deadline,
+                    )
+                    .await
+                    {
+                        continue;
+                    }
+                    let response = tokio::time::timeout_at(attempt_deadline, resp_rx).await;
+                    match response {
+                        Ok(Ok(wire_results))
+                            if validate_mutation_results(&expected_keys, &wire_results).is_ok() =>
+                        {
+                            // A stale/non-serving holder or failed relay returns a
+                            // typed routing failure for every key. Retry the exact
+                            // stamped batch at the next configured replica.
+                            if wire_results.iter().all(|result| {
+                                MutationStatus::try_from(result.status)
+                                    == Ok(MutationStatus::Unavailable)
+                            }) {
+                                continue;
+                            }
+                            for (index, result) in indices.iter().zip(wire_results) {
+                                results[*index] = Some(decode_mutation_result(result));
+                            }
+                            done = true;
+                            break;
+                        }
+                        // A timeout or malformed/dropped response may follow a
+                        // successful apply. Retrying the exact stamped versions
+                        // at another holder is safe under the idempotent merge.
+                        _ => {}
+                    }
+                }
+                if !done {
+                    for i in indices {
+                        results[i] = Some(Err(NodeError::Network(format!(
+                            "no replica acknowledged batch put for fragment {frag} (tried {})",
+                            tried.join(",")
+                        ))));
+                    }
                 }
             }
         }
@@ -2710,8 +2958,8 @@ impl Node {
     }
 
     /// Put multiple keys. Each key is hashed to its fragment; keys are
-    /// grouped by fragment and each fragment's keys are sent with one
-    /// `BatchPut` message, failing over across replica holders.
+    /// grouped by fragment and each fragment's keys are sent in count-bounded
+    /// `BatchPut` messages, failing over across replica holders.
     /// Returns per-key results in input order.
     ///
     /// Bulk puts run at [`OpPriority::Background`]; see
@@ -2729,7 +2977,7 @@ impl Node {
     /// priority, so fan-out preserves traffic isolation end-to-end.
     ///
     /// Each key is hashed to its fragment; keys are grouped by fragment
-    /// and each fragment's keys are fetched with one `BatchGet` message.
+    /// and each fragment's keys are fetched in count-bounded `BatchGet` messages.
     /// Returns per-key results in input order.
     ///
     /// Remote reads use the configured timeout (5 seconds by default) per
@@ -2778,89 +3026,92 @@ impl Node {
             results[i] = Some(r);
         }
 
-        // Remote gets: one BatchGet per fragment, failing over across
-        // replica holders on timeout or dropped replies.
+        // Remote gets: count-bounded BatchGet chunks per fragment, each
+        // failing over across replica holders on timeout or dropped replies.
         let wire_priority = priority_to_proto(priority);
         for (frag, items) in remote {
-            let keys: Vec<String> = items.iter().map(|(_, k)| k.clone()).collect();
-            let indices: Vec<usize> = items.iter().map(|(i, _)| *i).collect();
-            let mut done = false;
-            let mut tried: Vec<String> = Vec::new();
-            for owner in self.replica_order(frag) {
-                tried.push(owner.clone());
-                let Some(tx) = self.peer_sender(&owner).await else {
-                    continue;
-                };
-                let req_id = self.next_req_id.fetch_add(1, Ordering::Relaxed);
-                let (resp_tx, resp_rx) = oneshot::channel();
-                self.pending_batch_gets
-                    .lock()
-                    .unwrap()
-                    .insert(req_id, resp_tx);
-                let _pending_guard = PendingBatchGetGuard {
-                    req_id,
-                    pending: self.pending_batch_gets.clone(),
-                };
-                let attempt_deadline =
-                    deadline_after(self.runtime_options.forwarded_attempt_timeout);
-                if !try_send_envelope_until(
-                    &tx,
-                    Envelope {
-                        msg: Some(EnvelopeMsg::BatchGet(BatchGet {
-                            req_id,
-                            keys: keys.clone(),
-                            priority: wire_priority,
-                        })),
-                    },
-                    attempt_deadline,
-                )
-                .await
-                {
-                    continue;
-                }
-                let response = tokio::time::timeout_at(attempt_deadline, resp_rx).await;
-                if let Ok(Ok(kvs)) = response {
-                    // Map back by key.
-                    let by_key: HashMap<String, BatchKeyValue> =
-                        kvs.into_iter().map(|kv| (kv.key.clone(), kv)).collect();
-                    for (i, key) in indices.iter().zip(&keys) {
-                        match by_key.get(key) {
-                            Some(kv) if kv.shed => {
-                                results[*i] = Some(Err(NodeError::Backpressure(format!(
-                                    "batch get for key {key} shed by remote"
-                                ))));
-                            }
-                            Some(kv) if kv.found => {
-                                let mut v = VersionedValue::new(
-                                    kv.value.clone(),
-                                    kv.timestamp_ms,
-                                    kv.node_id.clone(),
-                                );
-                                v.expires_at_ms = if kv.expires_at_ms == 0 {
-                                    None
-                                } else {
-                                    Some(kv.expires_at_ms)
-                                };
-                                v.is_tombstone = kv.is_tombstone;
-                                // Tombstones read as absent.
-                                results[*i] = Some(Ok(if v.is_tombstone { None } else { Some(v) }));
-                            }
-                            _ => results[*i] = Some(Ok(None)),
-                        }
+            for items in items.chunks(MAX_WIRE_BATCH_ITEMS) {
+                let keys: Vec<String> = items.iter().map(|(_, k)| k.clone()).collect();
+                let indices: Vec<usize> = items.iter().map(|(i, _)| *i).collect();
+                let mut done = false;
+                let mut tried: Vec<String> = Vec::new();
+                for owner in self.replica_order(frag) {
+                    tried.push(owner.clone());
+                    let Some(tx) = self.peer_sender(&owner).await else {
+                        continue;
+                    };
+                    let req_id = self.next_req_id.fetch_add(1, Ordering::Relaxed);
+                    let (resp_tx, resp_rx) = oneshot::channel();
+                    self.pending_batch_gets
+                        .lock()
+                        .unwrap()
+                        .insert(req_id, resp_tx);
+                    let _pending_guard = PendingBatchGetGuard {
+                        req_id,
+                        pending: self.pending_batch_gets.clone(),
+                    };
+                    let attempt_deadline =
+                        deadline_after(self.runtime_options.forwarded_attempt_timeout);
+                    if !try_send_envelope_until(
+                        &tx,
+                        Envelope {
+                            msg: Some(EnvelopeMsg::BatchGet(BatchGet {
+                                req_id,
+                                keys: keys.clone(),
+                                priority: wire_priority,
+                            })),
+                        },
+                        attempt_deadline,
+                    )
+                    .await
+                    {
+                        continue;
                     }
-                    done = true;
-                    break;
+                    let response = tokio::time::timeout_at(attempt_deadline, resp_rx).await;
+                    if let Ok(Ok(kvs)) = response {
+                        // Map back by key.
+                        let by_key: HashMap<String, BatchKeyValue> =
+                            kvs.into_iter().map(|kv| (kv.key.clone(), kv)).collect();
+                        for (i, key) in indices.iter().zip(&keys) {
+                            match by_key.get(key) {
+                                Some(kv) if kv.shed => {
+                                    results[*i] = Some(Err(NodeError::Backpressure(format!(
+                                        "batch get for key {key} shed by remote"
+                                    ))));
+                                }
+                                Some(kv) if kv.found => {
+                                    let mut v = VersionedValue::new(
+                                        kv.value.clone(),
+                                        kv.timestamp_ms,
+                                        kv.node_id.clone(),
+                                    );
+                                    v.expires_at_ms = if kv.expires_at_ms == 0 {
+                                        None
+                                    } else {
+                                        Some(kv.expires_at_ms)
+                                    };
+                                    v.is_tombstone = kv.is_tombstone;
+                                    // Tombstones read as absent.
+                                    results[*i] =
+                                        Some(Ok(if v.is_tombstone { None } else { Some(v) }));
+                                }
+                                _ => results[*i] = Some(Ok(None)),
+                            }
+                        }
+                        done = true;
+                        break;
+                    }
+                    // A dropped reply or timeout falls through to the next
+                    // replica. The guard removes this req_id, so a late response
+                    // is ignored by the handler.
                 }
-                // A dropped reply or timeout falls through to the next
-                // replica. The guard removes this req_id, so a late response
-                // is ignored by the handler.
-            }
-            if !done {
-                for i in indices {
-                    results[i] = Some(Err(NodeError::Network(format!(
-                        "no replica answered batch get for fragment {frag} (tried {})",
-                        tried.join(",")
-                    ))));
+                if !done {
+                    for i in indices {
+                        results[i] = Some(Err(NodeError::Network(format!(
+                            "no replica answered batch get for fragment {frag} (tried {})",
+                            tried.join(",")
+                        ))));
+                    }
                 }
             }
         }
@@ -2869,8 +3120,8 @@ impl Node {
     }
 
     /// Get multiple keys. Each key is hashed to its fragment; keys are
-    /// grouped by fragment and each fragment's keys are fetched with one
-    /// `BatchGet` message, failing over across replica holders.
+    /// grouped by fragment and each fragment's keys are fetched in count-bounded
+    /// `BatchGet` messages, failing over across replica holders.
     /// Returns per-key results in input order.
     ///
     /// Bulk gets run at [`OpPriority::Background`]; see
@@ -3019,9 +3270,9 @@ impl Node {
         }
     }
 
-    /// Full-state sync entries applied via SyncResponse since start.
-    /// Stays 0 when dynamic placement is enabled (the handshake skips
-    /// the full-state sync; the Phase 5 reconciler owns anti-entropy).
+    /// Compatibility counter for the retired `SyncResponse` protocol.
+    /// Protocol v3 uses correlated reconciliation for every placement mode,
+    /// so this always remains zero.
     pub fn sync_entries_applied(&self) -> u64 {
         self.sync_entries_applied.load(Ordering::Relaxed)
     }
@@ -3043,6 +3294,10 @@ struct PlacementDriverDeps {
     supervisors: Arc<Mutex<HashMap<FragmentId, ActorRef<SupervisorMessage>>>>,
     supervisor_stops: Arc<SupervisorRegistry>,
     placement_states: Arc<Mutex<HashMap<FragmentId, FragmentPlacementState>>>,
+    /// Subtrees loaded synchronously during dynamic startup but not yet
+    /// reconciled or published as authoritative. The first placement tick
+    /// consumes this set into explicit gain/loss transitions.
+    preloaded_fragments: Arc<StdMutex<HashSet<FragmentId>>>,
     /// Increments only when the published placement map actually changes.
     /// A global generation is conservative: unrelated fragment movement can
     /// retry an in-flight bootstrap, but a P -> Q -> P ABA cannot publish work
@@ -3135,11 +3390,7 @@ async fn placement_tick(deps: &PlacementDriverDeps) {
     // controller map and marking its gain/loss transitions in one critical
     // section prevents a stale drainer from validating the old map and then
     // tearing down state after a re-add has already been published.
-    let (mine_current, in_flight, transitions): (
-        HashSet<FragmentId>,
-        HashSet<FragmentId>,
-        Vec<(FragmentId, bool)>,
-    ) = {
+    let (mine_current, in_flight, transitions) = {
         let mut states = deps.placement_states.lock().await;
         // Canonical lock order is placement_states -> placement. The sync map
         // guard never crosses an await.
@@ -3165,18 +3416,36 @@ async fn placement_tick(deps: &PlacementDriverDeps) {
             }
         }
 
+        // Dynamic startup loaded these subtrees synchronously for durable
+        // validation but deliberately withheld authority. Consume each one
+        // exactly once into a transition which adopts (rather than replaces)
+        // the existing actor tree. A controller revocation before this first
+        // tick becomes a loss transition instead of leaving an orphan.
+        let preloaded = std::mem::take(&mut *deps.preloaded_fragments.lock().unwrap());
+        for fragment in preloaded {
+            current.insert(fragment);
+            flight.insert(fragment);
+            if mine_desired.contains(&fragment) {
+                states.insert(fragment, FragmentPlacementState::Bootstrapping);
+                transitions.push((fragment, true, true));
+            } else {
+                states.insert(fragment, FragmentPlacementState::Draining);
+                transitions.push((fragment, false, true));
+            }
+        }
+
         // Mark transitions before spawning so the next tick cannot create a
         // duplicate while the child task is waiting to be scheduled.
         for f in mine_desired.difference(&current) {
             states.insert(*f, FragmentPlacementState::Bootstrapping);
-            transitions.push((*f, true));
+            transitions.push((*f, true, false));
         }
         for f in current.difference(&mine_desired) {
             if flight.contains(f) {
                 continue;
             }
             states.insert(*f, FragmentPlacementState::Draining);
-            transitions.push((*f, false));
+            transitions.push((*f, false, false));
         }
         (current, flight, transitions)
     };
@@ -3184,11 +3453,11 @@ async fn placement_tick(deps: &PlacementDriverDeps) {
     // Register outside the placement-state commit mutex. The Node task manager
     // owns and joins transitions directly, so aborting the polling driver
     // cannot detach a gain/loss child during shutdown.
-    for (fragment, gaining) in transitions {
+    for (fragment, gaining, preloaded) in transitions {
         let transition_deps = deps.clone();
         let transition = async move {
             if gaining {
-                gain_fragment(&transition_deps, fragment).await;
+                gain_fragment(&transition_deps, fragment, preloaded).await;
             } else {
                 lose_fragment(&transition_deps, fragment).await;
             }
@@ -3242,9 +3511,7 @@ async fn ensure_fragment_senders(
             if let (Some(tx), Some(sender)) =
                 (peers.get(peer), senders.get(&(fragment, peer.clone())))
             {
-                let _ = sender.send(SenderMsg::PeerConnected {
-                    peer_tx: tx.raw_sender(),
-                });
+                let _ = sender.connect_peer(tx.budgeted_sender());
             }
         }
     }
@@ -3278,9 +3545,9 @@ async fn ensure_fragment_senders(
     }
 }
 
-/// Bootstrap timeout: bound the wait for a source peer / reconcile
-/// round. On timeout the fragment still goes Serving (availability
-/// over consistency); LWW + periodic reconcile converge it later.
+/// Bootstrap timeout: bound the wait for a serving source peer and verified
+/// reconcile round. Timeout keeps the fragment non-authoritative; the
+/// placement loop can retry the gain later.
 const BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3351,8 +3618,9 @@ async fn converge_fragment_gain(deps: &PlacementDriverDeps, fragment: FragmentId
         if !sources.is_empty() && !bootstrap_from(deps, fragment, &sources).await {
             tracing::warn!(
                 fragment = fragment.0,
-                "fragment bootstrap timed out; serving retained state if placement is unchanged"
+                "fragment bootstrap timed out; refusing to publish incomplete state"
             );
+            return false;
         }
 
         match commit_fragment_gain(deps, fragment, &replicas, generation).await {
@@ -3363,36 +3631,50 @@ async fn converge_fragment_gain(deps: &PlacementDriverDeps, fragment: FragmentId
     }
 }
 
-/// Gain a fragment: spawn the subtree, bootstrap state from a replica
-/// holder via the Phase 5 reconciler (chunked, bounded), then go
-/// Serving. The fragment is NOT authoritative until bootstrap
-/// completes (or times out): local reads/writes forward to the
-/// previous owner meanwhile.
-async fn gain_fragment(deps: &PlacementDriverDeps, fragment: FragmentId) {
-    let (supervisor, dispatcher) = match spawn_fragment_subtree_registered(
-        &deps.node_id,
-        fragment,
-        &deps.subtree_config,
-        &deps.hlc,
-        &deps.supervisor_stops,
-    )
-    .await
-    {
-        Ok(x) => x,
-        Err(e) => {
-            eprintln!("[placement] failed to spawn subtree for {fragment}: {e}");
-            // Drop the Bootstrapping mark so the next tick retries.
+/// Gain a fragment: adopt a synchronously preloaded startup subtree or spawn a
+/// new one, bootstrap state from a replica holder via the bounded reconciler,
+/// then go Serving. The fragment is not authoritative until bootstrap
+/// completes: local reads/writes forward to a serving owner meanwhile.
+async fn gain_fragment(deps: &PlacementDriverDeps, fragment: FragmentId, preloaded: bool) {
+    if preloaded {
+        let actor_loaded = deps.router.route_for_fragment(fragment).is_some();
+        let supervisor_loaded = deps.supervisors.lock().await.contains_key(&fragment);
+        if !actor_loaded || !supervisor_loaded {
+            tracing::error!(
+                fragment = fragment.0,
+                actor_loaded,
+                supervisor_loaded,
+                "dynamic startup preload was incomplete"
+            );
             deps.placement_states.lock().await.remove(&fragment);
             return;
         }
-    };
-    let mut startup_supervisor = SupervisorStartupGuard::new(1);
-    startup_supervisor.push(supervisor.clone());
-    deps.supervisors.lock().await.insert(fragment, supervisor);
-    startup_supervisor.disarm();
-    // The actor exists in the router now (so the reconciler can merge
-    // into it), but the fragment is not serving yet.
-    deps.router.insert(fragment, dispatcher);
+    } else {
+        let (supervisor, dispatcher) = match spawn_fragment_subtree_registered(
+            &deps.node_id,
+            fragment,
+            &deps.subtree_config,
+            &deps.hlc,
+            &deps.supervisor_stops,
+        )
+        .await
+        {
+            Ok(x) => x,
+            Err(e) => {
+                eprintln!("[placement] failed to spawn subtree for {fragment}: {e}");
+                // Drop the Bootstrapping mark so the next tick retries.
+                deps.placement_states.lock().await.remove(&fragment);
+                return;
+            }
+        };
+        let mut startup_supervisor = SupervisorStartupGuard::new(1);
+        startup_supervisor.push(supervisor.clone());
+        deps.supervisors.lock().await.insert(fragment, supervisor);
+        startup_supervisor.disarm();
+        // The actor exists in the router now (so the reconciler can merge
+        // into it), but the fragment is not serving yet.
+        deps.router.insert(fragment, dispatcher);
+    }
 
     if converge_fragment_gain(deps, fragment).await {
         deps.controller.on_fragment_ready(fragment);
@@ -3409,33 +3691,44 @@ async fn bootstrap_from(
     sources: &[String],
 ) -> bool {
     let start = std::time::Instant::now();
-    // Wait for a source peer to be connected.
-    let source = loop {
-        {
-            let peers = deps.peers.lock().await;
-            if let Some(s) = sources.iter().find(|p| peers.contains_key(*p)) {
-                break s.clone();
-            }
-        }
-        if start.elapsed() > BOOTSTRAP_TIMEOUT {
-            return false;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    };
-    let before = deps.sender_rounds(fragment, &source).await.unwrap_or(0);
-    {
-        let senders = deps.senders.lock().await;
-        match senders.get(&(fragment, source.clone())) {
-            Some(tx) => {
-                let _ = tx.send(SenderMsg::ReconcileNow);
-            }
-            None => return false,
-        }
-    }
-    // Wait for the round to complete.
+    let mut baselines = HashMap::<String, u64>::new();
+    // Trigger every connected candidate rather than trusting replica order.
+    // A simultaneously bootstrapping replica is deliberately non-authoritative
+    // and will reject the request; any already-serving holder may complete it.
     loop {
-        if let Some(rounds) = deps.sender_rounds(fragment, &source).await {
-            if rounds > before {
+        let connected: Vec<String> = {
+            let peers = deps.peers.lock().await;
+            sources
+                .iter()
+                .filter(|source| peers.contains_key(*source))
+                .cloned()
+                .collect()
+        };
+        for source in connected {
+            if baselines.contains_key(&source) {
+                continue;
+            }
+            let Some(before) = deps.sender_rounds(fragment, &source).await else {
+                continue;
+            };
+            let sender = deps
+                .senders
+                .lock()
+                .await
+                .get(&(fragment, source.clone()))
+                .cloned();
+            if let Some(sender) = sender {
+                if sender.send(SenderMsg::ReconcileNow).is_ok() {
+                    baselines.insert(source, before);
+                }
+            }
+        }
+        for (source, before) in &baselines {
+            if deps
+                .sender_rounds(fragment, source)
+                .await
+                .map_or(false, |rounds| rounds > *before)
+            {
                 return true;
             }
         }
@@ -3513,9 +3806,7 @@ async fn lose_fragment(deps: &PlacementDriverDeps, fragment: FragmentId) {
         for ((f, p), tx) in senders.iter() {
             if *f == fragment {
                 if let Some(peer_tx) = peers.get(p) {
-                    let _ = tx.send(SenderMsg::PeerConnected {
-                        peer_tx: peer_tx.raw_sender(),
-                    });
+                    let _ = tx.connect_peer(peer_tx.budgeted_sender());
                 }
             }
         }
@@ -3661,6 +3952,212 @@ struct ConnectionOutcome {
     was_established: bool,
 }
 
+struct ServedReconcileState {
+    session_id: u64,
+    round_id: u64,
+    next_page_seq: u64,
+    next_after_key: String,
+    snapshot_revision: u64,
+    snapshot_time_ms: u64,
+    next_fetch_chunk_seq: u64,
+    advertised_keys: HashSet<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct InboundSession {
+    session_id: u64,
+    generation: u64,
+}
+
+type InboundSessions = Arc<Mutex<HashMap<(String, FragmentId), InboundSession>>>;
+
+struct ReconcileResponseJob {
+    peer: String,
+    session: InboundSession,
+    actor: ActorRef<KvMessage>,
+    fetch: ReconcileFetch,
+    snapshot_time_ms: u64,
+}
+
+/// Read an authorized fetch through actor-owned memory-bounded value pages and
+/// emit exact wire-byte-bounded pages. The peer writer's byte semaphore bounds
+/// encoded pages waiting on the socket.
+async fn send_reconcile_data_pages(
+    actor: &ActorRef<KvMessage>,
+    tx: &PeerChannel,
+    fetch: ReconcileFetch,
+    snapshot_time_ms: u64,
+    admission_timeout: Duration,
+) -> bool {
+    let ReconcileFetch {
+        fragment,
+        session_id,
+        round_id,
+        chunk_seq,
+        keys,
+    } = fetch;
+    let keys = Arc::new(keys);
+    let mut next_key_index = 0usize;
+    let mut page = ReconcileData {
+        fragment,
+        entries: Vec::new(),
+        session_id,
+        round_id,
+        chunk_seq,
+        page_seq: 0,
+        done: false,
+    };
+
+    while next_key_index < keys.len() {
+        let request_keys = keys.clone();
+        let value_page = match actor
+            .call(
+                move |reply| KvMessage::GetVersionedPage {
+                    keys: request_keys,
+                    start_index: next_key_index,
+                    snapshot_time_ms: Some(snapshot_time_ms),
+                    reply,
+                },
+                None,
+            )
+            .await
+        {
+            Ok(CallResult::Success(value_page)) => value_page,
+            _ => return false,
+        };
+        if value_page.next_index <= next_key_index || value_page.next_index > keys.len() {
+            return false;
+        }
+        next_key_index = value_page.next_index;
+        for (key, value) in value_page.entries {
+            page.entries.push(SyncEntry {
+                key,
+                value: value.value,
+                timestamp_ms: value.timestamp_ms,
+                node_id: value.node_id,
+                expires_at_ms: value.expires_at_ms.unwrap_or(0),
+                is_tombstone: value.is_tombstone,
+            });
+
+            let encoded_len = message_field_len(14, page.encoded_len());
+            if encoded_len > MAX_FRAME_BYTES && page.entries.len() == 1 {
+                tracing::warn!(
+                    fragment,
+                    round_id,
+                    chunk_seq,
+                    encoded_len,
+                    "one reconcile value exceeds the hard frame limit"
+                );
+                return false;
+            }
+            if encoded_len > MAX_FRAME_BYTES
+                || (encoded_len > ANTI_ENTROPY_PAGE_BYTES && page.entries.len() > 1)
+            {
+                let next = page.entries.pop().expect("multi-entry page");
+                let next_page_seq = page.page_seq.saturating_add(1);
+                if !try_send_envelope_with_admission_timeout(
+                    tx,
+                    Envelope {
+                        msg: Some(EnvelopeMsg::ReconcileData(page)),
+                    },
+                    admission_timeout,
+                )
+                .await
+                {
+                    return false;
+                }
+                page = ReconcileData {
+                    fragment,
+                    entries: vec![next],
+                    session_id,
+                    round_id,
+                    chunk_seq,
+                    page_seq: next_page_seq,
+                    done: false,
+                };
+            }
+        }
+    }
+
+    page.done = true;
+    try_send_envelope_with_admission_timeout(
+        tx,
+        Envelope {
+            msg: Some(EnvelopeMsg::ReconcileData(page)),
+        },
+        admission_timeout,
+    )
+    .await
+}
+
+/// Stream fetch responses outside the connection reader. Keeping outbound
+/// byte admission off that reader is essential: two peers may fetch large
+/// divergent values simultaneously, and each reader must remain available to
+/// drain the other peer's data while its own writer is backpressured.
+async fn run_reconcile_responder(
+    mut jobs: mpsc::Receiver<ReconcileResponseJob>,
+    tx: PeerChannel,
+    sessions: InboundSessions,
+    mut session_changes: watch::Receiver<u64>,
+    admission_timeout: Duration,
+) {
+    let mut cancelled = tx.cancel.subscribe();
+    'jobs: loop {
+        if *cancelled.borrow() {
+            return;
+        }
+        let job = tokio::select! {
+            changed = cancelled.changed() => {
+                let _ = changed;
+                return;
+            }
+            job = jobs.recv() => match job {
+                Some(job) => job,
+                None => return,
+            }
+        };
+        let session_key = (job.peer.clone(), FragmentId(job.fetch.fragment));
+        if sessions.lock().await.get(&session_key).copied() != Some(job.session) {
+            continue;
+        }
+
+        let response = send_reconcile_data_pages(
+            &job.actor,
+            &tx,
+            job.fetch,
+            job.snapshot_time_ms,
+            admission_timeout,
+        );
+        tokio::pin!(response);
+        loop {
+            tokio::select! {
+                changed = cancelled.changed() => {
+                    let _ = changed;
+                    return;
+                }
+                changed = session_changes.changed() => {
+                    if changed.is_err() {
+                        return;
+                    }
+                    if sessions.lock().await.get(&session_key).copied() != Some(job.session) {
+                        // Dropping the response future cancels an in-progress
+                        // actor RPC or outbound admission wait for the stale
+                        // session without disturbing the replacement session.
+                        continue 'jobs;
+                    }
+                }
+                sent = &mut response => {
+                    if !sent {
+                        tx.cancel();
+                        return;
+                    }
+                    continue 'jobs;
+                }
+            }
+        }
+    }
+}
+
 async fn read_connection_frame<R>(
     reader: &mut R,
     cancel: &mut watch::Receiver<bool>,
@@ -3780,7 +4277,6 @@ async fn handle_connection(
         sender_runtime,
         runtime_options,
         sender_reports,
-        sync_entries_applied,
         membership_tx,
         cluster_secret,
     } = ctx;
@@ -3796,18 +4292,47 @@ async fn handle_connection(
     };
     // Phase 5: current session per (peer, fragment) on this connection.
     // Sessions are per-connection: a new connection means a new pairing.
-    let sessions: Arc<Mutex<HashMap<(String, FragmentId), u64>>> =
-        Arc::new(Mutex::new(HashMap::new()));
+    let sessions: InboundSessions = Arc::new(Mutex::new(HashMap::new()));
+    let (session_changes, session_change_rx) = watch::channel(0u64);
+    let mut next_session_generation = 1u64;
     // An untracked reconciliation repair has no individual ACK. Remember its
     // first failure so the following tracked empty barrier NACKs instead of
     // falsely declaring the session converged. A fresh SessionStart clears
     // the poison and lets the sender retry the complete round.
     let mut reconcile_failures: HashMap<(String, FragmentId), (u64, String)> = HashMap::new();
+    // Bounded responder-side authorization. Only the exact next cursor page
+    // and keys advertised by the most recent page may be fetched.
+    let mut served_reconciles: HashMap<(String, FragmentId), ServedReconcileState> = HashMap::new();
     let (mut reader, writer) = tokio::io::split(stream);
-    let (raw_tx, rx) = mpsc::channel::<Vec<u8>>(runtime_options.peer_queue_frame_capacity);
+    let socket_write_timeout = runtime_options.socket_write_timeout;
+    let peer_queue_frame_capacity = runtime_options.peer_queue_frame_capacity;
+    let peer_queue_byte_capacity = runtime_options.peer_queue_byte_capacity;
+    // Split the configured frame budget between ordinary producer traffic and
+    // reader-generated responses. The writer drains responses first, avoiding
+    // the symmetric full-queue deadlock where both peers need to emit an ACK
+    // before either can make progress.
+    let response_frame_capacity = peer_queue_frame_capacity / 2;
+    let producer_frame_capacity = peer_queue_frame_capacity - response_frame_capacity;
+    let (frame_tx, rx) = mpsc::channel::<BudgetedFrame>(producer_frame_capacity);
+    let (response_tx, response_rx) = mpsc::channel::<BudgetedFrame>(response_frame_capacity);
+    // `SenderMsg::PeerDisconnected` is public and historically identifies a
+    // transport with Sender<Vec<u8>>. Keep a live, unsent compatibility token;
+    // Node frames exclusively use the budgeted channel above.
+    let (identity, _identity_rx) = mpsc::channel::<Vec<u8>>(1);
     let (cancel, _) = watch::channel(false);
+    let byte_budget = Arc::new(Semaphore::new(peer_queue_byte_capacity));
+    let producer_byte_budget = Arc::new(Semaphore::new(
+        peer_queue_byte_capacity - PEER_RESPONSE_BYTE_RESERVE,
+    ));
     let mut tx = PeerChannel {
-        tx: raw_tx,
+        outbound: BudgetedPeerTx {
+            tx: frame_tx,
+            response_tx,
+            byte_budget: byte_budget.clone(),
+            producer_byte_budget: producer_byte_budget.clone(),
+            reconcile_gate: ReconcileGate::new(),
+            identity,
+        },
         cancel: cancel.clone(),
         queue_admission_timeout: runtime_options.queue_admission_timeout,
         rank: None,
@@ -3818,8 +4343,6 @@ async fn handle_connection(
     // observed and leave the read side waiting forever.
     let mut read_cancel = cancel.subscribe();
     let writer_cancel_tx = cancel.clone();
-    let socket_write_timeout = runtime_options.socket_write_timeout;
-
     // The writer is independently registered with the Node task manager. The
     // context carries only a Weak reference, avoiding a manager→handler→manager
     // ownership cycle while still making shutdown join both halves.
@@ -3830,9 +4353,14 @@ async fn handle_connection(
                 handshake_deadline,
                 tasks.spawn(async move {
                     let _writer_lease = writer_lease;
-                    run_peer_writer(
+                    run_bounded_peer_writer(
                         writer,
-                        rx,
+                        PeerWriterPipeline {
+                            data_rx: rx,
+                            response_rx,
+                            byte_budget,
+                            producer_byte_budget,
+                        },
                         writer_cancel,
                         writer_cancel_tx,
                         socket_write_timeout,
@@ -3846,6 +4374,39 @@ async fn handle_connection(
         None => false,
     };
     if !writer_registered {
+        return ConnectionOutcome {
+            peer_id: None,
+            was_established: false,
+        };
+    }
+
+    // Fetch responses can span multiple near-limit frames. Produce them in a
+    // bounded connection-owned worker so the reader always keeps consuming
+    // the opposite direction and cannot participate in a bidirectional
+    // socket/byte-budget deadlock.
+    let (reconcile_response_tx, reconcile_response_rx) =
+        mpsc::channel(RECONCILE_RESPONSE_QUEUE_DEPTH);
+    let responder_registered = match tasks.upgrade() {
+        Some(tasks) => {
+            let responder_tx = tx.clone();
+            let admission_timeout = runtime_options.reconcile_data_admission_timeout;
+            tokio::time::timeout_at(
+                handshake_deadline,
+                tasks.spawn(run_reconcile_responder(
+                    reconcile_response_rx,
+                    responder_tx,
+                    sessions.clone(),
+                    session_change_rx,
+                    admission_timeout,
+                )),
+            )
+            .await
+            .unwrap_or(false)
+        }
+        None => false,
+    };
+    if !responder_registered {
+        tx.cancel();
         return ConnectionOutcome {
             peer_id: None,
             was_established: false,
@@ -3878,7 +4439,7 @@ async fn handle_connection(
     let mut authenticated_peer_id = None;
     let mut was_established = false;
     // Length-delimited framing: 4-byte big-endian length prefix.
-    loop {
+    'connection: loop {
         let Some(buf) = read_connection_frame(
             &mut reader,
             &mut read_cancel,
@@ -3890,6 +4451,10 @@ async fn handle_connection(
         else {
             break;
         };
+        if let Err(error) = preflight_envelope_decode(&buf) {
+            tracing::warn!(%error, "rejecting inbound peer frame before protobuf allocation");
+            break;
+        }
         let envelope = match Envelope::decode(&buf[..]) {
             Ok(e) => e,
             Err(_) => break,
@@ -3990,13 +4555,11 @@ async fn handle_connection(
                 handshake = HandshakeState::Established { peer: peer.clone() };
                 was_established = true;
 
-                // Both sides then pull the fragments they serve
-                // for anti-entropy — unless dynamic placement is on, in
-                // which case the Phase 5 reconciler owns anti-entropy
-                // (delta-only; no full-state copy).
-                if !dynamic_placement {
-                    send_sync_request(&tx, router.fragment_ids()).await;
-                }
+                // Both static and dynamic placement use the same correlated,
+                // byte-bounded reconciliation protocol. The legacy
+                // SyncRequest/SyncResponse exchange is deliberately retired:
+                // keeping a second monolithic bootstrap path would re-open
+                // the frame and memory bounds enforced by protocol v3.
                 // Phase 8: wake the placement driver so the controller
                 // sees the membership change promptly.
                 if let Some(mtx) = membership_tx.clone() {
@@ -4055,9 +4618,10 @@ async fn handle_connection(
                     let senders_guard = senders.lock().await;
                     for ((_, sender_peer), sender_tx) in senders_guard.iter() {
                         if sender_peer == &peer {
-                            let _ = sender_tx.send(SenderMsg::PeerConnected {
-                                peer_tx: tx.raw_sender(),
-                            });
+                            let _ = sender_tx.connect_peer(tx.budgeted_sender());
+                            if !dynamic_placement {
+                                let _ = sender_tx.send(SenderMsg::ReconcileNow);
+                            }
                         }
                     }
                 }
@@ -4091,13 +4655,41 @@ async fn handle_connection(
                 }
                 if let Some(peer) = peer_node_id.clone() {
                     let key = (peer, fragment);
-                    let previous = sessions.lock().await.insert(key.clone(), s.session_id);
-                    if previous != Some(s.session_id) {
+                    let changed = {
+                        let mut sessions = sessions.lock().await;
+                        if sessions
+                            .get(&key)
+                            .map_or(false, |session| session.session_id == s.session_id)
+                        {
+                            false
+                        } else {
+                            let generation = next_session_generation;
+                            next_session_generation =
+                                next_session_generation.wrapping_add(1).max(1);
+                            sessions.insert(
+                                key.clone(),
+                                InboundSession {
+                                    session_id: s.session_id,
+                                    generation,
+                                },
+                            );
+                            true
+                        }
+                    };
+                    if changed {
                         reconcile_failures.remove(&key);
+                        served_reconciles.remove(&key);
+                        session_changes.send_modify(|generation| {
+                            *generation = generation.wrapping_add(1);
+                        });
                     }
                 }
             }
             Some(EnvelopeMsg::ReplicateBatch(b)) => {
+                if b.ops.len() > MAX_WIRE_BATCH_ITEMS {
+                    tracing::warn!(item_count = b.ops.len(), "replication batch is too large");
+                    break;
+                }
                 // Validate the session and the whole batch before applying
                 // anything. An ACK is sent only after every exact outcome is
                 // known and the sender's requested fence is reached.
@@ -4108,7 +4700,7 @@ async fn handle_connection(
                 let frag = FragmentId(b.fragment);
                 let session_key = (peer.clone(), frag);
                 let current = sessions.lock().await.get(&session_key).copied();
-                if current != Some(b.session_id) {
+                if current.map(|session| session.session_id) != Some(b.session_id) {
                     continue; // stale session
                 }
                 // Dynamic placement teardown takes the exclusive side of this
@@ -4121,6 +4713,7 @@ async fn handle_connection(
                     None
                 };
                 let tracked = b.batch_seq != u64::MAX;
+                let reconcile_barrier = tracked && b.ops.is_empty();
                 let requested_ack = if tracked {
                     match ReplicationAckLevel::try_from(b.required_ack_level) {
                         Ok(ReplicationAckLevel::Applied) => {
@@ -4186,6 +4779,10 @@ async fn handle_connection(
                             seq: op.seq,
                             boot_id: op.boot_id,
                         };
+                        if let Err(error) = validate_replicated_op(&replicated) {
+                            failure = Some(error.to_string());
+                            break;
+                        }
                         if let Err(error) =
                             call_apply(actor, replicated, OpPriority::Default, true).await
                         {
@@ -4215,6 +4812,13 @@ async fn handle_connection(
                     None
                 };
 
+                if reconcile_barrier {
+                    // The empty tracked batch is the reconcile durability
+                    // barrier. Its ACK or NACK ends this responder round, so
+                    // no fetch authorization may survive into a retry.
+                    served_reconciles.remove(&session_key);
+                }
+
                 if tracked {
                     let response = if let Some(error) = failure {
                         EnvelopeMsg::BatchNack(BatchNack {
@@ -4235,13 +4839,14 @@ async fn handle_connection(
                             level: level as i32,
                         })
                     };
-                    send_envelope(
+                    if !send_envelope(
                         &tx,
                         Envelope {
                             msg: Some(response),
                         },
-                    )
-                    .await;
+                    ) {
+                        break;
+                    }
                 } else if let Some(error) = failure {
                     reconcile_failures
                         .entry(session_key)
@@ -4305,16 +4910,19 @@ async fn handle_connection(
                 }
             }
             Some(EnvelopeMsg::ReconcileRequest(r)) => {
-                // Peer wants our (timestamp, tombstone) summaries.
+                // Peer wants one stable, ordered page of version summaries.
                 let peer = match peer_node_id.clone() {
                     Some(peer) => peer,
                     None => continue,
                 };
                 let frag = FragmentId(r.fragment);
-                let current = sessions.lock().await.get(&(peer, frag)).copied();
+                let current = sessions.lock().await.get(&(peer.clone(), frag)).copied();
                 // Both identifiers are nonzero so old senders, whose newly
                 // added scalar fields decode to defaults, fail closed.
-                if r.session_id == 0 || r.round_id == 0 || current != Some(r.session_id) {
+                if r.session_id == 0
+                    || r.round_id == 0
+                    || current.map(|session| session.session_id) != Some(r.session_id)
+                {
                     tracing::debug!(
                         fragment = r.fragment,
                         session_id = r.session_id,
@@ -4323,43 +4931,177 @@ async fn handle_connection(
                     );
                     continue;
                 }
+                if !serving.read().unwrap().contains(&frag) {
+                    tracing::warn!(
+                        peer = %peer,
+                        fragment = r.fragment,
+                        round_id = r.round_id,
+                        "rejecting reconciliation from a non-serving fragment"
+                    );
+                    break;
+                }
+                let first_page = r.page_seq == 0;
+                let reconcile_key = (peer.clone(), frag);
+                if (first_page
+                    && (!r.after_key.is_empty()
+                        || r.snapshot_revision != 0
+                        || r.snapshot_time_ms != 0))
+                    || (!first_page && r.snapshot_time_ms == 0)
+                {
+                    tracing::warn!(
+                        peer = %peer,
+                        fragment = r.fragment,
+                        round_id = r.round_id,
+                        page_seq = r.page_seq,
+                        "rejecting malformed reconcile page request"
+                    );
+                    break;
+                }
+                if !first_page
+                    && !served_reconciles
+                        .get(&reconcile_key)
+                        .map_or(false, |state| {
+                            state.session_id == r.session_id
+                                && state.round_id == r.round_id
+                                && state.next_page_seq == r.page_seq
+                                && state.next_after_key == r.after_key
+                                && state.snapshot_revision == r.snapshot_revision
+                                && state.snapshot_time_ms == r.snapshot_time_ms
+                        })
+                {
+                    tracing::warn!(
+                        peer = %peer,
+                        fragment = r.fragment,
+                        round_id = r.round_id,
+                        page_seq = r.page_seq,
+                        "rejecting unexpected reconcile continuation"
+                    );
+                    break;
+                }
                 if let Some(actor) = router.route_for_fragment(frag) {
-                    if let Ok(CallResult::Success(map)) =
-                        actor.call(|reply| KvMessage::GetAll { reply }, None).await
+                    if let Ok(CallResult::Success(page)) = actor
+                        .call(
+                            |reply| KvMessage::GetSummaryPage {
+                                after_key: (!first_page).then_some(r.after_key.clone()),
+                                // Do not hold or clone a fragment-wide
+                                // snapshot across network turns. Revision
+                                // drift is returned to the requester, which
+                                // completes this bounded pass and then runs a
+                                // mutation-free verification pass.
+                                expected_revision: None,
+                                snapshot_time_ms: (!first_page).then_some(r.snapshot_time_ms),
+                                limit: RECONCILE_SUMMARY_PAGE_ITEMS,
+                                reply,
+                            },
+                            None,
+                        )
+                        .await
                     {
-                        let summaries = map
+                        let summaries: Vec<KeySummary> = page
+                            .summaries
                             .into_iter()
-                            .map(|(key, v): (String, VersionedValue)| KeySummary {
-                                key,
-                                timestamp_ms: v.timestamp_ms,
-                                node_id: v.node_id,
-                                is_tombstone: v.is_tombstone,
+                            .map(|summary| KeySummary {
+                                key: summary.key,
+                                timestamp_ms: summary.timestamp_ms,
+                                node_id: summary.node_id,
+                                is_tombstone: summary.is_tombstone,
                             })
                             .collect();
-                        send_envelope(
-                            &tx,
-                            Envelope {
-                                msg: Some(EnvelopeMsg::ReconcileResponse(ReconcileResponse {
-                                    fragment: r.fragment,
-                                    summaries,
-                                    session_id: r.session_id,
-                                    round_id: r.round_id,
-                                })),
-                            },
-                        )
-                        .await;
+                        let original_len = summaries.len();
+                        let mut response = ReconcileResponse {
+                            fragment: r.fragment,
+                            summaries,
+                            session_id: r.session_id,
+                            round_id: r.round_id,
+                            page_seq: r.page_seq,
+                            next_after_key: String::new(),
+                            snapshot_revision: page.revision,
+                            snapshot_time_ms: page.snapshot_time_ms,
+                            done: false,
+                            restart: page.restart,
+                        };
+                        loop {
+                            response.next_after_key = response
+                                .summaries
+                                .last()
+                                .map(|summary| summary.key.clone())
+                                .unwrap_or_else(|| r.after_key.clone());
+                            response.done = page.done && response.summaries.len() == original_len;
+                            let encoded_len = message_field_len(12, response.encoded_len());
+                            if encoded_len > MAX_FRAME_BYTES && response.summaries.len() <= 1 {
+                                tracing::warn!(
+                                    peer = %peer,
+                                    fragment = r.fragment,
+                                    round_id = r.round_id,
+                                    page_seq = r.page_seq,
+                                    encoded_len,
+                                    "one reconcile summary exceeds the hard frame limit"
+                                );
+                                break 'connection;
+                            }
+                            if encoded_len <= ANTI_ENTROPY_PAGE_BYTES
+                                || (response.summaries.len() <= 1 && encoded_len <= MAX_FRAME_BYTES)
+                            {
+                                let (snapshot_revision, snapshot_time_ms, next_fetch_chunk_seq) =
+                                    if first_page {
+                                        (response.snapshot_revision, response.snapshot_time_ms, 0)
+                                    } else {
+                                        let state = served_reconciles
+                                            .get(&reconcile_key)
+                                            .expect("validated continuation");
+                                        (
+                                            state.snapshot_revision,
+                                            state.snapshot_time_ms,
+                                            state.next_fetch_chunk_seq,
+                                        )
+                                    };
+                                let served_state =
+                                    (!response.restart).then(|| ServedReconcileState {
+                                        session_id: response.session_id,
+                                        round_id: response.round_id,
+                                        next_page_seq: response.page_seq.saturating_add(1),
+                                        next_after_key: response.next_after_key.clone(),
+                                        snapshot_revision,
+                                        snapshot_time_ms,
+                                        next_fetch_chunk_seq,
+                                        advertised_keys: response
+                                            .summaries
+                                            .iter()
+                                            .map(|summary| summary.key.clone())
+                                            .collect(),
+                                    });
+                                let envelope = Envelope {
+                                    msg: Some(EnvelopeMsg::ReconcileResponse(response)),
+                                };
+                                if !try_send_envelope_immediate(&tx, envelope) {
+                                    break 'connection;
+                                }
+                                if let Some(state) = served_state {
+                                    served_reconciles.insert(reconcile_key.clone(), state);
+                                } else {
+                                    served_reconciles.remove(&reconcile_key);
+                                }
+                                break;
+                            }
+                            response.summaries.pop().expect("non-singleton page");
+                        }
                     }
                 }
             }
             Some(EnvelopeMsg::ReconcileFetch(f)) => {
-                // Peer wants full values for these keys.
+                // Peer wants full values for a bounded key batch. Read values
+                // incrementally and stream exact-byte-bounded pages so neither
+                // the cache lock nor this connection owns an unbounded clone.
                 let peer = match peer_node_id.clone() {
                     Some(peer) => peer,
                     None => continue,
                 };
                 let frag = FragmentId(f.fragment);
-                let current = sessions.lock().await.get(&(peer, frag)).copied();
-                if f.session_id == 0 || f.round_id == 0 || current != Some(f.session_id) {
+                let current = sessions.lock().await.get(&(peer.clone(), frag)).copied();
+                if f.session_id == 0
+                    || f.round_id == 0
+                    || current.map(|session| session.session_id) != Some(f.session_id)
+                {
                     tracing::debug!(
                         fragment = f.fragment,
                         session_id = f.session_id,
@@ -4369,41 +5111,92 @@ async fn handle_connection(
                     );
                     continue;
                 }
+                if !serving.read().unwrap().contains(&frag) {
+                    tracing::warn!(
+                        peer = %peer,
+                        fragment = f.fragment,
+                        round_id = f.round_id,
+                        chunk_seq = f.chunk_seq,
+                        "rejecting reconciliation fetch from a non-serving fragment"
+                    );
+                    break;
+                }
+                if f.keys.is_empty() || f.keys.len() > MAX_RECONCILE_FETCH_KEYS {
+                    tracing::warn!(
+                        peer = %peer,
+                        fragment = f.fragment,
+                        round_id = f.round_id,
+                        chunk_seq = f.chunk_seq,
+                        key_count = f.keys.len(),
+                        "rejecting reconcile fetch outside the key-count bound"
+                    );
+                    break;
+                }
+                let mut unique_keys = HashSet::with_capacity(f.keys.len());
+                if f.keys.iter().any(|key| {
+                    !router.key_belongs_to(frag, key) || !unique_keys.insert(key.as_str())
+                }) {
+                    tracing::warn!(
+                        peer = %peer,
+                        fragment = f.fragment,
+                        round_id = f.round_id,
+                        chunk_seq = f.chunk_seq,
+                        "rejecting duplicate or wrong-fragment reconcile fetch"
+                    );
+                    break;
+                }
+                let reconcile_key = (peer.clone(), frag);
+                let snapshot_time_ms =
+                    served_reconciles.get_mut(&reconcile_key).and_then(|state| {
+                        if state.session_id != f.session_id
+                            || state.round_id != f.round_id
+                            || state.next_fetch_chunk_seq != f.chunk_seq
+                            || !f.keys.iter().all(|key| state.advertised_keys.contains(key))
+                        {
+                            return None;
+                        }
+                        for key in &f.keys {
+                            state.advertised_keys.remove(key);
+                        }
+                        state.next_fetch_chunk_seq = state.next_fetch_chunk_seq.saturating_add(1);
+                        Some(state.snapshot_time_ms)
+                    });
+                let Some(snapshot_time_ms) = snapshot_time_ms else {
+                    tracing::warn!(
+                        peer = %peer,
+                        fragment = f.fragment,
+                        round_id = f.round_id,
+                        chunk_seq = f.chunk_seq,
+                        "rejecting unadvertised or out-of-order reconcile fetch"
+                    );
+                    break;
+                };
                 if let Some(actor) = router.route_for_fragment(frag) {
-                    if let Ok(CallResult::Success(map)) =
-                        actor.call(|reply| KvMessage::GetAll { reply }, None).await
-                    {
-                        let entries = f
-                            .keys
-                            .into_iter()
-                            .filter_map(|key| {
-                                map.get(&key).map(|v| SyncEntry {
-                                    key: key.clone(),
-                                    value: v.value.clone(),
-                                    timestamp_ms: v.timestamp_ms,
-                                    node_id: v.node_id.clone(),
-                                    expires_at_ms: v.expires_at_ms.unwrap_or(0),
-                                    is_tombstone: v.is_tombstone,
-                                })
-                            })
-                            .collect();
-                        send_envelope(
-                            &tx,
-                            Envelope {
-                                msg: Some(EnvelopeMsg::ReconcileData(ReconcileData {
-                                    fragment: f.fragment,
-                                    entries,
-                                    session_id: f.session_id,
-                                    round_id: f.round_id,
-                                    chunk_seq: f.chunk_seq,
-                                })),
-                            },
-                        )
-                        .await;
+                    let job = ReconcileResponseJob {
+                        peer: peer.clone(),
+                        session: current.expect("validated reconcile fetch session"),
+                        actor,
+                        fetch: f,
+                        snapshot_time_ms,
+                    };
+                    if reconcile_response_tx.try_send(job).is_err() {
+                        tracing::warn!(
+                            peer = %peer,
+                            fragment = frag.0,
+                            "reconcile response queue is unavailable or at capacity"
+                        );
+                        break;
                     }
                 }
             }
             Some(EnvelopeMsg::ReconcileResponse(r)) => {
+                if r.summaries.len() > MAX_RECONCILE_PAGE_ITEMS {
+                    tracing::warn!(
+                        item_count = r.summaries.len(),
+                        "reconcile summary page is too large"
+                    );
+                    break;
+                }
                 // Zero is the protobuf default for peers that do not speak
                 // the correlated reconcile protocol. Reject it before it can
                 // influence the HLC or reach a sender.
@@ -4427,6 +5220,12 @@ async fn handle_connection(
                         match tx.send(SenderMsg::ReconcileResponse {
                             session_id: r.session_id,
                             round_id: r.round_id,
+                            page_seq: r.page_seq,
+                            next_after_key: r.next_after_key,
+                            snapshot_revision: r.snapshot_revision,
+                            snapshot_time_ms: r.snapshot_time_ms,
+                            done: r.done,
+                            restart: r.restart,
                             summaries: r.summaries,
                             connection_valid,
                         }) {
@@ -4463,6 +5262,13 @@ async fn handle_connection(
                 }
             }
             Some(EnvelopeMsg::ReconcileData(d)) => {
+                if d.entries.len() > MAX_RECONCILE_PAGE_ITEMS {
+                    tracing::warn!(
+                        item_count = d.entries.len(),
+                        "reconcile data page is too large"
+                    );
+                    break;
+                }
                 if d.session_id == 0 || d.round_id == 0 {
                     tracing::debug!(
                         fragment = d.fragment,
@@ -4482,6 +5288,8 @@ async fn handle_connection(
                             session_id: d.session_id,
                             round_id: d.round_id,
                             chunk_seq: d.chunk_seq,
+                            page_seq: d.page_seq,
+                            done: d.done,
                             entries: d.entries,
                             connection_valid,
                         }) {
@@ -4557,26 +5365,28 @@ async fn handle_connection(
                         ),
                     };
                     drop(mutation_lease);
-                    send_mutation_response(
+                    if !send_mutation_response(
                         &tx,
                         MutationResponse {
                             req_id: p.req_id,
                             results: vec![result],
                         },
-                    )
-                    .await;
+                    ) {
+                        break;
+                    }
                 } else if p.hops < MAX_FORWARD_HOPS {
                     drop(mutation_lease);
                     relay_put(p, frag, &tx, &peer_node_id, &rfctx).await;
                 } else {
                     drop(mutation_lease);
-                    send_unavailable_mutation(
+                    if !send_unavailable_mutation(
                         &tx,
                         p.req_id,
                         vec![p.key],
                         "forward hop limit reached",
-                    )
-                    .await;
+                    ) {
+                        break;
+                    }
                 }
             }
             Some(EnvelopeMsg::ForwardedGet(g)) => {
@@ -4626,7 +5436,7 @@ async fn handle_connection(
                     ),
                     None => (false, Vec::new(), 0, String::new(), 0, false),
                 };
-                send_envelope(
+                if !send_envelope(
                     &tx,
                     Envelope {
                         msg: Some(EnvelopeMsg::GetResponse(GetResponse {
@@ -4640,8 +5450,9 @@ async fn handle_connection(
                             shed,
                         })),
                     },
-                )
-                .await;
+                ) {
+                    break;
+                }
             }
             Some(EnvelopeMsg::GetResponse(r)) => {
                 if r.found && !observe_remote_timestamp(&hlc, r.timestamp_ms, "GetResponse").await {
@@ -4652,7 +5463,7 @@ async fn handle_connection(
                 let relay = { pending_relays.lock().await.remove(&r.req_id) };
                 if let Some(relay) = relay {
                     let _ = relay.timeout_cancel.send(());
-                    send_envelope(
+                    let _ = send_envelope(
                         &relay.origin_tx,
                         Envelope {
                             msg: Some(EnvelopeMsg::GetResponse(GetResponse {
@@ -4660,8 +5471,7 @@ async fn handle_connection(
                                 ..r
                             })),
                         },
-                    )
-                    .await;
+                    );
                     continue;
                 }
                 if let Some(resp_tx) = pending_gets.lock().unwrap().remove(&r.req_id) {
@@ -4688,6 +5498,13 @@ async fn handle_connection(
                 }
             }
             Some(EnvelopeMsg::MutationResponse(mut response)) => {
+                if response.results.len() > MAX_WIRE_BATCH_ITEMS {
+                    tracing::warn!(
+                        item_count = response.results.len(),
+                        "mutation response is too large"
+                    );
+                    break;
+                }
                 let Some(peer) = peer_node_id.clone() else {
                     continue;
                 };
@@ -4743,7 +5560,7 @@ async fn handle_connection(
                 if let Some(relay) = relay {
                     let _ = relay.timeout_cancel.send(());
                     response.req_id = relay.origin_req_id;
-                    send_mutation_response(&relay.origin_tx, response).await;
+                    let _ = send_mutation_response(&relay.origin_tx, response);
                     continue;
                 }
 
@@ -4763,6 +5580,13 @@ async fn handle_connection(
                 }
             }
             Some(EnvelopeMsg::BatchPut(bp)) => {
+                if bp.puts.len() > MAX_WIRE_BATCH_ITEMS {
+                    tracing::warn!(
+                        item_count = bp.puts.len(),
+                        "forwarded mutation batch is too large"
+                    );
+                    break;
+                }
                 let batch_priority = priority_from_proto(bp.priority);
                 if let Some(timestamp_ms) = bp.puts.iter().map(|p| p.timestamp_ms).max() {
                     if !observe_remote_timestamp(&hlc, timestamp_ms, "BatchPut").await {
@@ -4775,14 +5599,15 @@ async fn handle_connection(
                     .first()
                     .map(|p| fragment_of(&p.key, router.fragment_count))
                 else {
-                    send_mutation_response(
+                    if !send_mutation_response(
                         &tx,
                         MutationResponse {
                             req_id: bp.req_id,
                             results: Vec::new(),
                         },
-                    )
-                    .await;
+                    ) {
+                        break;
+                    }
                     continue;
                 };
                 if bp
@@ -4790,13 +5615,14 @@ async fn handle_connection(
                     .iter()
                     .any(|p| fragment_of(&p.key, router.fragment_count) != frag)
                 {
-                    send_unavailable_mutation(
+                    if !send_unavailable_mutation(
                         &tx,
                         bp.req_id,
                         keys,
                         "batch contains keys from multiple fragments",
-                    )
-                    .await;
+                    ) {
+                        break;
+                    }
                     continue;
                 }
 
@@ -4812,26 +5638,28 @@ async fn handle_connection(
                     if max_hops < MAX_FORWARD_HOPS {
                         relay_batch(bp, frag, &tx, &peer_node_id, &rfctx).await;
                     } else {
-                        send_unavailable_mutation(
+                        if !send_unavailable_mutation(
                             &tx,
                             bp.req_id,
                             keys,
                             "forward hop limit reached",
-                        )
-                        .await;
+                        ) {
+                            break;
+                        }
                     }
                     continue;
                 }
 
                 let Some(actor) = router.route_for_fragment(frag) else {
                     drop(mutation_lease);
-                    send_unavailable_mutation(
+                    if !send_unavailable_mutation(
                         &tx,
                         bp.req_id,
                         keys,
                         "serving fragment has no actor",
-                    )
-                    .await;
+                    ) {
+                        break;
+                    }
                     continue;
                 };
                 let req_id = bp.req_id;
@@ -4861,9 +5689,18 @@ async fn handle_connection(
                     );
                 }
                 drop(mutation_lease);
-                send_mutation_response(&tx, MutationResponse { req_id, results }).await;
+                if !send_mutation_response(&tx, MutationResponse { req_id, results }) {
+                    break;
+                }
             }
             Some(EnvelopeMsg::BatchGet(bg)) => {
+                if bg.keys.len() > MAX_WIRE_BATCH_ITEMS {
+                    tracing::warn!(
+                        item_count = bg.keys.len(),
+                        "forwarded read batch is too large"
+                    );
+                    break;
+                }
                 // Phase 6: serve a batch of reads. Phase 7: the batch
                 // carries one priority applied to every get.
                 let batch_priority = priority_from_proto(bg.priority);
@@ -4910,7 +5747,7 @@ async fn handle_connection(
                         shed,
                     });
                 }
-                send_envelope(
+                if !send_envelope(
                     &tx,
                     Envelope {
                         msg: Some(EnvelopeMsg::BatchGetResponse(BatchGetResponse {
@@ -4918,10 +5755,15 @@ async fn handle_connection(
                             results,
                         })),
                     },
-                )
-                .await;
+                ) {
+                    break;
+                }
             }
             Some(EnvelopeMsg::BatchGetResponse(r)) => {
+                if r.results.len() > MAX_WIRE_BATCH_ITEMS {
+                    tracing::warn!(item_count = r.results.len(), "read response is too large");
+                    break;
+                }
                 if let Some(timestamp_ms) = r
                     .results
                     .iter()
@@ -4937,94 +5779,13 @@ async fn handle_connection(
                     let _ = resp_tx.send(r.results);
                 }
             }
-            Some(EnvelopeMsg::SyncRequest(req)) => {
-                // Send only the requested fragments we serve. An empty
-                // request means "everything you hold".
-                let wanted: Vec<FragmentId> = if req.fragments.is_empty() {
-                    router.actors.read().unwrap().keys().copied().collect()
-                } else {
-                    req.fragments
-                        .iter()
-                        .map(|f| FragmentId(*f))
-                        .filter(|f| router.actors.read().unwrap().contains_key(f))
-                        .collect()
-                };
-                let mut all = HashMap::new();
-                for frag in wanted {
-                    if let Some(actor) = router.route_for_fragment(frag) {
-                        if let Ok(CallResult::Success(map)) =
-                            actor.call(|reply| KvMessage::GetAll { reply }, None).await
-                        {
-                            all.extend(map);
-                        }
-                    }
-                }
-                {
-                    let entries = all
-                        .into_iter()
-                        .map(|(key, v)| SyncEntry {
-                            key,
-                            value: v.value,
-                            timestamp_ms: v.timestamp_ms,
-                            node_id: v.node_id,
-                            expires_at_ms: v.expires_at_ms.unwrap_or(0),
-                            is_tombstone: v.is_tombstone,
-                        })
-                        .collect();
-                    send_envelope(
-                        &tx,
-                        Envelope {
-                            msg: Some(EnvelopeMsg::SyncResponse(SyncResponse { entries })),
-                        },
-                    )
-                    .await;
-                }
-            }
-            Some(EnvelopeMsg::SyncResponse(resp)) => {
-                // Merge-only: sync never re-broadcasts (the gossiper
-                // already has these ops; everyone else will get them
-                // through normal gossip or their own sync).
-                if let Some(timestamp_ms) = resp.entries.iter().map(|e| e.timestamp_ms).max() {
-                    if !observe_remote_timestamp(&hlc, timestamp_ms, "SyncResponse").await {
-                        break;
-                    }
-                }
-                let mut sync_failed = false;
-                for e in resp.entries {
-                    let op = ReplicatedOp {
-                        key: e.key,
-                        value: {
-                            let mut v = VersionedValue::new(e.value, e.timestamp_ms, e.node_id);
-                            v.expires_at_ms = if e.expires_at_ms == 0 {
-                                None
-                            } else {
-                                Some(e.expires_at_ms)
-                            };
-                            v.is_tombstone = e.is_tombstone;
-                            v
-                        },
-                        seq: 0,     // seq/boot_id are propagation concerns;
-                        boot_id: 0, // sync is not gossip
-                    };
-                    if let Some(actor) = router.route(&op.key) {
-                        match call_apply(&actor, op, OpPriority::Background, true).await {
-                            Ok(_) => {
-                                sync_entries_applied.fetch_add(1, Ordering::Relaxed);
-                            }
-                            Err(error) => {
-                                tracing::warn!(
-                                    %error,
-                                    "full-state sync apply failed; closing connection for retry"
-                                );
-                                sync_failed = true;
-                                break;
-                            }
-                        }
-                    }
-                }
-                if sync_failed {
-                    break;
-                }
+            Some(EnvelopeMsg::SyncRequest(_)) | Some(EnvelopeMsg::SyncResponse(_)) => {
+                // Protocol v3 deliberately has one anti-entropy engine. A
+                // negotiated v3 peer that sends a legacy full-sync frame is
+                // either malformed or has falsely advertised capabilities;
+                // fail closed instead of rebuilding an unbounded response.
+                tracing::warn!("closing peer that sent a retired full-state sync frame");
+                break;
             }
             None => {}
         }
@@ -5034,9 +5795,10 @@ async fn handle_connection(
     // is still current. Legacy full-replication peers are discovered at
     // runtime, so reap their per-fragment senders on disconnect rather than
     // letting sequential claimed identities grow the sender maps forever.
-    // The next handshake's mandatory full-state exchange covers writes made
-    // while that peer is absent. Explicit placement maps retain sender buffers
-    // because their peer cardinality is configured and bounded.
+    // The next established session's immediate correlated reconciliation
+    // covers writes made while that peer is absent. Explicit placement maps
+    // retain sender buffers because their peer cardinality is configured and
+    // bounded.
     let mut disconnected_senders = Vec::new();
     if let Some(peer) = handshake.established_peer_id().map(str::to_owned) {
         let mut guard = peers.lock().await;
@@ -5085,6 +5847,7 @@ async fn handle_connection(
             }
         }
     }
+    drop(reconcile_response_tx);
     tx.cancel();
     for sender in disconnected_senders {
         sender.join().await;
@@ -5142,7 +5905,12 @@ fn unavailable_mutation_results(keys: Vec<String>, reason: &str) -> Vec<Mutation
         .collect()
 }
 
-async fn send_unavailable_mutation(tx: &PeerChannel, req_id: u64, keys: Vec<String>, reason: &str) {
+fn send_unavailable_mutation(
+    tx: &PeerChannel,
+    req_id: u64,
+    keys: Vec<String>,
+    reason: &str,
+) -> bool {
     send_mutation_response(
         tx,
         MutationResponse {
@@ -5150,17 +5918,15 @@ async fn send_unavailable_mutation(tx: &PeerChannel, req_id: u64, keys: Vec<Stri
             results: unavailable_mutation_results(keys, reason),
         },
     )
-    .await;
 }
 
-async fn send_mutation_response(tx: &PeerChannel, response: MutationResponse) -> bool {
-    try_send_envelope(
+fn send_mutation_response(tx: &PeerChannel, response: MutationResponse) -> bool {
+    try_send_envelope_immediate(
         tx,
         Envelope {
             msg: Some(EnvelopeMsg::MutationResponse(response)),
         },
     )
-    .await
 }
 
 async fn register_mutation_relay(
@@ -5197,13 +5963,12 @@ async fn register_mutation_relay(
             _ = tokio::time::sleep_until(deadline) => {
                 let relay = { timeout_relays.lock().await.remove(&relay_id) };
                 if let Some(relay) = relay {
-                    send_unavailable_mutation(
+                    let _ = send_unavailable_mutation(
                         &relay.origin_tx,
                         relay.origin_req_id,
                         timeout_keys,
                         "forwarded mutation relay timed out",
-                    )
-                    .await;
+                    );
                 }
             }
             _ = cancelled => {}
@@ -5266,13 +6031,12 @@ async fn relay_put(
     let original_req_id = p.req_id;
     let keys = vec![p.key.clone()];
     let Some((owner, owner_tx)) = reforward_target(ctx, peer_node_id, frag).await else {
-        send_unavailable_mutation(
+        let _ = send_unavailable_mutation(
             origin_tx,
             original_req_id,
             keys,
             "no connected owner available for mutation relay",
-        )
-        .await;
+        );
         return;
     };
     let relay_id = ctx.next_req_id.fetch_add(1, Ordering::Relaxed);
@@ -5304,13 +6068,12 @@ async fn relay_put(
         let relay = { ctx.pending_mutation_relays.lock().await.remove(&relay_id) };
         if let Some(relay) = relay {
             let _ = relay.timeout_cancel.send(());
-            send_unavailable_mutation(
+            let _ = send_unavailable_mutation(
                 &relay.origin_tx,
                 relay.origin_req_id,
                 keys,
                 "mutation relay connection closed while sending",
-            )
-            .await;
+            );
         }
     }
 }
@@ -5326,13 +6089,12 @@ async fn relay_batch(
     let original_req_id = bp.req_id;
     let keys: Vec<String> = bp.puts.iter().map(|put| put.key.clone()).collect();
     let Some((owner, owner_tx)) = reforward_target(ctx, peer_node_id, frag).await else {
-        send_unavailable_mutation(
+        let _ = send_unavailable_mutation(
             origin_tx,
             original_req_id,
             keys,
             "no connected owner available for batch relay",
-        )
-        .await;
+        );
         return;
     };
     let relay_id = ctx.next_req_id.fetch_add(1, Ordering::Relaxed);
@@ -5366,13 +6128,12 @@ async fn relay_batch(
         let relay = { ctx.pending_mutation_relays.lock().await.remove(&relay_id) };
         if let Some(relay) = relay {
             let _ = relay.timeout_cancel.send(());
-            send_unavailable_mutation(
+            let _ = send_unavailable_mutation(
                 &relay.origin_tx,
                 relay.origin_req_id,
                 keys,
                 "batch relay connection closed while sending",
-            )
-            .await;
+            );
         }
     }
 }
@@ -5638,24 +6399,57 @@ fn connection_rank(dialer: &Hello, listener: &Hello) -> ConnectionRank {
     }
 }
 
-async fn send_sync_request(tx: &PeerChannel, fragments: Vec<u32>) {
-    send_envelope(
-        tx,
-        Envelope {
-            msg: Some(EnvelopeMsg::SyncRequest(crate::proto::SyncRequest {
-                fragments,
-            })),
-        },
-    )
-    .await;
+fn send_envelope(tx: &PeerChannel, envelope: Envelope) -> bool {
+    try_send_envelope_immediate(tx, envelope)
 }
 
-async fn send_envelope(tx: &PeerChannel, envelope: Envelope) {
-    let _ = try_send_envelope(tx, envelope).await;
+/// Admit a reader-generated response without ever parking the sole socket
+/// reader behind its own writer. The writer drains this reserved lane before
+/// ordinary producer traffic. Saturation cancels the physical connection;
+/// correlated senders then retry, while the reader remains available to drain
+/// frames that let the opposite writer make progress.
+fn try_send_envelope_immediate(tx: &PeerChannel, envelope: Envelope) -> bool {
+    let encoded_len = match check_envelope_budget(&envelope, MAX_FRAME_BYTES) {
+        Ok(encoded_len) => encoded_len,
+        Err(error) => {
+            tracing::warn!(%error, "rejecting oversized or invalid outbound peer frame");
+            return false;
+        }
+    };
+    let frame_permit = match tx.outbound.response_tx.try_reserve() {
+        Ok(permit) => permit,
+        Err(_) => {
+            tx.cancel();
+            return false;
+        }
+    };
+    let byte_permit = match tx
+        .outbound
+        .byte_budget
+        .clone()
+        .try_acquire_many_owned(encoded_len as u32)
+    {
+        Ok(permit) => permit,
+        Err(_) => {
+            drop(frame_permit);
+            tx.cancel();
+            return false;
+        }
+    };
+    let frame = match encode_envelope(&envelope) {
+        Ok(frame) => frame,
+        Err(error) => {
+            tracing::warn!(%error, "failed to encode preflighted outbound peer frame");
+            return false;
+        }
+    };
+    frame_permit.send(BudgetedFrame::new_response(frame, byte_permit));
+    true
 }
 
+#[cfg(test)]
 async fn try_send_envelope(tx: &PeerChannel, envelope: Envelope) -> bool {
-    try_send_envelope_with_deadline(tx, envelope, None).await
+    try_send_envelope_with_deadline(tx, envelope, None, tx.queue_admission_timeout).await
 }
 
 async fn try_send_envelope_until(
@@ -5663,19 +6457,37 @@ async fn try_send_envelope_until(
     envelope: Envelope,
     attempt_deadline: Instant,
 ) -> bool {
-    try_send_envelope_with_deadline(tx, envelope, Some(attempt_deadline)).await
+    try_send_envelope_with_deadline(
+        tx,
+        envelope,
+        Some(attempt_deadline),
+        tx.queue_admission_timeout,
+    )
+    .await
+}
+
+async fn try_send_envelope_with_admission_timeout(
+    tx: &PeerChannel,
+    envelope: Envelope,
+    admission_timeout: Duration,
+) -> bool {
+    try_send_envelope_with_deadline(tx, envelope, None, admission_timeout).await
 }
 
 async fn try_send_envelope_with_deadline(
     tx: &PeerChannel,
     envelope: Envelope,
     attempt_deadline: Option<Instant>,
+    admission_timeout: Duration,
 ) -> bool {
-    let mut frame = Vec::new();
-    if envelope.encode(&mut frame).is_err() {
-        return false;
-    }
-    let queue_deadline = deadline_after(tx.queue_admission_timeout);
+    let encoded_len = match check_envelope_budget(&envelope, MAX_FRAME_BYTES) {
+        Ok(encoded_len) => encoded_len,
+        Err(error) => {
+            tracing::warn!(%error, "rejecting oversized or invalid outbound peer frame");
+            return false;
+        }
+    };
+    let queue_deadline = deadline_after(admission_timeout);
     let admission_deadline = attempt_deadline
         .map(|deadline| deadline.min(queue_deadline))
         .unwrap_or(queue_deadline);
@@ -5683,21 +6495,61 @@ async fn try_send_envelope_with_deadline(
         tx.cancel();
         return false;
     }
-    match tokio::time::timeout_at(admission_deadline, tx.tx.reserve()).await {
-        Ok(Ok(permit)) => {
-            if Instant::now() >= admission_deadline {
-                drop(permit);
+    let frame_permit =
+        match tokio::time::timeout_at(admission_deadline, tx.outbound.tx.reserve()).await {
+            Ok(Ok(permit)) => permit,
+            Ok(Err(_)) | Err(_) => {
                 tx.cancel();
                 return false;
             }
-            permit.send(frame);
-            true
-        }
+        };
+    let producer_byte_permit = match tokio::time::timeout_at(
+        admission_deadline,
+        tx.outbound
+            .producer_byte_budget
+            .clone()
+            .acquire_many_owned(encoded_len as u32),
+    )
+    .await
+    {
+        Ok(Ok(permit)) => permit,
         Ok(Err(_)) | Err(_) => {
             tx.cancel();
-            false
+            return false;
         }
+    };
+    let byte_permit = match tokio::time::timeout_at(
+        admission_deadline,
+        tx.outbound
+            .byte_budget
+            .clone()
+            .acquire_many_owned(encoded_len as u32),
+    )
+    .await
+    {
+        Ok(Ok(permit)) => permit,
+        Ok(Err(_)) | Err(_) => {
+            tx.cancel();
+            return false;
+        }
+    };
+    if Instant::now() >= admission_deadline {
+        tx.cancel();
+        return false;
     }
+    let frame = match encode_envelope(&envelope) {
+        Ok(frame) => frame,
+        Err(error) => {
+            tracing::warn!(%error, "failed to encode preflighted outbound peer frame");
+            return false;
+        }
+    };
+    frame_permit.send(BudgetedFrame::new_producer(
+        frame,
+        byte_permit,
+        producer_byte_permit,
+    ));
+    true
 }
 
 #[cfg(test)]
@@ -5705,18 +6557,80 @@ mod tests {
     use super::*;
     use crate::replication::spawn_sender_with_options;
 
-    fn test_peer_channel(capacity: usize) -> (PeerChannel, mpsc::Receiver<Vec<u8>>) {
+    struct BlockingPageActor;
+
+    struct BlockingPageState {
+        started: Arc<Notify>,
+        release: Arc<Notify>,
+    }
+
+    impl Actor for BlockingPageActor {
+        type Msg = KvMessage;
+        type State = BlockingPageState;
+        type Arguments = BlockingPageState;
+
+        async fn pre_start(
+            &self,
+            _myself: ActorRef<Self::Msg>,
+            args: Self::Arguments,
+        ) -> Result<Self::State, ractor::ActorProcessingErr> {
+            Ok(args)
+        }
+
+        async fn handle(
+            &self,
+            _myself: ActorRef<Self::Msg>,
+            message: Self::Msg,
+            state: &mut Self::State,
+        ) -> Result<(), ractor::ActorProcessingErr> {
+            if let KvMessage::GetVersionedPage { reply, .. } = message {
+                state.started.notify_one();
+                state.release.notified().await;
+                drop(reply);
+            }
+            Ok(())
+        }
+    }
+
+    fn test_peer_channel(
+        capacity: usize,
+    ) -> (
+        PeerChannel,
+        mpsc::Receiver<BudgetedFrame>,
+        mpsc::Receiver<BudgetedFrame>,
+    ) {
         let (tx, rx) = mpsc::channel(capacity);
+        let (response_tx, response_rx) = mpsc::channel(capacity);
+        let (identity, _) = mpsc::channel(1);
         let (cancel, _) = watch::channel(false);
         (
             PeerChannel {
-                tx,
+                outbound: BudgetedPeerTx {
+                    tx,
+                    response_tx,
+                    byte_budget: Arc::new(Semaphore::new(PEER_CHANNEL_BYTE_CAPACITY)),
+                    producer_byte_budget: Arc::new(Semaphore::new(
+                        PEER_CHANNEL_BYTE_CAPACITY - PEER_RESPONSE_BYTE_RESERVE,
+                    )),
+                    reconcile_gate: ReconcileGate::new(),
+                    identity,
+                },
                 cancel,
                 queue_admission_timeout: Duration::from_millis(10),
                 rank: None,
             },
             rx,
+            response_rx,
         )
+    }
+
+    async fn test_budgeted_frame(bytes: Vec<u8>, budget: &Arc<Semaphore>) -> BudgetedFrame {
+        let permit = budget
+            .clone()
+            .acquire_many_owned(bytes.len() as u32)
+            .await
+            .unwrap();
+        BudgetedFrame::new_response(bytes, permit)
     }
 
     fn test_sender_report() -> Arc<Mutex<SenderStateReport>> {
@@ -5755,6 +6669,7 @@ mod tests {
                 FragmentId(0),
                 FragmentPlacementState::Draining,
             )]))),
+            preloaded_fragments: Arc::new(StdMutex::new(HashSet::new())),
             placement_generation: Arc::new(AtomicU64::new(0)),
             senders,
             retiring_senders: Arc::new(RetiringSenderRegistry::default()),
@@ -5803,7 +6718,6 @@ mod tests {
                 sender_runtime: SenderRuntimeOptions::default(),
                 runtime_options: NodeRuntimeOptions::default(),
                 sender_reports,
-                sync_entries_applied: Arc::new(AtomicU64::new(0)),
                 membership_tx: None,
                 cluster_secret: None,
             },
@@ -5887,9 +6801,14 @@ mod tests {
     fn runtime_option_defaults_are_explicit_and_source_compatible() {
         let options = NodeRuntimeOptions::default();
         assert_eq!(options.peer_queue_frame_capacity(), 256);
+        assert_eq!(options.peer_queue_byte_capacity(), 32 * 1024 * 1024);
         assert_eq!(options.replication_control_message_capacity(), 64);
         assert_eq!(options.inbound_connection_capacity(), 1024);
         assert_eq!(options.queue_admission_timeout(), Duration::from_secs(5));
+        assert_eq!(
+            options.reconcile_data_admission_timeout(),
+            Duration::from_secs(30)
+        );
         assert_eq!(options.forwarded_attempt_timeout(), Duration::from_secs(5));
         assert_eq!(options.connect_timeout(), Duration::from_secs(5));
         assert_eq!(options.handshake_timeout(), Duration::from_secs(5));
@@ -5908,6 +6827,18 @@ mod tests {
             .with_peer_queue_frame_capacity(tokio::sync::Semaphore::MAX_PERMITS.saturating_add(1))
             .validate()
             .is_err());
+        assert!(NodeRuntimeOptions::default()
+            .with_peer_queue_frame_capacity(1)
+            .validate()
+            .is_err());
+        assert!(NodeRuntimeOptions::default()
+            .with_peer_queue_byte_capacity(MIN_PEER_CHANNEL_BYTE_CAPACITY - 1)
+            .validate()
+            .is_err());
+        assert!(NodeRuntimeOptions::default()
+            .with_peer_queue_byte_capacity(MIN_PEER_CHANNEL_BYTE_CAPACITY)
+            .validate()
+            .is_ok());
         assert!(NodeRuntimeOptions::default()
             .with_replication_control_message_capacity(0)
             .validate()
@@ -5934,6 +6865,7 @@ mod tests {
             NodeRuntimeOptions::default().with_connect_timeout(Duration::ZERO),
             NodeRuntimeOptions::default().with_handshake_timeout(Duration::ZERO),
             NodeRuntimeOptions::default().with_socket_read_timeout(Duration::ZERO),
+            NodeRuntimeOptions::default().with_reconcile_data_admission_timeout(Duration::ZERO),
         ] {
             assert!(options.validate().is_err());
         }
@@ -6193,6 +7125,8 @@ mod tests {
                     session_id: 1,
                     round_id: 1,
                     chunk_seq: 1,
+                    page_seq: 0,
+                    done: true,
                 })
             } else {
                 EnvelopeMsg::ReconcileResponse(ReconcileResponse {
@@ -6200,6 +7134,12 @@ mod tests {
                     summaries: Vec::new(),
                     session_id: 1,
                     round_id: 1,
+                    page_seq: 0,
+                    next_after_key: String::new(),
+                    snapshot_revision: 1,
+                    snapshot_time_ms: 1,
+                    done: true,
+                    restart: false,
                 })
             };
             write_test_envelope(
@@ -6225,20 +7165,24 @@ mod tests {
             // not grounds to discard the multiplexed connection. Exercise a
             // subsequent request to prove that both read and write halves are
             // still usable.
+            let probe_req_id = 99;
             write_test_envelope(
                 &mut client,
                 Envelope {
-                    msg: Some(EnvelopeMsg::SyncRequest(crate::proto::SyncRequest {
-                        fragments: Vec::new(),
+                    msg: Some(EnvelopeMsg::BatchGet(BatchGet {
+                        req_id: probe_req_id,
+                        keys: vec!["connection-probe".to_string()],
+                        priority: ProtoPriority::Default as i32,
                     })),
                 },
             )
             .await;
             loop {
-                if matches!(
-                    read_test_envelope(&mut client).await.msg,
-                    Some(EnvelopeMsg::SyncResponse(_))
-                ) {
+                if let Some(EnvelopeMsg::BatchGetResponse(response)) =
+                    read_test_envelope(&mut client).await.msg
+                {
+                    assert_eq!(response.req_id, probe_req_id);
+                    assert_eq!(response.results.len(), 1);
                     break;
                 }
             }
@@ -7075,7 +8019,7 @@ mod tests {
 
     #[tokio::test]
     async fn full_peer_queue_times_out_cancels_and_does_not_admit_frame() {
-        let (peer, mut rx) = test_peer_channel(1);
+        let (peer, mut rx, _response_rx) = test_peer_channel(1);
         let mut cancelled = peer.cancel.subscribe();
         let envelope = || Envelope { msg: None };
         assert!(try_send_envelope(&peer, envelope()).await);
@@ -7090,8 +8034,119 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reader_response_saturation_cancels_without_waiting() {
+        let (peer, _rx, mut response_rx) = test_peer_channel(1);
+        let envelope = || Envelope {
+            msg: Some(EnvelopeMsg::BatchAck(BatchAck {
+                session_id: 1,
+                batch_seq: 1,
+                fragment: 0,
+                level: ReplicationAckLevel::Applied as i32,
+            })),
+        };
+        assert!(try_send_envelope_immediate(&peer, envelope()));
+        let mut cancelled = peer.cancel.subscribe();
+        let started = Instant::now();
+        assert!(!try_send_envelope_immediate(&peer, envelope()));
+        assert!(started.elapsed() < Duration::from_millis(50));
+        tokio::time::timeout(Duration::from_secs(1), cancelled.changed())
+            .await
+            .expect("saturated reader response did not cancel the connection")
+            .expect("cancellation sender dropped");
+        assert!(*cancelled.borrow());
+        assert!(response_rx.recv().await.is_some());
+        assert!(response_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn session_replacement_cancels_in_progress_reconcile_response() {
+        let started = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let (actor, actor_handle) = BlockingPageActor::spawn(
+            None,
+            BlockingPageActor,
+            BlockingPageState {
+                started: started.clone(),
+                release: release.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        let (peer, _frames, _responses) = test_peer_channel(1);
+        let session_key = ("peer".to_string(), FragmentId(0));
+        let original_session = InboundSession {
+            session_id: 7,
+            generation: 1,
+        };
+        let sessions: InboundSessions = Arc::new(Mutex::new(HashMap::from([(
+            session_key.clone(),
+            original_session,
+        )])));
+        let (session_changes, session_change_rx) = watch::channel(0u64);
+        let (jobs, job_rx) = mpsc::channel(1);
+        let responder = tokio::spawn(run_reconcile_responder(
+            job_rx,
+            peer,
+            sessions.clone(),
+            session_change_rx,
+            Duration::from_secs(30),
+        ));
+        jobs.send(ReconcileResponseJob {
+            peer: "peer".to_string(),
+            session: original_session,
+            actor,
+            fetch: ReconcileFetch {
+                fragment: 0,
+                keys: vec!["key".to_string()],
+                session_id: original_session.session_id,
+                round_id: 1,
+                chunk_seq: 0,
+            },
+            snapshot_time_ms: 1,
+        })
+        .await
+        .unwrap();
+        started.notified().await;
+
+        sessions.lock().await.insert(
+            session_key,
+            InboundSession {
+                session_id: 8,
+                generation: 2,
+            },
+        );
+        session_changes.send_modify(|generation| *generation += 1);
+        drop(jobs);
+        tokio::time::timeout(Duration::from_secs(1), responder)
+            .await
+            .expect("stale responder remained blocked on its actor RPC")
+            .unwrap();
+
+        release.notify_one();
+        actor_handle.abort();
+        let _ = actor_handle.await;
+    }
+
+    #[tokio::test]
+    async fn oversized_outbound_frame_is_rejected_before_queue_admission() {
+        let (peer, mut rx, _response_rx) = test_peer_channel(1);
+        let envelope = Envelope {
+            msg: Some(EnvelopeMsg::BatchGet(BatchGet {
+                req_id: 1,
+                keys: vec!["x".repeat(MAX_FRAME_BYTES)],
+                priority: ProtoPriority::Default as i32,
+            })),
+        };
+
+        assert!(!try_send_envelope(&peer, envelope).await);
+        assert!(rx.try_recv().is_err());
+        assert!(try_send_envelope(&peer, Envelope { msg: None }).await);
+        assert!(rx.recv().await.is_some());
+    }
+
+    #[tokio::test]
     async fn forwarded_attempt_deadline_caps_queue_admission_wait() {
-        let (mut peer, mut rx) = test_peer_channel(1);
+        let (mut peer, mut rx, _response_rx) = test_peer_channel(1);
         peer.queue_admission_timeout = Duration::from_secs(1);
         assert!(try_send_envelope(&peer, Envelope { msg: None }).await);
         let started = Instant::now();
@@ -7110,7 +8165,7 @@ mod tests {
 
     #[tokio::test]
     async fn expired_forwarded_attempt_never_admits_to_an_empty_queue() {
-        let (peer, mut rx) = test_peer_channel(1);
+        let (peer, mut rx, _response_rx) = test_peer_channel(1);
         let expired = Instant::now();
         tokio::task::yield_now().await;
         assert!(
@@ -7122,7 +8177,7 @@ mod tests {
 
     #[tokio::test]
     async fn closed_peer_queue_fails_and_cancels_connection() {
-        let (peer, rx) = test_peer_channel(1);
+        let (peer, rx, _response_rx) = test_peer_channel(1);
         let mut cancelled = peer.cancel.subscribe();
         drop(rx);
         assert!(!try_send_envelope(&peer, Envelope { msg: None }).await);
@@ -7135,8 +8190,8 @@ mod tests {
 
     #[tokio::test]
     async fn stale_peer_failure_cannot_overwrite_current_channel_failure() {
-        let (current, _current_rx) = test_peer_channel(1);
-        let (stale, _stale_rx) = test_peer_channel(1);
+        let (current, _current_rx, _current_response_rx) = test_peer_channel(1);
+        let (stale, _stale_rx, _stale_response_rx) = test_peer_channel(1);
         let mut cancelled = current.cancel.subscribe();
         let peers = Arc::new(Mutex::new(HashMap::from([(
             "peer".to_string(),
@@ -7188,14 +8243,122 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn peer_writer_prioritizes_reader_responses_over_queued_data() {
+        let (mut reader, writer) = tokio::io::duplex(64);
+        let (frame_tx, frame_rx) = mpsc::channel(1);
+        let (response_tx, response_rx) = mpsc::channel(1);
+        let (cancel_tx, _) = watch::channel(false);
+        let byte_budget = Arc::new(Semaphore::new(2));
+        let producer_byte_budget = Arc::new(Semaphore::new(1));
+
+        let producer_permit = producer_byte_budget.clone().acquire_owned().await.unwrap();
+        let data_permit = byte_budget.clone().acquire_owned().await.unwrap();
+        frame_tx
+            .send(BudgetedFrame::new_producer(
+                vec![1],
+                data_permit,
+                producer_permit,
+            ))
+            .await
+            .unwrap();
+        let response_permit = byte_budget.clone().acquire_owned().await.unwrap();
+        response_tx
+            .send(BudgetedFrame::new_response(vec![2], response_permit))
+            .await
+            .unwrap();
+        drop(frame_tx);
+        drop(response_tx);
+
+        let task = tokio::spawn(run_bounded_peer_writer(
+            writer,
+            PeerWriterPipeline {
+                data_rx: frame_rx,
+                response_rx,
+                byte_budget: byte_budget.clone(),
+                producer_byte_budget: producer_byte_budget.clone(),
+            },
+            cancel_tx.subscribe(),
+            cancel_tx,
+            Duration::from_secs(1),
+        ));
+        for expected in [2, 1] {
+            assert_eq!(reader.read_u32().await.unwrap(), 1);
+            assert_eq!(reader.read_u8().await.unwrap(), expected);
+        }
+        task.await.unwrap();
+        assert!(byte_budget.is_closed());
+        assert!(producer_byte_budget.is_closed());
+        assert_eq!(byte_budget.available_permits(), 2);
+        assert_eq!(producer_byte_budget.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn peer_writer_bounds_response_bursts_to_preserve_data_progress() {
+        let response_count = PEER_RESPONSE_BURST_LIMIT + 1;
+        let (mut reader, writer) = tokio::io::duplex(256);
+        let (frame_tx, frame_rx) = mpsc::channel(1);
+        let (response_tx, response_rx) = mpsc::channel(response_count);
+        let (cancel_tx, _) = watch::channel(false);
+        let byte_budget = Arc::new(Semaphore::new(response_count + 1));
+        let producer_byte_budget = Arc::new(Semaphore::new(1));
+
+        let producer_permit = producer_byte_budget.clone().acquire_owned().await.unwrap();
+        let data_permit = byte_budget.clone().acquire_owned().await.unwrap();
+        frame_tx
+            .send(BudgetedFrame::new_producer(
+                vec![1],
+                data_permit,
+                producer_permit,
+            ))
+            .await
+            .unwrap();
+        for _ in 0..response_count {
+            let permit = byte_budget.clone().acquire_owned().await.unwrap();
+            response_tx
+                .send(BudgetedFrame::new_response(vec![2], permit))
+                .await
+                .unwrap();
+        }
+        drop(frame_tx);
+        drop(response_tx);
+
+        let task = tokio::spawn(run_bounded_peer_writer(
+            writer,
+            PeerWriterPipeline {
+                data_rx: frame_rx,
+                response_rx,
+                byte_budget: byte_budget.clone(),
+                producer_byte_budget: producer_byte_budget.clone(),
+            },
+            cancel_tx.subscribe(),
+            cancel_tx,
+            Duration::from_secs(1),
+        ));
+        for _ in 0..PEER_RESPONSE_BURST_LIMIT {
+            assert_eq!(reader.read_u32().await.unwrap(), 1);
+            assert_eq!(reader.read_u8().await.unwrap(), 2);
+        }
+        assert_eq!(reader.read_u32().await.unwrap(), 1);
+        assert_eq!(reader.read_u8().await.unwrap(), 1);
+        task.await.unwrap();
+        assert_eq!(byte_budget.available_permits(), response_count + 1);
+        assert_eq!(producer_byte_budget.available_permits(), 1);
+    }
+
+    #[tokio::test]
     async fn socket_write_timeout_signals_connection_cancellation() {
         let (_reader, writer) = tokio::io::duplex(1);
         let (frame_tx, frame_rx) = mpsc::channel(1);
         let (cancel_tx, mut cancelled) = watch::channel(false);
-        frame_tx.send(vec![0; 1024]).await.unwrap();
+        let byte_budget = Arc::new(Semaphore::new(1024));
+        frame_tx
+            .send(test_budgeted_frame(vec![0; 1024], &byte_budget).await)
+            .await
+            .unwrap();
         let task = tokio::spawn(run_peer_writer(
             writer,
             frame_rx,
+            byte_budget.clone(),
             cancel_tx.subscribe(),
             cancel_tx,
             Duration::from_millis(10),
@@ -7213,10 +8376,15 @@ mod tests {
         let (_reader, writer) = tokio::io::duplex(1);
         let (frame_tx, frame_rx) = mpsc::channel(1);
         let (cancel_tx, _) = watch::channel(false);
-        frame_tx.send(vec![0; 1024]).await.unwrap();
+        let byte_budget = Arc::new(Semaphore::new(1024));
+        frame_tx
+            .send(test_budgeted_frame(vec![0; 1024], &byte_budget).await)
+            .await
+            .unwrap();
         let task = tokio::spawn(run_peer_writer(
             writer,
             frame_rx,
+            byte_budget.clone(),
             cancel_tx.subscribe(),
             cancel_tx.clone(),
             Duration::from_secs(30),
@@ -7228,12 +8396,124 @@ mod tests {
             .await
             .expect("cancelled writer waited for the socket write timeout")
             .unwrap();
+        assert!(byte_budget.is_closed());
+        assert_eq!(byte_budget.available_permits(), 1024);
+    }
+
+    #[tokio::test]
+    async fn aborting_peer_writer_releases_current_and_queued_byte_permits() {
+        let (_reader, writer) = tokio::io::duplex(1);
+        let (frame_tx, frame_rx) = mpsc::channel(2);
+        let (cancel_tx, _) = watch::channel(false);
+        let byte_budget = Arc::new(Semaphore::new(2048));
+        frame_tx
+            .send(test_budgeted_frame(vec![1; 1024], &byte_budget).await)
+            .await
+            .unwrap();
+        frame_tx
+            .send(test_budgeted_frame(vec![2; 1024], &byte_budget).await)
+            .await
+            .unwrap();
+        let task = tokio::spawn(run_peer_writer(
+            writer,
+            frame_rx,
+            byte_budget.clone(),
+            cancel_tx.subscribe(),
+            cancel_tx,
+            Duration::from_secs(30),
+        ));
+        tokio::task::yield_now().await;
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert!(byte_budget.is_closed());
+        assert_eq!(byte_budget.available_permits(), 2048);
+    }
+
+    #[tokio::test]
+    async fn peer_byte_budget_backpressures_producers_before_frame_allocation() {
+        let envelope = Envelope {
+            msg: Some(EnvelopeMsg::BatchGet(BatchGet {
+                req_id: 1,
+                keys: vec!["bounded".repeat(32)],
+                priority: ProtoPriority::Default as i32,
+            })),
+        };
+        let encoded_len = envelope.encoded_len();
+        let (frame_tx, frame_rx) = mpsc::channel(8);
+        let (response_tx, _response_rx) = mpsc::channel(8);
+        let (identity, _) = mpsc::channel(1);
+        let (cancel_tx, _) = watch::channel(false);
+        let byte_budget = Arc::new(Semaphore::new(encoded_len * 3));
+        let producer_byte_budget = Arc::new(Semaphore::new(encoded_len * 2));
+        let peer = PeerChannel {
+            outbound: BudgetedPeerTx {
+                tx: frame_tx,
+                response_tx,
+                byte_budget,
+                producer_byte_budget,
+                reconcile_gate: ReconcileGate::new(),
+                identity,
+            },
+            cancel: cancel_tx,
+            queue_admission_timeout: Duration::from_millis(10),
+            rank: None,
+        };
+
+        assert!(try_send_envelope(&peer, envelope.clone()).await);
+        assert!(try_send_envelope(&peer, envelope.clone()).await);
+        assert!(!try_send_envelope(&peer, envelope).await);
+        assert_eq!(frame_rx.len(), 2);
+        assert_eq!(peer.outbound.tx.capacity(), 6);
+    }
+
+    #[tokio::test]
+    async fn reader_responses_use_reserved_byte_capacity() {
+        let envelope = Envelope {
+            msg: Some(EnvelopeMsg::BatchAck(BatchAck {
+                session_id: 1,
+                batch_seq: 1,
+                fragment: 0,
+                level: ReplicationAckLevel::Applied as i32,
+            })),
+        };
+        let encoded_len = envelope.encoded_len();
+        let (frame_tx, mut frame_rx) = mpsc::channel(1);
+        let (response_tx, mut response_rx) = mpsc::channel(1);
+        let (identity, _) = mpsc::channel(1);
+        let (cancel_tx, _) = watch::channel(false);
+        let byte_budget = Arc::new(Semaphore::new(encoded_len * 2));
+        let producer_byte_budget = Arc::new(Semaphore::new(encoded_len));
+        let peer = PeerChannel {
+            outbound: BudgetedPeerTx {
+                tx: frame_tx,
+                response_tx,
+                byte_budget: byte_budget.clone(),
+                producer_byte_budget: producer_byte_budget.clone(),
+                reconcile_gate: ReconcileGate::new(),
+                identity,
+            },
+            cancel: cancel_tx,
+            queue_admission_timeout: Duration::from_millis(10),
+            rank: None,
+        };
+
+        assert!(try_send_envelope(&peer, envelope.clone()).await);
+        assert_eq!(producer_byte_budget.available_permits(), 0);
+        assert_eq!(byte_budget.available_permits(), encoded_len);
+        assert!(try_send_envelope_immediate(&peer, envelope));
+        assert_eq!(byte_budget.available_permits(), 0);
+        drop(response_rx.recv().await.unwrap());
+        assert_eq!(byte_budget.available_permits(), encoded_len);
+        assert_eq!(producer_byte_budget.available_permits(), 0);
+        drop(frame_rx.recv().await.unwrap());
+        assert_eq!(byte_budget.available_permits(), encoded_len * 2);
+        assert_eq!(producer_byte_budget.available_permits(), encoded_len);
     }
 
     #[tokio::test]
     async fn mutation_relay_timeout_removes_entry_and_replies_unavailable() {
         let relays: MutationRelayMap = Arc::new(Mutex::new(HashMap::new()));
-        let (origin_tx, mut origin_rx) = test_peer_channel(1);
+        let (origin_tx, _origin_rx, mut origin_response_rx) = test_peer_channel(1);
         let tasks = RuntimeTasks::new(4);
         let task_ref = Arc::downgrade(&tasks);
         register_mutation_relay(
@@ -7251,11 +8531,11 @@ mod tests {
         .await;
         assert!(relays.lock().await.contains_key(&17));
 
-        let bytes = tokio::time::timeout(Duration::from_secs(1), origin_rx.recv())
+        let bytes = tokio::time::timeout(Duration::from_secs(1), origin_response_rx.recv())
             .await
             .expect("relay timeout did not reply")
             .expect("relay response channel closed");
-        let envelope = Envelope::decode(bytes.as_slice()).expect("invalid relay response");
+        let envelope = Envelope::decode(bytes.bytes()).expect("invalid relay response");
         let Some(EnvelopeMsg::MutationResponse(response)) = envelope.msg else {
             panic!("expected mutation response");
         };
@@ -7273,7 +8553,7 @@ mod tests {
     #[tokio::test]
     async fn completed_mutation_relay_cancels_timeout() {
         let relays: MutationRelayMap = Arc::new(Mutex::new(HashMap::new()));
-        let (origin_tx, mut origin_rx) = test_peer_channel(1);
+        let (origin_tx, _origin_rx, mut origin_response_rx) = test_peer_channel(1);
         let tasks = RuntimeTasks::new(4);
         let task_ref = Arc::downgrade(&tasks);
         register_mutation_relay(
@@ -7293,7 +8573,7 @@ mod tests {
         let _ = relay.timeout_cancel.send(());
 
         tokio::time::sleep(Duration::from_millis(30)).await;
-        assert!(origin_rx.try_recv().is_err());
+        assert!(origin_response_rx.try_recv().is_err());
         assert!(relays.lock().await.is_empty());
         tasks.shutdown().await;
     }
@@ -7301,7 +8581,7 @@ mod tests {
     #[tokio::test]
     async fn read_relay_timeout_removes_registry_entry() {
         let relays: RelayMap = Arc::new(Mutex::new(HashMap::new()));
-        let (origin_tx, _origin_rx) = test_peer_channel(1);
+        let (origin_tx, _origin_rx, _origin_response_rx) = test_peer_channel(1);
         let tasks = RuntimeTasks::new(4);
         let task_ref = Arc::downgrade(&tasks);
         register_get_relay(

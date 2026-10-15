@@ -27,10 +27,10 @@ reports the exact LWW apply outcome (see [Consistency](consistency.md)).
 ## Static placement (default)
 
 With no `placement_controller` configured, each node routes by its
-`fragment_map`. The map must be **identical on every node**. Static mode keeps
-the legacy connection handshake: on connect, each side sends a full-state
-`SyncRequest`/`SyncResponse` so a late joiner or restarted node catches up
-(see [Replication](replication.md)).
+`fragment_map`. The map must be **identical on every node**. After the
+protocol-v3 handshake, static mode uses the same correlated, byte-bounded
+reconciliation engine as dynamic placement so a late joiner or restarted node
+catches up (see [Replication](replication.md)).
 
 ## The `PlacementController` trait (Phase 8)
 
@@ -60,8 +60,8 @@ and configured member ids have the same byte-length constraint.
 Two implementations ship with the crate:
 
 - **`StaticPlacement`** — wraps a fixed map; exists so the dynamic code path
-  shares validation logic. Nodes without an explicit controller keep the legacy
-  static startup path untouched.
+  shares validation logic. Nodes without an explicit controller keep static
+  routing/lifecycle while sharing the protocol-v3 reconciliation path.
 - **`ManualPlacement`** — an `RwLock`-guarded map with `set_placement(map)` /
   `placement()`. Publishing a new map takes effect on the driver's next poll.
   There is no `move_fragment` helper: moves are expressed as full-map
@@ -86,9 +86,12 @@ authoritative and tears down local state for revoked fragments.
 
 **Gaining a fragment** (`gain_fragment`):
 
-1. Spawn the fragment supervision subtree; mark the fragment
-   `Bootstrapping` synchronously so the next tick can't double-spawn (a spawn
-   failure clears the mark so the next tick retries).
+1. Mark the fragment `Bootstrapping` synchronously so the next tick cannot
+   double-spawn. A runtime gain spawns its supervision subtree; dynamic startup
+   instead adopts the subtree that `Node::start` synchronously preloaded for
+   durable-record and HLC validation. Startup never publishes that preload as
+   authoritative before reconciliation (a spawn failure clears the mark so the
+   next tick retries).
 2. Make the dispatcher routable immediately so the reconciler can merge into
    it — but the fragment is **not serving** yet, so local ops forward to the
    previous owner instead of being applied to possibly-stale state. If the
@@ -96,15 +99,17 @@ authoritative and tears down local state for revoked fragments.
    replication session before the dispatcher exists; early tracked batches
    NACK and replay instead of losing the one-time `SessionStart`.
 3. Ensure replication senders to each replica peer.
-4. `bootstrap_from`: wait up to `BOOTSTRAP_TIMEOUT` (30 s) for a source peer,
-   fire one on-demand reconcile round (`ReconcileNow`), and wait for the
-   sender's completed-round counter to advance. Bootstrap transfers a
-   **chunked delta reconcile** (500 keys per `ReconcileFetch` chunk), not a
-   monolithic snapshot. If it fetches remote winners, their barrier is followed
-   by a fresh correlated no-fetch verification round before the counter can
-   advance. On timeout the fragment can go Serving anyway —
-   **availability over consistency**; LWW plus periodic reconcile converge it
-   later. Before publication, the driver verifies that both the placement
+4. `bootstrap_from`: for up to `BOOTSTRAP_TIMEOUT` (30 s), trigger on-demand
+   reconciliation (`ReconcileNow`) against every connected source candidate
+   and wait for any completed-round counter to advance. A bootstrapping or
+   draining candidate refuses to answer authoritative summary/fetch requests,
+   preventing simultaneously added replicas from certifying each other's empty
+   state. Bootstrap transfers a **streamed delta reconcile** (one
+   requester-driven key fetch at a time), not a monolithic snapshot. Any repair
+   or revision drift is followed by a fresh mutation-free verification pass
+   before the counter can advance. On timeout the fragment remains
+   non-authoritative and is retried; it never goes `Serving` with unverified
+   state. Before publication, the driver verifies that both the placement
    generation and complete replica list still match the snapshot used for
    sender alignment and bootstrap. If placement changed — including a
    `P -> Q -> P` change back to the same list — the fragment remains
@@ -113,6 +118,12 @@ authoritative and tears down local state for revoked fragments.
 5. Mark `Serving`, add to the serving set, call
    `controller.on_fragment_ready(fragment)` so an in-process controller can
    sequence the next step (revoking the old owner).
+
+Cold-cluster genesis must seed one owner per fragment and wait for `Serving`
+before adding overlap replicas. Simultaneously starting every member of a new
+multi-replica placement leaves them `Bootstrapping` by design: no
+already-serving source exists, and bootstrapping nodes cannot safely certify
+one another's empty state.
 
 **Losing a fragment** (`lose_fragment`):
 
@@ -142,9 +153,9 @@ hop-limited (`MAX_FORWARD_HOPS = 4`, never bounced back to the sender, never
 to self) instead of dropping it. Mutation relays mint a collision-free local
 request id, validate the downstream peer, restore the upstream id, and return
 `Unavailable` on no route, hop exhaustion, send failure, or the 5-second relay
-deadline. In dynamic mode the full-state handshake sync is skipped — the Phase
-5 reconciler owns anti-entropy, so the rolling-restart test asserts
-`sync_entries_applied() == 0`.
+deadline. The Phase 5 reconciler owns anti-entropy in both dynamic and static
+mode. The retired `SyncResponse` compatibility counter,
+`sync_entries_applied()`, remains zero.
 
 ## `placement_report()`
 

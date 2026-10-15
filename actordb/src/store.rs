@@ -18,6 +18,8 @@ use std::sync::Arc;
 
 use crate::actor::VersionedValue;
 use crate::shard::FragmentId;
+#[cfg(feature = "rocksdb")]
+use crate::wire::check_record_budget;
 
 /// Error from a [`KvStore`] operation.
 #[derive(Debug)]
@@ -44,8 +46,19 @@ impl std::error::Error for StoreError {}
 /// at the boundary (failing boot loudly on non-UTF-8 data); the store
 /// itself never interprets key bytes.
 pub trait KvStore: Send + Sync + 'static {
-    /// Load the full dataset. Called once at actor boot.
+    /// Load the full backing dataset. The default [`KvStore::load_prefix`]
+    /// implementation filters this result during fragment startup.
     fn load(&self) -> Result<Vec<(Vec<u8>, VersionedValue)>, StoreError>;
+    /// Load only keys beginning with `prefix`. The default preserves source
+    /// compatibility for custom stores; stores with ordered iteration should
+    /// override it to avoid a full-dataset scan for every fragment.
+    fn load_prefix(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, VersionedValue)>, StoreError> {
+        Ok(self
+            .load()?
+            .into_iter()
+            .filter(|(key, _)| key.starts_with(prefix))
+            .collect())
+    }
     /// Atomically persist a batch of winning writes. Each key occurs at most
     /// once in a batch.
     fn write_batch(&self, writes: &[(Vec<u8>, VersionedValue)]) -> Result<(), StoreError>;
@@ -95,7 +108,7 @@ impl PrefixedStore {
 impl KvStore for PrefixedStore {
     fn load(&self) -> Result<Vec<(Vec<u8>, VersionedValue)>, StoreError> {
         let mut out = Vec::new();
-        for (key, value) in self.inner.load()? {
+        for (key, value) in self.inner.load_prefix(&self.prefix)? {
             if let Some(stripped) = key.strip_prefix(self.prefix.as_slice()) {
                 out.push((stripped.to_vec(), value));
             }
@@ -177,20 +190,64 @@ impl RocksDbStore {
             is_tombstone,
         })
     }
+
+    fn load_matching(
+        &self,
+        prefix: Option<&[u8]>,
+    ) -> Result<Vec<(Vec<u8>, VersionedValue)>, StoreError> {
+        let mode = prefix.map_or(rocksdb::IteratorMode::Start, |prefix| {
+            rocksdb::IteratorMode::From(prefix, rocksdb::Direction::Forward)
+        });
+        let prefix_len = prefix.map_or(0, <[u8]>::len);
+        let mut out = Vec::new();
+        // Validate each raw record before decoding or retaining another owned
+        // copy. Prefix iteration also prevents one full-DB scan per fragment.
+        for item in self.db.iterator(mode) {
+            let (key, encoded) = item.map_err(|error| StoreError(error.to_string()))?;
+            if prefix.map_or(false, |prefix| !key.starts_with(prefix)) {
+                break;
+            }
+            let logical_key = key.get(prefix_len..).ok_or_else(|| {
+                StoreError("RocksDB key is shorter than its requested prefix".to_string())
+            })?;
+            if encoded.len() < 21 {
+                return Err(StoreError(format!(
+                    "persisted value too short: {} bytes",
+                    encoded.len()
+                )));
+            }
+            let node_len = u32::from_be_bytes(encoded[17..21].try_into().unwrap()) as usize;
+            let value_offset = 21usize.checked_add(node_len).ok_or_else(|| {
+                StoreError("persisted node id length overflowed usize".to_string())
+            })?;
+            if encoded.len() < value_offset {
+                return Err(StoreError(format!(
+                    "persisted node id overruns value: id_len={node_len} total={}",
+                    encoded.len()
+                )));
+            }
+            check_record_budget(logical_key.len(), encoded.len() - value_offset, node_len)
+                .map_err(|error| {
+                    StoreError(format!(
+                        "persisted record (key bytes {}) cannot be replicated: {error}",
+                        logical_key.len()
+                    ))
+                })?;
+            let value = Self::decode(&encoded).map_err(StoreError)?;
+            out.push((key.to_vec(), value));
+        }
+        Ok(out)
+    }
 }
 
 #[cfg(feature = "rocksdb")]
 impl KvStore for RocksDbStore {
     fn load(&self) -> Result<Vec<(Vec<u8>, VersionedValue)>, StoreError> {
-        let mut out = Vec::new();
-        // Corrupt or unreadable entries fail the boot loudly rather
-        // than silently dropping data.
-        for item in self.db.iterator(rocksdb::IteratorMode::Start) {
-            let (k, v) = item.map_err(|e| StoreError(e.to_string()))?;
-            let value = Self::decode(&v).map_err(StoreError)?;
-            out.push((k.to_vec(), value));
-        }
-        Ok(out)
+        self.load_matching(None)
+    }
+
+    fn load_prefix(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, VersionedValue)>, StoreError> {
+        self.load_matching(Some(prefix))
     }
 
     fn write_batch(&self, writes: &[(Vec<u8>, VersionedValue)]) -> Result<(), StoreError> {
@@ -283,5 +340,23 @@ mod tests {
         bad[8..12].copy_from_slice(&10u32.to_be_bytes());
         bad.extend_from_slice(b"abc");
         assert!(RocksDbStore::decode(&bad).is_err());
+    }
+
+    #[cfg(feature = "rocksdb")]
+    #[test]
+    fn rocksdb_prefix_load_rejects_irreducible_record_before_decode() {
+        use crate::wire::MAX_FRAME_BYTES;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(RocksDbStore::open(dir.path()).unwrap());
+        let mut raw_key = 0u32.to_be_bytes().to_vec();
+        raw_key.extend(std::iter::repeat(b'k').take(MAX_FRAME_BYTES / 2));
+        let encoded = RocksDbStore::encode(&VersionedValue::new(Vec::new(), 1, "node".to_string()));
+        store.db.put(raw_key, encoded).unwrap();
+
+        let error = PrefixedStore::new(store, FragmentId(0))
+            .load()
+            .expect_err("oversized persisted key was accepted");
+        assert!(error.to_string().contains("cannot be replicated"));
     }
 }

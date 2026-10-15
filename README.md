@@ -22,8 +22,8 @@ A working, tested prototype of the actor-first sharded database vision:
   `WorkerPool` by `hash(key) % worker_count`. Sticky dispatch preserves
   per-key ordering within a priority pool while different keys execute
   concurrently. Workers share the fragment's `FragmentState`: one in-memory
-  cache, one ordered persistence buffer, one `KvStore`; cross-pool LWW merges
-  are serialized there.
+  cache with a lock-coherent ordered key index, one ordered persistence buffer,
+  and one `KvStore`; cross-pool LWW merges are serialized there.
 * **`supervision`**: every fragment runs under a `FragmentSupervisor`
   owning the dispatcher pool plus background actors — a `Cleaner`
   (durable TTL-expiry markers) and a `Snapshotter`
@@ -37,8 +37,8 @@ A working, tested prototype of the actor-first sharded database vision:
   merge with **last-writer-wins** on hybrid-logical-clock timestamps
   (tie-broken by `node_id`), which is idempotent and commutative, so
   replicas converge without coordination. Deletes are tombstones that
-  propagate like writes. A joining node pulls state via handshake sync
-  (anti-entropy).
+  propagate like writes. Joining and restarted nodes converge through
+  correlated, byte-bounded reconciliation after the peer handshake.
 * **`store`**: pluggable durable storage. In-memory by default; enable
   the `rocksdb` feature for RocksDB (per-fragment key namespacing via
   `PrefixedStore`).
@@ -71,7 +71,7 @@ Comprehensive guides live in [`docs/`](docs/):
 - [Routing & placement](docs/routing-placement.md) — key→fragment→owner,
   `PlacementController`, migration protocol, `placement_report()`
 - [Replication](docs/replication.md) — sender/receiver state machine, sessions,
-  acks, periodic reconciliation, the Hello/full-state handshake
+  acks, byte-bounded reconciliation, and the protocol-v3 handshake
 - [Tombstones & deletes](docs/tombstones.md) — delete lifecycle, conflict
   rules, retention, and requirements for safe future reclamation
 - [Consistency model](docs/consistency.md) — LWW via HLC, exact local apply
@@ -102,7 +102,7 @@ Scenarios live in `docker/envs/`:
 * **restart** — `SIGKILL` node-a mid-cluster (a real kill -9, delivered
   by the driver script), restart it, and require all three nodes to
   reconverge. Exercises the redial supervisor, fresh replication sessions,
-  and handshake sync across process death.
+  and immediate correlated reconciliation across process death.
 
 ```bash
 docker compose build
@@ -131,7 +131,7 @@ let node = Node::start(
 
 node.connect("127.0.0.1:7447".parse().unwrap()).await?;
 // connect() returns after the transport dial is owned by the redial supervisor;
-// authentication and static-mode full-state sync finish asynchronously. The
+// authentication and immediate reconciliation continue asynchronously. The
 // first authenticated peer id at this address is pinned for later reconnects.
 
 node.put("key".to_string(), b"value".to_vec()).await?;
@@ -142,8 +142,8 @@ let value = node.get("key".to_string()).await?;  // routed read, Option<Versione
 let all = node.get_all().await?;                  // full local copy (live keys)
 let health = node.health().await?;                // per-fragment supervision health
 
-// Bulk APIs: keys hash to fragments, one batch per remote fragment/owner
-// attempt. Per-key Results remain in input order.
+// Bulk APIs: keys hash to fragments, then count-bounded chunks per remote
+// fragment/owner attempt. Per-key Results remain in input order.
 let puts = node.put_multi(vec![
     ("k1".to_string(), b"v1".to_vec()),
     ("k2".to_string(), b"v2".to_vec()),
@@ -165,9 +165,11 @@ use std::time::Duration;
 
 let runtime = NodeRuntimeOptions::default()
     .with_peer_queue_frame_capacity(512)
+    .with_peer_queue_byte_capacity(64 * 1024 * 1024)
     .with_replication_control_message_capacity(128)
     .with_inbound_connection_capacity(512)
     .with_queue_admission_timeout(Duration::from_secs(2))
+    .with_reconcile_data_admission_timeout(Duration::from_secs(20))
     .with_forwarded_attempt_timeout(Duration::from_secs(8))
     .with_connect_timeout(Duration::from_secs(3))
     .with_handshake_timeout(Duration::from_secs(3))
@@ -190,12 +192,17 @@ connections. Queue admission, a complete forwarded owner attempt, one dial,
 and the absolute two-flight handshake each have 5-second deadlines. Reading a
 frame body after its length prefix and writing a complete frame each have a
 30-second deadline; an idle established connection has no read deadline until
-it sends a prefix. An acceptable ordinary replication ACK is due within 30
-seconds. Locally applied mutations have a separate per-sender ingress lane
+it sends a prefix. Streamed reconciliation-data pages have a separate
+30-second queue-admission deadline so a legal near-limit value can wait behind
+another slow near-limit frame; an acceptable ordinary replication ACK is due
+within 30 seconds. Locally applied mutations have a separate per-sender ingress lane
 sized by `SenderConfig::buffer_capacity`; saturation schedules lossless reset
 reconciliation without blocking the write path. Reconciliation barriers use
-`SenderConfig::reconcile_timeout` instead of the ordinary ACK timeout. Queue
-and connection limits count items, not encoded bytes.
+`SenderConfig::reconcile_timeout` instead of the ordinary ACK timeout.
+Anti-entropy and ordinary replication frames are built against their exact
+encoded size, targeting 1 MiB pages and never exceeding the 16 MiB hard frame
+limit. The peer writer also enforces a 32 MiB default encoded-byte budget in
+addition to its frame-count limit.
 
 Multi-key semantics:
 
@@ -261,8 +268,17 @@ contain 1 to 255 UTF-8 bytes. Placement replica lists must be duplicate-free.
 - `HlcClock` — hybrid logical clock behind all timestamps.
 - `ApplyOutcome::{Applied, AlreadyPresent, Superseded, Expired}` — the exact
   result used instead of inferring write success from a later read.
-- `KvMessage::{ApplyOp, Flush, Get, GetAll, GetShedCounts}` — for embedders
-  driving the dispatcher directly instead of through `Node`.
+- `ApplyError::{Backpressure, InvalidInput, Storage}` distinguishes a nonfatal
+  unencodable direct actor request from persistence failure; invalid input does
+  not restart the fragment worker.
+- `SnapshotSummary`, `SummaryPage`, `VersionedPage`, and
+  `KvMessage::{GetSummaryPage, GetVersioned, GetVersionedPage}` provide
+  pinned-time, revision-aware anti-entropy reads without cloning whole
+  fragments or arbitrary fetch chunks; existing `GetAll` and `GetSnapshot`
+  remain available for compatibility and debugging.
+- `KvMessage::{ApplyOp, Flush, Get, GetAll, GetSnapshot, GetSummaryPage,
+  GetVersioned, GetVersionedPage, GetShedCounts}` — for embedders driving the
+  dispatcher directly instead of through `Node`.
 
 #### Traffic isolation + backpressure (Phase 7)
 
@@ -282,7 +298,7 @@ Each fragment runs **three isolated worker pools** instead of one:
 - Priority is preserved end-to-end: forwarded single-key ops and batch
   messages carry the originator's priority on the wire, and the owner
   applies/serves them in the matching pool. Priority selects that remote actor
-  pool; it does not prioritize the shared per-peer socket queue.
+  pool; it does not prioritize the per-peer socket's ordinary data lane.
 - Shed counts are surfaced per pool `(high, default, background)` via
   `node.health()` → `FragmentHealth.shed_counts`.
 
@@ -314,9 +330,13 @@ or ignore pending state.
 - Session ids per pairing; stale batches discarded on reconnect.
 - Buffer overflow → `buffer_reset`: shed, rotate the session, and reconcile
   via timestamp/tombstone comparison immediately or when the peer returns.
-- Periodic anti-entropy repairs residual divergence, including in the
-  connected state (timestamp/tombstone compare, fetch in 500-key
-  chunks, ship winners back). Reconcile rounds are counted per sender
+- Periodic anti-entropy repairs residual divergence in both static and dynamic
+  placement. Both sides stream ordered, byte-bounded summary pages at a pinned
+  TTL time; revision drift or any repair forces a fresh stable verification
+  pass. Fetch requests contain up to 256 exact-byte-bounded keys; the responder
+  reads values incrementally and streams byte-bounded data pages through its
+  bounded writer. Repair and ordinary replication batches use the same exact
+  protobuf sizing: 1 MiB soft pages and 16 MiB hard frames. Reconcile rounds are counted per sender
   (`SenderStateReport::reconcile_rounds`).
 
 ### `actordb::placement` — dynamic placement controller (Phase 8)
@@ -352,9 +372,17 @@ controller.set_placement(final_map);
   covers tests and operator-driven moves.
 - The driver polls the controller, publishes its map as the routing
   table, and converges: gained fragments get a supervised subtree plus
-  a **chunked bootstrap** from a replica holder (on-demand reconcile,
-  500-key fetch chunks, 30s timeout); revoked fragments drain their
-  replication senders, then stop.
+  a **streamed bootstrap** from every connected source candidate (on-demand
+  reconcile with bounded fetch chunks and value pages, 30s timeout); only an
+  already-serving holder may answer, and timeout leaves the new holder
+  non-authoritative. Revoked fragments drain their replication senders, then
+  stop.
+- Dynamic startup synchronously loads assigned durable subtrees for validation
+  but leaves them `Bootstrapping` until an already-serving replica completes a
+  verified reconcile round. For a brand-new cluster, seed each fragment on one
+  node first, wait for `Serving`, and only then publish overlap replicas;
+  simultaneously starting an all-new replica set remains non-authoritative by
+  design because no node can prove it has the latest state.
 - **Migration protocol** (controller-sequenced, with overlap): add the
   new owner → wait for it to report `Serving` (bootstrap done) →
   revoke the old owner. At least one node always serves the fragment;
@@ -367,20 +395,22 @@ controller.set_placement(final_map);
 - `node.placement_report()` — per-fragment lifecycle state
   (`Bootstrapping` / `Serving` / `Draining` / `Stopped`) plus the
   authoritative placement map.
-- In dynamic mode the handshake **skips the full-state sync**; the
-  Phase 5 reconciler owns anti-entropy (delta-only). A restarted node
-  therefore catches up via reconciliation, not a full copy
-  (`node.sync_entries_applied()` stays 0).
+- Static and dynamic placement use the same correlated reconciliation engine.
+  `SyncRequest`/`SyncResponse` are retired in protocol v3, and
+  `node.sync_entries_applied()` is a compatibility counter that remains zero.
 - Assumes the peer mesh is established (`members` or manual
   `connect()`); the driver does not dial.
 
 ### `actordb::proto` — wire protocol
 
 Prost-generated protobuf types (`Envelope`, `Hello`, `HelloAuth`, `ReplicateOp`,
-`ForwardedPut`, `ForwardedGet`, `GetResponse`, `SyncRequest`,
-`SyncResponse`, `SyncEntry`, `BatchPut`, `BatchGet`,
-`BatchGetResponse`, `MutationResponse`, `BatchAck`, `BatchNack`), sent as 4-byte length-prefixed frames
-over TCP. Mostly of interest if you're implementing a compatible peer.
+`ForwardedPut`, `ForwardedGet`, `GetResponse`, `ReconcileRequest`,
+`ReconcileResponse`, `ReconcileFetch`, `ReconcileData`, `SyncEntry`, `BatchPut`,
+`BatchGet`, `BatchGetResponse`, `MutationResponse`, `BatchAck`, `BatchNack`),
+sent as 4-byte length-prefixed frames over TCP. `SyncRequest` and `SyncResponse`
+remain generated for source compatibility but are retired; a negotiated v3
+peer that sends either is rejected. These types are mostly of interest when
+implementing a compatible peer.
 
 ### Current limitations
 
@@ -389,55 +419,69 @@ as issues in the [issue tracker](https://github.com/slawlor/actordb/issues):
 
 - **Persistence is opt-in** — pass a `store` in `NodeConfig` for
   durability; without it the dataset lives in memory and a restart
-  wipes it (recoverable only via peer sync).
-- **No built-in TLS or individual peer identity** — plaintext TCP. Protocol v2
+  wipes it (recoverable only via peer reconciliation).
+- **No built-in TLS or individual peer identity** — plaintext TCP. Protocol v3
   gives each physical connection two fresh 256-bit challenges. With a
   `NodeConfig::cluster_secret` containing at least 32 independently generated,
   high-entropy random bytes, both peers prove fresh possession by
   HMAC-SHA256 over the ordered dialer/listener transcript, roles, ids, version
-  ranges, capabilities, and challenges. This prevents replay of a captured v2
+  ranges, capabilities, and challenges. This prevents replay of a captured v3
   handshake, but a shared secret proves cluster membership, not which member is
   speaking: any holder can claim any node id. A guessable password can also be
   tested offline against a captured transcript. The proof provides no
   confidentiality or integrity for application frames after the handshake. Use
   a protected, mutually authenticated custom `Network` when those properties
   matter.
-- **Full-state handshake anti-entropy** — in static mode every
-  handshake ships the whole dataset (tombstones included);
-  steady-state replication is incremental (batches + reconciliation).
-  In legacy map-empty mode, per-peer senders are reaped on disconnect instead
-  of retaining an unbounded set of discovered identities; the mandatory
-  full-state exchange recovers LWW winners, including downtime writes and
-  tombstones, on reconnect. Senders named by an explicit placement map remain
-  allocated while disconnected and retain their bounded replay/reset state.
-  With dynamic placement enabled the handshake skips the full-state
-  sync and the reconciler owns anti-entropy (delta-only).
-- **Transport bounds are count based** — the shared per-peer outbound
-  queue defaults to 256 frames, not a byte budget, and a single accepted frame
-  can approach 16 MiB. Queue admission and socket writes have bounded waits;
-  expiry cancels the connection so the dialer can reconnect. Each Node sender
+- **Anti-entropy is correlated reconciliation** — static placement, dynamic
+  placement, late joins, reconnect recovery, buffer resets, and periodic repair
+  all use the same session/round-correlated reconciliation engine. In legacy
+  map-empty mode, per-peer senders are reaped on disconnect instead of retaining
+  an unbounded set of discovered identities; mandatory immediate reconciliation
+  after reconnect recovers downtime writes and tombstones. Senders named by an
+  explicit placement map remain allocated while disconnected and retain their
+  bounded replay/reset state.
+- **Transport queues have count and byte bounds** — the shared per-peer
+  writer pipeline defaults to 256 frames and 32 MiB of admitted encoded data;
+  a single accepted frame can approach 16 MiB. A producer first reserves the
+  data-lane ingress and its exact encoded-byte permits, then allocates the
+  frame; the owned permit travels with the frame through the socket write and
+  releases on every drop path. Queue admission and socket writes have bounded
+  waits; expiry cancels the connection so the dialer can reconnect. The frame
+  budget is split between data and a writer-priority response lane, and 1 MiB
+  of the byte budget is reserved from ordinary producers. Responses produced
+  by the sole connection reader use nonblocking admission and cancel on
+  saturation, so the reader never waits behind its own writer. After at most
+  16 consecutive responses, a ready data frame is written to prevent starvation.
+  Each Node sender
   has a bounded mutation lane and a separate bounded protocol-control lane;
   mutation overflow advances a persistent reset generation, while control
-  overflow closes the contributing connection for replay. These are item-count
-  bounds, not byte bounds: receiver actor mailboxes and individual values or
-  control frames are not byte-budgeted. Reconciliation fetches use 500-key
-  chunks, but the summary and encoded byte size are not paginated yet. Inbound
-  handlers are capped at 1024 by default, the two-flight handshake has one
-  absolute 5-second deadline, and completed Node-owned tasks are reaped while
-  the node runs.
+  overflow closes the contributing connection for replay. Sender actor lanes
+  remain operation/message-count bounds. Protocol builders separately enforce
+  exact encoded sizes: anti-entropy and ordinary replication target
+  1 MiB pages and no frame may exceed 16 MiB. An irreducible oversized record is
+  rejected before local apply; a legacy oversized persisted record fails node
+  startup instead of becoming permanently unreplicable. Before Prost decoding,
+  an allocation-free scan caps anti-entropy pages at 256 repeated items and
+  general batch fields at 4096, preventing empty-message decode amplification.
+  One ticketed FIFO credit schedules anti-entropy rounds fairly across every
+  fragment on a physical connection. Receiver actor mailbox byte accounting remains follow-up
+  work. Inbound handlers are capped at 1024
+  by default, the two-flight handshake has one absolute 5-second deadline, and
+  completed Node-owned tasks are reaped while the node runs.
 - **Fan-out is sequential** — remote fragment groups and their replica-holder
   attempts are currently awaited one at a time. Operation priority chooses the
-  destination actor pool but does not schedule the shared socket queue.
-- **Wire upgrades are negotiated but coordinated** — protocol-v2 `Hello`
+  destination actor pool but does not schedule the ordinary socket data lane.
+- **Wire upgrades are negotiated but coordinated** — protocol-v3 `Hello`
   advertises an inclusive version range, required capability bits, and a fresh
   challenge; `HelloAuth` completes the transcript proof. Missing or
   incompatible fields fail closed before peer installation. The current binary
-  supports only wire v2, which is wire-incompatible with v1, so deploy
-  compatible binaries together rather than performing a rolling v1/v2 upgrade.
-  This v2 transition is also a Rust source break for advanced users of the
-  public generated `actordb::proto` API:
-  `Hello` gained `challenge` and `EnvelopeMsg` gained `HelloAuth`, so struct
-  literals and exhaustive matches must be updated.
+  supports only wire v3 and requires the paged-anti-entropy capability. It is
+  incompatible with v2, so deploy compatible binaries together rather than
+  performing a mixed v2/v3 rolling upgrade. This transition is also a Rust
+  source break for advanced users of the public generated `actordb::proto` API
+  and the public `replication::SenderMsg`: reconciliation messages gained
+  cursor, revision, page, and completion fields, so struct literals and
+  exhaustive assumptions must be updated.
 - **Shutdown is explicit** — `Node::shutdown().await` closes Node-owned task
   admission, joins listener/connection/dial work, stops replication senders,
   and waits for fragment supervisors to flush and exit. Dropping `Node` only

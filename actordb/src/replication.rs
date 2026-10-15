@@ -39,18 +39,26 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use prost::Message as ProstMessage;
 use ractor::rpc::CallResult;
 use tokio::sync::{mpsc, oneshot, watch, Mutex};
 use tokio::task::AbortHandle;
 use tokio::time::Instant;
 
-use crate::actor::{ApplyDurability, HlcClock, KvMessage, OpPriority, VersionedValue};
+use crate::actor::{
+    ApplyDurability, HlcClock, KvMessage, OpPriority, SnapshotSummary, VersionedValue,
+};
 use crate::node::FragmentRouter;
 use crate::proto::{
     Envelope, EnvelopeMsg, KeySummary, ReconcileFetch, ReconcileRequest, ReplicateBatch,
     ReplicateOp as ProtoReplicateOp, ReplicationAckLevel, SessionStart, SyncEntry,
 };
 use crate::shard::FragmentId;
+use crate::wire::{
+    check_envelope_budget, check_replicated_op_budget, encode_envelope, message_field_len,
+    BudgetedFrame, BudgetedPeerTx, ReconcilePermit, ReconcileTicket, ANTI_ENTROPY_PAGE_BYTES,
+    MAX_FRAME_BYTES, MAX_RECONCILE_FETCH_KEYS, MAX_RECONCILE_PAGE_ITEMS, MAX_WIRE_BATCH_ITEMS,
+};
 
 /// Prevent a permanently failing receiver store from becoming a tight
 /// NACK/write/log loop. Full retry policy belongs with ACK timeouts and bounded
@@ -358,6 +366,12 @@ pub enum SenderMsg {
     ReconcileResponse {
         session_id: u64,
         round_id: u64,
+        page_seq: u64,
+        next_after_key: String,
+        snapshot_revision: u64,
+        snapshot_time_ms: u64,
+        done: bool,
+        restart: bool,
         summaries: Vec<KeySummary>,
         /// Tells the connection task whether the correlated frame passed
         /// timestamp validation. Stale frames return `true` without touching
@@ -370,6 +384,8 @@ pub enum SenderMsg {
         session_id: u64,
         round_id: u64,
         chunk_seq: u64,
+        page_seq: u64,
+        done: bool,
         entries: Vec<SyncEntry>,
         connection_valid: oneshot::Sender<bool>,
     },
@@ -384,7 +400,13 @@ struct NodeSenderSignals {
     overflow_generation: u64,
     reconcile_generation: u64,
     peer_generation: u64,
-    peer_tx: Option<mpsc::Sender<Vec<u8>>>,
+    peer: Option<NodeSenderPeer>,
+}
+
+#[derive(Clone)]
+struct NodeSenderPeer {
+    tx: mpsc::Sender<Vec<u8>>,
+    budgeted: Option<BudgetedPeerTx>,
 }
 
 #[derive(Default)]
@@ -433,32 +455,18 @@ impl NodeSender {
         }
         match msg {
             SenderMsg::Enqueue(op) => self.send_data(op),
-            SenderMsg::PeerConnected { peer_tx } => {
-                self.signals_tx.send_if_modified(|signals| {
-                    if signals
-                        .peer_tx
-                        .as_ref()
-                        .map_or(false, |current| current.same_channel(&peer_tx))
-                    {
-                        return false;
-                    }
-                    signals.peer_generation = next_generation(signals.peer_generation);
-                    signals.peer_tx = Some(peer_tx);
-                    true
-                });
-                Ok(())
-            }
+            SenderMsg::PeerConnected { peer_tx } => self.set_peer(peer_tx, None),
             SenderMsg::PeerDisconnected { peer_tx } => {
                 self.signals_tx.send_if_modified(|signals| {
                     if !signals
-                        .peer_tx
+                        .peer
                         .as_ref()
-                        .map_or(false, |current| current.same_channel(&peer_tx))
+                        .map_or(false, |current| current.tx.same_channel(&peer_tx))
                     {
                         return false;
                     }
                     signals.peer_generation = next_generation(signals.peer_generation);
-                    signals.peer_tx = None;
+                    signals.peer = None;
                     true
                 });
                 Ok(())
@@ -471,6 +479,47 @@ impl NodeSender {
             }
             control => self.send_control(control),
         }
+    }
+
+    /// Install a Node-owned transport together with its encoded-byte budget.
+    /// Standalone senders retain the legacy `PeerConnected` API and therefore
+    /// have no producer-side byte gate; every Node connection uses this path.
+    pub(crate) fn connect_peer(&self, peer: BudgetedPeerTx) -> Result<(), NodeSenderSendError> {
+        if self.is_closed() {
+            return Err(NodeSenderSendError::Closed);
+        }
+        self.set_peer(peer.identity.clone(), Some(peer))
+    }
+
+    fn set_peer(
+        &self,
+        peer_tx: mpsc::Sender<Vec<u8>>,
+        budgeted: Option<BudgetedPeerTx>,
+    ) -> Result<(), NodeSenderSendError> {
+        self.signals_tx.send_if_modified(|signals| {
+            if let Some(current) = signals.peer.as_ref() {
+                if current.tx.same_channel(&peer_tx) {
+                    // Never let a legacy duplicate notification remove the
+                    // Node transport's hard producer-side byte gate.
+                    if budgeted.is_none()
+                        || current
+                            .budgeted
+                            .as_ref()
+                            .zip(budgeted.as_ref())
+                            .map_or(false, |(current, next)| current.same_channel(next))
+                    {
+                        return false;
+                    }
+                }
+            }
+            signals.peer_generation = next_generation(signals.peer_generation);
+            signals.peer = Some(NodeSenderPeer {
+                tx: peer_tx,
+                budgeted,
+            });
+            true
+        });
+        Ok(())
     }
 
     fn send_data(&self, op: crate::actor::ReplicatedOp) -> Result<(), NodeSenderSendError> {
@@ -542,7 +591,7 @@ enum SenderInput {
     Message(SenderMsg),
     Data(crate::actor::ReplicatedOp, Arc<NodeSenderIngress>),
     Overflow(u64, Arc<NodeSenderIngress>),
-    PeerChanged(Option<mpsc::Sender<Vec<u8>>>),
+    PeerChanged(Option<NodeSenderPeer>),
     ReconcileNow,
     Closed,
 }
@@ -587,7 +636,7 @@ impl SenderInbox {
                 }
                 if signals.peer_generation != *delivered_peer_generation {
                     *delivered_peer_generation = signals.peer_generation;
-                    return SenderInput::PeerChanged(signals.peer_tx);
+                    return SenderInput::PeerChanged(signals.peer);
                 }
                 if signals.reconcile_generation != *delivered_reconcile_generation {
                     *delivered_reconcile_generation = signals.reconcile_generation;
@@ -671,14 +720,23 @@ impl ActiveConnection {
 #[derive(Clone)]
 struct SenderPeer {
     tx: mpsc::Sender<Vec<u8>>,
+    budgeted: Option<BudgetedPeerTx>,
     queue_admission_timeout: Duration,
     queue_failure_handler: Option<QueueFailureHandler>,
 }
 
 impl SenderPeer {
-    fn new(tx: mpsc::Sender<Vec<u8>>, options: &SenderRuntimeOptions) -> Self {
+    fn new(
+        tx: mpsc::Sender<Vec<u8>>,
+        budgeted: Option<BudgetedPeerTx>,
+        options: &SenderRuntimeOptions,
+    ) -> Self {
+        debug_assert!(budgeted
+            .as_ref()
+            .map_or(true, |peer| peer.identity.same_channel(&tx)));
         Self {
             tx,
+            budgeted,
             queue_admission_timeout: options.queue_admission_timeout,
             queue_failure_handler: options.queue_failure_handler.clone(),
         }
@@ -695,7 +753,10 @@ impl SenderPeer {
     }
 
     fn must_disconnect_after_failure(&self) -> bool {
-        self.tx.is_closed() || self.queue_failure_handler.is_some()
+        self.budgeted
+            .as_ref()
+            .map_or_else(|| self.tx.is_closed(), |peer| peer.tx.is_closed())
+            || self.queue_failure_handler.is_some()
     }
 }
 
@@ -711,12 +772,37 @@ enum ReconcilePurpose {
     Reset { epoch: u64 },
 }
 
+struct ReconcileSummaryState {
+    next_page_seq: u64,
+    next_fetch_chunk_seq: u64,
+    after_key: String,
+    remote_snapshot_revision: Option<u64>,
+    remote_snapshot_time_ms: Option<u64>,
+    remote_revision_stable: bool,
+    local: ReconcileLocalCursor,
+    changed_any: bool,
+    summary_done: bool,
+}
+
+struct ReconcileLocalCursor {
+    after_key: String,
+    revision: Option<u64>,
+    snapshot_time_ms: Option<u64>,
+    revision_stable: bool,
+    buffered: VecDeque<SnapshotSummary>,
+    current: Option<SnapshotSummary>,
+    done: bool,
+}
+
 enum ReconcilePhase {
-    Response,
+    Response(ReconcileSummaryState),
     Data {
+        summary: ReconcileSummaryState,
         remaining_chunks: VecDeque<Vec<String>>,
         next_chunk_seq: u64,
         expected_keys: HashSet<String>,
+        received_keys: HashSet<String>,
+        next_page_seq: u64,
     },
     Barrier {
         batch_seq: u64,
@@ -730,6 +816,9 @@ struct ReconcileRound {
     phase: ReconcilePhase,
     phase_deadline: Instant,
     snapshot_revision: Option<u64>,
+    /// Peer-wide credit retained for the complete round, including its
+    /// durability barrier. Dropping or completing the round releases it.
+    connection_permit: Option<ReconcilePermit>,
 }
 
 fn requeue_in_flight(
@@ -902,19 +991,64 @@ fn proto_op(op: &crate::actor::ReplicatedOp) -> ProtoReplicateOp {
     }
 }
 
+fn take_streaming_batch(
+    buffer: &mut VecDeque<crate::actor::ReplicatedOp>,
+    max_items: usize,
+    session_id: u64,
+    batch_seq: u64,
+    fragment: FragmentId,
+    required_ack_level: i32,
+) -> Result<(Vec<crate::actor::ReplicatedOp>, Vec<ProtoReplicateOp>), ()> {
+    let mut ops = Vec::new();
+    let mut batch = ReplicateBatch {
+        session_id,
+        batch_seq,
+        fragment: fragment.0,
+        ops: Vec::new(),
+        required_ack_level,
+    };
+    while ops.len() < max_items.min(MAX_WIRE_BATCH_ITEMS) {
+        let Some(op) = buffer.pop_front() else { break };
+        batch.ops.push(proto_op(&op));
+        let encoded_len = message_field_len(9, batch.encoded_len());
+        if encoded_len > MAX_FRAME_BYTES {
+            batch.ops.pop();
+            buffer.push_front(op);
+            if ops.is_empty() {
+                return Err(());
+            }
+            break;
+        }
+        if encoded_len > ANTI_ENTROPY_PAGE_BYTES && !ops.is_empty() {
+            batch.ops.pop();
+            buffer.push_front(op);
+            break;
+        }
+        ops.push(op);
+        if encoded_len > ANTI_ENTROPY_PAGE_BYTES {
+            break;
+        }
+    }
+    if ops.is_empty() {
+        Err(())
+    } else {
+        Ok((ops, batch.ops))
+    }
+}
+
 async fn send_envelope(
     peer: &SenderPeer,
     tracked_deadline: Option<Instant>,
     msg: EnvelopeMsg,
 ) -> bool {
-    let mut buf = Vec::new();
-    {
-        use prost::Message;
-        let env = Envelope { msg: Some(msg) };
-        if env.encode(&mut buf).is_err() {
+    let envelope = Envelope { msg: Some(msg) };
+    let encoded_len = match check_envelope_budget(&envelope, MAX_FRAME_BYTES) {
+        Ok(encoded_len) => encoded_len,
+        Err(error) => {
+            tracing::warn!(%error, "rejecting oversized or invalid outbound replication frame");
             return false;
         }
-    }
+    };
     let now = Instant::now();
     let queue_deadline = now.checked_add(peer.queue_admission_timeout).unwrap_or(now);
     let admission_deadline = tracked_deadline
@@ -924,20 +1058,84 @@ async fn send_envelope(
         peer.report_failure();
         return false;
     }
-    match tokio::time::timeout_at(admission_deadline, peer.tx.reserve()).await {
-        Ok(Ok(permit)) => {
-            if Instant::now() >= admission_deadline {
-                drop(permit);
+    if let Some(outbound) = &peer.budgeted {
+        let frame_permit =
+            match tokio::time::timeout_at(admission_deadline, outbound.tx.reserve()).await {
+                Ok(Ok(permit)) => permit,
+                Ok(Err(_)) | Err(_) => {
+                    peer.report_failure();
+                    return false;
+                }
+            };
+        let producer_byte_permit = match tokio::time::timeout_at(
+            admission_deadline,
+            outbound
+                .producer_byte_budget
+                .clone()
+                .acquire_many_owned(encoded_len as u32),
+        )
+        .await
+        {
+            Ok(Ok(permit)) => permit,
+            Ok(Err(_)) | Err(_) => {
                 peer.report_failure();
                 return false;
             }
-            permit.send(buf);
-            true
-        }
-        Ok(Err(_)) | Err(_) => {
+        };
+        let byte_permit = match tokio::time::timeout_at(
+            admission_deadline,
+            outbound
+                .byte_budget
+                .clone()
+                .acquire_many_owned(encoded_len as u32),
+        )
+        .await
+        {
+            Ok(Ok(permit)) => permit,
+            Ok(Err(_)) | Err(_) => {
+                peer.report_failure();
+                return false;
+            }
+        };
+        if Instant::now() >= admission_deadline {
             peer.report_failure();
-            false
+            return false;
         }
+        let buf = match encode_envelope(&envelope) {
+            Ok(buf) => buf,
+            Err(error) => {
+                tracing::warn!(%error, "failed to encode preflighted outbound replication frame");
+                return false;
+            }
+        };
+        frame_permit.send(BudgetedFrame::new_producer(
+            buf,
+            byte_permit,
+            producer_byte_permit,
+        ));
+        true
+    } else {
+        let frame_permit =
+            match tokio::time::timeout_at(admission_deadline, peer.tx.reserve()).await {
+                Ok(Ok(permit)) => permit,
+                Ok(Err(_)) | Err(_) => {
+                    peer.report_failure();
+                    return false;
+                }
+            };
+        if Instant::now() >= admission_deadline {
+            peer.report_failure();
+            return false;
+        }
+        let buf = match encode_envelope(&envelope) {
+            Ok(buf) => buf,
+            Err(error) => {
+                tracing::warn!(%error, "failed to encode preflighted outbound replication frame");
+                return false;
+            }
+        };
+        frame_permit.send(buf);
+        true
     }
 }
 
@@ -964,6 +1162,8 @@ async fn sender_task(
     consistency_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     let mut active_reconcile: Option<ReconcileRound> = None;
+    let mut reconcile_credit_rx: Option<watch::Receiver<u64>> = None;
+    let mut reconcile_ticket: Option<ReconcileTicket> = None;
     let mut next_round_id = 0_u64;
     let mut next_reset_epoch = 0_u64;
     let mut reconcile_rounds: u64 = 0;
@@ -985,6 +1185,10 @@ async fn sender_task(
     let mut active_ingress_overflow: Option<(Arc<NodeSenderIngress>, u64)> = None;
 
     loop {
+        if connection.is_none() {
+            reconcile_credit_rx = None;
+            reconcile_ticket = None;
+        }
         // Publish state for health checks and tests.
         {
             let state = match delivery {
@@ -1040,6 +1244,7 @@ async fn sender_task(
         tokio::select! {
             input = inbox.recv() => {
                 let mut overflow = None;
+                let mut budgeted_peer = None;
                 let msg = match input {
                     SenderInput::Message(msg) => Some(msg),
                     SenderInput::Data(op, ingress) => {
@@ -1050,8 +1255,9 @@ async fn sender_task(
                         overflow = Some((ingress, generation));
                         None
                     }
-                    SenderInput::PeerChanged(Some(peer_tx)) => {
-                        Some(SenderMsg::PeerConnected { peer_tx })
+                    SenderInput::PeerChanged(Some(peer)) => {
+                        budgeted_peer = peer.budgeted;
+                        Some(SenderMsg::PeerConnected { peer_tx: peer.tx })
                     }
                     SenderInput::PeerChanged(None) => connection.as_ref().map(|current| {
                         SenderMsg::PeerDisconnected {
@@ -1105,12 +1311,19 @@ async fn sender_task(
                             fragment,
                             ReconcilePurpose::Reset { epoch },
                             conn,
+                            &mut reconcile_ticket,
                             &mut next_round_id,
                             config.reconcile_timeout,
                         )
                         .await
                         {
-                            Ok(round) => active_reconcile = Some(round),
+                            Ok(Some(round)) => active_reconcile = Some(round),
+                            Ok(None) => {
+                                reconcile_retry = Some((
+                                    Instant::now() + NACK_RETRY_DELAY,
+                                    ReconcilePurpose::Reset { epoch },
+                                ));
+                            }
                             Err(()) => {
                                 reconcile_retry = Some((
                                     Instant::now() + NACK_RETRY_DELAY,
@@ -1155,6 +1368,7 @@ async fn sender_task(
                             // notifications must not rotate live sessions.
                             continue;
                         }
+                        reconcile_ticket = None;
                         if let Some(round) = active_reconcile.take() {
                             reconcile_retry = Some((Instant::now(), round.purpose));
                         }
@@ -1168,8 +1382,11 @@ async fn sender_task(
                         }
                         last_ack_durability = None;
                         ack_durability_mismatch = false;
+                        reconcile_credit_rx = budgeted_peer
+                            .as_ref()
+                            .map(BudgetedPeerTx::reconcile_change_receiver);
                         let mut conn = ActiveConnection {
-                            peer_tx: SenderPeer::new(tx, &runtime),
+                            peer_tx: SenderPeer::new(tx, budgeted_peer, &runtime),
                             session_id: rand_session_id(),
                             session_ready: false,
                             next_batch_seq: 0,
@@ -1210,15 +1427,23 @@ async fn sender_task(
                                 fragment,
                                 purpose,
                                 &conn,
+                                &mut reconcile_ticket,
                                 &mut next_round_id,
                                 config.reconcile_timeout,
                             )
                             .await
                             {
-                                Ok(round) => {
+                                Ok(Some(round)) => {
                                     active_reconcile = Some(round);
                                     reconcile_retry = None;
                                     pause_new_streaming = false;
+                                }
+                                Ok(None) => {
+                                    reconcile_retry = Some((
+                                        deadline_after(NACK_RETRY_DELAY),
+                                        purpose,
+                                    ));
+                                    pause_new_streaming = true;
                                 }
                                 Err(()) => {
                                     reconcile_retry = Some((
@@ -1242,6 +1467,7 @@ async fn sender_task(
                         {
                             continue;
                         }
+                        reconcile_ticket = None;
                         if let Some(round) = active_reconcile.take() {
                             reconcile_retry = Some((Instant::now(), round.purpose));
                         }
@@ -1306,28 +1532,41 @@ async fn sender_task(
                             pause_new_streaming = false;
                             match round.purpose {
                                 ReconcilePurpose::Routine => {
-                                    if round.snapshot_revision.is_some() {
+                                    let snapshot_is_current = match (
+                                        round.snapshot_revision,
+                                        fragment_revision(fragment, &deps.router).await,
+                                    ) {
+                                        (Some(expected), Ok(current)) => expected == current,
+                                        _ => false,
+                                    };
+                                    if snapshot_is_current {
                                         reconcile_rounds = reconcile_rounds.saturating_add(1);
                                     } else if let Some(conn) = connection.as_ref() {
-                                        // Fetched winners (and reset deltas)
-                                        // invalidate the snapshot that chose
-                                        // them. The barrier proves those
-                                        // writes were applied, but not that
-                                        // the two sides now agree. Require a
-                                        // fresh no-fetch round before
+                                        // Fetched winners or a concurrent
+                                        // local mutation invalidate the
+                                        // snapshot that chose the repairs.
+                                        // Require a fresh stable round before
                                         // reporting routine/bootstrap
                                         // completion.
+                                        drop(round.connection_permit.take());
                                         match begin_reconcile(
                                             fragment,
                                             ReconcilePurpose::Routine,
                                             conn,
+                                            &mut reconcile_ticket,
                                             &mut next_round_id,
                                             config.reconcile_timeout,
                                         )
                                         .await
                                         {
-                                            Ok(next_round) => {
+                                            Ok(Some(next_round)) => {
                                                 active_reconcile = Some(next_round)
+                                            }
+                                            Ok(None) => {
+                                                reconcile_retry = Some((
+                                                    Instant::now() + NACK_RETRY_DELAY,
+                                                    ReconcilePurpose::Routine,
+                                                ));
                                             }
                                             Err(()) => {
                                                 reconcile_retry = Some((
@@ -1436,16 +1675,26 @@ async fn sender_task(
                                         }
                                         DeliveryState::Reset { epoch } => {
                                             if let Some(conn) = connection.as_ref() {
+                                                drop(round.connection_permit.take());
                                                 match begin_reconcile(
                                                     fragment,
                                                     ReconcilePurpose::Reset { epoch },
                                                     conn,
+                                                    &mut reconcile_ticket,
                                                     &mut next_round_id,
                                                     config.reconcile_timeout,
                                                 )
                                                 .await
                                                 {
-                                                    Ok(round) => active_reconcile = Some(round),
+                                                    Ok(Some(round)) => {
+                                                        active_reconcile = Some(round)
+                                                    }
+                                                    Ok(None) => {
+                                                        reconcile_retry = Some((
+                                                            Instant::now() + NACK_RETRY_DELAY,
+                                                            ReconcilePurpose::Reset { epoch },
+                                                        ));
+                                                    }
                                                     Err(()) => {
                                                         reconcile_retry = Some((
                                                             Instant::now() + NACK_RETRY_DELAY,
@@ -1567,14 +1816,22 @@ async fn sender_task(
                                     fragment,
                                     ReconcilePurpose::Routine,
                                     conn,
+                                    &mut reconcile_ticket,
                                     &mut next_round_id,
                                     config.reconcile_timeout,
                                 )
                                 .await
                                 {
-                                    Ok(round) => {
+                                    Ok(Some(round)) => {
                                         active_reconcile = Some(round);
                                         reconcile_retry = None;
+                                    }
+                                    Ok(None) => {
+                                        reconcile_retry = Some((
+                                            Instant::now() + NACK_RETRY_DELAY,
+                                            ReconcilePurpose::Routine,
+                                        ));
+                                        pause_new_streaming = true;
                                     }
                                     Err(()) => {
                                         reconcile_retry = Some((
@@ -1598,23 +1855,68 @@ async fn sender_task(
                     SenderMsg::ReconcileResponse {
                         session_id,
                         round_id,
+                        page_seq,
+                        next_after_key,
+                        snapshot_revision,
+                        snapshot_time_ms,
+                        done,
+                        restart,
                         summaries,
                         connection_valid,
                     } => {
                         let expected = active_reconcile.as_ref().map_or(false, |round| {
                             round.session_id == session_id
                                 && round.round_id == round_id
-                                && matches!(round.phase, ReconcilePhase::Response)
+                                && matches!(
+                                    &round.phase,
+                                    ReconcilePhase::Response(summary)
+                                        if summary.next_page_seq == page_seq
+                                )
                         });
                         if !expected {
                             let _ = connection_valid.send(true);
                             continue;
                         }
-                        if reconcile_summaries_are_well_formed(
-                            fragment,
-                            &deps.router,
-                            &summaries,
-                        ) {
+                        let structurally_valid = active_reconcile.as_ref().map_or(false, |round| {
+                            let ReconcilePhase::Response(summary) = &round.phase else {
+                                return false;
+                            };
+                            if restart {
+                                return summaries.is_empty() && !done;
+                            }
+                            let snapshot_matches = match (
+                                summary.remote_snapshot_revision,
+                                summary.remote_snapshot_time_ms,
+                            ) {
+                                (None, None) => page_seq == 0 && snapshot_time_ms != 0,
+                                (Some(_), Some(snapshot_time)) => {
+                                    snapshot_time == snapshot_time_ms
+                                }
+                                _ => false,
+                            };
+                            snapshot_matches
+                                && reconcile_summaries_are_well_formed(
+                                    fragment,
+                                    &deps.router,
+                                    summary.next_page_seq != 0,
+                                    &summary.after_key,
+                                    &summaries,
+                                    &next_after_key,
+                                    done,
+                                )
+                        });
+                        if !structurally_valid {
+                            tracing::warn!(
+                                peer = %peer_id,
+                                fragment = fragment.0,
+                                round_id,
+                                page_seq,
+                                "rejecting malformed reconcile summary page"
+                            );
+                            let _ = connection_valid.send(false);
+                            continue;
+                        }
+                        if !restart {
                             if let Some(timestamp_ms) =
                                 summaries.iter().map(|summary| summary.timestamp_ms).max()
                             {
@@ -1632,80 +1934,155 @@ async fn sender_task(
                         }
                         let _ = connection_valid.send(true);
                         let Some(mut round) = active_reconcile.take() else { continue };
-                        let Some(conn) = connection.as_mut() else { continue };
-                        match reconcile(
-                            fragment,
-                            &deps.router,
-                            conn,
-                            round.round_id,
-                            summaries,
-                        )
-                        .await
-                        {
-                            Ok((
-                                Some((
-                                    remaining_chunks,
-                                    expected_chunk_seq,
-                                    expected_keys,
-                                )),
-                                snapshot_revision,
-                            )) => {
-                                round.snapshot_revision = Some(snapshot_revision);
-                                round.phase = ReconcilePhase::Data {
-                                    remaining_chunks,
-                                    next_chunk_seq: expected_chunk_seq,
-                                    expected_keys,
-                                };
-                                round.phase_deadline =
-                                    deadline_after(config.reconcile_timeout);
-                                active_reconcile = Some(round);
+                        if restart {
+                            reconcile_retry =
+                                Some((Instant::now() + NACK_RETRY_DELAY, round.purpose));
+                            continue;
+                        }
+                        let ReconcilePhase::Response(mut summary) = round.phase else {
+                            continue;
+                        };
+                        if summary.remote_snapshot_revision.is_none() {
+                            summary.remote_snapshot_revision = Some(snapshot_revision);
+                            summary.remote_snapshot_time_ms = Some(snapshot_time_ms);
+                        } else if summary.remote_snapshot_revision != Some(snapshot_revision) {
+                            summary.remote_revision_stable = false;
+                        }
+                        summary.next_page_seq = summary.next_page_seq.saturating_add(1);
+                        summary.after_key = next_after_key;
+                        summary.summary_done = done;
+
+                        let page_result = match connection.as_ref() {
+                            Some(conn) => {
+                                reconcile_summary_page(
+                                    fragment,
+                                    &deps.router,
+                                    conn,
+                                    round.round_id,
+                                    &mut summary,
+                                    &summaries,
+                                    done,
+                                )
+                                .await
                             }
-                            Ok((None, snapshot_revision)) => {
-                                round.snapshot_revision = Some(snapshot_revision);
-                                // A prior attempt may already have applied
-                                // fetched winners to the cache and then failed
-                                // its local store flush. The retry will see
-                                // equal summaries and need no fetch, so fence
-                                // local durability on every StoreCommitted
-                                // completion path, not only after fresh data.
-                                if local_reconcile_flush_pending {
-                                    if flush_reconcile(fragment, &deps.router).await.is_err() {
-                                        reconcile_retry = Some((
-                                            Instant::now() + NACK_RETRY_DELAY,
-                                            round.purpose,
-                                        ));
-                                        continue;
-                                    }
-                                    local_reconcile_flush_pending = false;
-                                }
-                                match send_reconcile_barrier(fragment, &config, conn).await {
-                                    Ok(batch_seq) => {
-                                        round.phase = ReconcilePhase::Barrier { batch_seq };
-                                        round.phase_deadline =
-                                            deadline_after(config.reconcile_timeout);
-                                        active_reconcile = Some(round);
-                                    }
-                                    Err(()) => {
-                                        reconcile_retry = Some((
-                                            Instant::now() + NACK_RETRY_DELAY,
-                                            round.purpose,
-                                        ));
-                                        disconnect_transport(&mut connection, delivery, &mut buffer);
-                                    }
-                                }
-                            }
-                            Err(ReconcileError::Local) => {
+                            None => Err(ReconcileError::Transport),
+                        };
+                        let mut chunks = match page_result {
+                            Ok(chunks) => chunks,
+                            Err(error) => {
                                 reconcile_retry = Some((
                                     Instant::now() + NACK_RETRY_DELAY,
                                     round.purpose,
                                 ));
+                                if error == ReconcileError::Transport {
+                                    disconnect_transport(
+                                        &mut connection,
+                                        delivery,
+                                        &mut buffer,
+                                    );
+                                }
+                                continue;
                             }
-                            Err(ReconcileError::Transport) => {
+                        };
+                        if let Some(keys) = chunks.pop_front() {
+                            summary.changed_any = true;
+                            let chunk_seq = summary.next_fetch_chunk_seq;
+                            summary.next_fetch_chunk_seq =
+                                summary.next_fetch_chunk_seq.saturating_add(1);
+                            let expected_keys = keys.iter().cloned().collect();
+                            let sent = match connection.as_ref() {
+                                Some(conn) => {
+                                    send_fetch(fragment, conn, round.round_id, chunk_seq, keys)
+                                        .await
+                                }
+                                None => Err(ReconcileError::Transport),
+                            };
+                            if let Err(error) = sent {
+                                reconcile_retry = Some((
+                                    Instant::now() + NACK_RETRY_DELAY,
+                                    round.purpose,
+                                ));
+                                if error == ReconcileError::Transport {
+                                    disconnect_transport(
+                                        &mut connection,
+                                        delivery,
+                                        &mut buffer,
+                                    );
+                                }
+                                continue;
+                            }
+                            round.phase = ReconcilePhase::Data {
+                                summary,
+                                remaining_chunks: chunks,
+                                next_chunk_seq: chunk_seq,
+                                expected_keys,
+                                received_keys: HashSet::new(),
+                                next_page_seq: 0,
+                            };
+                            round.phase_deadline = deadline_after(config.reconcile_timeout);
+                            active_reconcile = Some(round);
+                            continue;
+                        }
+                        if !summary.summary_done {
+                            let sent = match connection.as_ref() {
+                                Some(conn) => {
+                                    send_summary_request(fragment, conn, round.round_id, &summary)
+                                        .await
+                                }
+                                None => Err(ReconcileError::Transport),
+                            };
+                            if sent.is_ok() {
+                                round.phase = ReconcilePhase::Response(summary);
+                                round.phase_deadline = deadline_after(config.reconcile_timeout);
+                                active_reconcile = Some(round);
+                            } else {
                                 reconcile_retry = Some((
                                     Instant::now() + NACK_RETRY_DELAY,
                                     round.purpose,
                                 ));
                                 disconnect_transport(&mut connection, delivery, &mut buffer);
+                            }
+                            continue;
+                        }
+                        round.snapshot_revision = if summary.changed_any
+                            || !summary.remote_revision_stable
+                            || !summary.local.revision_stable
+                        {
+                            None
+                        } else {
+                            summary.local.revision
+                        };
+                        // Reinitialize the moved phase before the barrier
+                        // helper borrows the complete round.
+                        round.phase = ReconcilePhase::Response(summary);
+                        let barrier = match connection.as_mut() {
+                            Some(conn) => {
+                                enter_reconcile_barrier(
+                                    fragment,
+                                    &deps.router,
+                                    &config,
+                                    conn,
+                                    &mut round,
+                                    &mut local_reconcile_flush_pending,
+                                )
+                                .await
+                            }
+                            None => Err(ReconcileError::Transport),
+                        };
+                        match barrier {
+                            Ok(()) => active_reconcile = Some(round),
+                            Err(error) => {
+                                reconcile_retry = Some((
+                                    Instant::now() + NACK_RETRY_DELAY,
+                                    round.purpose,
+                                ));
+                                if error == ReconcileError::Transport {
+                                    disconnect_transport(
+                                        &mut connection,
+                                        delivery,
+                                        &mut buffer,
+                                    );
+                                }
                             }
                         }
                     }
@@ -1713,6 +2090,8 @@ async fn sender_task(
                         session_id,
                         round_id,
                         chunk_seq,
+                        page_seq,
+                        done,
                         entries,
                         connection_valid,
                     } => {
@@ -1720,31 +2099,53 @@ async fn sender_task(
                             round.session_id == session_id
                                 && round.round_id == round_id
                                 && matches!(
-                                    round.phase,
-                                    ReconcilePhase::Data { next_chunk_seq, .. }
-                                        if next_chunk_seq == chunk_seq
+                                    &round.phase,
+                                    ReconcilePhase::Data {
+                                        next_chunk_seq,
+                                        next_page_seq,
+                                        ..
+                                    } if *next_chunk_seq == chunk_seq && *next_page_seq == page_seq
                                 )
                         });
                         if !expected {
                             let _ = connection_valid.send(true);
                             continue;
                         }
-                        let expected_keys = match active_reconcile.as_ref().map(|round| &round.phase)
+                        let (expected_keys, received_keys) = match active_reconcile
+                            .as_ref()
+                            .map(|round| &round.phase)
                         {
-                            Some(ReconcilePhase::Data { expected_keys, .. }) => {
-                                expected_keys
-                            }
+                            Some(ReconcilePhase::Data {
+                                expected_keys,
+                                received_keys,
+                                ..
+                            }) => (expected_keys, received_keys),
                             _ => {
                                 let _ = connection_valid.send(true);
                                 continue;
                             }
                         };
-                        if reconcile_entries_are_exact(
+                        let well_formed = (!entries.is_empty() || done)
+                            && reconcile_entries_are_well_formed(
                             fragment,
                             &deps.router,
                             &entries,
                             expected_keys,
-                        ) {
+                            received_keys,
+                        );
+                        if !well_formed {
+                            tracing::warn!(
+                                peer = %peer_id,
+                                fragment = fragment.0,
+                                round_id,
+                                chunk_seq,
+                                page_seq,
+                                "rejecting malformed reconcile data page"
+                            );
+                            let _ = connection_valid.send(false);
+                            continue;
+                        }
+                        if well_formed {
                             if let Some(timestamp_ms) =
                                 entries.iter().map(|entry| entry.timestamp_ms).max()
                             {
@@ -1763,9 +2164,12 @@ async fn sender_task(
                         let _ = connection_valid.send(true);
                         let Some(mut round) = active_reconcile.take() else { continue };
                         let ReconcilePhase::Data {
+                            mut summary,
                             mut remaining_chunks,
-                            next_chunk_seq,
+                            next_chunk_seq: current_chunk_seq,
                             expected_keys,
+                            mut received_keys,
+                            next_page_seq,
                         } = round.phase
                         else {
                             continue;
@@ -1778,12 +2182,8 @@ async fn sender_task(
                             // flush obligation before the first mutation.
                             local_reconcile_flush_pending = true;
                         }
-                        if apply_reconcile_entries(
-                            fragment,
-                            &deps.router,
-                            entries,
-                            &expected_keys,
-                        )
+                        received_keys.extend(entries.iter().map(|entry| entry.key.clone()));
+                        if apply_reconcile_entries(fragment, &deps.router, entries)
                             .await
                             .is_err()
                         {
@@ -1793,23 +2193,43 @@ async fn sender_task(
                             ));
                             continue;
                         }
+                        if !done {
+                            round.phase = ReconcilePhase::Data {
+                                summary,
+                                remaining_chunks,
+                                next_chunk_seq: current_chunk_seq,
+                                expected_keys,
+                                received_keys,
+                                next_page_seq: next_page_seq.saturating_add(1),
+                            };
+                            round.phase_deadline = deadline_after(config.reconcile_timeout);
+                            active_reconcile = Some(round);
+                            continue;
+                        }
+                        if received_keys != expected_keys {
+                            tracing::warn!(
+                                peer = %peer_id,
+                                fragment = fragment.0,
+                                expected = expected_keys.len(),
+                                received = received_keys.len(),
+                                "reconcile data terminated before every requested key arrived"
+                            );
+                            reconcile_retry = Some((
+                                Instant::now() + NACK_RETRY_DELAY,
+                                round.purpose,
+                            ));
+                            continue;
+                        }
                         let Some(conn) = connection.as_mut() else { continue };
                         if let Some(keys) = remaining_chunks.pop_front() {
-                            let next_seq = next_chunk_seq.saturating_add(1);
+                            let next_seq = summary.next_fetch_chunk_seq;
+                            summary.next_fetch_chunk_seq =
+                                summary.next_fetch_chunk_seq.saturating_add(1);
                             let expected_keys = keys.iter().cloned().collect();
-                            let ok = send_envelope(
-                                &conn.peer_tx,
-                                conn.next_streaming_deadline(),
-                                EnvelopeMsg::ReconcileFetch(ReconcileFetch {
-                                    fragment: fragment.0,
-                                    keys,
-                                    session_id,
-                                    round_id,
-                                    chunk_seq: next_seq,
-                                }),
-                            )
-                            .await;
-                            if !ok {
+                            if send_fetch(fragment, conn, round_id, next_seq, keys)
+                                .await
+                                .is_err()
+                            {
                                 reconcile_retry = Some((
                                     Instant::now() + NACK_RETRY_DELAY,
                                     round.purpose,
@@ -1818,42 +2238,63 @@ async fn sender_task(
                                 continue;
                             }
                             round.phase = ReconcilePhase::Data {
+                                summary,
                                 remaining_chunks,
                                 next_chunk_seq: next_seq,
                                 expected_keys,
+                                received_keys: HashSet::new(),
+                                next_page_seq: 0,
                             };
                             round.phase_deadline = deadline_after(config.reconcile_timeout);
                             active_reconcile = Some(round);
                             continue;
                         }
-                        if local_reconcile_flush_pending {
-                            if flush_reconcile(fragment, &deps.router).await.is_err() {
+                        if !summary.summary_done {
+                            if send_summary_request(fragment, conn, round.round_id, &summary)
+                                .await
+                                .is_err()
+                            {
                                 reconcile_retry = Some((
                                     Instant::now() + NACK_RETRY_DELAY,
                                     round.purpose,
                                 ));
+                                disconnect_transport(&mut connection, delivery, &mut buffer);
                                 continue;
                             }
-                            local_reconcile_flush_pending = false;
+                            round.phase = ReconcilePhase::Response(summary);
+                            round.phase_deadline = deadline_after(config.reconcile_timeout);
+                            active_reconcile = Some(round);
+                            continue;
                         }
                         // A fetched apply changes the fragment revision, but
                         // unrelated mutations may have raced with it. Force a
                         // no-fetch verification round after this barrier
                         // instead of rebasing to an ambiguous revision.
                         round.snapshot_revision = None;
-                        match send_reconcile_barrier(fragment, &config, conn).await {
-                            Ok(batch_seq) => {
-                                round.phase = ReconcilePhase::Barrier { batch_seq };
-                                round.phase_deadline =
-                                    deadline_after(config.reconcile_timeout);
-                                active_reconcile = Some(round);
-                            }
-                            Err(()) => {
+                        round.phase = ReconcilePhase::Response(summary);
+                        match enter_reconcile_barrier(
+                            fragment,
+                            &deps.router,
+                            &config,
+                            conn,
+                            &mut round,
+                            &mut local_reconcile_flush_pending,
+                        )
+                        .await
+                        {
+                            Ok(()) => active_reconcile = Some(round),
+                            Err(error) => {
                                 reconcile_retry = Some((
                                     Instant::now() + NACK_RETRY_DELAY,
                                     round.purpose,
                                 ));
-                                disconnect_transport(&mut connection, delivery, &mut buffer);
+                                if error == ReconcileError::Transport {
+                                    disconnect_transport(
+                                        &mut connection,
+                                        delivery,
+                                        &mut buffer,
+                                    );
+                                }
                             }
                         }
                     }
@@ -1887,10 +2328,33 @@ async fn sender_task(
                     Some(conn) => allocate_batch_seq(conn),
                     None => continue,
                 };
-                let ops: Vec<_> = buffer
-                    .drain(..config.batch_size.min(buffer.len()))
-                    .collect();
-                let proto_ops = ops.iter().map(proto_op).collect();
+                let required_ack_level = match config.required_ack_durability {
+                    ReplicationAckDurability::MemoryApplied => {
+                        ReplicationAckLevel::Applied as i32
+                    }
+                    ReplicationAckDurability::StoreCommitted => {
+                        ReplicationAckLevel::StoreCommitted as i32
+                    }
+                };
+                let (ops, proto_ops) = match take_streaming_batch(
+                    &mut buffer,
+                    config.batch_size,
+                    sid,
+                    batch_seq,
+                    fragment,
+                    required_ack_level,
+                ) {
+                    Ok(batch) => batch,
+                    Err(()) => {
+                        tracing::error!(
+                            peer = %peer_id,
+                            fragment = fragment.0,
+                            "buffered mutation cannot fit in one replication frame"
+                        );
+                        retry_not_before = Some(Instant::now() + NACK_RETRY_DELAY);
+                        continue;
+                    }
+                };
                 let ok = send_envelope(
                     &tx,
                     tracked_deadline,
@@ -1899,14 +2363,7 @@ async fn sender_task(
                         batch_seq,
                         fragment: fragment.0,
                         ops: proto_ops,
-                        required_ack_level: match config.required_ack_durability {
-                            ReplicationAckDurability::MemoryApplied => {
-                                ReplicationAckLevel::Applied as i32
-                            }
-                            ReplicationAckDurability::StoreCommitted => {
-                                ReplicationAckLevel::StoreCommitted as i32
-                            }
-                        },
+                        required_ack_level,
                     }),
                 )
                 .await;
@@ -2055,14 +2512,19 @@ async fn sender_task(
                         fragment,
                         purpose,
                         conn,
+                        &mut reconcile_ticket,
                         &mut next_round_id,
                         config.reconcile_timeout,
                     )
                     .await
                     {
-                        Ok(round) => {
+                        Ok(Some(round)) => {
                             active_reconcile = Some(round);
                             reconcile_retry = None;
+                        }
+                        Ok(None) => {
+                            reconcile_retry = Some((now + NACK_RETRY_DELAY, purpose));
+                            pause_new_streaming = true;
                         }
                         Err(()) => {
                             reconcile_retry = Some((now + NACK_RETRY_DELAY, purpose));
@@ -2070,6 +2532,18 @@ async fn sender_task(
                             disconnect_transport(&mut connection, delivery, &mut buffer);
                         }
                     }
+                }
+            }
+            _ = async {
+                match reconcile_credit_rx.as_mut() {
+                    Some(changes) => {
+                        let _ = changes.changed().await;
+                    }
+                    None => std::future::pending::<()>().await,
+                }
+            } => {
+                if let Some((_, purpose)) = reconcile_retry {
+                    reconcile_retry = Some((Instant::now(), purpose));
                 }
             }
             _ = consistency_timer.tick() => {
@@ -2094,14 +2568,22 @@ async fn sender_task(
                             fragment,
                             ReconcilePurpose::Routine,
                             conn,
+                            &mut reconcile_ticket,
                             &mut next_round_id,
                             config.reconcile_timeout,
                         )
                         .await
                         {
-                            Ok(round) => {
+                            Ok(Some(round)) => {
                                 active_reconcile = Some(round);
                                 reconcile_retry = None;
+                            }
+                            Ok(None) => {
+                                reconcile_retry = Some((
+                                    Instant::now() + NACK_RETRY_DELAY,
+                                    ReconcilePurpose::Routine,
+                                ));
+                                pause_new_streaming = true;
                             }
                             Err(()) => {
                                 reconcile_retry = Some((
@@ -2119,10 +2601,9 @@ async fn sender_task(
     }
 }
 
-/// Keys per ReconcileFetch chunk. Bounds the memory of a single
-/// ReconcileData message during bootstrap / anti-entropy on large
-/// fragments (Phase 8 chunked bootstrap).
-const RECONCILE_FETCH_CHUNK: usize = 500;
+/// A count ceiling complements the exact encoded-byte ceiling. Responders
+/// stream values into byte-bounded data pages and never clone this whole set.
+const RECONCILE_LOCAL_READ_CHUNK: usize = 256;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ReconcileError {
@@ -2171,9 +2652,20 @@ async fn begin_reconcile(
     fragment: FragmentId,
     purpose: ReconcilePurpose,
     connection: &ActiveConnection,
+    reconcile_ticket: &mut Option<ReconcileTicket>,
     next_round_id: &mut u64,
     phase_timeout: Duration,
-) -> Result<ReconcileRound, ()> {
+) -> Result<Option<ReconcileRound>, ()> {
+    let connection_permit = match connection.peer_tx.budgeted.as_ref() {
+        Some(peer) => match peer.try_acquire_reconcile(reconcile_ticket)? {
+            Some(permit) => Some(permit),
+            None => return Ok(None),
+        },
+        None => {
+            *reconcile_ticket = None;
+            None
+        }
+    };
     let round_id = next_nonzero(next_round_id);
     let ok = send_envelope(
         &connection.peer_tx,
@@ -2182,20 +2674,43 @@ async fn begin_reconcile(
             fragment: fragment.0,
             session_id: connection.session_id,
             round_id,
+            page_seq: 0,
+            after_key: String::new(),
+            snapshot_revision: 0,
+            snapshot_time_ms: 0,
         }),
     )
     .await;
     if !ok {
         return Err(());
     }
-    Ok(ReconcileRound {
+    Ok(Some(ReconcileRound {
         session_id: connection.session_id,
         round_id,
         purpose,
-        phase: ReconcilePhase::Response,
+        phase: ReconcilePhase::Response(ReconcileSummaryState {
+            next_page_seq: 0,
+            next_fetch_chunk_seq: 0,
+            after_key: String::new(),
+            remote_snapshot_revision: None,
+            remote_snapshot_time_ms: None,
+            remote_revision_stable: true,
+            local: ReconcileLocalCursor {
+                after_key: String::new(),
+                revision: None,
+                snapshot_time_ms: None,
+                revision_stable: true,
+                buffered: VecDeque::new(),
+                current: None,
+                done: false,
+            },
+            changed_any: false,
+            summary_done: false,
+        }),
         phase_deadline: deadline_after(phase_timeout),
         snapshot_revision: None,
-    })
+        connection_permit,
+    }))
 }
 
 async fn send_reconcile_barrier(
@@ -2237,25 +2752,52 @@ async fn send_repair_ops(
     connection: &ActiveConnection,
     ops: &[crate::actor::ReplicatedOp],
 ) -> Result<(), ReconcileError> {
-    for chunk in ops.chunks(100) {
-        let proto_ops = chunk.iter().map(proto_op).collect();
+    let mut offset = 0;
+    while offset < ops.len() {
+        let mut batch = ReplicateBatch {
+            session_id: connection.session_id,
+            batch_seq: u64::MAX,
+            fragment: fragment.0,
+            ops: Vec::new(),
+            // Untracked repairs are apply-only. The following tracked empty
+            // barrier requests and reports the actual fence.
+            required_ack_level: ReplicationAckLevel::Applied as i32,
+        };
+        let mut consumed = 0;
+        for op in ops[offset..].iter().take(100) {
+            batch.ops.push(proto_op(op));
+            let encoded_len = message_field_len(9, batch.encoded_len());
+            if encoded_len > MAX_FRAME_BYTES {
+                batch.ops.pop();
+                break;
+            }
+            if encoded_len > ANTI_ENTROPY_PAGE_BYTES && batch.ops.len() > 1 {
+                batch.ops.pop();
+                break;
+            }
+            consumed += 1;
+            if encoded_len > ANTI_ENTROPY_PAGE_BYTES {
+                break;
+            }
+        }
+        if consumed == 0 {
+            tracing::warn!(
+                fragment = fragment.0,
+                key = %ops[offset].key,
+                "reconciliation repair cannot fit in one wire frame"
+            );
+            return Err(ReconcileError::Local);
+        }
         if !send_envelope(
             &connection.peer_tx,
             connection.next_streaming_deadline(),
-            EnvelopeMsg::ReplicateBatch(ReplicateBatch {
-                session_id: connection.session_id,
-                batch_seq: u64::MAX,
-                fragment: fragment.0,
-                ops: proto_ops,
-                // Untracked repairs are apply-only. The following tracked
-                // empty barrier requests and reports the actual fence.
-                required_ack_level: ReplicationAckLevel::Applied as i32,
-            }),
+            EnvelopeMsg::ReplicateBatch(batch),
         )
         .await
         {
             return Err(ReconcileError::Transport);
         }
+        offset += consumed;
     }
     Ok(())
 }
@@ -2263,154 +2805,425 @@ async fn send_repair_ops(
 fn reconcile_summaries_are_well_formed(
     fragment: FragmentId,
     router: &FragmentRouter,
+    has_cursor: bool,
+    after_key: &str,
     summaries: &[KeySummary],
+    next_after_key: &str,
+    done: bool,
 ) -> bool {
-    let mut seen = HashSet::with_capacity(summaries.len());
-    summaries.iter().all(|summary| {
-        router.key_belongs_to(fragment, &summary.key) && seen.insert(summary.key.as_str())
-    })
+    if summaries.len() > MAX_RECONCILE_PAGE_ITEMS {
+        return false;
+    }
+    if summaries.is_empty() {
+        return done && next_after_key == after_key;
+    }
+    if (has_cursor && summaries[0].key.as_str() <= after_key)
+        || summaries.windows(2).any(|pair| pair[0].key >= pair[1].key)
+        || summaries
+            .iter()
+            .any(|summary| !router.key_belongs_to(fragment, &summary.key))
+    {
+        return false;
+    }
+    summaries
+        .last()
+        .map_or(false, |summary| summary.key == next_after_key)
 }
 
-fn reconcile_entries_are_exact(
+fn reconcile_entries_are_well_formed(
     fragment: FragmentId,
     router: &FragmentRouter,
     entries: &[SyncEntry],
     expected_keys: &HashSet<String>,
+    received_keys: &HashSet<String>,
 ) -> bool {
-    let received_keys: HashSet<&str> = entries.iter().map(|entry| entry.key.as_str()).collect();
-    entries.len() == expected_keys.len()
-        && received_keys.len() == entries.len()
-        && entries.iter().all(|entry| {
-            expected_keys.contains(&entry.key) && router.key_belongs_to(fragment, &entry.key)
-        })
+    if entries.len() > MAX_RECONCILE_PAGE_ITEMS || entries.len() > expected_keys.len() {
+        return false;
+    }
+    let mut page_keys = HashSet::with_capacity(entries.len());
+    entries.iter().all(|entry| {
+        expected_keys.contains(&entry.key)
+            && !received_keys.contains(&entry.key)
+            && page_keys.insert(entry.key.as_str())
+            && router.key_belongs_to(fragment, &entry.key)
+    })
 }
 
-/// Run one reconciliation round: compare the peer's summaries against
-/// local state, fetch keys where the peer wins, and ship keys where we
-/// win.
-///
-/// Returns `None` when no fetch was needed (the round is complete).
-/// Otherwise sends the first fetch chunk and returns the remaining
-/// chunks; the caller sends them as each `ReconcileData` arrives.
-///
-/// LWW makes the whole exchange idempotent: if a shipped op no longer
-/// wins by the time the peer applies it, the peer's merge rejects it.
-async fn reconcile(
+fn remote_summary_wins(remote: &KeySummary, local: &SnapshotSummary) -> bool {
+    (remote.timestamp_ms, &remote.node_id, remote.is_tombstone)
+        > (local.timestamp_ms, &local.node_id, local.is_tombstone)
+}
+
+fn local_summary_wins(local: &SnapshotSummary, remote: &KeySummary) -> bool {
+    (local.timestamp_ms, &local.node_id, local.is_tombstone)
+        > (remote.timestamp_ms, &remote.node_id, remote.is_tombstone)
+}
+
+async fn ensure_local_summary(
+    fragment: FragmentId,
+    router: &FragmentRouter,
+    local: &mut ReconcileLocalCursor,
+) -> Result<(), ReconcileError> {
+    while local.current.is_none() {
+        if let Some(summary) = local.buffered.pop_front() {
+            local.current = Some(summary);
+            return Ok(());
+        }
+        if local.done {
+            return Ok(());
+        }
+        let actor = router
+            .route_for_fragment(fragment)
+            .ok_or(ReconcileError::Local)?;
+        let first_page = local.revision.is_none();
+        let page = match actor
+            .call(
+                |reply| KvMessage::GetSummaryPage {
+                    after_key: (!first_page).then_some(local.after_key.clone()),
+                    // Reconciliation is a bounded, monotonic scan rather
+                    // than a lock-held snapshot. Drift is recorded below and
+                    // forces a fresh verification pass after the barrier.
+                    expected_revision: None,
+                    snapshot_time_ms: local.snapshot_time_ms,
+                    limit: RECONCILE_LOCAL_READ_CHUNK,
+                    reply,
+                },
+                None,
+            )
+            .await
+        {
+            Ok(CallResult::Success(page)) => page,
+            _ => return Err(ReconcileError::Local),
+        };
+        if page.restart
+            || (page.summaries.is_empty() && !page.done)
+            || (!first_page
+                && page
+                    .summaries
+                    .first()
+                    .map_or(false, |summary| summary.key <= local.after_key))
+            || page
+                .summaries
+                .windows(2)
+                .any(|pair| pair[0].key >= pair[1].key)
+        {
+            return Err(ReconcileError::Local);
+        }
+        match (local.revision, local.snapshot_time_ms) {
+            (None, None) => {
+                local.revision = Some(page.revision);
+                local.snapshot_time_ms = Some(page.snapshot_time_ms);
+            }
+            (Some(revision), Some(snapshot_time_ms))
+                if snapshot_time_ms == page.snapshot_time_ms =>
+            {
+                if revision != page.revision {
+                    local.revision_stable = false;
+                }
+            }
+            _ => return Err(ReconcileError::Local),
+        }
+        local.done = page.done;
+        local.buffered.extend(page.summaries);
+    }
+    Ok(())
+}
+
+fn take_local_summary(local: &mut ReconcileLocalCursor) -> Option<SnapshotSummary> {
+    let summary = local.current.take()?;
+    local.after_key = summary.key.clone();
+    Some(summary)
+}
+
+async fn send_repair_keys(
     fragment: FragmentId,
     router: &FragmentRouter,
     connection: &ActiveConnection,
-    round_id: u64,
-    summaries: Vec<KeySummary>,
-) -> Result<(Option<(VecDeque<Vec<String>>, u64, HashSet<String>)>, u64), ReconcileError> {
+    keys: Vec<String>,
+    snapshot_time_ms: u64,
+) -> Result<(), ReconcileError> {
     let actor = router
         .route_for_fragment(fragment)
         .ok_or(ReconcileError::Local)?;
-    let (local, snapshot_revision): (HashMap<String, VersionedValue>, u64) = match actor
-        .call(|reply| KvMessage::GetSnapshot { reply }, None)
-        .await
-    {
-        Ok(CallResult::Success(snapshot)) => snapshot,
-        _ => return Err(ReconcileError::Local),
+    let keys = Arc::new(keys);
+    let mut next_key_index = 0usize;
+    let mut page = Vec::new();
+    let mut sizing_batch = ReplicateBatch {
+        session_id: connection.session_id,
+        batch_seq: u64::MAX,
+        fragment: fragment.0,
+        ops: Vec::new(),
+        required_ack_level: ReplicationAckLevel::Applied as i32,
     };
-
-    let mut fetch_keys = Vec::new();
-    let mut send_ops: Vec<crate::actor::ReplicatedOp> = Vec::new();
-    let mut seen_remote = HashSet::new();
-
-    for s in &summaries {
-        if !router.key_belongs_to(fragment, &s.key) || !seen_remote.insert(s.key.clone()) {
-            tracing::warn!(
-                fragment = fragment.0,
-                key = %s.key,
-                "rejecting reconcile summary with wrong-fragment or duplicate key"
-            );
+    while next_key_index < keys.len() {
+        let request_keys = keys.clone();
+        let value_page = match actor
+            .call(
+                move |reply| KvMessage::GetVersionedPage {
+                    keys: request_keys,
+                    start_index: next_key_index,
+                    snapshot_time_ms: Some(snapshot_time_ms),
+                    reply,
+                },
+                None,
+            )
+            .await
+        {
+            Ok(CallResult::Success(value_page)) => value_page,
+            _ => return Err(ReconcileError::Local),
+        };
+        if value_page.missing
+            || value_page.next_index <= next_key_index
+            || value_page.next_index > keys.len()
+        {
             return Err(ReconcileError::Local);
         }
-        let remote_v = VersionedValue {
-            value: Vec::new(),
-            timestamp_ms: s.timestamp_ms,
-            node_id: s.node_id.clone(),
-            expires_at_ms: None,
-            is_tombstone: s.is_tombstone,
-        };
-        match local.get(&s.key) {
-            Some(local_v) => {
-                if remote_v.wins_over(local_v) {
-                    fetch_keys.push(s.key.clone());
-                } else if local_v.wins_over(&remote_v) {
-                    send_ops.push(crate::actor::ReplicatedOp {
-                        key: s.key.clone(),
-                        value: local_v.clone(),
-                        seq: 0,
-                        boot_id: 0,
-                    });
-                }
-            }
-            None => {
-                // Peer has it, we don't.
-                fetch_keys.push(s.key.clone());
-            }
-        }
-    }
-    // Keys we have that the peer lacks.
-    for (key, v) in &local {
-        if !seen_remote.contains(key) {
-            send_ops.push(crate::actor::ReplicatedOp {
-                key: key.clone(),
-                value: v.clone(),
+        next_key_index = value_page.next_index;
+        for (key, value) in value_page.entries {
+            let op = crate::actor::ReplicatedOp {
+                key,
+                value,
                 seq: 0,
                 boot_id: 0,
-            });
+            };
+            sizing_batch.ops.push(proto_op(&op));
+            page.push(op);
+            let encoded_len = message_field_len(9, sizing_batch.encoded_len());
+            if encoded_len > MAX_FRAME_BYTES {
+                let oversized = page.pop().expect("just pushed");
+                let oversized_proto = sizing_batch.ops.pop().expect("just pushed");
+                if page.is_empty() {
+                    tracing::warn!(
+                        fragment = fragment.0,
+                        key = %oversized.key,
+                        "one reconciliation repair exceeds the hard frame limit"
+                    );
+                    return Err(ReconcileError::Local);
+                }
+                send_repair_ops(fragment, connection, &page).await?;
+                page.clear();
+                sizing_batch.ops.clear();
+                page.push(oversized);
+                sizing_batch.ops.push(oversized_proto);
+            } else if encoded_len > ANTI_ENTROPY_PAGE_BYTES && page.len() > 1 {
+                let next = page.pop().expect("just pushed");
+                let next_proto = sizing_batch.ops.pop().expect("just pushed");
+                send_repair_ops(fragment, connection, &page).await?;
+                page.clear();
+                sizing_batch.ops.clear();
+                page.push(next);
+                sizing_batch.ops.push(next_proto);
+            }
         }
     }
-
-    send_repair_ops(fragment, connection, &send_ops).await?;
-
-    if fetch_keys.is_empty() {
-        return Ok((None, snapshot_revision));
+    if !page.is_empty() {
+        send_repair_ops(fragment, connection, &page).await?;
     }
-    // Chunk the fetch so a large fragment doesn't materialize as one
-    // giant ReconcileData message: send the first chunk now, queue the
-    // rest for the caller to send as each chunk's data arrives.
-    let mut chunks: VecDeque<Vec<String>> = fetch_keys
-        .chunks(RECONCILE_FETCH_CHUNK)
-        .map(|c| c.to_vec())
-        .collect();
-    let first = chunks.pop_front().unwrap_or_default();
-    let expected_keys = first.iter().cloned().collect();
-    if !send_envelope(
+    Ok(())
+}
+
+fn reconcile_fetch_chunks(
+    fragment: FragmentId,
+    session_id: u64,
+    round_id: u64,
+    keys: Vec<String>,
+) -> Result<VecDeque<Vec<String>>, ReconcileError> {
+    let mut chunks = VecDeque::new();
+    let mut request = ReconcileFetch {
+        fragment: fragment.0,
+        keys: Vec::new(),
+        session_id,
+        round_id,
+        chunk_seq: u64::MAX,
+    };
+    for key in keys {
+        request.keys.push(key);
+        let encoded_len = message_field_len(13, request.encoded_len());
+        if encoded_len > MAX_FRAME_BYTES
+            || ((encoded_len > ANTI_ENTROPY_PAGE_BYTES
+                || request.keys.len() > MAX_RECONCILE_FETCH_KEYS)
+                && request.keys.len() > 1)
+        {
+            let next = request.keys.pop().expect("just pushed");
+            if request.keys.is_empty() {
+                return Err(ReconcileError::Local);
+            }
+            chunks.push_back(std::mem::take(&mut request.keys));
+            request.keys.push(next);
+            if message_field_len(13, request.encoded_len()) > MAX_FRAME_BYTES {
+                return Err(ReconcileError::Local);
+            }
+        }
+    }
+    if !request.keys.is_empty() {
+        chunks.push_back(request.keys);
+    }
+    Ok(chunks)
+}
+
+async fn send_summary_request(
+    fragment: FragmentId,
+    connection: &ActiveConnection,
+    round_id: u64,
+    summary: &ReconcileSummaryState,
+) -> Result<(), ReconcileError> {
+    if send_envelope(
         &connection.peer_tx,
         connection.next_streaming_deadline(),
-        EnvelopeMsg::ReconcileFetch(ReconcileFetch {
+        EnvelopeMsg::ReconcileRequest(ReconcileRequest {
             fragment: fragment.0,
-            keys: first,
             session_id: connection.session_id,
             round_id,
-            chunk_seq: 0,
+            page_seq: summary.next_page_seq,
+            after_key: summary.after_key.clone(),
+            snapshot_revision: summary.remote_snapshot_revision.unwrap_or(0),
+            snapshot_time_ms: summary.remote_snapshot_time_ms.unwrap_or(0),
         }),
     )
     .await
     {
-        return Err(ReconcileError::Transport);
+        Ok(())
+    } else {
+        Err(ReconcileError::Transport)
     }
-    Ok((Some((chunks, 0, expected_keys)), snapshot_revision))
+}
+
+async fn send_fetch(
+    fragment: FragmentId,
+    connection: &ActiveConnection,
+    round_id: u64,
+    chunk_seq: u64,
+    keys: Vec<String>,
+) -> Result<(), ReconcileError> {
+    if send_envelope(
+        &connection.peer_tx,
+        connection.next_streaming_deadline(),
+        EnvelopeMsg::ReconcileFetch(ReconcileFetch {
+            fragment: fragment.0,
+            keys,
+            session_id: connection.session_id,
+            round_id,
+            chunk_seq,
+        }),
+    )
+    .await
+    {
+        Ok(())
+    } else {
+        Err(ReconcileError::Transport)
+    }
+}
+
+/// Merge one bounded peer summary page with bounded local summary pages.
+/// Values are read only for local winners, one at a time, so neither side's
+/// complete key or value set is materialized by reconciliation.
+async fn reconcile_summary_page(
+    fragment: FragmentId,
+    router: &FragmentRouter,
+    connection: &ActiveConnection,
+    round_id: u64,
+    summary: &mut ReconcileSummaryState,
+    summaries: &[KeySummary],
+    done: bool,
+) -> Result<VecDeque<Vec<String>>, ReconcileError> {
+    let mut fetch_keys = Vec::new();
+    let mut repair_keys = Vec::new();
+    for remote in summaries {
+        loop {
+            ensure_local_summary(fragment, router, &mut summary.local).await?;
+            match summary.local.current.as_ref() {
+                Some(local) if local.key < remote.key => {
+                    let local = take_local_summary(&mut summary.local).expect("matched Some");
+                    repair_keys.push(local.key);
+                    if repair_keys.len() >= RECONCILE_LOCAL_READ_CHUNK {
+                        summary.changed_any = true;
+                        let snapshot_time_ms = summary
+                            .local
+                            .snapshot_time_ms
+                            .ok_or(ReconcileError::Local)?;
+                        send_repair_keys(
+                            fragment,
+                            router,
+                            connection,
+                            std::mem::take(&mut repair_keys),
+                            snapshot_time_ms,
+                        )
+                        .await?;
+                    }
+                }
+                Some(local) if local.key == remote.key => {
+                    let local = take_local_summary(&mut summary.local).expect("matched Some");
+                    if remote_summary_wins(remote, &local) {
+                        fetch_keys.push(remote.key.clone());
+                    } else if local_summary_wins(&local, remote) {
+                        repair_keys.push(remote.key.clone());
+                    }
+                    break;
+                }
+                Some(_) | None => {
+                    fetch_keys.push(remote.key.clone());
+                    break;
+                }
+            }
+        }
+    }
+    if !repair_keys.is_empty() {
+        summary.changed_any = true;
+        let snapshot_time_ms = summary
+            .local
+            .snapshot_time_ms
+            .ok_or(ReconcileError::Local)?;
+        send_repair_keys(
+            fragment,
+            router,
+            connection,
+            std::mem::take(&mut repair_keys),
+            snapshot_time_ms,
+        )
+        .await?;
+    }
+
+    if done {
+        loop {
+            ensure_local_summary(fragment, router, &mut summary.local).await?;
+            let Some(local) = take_local_summary(&mut summary.local) else {
+                break;
+            };
+            repair_keys.push(local.key);
+            if repair_keys.len() >= RECONCILE_LOCAL_READ_CHUNK {
+                summary.changed_any = true;
+                let snapshot_time_ms = summary
+                    .local
+                    .snapshot_time_ms
+                    .ok_or(ReconcileError::Local)?;
+                send_repair_keys(
+                    fragment,
+                    router,
+                    connection,
+                    std::mem::take(&mut repair_keys),
+                    snapshot_time_ms,
+                )
+                .await?;
+            }
+        }
+        if !repair_keys.is_empty() {
+            summary.changed_any = true;
+            let snapshot_time_ms = summary
+                .local
+                .snapshot_time_ms
+                .ok_or(ReconcileError::Local)?;
+            send_repair_keys(fragment, router, connection, repair_keys, snapshot_time_ms).await?;
+        }
+    }
+
+    reconcile_fetch_chunks(fragment, connection.session_id, round_id, fetch_keys)
 }
 
 async fn apply_reconcile_entries(
     fragment: FragmentId,
     router: &FragmentRouter,
     entries: Vec<SyncEntry>,
-    expected_keys: &HashSet<String>,
 ) -> Result<(), ReconcileError> {
-    if !reconcile_entries_are_exact(fragment, router, &entries, expected_keys) {
-        tracing::warn!(
-            fragment = fragment.0,
-            expected = expected_keys.len(),
-            received = entries.len(),
-            "rejecting incomplete, duplicate, unrequested, or wrong-fragment reconcile data"
-        );
-        return Err(ReconcileError::Local);
-    }
     let actor = router
         .route_for_fragment(fragment)
         .ok_or(ReconcileError::Local)?;
@@ -2424,6 +3237,10 @@ async fn apply_reconcile_entries(
             seq: 0,
             boot_id: 0,
         };
+        if let Err(error) = check_replicated_op_budget(&op) {
+            tracing::warn!(fragment = fragment.0, %error, "reconcile value exceeds wire budget");
+            return Err(ReconcileError::Local);
+        }
         match actor
             .call(
                 |reply| KvMessage::ApplyOp {
@@ -2446,6 +3263,26 @@ async fn apply_reconcile_entries(
             }
         }
     }
+    Ok(())
+}
+
+async fn enter_reconcile_barrier(
+    fragment: FragmentId,
+    router: &FragmentRouter,
+    config: &SenderConfig,
+    connection: &mut ActiveConnection,
+    round: &mut ReconcileRound,
+    local_reconcile_flush_pending: &mut bool,
+) -> Result<(), ReconcileError> {
+    if *local_reconcile_flush_pending {
+        flush_reconcile(fragment, router).await?;
+        *local_reconcile_flush_pending = false;
+    }
+    let batch_seq = send_reconcile_barrier(fragment, config, connection)
+        .await
+        .map_err(|()| ReconcileError::Transport)?;
+    round.phase = ReconcilePhase::Barrier { batch_seq };
+    round.phase_deadline = deadline_after(config.reconcile_timeout);
     Ok(())
 }
 
@@ -2506,7 +3343,6 @@ fn rand_session_id() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use prost::Message as _;
     use std::sync::atomic::{AtomicBool, Ordering};
 
     fn op(key: &str) -> crate::actor::ReplicatedOp {
@@ -2528,6 +3364,130 @@ mod tests {
             ack_durability_mismatch: false,
             reconcile_rounds: 0,
         }))
+    }
+
+    #[test]
+    fn streaming_batch_soft_byte_split_preserves_buffer_order() {
+        let mut first = op("first");
+        first.value.value = vec![1; ANTI_ENTROPY_PAGE_BYTES / 2 + 1024];
+        let mut second = op("second");
+        second.value.value = vec![2; ANTI_ENTROPY_PAGE_BYTES / 2 + 1024];
+        let third = op("third");
+        let mut buffer = VecDeque::from([first.clone(), second.clone(), third.clone()]);
+
+        let (taken, encoded) = take_streaming_batch(
+            &mut buffer,
+            100,
+            1,
+            2,
+            FragmentId(0),
+            ReplicationAckLevel::Applied as i32,
+        )
+        .unwrap();
+
+        assert_eq!(taken.len(), 1);
+        assert_eq!(taken[0].key, first.key);
+        assert_eq!(taken[0].value.value, first.value.value);
+        assert_eq!(encoded.len(), 1);
+        assert_eq!(encoded[0].key, "first");
+        assert_eq!(
+            buffer.into_iter().map(|op| op.key).collect::<Vec<_>>(),
+            vec![second.key, third.key]
+        );
+    }
+
+    #[test]
+    fn reconcile_fetches_batch_keys_without_exceeding_count_or_byte_bounds() {
+        let chunks = reconcile_fetch_chunks(
+            FragmentId(0),
+            1,
+            2,
+            (0..600).map(|index| format!("key-{index:04}")).collect(),
+        )
+        .unwrap();
+        assert_eq!(
+            chunks.iter().map(Vec::len).collect::<Vec<_>>(),
+            vec![256, 256, 88]
+        );
+
+        let metadata_heavy = reconcile_fetch_chunks(
+            FragmentId(0),
+            1,
+            2,
+            (0..100)
+                .map(|index| format!("{index:04}-{}", "k".repeat(20 * 1024)))
+                .collect(),
+        )
+        .unwrap();
+        assert!(metadata_heavy.len() > 1);
+        assert!(metadata_heavy.iter().all(|keys| {
+            keys.len() <= MAX_RECONCILE_FETCH_KEYS
+                && message_field_len(
+                    13,
+                    ReconcileFetch {
+                        fragment: 0,
+                        keys: keys.clone(),
+                        session_id: 1,
+                        round_id: 2,
+                        chunk_seq: u64::MAX,
+                    }
+                    .encoded_len(),
+                ) <= ANTI_ENTROPY_PAGE_BYTES
+        }));
+
+        let large_key = "k".repeat(ANTI_ENTROPY_PAGE_BYTES + 1024);
+        let singleton = reconcile_fetch_chunks(FragmentId(0), 1, 2, vec![large_key.clone()])
+            .expect("one valid key may exceed the soft target");
+        assert_eq!(singleton, VecDeque::from([vec![large_key]]));
+        assert!(
+            message_field_len(
+                13,
+                ReconcileFetch {
+                    fragment: 0,
+                    keys: singleton[0].clone(),
+                    session_id: 1,
+                    round_id: 2,
+                    chunk_seq: u64::MAX,
+                }
+                .encoded_len(),
+            ) > ANTI_ENTROPY_PAGE_BYTES
+        );
+    }
+
+    #[test]
+    fn summary_page_validation_distinguishes_empty_key_from_no_cursor() {
+        let router = FragmentRouter::new(1, 0);
+        let first = vec![KeySummary {
+            key: String::new(),
+            timestamp_ms: 1,
+            node_id: "node".to_string(),
+            is_tombstone: false,
+        }];
+        assert!(reconcile_summaries_are_well_formed(
+            FragmentId(0),
+            &router,
+            false,
+            "",
+            &first,
+            "",
+            false,
+        ));
+
+        let second = vec![KeySummary {
+            key: "next".to_string(),
+            timestamp_ms: 2,
+            node_id: "node".to_string(),
+            is_tombstone: false,
+        }];
+        assert!(reconcile_summaries_are_well_formed(
+            FragmentId(0),
+            &router,
+            true,
+            "",
+            &second,
+            "next",
+            true,
+        ));
     }
 
     async fn wait_for_sender_report(
@@ -2637,8 +3597,8 @@ mod tests {
         sender.send(SenderMsg::ReconcileNow).unwrap();
         let signals = signals_rx.borrow().clone();
         assert!(signals
-            .peer_tx
-            .map_or(false, |current| current.same_channel(&new_peer)));
+            .peer
+            .map_or(false, |current| current.tx.same_channel(&new_peer)));
         assert_eq!(signals.reconcile_generation, 1);
 
         assert_eq!(data_rx.recv().await.unwrap().key, "queued");
@@ -2700,7 +3660,10 @@ mod tests {
         signals_tx.send_modify(|signals| {
             signals.overflow_generation = 1;
             signals.peer_generation = 1;
-            signals.peer_tx = Some(first_peer);
+            signals.peer = Some(NodeSenderPeer {
+                tx: first_peer,
+                budgeted: None,
+            });
             signals.reconcile_generation = 1;
         });
         assert!(matches!(
@@ -2712,11 +3675,14 @@ mod tests {
         // still-undelivered reconcile generation from the prior snapshot.
         signals_tx.send_modify(|signals| {
             signals.peer_generation = 2;
-            signals.peer_tx = Some(latest_peer.clone());
+            signals.peer = Some(NodeSenderPeer {
+                tx: latest_peer.clone(),
+                budgeted: None,
+            });
         });
         assert!(matches!(
             inbox.recv().await,
-            SenderInput::PeerChanged(Some(peer)) if peer.same_channel(&latest_peer)
+            SenderInput::PeerChanged(Some(peer)) if peer.tx.same_channel(&latest_peer)
         ));
         assert!(matches!(
             tokio::time::timeout(Duration::from_secs(1), inbox.recv()).await,
@@ -2855,7 +3821,7 @@ mod tests {
     fn batch_sequence_allocator_never_emits_reserved_repair_sentinel() {
         let (tx, _rx) = mpsc::channel(1);
         let mut connection = ActiveConnection {
-            peer_tx: SenderPeer::new(tx, &SenderRuntimeOptions::default()),
+            peer_tx: SenderPeer::new(tx, None, &SenderRuntimeOptions::default()),
             session_id: 1,
             session_ready: true,
             next_batch_seq: u64::MAX - 1,
@@ -3004,7 +3970,7 @@ mod tests {
             .with_queue_failure_handler(Arc::new(move |_| {
                 observed.store(true, Ordering::SeqCst);
             }));
-        let peer = SenderPeer::new(tx, &options);
+        let peer = SenderPeer::new(tx, None, &options);
         assert!(
             !send_envelope(
                 &peer,
@@ -3019,6 +3985,148 @@ mod tests {
         assert!(failed.load(Ordering::SeqCst));
         assert_eq!(rx.recv().await, Some(vec![1]));
         assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn node_replication_producers_share_one_raii_byte_budget() {
+        let msg = || {
+            EnvelopeMsg::SessionStart(SessionStart {
+                session_id: 7,
+                fragment: 0,
+            })
+        };
+        let encoded_len = Envelope { msg: Some(msg()) }.encoded_len();
+        let (frame_tx, mut frame_rx) = mpsc::channel(4);
+        let (response_tx, _response_rx) = mpsc::channel(4);
+        let (identity, _identity_rx) = mpsc::channel(1);
+        let budget = Arc::new(tokio::sync::Semaphore::new(encoded_len * 2));
+        let producer_budget = Arc::new(tokio::sync::Semaphore::new(encoded_len * 2));
+        let outbound = BudgetedPeerTx {
+            tx: frame_tx,
+            response_tx,
+            byte_budget: budget.clone(),
+            producer_byte_budget: producer_budget,
+            reconcile_gate: crate::wire::ReconcileGate::new(),
+            identity: identity.clone(),
+        };
+        let options =
+            SenderRuntimeOptions::default().with_queue_admission_timeout(Duration::from_millis(10));
+        let first = SenderPeer::new(identity.clone(), Some(outbound.clone()), &options);
+        let second = SenderPeer::new(identity, Some(outbound), &options);
+
+        assert!(send_envelope(&first, None, msg()).await);
+        assert!(send_envelope(&second, None, msg()).await);
+        assert_eq!(budget.available_permits(), 0);
+        assert!(!send_envelope(&first, None, msg()).await);
+        assert_eq!(frame_rx.len(), 2);
+
+        drop(frame_rx.recv().await.unwrap());
+        assert_eq!(budget.available_permits(), encoded_len);
+        assert!(send_envelope(&second, None, msg()).await);
+    }
+
+    #[tokio::test]
+    async fn node_reconciliation_rounds_share_one_connection_credit() {
+        let (frame_tx, mut frame_rx) = mpsc::channel(4);
+        let (response_tx, _response_rx) = mpsc::channel(4);
+        let (identity, _identity_rx) = mpsc::channel(1);
+        let reconcile_gate = crate::wire::ReconcileGate::new();
+        let outbound = BudgetedPeerTx {
+            tx: frame_tx,
+            response_tx,
+            byte_budget: Arc::new(tokio::sync::Semaphore::new(4096)),
+            producer_byte_budget: Arc::new(tokio::sync::Semaphore::new(4096)),
+            reconcile_gate: reconcile_gate.clone(),
+            identity: identity.clone(),
+        };
+        let peer = SenderPeer::new(identity, Some(outbound), &SenderRuntimeOptions::default());
+        let connection = ActiveConnection {
+            peer_tx: peer,
+            session_id: 7,
+            session_ready: true,
+            next_batch_seq: 0,
+            in_flight: VecDeque::new(),
+        };
+        let mut first_round_id = 0;
+        let mut first_ticket = None;
+        let first = begin_reconcile(
+            FragmentId(0),
+            ReconcilePurpose::Routine,
+            &connection,
+            &mut first_ticket,
+            &mut first_round_id,
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap()
+        .expect("first round did not acquire the peer credit");
+        assert_eq!(reconcile_gate.available_permits(), 0);
+
+        let mut second_round_id = 0;
+        let mut second_ticket = None;
+        assert!(
+            begin_reconcile(
+                FragmentId(1),
+                ReconcilePurpose::Routine,
+                &connection,
+                &mut second_ticket,
+                &mut second_round_id,
+                Duration::from_secs(1),
+            )
+            .await
+            .unwrap()
+            .is_none(),
+            "a second fragment bypassed the physical-connection credit"
+        );
+
+        drop(first);
+        assert_eq!(reconcile_gate.available_permits(), 1);
+
+        let mut incumbent_ticket = None;
+        assert!(
+            begin_reconcile(
+                FragmentId(0),
+                ReconcilePurpose::Routine,
+                &connection,
+                &mut incumbent_ticket,
+                &mut first_round_id,
+                Duration::from_secs(1),
+            )
+            .await
+            .unwrap()
+            .is_none(),
+            "the completing fragment stole credit from an existing waiter"
+        );
+        let second = begin_reconcile(
+            FragmentId(1),
+            ReconcilePurpose::Routine,
+            &connection,
+            &mut second_ticket,
+            &mut second_round_id,
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap()
+        .expect("the oldest waiter did not receive the released credit");
+        assert_eq!(reconcile_gate.available_permits(), 0);
+        drop(second);
+        let incumbent = begin_reconcile(
+            FragmentId(0),
+            ReconcilePurpose::Routine,
+            &connection,
+            &mut incumbent_ticket,
+            &mut first_round_id,
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        assert!(incumbent.is_some());
+        assert_eq!(frame_rx.len(), 3);
+        while frame_rx.recv().await.is_some() {
+            if frame_rx.is_empty() {
+                break;
+            }
+        }
     }
 
     #[tokio::test]
@@ -3105,7 +4213,7 @@ mod tests {
     #[tokio::test]
     async fn expired_replication_deadline_never_admits_to_an_empty_queue() {
         let (tx, mut rx) = mpsc::channel(1);
-        let peer = SenderPeer::new(tx, &SenderRuntimeOptions::default());
+        let peer = SenderPeer::new(tx, None, &SenderRuntimeOptions::default());
         let expired = Instant::now();
         tokio::task::yield_now().await;
         assert!(

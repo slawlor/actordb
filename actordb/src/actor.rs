@@ -21,7 +21,7 @@
 //! inbound ops merge here with last-writer-wins. Because the merge is
 //! idempotent and commutative, replicas converge without coordination.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -102,6 +102,7 @@ impl TokenBucket {
 
 use crate::shard::{hash_key, FragmentId};
 use crate::store::KvStore;
+use crate::wire::check_versioned_value_budget;
 
 /// A value stamped with its last-writer-wins version.
 ///
@@ -197,6 +198,52 @@ pub struct ReplicatedOp {
     pub boot_id: u64,
 }
 
+/// Version metadata for one key in an anti-entropy snapshot.
+///
+/// Values are intentionally omitted so callers can compare snapshots before
+/// fetching only the keys whose versions differ. An expired live value is
+/// represented as its deterministic expiry tombstone at the snapshot's
+/// pinned wall-clock time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnapshotSummary {
+    pub key: String,
+    pub timestamp_ms: u64,
+    pub node_id: String,
+    pub is_tombstone: bool,
+}
+
+/// One lexicographically ordered page of fragment version summaries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SummaryPage {
+    pub summaries: Vec<SnapshotSummary>,
+    /// Fragment mutation revision captured under the cache read lock.
+    pub revision: u64,
+    /// Wall-clock instant used to decide which TTL values are expired.
+    pub snapshot_time_ms: u64,
+    /// True when no keys remain after this page.
+    pub done: bool,
+    /// True when `expected_revision` did not match. In that case summaries
+    /// are empty and the caller must restart from the beginning.
+    pub restart: bool,
+}
+
+/// One memory-bounded page of exact values requested by reconciliation.
+/// `next_index` is the first unexamined position in the caller's key vector;
+/// absent keys still advance it and are omitted from `entries`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VersionedPage {
+    pub entries: Vec<(String, VersionedValue)>,
+    pub next_index: usize,
+    /// At least one examined key was absent from the cache.
+    pub missing: bool,
+}
+
+// Keep actor-owned summary clones bounded before the network layer adds
+// protobuf metadata. A single individually valid summary may exceed the soft
+// target, but admission control guarantees it still fits the hard wire limit.
+const SUMMARY_PAGE_TARGET_BYTES: usize = 1024 * 1024;
+const VERSIONED_PAGE_TARGET_BYTES: usize = 1024 * 1024;
+
 /// Result of merging one exact version into a fragment.
 ///
 /// Callers must use this result rather than infer success from a later read:
@@ -235,6 +282,8 @@ pub enum ApplyDurability {
 pub enum ApplyError {
     /// Admission control rejected a client-originated mutation.
     Backpressure,
+    /// The operation cannot be represented safely by the peer protocol.
+    InvalidInput(String),
     /// Persistence failed while applying a batch-triggering mutation.
     Storage(String),
 }
@@ -243,6 +292,7 @@ impl std::fmt::Display for ApplyError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Backpressure => write!(f, "fragment worker pool is at capacity"),
+            Self::InvalidInput(error) => write!(f, "invalid mutation: {error}"),
             Self::Storage(error) => write!(f, "persistence failed: {error}"),
         }
     }
@@ -256,8 +306,8 @@ pub enum KvMessage {
     /// so applying the same op twice is harmless (idempotent).
     ///
     /// `is_replication`: true for ops arriving via acked replication
-    /// (`ReplicateBatch`) or anti-entropy (`SyncResponse`, reconcile
-    /// fetch). These bypass dispatcher admission control: the sender
+    /// (`ReplicateBatch`) or anti-entropy (`ReconcileData`). These bypass
+    /// dispatcher admission control: the sender
     /// side is already bounded (`max_in_flight` + `buffer_capacity`),
     /// and shedding an acked op while the sender acks it would
     /// silently lose acknowledged writes (adversarial review #2).
@@ -285,7 +335,8 @@ pub enum KvMessage {
         reply: RpcReplyPort<Result<Option<VersionedValue>, String>>,
         priority: OpPriority,
     },
-    /// Read the full local copy (used for anti-entropy sync).
+    /// Read the full local copy for compatibility and diagnostics. The wire
+    /// reconciler uses bounded summary pages and exact-key reads instead.
     GetAll {
         reply: RpcReplyPort<HashMap<String, VersionedValue>>,
     },
@@ -293,6 +344,34 @@ pub enum KvMessage {
     /// revision captured under the same cache read lock.
     GetSnapshot {
         reply: RpcReplyPort<(HashMap<String, VersionedValue>, u64)>,
+    },
+    /// Read at most `limit.max(1)` summaries in lexicographic key order,
+    /// subject to an internal byte target. `after_key` is exclusive. A
+    /// paginating caller passes the revision and pinned time returned by its
+    /// first page on every subsequent request.
+    GetSummaryPage {
+        after_key: Option<String>,
+        expected_revision: Option<u64>,
+        snapshot_time_ms: Option<u64>,
+        limit: usize,
+        reply: RpcReplyPort<SummaryPage>,
+    },
+    /// Read one exact value, including tombstones. An expired live value is
+    /// synthesized as a deterministic tombstone at `snapshot_time_ms`, or at
+    /// the current wall-clock time when omitted.
+    GetVersioned {
+        key: String,
+        snapshot_time_ms: Option<u64>,
+        reply: RpcReplyPort<Option<VersionedValue>>,
+    },
+    /// Read a bounded page from one exact-key reconciliation request while
+    /// taking the shared cache read lock only once per page. `keys` is shared
+    /// across calls; `start_index` is the first position to examine.
+    GetVersionedPage {
+        keys: Arc<Vec<String>>,
+        start_index: usize,
+        snapshot_time_ms: Option<u64>,
+        reply: RpcReplyPort<VersionedPage>,
     },
     /// Read the current fragment-wide mutation revision.
     GetRevision { reply: RpcReplyPort<u64> },
@@ -312,11 +391,11 @@ pub enum KvMessage {
 /// Applied writes are buffered and flushed to the [`KvStore`]
 /// in batches (see `NodeConfig` flush knobs); the cache is reloaded from
 /// the store on boot, so a restarted node keeps its dataset. A crash
-/// can lose the unflushed tail of the write buffer; the handshake sync
-/// on reconnect reconciles it from peers.
+/// can lose the unflushed tail of the write buffer; immediate correlated
+/// reconciliation on reconnect repairs it from peers.
 pub struct FragmentState {
     /// In-memory cache of the fragment: the fast path for all reads.
-    cache: RwLock<HashMap<String, VersionedValue>>,
+    cache: RwLock<FragmentCache>,
     /// Optional durable layer behind the cache. `None` = no persistence.
     kvstore: Option<Arc<dyn KvStore>>,
     /// Advances for every winning cache mutation, including replicated
@@ -330,6 +409,13 @@ pub struct FragmentState {
     flush_in_progress: Mutex<()>,
     flush_batch_size: usize,
     flush_interval: Duration,
+}
+
+/// Values and their ordered key index. Both live under one lock so every
+/// visible key is immediately available to ordered snapshot pagination.
+struct FragmentCache {
+    values: HashMap<String, VersionedValue>,
+    ordered_keys: BTreeSet<String>,
 }
 
 struct FlushBuffer {
@@ -347,8 +433,12 @@ impl FragmentState {
         flush_batch_size: usize,
         flush_interval: Duration,
     ) -> Self {
+        let ordered_keys = cache.keys().cloned().collect();
         Self {
-            cache: RwLock::new(cache),
+            cache: RwLock::new(FragmentCache {
+                values: cache,
+                ordered_keys,
+            }),
             kvstore,
             revision: AtomicU64::new(0),
             flush: Mutex::new(FlushBuffer {
@@ -380,7 +470,12 @@ impl FragmentState {
     /// workers cannot enqueue versions in a different order from the cache
     /// merge. This matters across priority pools, where the same key can be
     /// handled by different workers.
-    pub async fn apply(&self, op: &ReplicatedOp) -> Result<ApplyOutcome, ActorProcessingErr> {
+    pub async fn apply(&self, op: &ReplicatedOp) -> Result<ApplyOutcome, ApplyError> {
+        check_versioned_value_budget(&op.key, &op.value).map_err(|error| {
+            ApplyError::InvalidInput(format!(
+                "key/value cannot fit every required peer frame: {error}"
+            ))
+        })?;
         let expired = op.value.is_expired(now_ms());
         let expiry_tombstone;
         let value = if expired {
@@ -418,27 +513,32 @@ impl FragmentState {
         };
 
         if should_flush {
-            self.flush().await?;
+            self.flush()
+                .await
+                .map_err(|error| ApplyError::Storage(error.to_string()))?;
         }
         Ok(Self::reported_outcome(outcome, expired))
     }
 
-    fn merge_cache(
-        cache: &mut HashMap<String, VersionedValue>,
-        key: &str,
-        value: &VersionedValue,
-    ) -> ApplyOutcome {
-        match cache.get(key) {
-            Some(existing) if existing == value => ApplyOutcome::AlreadyPresent,
-            Some(existing) if !value.wins_over(existing) => ApplyOutcome::Superseded {
-                timestamp_ms: existing.timestamp_ms,
-                node_id: existing.node_id.clone(),
-                is_tombstone: existing.is_tombstone,
-            },
-            _ => {
-                cache.insert(key.to_string(), value.clone());
-                ApplyOutcome::Applied
+    fn merge_cache(cache: &mut FragmentCache, key: &str, value: &VersionedValue) -> ApplyOutcome {
+        if let Some(existing) = cache.values.get_mut(key) {
+            if existing == value {
+                return ApplyOutcome::AlreadyPresent;
             }
+            if !value.wins_over(existing) {
+                return ApplyOutcome::Superseded {
+                    timestamp_ms: existing.timestamp_ms,
+                    node_id: existing.node_id.clone(),
+                    is_tombstone: existing.is_tombstone,
+                };
+            }
+            *existing = value.clone();
+            ApplyOutcome::Applied
+        } else {
+            let key = key.to_string();
+            cache.ordered_keys.insert(key.clone());
+            cache.values.insert(key, value.clone());
+            ApplyOutcome::Applied
         }
     }
 
@@ -507,6 +607,7 @@ impl FragmentState {
         self.cache
             .read()
             .await
+            .values
             .get(key)
             .filter(|v| !v.is_tombstone && !v.is_expired(now))
             .cloned()
@@ -526,6 +627,7 @@ impl FragmentState {
         let now = now_ms();
         let cache = self.cache.read().await;
         let snapshot = cache
+            .values
             .iter()
             .map(|(key, value)| {
                 let value = if value.is_expired(now) {
@@ -538,6 +640,151 @@ impl FragmentState {
             .collect();
         let revision = self.revision.load(Ordering::Acquire);
         (snapshot, revision)
+    }
+
+    /// Read one lexicographically ordered page of version summaries.
+    ///
+    /// A caller starts with no expected revision or pinned time, then feeds
+    /// both returned values into later pages. If a winning mutation occurred,
+    /// the revision mismatch returns an empty restart page instead of mixing
+    /// two logical snapshots.
+    pub async fn summary_page(
+        &self,
+        after_key: Option<&str>,
+        expected_revision: Option<u64>,
+        snapshot_time_ms: Option<u64>,
+        limit: usize,
+    ) -> SummaryPage {
+        use std::ops::Bound::{Excluded, Unbounded};
+
+        let cache = self.cache.read().await;
+        let revision = self.revision.load(Ordering::Acquire);
+        let snapshot_time_ms = snapshot_time_ms.unwrap_or_else(now_ms);
+        if expected_revision.map_or(false, |expected| expected != revision) {
+            return SummaryPage {
+                summaries: Vec::new(),
+                revision,
+                snapshot_time_ms,
+                done: false,
+                restart: true,
+            };
+        }
+
+        let lower_bound = after_key
+            .map(|key| Excluded(key.to_string()))
+            .unwrap_or(Unbounded);
+        let limit = limit.max(1);
+        let keys = cache.ordered_keys.range((lower_bound, Unbounded));
+        // Do not reserve from the fragment's total cardinality: callers may
+        // use a very large count limit while the byte target still ends the
+        // page after only a handful of metadata-heavy records.
+        let mut summaries = Vec::with_capacity(limit.min(256));
+        let mut payload_bytes = 0usize;
+        let mut done = true;
+        for key in keys {
+            if summaries.len() == limit {
+                done = false;
+                break;
+            }
+            if let Some(value) = cache.values.get(key) {
+                let summary_bytes = key.len().saturating_add(value.node_id.len());
+                if !summaries.is_empty()
+                    && payload_bytes.saturating_add(summary_bytes) > SUMMARY_PAGE_TARGET_BYTES
+                {
+                    done = false;
+                    break;
+                }
+                summaries.push(Self::snapshot_summary(key, value, snapshot_time_ms));
+                payload_bytes = payload_bytes.saturating_add(summary_bytes);
+            }
+        }
+
+        SummaryPage {
+            summaries,
+            revision,
+            snapshot_time_ms,
+            done,
+            restart: false,
+        }
+    }
+
+    /// Read one value including tombstones at a pinned expiry time.
+    pub async fn get_versioned(
+        &self,
+        key: &str,
+        snapshot_time_ms: Option<u64>,
+    ) -> Option<VersionedValue> {
+        let cache = self.cache.read().await;
+        let snapshot_time_ms = snapshot_time_ms.unwrap_or_else(now_ms);
+        cache.values.get(key).map(|value| {
+            if value.is_expired(snapshot_time_ms) {
+                value.expiry_tombstone()
+            } else {
+                value.clone()
+            }
+        })
+    }
+
+    /// Read exact values in input order without cloning an arbitrary fetch
+    /// chunk at once. Pages target 1 MiB of key/value metadata; one individually
+    /// valid value may exceed that soft target but is returned alone.
+    pub async fn get_versioned_page(
+        &self,
+        keys: &[String],
+        start_index: usize,
+        snapshot_time_ms: Option<u64>,
+    ) -> VersionedPage {
+        let cache = self.cache.read().await;
+        let snapshot_time_ms = snapshot_time_ms.unwrap_or_else(now_ms);
+        let mut next_index = start_index.min(keys.len());
+        let mut payload_bytes = 0usize;
+        let mut entries = Vec::new();
+        let mut missing = false;
+        while let Some(key) = keys.get(next_index) {
+            let Some(value) = cache.values.get(key) else {
+                missing = true;
+                next_index += 1;
+                continue;
+            };
+            let value = if value.is_expired(snapshot_time_ms) {
+                value.expiry_tombstone()
+            } else {
+                value.clone()
+            };
+            let entry_bytes = key
+                .len()
+                .saturating_add(value.value.len())
+                .saturating_add(value.node_id.len());
+            if !entries.is_empty()
+                && payload_bytes.saturating_add(entry_bytes) > VERSIONED_PAGE_TARGET_BYTES
+            {
+                break;
+            }
+            entries.push((key.clone(), value));
+            payload_bytes = payload_bytes.saturating_add(entry_bytes);
+            next_index += 1;
+            if payload_bytes > VERSIONED_PAGE_TARGET_BYTES {
+                break;
+            }
+        }
+        VersionedPage {
+            entries,
+            next_index,
+            missing,
+        }
+    }
+
+    fn snapshot_summary(
+        key: &str,
+        value: &VersionedValue,
+        snapshot_time_ms: u64,
+    ) -> SnapshotSummary {
+        SnapshotSummary {
+            key: key.to_string(),
+            timestamp_ms: value.timestamp_ms,
+            node_id: value.node_id.clone(),
+            is_tombstone: value.is_tombstone || value.is_expired(snapshot_time_ms),
+        }
     }
 
     /// Read the mutation revision while holding the cache read lock.
@@ -566,7 +813,7 @@ impl FragmentState {
         if self.kvstore.is_none() {
             let mut cache = self.cache.write().await;
             let mut converted = 0;
-            for value in cache.values_mut() {
+            for value in cache.values.values_mut() {
                 if value.is_expired(now_ms) {
                     *value = value.expiry_tombstone();
                     converted += 1;
@@ -585,7 +832,7 @@ impl FragmentState {
             let mut flush = self.flush.lock().await;
             let mut cache = self.cache.write().await;
             let mut converted = 0;
-            for (key, value) in cache.iter_mut() {
+            for (key, value) in cache.values.iter_mut() {
                 if value.is_expired(now_ms) {
                     let tombstone = value.expiry_tombstone();
                     *value = tombstone.clone();
@@ -710,10 +957,19 @@ impl Actor for KvWorker {
                         Ok(())
                     }
                     Err(error) => {
+                        let fatal = match &error {
+                            ApplyError::Storage(message) => {
+                                Some(ActorProcessingErr::from(message.clone()))
+                            }
+                            ApplyError::Backpressure | ApplyError::InvalidInput(_) => None,
+                        };
                         if let Some(reply) = reply {
-                            let _ = reply.send(Err(ApplyError::Storage(error.to_string())));
+                            let _ = reply.send(Err(error));
                         }
-                        Err(error)
+                        match fatal {
+                            Some(error) => Err(error),
+                            None => Ok(()),
+                        }
                     }
                 }
             }
@@ -738,6 +994,9 @@ impl Actor for KvWorker {
             // shared state.
             KvMessage::GetAll { .. }
             | KvMessage::GetSnapshot { .. }
+            | KvMessage::GetSummaryPage { .. }
+            | KvMessage::GetVersioned { .. }
+            | KvMessage::GetVersionedPage { .. }
             | KvMessage::GetRevision { .. } => Ok(()),
             // Shed counts are a dispatcher-level query; workers don't track them.
             KvMessage::GetShedCounts { reply } => {
@@ -1088,6 +1347,47 @@ impl Actor for KvActor {
                 let _ = reply.send(state.shared.snapshot_with_revision().await);
                 Ok(())
             }
+            KvMessage::GetSummaryPage {
+                after_key,
+                expected_revision,
+                snapshot_time_ms,
+                limit,
+                reply,
+            } => {
+                let page = state
+                    .shared
+                    .summary_page(
+                        after_key.as_deref(),
+                        expected_revision,
+                        snapshot_time_ms,
+                        limit,
+                    )
+                    .await;
+                let _ = reply.send(page);
+                Ok(())
+            }
+            KvMessage::GetVersioned {
+                key,
+                snapshot_time_ms,
+                reply,
+            } => {
+                let _ = reply.send(state.shared.get_versioned(&key, snapshot_time_ms).await);
+                Ok(())
+            }
+            KvMessage::GetVersionedPage {
+                keys,
+                start_index,
+                snapshot_time_ms,
+                reply,
+            } => {
+                let _ = reply.send(
+                    state
+                        .shared
+                        .get_versioned_page(&keys, start_index, snapshot_time_ms)
+                        .await,
+                );
+                Ok(())
+            }
             KvMessage::GetRevision { reply } => {
                 let _ = reply.send(state.shared.current_revision().await);
                 Ok(())
@@ -1297,6 +1597,302 @@ mod tests {
         assert!(!b.wins_over(&c));
         // identical versions never "win" — merge is a no-op
         assert!(!a.wins_over(&a));
+    }
+
+    fn test_state(cache: HashMap<String, VersionedValue>) -> FragmentState {
+        FragmentState::new(cache, None, 100, Duration::from_secs(3600))
+    }
+
+    fn test_op(key: &str, value: VersionedValue) -> ReplicatedOp {
+        ReplicatedOp {
+            key: key.to_string(),
+            value,
+            seq: 0,
+            boot_id: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn summary_pages_are_ordered_exclusive_and_revision_guarded() {
+        let state = test_state(HashMap::from([
+            (
+                "zulu".to_string(),
+                VersionedValue::new(vec![3], 30, "n1".to_string()),
+            ),
+            (
+                "alpha".to_string(),
+                VersionedValue::new(vec![1], 10, "n1".to_string()),
+            ),
+            (
+                "charlie".to_string(),
+                VersionedValue::new(vec![2], 20, "n1".to_string()),
+            ),
+        ]));
+
+        let first = state.summary_page(None, None, Some(123), 2).await;
+        assert_eq!(first.revision, 0);
+        assert_eq!(first.snapshot_time_ms, 123);
+        assert!(!first.done);
+        assert!(!first.restart);
+        assert_eq!(
+            first
+                .summaries
+                .iter()
+                .map(|summary| summary.key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["alpha", "charlie"]
+        );
+
+        let second = state
+            .summary_page(
+                Some("charlie"),
+                Some(first.revision),
+                Some(first.snapshot_time_ms),
+                2,
+            )
+            .await;
+        assert!(second.done);
+        assert!(!second.restart);
+        assert_eq!(
+            second
+                .summaries
+                .iter()
+                .map(|summary| summary.key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["zulu"]
+        );
+
+        state
+            .apply(&test_op(
+                "bravo",
+                VersionedValue::new(vec![4], 40, "n1".to_string()),
+            ))
+            .await
+            .unwrap();
+        let stale = state
+            .summary_page(
+                Some("charlie"),
+                Some(first.revision),
+                Some(first.snapshot_time_ms),
+                2,
+            )
+            .await;
+        assert!(stale.restart);
+        assert!(!stale.done);
+        assert!(stale.summaries.is_empty());
+        assert_eq!(stale.revision, 1);
+
+        let restarted = state.summary_page(None, None, Some(123), 10).await;
+        assert_eq!(
+            restarted
+                .summaries
+                .iter()
+                .map(|summary| summary.key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["alpha", "bravo", "charlie", "zulu"]
+        );
+        assert!(restarted.done);
+    }
+
+    #[tokio::test]
+    async fn summary_cursor_can_advance_past_an_empty_key() {
+        let state = test_state(HashMap::from([
+            (
+                String::new(),
+                VersionedValue::new(vec![0], 1, "n1".to_string()),
+            ),
+            (
+                "next".to_string(),
+                VersionedValue::new(vec![1], 2, "n1".to_string()),
+            ),
+        ]));
+
+        let first = state.summary_page(None, None, Some(123), 1).await;
+        assert_eq!(first.summaries[0].key, "");
+        assert!(!first.done);
+        let second = state
+            .summary_page(
+                Some(""),
+                Some(first.revision),
+                Some(first.snapshot_time_ms),
+                1,
+            )
+            .await;
+        assert_eq!(second.summaries[0].key, "next");
+        assert!(second.done);
+    }
+
+    #[tokio::test]
+    async fn summary_pages_clamp_zero_limit_and_bound_cloned_metadata() {
+        let large_node_id = "n".repeat(SUMMARY_PAGE_TARGET_BYTES / 2 + 1);
+        let state = test_state(HashMap::from([
+            (
+                "alpha".to_string(),
+                VersionedValue::new(Vec::new(), 1, large_node_id.clone()),
+            ),
+            (
+                "bravo".to_string(),
+                VersionedValue::new(Vec::new(), 2, large_node_id),
+            ),
+        ]));
+
+        let first = state.summary_page(None, None, Some(123), 0).await;
+        assert_eq!(first.summaries.len(), 1);
+        assert_eq!(first.summaries[0].key, "alpha");
+        assert!(!first.done);
+
+        let second = state
+            .summary_page(
+                Some("alpha"),
+                Some(first.revision),
+                Some(first.snapshot_time_ms),
+                usize::MAX,
+            )
+            .await;
+        assert_eq!(second.summaries.len(), 1);
+        assert_eq!(second.summaries[0].key, "bravo");
+        assert!(second.done);
+    }
+
+    #[tokio::test]
+    async fn summary_and_get_versioned_share_pinned_expiry_semantics() {
+        let mut expiring = VersionedValue::new(b"value".to_vec(), 50, "n1".to_string());
+        expiring.expires_at_ms = Some(100);
+        let tombstone = VersionedValue::tombstone(60, "n2".to_string());
+        let state = test_state(HashMap::from([
+            ("expiring".to_string(), expiring.clone()),
+            ("deleted".to_string(), tombstone.clone()),
+        ]));
+
+        let before = state.summary_page(None, None, Some(99), 10).await;
+        assert!(
+            !before
+                .summaries
+                .iter()
+                .find(|summary| summary.key == "expiring")
+                .unwrap()
+                .is_tombstone
+        );
+        let at_expiry = state.summary_page(None, None, Some(100), 10).await;
+        assert!(
+            at_expiry
+                .summaries
+                .iter()
+                .find(|summary| summary.key == "expiring")
+                .unwrap()
+                .is_tombstone
+        );
+        assert!(
+            at_expiry
+                .summaries
+                .iter()
+                .find(|summary| summary.key == "deleted")
+                .unwrap()
+                .is_tombstone
+        );
+
+        assert_eq!(
+            state.get_versioned("expiring", Some(99)).await,
+            Some(expiring.clone())
+        );
+        assert_eq!(
+            state.get_versioned("deleted", Some(99)).await,
+            Some(tombstone)
+        );
+        assert_eq!(state.get_versioned("missing", Some(99)).await, None);
+        assert_eq!(
+            state.get_versioned("expiring", Some(100)).await,
+            Some(expiring.expiry_tombstone())
+        );
+    }
+
+    #[tokio::test]
+    async fn versioned_pages_bound_value_clones_and_advance_over_missing_keys() {
+        let state = test_state(HashMap::from([
+            (
+                "a".to_string(),
+                VersionedValue::new(vec![1; 600 * 1024], 1, "n".to_string()),
+            ),
+            (
+                "b".to_string(),
+                VersionedValue::new(vec![2; 600 * 1024], 2, "n".to_string()),
+            ),
+        ]));
+        let keys = vec!["missing".to_string(), "a".to_string(), "b".to_string()];
+
+        let first = state.get_versioned_page(&keys, 0, Some(u64::MAX)).await;
+        assert!(first.missing);
+        assert_eq!(first.next_index, 2);
+        assert_eq!(first.entries.len(), 1);
+        assert_eq!(first.entries[0].0, "a");
+
+        let second = state
+            .get_versioned_page(&keys, first.next_index, Some(u64::MAX))
+            .await;
+        assert!(!second.missing);
+        assert_eq!(second.next_index, keys.len());
+        assert_eq!(second.entries.len(), 1);
+        assert_eq!(second.entries[0].0, "b");
+    }
+
+    #[tokio::test]
+    async fn invalid_size_apply_is_nonfatal_to_worker() {
+        let shared = Arc::new(test_state(HashMap::new()));
+        let (worker, handle) = KvWorker::spawn(
+            None,
+            KvWorker,
+            KvWorkerArgs {
+                shared: shared.clone(),
+                pending: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let oversized_key = "k".repeat(crate::wire::MAX_FRAME_BYTES / 2);
+        let invalid = worker
+            .call(
+                |reply| KvMessage::ApplyOp {
+                    op: test_op(
+                        &oversized_key,
+                        VersionedValue::new(Vec::new(), 1, "node".to_string()),
+                    ),
+                    priority: OpPriority::Default,
+                    is_replication: false,
+                    reply: Some(reply),
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            invalid,
+            CallResult::Success(Err(ApplyError::InvalidInput(_)))
+        ));
+
+        let valid = worker
+            .call(
+                |reply| KvMessage::ApplyOp {
+                    op: test_op(
+                        "healthy",
+                        VersionedValue::new(b"value".to_vec(), 2, "node".to_string()),
+                    ),
+                    priority: OpPriority::Default,
+                    is_replication: false,
+                    reply: Some(reply),
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(valid, CallResult::Success(Ok(ApplyOutcome::Applied)));
+        assert_eq!(
+            shared.get("healthy").await.unwrap().value,
+            b"value".to_vec()
+        );
+
+        worker.stop(None);
+        handle.await.unwrap();
     }
 }
 

@@ -9,6 +9,8 @@ touches disk. Set a store to get durability.
 ```rust
 pub trait KvStore: Send + Sync + 'static {
     fn load(&self) -> Result<Vec<(Vec<u8>, VersionedValue)>, StoreError>;
+    fn load_prefix(&self, prefix: &[u8])
+        -> Result<Vec<(Vec<u8>, VersionedValue)>, StoreError>;
     fn write_batch(&self, writes: &[(Vec<u8>, VersionedValue)]) -> Result<(), StoreError>;
 }
 ```
@@ -17,6 +19,9 @@ The contract is deliberately narrow:
 
 - `load` is called **once at actor boot** and returns the full dataset.
   Corrupt entries fail boot loudly — they are not silently skipped.
+- `load_prefix` has a source-compatible default that filters `load`. Ordered
+  stores should override it; `RocksDbStore` seeks to the fragment prefix and
+  stops when the prefix changes, avoiding one full-database scan per fragment.
 - `write_batch` persists a batch of **winning writes** (post-LWW-merge).
   The actor never calls `get`/`put`/`delete` on the store; it works from the
   in-memory `FragmentState` cache and pushes batches down.
@@ -25,6 +30,13 @@ The contract is deliberately narrow:
   stores must apply identical key/version writes idempotently.
 - Keys are raw bytes; the actor converts `String` keys at the boundary, so
   non-UTF-8 keys fail boot loudly rather than corrupting the store.
+- Loaded records are preflighted against every required single-record wire
+  envelope, including the duplicated summary continuation key. RocksDB performs
+  this check from raw lengths before decoding/retaining another value copy. A
+  legacy key/value that exceeds the 16 MiB hard frame limit fails startup
+  rather than entering the cache in a permanently unreplicable state. Migrate
+  or remove that record offline with a compatible older binary before upgrade;
+  actordb never truncates it automatically.
 
 ## Implementations
 
@@ -75,8 +87,8 @@ The buffer is pushed to the store when:
 - it reaches `flush_batch_size` (default 1000 ops; ignored when `store` is `None`), or
 - a write arrives after `flush_interval` has elapsed (default 100 ms), or
 - the periodic **Snapshotter** ticks (every `snapshot_interval`, default 60 s), or
-- a tracked replication batch requests a `StoreCommitted` ACK, or an untracked
-  reconciliation batch finishes applying.
+- a tracked replication batch or reconciliation barrier requests a
+  `StoreCommitted` ACK.
 
 `flush_interval` is write-triggered, not an independent timer. For an idle
 fragment, `snapshot_interval` is the upper bound before a periodic flush.
@@ -87,8 +99,9 @@ fragment starts serving, so a crash/restart cannot erase the version floor.
 An inbound tracked replication batch adds an explicit flush fence after all of
 its apply replies only when its sender requests `StoreCommitted`; the default
 `MemoryApplied` requirement leaves the normal batch/interval flush policy in
-effect. Untracked reconciliation batches also flush after application. With a
-configured store, `BatchAck::STORE_COMMITTED` means
+effect. Untracked reconciliation repairs are memory-applied; their final
+barrier forces a flush only when it requests `StoreCommitted`. With a configured
+store, `BatchAck::STORE_COMMITTED` means
 `KvStore::write_batch` returned successfully for every update ordered before
 the fence. It does **not** mean fsync: `RocksDbStore` currently uses RocksDB's
 default WAL-backed, non-sync write options. Deployments that require
@@ -103,8 +116,8 @@ Crash semantics: after callers quiesce and await their operation futures, an
 explicit `shutdown().await` flushes and releases the RocksDB lock. Dropping
 `Node` requests a best-effort stop but cannot await that flush or lock release;
 `kill -9` can lose the unflushed write-buffer tail. Recovery for that tail comes
-from peer sync on reconnect — which is why production deployments want at least
-two replicas per fragment.
+from correlated peer reconciliation after reconnect — which is why production
+deployments want at least two replicas per fragment.
 
 Sender-ingress overflow recovery reads this same authoritative cache and
 revision; it never clears the persistence buffer. Because overflow commands
@@ -112,7 +125,7 @@ represent writes that have already merged locally, a correlated reset can
 reconstruct their current LWW winners and tombstones. That mechanism bounds
 asynchronous fan-out memory but does not strengthen origin crash durability:
 a storeless or unflushed origin can still fail before any peer receives the
-snapshot.
+reconciled value.
 
 ## Clock recovery and timestamp admission
 
@@ -134,6 +147,5 @@ explicitly widen the bound after investigating the data.
   time bound cannot prove durable replica convergence. Safe reclamation needs
   such evidence plus store deletion support (see
   [Tombstones & deletes](tombstones.md)).
-- **No per-fragment drop/migrate at the store layer yet.** `PrefixedStore`'s
-  design notes that prefix scans would enable per-fragment drop/migrate, but it
-  is not implemented.
+- **No per-fragment drop/migrate at the store layer yet.** Prefix-bounded loads
+  are implemented, but deletion/export lifecycle operations are not.

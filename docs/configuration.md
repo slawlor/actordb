@@ -26,7 +26,7 @@ of the defaults.
 | `placement_poll_interval` | `Duration` | `1 s` | Driver re-evaluation cadence. Ignored in static mode. |
 | `placement_drain_warn_interval` | `Duration` | `10 s` | Warning cadence while a revoked fragment cannot safely drain. This never forces destructive teardown; the node remains `Draining` until recovery completes. |
 | `max_clock_skew` | `Duration` | `300 s` (5 min) | Peer and persisted timestamps farther ahead than this are rejected before storage. A violating peer connection is closed; poisoned durable state fails startup. |
-| `cluster_secret` | `Option<Vec<u8>>` | `None` | At least 32 independently generated, high-entropy random bytes for protocol-v2 mutual HMAC proofs. Each physical connection uses two fresh challenges, and the proof binds the ordered roles, ids, version ranges, capabilities, and challenges, so a captured v2 handshake cannot be replayed. The shared key proves fresh cluster-key possession, not individual member identity, and does not encrypt or integrity-protect later frames. Use a protected, mutually authenticated custom `Network` when those properties matter. Must be identical on every node. |
+| `cluster_secret` | `Option<Vec<u8>>` | `None` | At least 32 independently generated, high-entropy random bytes for protocol-v3 mutual HMAC proofs. Each physical connection uses two fresh challenges, and the proof binds the ordered roles, ids, version ranges, capabilities, and challenges, so a captured v3 handshake cannot be replayed. The shared key proves fresh cluster-key possession, not individual member identity, and does not encrypt or integrity-protect later frames. Use a protected, mutually authenticated custom `Network` when those properties matter. Must be identical on every node. |
 
 `clock_skew_ms` exists but is `#[doc(hidden)]` — it is a test-only HLC skew
 simulator, not a tuning knob.
@@ -53,10 +53,12 @@ does not break exhaustive `NodeConfig` literals. `Node::start` uses
 
 | Builder / getter | Default | Guidance |
 |---|---|---|
-| `with_peer_queue_frame_capacity` / `peer_queue_frame_capacity` | `256` frames | Capacity of the single outbound queue per peer connection. This is a frame-count bound, not a byte bound, and all traffic classes share it. |
+| `with_peer_queue_frame_capacity` / `peer_queue_frame_capacity` | `256` frames | Total frame-count capacity behind the peer writer's byte gate, split evenly between ordinary producer traffic and a writer-priority reader-response lane. Must be at least `2`. |
+| `with_peer_queue_byte_capacity` / `peer_queue_byte_capacity` | `32 MiB` | Encoded bytes admitted to one peer writer pipeline, including the frame currently blocked on the socket. Must be at least `17 MiB`: one maximum 16 MiB frame plus the 1 MiB response reserve. Ordinary producers cannot consume that reserve. Permits remain attached through write/drop. |
 | `with_replication_control_message_capacity` / `replication_control_message_capacity` | `64` messages | Capacity of the separate ACK/NACK/reconciliation-response lane per fragment/peer sender. Full admission fails the contributing connection so session replay/reconciliation recovers it. A reconcile reply targeting a sender already retired by placement is ignored without dropping the shared peer connection. Peer lifecycle and on-demand reconcile signals are coalesced out of band. |
 | `with_inbound_connection_capacity` / `inbound_connection_capacity` | `1024` connections | Maximum accepted sockets concurrently handshaking or serving as inbound peers. Excess accepted sockets are closed immediately. |
-| `with_queue_admission_timeout` / `queue_admission_timeout` | `5 s` | Maximum wait to reserve one peer-queue slot. Expiry cancels that connection; an outbound peer is then redialed. |
+| `with_queue_admission_timeout` / `queue_admission_timeout` | `5 s` | One absolute maximum wait to reserve a peer-queue frame slot and its exact encoded-byte permits. Expiry cancels that connection; an outbound peer is then redialed. |
+| `with_reconcile_data_admission_timeout` / `reconcile_data_admission_timeout` | `30 s` | Admission wait for each streamed reconciliation-data page. This longer, explicit budget lets a legal near-16 MiB value wait behind another frame while the socket writer is still healthy. Tune with `SenderConfig::reconcile_timeout` and `socket_write_timeout`. |
 | `with_forwarded_attempt_timeout` / `forwarded_attempt_timeout` | `5 s` | Total budget for one forwarded owner attempt, including queue admission and response. Batch holder attempts and remote fragment groups remain sequential. |
 | `with_connect_timeout` / `connect_timeout` | `5 s` | Maximum duration of one outbound transport dial. Configured member dialers retry failures with exponential backoff; manual `connect` returns the initial failure. |
 | `with_handshake_timeout` / `handshake_timeout` | `5 s` | One absolute deadline for both `Hello` and `HelloAuth` flights. A peer cannot extend it by sending partial handshake data. |
@@ -64,15 +66,18 @@ does not break exhaustive `NodeConfig` literals. `Node::start` uses
 | `with_socket_write_timeout` / `socket_write_timeout` | `30 s` | Maximum time to write one complete length-prefixed frame. Expiry cancels the connection and allows redial. |
 | `with_replication_ack_timeout` / `replication_ack_timeout` | `30 s` | Maximum wait after queue admission for an acceptable ordinary streaming ACK. Expiry rotates the sender session and replays the exact unacknowledged LWW operations. Reconciliation barriers use `SenderConfig::reconcile_timeout` instead. |
 
-Capacity and every runtime timeout must be nonzero; startup rejects invalid
+The frame capacity must be at least two, the byte capacity at least 17 MiB,
+and every other capacity and runtime timeout nonzero; startup rejects invalid
 values. Operation priority selects the local or remote actor pool, but it does
-not schedule the shared peer queue or socket writer.
+not schedule the ordinary peer data lane or socket writer. The peer writer
+applies both the configured frame-count and encoded-byte bounds; sender actor
+lanes are still bounded by operation/message count.
 
 ## `SenderConfig` (replication)
 
 | Field | Default | Guidance |
 |---|---|---|
-| `batch_size` | `100` | Ops per replication batch. |
+| `batch_size` | `100` | Maximum ops per replication batch. Exact encoded-size bounds may split a batch sooner. |
 | `batch_interval` | `100 ms` | Max batching delay — bounds steady-state replication lag. |
 | `max_in_flight` | `4` | Ordinary batches awaiting ACK before sending pauses. Each gets the `NodeRuntimeOptions::replication_ack_timeout` deadline after queue admission. |
 | `buffer_capacity` | `10_000` | Bound on both the Node sender's locally-applied-mutation ingress lane and its sender-owned deque. Either overflow advances a persistent `BufferReset` generation; a live sender rotates the session and starts correlated reconciliation without blocking the client write. Total retained operations also include bounded in-flight batches. This is an operation-count bound, not a byte bound. |
@@ -122,10 +127,19 @@ These are `const`s, documented here so they don't surprise you:
 
 | Constant | Value | Meaning |
 |---|---|---|
+| `WIRE_PROTOCOL_VERSION` | `3` | The current binary accepts only wire v3. V3 requires the paged-anti-entropy capability and must be deployed as a coordinated upgrade from v2. |
 | `MAX_FORWARD_HOPS` | `4` | Bounds re-forward chains during placement disagreement. |
 | `NACK_RETRY_DELAY` | `1 s` | Minimum delay before retrying a receiver-rejected replication batch. |
-| `BOOTSTRAP_TIMEOUT` | `30 s` | Max wait bootstrapping a gained fragment before going Serving anyway. |
-| `RECONCILE_FETCH_CHUNK` | `500` | Keys per `ReconcileFetch`/`ReconcileData` message. |
-| `MAX_FRAME_BYTES` | `16 MiB` | Max protobuf envelope frame. |
+| `BOOTSTRAP_TIMEOUT` | `30 s` | Max wait for one of the connected, already-serving source candidates to complete bootstrap. Timeout leaves the gained fragment non-authoritative and eligible for retry. |
+| `MAX_RECONCILE_FETCH_KEYS` | `256` | Maximum keys per exact-byte-bounded fetch chunk. Values are read incrementally and returned in byte-bounded pages through the writer byte budget. |
+| `RECONCILE_SUMMARY_PAGE_ITEMS` / `RECONCILE_LOCAL_READ_CHUNK` | `256` | Maximum summaries read per remote/local cache page; exact encoded-size bounds may split a wire page sooner. |
+| `MAX_WIRE_BATCH_ITEMS` | `4096` | Defensive repeated-field ceiling checked before protobuf decode for replication and forwarded request/response batches. This is separate from exact encoded-byte limits. |
+| `ANTI_ENTROPY_PAGE_BYTES` | `1 MiB` | Soft encoded-body target for summaries, fetches, data, repairs, and ordinary replication. One individually valid record may exceed the soft target. |
+| `MAX_FRAME_BYTES` | `16 MiB` | Hard maximum encoded protobuf envelope body. Irreducible oversized mutations are rejected before local apply. |
 | `RECONNECT_BASE` | `100 ms` | Reconnect backoff base, doubling. |
 | `RECONNECT_MAX` | `30 s` | Reconnect backoff cap; attempts add up to 50% jitter. |
+
+There is no setting that permits records above `MAX_FRAME_BYTES`. On startup,
+durable records written by an older binary are preflighted against every
+required single-record envelope; an oversized legacy record fails startup
+rather than loading data that can never replicate or be returned remotely.

@@ -31,6 +31,7 @@ use crate::actor::{
 };
 use crate::shard::FragmentId;
 use crate::store::KvStore;
+use crate::wire::check_versioned_value_budget;
 
 /// Per-fragment health snapshot, served by the [`FragmentSupervisor`].
 #[derive(Debug, Clone)]
@@ -138,6 +139,13 @@ impl SupervisorState {
                     } else {
                         v
                     };
+                    check_versioned_value_budget(&key, &value).map_err(|error| {
+                        let prefix: String = key.chars().take(64).collect();
+                        ActorProcessingErr::from(format!(
+                            "persisted record (key bytes {}, prefix {prefix:?}) cannot be replicated: {error}",
+                            key.len()
+                        ))
+                    })?;
                     map.insert(key, value);
                 }
                 // Persist boot-time expiry conversion before the fragment
