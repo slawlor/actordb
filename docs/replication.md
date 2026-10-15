@@ -25,8 +25,14 @@ background.
   (64 messages by default); peer lifecycle, overflow generations, and
   on-demand reconciliation are persistent/coalesced signals, so mutation
   saturation cannot hide control progress.
-- **Disconnected**: peer down; buffered and in-flight operations are retained
-  for replay in the next session.
+- **Disconnected**: with an explicit placement map, the identity-keyed sender
+  remains allocated and retains buffered/in-flight operations for replay in the
+  next session. Legacy map-empty mode instead discovers peer identities at
+  runtime and reaps their senders on disconnect so sequential claimants cannot
+  grow the sender maps without bound. Writes made during that legacy downtime
+  are recovered by the mandatory static-mode full-state exchange on reconnect,
+  including tombstones; that exchange is therefore part of the legacy mode's
+  safety contract, not an optional optimization.
 - **BufferReset**: entered when either the mutation-ingress lane or owned
   buffer is full. Shed commands name mutations already applied to authoritative
   fragment state; overflow atomically advances a persistent generation before
@@ -76,12 +82,18 @@ queue identity, so an older connection cannot replace or clear a newer one.
 Replaying `SessionStart` with the same id also does not clear a failed-repair
 latch; only a genuinely new session does.
 
-The receiver accepts `SessionStart` only for a fragment it currently hosts,
-which bounds the per-connection session table by configured fragments. Normal
-replication batches are processed sequentially per connection and await every
-actor apply. Legacy full-state `SyncResponse` entries now do the same and are
-counted only after successful application; a shed or failed apply closes the
-connection so handshake sync can retry instead of silently dropping a suffix.
+The receiver accepts `SessionStart` for any in-range configured fragment, even
+if its placement actor is still being installed. Placement controllers are
+observed independently, so the source can see an overlap just before the
+destination does; retaining the session prevents that race from silently
+stalling replication until the ordinary ACK timeout. A tracked batch that
+arrives before actor installation receives a NACK and is replayed under the
+same session. Out-of-range fragments are rejected, which bounds the
+per-connection session table by `fragment_count`. Normal replication batches
+are processed sequentially per connection and await every actor apply. Legacy
+full-state `SyncResponse` entries now do the same and are counted only after
+successful application; a shed or failed apply closes the connection so
+handshake sync can retry instead of silently dropping a suffix.
 
 A tracked batch carries the sender's `required_ack_level`. The receiver first
 verifies that every key belongs to the declared fragment and awaits every exact
@@ -116,16 +128,28 @@ permanently failing store from becoming a tight write/log loop.
 ACK; the batch remains in flight. A weak ACK does not extend that batch's
 original deadline. ACK observations reset on every session.
 
-`Hello` advertises an inclusive protocol-version range and capability bits for
-exact mutation results, durability ACKs, and correlated reconciliation. The
-connection is rejected before peer installation unless the range includes the
-local version and every required bit is present. With `cluster_secret`
-configured, identity, range, and capabilities are all bound into the HMAC, so
-an on-path peer cannot strip a feature bit without failing tag verification.
-This static tag is not peer authentication: it has no fresh challenge, so a
-captured Hello can be replayed on the plaintext transport. Fieldless legacy
-Hellos fail closed. The current release supports one wire version, so upgrades
-still require mutually compatible binaries.
+Protocol-v2 `Hello` advertises an inclusive protocol-version range, capability
+bits for exact mutation results, durability ACKs, correlated reconciliation,
+and challenge authentication, plus a fresh 256-bit challenge. Both endpoints
+then send `HelloAuth`. With `cluster_secret` configured, its HMAC-SHA256 binds
+the ordered dialer/listener roles, both complete Hello offers, the selected
+version/capabilities, and both challenges. A captured v2 exchange therefore
+cannot be replayed on a fresh connection, and an on-path peer without the key
+cannot rewrite an id or feature bit.
+
+The proof establishes fresh possession of a cluster-wide shared key, not
+individual node identity: any key holder can claim any node id. Plain TCP also
+provides no confidentiality or post-handshake frame integrity. Without a
+secret, `HelloAuth` is empty and provides sequencing/freshness for connection
+election, not authentication. Missing challenge fields, the retired v1 Hello
+tag, and incompatible ranges/capabilities fail closed. The current binary
+supports only wire v2, which is wire-incompatible with v1, so upgrades require
+mutually compatible binaries rather than a rolling v1/v2 mix. Moving from v1
+to v2 is also a Rust source break for advanced users of the public generated
+`actordb::proto` types: `Hello` gained a
+`challenge` field and `EnvelopeMsg` gained a `HelloAuth` variant, so struct
+literals and exhaustive matches must change along with the coordinated wire
+deployment.
 
 Every ordinary streaming batch receives an ACK deadline after its frame enters
 the peer queue (30 seconds by default). If any ordinary batch expires, the
@@ -140,12 +164,15 @@ Reconciliation summary, data, and tracked-barrier phases instead use
 `reconcile_timeout`; an expired phase also rotates the session and retries the
 round after the one-second floor. Neither kind of session rotation necessarily
 drops a healthy socket. Queue admission has its own bounded wait (5 seconds by
-default). In the `Node` integration, admission expiry marks the exact peer
-connection failed and cancels it; the connection is removed, senders retain or
-requeue work, and the configured dialer can redial. A per-frame socket write
-that exceeds its 30-second default has the same connection-cancellation and
-redial path. A forwarded request's separately configured budget (5 seconds by
-default) covers its entire enqueue-plus-response attempt.
+default). A reconcile reply racing placement retirement is discarded when its
+per-fragment sender has already stopped; it does not tear down the shared,
+multiplexed peer connection. In the `Node` integration, admission expiry marks
+the exact peer connection failed and cancels it; the connection is removed,
+senders retain or requeue work, and the configured dialer can redial. A
+per-frame socket write that exceeds its 30-second default has the same
+connection-cancellation and redial path. A forwarded request's separately
+configured budget (5 seconds by default) covers its entire
+enqueue-plus-response attempt.
 
 ## Periodic reconciliation (anti-entropy)
 
@@ -197,20 +224,40 @@ frame limit; byte-bounded reconciliation pagination remains follow-up work.
 ## The Hello / full-state handshake
 
 The connection handshake is **not** replaced by the reconciler in static mode.
-The dialer sends `Hello { node_id, protocol range, capabilities, auth_tag }`
-immediately; the listener validates and replies; then,
+Both endpoints send `Hello { node_id, protocol range, capabilities, challenge }`
+and then mutually prove the ordered transcript with `HelloAuth`. One absolute
+handshake deadline covers both flights. A configured member dialer also checks
+the claimed id against the id assigned to that address. Only after mutual proof
+does either side publish the connection. If crossed or duplicate dials race,
+both endpoints use the same transcript-derived rank to retain the same winner;
+the losing dialer waits while that winner remains live. Then,
 when dynamic placement is *off*, each side sends a full-state `SyncRequest`
 for its fragments and the peer answers with `SyncResponse` entries. With the
 Phase 8 placement driver active, the handshake skips `SyncRequest` entirely —
 the reconciler owns anti-entropy (the rolling-restart test asserts
 `sync_entries_applied() == 0` in that mode).
 
+This distinction is especially important when the static `fragment_map` is
+empty (legacy full replication). Its connection-discovered senders are removed
+on disconnect rather than retaining downtime writes. The mandatory full-state
+request/response restores the current LWW winners after reconnect. With an
+explicit placement map, senders are bounded by configured replica identities
+and remain present while disconnected, preserving their bounded buffers and
+reset/reconciliation state in addition to the static full-state exchange.
+
 ## Wire framing and transport notes
 
 - Messages are 4-byte length-prefixed protobuf `Envelope`s over TCP;
   `MAX_FRAME_BYTES` is 16 MiB.
 - Reconnect uses exponential backoff from `RECONNECT_BASE` (100 ms, doubling),
-  managed by the redial supervisor in the node layer.
+  capped at 30 seconds with jitter and managed by the redial supervisor in the
+  node layer. Configured members retry from their first failed dial; manual
+  `Node::connect` returns its first failure but owns retries after first success.
+- Inbound handlers are capped at 1024 concurrent sockets by default. The
+  two-flight handshake has one absolute 5-second deadline, and a pre-auth frame
+  is capped at 4 KiB. Completed listener, handler, writer, dial, timer, and
+  placement tasks are continuously reaped and are abort-and-joined at explicit
+  Node shutdown.
 - The per-peer outbound queue defaults to 256 **frames** through
   `NodeRuntimeOptions`; it is not byte-bounded. All protocol traffic shares the
   same queue and socket writer. `OpPriority` selects the receiver's actor pool

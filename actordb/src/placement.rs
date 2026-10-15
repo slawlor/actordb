@@ -37,7 +37,7 @@
 //! With no controller configured, the node behaves exactly as before
 //! (static placement, full-state handshake sync).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
 use std::sync::RwLock;
 
@@ -63,9 +63,9 @@ use crate::shard::FragmentId;
 /// authoritative and will tear down local state for revoked fragments.
 pub trait PlacementController: Debug + Send + Sync {
     /// Desired placement: fragment -> replica node ids. Must cover
-    /// every fragment `0..fragment_count` with a non-empty replica
-    /// list. The driver validates this each poll and keeps the current
-    /// placement on invalid output (fail-safe).
+    /// every fragment `0..fragment_count` with a non-empty, duplicate-free
+    /// replica list of valid 1-to-255-byte node ids. The driver validates this
+    /// each poll and keeps the current placement on invalid output (fail-safe).
     fn desired_placement(&self) -> HashMap<FragmentId, Vec<String>>;
 
     /// Called when the node's observed peer set changes (a peer
@@ -167,17 +167,36 @@ pub struct PlacementReport {
     pub dynamic: bool,
 }
 
-/// Validate a desired placement: every fragment `0..fragment_count`
-/// present with a non-empty replica list.
+/// Validate a desired placement: exactly the fragment range
+/// `0..fragment_count`, each with a non-empty, duplicate-free list of node ids
+/// that can be represented by the peer handshake.
 pub fn validate_placement(
     map: &HashMap<FragmentId, Vec<String>>,
     fragment_count: usize,
 ) -> Result<(), String> {
+    if let Some(fragment) = map
+        .keys()
+        .find(|fragment| fragment.0 as usize >= fragment_count)
+    {
+        return Err(format!("placement contains out-of-range {fragment}"));
+    }
     for i in 0..fragment_count {
         let frag = FragmentId(i as u32);
-        match map.get(&frag) {
-            Some(replicas) if !replicas.is_empty() => {}
-            _ => return Err(format!("placement leaves {frag} with no replicas")),
+        let Some(replicas) = map.get(&frag).filter(|replicas| !replicas.is_empty()) else {
+            return Err(format!("placement leaves {frag} with no replicas"));
+        };
+        let mut unique = HashSet::with_capacity(replicas.len());
+        for replica in replicas {
+            if replica.is_empty() || replica.len() > 255 {
+                return Err(format!(
+                    "placement {frag} has a replica id outside 1 to 255 bytes"
+                ));
+            }
+            if !unique.insert(replica) {
+                return Err(format!(
+                    "placement {frag} contains duplicate replica {replica:?}"
+                ));
+            }
         }
     }
     Ok(())
@@ -219,6 +238,21 @@ mod tests {
         map.insert(FragmentId(0), vec!["a".to_string()]);
         map.insert(FragmentId(1), vec![]);
         assert!(validate_placement(&map, 2).is_err());
+    }
+
+    #[test]
+    fn validate_rejects_unrepresentable_duplicate_and_out_of_range_replicas() {
+        for map in [
+            HashMap::from([(FragmentId(0), vec![String::new()])]),
+            HashMap::from([(FragmentId(0), vec!["x".repeat(256)])]),
+            HashMap::from([(FragmentId(0), vec!["a".to_string(), "a".to_string()])]),
+            HashMap::from([
+                (FragmentId(0), vec!["a".to_string()]),
+                (FragmentId(1), vec!["b".to_string()]),
+            ]),
+        ] {
+            assert!(validate_placement(&map, 1).is_err());
+        }
     }
 
     #[test]

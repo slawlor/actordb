@@ -3,9 +3,9 @@
 actordb is a **sharded, actor-model key–value store** written in Rust on top of
 [ractor](https://github.com/slawlor/ractor) (a Rust actor framework). It is a
 working prototype: a real, networked, multi-node KV store with replication,
-persistence, traffic isolation, and an optional pre-shared-secret Hello
-integrity tag, but without built-in TLS, replay-resistant peer authentication,
-multi-datacenter support, or transactional semantics.
+persistence, traffic isolation, and an optional fresh challenge-bound
+pre-shared-secret handshake, but without built-in TLS, individual peer
+credentials, multi-datacenter support, or transactional semantics.
 
 ## What it is
 
@@ -41,7 +41,7 @@ integration crate, and an `xtask` for coverage.
 | `actordb::store` | `KvStore` trait, `MemoryStore`, `PrefixedStore`, `RocksDbStore` (feature-gated) |
 | `actordb::shard` | `FragmentId`, `hash_key` (seahash), `fragment_of` |
 | `actordb::network` | Transport abstraction: `Network`, `TcpNetwork`, `PeerStream`; 4-byte length-prefixed `Envelope` framing |
-| `actordb::proto` | prost-generated `meta` protocol-buffer messages (ids 1–19), priorities, mutation outcomes, replication and reconcile messages |
+| `actordb::proto` | prost-generated `meta` protocol-buffer messages (ids 1–20), priorities, mutation outcomes, challenge handshake, replication and reconcile messages |
 
 ## The hierarchy
 
@@ -91,9 +91,11 @@ Key design points:
 
 - No transactions, no multi-key atomicity (see [Multi-key batching](batching.md)
   for exactly what `put_multi` guarantees — it's fan-out, not a transaction).
-- Plain TCP by default and no built-in TLS. The optional pre-shared-secret
-  Hello HMAC is static and replayable; protected, authenticated transports
-  remain an extension point via the `Network` trait.
+- Plain TCP by default and no built-in TLS. Protocol v2 uses two fresh
+  challenges when proving possession of the optional cluster-wide secret, but
+  that shared key does not distinguish members and does not protect subsequent
+  frames. Confidential, individually authenticated transports remain an
+  extension point via the `Network` trait.
 - No consensus: conflict resolution is last-writer-wins by HLC timestamp, not
   Raft/Paxos (see [Consistency](consistency.md)).
 - Persistence is opt-in (`store: None` by default = pure in-memory) and crash

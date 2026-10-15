@@ -418,6 +418,15 @@ pub(crate) struct NodeSender {
 }
 
 impl NodeSender {
+    pub(crate) fn same_task(&self, other: &Self) -> bool {
+        self.data_tx.same_channel(&other.data_tx)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn control_capacity(&self) -> usize {
+        self.control_tx.capacity()
+    }
+
     pub(crate) fn send(&self, msg: SenderMsg) -> Result<(), NodeSenderSendError> {
         if self.is_closed() {
             return Err(NodeSenderSendError::Closed);

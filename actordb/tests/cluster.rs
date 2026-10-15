@@ -9,13 +9,65 @@ use std::sync::{Arc, Condvar, Mutex as StdMutex};
 use std::time::Duration;
 
 use actordb::actor::{now_ms, VersionedValue};
+use actordb::network::{BindFuture, ConnectFuture, Network, NetworkError, TcpNetwork};
 use actordb::node::{
     Node, NodeConfig, NodeRuntimeOptions, REQUIRED_WIRE_CAPABILITIES, WIRE_PROTOCOL_VERSION,
 };
-use actordb::proto::Envelope;
+use actordb::proto::{Envelope, EnvelopeMsg, Hello, HelloAuth};
 use actordb::store::{KvStore, StoreError};
 use prost::Message;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+#[derive(Clone)]
+struct CountingNetwork {
+    connect_attempts: Arc<AtomicUsize>,
+}
+
+#[derive(Clone)]
+struct GatedFailNetwork {
+    connect_attempts: Arc<AtomicUsize>,
+    first_entered: Arc<tokio::sync::Notify>,
+    release_first: Arc<tokio::sync::Notify>,
+}
+
+impl Network for CountingNetwork {
+    fn bind(&self, addr: SocketAddr) -> BindFuture<'_> {
+        Box::pin(async move {
+            let tcp = TcpNetwork;
+            tcp.bind(addr).await
+        })
+    }
+
+    fn connect(&self, addr: SocketAddr) -> ConnectFuture<'_> {
+        self.connect_attempts.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async move {
+            let tcp = TcpNetwork;
+            tcp.connect(addr).await
+        })
+    }
+}
+
+impl Network for GatedFailNetwork {
+    fn bind(&self, addr: SocketAddr) -> BindFuture<'_> {
+        Box::pin(async move {
+            let tcp = TcpNetwork;
+            tcp.bind(addr).await
+        })
+    }
+
+    fn connect(&self, _addr: SocketAddr) -> ConnectFuture<'_> {
+        let attempt = self.connect_attempts.fetch_add(1, Ordering::SeqCst);
+        let first_entered = self.first_entered.clone();
+        let release_first = self.release_first.clone();
+        Box::pin(async move {
+            if attempt == 0 {
+                first_entered.notify_one();
+                release_first.notified().await;
+            }
+            Err(NetworkError("injected dial failure".to_string()))
+        })
+    }
+}
 
 #[derive(Default)]
 struct PreloadedStore {
@@ -173,6 +225,49 @@ async fn recv_frame(stream: &mut tokio::net::TcpStream) -> Envelope {
     .expect("timed out waiting for protocol frame")
 }
 
+/// Complete the protocol-v2 mutual handshake used by raw TCP peers in these
+/// tests. With no cluster secret configured, the second flight is explicit
+/// but carries an empty proof.
+async fn complete_no_secret_handshake(stream: &mut tokio::net::TcpStream, peer_id: &str) {
+    let server_hello = match recv_frame(stream).await.msg {
+        Some(EnvelopeMsg::Hello(hello)) => hello,
+        other => panic!("expected server Hello, got {other:?}"),
+    };
+    assert_eq!(server_hello.min_protocol_version, WIRE_PROTOCOL_VERSION);
+    assert_eq!(server_hello.max_protocol_version, WIRE_PROTOCOL_VERSION);
+    assert_eq!(server_hello.capabilities, REQUIRED_WIRE_CAPABILITIES);
+    assert_eq!(server_hello.challenge.len(), 32);
+
+    send_frame(
+        stream,
+        Envelope {
+            msg: Some(EnvelopeMsg::Hello(Hello {
+                node_id: peer_id.to_string(),
+                auth_tag: Vec::new(),
+                min_protocol_version: WIRE_PROTOCOL_VERSION,
+                max_protocol_version: WIRE_PROTOCOL_VERSION,
+                capabilities: REQUIRED_WIRE_CAPABILITIES,
+                challenge: vec![0x5a; 32],
+            })),
+        },
+    )
+    .await;
+
+    match recv_frame(stream).await.msg {
+        Some(EnvelopeMsg::HelloAuth(HelloAuth { auth_tag })) => assert!(auth_tag.is_empty()),
+        other => panic!("expected server HelloAuth, got {other:?}"),
+    }
+    send_frame(
+        stream,
+        Envelope {
+            msg: Some(EnvelopeMsg::HelloAuth(HelloAuth {
+                auth_tag: Vec::new(),
+            })),
+        },
+    )
+    .await;
+}
+
 #[tokio::test]
 async fn single_node_put_get() {
     let n = test_node("solo").await;
@@ -207,12 +302,17 @@ async fn invalid_zero_sized_replication_and_placement_config_is_rejected() {
         cluster_secret: Some(Vec::new()),
         ..NodeConfig::default()
     };
+    let weak_cluster_secret = NodeConfig {
+        cluster_secret: Some(vec![7; 31]),
+        ..NodeConfig::default()
+    };
 
     for (id, config) in [
         ("invalid-batch", batch_zero),
         ("invalid-in-flight", in_flight_zero),
         ("invalid-reconcile", reconcile_zero),
         ("invalid-empty-cluster-secret", empty_cluster_secret),
+        ("invalid-weak-cluster-secret", weak_cluster_secret),
     ] {
         assert!(matches!(
             Node::start(id.to_string(), "127.0.0.1:0".parse().unwrap(), config).await,
@@ -244,6 +344,41 @@ async fn invalid_zero_sized_replication_and_placement_config_is_rejected() {
     // bind failure.
     let occupied = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let occupied_addr = occupied.local_addr().unwrap();
+    for invalid_id in [String::new(), "x".repeat(256)] {
+        assert!(matches!(
+            Node::start(invalid_id, occupied_addr, NodeConfig::default()).await,
+            Err(NodeError::Actor(_))
+        ));
+    }
+    for invalid_member in [String::new(), "x".repeat(256)] {
+        assert!(matches!(
+            Node::start(
+                "invalid-member-id".to_string(),
+                occupied_addr,
+                NodeConfig {
+                    members: HashMap::from([(invalid_member, "127.0.0.1:9".parse().unwrap())]),
+                    ..NodeConfig::default()
+                },
+            )
+            .await,
+            Err(NodeError::Actor(_))
+        ));
+    }
+    assert!(matches!(
+        Node::start(
+            "invalid-static-placement-id".to_string(),
+            occupied_addr,
+            NodeConfig {
+                fragment_map: HashMap::from([(
+                    FragmentId(0),
+                    vec!["invalid-static-placement-id".to_string(), String::new()],
+                )]),
+                ..NodeConfig::default()
+            },
+        )
+        .await,
+        Err(NodeError::Actor(_))
+    ));
     let invalid_runtime_options = [
         (
             "invalid-peer-queue-capacity",
@@ -254,12 +389,28 @@ async fn invalid_zero_sized_replication_and_placement_config_is_rejected() {
             NodeRuntimeOptions::default().with_replication_control_message_capacity(0),
         ),
         (
+            "invalid-inbound-connection-capacity",
+            NodeRuntimeOptions::default().with_inbound_connection_capacity(0),
+        ),
+        (
             "invalid-queue-admission-timeout",
             NodeRuntimeOptions::default().with_queue_admission_timeout(Duration::ZERO),
         ),
         (
             "invalid-forwarded-attempt-timeout",
             NodeRuntimeOptions::default().with_forwarded_attempt_timeout(Duration::ZERO),
+        ),
+        (
+            "invalid-connect-timeout",
+            NodeRuntimeOptions::default().with_connect_timeout(Duration::ZERO),
+        ),
+        (
+            "invalid-handshake-timeout",
+            NodeRuntimeOptions::default().with_handshake_timeout(Duration::ZERO),
+        ),
+        (
+            "invalid-socket-read-timeout",
+            NodeRuntimeOptions::default().with_socket_read_timeout(Duration::ZERO),
         ),
         (
             "invalid-socket-write-timeout",
@@ -539,6 +690,388 @@ async fn dropped_connection_redials() {
 }
 
 #[tokio::test]
+async fn legacy_sender_reap_recovers_offline_writes_and_tombstones_by_full_sync() {
+    let a = test_node("legacy-a").await;
+    let b = test_node("legacy-b").await;
+    b.connect(a.addr()).await.unwrap();
+    wait_for_peers(&a, &b).await;
+
+    a.put("delete-while-away".to_string(), b"old".to_vec())
+        .await
+        .unwrap();
+    common::wait_for(
+        || async {
+            b.get("delete-while-away".to_string())
+                .await
+                .unwrap()
+                .is_some()
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+    b.shutdown().await;
+    common::wait_for(
+        || async { a.peer_count().await == 0 },
+        Duration::from_secs(2),
+    )
+    .await;
+
+    a.put("written-while-away".to_string(), b"new".to_vec())
+        .await
+        .unwrap();
+    a.delete("delete-while-away".to_string()).await.unwrap();
+
+    let b2 = test_node("legacy-b").await;
+    b2.connect(a.addr()).await.unwrap();
+    wait_for_peers(&a, &b2).await;
+    common::wait_for(
+        || async {
+            b2.get("written-while-away".to_string())
+                .await
+                .unwrap()
+                .map(|value| value.value)
+                == Some(b"new".to_vec())
+                && b2
+                    .get("delete-while-away".to_string())
+                    .await
+                    .unwrap()
+                    .is_none()
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    a.shutdown().await;
+    b2.shutdown().await;
+}
+
+#[tokio::test]
+async fn configured_member_retries_initial_failure_and_rejects_wrong_identity() {
+    // Reserve an ephemeral address, release it, and start the node while no
+    // listener exists. The configured dial intent must survive that first
+    // refusal and connect once the peer appears.
+    let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let peer_addr = probe.local_addr().unwrap();
+    drop(probe);
+
+    let node = Node::start(
+        "configured-dialer".to_string(),
+        "127.0.0.1:0".parse().unwrap(),
+        NodeConfig {
+            members: HashMap::from([("expected-peer".to_string(), peer_addr)]),
+            ..NodeConfig::default()
+        },
+    )
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(250)).await;
+
+    let listener = tokio::net::TcpListener::bind(peer_addr).await.unwrap();
+    let (mut wrong_peer, _) = tokio::time::timeout(Duration::from_secs(3), listener.accept())
+        .await
+        .expect("configured member was not retried after its initial refusal")
+        .unwrap();
+    assert!(matches!(
+        recv_frame(&mut wrong_peer).await.msg,
+        Some(EnvelopeMsg::Hello(_))
+    ));
+    send_frame(
+        &mut wrong_peer,
+        Envelope {
+            msg: Some(EnvelopeMsg::Hello(Hello {
+                node_id: "wrong-peer".to_string(),
+                auth_tag: Vec::new(),
+                min_protocol_version: WIRE_PROTOCOL_VERSION,
+                max_protocol_version: WIRE_PROTOCOL_VERSION,
+                capabilities: REQUIRED_WIRE_CAPABILITIES,
+                challenge: vec![0x31; 32],
+            })),
+        },
+    )
+    .await;
+    let mut remainder = Vec::new();
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        wrong_peer.read_to_end(&mut remainder),
+    )
+    .await
+    .expect("wrong configured member identity was not rejected")
+    .unwrap();
+    assert_eq!(node.peer_count().await, 0);
+
+    let (mut expected_peer, _) = tokio::time::timeout(Duration::from_secs(3), listener.accept())
+        .await
+        .expect("identity failure did not leave the configured dialer supervised")
+        .unwrap();
+    complete_no_secret_handshake(&mut expected_peer, "expected-peer").await;
+    common::wait_for(
+        || async { node.peer_count().await == 1 },
+        Duration::from_secs(3),
+    )
+    .await;
+
+    node.shutdown().await;
+}
+
+#[tokio::test]
+async fn address_only_connect_pins_the_first_authenticated_identity() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let peer_addr = listener.local_addr().unwrap();
+    let node = test_node("identity-pinning-dialer").await;
+    node.connect(peer_addr).await.unwrap();
+
+    let (mut first_peer, _) = tokio::time::timeout(Duration::from_secs(1), listener.accept())
+        .await
+        .expect("initial dial did not arrive")
+        .unwrap();
+    complete_no_secret_handshake(&mut first_peer, "peer-b").await;
+    common::wait_for(
+        || async { node.peer_count().await == 1 },
+        Duration::from_secs(2),
+    )
+    .await;
+    drop(first_peer);
+    common::wait_for(
+        || async { node.peer_count().await == 0 },
+        Duration::from_secs(2),
+    )
+    .await;
+
+    let (mut wrong_replacement, _) =
+        tokio::time::timeout(Duration::from_secs(3), listener.accept())
+            .await
+            .expect("dial supervisor did not retry after disconnect")
+            .unwrap();
+    assert!(matches!(
+        recv_frame(&mut wrong_replacement).await.msg,
+        Some(EnvelopeMsg::Hello(_))
+    ));
+    send_frame(
+        &mut wrong_replacement,
+        Envelope {
+            msg: Some(EnvelopeMsg::Hello(Hello {
+                node_id: "peer-c".to_string(),
+                auth_tag: Vec::new(),
+                min_protocol_version: WIRE_PROTOCOL_VERSION,
+                max_protocol_version: WIRE_PROTOCOL_VERSION,
+                capabilities: REQUIRED_WIRE_CAPABILITIES,
+                challenge: vec![0x42; 32],
+            })),
+        },
+    )
+    .await;
+    let mut remainder = Vec::new();
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        wrong_replacement.read_to_end(&mut remainder),
+    )
+    .await
+    .expect("address reuse by a different identity was accepted")
+    .unwrap();
+    assert_eq!(node.peer_count().await, 0);
+
+    let (mut original_identity, _) =
+        tokio::time::timeout(Duration::from_secs(3), listener.accept())
+            .await
+            .expect("identity mismatch stopped the supervised retries")
+            .unwrap();
+    complete_no_secret_handshake(&mut original_identity, "peer-b").await;
+    common::wait_for(
+        || async { node.peer_count().await == 1 },
+        Duration::from_secs(2),
+    )
+    .await;
+    node.shutdown().await;
+}
+
+#[tokio::test]
+async fn simultaneous_dials_elect_one_stable_connection_without_redial_churn() {
+    let attempts_a = Arc::new(AtomicUsize::new(0));
+    let attempts_b = Arc::new(AtomicUsize::new(0));
+    let a = Node::start(
+        "a".to_string(),
+        "127.0.0.1:0".parse().unwrap(),
+        NodeConfig {
+            network: Arc::new(CountingNetwork {
+                connect_attempts: attempts_a.clone(),
+            }),
+            ..NodeConfig::default()
+        },
+    )
+    .await
+    .unwrap();
+    let b = Node::start(
+        "b".to_string(),
+        "127.0.0.1:0".parse().unwrap(),
+        NodeConfig {
+            network: Arc::new(CountingNetwork {
+                connect_attempts: attempts_b.clone(),
+            }),
+            ..NodeConfig::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    let (a_result, b_result) = tokio::join!(a.connect(b.addr()), b.connect(a.addr()));
+    a_result.unwrap();
+    b_result.unwrap();
+    wait_for_peers(&a, &b).await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(attempts_a.load(Ordering::SeqCst), 1);
+    assert_eq!(attempts_b.load(Ordering::SeqCst), 1);
+    assert_eq!(a.peer_count().await, 1);
+    assert_eq!(b.peer_count().await, 1);
+
+    a.put("crossed-dial".to_string(), b"stable".to_vec())
+        .await
+        .unwrap();
+    common::wait_for(
+        || async {
+            b.get("crossed-dial".to_string())
+                .await
+                .unwrap()
+                .map(|value| value.value)
+                == Some(b"stable".to_vec())
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    a.shutdown().await;
+    b.shutdown().await;
+}
+
+#[tokio::test]
+async fn concurrent_connect_calls_share_one_transport_dial_intent() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let peer_addr = listener.local_addr().unwrap();
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let node = Node::start(
+        "single-dial-intent".to_string(),
+        "127.0.0.1:0".parse().unwrap(),
+        NodeConfig {
+            network: Arc::new(CountingNetwork {
+                connect_attempts: attempts.clone(),
+            }),
+            ..NodeConfig::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    let (first, second, third, fourth) = tokio::join!(
+        node.connect(peer_addr),
+        node.connect(peer_addr),
+        node.connect(peer_addr),
+        node.connect(peer_addr),
+    );
+    first.unwrap();
+    second.unwrap();
+    third.unwrap();
+    fourth.unwrap();
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+
+    let (mut peer, _) = tokio::time::timeout(Duration::from_secs(1), listener.accept())
+        .await
+        .expect("reserved dial did not reach the listener")
+        .unwrap();
+    complete_no_secret_handshake(&mut peer, "single-peer").await;
+    common::wait_for(
+        || async { node.peer_count().await == 1 },
+        Duration::from_secs(2),
+    )
+    .await;
+    node.shutdown().await;
+}
+
+#[tokio::test]
+async fn concurrent_connect_waiter_never_reports_false_success_after_owner_failure() {
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let first_entered = Arc::new(tokio::sync::Notify::new());
+    let release_first = Arc::new(tokio::sync::Notify::new());
+    let node = Arc::new(
+        Node::start(
+            "failed-single-dial".to_string(),
+            "127.0.0.1:0".parse().unwrap(),
+            NodeConfig {
+                network: Arc::new(GatedFailNetwork {
+                    connect_attempts: attempts.clone(),
+                    first_entered: first_entered.clone(),
+                    release_first: release_first.clone(),
+                }),
+                ..NodeConfig::default()
+            },
+        )
+        .await
+        .unwrap(),
+    );
+    let peer_addr = "127.0.0.1:9".parse().unwrap();
+
+    let first_node = node.clone();
+    let first = tokio::spawn(async move { first_node.connect(peer_addr).await });
+    first_entered.notified().await;
+    let second_node = node.clone();
+    let second = tokio::spawn(async move { second_node.connect(peer_addr).await });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        !second.is_finished(),
+        "duplicate caller reported success while the owning dial was pending"
+    );
+
+    release_first.notify_one();
+    assert!(first.await.unwrap().is_err());
+    assert!(second.await.unwrap().is_err());
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+
+    // Both failed attempts released their reservations; a later caller can
+    // become the owner instead of observing a permanently stuck Pending entry.
+    assert!(node.connect(peer_addr).await.is_err());
+    assert_eq!(attempts.load(Ordering::SeqCst), 3);
+    node.shutdown().await;
+}
+
+#[tokio::test]
+async fn cancelled_connect_owner_releases_pending_intent_to_waiter() {
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let first_entered = Arc::new(tokio::sync::Notify::new());
+    let release_first = Arc::new(tokio::sync::Notify::new());
+    let node = Arc::new(
+        Node::start(
+            "cancelled-single-dial".to_string(),
+            "127.0.0.1:0".parse().unwrap(),
+            NodeConfig {
+                network: Arc::new(GatedFailNetwork {
+                    connect_attempts: attempts.clone(),
+                    first_entered: first_entered.clone(),
+                    release_first,
+                }),
+                ..NodeConfig::default()
+            },
+        )
+        .await
+        .unwrap(),
+    );
+    let peer_addr = "127.0.0.1:9".parse().unwrap();
+
+    let first_node = node.clone();
+    let first = tokio::spawn(async move { first_node.connect(peer_addr).await });
+    first_entered.notified().await;
+
+    let second_node = node.clone();
+    let second = tokio::spawn(async move { second_node.connect(peer_addr).await });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(!second.is_finished());
+
+    first.abort();
+    assert!(first.await.unwrap_err().is_cancelled());
+    assert!(second.await.unwrap().is_err());
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+
+    node.shutdown().await;
+}
+
+#[tokio::test]
 async fn late_joiner_receives_full_state() {
     let a = test_node("a").await;
     let b = test_node("b").await;
@@ -575,7 +1108,7 @@ async fn late_joiner_receives_full_state() {
 
 #[tokio::test]
 async fn failed_full_state_sync_is_not_counted_and_retries_by_disconnect() {
-    use actordb::proto::{EnvelopeMsg, Hello, SyncEntry, SyncResponse};
+    use actordb::proto::{EnvelopeMsg, SyncEntry, SyncResponse};
 
     let node = Node::start(
         "sync-failure-receiver".to_string(),
@@ -589,19 +1122,7 @@ async fn failed_full_state_sync_is_not_counted_and_retries_by_disconnect() {
     .await
     .unwrap();
     let mut stream = tokio::net::TcpStream::connect(node.addr()).await.unwrap();
-    send_frame(
-        &mut stream,
-        Envelope {
-            msg: Some(EnvelopeMsg::Hello(Hello {
-                node_id: "raw-sync-source".to_string(),
-                auth_tag: Vec::new(),
-                min_protocol_version: WIRE_PROTOCOL_VERSION,
-                max_protocol_version: WIRE_PROTOCOL_VERSION,
-                capabilities: REQUIRED_WIRE_CAPABILITIES,
-            })),
-        },
-    )
-    .await;
+    complete_no_secret_handshake(&mut stream, "raw-sync-source").await;
     loop {
         if matches!(
             recv_frame(&mut stream).await.msg,
@@ -1450,7 +1971,9 @@ async fn sender_buffer_reset_and_reconcile() {
     use actordb::replication::SenderConfig;
     use actordb::shard::FragmentId;
 
+    let fragment_map = HashMap::from([(FragmentId(0), vec!["a".to_string(), "b".to_string()])]);
     let config = NodeConfig {
+        fragment_map: fragment_map.clone(),
         replication: SenderConfig {
             batch_size: 5,
             batch_interval: Duration::from_millis(50),
@@ -1465,7 +1988,16 @@ async fn sender_buffer_reset_and_reconcile() {
     let a = Node::start("a".to_string(), "127.0.0.1:0".parse().unwrap(), config)
         .await
         .unwrap();
-    let b = test_node("b").await;
+    let b = Node::start(
+        "b".to_string(),
+        "127.0.0.1:0".parse().unwrap(),
+        NodeConfig {
+            fragment_map: fragment_map.clone(),
+            ..NodeConfig::default()
+        },
+    )
+    .await
+    .unwrap();
     b.connect(a.addr()).await.unwrap();
     wait_for_peers(&a, &b).await;
 
@@ -1502,7 +2034,10 @@ async fn sender_buffer_reset_and_reconcile() {
     let b2 = Node::start(
         "b".to_string(),
         "127.0.0.1:0".parse().unwrap(),
-        NodeConfig::default(),
+        NodeConfig {
+            fragment_map,
+            ..NodeConfig::default()
+        },
     )
     .await
     .unwrap();
@@ -1670,7 +2205,7 @@ async fn unchanged_placement_polls_preserve_sender_session() {
 #[tokio::test]
 async fn stale_reconcile_round_cannot_complete_live_reset() {
     use actordb::proto::{
-        BatchAck, Envelope, EnvelopeMsg, Hello, KeySummary, ReconcileResponse, ReplicationAckLevel,
+        BatchAck, Envelope, EnvelopeMsg, KeySummary, ReconcileResponse, ReplicationAckLevel,
     };
     use actordb::replication::SenderConfig;
     use actordb::shard::FragmentId;
@@ -1702,19 +2237,7 @@ async fn stale_reconcile_round_cannot_complete_live_reset() {
     .unwrap();
 
     let mut stream = tokio::net::TcpStream::connect(node.addr()).await.unwrap();
-    send_frame(
-        &mut stream,
-        Envelope {
-            msg: Some(EnvelopeMsg::Hello(Hello {
-                node_id: "raw-reset-peer".to_string(),
-                auth_tag: Vec::new(),
-                min_protocol_version: WIRE_PROTOCOL_VERSION,
-                max_protocol_version: WIRE_PROTOCOL_VERSION,
-                capabilities: REQUIRED_WIRE_CAPABILITIES,
-            })),
-        },
-    )
-    .await;
+    complete_no_secret_handshake(&mut stream, "raw-reset-peer").await;
 
     // Drain handshake/sync frames through the initial SessionStart.
     loop {
@@ -1889,7 +2412,7 @@ async fn stale_reconcile_round_cannot_complete_live_reset() {
 async fn placement_bootstrap_fetch_requires_verification_round() {
     use actordb::placement::{FragmentPlacementState, ManualPlacement};
     use actordb::proto::{
-        BatchAck, Envelope, EnvelopeMsg, Hello, KeySummary, ReconcileData, ReconcileResponse,
+        BatchAck, Envelope, EnvelopeMsg, KeySummary, ReconcileData, ReconcileResponse,
         ReplicationAckLevel, SyncEntry,
     };
     use actordb::replication::{ReplicationAckDurability, SenderConfig};
@@ -1921,19 +2444,7 @@ async fn placement_bootstrap_fetch_requires_verification_round() {
     .unwrap();
 
     let mut stream = tokio::net::TcpStream::connect(node.addr()).await.unwrap();
-    send_frame(
-        &mut stream,
-        Envelope {
-            msg: Some(EnvelopeMsg::Hello(Hello {
-                node_id: "raw-bootstrap-source".to_string(),
-                auth_tag: Vec::new(),
-                min_protocol_version: WIRE_PROTOCOL_VERSION,
-                max_protocol_version: WIRE_PROTOCOL_VERSION,
-                capabilities: REQUIRED_WIRE_CAPABILITIES,
-            })),
-        },
-    )
-    .await;
+    complete_no_secret_handshake(&mut stream, "raw-bootstrap-source").await;
 
     common::wait_for(
         || async { node.peer_count().await == 1 },
@@ -2094,7 +2605,7 @@ async fn placement_bootstrap_fetch_requires_verification_round() {
 /// and a fresh correlated round within the configured phase timeout.
 #[tokio::test]
 async fn silent_reconcile_phase_times_out_and_retries() {
-    use actordb::proto::{Envelope, EnvelopeMsg, Hello};
+    use actordb::proto::EnvelopeMsg;
     use actordb::replication::SenderConfig;
     use actordb::shard::FragmentId;
 
@@ -2125,19 +2636,7 @@ async fn silent_reconcile_phase_times_out_and_retries() {
     .unwrap();
 
     let mut stream = tokio::net::TcpStream::connect(node.addr()).await.unwrap();
-    send_frame(
-        &mut stream,
-        Envelope {
-            msg: Some(EnvelopeMsg::Hello(Hello {
-                node_id: "raw-timeout-peer".to_string(),
-                auth_tag: Vec::new(),
-                min_protocol_version: WIRE_PROTOCOL_VERSION,
-                max_protocol_version: WIRE_PROTOCOL_VERSION,
-                capabilities: REQUIRED_WIRE_CAPABILITIES,
-            })),
-        },
-    )
-    .await;
+    complete_no_secret_handshake(&mut stream, "raw-timeout-peer").await;
     loop {
         if matches!(
             recv_frame(&mut stream).await.msg,
@@ -2192,7 +2691,7 @@ async fn silent_reconcile_phase_times_out_and_retries() {
 #[tokio::test]
 async fn inbound_mutation_after_snapshot_invalidates_reset_completion() {
     use actordb::proto::{
-        BatchAck, Envelope, EnvelopeMsg, Hello, ReconcileResponse, ReplicateBatch, ReplicateOp,
+        BatchAck, Envelope, EnvelopeMsg, ReconcileResponse, ReplicateBatch, ReplicateOp,
         ReplicationAckLevel,
     };
     use actordb::replication::SenderConfig;
@@ -2227,19 +2726,7 @@ async fn inbound_mutation_after_snapshot_invalidates_reset_completion() {
     .await
     .unwrap();
     let mut stream = tokio::net::TcpStream::connect(node.addr()).await.unwrap();
-    send_frame(
-        &mut stream,
-        Envelope {
-            msg: Some(EnvelopeMsg::Hello(Hello {
-                node_id: "raw-revision-peer".to_string(),
-                auth_tag: Vec::new(),
-                min_protocol_version: WIRE_PROTOCOL_VERSION,
-                max_protocol_version: WIRE_PROTOCOL_VERSION,
-                capabilities: REQUIRED_WIRE_CAPABILITIES,
-            })),
-        },
-    )
-    .await;
+    complete_no_secret_handshake(&mut stream, "raw-revision-peer").await;
     loop {
         if matches!(
             recv_frame(&mut stream).await.msg,
@@ -2365,7 +2852,7 @@ async fn inbound_mutation_after_snapshot_invalidates_reset_completion() {
 #[tokio::test]
 async fn malformed_reconcile_data_is_rejected_and_retried() {
     use actordb::proto::{
-        Envelope, EnvelopeMsg, Hello, KeySummary, ReconcileData, ReconcileResponse, SyncEntry,
+        Envelope, EnvelopeMsg, KeySummary, ReconcileData, ReconcileResponse, SyncEntry,
     };
     use actordb::replication::SenderConfig;
     use actordb::shard::FragmentId;
@@ -2396,19 +2883,7 @@ async fn malformed_reconcile_data_is_rejected_and_retried() {
     .await
     .unwrap();
     let mut stream = tokio::net::TcpStream::connect(node.addr()).await.unwrap();
-    send_frame(
-        &mut stream,
-        Envelope {
-            msg: Some(EnvelopeMsg::Hello(Hello {
-                node_id: "raw-data-peer".to_string(),
-                auth_tag: Vec::new(),
-                min_protocol_version: WIRE_PROTOCOL_VERSION,
-                max_protocol_version: WIRE_PROTOCOL_VERSION,
-                capabilities: REQUIRED_WIRE_CAPABILITIES,
-            })),
-        },
-    )
-    .await;
+    complete_no_secret_handshake(&mut stream, "raw-data-peer").await;
     loop {
         if matches!(
             recv_frame(&mut stream).await.msg,
@@ -2544,9 +3019,7 @@ async fn malformed_reconcile_data_is_rejected_and_retried() {
 /// receiver must drop it.
 #[tokio::test]
 async fn stale_session_batches_discarded() {
-    use actordb::proto::{
-        Envelope, EnvelopeMsg, Hello, ReplicateBatch, ReplicateOp, ReplicationAckLevel,
-    };
+    use actordb::proto::{Envelope, EnvelopeMsg, ReplicateBatch, ReplicateOp, ReplicationAckLevel};
 
     let b = test_node("b").await;
 
@@ -2554,23 +3027,7 @@ async fn stale_session_batches_discarded() {
     // a fragment session. Using a unique peer identity avoids racing the
     // node's intentional replacement of duplicate peer connections.
     let mut stream = tokio::net::TcpStream::connect(b.addr()).await.unwrap();
-    send_frame(
-        &mut stream,
-        Envelope {
-            msg: Some(EnvelopeMsg::Hello(Hello {
-                node_id: "raw-stale-peer".to_string(),
-                auth_tag: Vec::new(),
-                min_protocol_version: WIRE_PROTOCOL_VERSION,
-                max_protocol_version: WIRE_PROTOCOL_VERSION,
-                capabilities: REQUIRED_WIRE_CAPABILITIES,
-            })),
-        },
-    )
-    .await;
-    assert!(matches!(
-        recv_frame(&mut stream).await.msg,
-        Some(EnvelopeMsg::Hello(Hello { node_id, .. })) if node_id == "b"
-    ));
+    complete_no_secret_handshake(&mut stream, "raw-stale-peer").await;
 
     send_frame(
         &mut stream,
@@ -2603,26 +3060,14 @@ async fn stale_session_batches_discarded() {
 }
 
 #[tokio::test]
-async fn session_start_for_unhosted_fragment_is_not_admitted() {
+async fn session_start_for_out_of_range_fragment_is_not_admitted() {
     use actordb::proto::{
-        EnvelopeMsg, Hello, ReplicateBatch, ReplicateOp, ReplicationAckLevel, SessionStart,
+        EnvelopeMsg, ReplicateBatch, ReplicateOp, ReplicationAckLevel, SessionStart,
     };
 
     let node = test_node("session-bound-receiver").await;
     let mut stream = tokio::net::TcpStream::connect(node.addr()).await.unwrap();
-    send_frame(
-        &mut stream,
-        Envelope {
-            msg: Some(EnvelopeMsg::Hello(Hello {
-                node_id: "unhosted-session-peer".to_string(),
-                auth_tag: Vec::new(),
-                min_protocol_version: WIRE_PROTOCOL_VERSION,
-                max_protocol_version: WIRE_PROTOCOL_VERSION,
-                capabilities: REQUIRED_WIRE_CAPABILITIES,
-            })),
-        },
-    )
-    .await;
+    complete_no_secret_handshake(&mut stream, "unhosted-session-peer").await;
     loop {
         if matches!(
             recv_frame(&mut stream).await.msg,
@@ -2679,25 +3124,133 @@ async fn session_start_for_unhosted_fragment_is_not_admitted() {
 }
 
 #[tokio::test]
-async fn current_session_rejects_far_future_timestamp() {
+async fn session_started_before_actor_installation_survives_placement_race() {
+    use actordb::placement::{FragmentPlacementState, ManualPlacement};
     use actordb::proto::{
-        Envelope, EnvelopeMsg, Hello, ReplicateBatch, ReplicateOp, ReplicationAckLevel,
-        SessionStart,
+        EnvelopeMsg, ReplicateBatch, ReplicateOp, ReplicationAckLevel, SessionStart,
     };
-    use tokio::io::AsyncWriteExt;
+    use actordb::shard::FragmentId;
 
-    let node = test_node("receiver").await;
+    let controller = Arc::new(ManualPlacement::new(HashMap::from([(
+        FragmentId(0),
+        vec!["early-session-peer".to_string()],
+    )])));
+    let node = Node::start(
+        "early-session-target".to_string(),
+        "127.0.0.1:0".parse().unwrap(),
+        NodeConfig {
+            placement_controller: Some(controller.clone()),
+            placement_poll_interval: Duration::from_millis(25),
+            ..NodeConfig::default()
+        },
+    )
+    .await
+    .unwrap();
     let mut stream = tokio::net::TcpStream::connect(node.addr()).await.unwrap();
-    let frames = [
+    complete_no_secret_handshake(&mut stream, "early-session-peer").await;
+    common::wait_for(
+        || async { node.peer_count().await == 1 },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    let session_id = 77;
+    send_frame(
+        &mut stream,
         Envelope {
-            msg: Some(EnvelopeMsg::Hello(Hello {
-                node_id: "raw-peer".to_string(),
-                auth_tag: Vec::new(),
-                min_protocol_version: WIRE_PROTOCOL_VERSION,
-                max_protocol_version: WIRE_PROTOCOL_VERSION,
-                capabilities: REQUIRED_WIRE_CAPABILITIES,
+            msg: Some(EnvelopeMsg::SessionStart(SessionStart {
+                session_id,
+                fragment: 0,
             })),
         },
+    )
+    .await;
+    let batch = ReplicateBatch {
+        session_id,
+        batch_seq: 1,
+        fragment: 0,
+        ops: vec![ReplicateOp {
+            key: "early-session-key".to_string(),
+            value: b"accepted-after-install".to_vec(),
+            timestamp_ms: now_ms(),
+            node_id: "early-session-peer".to_string(),
+            seq: 1,
+            boot_id: 1,
+            expires_at_ms: 0,
+            is_tombstone: false,
+        }],
+        required_ack_level: ReplicationAckLevel::Applied as i32,
+    };
+    send_frame(
+        &mut stream,
+        Envelope {
+            msg: Some(EnvelopeMsg::ReplicateBatch(batch.clone())),
+        },
+    )
+    .await;
+    loop {
+        if matches!(
+            recv_frame(&mut stream).await.msg,
+            Some(EnvelopeMsg::BatchNack(nack))
+                if nack.session_id == session_id && nack.batch_seq == batch.batch_seq
+        ) {
+            break;
+        }
+    }
+    assert_eq!(node.peer_count().await, 1);
+
+    controller.set_placement(HashMap::from([(
+        FragmentId(0),
+        vec!["early-session-target".to_string()],
+    )]));
+    common::wait_for(
+        || async {
+            node.placement_report().await.states.get(&FragmentId(0))
+                == Some(&FragmentPlacementState::Serving)
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    // The receiver retained the bounded session while placement caught up,
+    // so replay does not need another SessionStart and succeeds immediately.
+    send_frame(
+        &mut stream,
+        Envelope {
+            msg: Some(EnvelopeMsg::ReplicateBatch(batch.clone())),
+        },
+    )
+    .await;
+    loop {
+        if matches!(
+            recv_frame(&mut stream).await.msg,
+            Some(EnvelopeMsg::BatchAck(ack))
+                if ack.session_id == session_id && ack.batch_seq == batch.batch_seq
+        ) {
+            break;
+        }
+    }
+    assert_eq!(
+        node.get(batch.ops[0].key.clone())
+            .await
+            .unwrap()
+            .unwrap()
+            .value,
+        batch.ops[0].value
+    );
+
+    node.shutdown().await;
+}
+
+#[tokio::test]
+async fn current_session_rejects_far_future_timestamp() {
+    use actordb::proto::{
+        Envelope, EnvelopeMsg, ReplicateBatch, ReplicateOp, ReplicationAckLevel, SessionStart,
+    };
+    let node = test_node("receiver").await;
+    let mut stream = tokio::net::TcpStream::connect(node.addr()).await.unwrap();
+    complete_no_secret_handshake(&mut stream, "raw-peer").await;
+    let frames = [
         Envelope {
             msg: Some(EnvelopeMsg::SessionStart(SessionStart {
                 session_id: 42,
@@ -2724,12 +3277,8 @@ async fn current_session_rejects_far_future_timestamp() {
         },
     ];
     for frame in frames {
-        let mut encoded = Vec::new();
-        frame.encode(&mut encoded).unwrap();
-        stream.write_u32(encoded.len() as u32).await.unwrap();
-        stream.write_all(&encoded).await.unwrap();
+        send_frame(&mut stream, frame).await;
     }
-    stream.flush().await.unwrap();
 
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert!(node.get("poisoned".to_string()).await.unwrap().is_none());
@@ -3336,7 +3885,7 @@ async fn placement_migration_no_lost_writes() {
     use actordb::replication::SenderConfig;
     use actordb::shard::{fragment_of, FragmentId};
     use std::collections::HashMap;
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
 
     let frag_count: usize = 2;
@@ -3388,13 +3937,19 @@ async fn placement_migration_no_lost_writes() {
     // Continuous writer via A (single writer, so HLC timestamps respect
     // write order). Records the latest acknowledged value per key.
     let expected: Arc<tokio::sync::Mutex<HashMap<String, Vec<u8>>>> =
-        Arc::new(tokio::sync::Mutex::new(HashMap::new()));
-    let max_round = Arc::new(AtomicU64::new(0));
+        Arc::new(tokio::sync::Mutex::new(
+            keys.iter()
+                .map(|key| (key.clone(), b"v0".to_vec()))
+                .collect(),
+        ));
+    let attempted: Arc<tokio::sync::Mutex<HashMap<String, u64>>> = Arc::new(
+        tokio::sync::Mutex::new(keys.iter().map(|key| (key.clone(), 0)).collect()),
+    );
     let stop = Arc::new(AtomicBool::new(false));
     let writer = {
         let a = a.clone();
         let expected = expected.clone();
-        let max_round = max_round.clone();
+        let attempted = attempted.clone();
         let stop = stop.clone();
         let keys = keys.clone();
         tokio::spawn(async move {
@@ -3402,11 +3957,11 @@ async fn placement_migration_no_lost_writes() {
             while !stop.load(Ordering::Relaxed) {
                 for k in &keys {
                     let v = format!("v{round}").into_bytes();
+                    attempted.lock().await.insert(k.clone(), round);
                     // A may forward to B once it stops serving; the write
                     // still lands.
                     if a.put(k.clone(), v.clone()).await.is_ok() {
                         expected.lock().await.insert(k.clone(), v);
-                        max_round.store(round, Ordering::Relaxed);
                     }
                 }
                 round += 1;
@@ -3423,14 +3978,24 @@ async fn placement_migration_no_lost_writes() {
     controller.set_placement(overlap);
 
     // Wait until B serves fragment 0 (bootstrap complete).
-    common::wait_for(
-        || async {
-            b.placement_report().await.states.get(&FragmentId(0))
-                == Some(&FragmentPlacementState::Serving)
-        },
-        Duration::from_secs(20),
-    )
-    .await;
+    let bootstrap_deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let report = b.placement_report().await;
+        if report.states.get(&FragmentId(0)) == Some(&FragmentPlacementState::Serving) {
+            break;
+        }
+        if tokio::time::Instant::now() >= bootstrap_deadline {
+            panic!(
+                "B did not finish bootstrap: b_placement={report:?}, a_placement={:?}, a_to_b={:?}, b_to_a={:?}, peer_counts=({}, {})",
+                a.placement_report().await,
+                a.sender_report(FragmentId(0), "b").await,
+                b.sender_report(FragmentId(0), "a").await,
+                a.peer_count().await,
+                b.peer_count().await,
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 
     // Reads during the overlap: every value must be one the writer
     // actually wrote (well-formed, and not from the future).
@@ -3439,8 +4004,9 @@ async fn placement_migration_no_lost_writes() {
         let s = String::from_utf8(got.value.clone()).unwrap();
         assert!(s.starts_with('v'), "unexpected value {s} for {k}");
         let round: u64 = s[1..].parse().expect("value should be v<round>");
+        let max_attempted_round = attempted.lock().await[k];
         assert!(
-            round <= max_round.load(Ordering::Relaxed),
+            round <= max_attempted_round,
             "read from the future for {k}: {s}"
         );
     }
@@ -3452,34 +4018,70 @@ async fn placement_migration_no_lost_writes() {
     controller.set_placement(final_map);
 
     // Wait until A drops fragment 0.
-    common::wait_for(
-        || async {
-            a.placement_report().await.states.get(&FragmentId(0))
-                == Some(&FragmentPlacementState::Stopped)
-        },
-        Duration::from_secs(20),
-    )
-    .await;
+    let drain_deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let report = a.placement_report().await;
+        if report.states.get(&FragmentId(0)) == Some(&FragmentPlacementState::Stopped) {
+            break;
+        }
+        if tokio::time::Instant::now() >= drain_deadline {
+            panic!(
+                "A did not finish drain: a_placement={report:?}, b_placement={:?}, a_to_b={:?}, b_to_a={:?}, peer_counts=({}, {})",
+                b.placement_report().await,
+                a.sender_report(FragmentId(0), "b").await,
+                b.sender_report(FragmentId(0), "a").await,
+                a.peer_count().await,
+                b.peer_count().await,
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 
-    // Stop the writer; B must converge to the final value of every key:
-    // zero lost writes.
+    // Stop the writer; B must retain at least the final acknowledged value of
+    // every key. A response can be lost after B applied a later attempt, so a
+    // value newer than the last acknowledged one is valid but must still be a
+    // value this writer actually attempted.
     stop.store(true, Ordering::Relaxed);
     writer.await.unwrap();
     let expected = expected.lock().await.clone();
-    assert!(!expected.is_empty());
-    common::wait_for(
-        || async {
-            for (k, v) in &expected {
-                match b.get(k.clone()).await.unwrap().map(|x| x.value) {
-                    Some(got) if got == *v => {}
-                    _ => return false,
-                }
+    let attempted = attempted.lock().await.clone();
+    assert_eq!(expected.len(), keys.len());
+    let convergence_deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        let mut mismatches = Vec::new();
+        for (key, expected_value) in &expected {
+            let actual = b.get(key.clone()).await.unwrap().map(|value| value.value);
+            let acknowledged_round = std::str::from_utf8(expected_value)
+                .unwrap()
+                .strip_prefix('v')
+                .unwrap()
+                .parse::<u64>()
+                .unwrap();
+            let max_attempted_round = attempted[key];
+            let actual_round = actual
+                .as_deref()
+                .and_then(|value| std::str::from_utf8(value).ok())
+                .and_then(|value| value.strip_prefix('v'))
+                .and_then(|round| round.parse::<u64>().ok());
+            if !matches!(actual_round, Some(round) if round >= acknowledged_round && round <= max_attempted_round)
+            {
+                mismatches.push((key.clone(), acknowledged_round, max_attempted_round, actual));
             }
-            true
-        },
-        Duration::from_secs(15),
-    )
-    .await;
+        }
+        if mismatches.is_empty() {
+            break;
+        }
+        if tokio::time::Instant::now() >= convergence_deadline {
+            panic!(
+                "migrated values did not converge: mismatches={mismatches:?}, a_placement={:?}, b_placement={:?}, a_to_b={:?}, b_to_a={:?}",
+                a.placement_report().await,
+                b.placement_report().await,
+                a.sender_report(FragmentId(0), "b").await,
+                b.sender_report(FragmentId(0), "a").await,
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 
     // Once A has retired the fragment, a grouped write must travel through
     // B's dynamic BatchPut mutation lease as one ownership decision.
@@ -3488,7 +4090,14 @@ async fn placement_migration_no_lost_writes() {
         (keys[1].clone(), b"batch-after-move-1".to_vec()),
     ];
     let batch_results = a.put_multi(migrated_batch.clone()).await;
-    assert!(batch_results.into_iter().all(|result| result.is_ok()));
+    assert!(
+        batch_results.iter().all(Result::is_ok),
+        "post-migration batch failed: results={batch_results:?}, a_placement={:?}, b_placement={:?}, peer_counts=({}, {})",
+        a.placement_report().await,
+        b.placement_report().await,
+        a.peer_count().await,
+        b.peer_count().await,
+    );
     for (key, expected_value) in migrated_batch {
         assert_eq!(
             b.get(key).await.unwrap().map(|value| value.value),
@@ -3507,9 +4116,7 @@ async fn placement_migration_no_lost_writes() {
 #[tokio::test]
 async fn placement_drain_waits_for_buffer_reset() {
     use actordb::placement::{FragmentPlacementState, ManualPlacement};
-    use actordb::proto::{
-        BatchAck, Envelope, EnvelopeMsg, Hello, ReconcileResponse, ReplicationAckLevel,
-    };
+    use actordb::proto::{BatchAck, Envelope, EnvelopeMsg, ReconcileResponse, ReplicationAckLevel};
     use actordb::replication::SenderConfig;
     use actordb::shard::FragmentId;
 
@@ -3541,19 +4148,7 @@ async fn placement_drain_waits_for_buffer_reset() {
     .await
     .unwrap();
     let mut stream = tokio::net::TcpStream::connect(node.addr()).await.unwrap();
-    send_frame(
-        &mut stream,
-        Envelope {
-            msg: Some(EnvelopeMsg::Hello(Hello {
-                node_id: "raw-drain-peer".to_string(),
-                auth_tag: Vec::new(),
-                min_protocol_version: WIRE_PROTOCOL_VERSION,
-                max_protocol_version: WIRE_PROTOCOL_VERSION,
-                capabilities: REQUIRED_WIRE_CAPABILITIES,
-            })),
-        },
-    )
-    .await;
+    complete_no_secret_handshake(&mut stream, "raw-drain-peer").await;
 
     common::wait_for(
         || async {
@@ -3668,9 +4263,7 @@ async fn placement_drain_waits_for_buffer_reset() {
 #[tokio::test]
 async fn placement_readd_while_draining_cancels_teardown() {
     use actordb::placement::{FragmentPlacementState, ManualPlacement};
-    use actordb::proto::{
-        BatchAck, Envelope, EnvelopeMsg, Hello, ReconcileResponse, ReplicationAckLevel,
-    };
+    use actordb::proto::{BatchAck, Envelope, EnvelopeMsg, ReconcileResponse, ReplicationAckLevel};
     use actordb::replication::SenderConfig;
     use actordb::shard::FragmentId;
 
@@ -3702,19 +4295,7 @@ async fn placement_readd_while_draining_cancels_teardown() {
     .await
     .unwrap();
     let mut stream = tokio::net::TcpStream::connect(node.addr()).await.unwrap();
-    send_frame(
-        &mut stream,
-        Envelope {
-            msg: Some(EnvelopeMsg::Hello(Hello {
-                node_id: "raw-readd-peer".to_string(),
-                auth_tag: Vec::new(),
-                min_protocol_version: WIRE_PROTOCOL_VERSION,
-                max_protocol_version: WIRE_PROTOCOL_VERSION,
-                capabilities: REQUIRED_WIRE_CAPABILITIES,
-            })),
-        },
-    )
-    .await;
+    complete_no_secret_handshake(&mut stream, "raw-readd-peer").await;
     common::wait_for(
         || async {
             node.sender_report(FragmentId(0), "raw-readd-peer")
@@ -3755,23 +4336,30 @@ async fn placement_readd_while_draining_cancels_teardown() {
         Duration::from_secs(5),
     )
     .await;
-    controller.set_placement(overlap);
+    let mut readded_stream = tokio::net::TcpStream::connect(node.addr()).await.unwrap();
+    complete_no_secret_handshake(&mut readded_stream, "raw-readded-peer").await;
+    controller.set_placement(HashMap::from([(
+        FragmentId(0),
+        vec!["readd-a".to_string(), "raw-readded-peer".to_string()],
+    )]));
     common::wait_for(
         || async {
             node.placement_report().await.states.get(&FragmentId(0))
-                == Some(&FragmentPlacementState::Serving)
+                == Some(&FragmentPlacementState::Bootstrapping)
         },
         Duration::from_secs(5),
     )
     .await;
 
     let request = loop {
-        if let Some(EnvelopeMsg::ReconcileRequest(request)) = recv_frame(&mut stream).await.msg {
+        if let Some(EnvelopeMsg::ReconcileRequest(request)) =
+            recv_frame(&mut readded_stream).await.msg
+        {
             break request;
         }
     };
     send_frame(
-        &mut stream,
+        &mut readded_stream,
         Envelope {
             msg: Some(EnvelopeMsg::ReconcileResponse(ReconcileResponse {
                 fragment: 0,
@@ -3783,14 +4371,15 @@ async fn placement_readd_while_draining_cancels_teardown() {
     )
     .await;
     let barrier = loop {
-        if let Some(EnvelopeMsg::ReplicateBatch(batch)) = recv_frame(&mut stream).await.msg {
+        if let Some(EnvelopeMsg::ReplicateBatch(batch)) = recv_frame(&mut readded_stream).await.msg
+        {
             if batch.batch_seq != u64::MAX {
                 break batch;
             }
         }
     };
     send_frame(
-        &mut stream,
+        &mut readded_stream,
         Envelope {
             msg: Some(EnvelopeMsg::BatchAck(BatchAck {
                 session_id: request.session_id,
@@ -3799,6 +4388,14 @@ async fn placement_readd_while_draining_cancels_teardown() {
                 level: ReplicationAckLevel::Applied as i32,
             })),
         },
+    )
+    .await;
+    common::wait_for(
+        || async {
+            node.placement_report().await.states.get(&FragmentId(0))
+                == Some(&FragmentPlacementState::Serving)
+        },
+        Duration::from_secs(5),
     )
     .await;
     tokio::time::sleep(Duration::from_millis(250)).await;
@@ -4006,41 +4603,220 @@ async fn shed_delete_never_acked_ok() {
     n.shutdown().await;
 }
 
-/// Regression test for adversarial review #3: a ForwardedPut arriving
-/// before any Hello (no completed handshake) must be ignored, not applied.
+#[tokio::test]
+async fn inbound_limit_sheds_excess_and_handshake_timeout_releases_capacity() {
+    let node = Node::start_with_options(
+        "bounded-handshakes".to_string(),
+        "127.0.0.1:0".parse().unwrap(),
+        NodeConfig::default(),
+        NodeRuntimeOptions::default()
+            .with_inbound_connection_capacity(1)
+            .with_handshake_timeout(Duration::from_millis(150)),
+    )
+    .await
+    .unwrap();
+
+    let mut held = tokio::net::TcpStream::connect(node.addr()).await.unwrap();
+    assert!(matches!(
+        recv_frame(&mut held).await.msg,
+        Some(EnvelopeMsg::Hello(_))
+    ));
+
+    let mut shed = tokio::net::TcpStream::connect(node.addr()).await.unwrap();
+    let mut byte = [0u8; 1];
+    let read = tokio::time::timeout(Duration::from_secs(1), shed.read(&mut byte))
+        .await
+        .expect("excess inbound connection was not shed")
+        .unwrap();
+    assert_eq!(read, 0);
+
+    let mut remainder = Vec::new();
+    tokio::time::timeout(Duration::from_secs(1), held.read_to_end(&mut remainder))
+        .await
+        .expect("silent pre-auth connection outlived its absolute deadline")
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let mut admitted = tokio::net::TcpStream::connect(node.addr()).await.unwrap();
+    complete_no_secret_handshake(&mut admitted, "admitted-after-timeout").await;
+    common::wait_for(
+        || async { node.peer_count().await == 1 },
+        Duration::from_secs(2),
+    )
+    .await;
+    node.shutdown().await;
+}
+
+#[tokio::test]
+async fn pre_auth_frames_have_a_small_cap_and_one_absolute_body_deadline() {
+    let node = Node::start_with_options(
+        "pre-auth-bounds".to_string(),
+        "127.0.0.1:0".parse().unwrap(),
+        NodeConfig::default(),
+        NodeRuntimeOptions::default().with_handshake_timeout(Duration::from_millis(150)),
+    )
+    .await
+    .unwrap();
+
+    let mut oversized = tokio::net::TcpStream::connect(node.addr()).await.unwrap();
+    assert!(matches!(
+        recv_frame(&mut oversized).await.msg,
+        Some(EnvelopeMsg::Hello(_))
+    ));
+    oversized.write_u32(4097).await.unwrap();
+    oversized.flush().await.unwrap();
+    let mut byte = [0u8; 1];
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(1), oversized.read(&mut byte))
+            .await
+            .expect("oversized pre-auth prefix did not close the socket")
+            .unwrap(),
+        0
+    );
+
+    let mut partial = tokio::net::TcpStream::connect(node.addr()).await.unwrap();
+    assert!(matches!(
+        recv_frame(&mut partial).await.msg,
+        Some(EnvelopeMsg::Hello(_))
+    ));
+    partial.write_u32(32).await.unwrap();
+    partial.write_all(&[1]).await.unwrap();
+    partial.flush().await.unwrap();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(1), partial.read(&mut byte))
+            .await
+            .expect("partial pre-auth body outlived the handshake deadline")
+            .unwrap(),
+        0
+    );
+
+    node.shutdown().await;
+}
+
+#[tokio::test]
+async fn hello_auth_second_flight_uses_the_original_handshake_deadline() {
+    let node = Node::start_with_options(
+        "second-flight-deadline".to_string(),
+        "127.0.0.1:0".parse().unwrap(),
+        NodeConfig::default(),
+        NodeRuntimeOptions::default().with_handshake_timeout(Duration::from_millis(600)),
+    )
+    .await
+    .unwrap();
+
+    let mut stream = tokio::net::TcpStream::connect(node.addr()).await.unwrap();
+    assert!(matches!(
+        recv_frame(&mut stream).await.msg,
+        Some(EnvelopeMsg::Hello(_))
+    ));
+    tokio::time::sleep(Duration::from_millis(350)).await;
+    send_frame(
+        &mut stream,
+        Envelope {
+            msg: Some(EnvelopeMsg::Hello(Hello {
+                node_id: "slow-second-flight".to_string(),
+                auth_tag: Vec::new(),
+                min_protocol_version: WIRE_PROTOCOL_VERSION,
+                max_protocol_version: WIRE_PROTOCOL_VERSION,
+                capabilities: REQUIRED_WIRE_CAPABILITIES,
+                challenge: vec![0x6b; 32],
+            })),
+        },
+    )
+    .await;
+    assert!(matches!(
+        recv_frame(&mut stream).await.msg,
+        Some(EnvelopeMsg::HelloAuth(_))
+    ));
+
+    let mut byte = [0u8; 1];
+    assert_eq!(
+        tokio::time::timeout(Duration::from_millis(450), stream.read(&mut byte))
+            .await
+            .expect("HelloAuth received a fresh handshake timeout")
+            .unwrap(),
+        0
+    );
+    assert_eq!(node.peer_count().await, 0);
+    node.shutdown().await;
+}
+
+#[tokio::test]
+async fn established_idle_is_allowed_but_partial_frame_body_times_out() {
+    let node = Node::start_with_options(
+        "established-read-timeout".to_string(),
+        "127.0.0.1:0".parse().unwrap(),
+        NodeConfig::default(),
+        NodeRuntimeOptions::default().with_socket_read_timeout(Duration::from_millis(100)),
+    )
+    .await
+    .unwrap();
+    let mut stream = tokio::net::TcpStream::connect(node.addr()).await.unwrap();
+    complete_no_secret_handshake(&mut stream, "partial-frame-peer").await;
+    common::wait_for(
+        || async { node.peer_count().await == 1 },
+        Duration::from_secs(2),
+    )
+    .await;
+
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    assert_eq!(node.peer_count().await, 1, "idle peer hit a prefix timeout");
+
+    stream.write_u32(32).await.unwrap();
+    stream.write_all(&[1]).await.unwrap();
+    stream.flush().await.unwrap();
+    let mut remainder = Vec::new();
+    tokio::time::timeout(Duration::from_secs(1), stream.read_to_end(&mut remainder))
+        .await
+        .expect("partial established frame body outlived its read deadline")
+        .unwrap();
+    common::wait_for(
+        || async { node.peer_count().await == 0 },
+        Duration::from_secs(2),
+    )
+    .await;
+    node.shutdown().await;
+}
+
+/// A ForwardedPut arriving before the mutual handshake completes must close
+/// the socket and must never be applied.
 #[tokio::test]
 async fn pre_handshake_forwarded_put_ignored() {
     use actordb::proto::{Envelope, EnvelopeMsg, ForwardedPut};
-    use tokio::io::AsyncWriteExt;
 
     let a = test_node("a").await;
 
-    // Raw TCP, no Hello: send a ForwardedPut directly.
+    // Consume the server's eager Hello, but do not answer it.
     let mut stream = tokio::net::TcpStream::connect(a.addr()).await.unwrap();
-    let mut buf = Vec::new();
-    Envelope {
-        msg: Some(EnvelopeMsg::ForwardedPut(ForwardedPut {
-            key: "evil".to_string(),
-            value: b"evil-val".to_vec(),
-            timestamp_ms: 1,
-            node_id: "attacker".to_string(),
-            expires_at_ms: 0,
-            is_tombstone: false,
-            seq: 0,
-            boot_id: 0,
-            priority: 0, // PRIORITY_DEFAULT
-            hops: 0,
-            req_id: 1,
-        })),
-    }
-    .encode(&mut buf)
-    .unwrap();
-    stream.write_u32(buf.len() as u32).await.unwrap();
-    stream.write_all(&buf).await.unwrap();
+    assert!(matches!(
+        recv_frame(&mut stream).await.msg,
+        Some(EnvelopeMsg::Hello(_))
+    ));
+    send_frame(
+        &mut stream,
+        Envelope {
+            msg: Some(EnvelopeMsg::ForwardedPut(ForwardedPut {
+                key: "evil".to_string(),
+                value: b"evil-val".to_vec(),
+                timestamp_ms: 1,
+                node_id: "attacker".to_string(),
+                expires_at_ms: 0,
+                is_tombstone: false,
+                seq: 0,
+                boot_id: 0,
+                priority: 0,
+                hops: 0,
+                req_id: 1,
+            })),
+        },
+    )
+    .await;
+    let mut remainder = Vec::new();
+    tokio::time::timeout(Duration::from_secs(1), stream.read_to_end(&mut remainder))
+        .await
+        .expect("pre-auth application frame did not close the socket")
+        .unwrap();
 
-    tokio::time::sleep(Duration::from_millis(300)).await;
-
-    // The key must not exist: the pre-handshake write was dropped.
     let got = a.get("evil".to_string()).await.unwrap();
     assert!(
         got.is_none(),
@@ -4050,36 +4826,50 @@ async fn pre_handshake_forwarded_put_ignored() {
     a.shutdown().await;
 }
 
-/// Regression test for adversarial review #3: with a cluster secret
-/// configured, a Hello with a bad auth tag must drop the connection.
+/// With a cluster secret configured, a valid Hello followed by an invalid
+/// challenge-bound proof must drop the connection before peer publication.
 #[tokio::test]
 async fn hello_auth_mismatch_drops_connection() {
-    use actordb::proto::{Envelope, EnvelopeMsg, Hello};
-
     let config = NodeConfig {
-        cluster_secret: Some(b"correct-secret".to_vec()),
+        cluster_secret: Some(vec![0x91; 32]),
         ..NodeConfig::default()
     };
     let a = Node::start("a".to_string(), "127.0.0.1:0".parse().unwrap(), config)
         .await
         .unwrap();
 
-    // Wrong secret: HMAC won't verify.
     let mut stream = tokio::net::TcpStream::connect(a.addr()).await.unwrap();
-    let mut buf = Vec::new();
-    Envelope {
-        msg: Some(EnvelopeMsg::Hello(Hello {
-            node_id: "b".to_string(),
-            auth_tag: b"wrong-tag".to_vec(),
-            min_protocol_version: WIRE_PROTOCOL_VERSION,
-            max_protocol_version: WIRE_PROTOCOL_VERSION,
-            capabilities: REQUIRED_WIRE_CAPABILITIES,
-        })),
-    }
-    .encode(&mut buf)
-    .unwrap();
-    stream.write_u32(buf.len() as u32).await.unwrap();
-    stream.write_all(&buf).await.unwrap();
+    assert!(matches!(
+        recv_frame(&mut stream).await.msg,
+        Some(EnvelopeMsg::Hello(_))
+    ));
+    send_frame(
+        &mut stream,
+        Envelope {
+            msg: Some(EnvelopeMsg::Hello(Hello {
+                node_id: "b".to_string(),
+                auth_tag: Vec::new(),
+                min_protocol_version: WIRE_PROTOCOL_VERSION,
+                max_protocol_version: WIRE_PROTOCOL_VERSION,
+                capabilities: REQUIRED_WIRE_CAPABILITIES,
+                challenge: vec![0x6b; 32],
+            })),
+        },
+    )
+    .await;
+    assert!(matches!(
+        recv_frame(&mut stream).await.msg,
+        Some(EnvelopeMsg::HelloAuth(HelloAuth { auth_tag })) if auth_tag.len() == 32
+    ));
+    send_frame(
+        &mut stream,
+        Envelope {
+            msg: Some(EnvelopeMsg::HelloAuth(HelloAuth {
+                auth_tag: vec![0; 32],
+            })),
+        },
+    )
+    .await;
 
     // The server must close the connection: read returns 0 (EOF).
     let mut read_buf = [0u8; 16];
@@ -4119,6 +4909,10 @@ async fn incompatible_hello_capabilities_are_rejected() {
     ];
     for hello in incompatible {
         let mut stream = tokio::net::TcpStream::connect(node.addr()).await.unwrap();
+        assert!(matches!(
+            recv_frame(&mut stream).await.msg,
+            Some(EnvelopeMsg::Hello(_))
+        ));
         send_frame(
             &mut stream,
             Envelope {
@@ -4141,25 +4935,27 @@ async fn incompatible_hello_capabilities_are_rejected() {
 /// node_id must be rejected.
 #[tokio::test]
 async fn hello_claiming_self_id_rejected() {
-    use actordb::proto::{Envelope, EnvelopeMsg, Hello};
-
     let a = test_node("a").await;
 
     let mut stream = tokio::net::TcpStream::connect(a.addr()).await.unwrap();
-    let mut buf = Vec::new();
-    Envelope {
-        msg: Some(EnvelopeMsg::Hello(Hello {
-            node_id: "a".to_string(), // our own id!
-            auth_tag: Vec::new(),
-            min_protocol_version: WIRE_PROTOCOL_VERSION,
-            max_protocol_version: WIRE_PROTOCOL_VERSION,
-            capabilities: REQUIRED_WIRE_CAPABILITIES,
-        })),
-    }
-    .encode(&mut buf)
-    .unwrap();
-    stream.write_u32(buf.len() as u32).await.unwrap();
-    stream.write_all(&buf).await.unwrap();
+    assert!(matches!(
+        recv_frame(&mut stream).await.msg,
+        Some(EnvelopeMsg::Hello(_))
+    ));
+    send_frame(
+        &mut stream,
+        Envelope {
+            msg: Some(EnvelopeMsg::Hello(Hello {
+                node_id: "a".to_string(), // our own id!
+                auth_tag: Vec::new(),
+                min_protocol_version: WIRE_PROTOCOL_VERSION,
+                max_protocol_version: WIRE_PROTOCOL_VERSION,
+                capabilities: REQUIRED_WIRE_CAPABILITIES,
+                challenge: vec![0x7c; 32],
+            })),
+        },
+    )
+    .await;
 
     let mut read_buf = [0u8; 16];
     let n = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut read_buf))
@@ -4176,27 +4972,28 @@ async fn hello_claiming_self_id_rejected() {
 /// sender session while leaving stale peer-map entries behind.
 #[tokio::test]
 async fn second_hello_closes_established_connection() {
-    use actordb::proto::{Envelope, EnvelopeMsg, Hello};
-
     let node = test_node("hello-server").await;
     let mut stream = tokio::net::TcpStream::connect(node.addr()).await.unwrap();
-    for peer in ["first-peer", "second-peer"] {
-        let mut encoded = Vec::new();
+    complete_no_secret_handshake(&mut stream, "first-peer").await;
+    common::wait_for(
+        || async { node.peer_count().await == 1 },
+        Duration::from_secs(5),
+    )
+    .await;
+    send_frame(
+        &mut stream,
         Envelope {
             msg: Some(EnvelopeMsg::Hello(Hello {
-                node_id: peer.to_string(),
+                node_id: "second-peer".to_string(),
                 auth_tag: Vec::new(),
                 min_protocol_version: WIRE_PROTOCOL_VERSION,
                 max_protocol_version: WIRE_PROTOCOL_VERSION,
                 capabilities: REQUIRED_WIRE_CAPABILITIES,
+                challenge: vec![0x8d; 32],
             })),
-        }
-        .encode(&mut encoded)
-        .unwrap();
-        stream.write_u32(encoded.len() as u32).await.unwrap();
-        stream.write_all(&encoded).await.unwrap();
-    }
-    stream.flush().await.unwrap();
+        },
+    )
+    .await;
 
     let mut remainder = Vec::new();
     tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut remainder))
@@ -4218,8 +5015,7 @@ async fn second_hello_closes_established_connection() {
 #[tokio::test]
 async fn same_session_replay_does_not_clear_reconcile_failure() {
     use actordb::proto::{
-        Envelope, EnvelopeMsg, Hello, ReplicateBatch, ReplicateOp, ReplicationAckLevel,
-        SessionStart,
+        Envelope, EnvelopeMsg, ReplicateBatch, ReplicateOp, ReplicationAckLevel, SessionStart,
     };
 
     let node = Node::start(
@@ -4236,19 +5032,7 @@ async fn same_session_replay_does_not_clear_reconcile_failure() {
     .await
     .unwrap();
     let mut stream = tokio::net::TcpStream::connect(node.addr()).await.unwrap();
-    send_frame(
-        &mut stream,
-        Envelope {
-            msg: Some(EnvelopeMsg::Hello(Hello {
-                node_id: "raw-poison-sender".to_string(),
-                auth_tag: Vec::new(),
-                min_protocol_version: WIRE_PROTOCOL_VERSION,
-                max_protocol_version: WIRE_PROTOCOL_VERSION,
-                capabilities: REQUIRED_WIRE_CAPABILITIES,
-            })),
-        },
-    )
-    .await;
+    complete_no_secret_handshake(&mut stream, "raw-poison-sender").await;
 
     let session_id = 77;
     let start = || Envelope {
@@ -4312,7 +5096,7 @@ async fn same_session_replay_does_not_clear_reconcile_failure() {
 /// handshake and replicate.
 #[tokio::test]
 async fn cluster_secret_handshake_succeeds() {
-    let secret = b"shared-secret".to_vec();
+    let secret = vec![0xa5; 32];
     let config_a = NodeConfig {
         cluster_secret: Some(secret.clone()),
         ..NodeConfig::default()
@@ -4611,7 +5395,7 @@ async fn replication_rejects_an_ack_below_the_configured_durability() {
 /// harmless even when the new session reuses the same batch sequence number.
 #[tokio::test]
 async fn ordinary_ack_timeout_rotates_session_and_replays_exact_batch() {
-    use actordb::proto::{BatchAck, EnvelopeMsg, Hello, ReplicationAckLevel};
+    use actordb::proto::{BatchAck, EnvelopeMsg, ReplicationAckLevel};
     use actordb::replication::{ReplicationAckDurability, SenderConfig};
     use actordb::shard::FragmentId;
 
@@ -4647,19 +5431,7 @@ async fn ordinary_ack_timeout_rotates_session_and_replays_exact_batch() {
     .unwrap();
 
     let mut stream = tokio::net::TcpStream::connect(node.addr()).await.unwrap();
-    send_frame(
-        &mut stream,
-        Envelope {
-            msg: Some(EnvelopeMsg::Hello(Hello {
-                node_id: "raw-ack-timeout-peer".to_string(),
-                auth_tag: Vec::new(),
-                min_protocol_version: WIRE_PROTOCOL_VERSION,
-                max_protocol_version: WIRE_PROTOCOL_VERSION,
-                capabilities: REQUIRED_WIRE_CAPABILITIES,
-            })),
-        },
-    )
-    .await;
+    complete_no_secret_handshake(&mut stream, "raw-ack-timeout-peer").await;
     let initial_session = loop {
         if let Some(EnvelopeMsg::SessionStart(session)) = recv_frame(&mut stream).await.msg {
             break session.session_id;
@@ -4763,7 +5535,7 @@ async fn ordinary_ack_timeout_rotates_session_and_replays_exact_batch() {
 /// replayed when that older deadline rotates the session.
 #[tokio::test]
 async fn older_batch_timeout_replays_only_the_unacknowledged_batch() {
-    use actordb::proto::{BatchAck, EnvelopeMsg, Hello, ReplicationAckLevel};
+    use actordb::proto::{BatchAck, EnvelopeMsg, ReplicationAckLevel};
     use actordb::replication::{ReplicationAckDurability, SenderConfig};
     use actordb::shard::FragmentId;
 
@@ -4799,19 +5571,7 @@ async fn older_batch_timeout_replays_only_the_unacknowledged_batch() {
     .unwrap();
 
     let mut stream = tokio::net::TcpStream::connect(node.addr()).await.unwrap();
-    send_frame(
-        &mut stream,
-        Envelope {
-            msg: Some(EnvelopeMsg::Hello(Hello {
-                node_id: "raw-out-of-order-ack-peer".to_string(),
-                auth_tag: Vec::new(),
-                min_protocol_version: WIRE_PROTOCOL_VERSION,
-                max_protocol_version: WIRE_PROTOCOL_VERSION,
-                capabilities: REQUIRED_WIRE_CAPABILITIES,
-            })),
-        },
-    )
-    .await;
+    complete_no_secret_handshake(&mut stream, "raw-out-of-order-ack-peer").await;
     let initial_session = loop {
         if let Some(EnvelopeMsg::SessionStart(session)) = recv_frame(&mut stream).await.msg {
             break session.session_id;
@@ -4931,7 +5691,7 @@ async fn older_batch_timeout_replays_only_the_unacknowledged_batch() {
 /// same fail-closed session rotation and exact replay as a missing ACK.
 #[tokio::test]
 async fn weak_ack_does_not_prevent_timeout_and_exact_replay() {
-    use actordb::proto::{BatchAck, EnvelopeMsg, Hello, ReplicationAckLevel};
+    use actordb::proto::{BatchAck, EnvelopeMsg, ReplicationAckLevel};
     use actordb::replication::{ReplicationAckDurability, SenderConfig};
     use actordb::shard::FragmentId;
 
@@ -4967,19 +5727,7 @@ async fn weak_ack_does_not_prevent_timeout_and_exact_replay() {
     .unwrap();
 
     let mut stream = tokio::net::TcpStream::connect(node.addr()).await.unwrap();
-    send_frame(
-        &mut stream,
-        Envelope {
-            msg: Some(EnvelopeMsg::Hello(Hello {
-                node_id: "raw-weak-ack-peer".to_string(),
-                auth_tag: Vec::new(),
-                min_protocol_version: WIRE_PROTOCOL_VERSION,
-                max_protocol_version: WIRE_PROTOCOL_VERSION,
-                capabilities: REQUIRED_WIRE_CAPABILITIES,
-            })),
-        },
-    )
-    .await;
+    complete_no_secret_handshake(&mut stream, "raw-weak-ack-peer").await;
     let initial_session = loop {
         if let Some(EnvelopeMsg::SessionStart(session)) = recv_frame(&mut stream).await.msg {
             break session.session_id;
@@ -5238,7 +5986,7 @@ async fn failed_reconcile_repair_cannot_be_hidden_by_barrier_ack() {
 #[tokio::test]
 async fn fetched_reconcile_value_retries_failed_local_store_fence() {
     use actordb::proto::{
-        BatchAck, Envelope, EnvelopeMsg, Hello, KeySummary, ReconcileData, ReconcileResponse,
+        BatchAck, Envelope, EnvelopeMsg, KeySummary, ReconcileData, ReconcileResponse,
         ReplicationAckLevel, SyncEntry,
     };
     use actordb::replication::{ReplicationAckDurability, SenderConfig};
@@ -5274,19 +6022,7 @@ async fn fetched_reconcile_value_retries_failed_local_store_fence() {
     .await
     .unwrap();
     let mut stream = tokio::net::TcpStream::connect(node.addr()).await.unwrap();
-    send_frame(
-        &mut stream,
-        Envelope {
-            msg: Some(EnvelopeMsg::Hello(Hello {
-                node_id: "raw-fetch-peer".to_string(),
-                auth_tag: Vec::new(),
-                min_protocol_version: WIRE_PROTOCOL_VERSION,
-                max_protocol_version: WIRE_PROTOCOL_VERSION,
-                capabilities: REQUIRED_WIRE_CAPABILITIES,
-            })),
-        },
-    )
-    .await;
+    complete_no_secret_handshake(&mut stream, "raw-fetch-peer").await;
     loop {
         if matches!(
             recv_frame(&mut stream).await.msg,

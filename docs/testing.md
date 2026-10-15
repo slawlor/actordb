@@ -14,6 +14,9 @@ integration tests rely on.
 Bounded replication-ingress unit tests additionally pin that a full mutation
 lane publishes a persistent reset generation, that the independent control
 lane fails fast at its cap, and that peer/reconcile signals remain available.
+`retiring_reconcile_consumer_does_not_close_shared_connection` forces both
+reconcile reply variants to race sender retirement after control-lane admission
+and proves the multiplexed peer connection remains usable.
 The placement lease test proves revocation waits for an already-admitted
 mutation before changing the serving decision.
 
@@ -40,6 +43,7 @@ process — the bulk of behavioral coverage:
 - **Replication internals**: `sender_buffer_reset_and_reconcile`,
   `live_connected_overflow_reconciles_without_reconnect`,
   `stale_session_batches_discarded`,
+  `session_started_before_actor_installation_survives_placement_race`,
   `stale_reconcile_round_cannot_complete_live_reset`,
   `malformed_reconcile_data_is_rejected_and_retried`,
   `same_session_replay_does_not_clear_reconcile_failure`,

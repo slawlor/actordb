@@ -17,8 +17,11 @@ async fn main() -> Result<(), actordb::node::NodeError> {
     let node = Node::start("node-a".to_string(), "127.0.0.1:7447".parse::<SocketAddr>()?, config).await?;
     println!("listening on {}", node.addr());
 
-    // Form the peer mesh (best-effort; a redial supervisor keeps it alive).
+    // Form the peer mesh; Ok means a Node-owned redial supervisor now owns
+    // the successful initial transport (authentication remains asynchronous).
     node.connect("127.0.0.1:7448".parse::<SocketAddr>()?).await?;
+    // First stop admitting work and await application operation tasks.
+    node.shutdown().await;
     Ok(())
 }
 ```
@@ -37,8 +40,12 @@ async fn main() -> Result<(), actordb::node::NodeError> {
   let runtime = NodeRuntimeOptions::default()
       .with_peer_queue_frame_capacity(512)
       .with_replication_control_message_capacity(128)
+      .with_inbound_connection_capacity(512)
       .with_queue_admission_timeout(Duration::from_secs(2))
       .with_forwarded_attempt_timeout(Duration::from_secs(8))
+      .with_connect_timeout(Duration::from_secs(3))
+      .with_handshake_timeout(Duration::from_secs(3))
+      .with_socket_read_timeout(Duration::from_secs(20))
       .with_socket_write_timeout(Duration::from_secs(20))
       .with_replication_ack_timeout(Duration::from_secs(20));
   let node = Node::start_with_options(
@@ -51,18 +58,47 @@ async fn main() -> Result<(), actordb::node::NodeError> {
   ```
 
   Defaults are 256 queued frames per peer, 64 protocol-control messages per
-  fragment/peer sender, 5 seconds for queue admission, 5 seconds total per
-  forwarded owner attempt (enqueue plus response), 30 seconds per socket frame
-  write, and 30 seconds for an acceptable ordinary replication ACK. Locally
-  applied mutations have a separate lane sized by
-  `SenderConfig::buffer_capacity`. All capacities/timeouts must be nonzero.
-  These are count bounds, not byte bounds.
-- `node.connect(peer_addr)` dials one peer. Dialing is best-effort and
-  retried by the redial supervisor; dropping a connection triggers redial.
+  fragment/peer sender, and 1024 concurrent inbound connections. Queue
+  admission, a forwarded owner attempt, a dial, and the complete two-flight
+  handshake each default to 5 seconds. Frame-body reads after a prefix, complete
+  frame writes, and acceptable ordinary replication ACKs each default to 30
+  seconds. Idle established connections have no read deadline until a prefix
+  arrives. Locally applied mutations have a separate lane sized by
+  `SenderConfig::buffer_capacity`. All capacities/timeouts must be nonzero;
+  capacities are item counts, not byte bounds.
+- `node.connect(peer_addr)` tries the first transport dial once and returns an
+  error if it cannot connect within the dial deadline. `Ok` means the successful
+  stream has been handed to a Node-owned redial supervisor, not that
+  authentication or static full-state sync has completed. Concurrent calls for
+  the same address wait for that pending initial dial and do not return early
+  merely because a dial is in progress. On success they share the active
+  supervisor; after an initial failure, a waiter may reserve and make the next
+  attempt. After the first successful authentication, the supervisor pins that
+  node id, rejects any different claimant at the address on later reconnects,
+  and retries transport or protocol failures with bounded exponential backoff.
+- Entries in `NodeConfig::members` are persistent dial intents from startup,
+  including when the first attempt fails. Their configured node ids are known
+  before the first connection attempt and checked against the first and every
+  later Hello; a mismatched claimant is never installed. If both
+  nodes dial at once, a transcript-derived election makes both endpoints keep
+  the same physical connection and parks the duplicate dialer while it is live.
+- The local node id, every `members` key, and every placement replica id must
+  contain 1 to 255 UTF-8 bytes. Every dynamic map and every non-empty static map
+  must contain exactly the fragments in `0..fragment_count` and use non-empty,
+  duplicate-free replica lists. An empty static map is the legacy
+  full-replication mode.
 - `node.id()`, `node.addr()`, `node.peer_count()` are the basic inspectors.
-- `node.shutdown().await` aborts connection tasks, stops Node-owned replication
-  sender tasks, and stops each fragment supervisor (each dispatcher drains its
-  pools and flushes the store, releasing the RocksDB lock).
+- `node.shutdown().await` closes Node-owned task admission, aborts and joins the
+  listener, connection, writer, dial, timer, and placement tasks, stops
+  replication senders, then stops and joins each fragment supervisor. Each
+  dispatcher drains its pools and flushes the store, releasing the RocksDB lock.
+  The method is idempotent and a cancelled waiter can call it again.
+
+`shutdown` owns Node background work, but it is not a fence around arbitrary
+public API futures already running in application tasks. Stop admitting calls
+and await those tasks before shutdown. Merely dropping a `Node` requests
+best-effort transport cancellation and actor stop, but cannot await a durable
+flush, task join, or RocksDB lock release.
 
 ## Single-key operations
 

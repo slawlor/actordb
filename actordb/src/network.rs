@@ -10,6 +10,21 @@
 //! operates on those streams generically. The default is [`TcpNetwork`](crate::network::TcpNetwork)
 //! (plain TCP); implement [`Network`](crate::network::Network) to run the mesh over TLS, a
 //! Meta-internal transport, or anything else that moves bytes.
+//!
+//! # Cancellation and resource ownership
+//!
+//! Node startup, deadlines, and shutdown may drop a pending
+//! [`Network::bind`](crate::network::Network::bind),
+//! [`Network::connect`](crate::network::Network::connect), or
+//! [`Acceptor::accept`](crate::network::Acceptor::accept) future.
+//! Implementations must be cancellation-safe: dropping one of these futures
+//! must cancel that operation and release any partially acquired transport
+//! resources rather than detach background work. Dropping an
+//! [`Acceptor`](crate::network::Acceptor) must release its listener, and
+//! dropping a [`BoxStream`](crate::network::BoxStream) must release the
+//! connection. This is how
+//! [`Node::shutdown`](crate::node::Node::shutdown) can join all Node-owned
+//! transport work without knowing the concrete transport.
 
 use std::fmt;
 use std::future::Future;
@@ -22,7 +37,9 @@ use tokio::net::{TcpListener, TcpStream};
 /// A connected peer: any async bidirectional byte stream.
 ///
 /// Blanket-implemented for all suitable types, so a `TcpStream`, a
-/// TLS stream, or any future transport plugs in unchanged.
+/// TLS stream, or any future transport plugs in unchanged. Dropping the stream
+/// must close or otherwise release the underlying connection; Node shutdown
+/// relies on this ownership boundary.
 pub trait PeerStream: AsyncRead + AsyncWrite + Send + Unpin + 'static {}
 impl<T: AsyncRead + AsyncWrite + Send + Unpin + 'static> PeerStream for T {}
 
@@ -61,8 +78,15 @@ impl From<std::io::Error> for NetworkError {
 }
 
 /// Accepts inbound peer connections. Returned by [`Network::bind`].
+///
+/// Dropping the acceptor must release the listening resource. A pending
+/// [`accept`](Acceptor::accept) future may be dropped during Node shutdown and
+/// must not leave a detached accept operation behind.
 pub trait Acceptor: Send + 'static {
     /// Accept the next inbound connection.
+    ///
+    /// This future must be cancellation-safe: dropping it cancels the pending
+    /// accept without leaking a socket, task, or other transport resource.
     fn accept(&mut self) -> AcceptFuture<'_>;
 }
 
@@ -74,9 +98,16 @@ pub trait Acceptor: Send + 'static {
 pub trait Network: Send + Sync + 'static {
     /// Bind `addr` (port 0 picks an ephemeral port). Returns the bound
     /// address and an acceptor for inbound connections.
+    ///
+    /// This future may be dropped when Node startup is cancelled. Dropping it
+    /// must release any partially created listener or background work.
     fn bind(&self, addr: SocketAddr) -> BindFuture<'_>;
 
     /// Dial a peer.
+    ///
+    /// Node dial deadlines and shutdown drop this future to cancel the attempt.
+    /// An implementation must therefore release partial connections and must
+    /// not leave a detached dial task running after the future is dropped.
     fn connect(&self, addr: SocketAddr) -> ConnectFuture<'_>;
 }
 
