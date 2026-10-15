@@ -153,19 +153,25 @@ keys against the captured transcript and HMAC.
 
 ### Graceful shutdown
 
-Stop admitting application operations and await their futures before calling
-`node.shutdown().await`. Shutdown closes internal task admission, aborts and
-joins listener, connection, writer, dial, relay-timer, and placement work,
-releases pending network waiters, stops replication senders, and finally stops
-and joins fragment supervisors so their pools drain and stores flush. It is
-idempotent, and a cancelled shutdown waiter may call it again.
+Call `node.shutdown().await` and handle its `Result`. The first call atomically
+closes public-operation admission; later data calls receive
+`NodeError::ShuttingDown`. Shutdown aborts and joins listener, connection,
+writer, dial, relay-timer, and placement work, releases pending network
+waiters, waits for calls admitted before the fence, and stops replication
+senders. It then closes periodic fragment producers, drains dispatchers and
+worker mailboxes, materializes TTL expirations, and flushes every local store
+before stopping any fragment supervisor.
 
-The lifecycle fence covers Node-owned background tasks; it does not
-automatically wait for arbitrary `put`, `get`, batch, health, or other Node
-futures running in caller-owned tasks. Dropping `Node` requests best-effort
-cancellation and actor stop only. Because `Drop` cannot await, it is not a
-substitute for shutdown when durable flush, task join, or prompt RocksDB lock
-release matters.
+A store failure returns `NodeError::Storage` without destroying the quiesced
+fragment or its retryable batch. The node remains one-way quiescing and admits
+no new work; call `shutdown` again after storage recovers. A cancelled waiter
+may also retry, and a successful/repeated call is idempotent. This is a local
+durability fence, not a replication-convergence fence: current shutdown stops
+senders without waiting for peer ACKs. Transport cancellation can also drop an
+inbound mutation response after that mutation applied locally, so peers and
+clients must retry stamped/idempotent requests after disconnect. Dropping
+`Node` remains best effort and cannot await or report flush, join, or RocksDB
+lock-release outcomes.
 
 ### Overloaded node (backpressure)
 

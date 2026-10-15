@@ -311,7 +311,7 @@ async fn replicate_writer(
     ctx.log("WRITER_DONE: letting gossip settle before exit");
     // let gossip settle before this container exits
     tokio::time::sleep(Duration::from_secs(5)).await;
-    ctx.node.shutdown().await;
+    ctx.node.shutdown().await.unwrap();
     ctx.log(&format!("done in {:.1}s", ctx.elapsed()));
     Ok(())
 }
@@ -356,7 +356,7 @@ async fn replicate_reader(
     )
     .await?;
     ctx.log("READER_OK");
-    ctx.node.shutdown().await;
+    ctx.node.shutdown().await.unwrap();
     ctx.log(&format!("done in {:.1}s", ctx.elapsed()));
     Ok(())
 }
@@ -396,7 +396,7 @@ async fn restart_crashing(
         // Sleep long enough for the scenario timeout, then exit.
         ctx.log("staying up for readers (60s)");
         tokio::time::sleep(Duration::from_secs(60)).await;
-        ctx.node.shutdown().await;
+        ctx.node.shutdown().await.unwrap();
         ctx.log(&format!("done in {:.1}s", ctx.elapsed()));
         return Ok(());
     }
@@ -451,7 +451,7 @@ async fn restart_survivor(
     ctx.log("PEER_RETURNED: letting post-restart sync settle");
     // let the rebooted node's handshake sync settle before we exit
     tokio::time::sleep(Duration::from_secs(10)).await;
-    ctx.node.shutdown().await;
+    ctx.node.shutdown().await.unwrap();
     ctx.log(&format!("done in {:.1}s", ctx.elapsed()));
     Ok(())
 }

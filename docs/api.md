@@ -20,8 +20,7 @@ async fn main() -> Result<(), actordb::node::NodeError> {
     // Form the peer mesh; Ok means a Node-owned redial supervisor now owns
     // the successful initial transport (authentication remains asynchronous).
     node.connect("127.0.0.1:7448".parse::<SocketAddr>()?).await?;
-    // First stop admitting work and await application operation tasks.
-    node.shutdown().await;
+    node.shutdown().await?;
     Ok(())
 }
 ```
@@ -95,17 +94,28 @@ async fn main() -> Result<(), actordb::node::NodeError> {
   duplicate-free replica lists. An empty static map is the legacy
   full-replication mode.
 - `node.id()`, `node.addr()`, `node.peer_count()` are the basic inspectors.
-- `node.shutdown().await` closes Node-owned task admission, aborts and joins the
-  listener, connection, writer, dial, timer, and placement tasks, stops
-  replication senders, then stops and joins each fragment supervisor. Each
-  dispatcher drains its pools and flushes the store, releasing the RocksDB lock.
-  The method is idempotent and a cancelled waiter can call it again.
+- `node.shutdown().await` is a fallible, one-way lifecycle fence. It rejects
+  later public data operations with `NodeError::ShuttingDown`, aborts and joins
+  listener, connection, writer, dial, timer, and placement tasks, wakes
+  admitted remote requests, waits for admitted API work, then stops replication
+  senders. Every fragment closes cleaner/snapshotter admission, drains its
+  dispatcher and worker mailboxes, materializes expired values, and reports its
+  final local-store flush before any supervisor state is destroyed.
+- If a final flush fails, `shutdown` returns `NodeError::Storage`, retains the
+  quiesced state and persistence batch, and admits no new work. Call
+  `shutdown` again to retry. Successful and repeated calls are idempotent; a
+  cancelled waiter can also call it again.
 
-`shutdown` owns Node background work, but it is not a fence around arbitrary
-public API futures already running in application tasks. Stop admitting calls
-and await those tasks before shutdown. Merely dropping a `Node` requests
-best-effort transport cancellation and actor stop, but cannot await a durable
-flush, task join, or RocksDB lock release.
+This pre-release lifecycle hardening is source-breaking: `shutdown` now returns
+`Result<(), NodeError>`, `NodeError` includes `ShuttingDown`, and the advanced
+public `SupervisorMessage` enum includes `Quiesce`. Update ignored shutdown
+calls and exhaustive matches when upgrading.
+
+`shutdown` fences public Node data calls, but transport tasks are currently
+cancelled rather than convergence-drained: it does not wait for peer
+replication ACKs. Merely dropping a `Node` requests best-effort transport
+cancellation and actor stop, but cannot await or report a durable flush, task
+join, or RocksDB lock release.
 
 ## Single-key operations
 
@@ -267,9 +277,10 @@ pub enum NodeError {
     Actor(String),             // misconfiguration, timeouts talking to actors
     Network(String),           // no peer / no replica reachable
     Backpressure(String),      // shed by queue cap or rate limit — retry with backoff
-    Storage(String),           // persistence failed during apply
+    Storage(String),           // persistence failed during apply or shutdown flush
     Superseded { .. },         // another LWW version won; this write was not applied
     Expired,                   // TTL elapsed; its expiry tombstone was installed
+    ShuttingDown,              // this Node no longer admits database operations
 }
 ```
 

@@ -22,11 +22,15 @@
 //! idempotent and commutative, replicas converge without coordination.
 
 use std::collections::{BTreeSet, HashMap};
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use futures::FutureExt;
 use ractor::rpc::CallResult;
-use ractor::{Actor, ActorCell, ActorProcessingErr, ActorRef, RpcReplyPort, SupervisionEvent};
+use ractor::{
+    Actor, ActorCell, ActorProcessingErr, ActorRef, ActorStatus, RpcReplyPort, SupervisionEvent,
+};
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::{Mutex, RwLock};
 
@@ -1030,6 +1034,38 @@ pub fn worker_idx(key: &str, worker_count: usize) -> usize {
 /// (health checks, restarts) will build on.
 /// A pool of workers with explicit backpressure: bounded queue,
 /// token-bucket rate limiting, and counted sheds (never silent).
+#[derive(Default)]
+struct WorkerStartupChildren {
+    cells: Vec<ActorCell>,
+}
+
+impl WorkerStartupChildren {
+    fn track(&mut self, cell: ActorCell) {
+        self.cells.push(cell);
+    }
+
+    async fn rollback(&mut self) {
+        for cell in &self.cells {
+            let _ = cell.drain();
+        }
+        for cell in self.cells.drain(..) {
+            let _ = cell.wait(None).await;
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.cells.clear();
+    }
+}
+
+impl Drop for WorkerStartupChildren {
+    fn drop(&mut self) {
+        for cell in &self.cells {
+            let _ = cell.drain();
+        }
+    }
+}
+
 pub struct WorkerPool {
     workers: Vec<ActorRef<KvMessage>>,
     config: PoolConfig,
@@ -1053,20 +1089,38 @@ impl WorkerPool {
         let worker_count = config.workers.max(1);
         let pending = Arc::new(AtomicU64::new(0));
         let mut workers = Vec::with_capacity(worker_count);
-        for slot in 0..worker_count {
-            let name = format!("{worker_prefix}-worker-{slot}");
-            let (worker, _handle) = KvWorker::spawn_linked(
-                Some(name),
-                KvWorker,
-                KvWorkerArgs {
-                    shared: shared.clone(),
-                    pending: Some(pending.clone()),
-                },
-                supervisor.clone(),
-            )
-            .await
-            .map_err(|e| ActorProcessingErr::from(e.to_string()))?;
-            workers.push(worker);
+        let mut startup_children = WorkerStartupChildren::default();
+        let startup = AssertUnwindSafe(async {
+            for slot in 0..worker_count {
+                let name = format!("{worker_prefix}-worker-{slot}");
+                let (worker, _handle) = KvWorker::spawn_linked(
+                    Some(name),
+                    KvWorker,
+                    KvWorkerArgs {
+                        shared: shared.clone(),
+                        pending: Some(pending.clone()),
+                    },
+                    supervisor.clone(),
+                )
+                .await
+                .map_err(|e| ActorProcessingErr::from(e.to_string()))?;
+                startup_children.track(worker.get_cell());
+                workers.push(worker);
+            }
+            Ok::<(), ActorProcessingErr>(())
+        })
+        .catch_unwind()
+        .await;
+        match startup {
+            Ok(Ok(())) => startup_children.disarm(),
+            Ok(Err(error)) => {
+                startup_children.rollback().await;
+                return Err(error);
+            }
+            Err(panic) => {
+                startup_children.rollback().await;
+                std::panic::resume_unwind(panic);
+            }
         }
         Ok(Self {
             workers,
@@ -1088,18 +1142,36 @@ impl WorkerPool {
         // through `spawn_linked` so the dispatcher restarts dead workers.
         let worker_count = config.workers.max(1);
         let mut workers = Vec::with_capacity(worker_count);
-        for _ in 0..worker_count {
-            let (worker, _handle) = KvWorker::spawn(
-                None,
-                KvWorker,
-                KvWorkerArgs {
-                    shared: shared.clone(),
-                    pending: None,
-                },
-            )
-            .await
-            .map_err(|e| ActorProcessingErr::from(e.to_string()))?;
-            workers.push(worker);
+        let mut startup_children = WorkerStartupChildren::default();
+        let startup = AssertUnwindSafe(async {
+            for _ in 0..worker_count {
+                let (worker, _handle) = KvWorker::spawn(
+                    None,
+                    KvWorker,
+                    KvWorkerArgs {
+                        shared: shared.clone(),
+                        pending: None,
+                    },
+                )
+                .await
+                .map_err(|e| ActorProcessingErr::from(e.to_string()))?;
+                startup_children.track(worker.get_cell());
+                workers.push(worker);
+            }
+            Ok::<(), ActorProcessingErr>(())
+        })
+        .catch_unwind()
+        .await;
+        match startup {
+            Ok(Ok(())) => startup_children.disarm(),
+            Ok(Err(error)) => {
+                startup_children.rollback().await;
+                return Err(error);
+            }
+            Err(panic) => {
+                startup_children.rollback().await;
+                std::panic::resume_unwind(panic);
+            }
         }
         Ok(Self {
             workers,
@@ -1165,12 +1237,32 @@ impl WorkerPool {
         &self.workers[idx]
     }
 
-    /// Stop every worker, waiting for each. Call before flushing shared
-    /// state so no new writes land mid-flush.
-    pub async fn shutdown(&self) {
+    /// Close every worker mailbox, drain the work accepted before that fence,
+    /// and wait for every worker to exit. Closing all mailboxes before waiting
+    /// prevents one slow shard from leaving its siblings open to new work.
+    fn begin_shutdown(&self) {
         for worker in &self.workers {
-            let _ = worker.stop_and_wait(None, None).await;
+            if worker.get_status() < ActorStatus::Draining {
+                let _ = worker.drain();
+            }
         }
+    }
+
+    async fn join(&self) {
+        for worker in &self.workers {
+            let _ = worker.wait(None).await;
+        }
+    }
+
+    pub async fn shutdown(&self) {
+        self.begin_shutdown();
+        self.join().await;
+    }
+}
+
+impl Drop for WorkerPool {
+    fn drop(&mut self) {
+        self.begin_shutdown();
     }
 }
 
@@ -1202,27 +1294,64 @@ impl Actor for KvActor {
         // Workers are linked to the dispatcher: a dead worker raises a
         // supervision event here and gets replaced in-place.
         // Phase 7: three isolated pools by priority.
-        let high_pool = WorkerPool::spawn_linked(
-            args.high_pool.clone(),
-            args.shared.clone(),
-            myself.get_cell(),
-            &format!("{}-high", args.worker_prefix),
-        )
-        .await?;
-        let default_pool = WorkerPool::spawn_linked(
-            args.default_pool.clone(),
-            args.shared.clone(),
-            myself.get_cell(),
-            &format!("{}-default", args.worker_prefix),
-        )
-        .await?;
-        let background_pool = WorkerPool::spawn_linked(
-            args.background_pool.clone(),
-            args.shared.clone(),
-            myself.get_cell(),
-            &format!("{}-bg", args.worker_prefix),
-        )
-        .await?;
+        let mut pools = Vec::with_capacity(3);
+        let startup = AssertUnwindSafe(async {
+            pools.push(
+                WorkerPool::spawn_linked(
+                    args.high_pool.clone(),
+                    args.shared.clone(),
+                    myself.get_cell(),
+                    &format!("{}-high", args.worker_prefix),
+                )
+                .await?,
+            );
+            pools.push(
+                WorkerPool::spawn_linked(
+                    args.default_pool.clone(),
+                    args.shared.clone(),
+                    myself.get_cell(),
+                    &format!("{}-default", args.worker_prefix),
+                )
+                .await?,
+            );
+            pools.push(
+                WorkerPool::spawn_linked(
+                    args.background_pool.clone(),
+                    args.shared.clone(),
+                    myself.get_cell(),
+                    &format!("{}-bg", args.worker_prefix),
+                )
+                .await?,
+            );
+            Ok::<(), ActorProcessingErr>(())
+        })
+        .catch_unwind()
+        .await;
+        match startup {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                for pool in &pools {
+                    pool.begin_shutdown();
+                }
+                for pool in &pools {
+                    pool.join().await;
+                }
+                return Err(error);
+            }
+            Err(panic) => {
+                for pool in &pools {
+                    pool.begin_shutdown();
+                }
+                for pool in &pools {
+                    pool.join().await;
+                }
+                std::panic::resume_unwind(panic);
+            }
+        }
+        let mut pools = pools.into_iter();
+        let high_pool = pools.next().expect("high pool was started");
+        let default_pool = pools.next().expect("default pool was started");
+        let background_pool = pools.next().expect("background pool was started");
         Ok(KvState {
             high_pool,
             default_pool,
@@ -1237,9 +1366,10 @@ impl Actor for KvActor {
         _myself: ActorRef<Self::Msg>,
         state: &mut Self::State,
     ) -> Result<(), ActorProcessingErr> {
-        // Drain workers first so no new writes land mid-flush, then don't
-        // leave buffered writes behind. (A kill -9 skips this; the
-        // unflushed tail is recovered via peer sync on reconnect.)
+        // Standalone KvActor users still receive the actor's historical
+        // flush-on-stop contract. A supervising fragment keeps another Arc to
+        // the shared state and performs an observable second fence, so a
+        // failed attempt here retains its batch for the supervisor to retry.
         state.high_pool.shutdown().await;
         state.default_pool.shutdown().await;
         state.background_pool.shutdown().await;
@@ -1414,6 +1544,12 @@ impl Actor for KvActor {
         message: SupervisionEvent,
         state: &mut Self::State,
     ) -> Result<(), ActorProcessingErr> {
+        // Planned worker drains emit the same termination events as failures.
+        // Ractor refuses to link a replacement to a draining parent, and an
+        // attempted restart would turn an orderly drain into actor failure.
+        if myself.get_status() >= ActorStatus::Draining {
+            return Ok(());
+        }
         // A dead worker is replaced in-place: the pool slot keeps its
         // index, so sticky routing is unaffected and no keys move.
         let dead = match &message {
@@ -2044,6 +2180,61 @@ mod flush_retention_tests {
                 .extend(writes.iter().map(|(k, v)| (k.clone(), v.clone())));
             Ok(())
         }
+    }
+
+    #[tokio::test]
+    async fn standalone_dispatcher_drain_flushes_buffered_writes() {
+        let store = Arc::new(FlakyStore {
+            failures_left: StdMutex::new(0),
+            written: StdMutex::new(Vec::new()),
+        });
+        let shared = Arc::new(FragmentState::new(
+            HashMap::new(),
+            Some(store.clone() as Arc<dyn KvStore>),
+            usize::MAX,
+            Duration::from_secs(3600),
+        ));
+        let pool = PoolConfig {
+            workers: 1,
+            queue_cap: 16,
+            rate_limit_per_sec: None,
+        };
+        let (dispatcher, _handle) = KvActor::spawn(
+            None,
+            KvActor,
+            KvArgs {
+                shared,
+                fragment: FragmentId(0),
+                worker_prefix: "standalone-drain-flush".to_string(),
+                default_pool: pool.clone(),
+                high_pool: pool.clone(),
+                background_pool: pool,
+            },
+        )
+        .await
+        .unwrap();
+        let value = VersionedValue::new(b"value".to_vec(), 100, "node".to_string());
+        let result = dispatcher
+            .call(
+                |reply| KvMessage::ApplyOp {
+                    op: op("key", value.clone()),
+                    priority: OpPriority::Default,
+                    is_replication: false,
+                    reply: Some(reply),
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(result, CallResult::Success(Ok(ApplyOutcome::Applied)));
+        assert!(store.written.lock().unwrap().is_empty());
+
+        dispatcher.drain().unwrap();
+        dispatcher.wait(None).await.unwrap();
+        assert_eq!(
+            store.written.lock().unwrap().as_slice(),
+            &[(b"key".to_vec(), value)]
+        );
     }
 
     #[tokio::test]

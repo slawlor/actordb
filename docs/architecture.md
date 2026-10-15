@@ -83,6 +83,14 @@ Key design points:
   a stale monitor from a removed placement generation cannot overwrite a
   re-added subtree. The planned ractor `Factory` migration addresses lossless
   worker admission/drain without coupling failures across fragments.
+- **Shutdown preserves the retry boundary.** A one-way Node admission gate
+  rejects new public data calls, while operations admitted before the fence
+  finish or receive their transport failure. Each fragment closes and joins
+  periodic producers, drains the dispatcher and every worker mailbox, then
+  performs an explicit supervisor-owned final flush. Supervisors remain alive
+  until every fragment succeeds, so a store error or cancelled waiter can
+  retry the retained batch without reopening service. Replication-sender
+  convergence remains a separate transport-lifecycle step.
 - **Placement is authoritative input.** In static mode the node routes by
   `fragment_map`. With a `PlacementController` set, a driver polls
   `desired_placement()` every `placement_poll_interval` and spawns/stops

@@ -11,7 +11,8 @@ use std::time::Duration;
 use actordb::actor::{now_ms, VersionedValue};
 use actordb::network::{BindFuture, ConnectFuture, Network, NetworkError, TcpNetwork};
 use actordb::node::{
-    Node, NodeConfig, NodeRuntimeOptions, REQUIRED_WIRE_CAPABILITIES, WIRE_PROTOCOL_VERSION,
+    Node, NodeConfig, NodeError, NodeRuntimeOptions, REQUIRED_WIRE_CAPABILITIES,
+    WIRE_PROTOCOL_VERSION,
 };
 use actordb::proto::{Envelope, EnvelopeMsg, Hello, HelloAuth};
 use actordb::store::{KvStore, StoreError};
@@ -145,6 +146,104 @@ impl KvStore for FailOnceStore {
     fn write_batch(&self, writes: &[(Vec<u8>, VersionedValue)]) -> Result<(), StoreError> {
         if self.attempts.fetch_add(1, Ordering::SeqCst) == 0 {
             return Err(StoreError("injected transient failure".to_string()));
+        }
+        let mut entries = self.entries.lock().unwrap();
+        for (key, value) in writes {
+            entries.insert(key.clone(), value.clone());
+        }
+        Ok(())
+    }
+}
+
+struct ToggleFailStore {
+    failing: AtomicBool,
+    attempts: AtomicUsize,
+    entries: StdMutex<HashMap<Vec<u8>, VersionedValue>>,
+}
+
+impl Default for ToggleFailStore {
+    fn default() -> Self {
+        Self {
+            failing: AtomicBool::new(true),
+            attempts: AtomicUsize::new(0),
+            entries: StdMutex::new(HashMap::new()),
+        }
+    }
+}
+
+impl KvStore for ToggleFailStore {
+    fn load(&self) -> Result<Vec<(Vec<u8>, VersionedValue)>, StoreError> {
+        Ok(self
+            .entries
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect())
+    }
+
+    fn write_batch(&self, writes: &[(Vec<u8>, VersionedValue)]) -> Result<(), StoreError> {
+        self.attempts.fetch_add(1, Ordering::SeqCst);
+        if self.failing.load(Ordering::SeqCst) {
+            return Err(StoreError("injected switchable failure".to_string()));
+        }
+        let mut entries = self.entries.lock().unwrap();
+        for (key, value) in writes {
+            entries.insert(key.clone(), value.clone());
+        }
+        Ok(())
+    }
+}
+
+struct SelectiveFailStore {
+    failing_fragment: u32,
+    failing: AtomicBool,
+    attempts: [AtomicUsize; 2],
+    entries: StdMutex<HashMap<Vec<u8>, VersionedValue>>,
+}
+
+impl SelectiveFailStore {
+    fn new(failing_fragment: u32) -> Self {
+        Self {
+            failing_fragment,
+            failing: AtomicBool::new(true),
+            attempts: [AtomicUsize::new(0), AtomicUsize::new(0)],
+            entries: StdMutex::new(HashMap::new()),
+        }
+    }
+
+    fn attempts_for(&self, fragment: u32) -> usize {
+        self.attempts[fragment as usize].load(Ordering::SeqCst)
+    }
+}
+
+impl KvStore for SelectiveFailStore {
+    fn load(&self) -> Result<Vec<(Vec<u8>, VersionedValue)>, StoreError> {
+        Ok(self
+            .entries
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect())
+    }
+
+    fn write_batch(&self, writes: &[(Vec<u8>, VersionedValue)]) -> Result<(), StoreError> {
+        let fragment = writes
+            .first()
+            .and_then(|(key, _)| key.get(..4))
+            .and_then(|prefix| prefix.try_into().ok())
+            .map(u32::from_be_bytes)
+            .expect("prefixed store supplied an empty or malformed batch");
+        assert!(
+            writes
+                .iter()
+                .all(|(key, _)| key.starts_with(&fragment.to_be_bytes())),
+            "a prefixed-store batch crossed fragment boundaries"
+        );
+        self.attempts[fragment as usize].fetch_add(1, Ordering::SeqCst);
+        if fragment == self.failing_fragment && self.failing.load(Ordering::SeqCst) {
+            return Err(StoreError("injected fragment-local failure".to_string()));
         }
         let mut entries = self.entries.lock().unwrap();
         for (key, value) in writes {
@@ -406,7 +505,7 @@ async fn single_node_put_get() {
     assert_eq!(got.node_id, "solo");
     assert!(n.get("missing".to_string()).await.unwrap().is_none());
 
-    n.shutdown().await;
+    n.shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -646,8 +745,8 @@ async fn two_nodes_replicate() {
         Duration::from_secs(5),
     )
     .await;
-    a.shutdown().await;
-    b.shutdown().await;
+    a.shutdown().await.unwrap();
+    b.shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -686,9 +785,9 @@ async fn three_node_mesh_converges() {
         .await;
     }
 
-    a.shutdown().await;
-    b.shutdown().await;
-    c.shutdown().await;
+    a.shutdown().await.unwrap();
+    b.shutdown().await.unwrap();
+    c.shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -715,8 +814,8 @@ async fn lww_last_write_wins_everywhere() {
         .await;
     }
 
-    a.shutdown().await;
-    b.shutdown().await;
+    a.shutdown().await.unwrap();
+    b.shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -735,7 +834,7 @@ async fn restarted_node_writes_are_accepted() {
 
     // Simulate a restart of a: same node_id, but fresh process state —
     // the sequence counter is back at zero.
-    a.shutdown().await;
+    a.shutdown().await.unwrap();
     let a2 = test_node("a").await;
     a2.connect(b.addr()).await.unwrap();
     common::wait_for(
@@ -756,8 +855,8 @@ async fn restarted_node_writes_are_accepted() {
         Duration::from_secs(5),
     )
     .await;
-    a2.shutdown().await;
-    b.shutdown().await;
+    a2.shutdown().await.unwrap();
+    b.shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -784,7 +883,7 @@ async fn dropped_connection_redials() {
 
     // Kill a outright. b's dialer-side supervisor must notice the drop
     // and redial once a is back on the same address.
-    a.shutdown().await;
+    a.shutdown().await.unwrap();
     // Give the OS a moment to release the port.
     tokio::time::sleep(Duration::from_millis(200)).await;
     let a2 = Node::start("a".to_string(), addr, NodeConfig::default())
@@ -807,8 +906,8 @@ async fn dropped_connection_redials() {
     )
     .await;
 
-    a2.shutdown().await;
-    b.shutdown().await;
+    a2.shutdown().await.unwrap();
+    b.shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -831,7 +930,7 @@ async fn legacy_sender_reap_recovers_offline_writes_and_tombstones_by_full_sync(
         Duration::from_secs(5),
     )
     .await;
-    b.shutdown().await;
+    b.shutdown().await.unwrap();
     common::wait_for(
         || async { a.peer_count().await == 0 },
         Duration::from_secs(2),
@@ -863,8 +962,8 @@ async fn legacy_sender_reap_recovers_offline_writes_and_tombstones_by_full_sync(
     )
     .await;
 
-    a.shutdown().await;
-    b2.shutdown().await;
+    a.shutdown().await.unwrap();
+    b2.shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -932,7 +1031,7 @@ async fn configured_member_retries_initial_failure_and_rejects_wrong_identity() 
     )
     .await;
 
-    node.shutdown().await;
+    node.shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -1003,7 +1102,7 @@ async fn address_only_connect_pins_the_first_authenticated_identity() {
         Duration::from_secs(2),
     )
     .await;
-    node.shutdown().await;
+    node.shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -1060,8 +1159,8 @@ async fn simultaneous_dials_elect_one_stable_connection_without_redial_churn() {
     )
     .await;
 
-    a.shutdown().await;
-    b.shutdown().await;
+    a.shutdown().await.unwrap();
+    b.shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -1104,7 +1203,7 @@ async fn concurrent_connect_calls_share_one_transport_dial_intent() {
         Duration::from_secs(2),
     )
     .await;
-    node.shutdown().await;
+    node.shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -1150,7 +1249,7 @@ async fn concurrent_connect_waiter_never_reports_false_success_after_owner_failu
     // become the owner instead of observing a permanently stuck Pending entry.
     assert!(node.connect(peer_addr).await.is_err());
     assert_eq!(attempts.load(Ordering::SeqCst), 3);
-    node.shutdown().await;
+    node.shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -1190,7 +1289,7 @@ async fn cancelled_connect_owner_releases_pending_intent_to_waiter() {
     assert!(second.await.unwrap().is_err());
     assert_eq!(attempts.load(Ordering::SeqCst), 2);
 
-    node.shutdown().await;
+    node.shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -1233,9 +1332,9 @@ async fn late_joiner_converges_via_immediate_reconciliation() {
     )
     .await;
 
-    a.shutdown().await;
-    b.shutdown().await;
-    c.shutdown().await;
+    a.shutdown().await.unwrap();
+    b.shutdown().await.unwrap();
+    c.shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -1290,8 +1389,8 @@ async fn reconciliation_paginates_summaries_and_fetches_without_restart_storms()
     )
     .await;
 
-    source.shutdown().await;
-    target.shutdown().await;
+    source.shutdown().await.unwrap();
+    target.shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -1452,8 +1551,8 @@ async fn bidirectional_large_reconciliation_keeps_connection_reader_live() {
         }
     }
 
-    a.shutdown().await;
-    b.shutdown().await;
+    a.shutdown().await.unwrap();
+    b.shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -1541,7 +1640,7 @@ async fn reconcile_cursor_continues_after_revision_drift_for_verified_multi_pass
     assert_ne!(second.snapshot_revision, first.snapshot_revision);
     assert_eq!(second.snapshot_time_ms, first.snapshot_time_ms);
 
-    node.shutdown().await;
+    node.shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -1650,7 +1749,7 @@ async fn reconcile_barrier_revokes_prior_fetch_authorization() {
     .await
     .expect("post-barrier fetch did not close the connection");
 
-    node.shutdown().await;
+    node.shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -1732,7 +1831,7 @@ async fn failed_immediate_reconciliation_is_not_counted_and_retries() {
             .reconcile_rounds,
         0
     );
-    node.shutdown().await;
+    assert!(matches!(node.shutdown().await, Err(NodeError::Storage(_))));
 }
 
 #[cfg(feature = "rocksdb")]
@@ -1753,7 +1852,7 @@ async fn persistence_roundtrip() {
 
     a.put("k1".to_string(), b"v1".to_vec()).await.unwrap();
     a.put("k2".to_string(), b"v2".to_vec()).await.unwrap();
-    a.shutdown().await;
+    a.shutdown().await.unwrap();
 
     let a2 = Node::start(
         "a".to_string(),
@@ -1772,7 +1871,7 @@ async fn persistence_roundtrip() {
         assert_eq!(got.value, v);
         assert_eq!(got.node_id, "a");
     }
-    a2.shutdown().await;
+    a2.shutdown().await.unwrap();
 }
 
 #[cfg(feature = "rocksdb")]
@@ -1815,7 +1914,7 @@ async fn persistence_keeps_gossiped_winner() {
     .await;
 
     // Restart a with no peers: disk must hold the winner.
-    a.shutdown().await;
+    a.shutdown().await.unwrap();
     let a2 = Node::start(
         "a".to_string(),
         "127.0.0.1:0".parse().unwrap(),
@@ -1841,8 +1940,8 @@ async fn persistence_keeps_gossiped_winner() {
     )
     .await;
 
-    a2.shutdown().await;
-    b.shutdown().await;
+    a2.shutdown().await.unwrap();
+    b.shutdown().await.unwrap();
 }
 
 #[cfg(feature = "rocksdb")]
@@ -1863,7 +1962,7 @@ async fn persistence_flushes_on_shutdown() {
         .await
         .expect("node failed to start");
     a.put("k".to_string(), b"v".to_vec()).await.unwrap();
-    a.shutdown().await;
+    a.shutdown().await.unwrap();
 
     let a2 = Node::start("a".to_string(), "127.0.0.1:0".parse().unwrap(), config())
         .await
@@ -1874,7 +1973,362 @@ async fn persistence_flushes_on_shutdown() {
         .unwrap()
         .expect("k missing after restart");
     assert_eq!(got.value, b"v");
-    a2.shutdown().await;
+    a2.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn shutdown_flush_failure_is_retryable_across_all_fragments() {
+    use actordb::shard::{fragment_of, FragmentId};
+
+    let store = Arc::new(ToggleFailStore::default());
+    let config = || NodeConfig {
+        fragment_count: 2,
+        store: Some(store.clone()),
+        flush_batch_size: usize::MAX,
+        flush_interval: Duration::from_secs(3600),
+        snapshot_interval: Duration::from_secs(3600),
+        clean_interval: Duration::from_secs(3600),
+        ..NodeConfig::default()
+    };
+    let node = Node::start(
+        "retry-shutdown".to_string(),
+        "127.0.0.1:0".parse().unwrap(),
+        config(),
+    )
+    .await
+    .unwrap();
+
+    let mut keys = HashMap::new();
+    for index in 0..10_000 {
+        let key = format!("shutdown-fragment-{index}");
+        let fragment = fragment_of(&key, 2);
+        keys.entry(fragment).or_insert(key);
+        if keys.len() == 2 {
+            break;
+        }
+    }
+    for fragment in [FragmentId(0), FragmentId(1)] {
+        let key = keys.get(&fragment).expect("missing key for fragment");
+        node.put(key.clone(), format!("value-{}", fragment.0).into_bytes())
+            .await
+            .unwrap();
+    }
+
+    let first = node.shutdown().await.unwrap_err();
+    assert!(matches!(first, NodeError::Storage(_)));
+    assert_eq!(store.attempts.load(Ordering::SeqCst), 4);
+    assert!(matches!(
+        node.get(keys[&FragmentId(0)].clone()).await,
+        Err(NodeError::ShuttingDown)
+    ));
+
+    store.failing.store(false, Ordering::SeqCst);
+    node.shutdown().await.unwrap();
+    assert_eq!(store.attempts.load(Ordering::SeqCst), 6);
+
+    let restarted = Node::start(
+        "retry-shutdown".to_string(),
+        "127.0.0.1:0".parse().unwrap(),
+        config(),
+    )
+    .await
+    .unwrap();
+    for fragment in [FragmentId(0), FragmentId(1)] {
+        let key = keys[&fragment].clone();
+        let value = restarted.get(key).await.unwrap().unwrap();
+        assert_eq!(value.value, format!("value-{}", fragment.0).into_bytes());
+    }
+    restarted.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn shutdown_retry_skips_fragments_that_already_reached_the_durability_fence() {
+    use actordb::shard::{fragment_of, FragmentId};
+
+    let store = Arc::new(SelectiveFailStore::new(0));
+    let config = || NodeConfig {
+        fragment_count: 2,
+        store: Some(store.clone()),
+        flush_batch_size: usize::MAX,
+        flush_interval: Duration::from_secs(3600),
+        snapshot_interval: Duration::from_secs(3600),
+        clean_interval: Duration::from_secs(3600),
+        ..NodeConfig::default()
+    };
+    let node = Node::start(
+        "partial-retry-shutdown".to_string(),
+        "127.0.0.1:0".parse().unwrap(),
+        config(),
+    )
+    .await
+    .unwrap();
+
+    let mut keys = HashMap::new();
+    for index in 0..10_000 {
+        let key = format!("partial-shutdown-fragment-{index}");
+        let fragment = fragment_of(&key, 2);
+        keys.entry(fragment).or_insert(key);
+        if keys.len() == 2 {
+            break;
+        }
+    }
+    for fragment in [FragmentId(0), FragmentId(1)] {
+        node.put(
+            keys[&fragment].clone(),
+            format!("value-{}", fragment.0).into_bytes(),
+        )
+        .await
+        .unwrap();
+    }
+
+    assert!(matches!(node.shutdown().await, Err(NodeError::Storage(_))));
+    let failed_attempts = store.attempts_for(0);
+    let prepared_attempts = store.attempts_for(1);
+    assert!(failed_attempts > 0);
+    assert!(prepared_attempts > 0);
+
+    store.failing.store(false, Ordering::SeqCst);
+    node.shutdown().await.unwrap();
+    assert!(store.attempts_for(0) > failed_attempts);
+    assert_eq!(
+        store.attempts_for(1),
+        prepared_attempts,
+        "retry flushed a fragment that had already completed its durability fence"
+    );
+
+    let restarted = Node::start(
+        "partial-retry-shutdown".to_string(),
+        "127.0.0.1:0".parse().unwrap(),
+        config(),
+    )
+    .await
+    .unwrap();
+    for fragment in [FragmentId(0), FragmentId(1)] {
+        let value = restarted
+            .get(keys[&fragment].clone())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(value.value, format!("value-{}", fragment.0).into_bytes());
+    }
+    restarted.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancelled_shutdown_waiter_resumes_retained_final_flush() {
+    let store = Arc::new(GatedStore::default());
+    let node = Arc::new(
+        Node::start(
+            "cancelled-shutdown".to_string(),
+            "127.0.0.1:0".parse().unwrap(),
+            NodeConfig {
+                store: Some(store.clone()),
+                flush_batch_size: usize::MAX,
+                flush_interval: Duration::from_secs(3600),
+                snapshot_interval: Duration::from_secs(3600),
+                clean_interval: Duration::from_secs(3600),
+                ..NodeConfig::default()
+            },
+        )
+        .await
+        .unwrap(),
+    );
+    node.put("cancelled-flush".to_string(), b"retained".to_vec())
+        .await
+        .unwrap();
+
+    let shutdown_node = node.clone();
+    let first = tokio::spawn(async move { shutdown_node.shutdown().await });
+    common::wait_for(
+        || async { store.entered.load(Ordering::SeqCst) },
+        Duration::from_secs(5),
+    )
+    .await;
+    first.abort();
+    assert!(first.await.unwrap_err().is_cancelled());
+    assert!(matches!(
+        node.get("cancelled-flush".to_string()).await,
+        Err(NodeError::ShuttingDown)
+    ));
+
+    store.release();
+    node.shutdown().await.unwrap();
+    let mut persisted_key = 0u32.to_be_bytes().to_vec();
+    persisted_key.extend_from_slice(b"cancelled-flush");
+    assert_eq!(
+        store
+            .entries
+            .lock()
+            .unwrap()
+            .get(&persisted_key)
+            .cloned()
+            .map(|value| value.value),
+        Some(b"retained".to_vec())
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shutdown_rejects_new_calls_and_waits_for_an_admitted_put() {
+    use actordb::actor::OpPriority;
+
+    let store = Arc::new(GatedStore::default());
+    let node = Arc::new(
+        Node::start(
+            "operation-fence".to_string(),
+            "127.0.0.1:0".parse().unwrap(),
+            NodeConfig {
+                store: Some(store.clone()),
+                flush_batch_size: 1,
+                flush_interval: Duration::from_secs(3600),
+                snapshot_interval: Duration::from_secs(3600),
+                clean_interval: Duration::from_secs(3600),
+                ..NodeConfig::default()
+            },
+        )
+        .await
+        .unwrap(),
+    );
+
+    let put_node = node.clone();
+    let put = tokio::spawn(async move {
+        put_node
+            .put("admitted-before-shutdown".to_string(), b"value".to_vec())
+            .await
+    });
+    common::wait_for(
+        || async { store.entered.load(Ordering::SeqCst) },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    let shutdown_node = node.clone();
+    let shutdown = tokio::spawn(async move { shutdown_node.shutdown().await });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            match node.health().await {
+                Err(NodeError::ShuttingDown) => break,
+                Ok(_) => tokio::task::yield_now().await,
+                Err(error) => panic!("unexpected health error: {error}"),
+            }
+        }
+    })
+    .await
+    .expect("shutdown did not close public operation admission");
+    assert!(!shutdown.is_finished(), "shutdown skipped an admitted put");
+
+    assert!(matches!(
+        node.connect("127.0.0.1:9".parse().unwrap()).await,
+        Err(NodeError::ShuttingDown)
+    ));
+    assert!(matches!(
+        node.put("rejected-put".to_string(), b"value".to_vec())
+            .await,
+        Err(NodeError::ShuttingDown)
+    ));
+    assert!(matches!(
+        node.put_with_priority(
+            "rejected-priority-put".to_string(),
+            b"value".to_vec(),
+            OpPriority::High,
+        )
+        .await,
+        Err(NodeError::ShuttingDown)
+    ));
+    assert!(matches!(
+        node.put_with_ttl(
+            "rejected-ttl-put".to_string(),
+            b"value".to_vec(),
+            Some(Duration::from_secs(1)),
+        )
+        .await,
+        Err(NodeError::ShuttingDown)
+    ));
+    assert!(matches!(
+        node.delete("rejected-delete".to_string()).await,
+        Err(NodeError::ShuttingDown)
+    ));
+    assert!(matches!(
+        node.get("rejected-get".to_string()).await,
+        Err(NodeError::ShuttingDown)
+    ));
+    assert!(matches!(
+        node.get_with_priority("rejected-priority-get".to_string(), OpPriority::High)
+            .await,
+        Err(NodeError::ShuttingDown)
+    ));
+    assert!(matches!(node.get_all().await, Err(NodeError::ShuttingDown)));
+
+    let put_results = node
+        .put_multi(vec![("rejected-batch-put".to_string(), b"value".to_vec())])
+        .await;
+    assert!(matches!(
+        put_results.as_slice(),
+        [Err(NodeError::ShuttingDown)]
+    ));
+    let priority_put_results = node
+        .put_multi_with_priority(
+            vec![("rejected-priority-batch-put".to_string(), b"value".to_vec())],
+            OpPriority::High,
+        )
+        .await;
+    assert!(matches!(
+        priority_put_results.as_slice(),
+        [Err(NodeError::ShuttingDown)]
+    ));
+    let get_results = node.get_multi(vec!["rejected-batch-get".to_string()]).await;
+    assert!(matches!(
+        get_results.as_slice(),
+        [Err(NodeError::ShuttingDown)]
+    ));
+    let priority_get_results = node
+        .get_multi_with_priority(
+            vec!["rejected-priority-batch-get".to_string()],
+            OpPriority::High,
+        )
+        .await;
+    assert!(matches!(
+        priority_get_results.as_slice(),
+        [Err(NodeError::ShuttingDown)]
+    ));
+
+    store.release();
+    put.await.unwrap().unwrap();
+    shutdown.await.unwrap().unwrap();
+    node.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn shutdown_materializes_expiry_before_the_final_flush() {
+    let store = Arc::new(PreloadedStore::default());
+    let node = Node::start(
+        "shutdown-expiry".to_string(),
+        "127.0.0.1:0".parse().unwrap(),
+        NodeConfig {
+            store: Some(store.clone()),
+            flush_batch_size: usize::MAX,
+            flush_interval: Duration::from_secs(3600),
+            clean_interval: Duration::from_secs(3600),
+            snapshot_interval: Duration::from_secs(3600),
+            ..NodeConfig::default()
+        },
+    )
+    .await
+    .unwrap();
+    node.put_with_ttl(
+        "expires-at-shutdown".to_string(),
+        b"short-lived".to_vec(),
+        Some(Duration::from_millis(20)),
+    )
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(30)).await;
+
+    node.shutdown().await.unwrap();
+    let persisted = store
+        .get_fragment_zero("expires-at-shutdown")
+        .expect("shutdown did not persist expiry tombstone");
+    assert!(persisted.is_tombstone);
+    assert!(persisted.value.is_empty());
 }
 
 #[tokio::test]
@@ -1895,7 +2349,7 @@ async fn memory_store_exercises_persistence_plumbing() {
     a.put("k".to_string(), b"v".to_vec()).await.unwrap();
     let got = a.get("k".to_string()).await.unwrap().expect("k missing");
     assert_eq!(got.value, b"v");
-    a.shutdown().await;
+    a.shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -1936,7 +2390,7 @@ async fn ttl_expiry_is_persisted_as_a_versioned_tombstone() {
     assert!(marker.is_tombstone);
     assert!(marker.expires_at_ms.is_some());
     assert!(node.get("ephemeral".to_string()).await.unwrap().is_none());
-    node.shutdown().await;
+    node.shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -1988,8 +2442,8 @@ async fn ttl_expiry_does_not_resurrect_an_older_partitioned_value() {
     )
     .await;
 
-    a.shutdown().await;
-    b.shutdown().await;
+    a.shutdown().await.unwrap();
+    b.shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -2020,7 +2474,7 @@ async fn startup_rewrites_expired_durable_values_as_tombstones() {
         store.get_fragment_zero("expired-at-boot"),
         Some(expired.expiry_tombstone())
     );
-    node.shutdown().await;
+    node.shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -2055,7 +2509,7 @@ async fn persisted_version_seeds_clock_before_first_write() {
         .expect("key missing");
     assert_eq!(current.value, b"new");
     assert!(current.timestamp_ms > persisted_timestamp);
-    node.shutdown().await;
+    node.shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -2072,7 +2526,7 @@ async fn startup_rejects_out_of_policy_persisted_timestamp() {
 
     match Node::start("node".to_string(), "127.0.0.1:0".parse().unwrap(), config).await {
         Ok(node) => {
-            node.shutdown().await;
+            node.shutdown().await.unwrap();
             panic!("node accepted a poisoned durable timestamp");
         }
         Err(error) => assert!(
@@ -2094,7 +2548,7 @@ async fn startup_rejects_invalid_persisted_provenance() {
 
         match Node::start("node".to_string(), "127.0.0.1:0".parse().unwrap(), config).await {
             Ok(node) => {
-                node.shutdown().await;
+                node.shutdown().await.unwrap();
                 panic!("node accepted invalid durable provenance");
             }
             Err(error) => assert!(
@@ -2139,7 +2593,7 @@ async fn fragments_route_and_isolate() {
 
     let all = a.get_all().await.unwrap();
     assert_eq!(all.len(), 50);
-    a.shutdown().await;
+    a.shutdown().await.unwrap();
 }
 
 /// Phase 2: disjoint fragments. Each node serves 2 of 6 fragments.
@@ -2209,9 +2663,9 @@ async fn disjoint_fragments_route_to_owner() {
     let v = a.get(key_c.clone()).await.unwrap().unwrap();
     assert_eq!(v.value, b"via-a".to_vec());
 
-    a.shutdown().await;
-    b.shutdown().await;
-    c.shutdown().await;
+    a.shutdown().await.unwrap();
+    b.shutdown().await.unwrap();
+    c.shutdown().await.unwrap();
 }
 
 /// Phase 2: replicated fragment. A put on one replica fans out to the
@@ -2259,8 +2713,8 @@ async fn replica_fanout_reaches_other_holder() {
     )
     .await;
 
-    a.shutdown().await;
-    b.shutdown().await;
+    a.shutdown().await.unwrap();
+    b.shutdown().await.unwrap();
 }
 
 /// Phase 3: the worker pool handles concurrent keys; per-key ordering
@@ -2311,7 +2765,7 @@ async fn worker_pool_concurrent_keys_and_ordering() {
     let got = a.get("ordered".to_string()).await.unwrap().unwrap();
     assert_eq!(got.value, b"w9".to_vec());
 
-    a.shutdown().await;
+    a.shutdown().await.unwrap();
 }
 
 /// Phase 4: TTL expiry — a key with a TTL disappears without manual
@@ -2348,7 +2802,7 @@ async fn ttl_expiry_removes_key() {
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert!(a.get("perm".to_string()).await.unwrap().is_some());
 
-    a.shutdown().await;
+    a.shutdown().await.unwrap();
 }
 
 /// Phase 4: killing a worker triggers a supervised restart; the
@@ -2417,7 +2871,7 @@ async fn worker_kill_triggers_supervised_restart() {
     let health = a.health().await.unwrap();
     assert!(health.contains_key(&actordb::shard::FragmentId(0)));
 
-    a.shutdown().await;
+    a.shutdown().await.unwrap();
 }
 
 /// Tombstones: delete hides the key locally and the tombstone
@@ -2448,8 +2902,8 @@ async fn delete_propagates_to_replicas() {
     // Tombstones are hidden from get_all too.
     assert!(!a.get_all().await.unwrap().contains_key("gone"));
 
-    a.shutdown().await;
-    b.shutdown().await;
+    a.shutdown().await.unwrap();
+    b.shutdown().await.unwrap();
 }
 
 /// Tombstones: a delete survives node restart (tombstone is durable)
@@ -2494,9 +2948,9 @@ async fn delete_survives_restart_and_rejoin() {
     )
     .await;
 
-    a.shutdown().await;
-    b.shutdown().await;
-    c.shutdown().await;
+    a.shutdown().await.unwrap();
+    b.shutdown().await.unwrap();
+    c.shutdown().await.unwrap();
 }
 
 /// HLC (#14): one node with a +5min clock skew must not permanently
@@ -2561,8 +3015,8 @@ async fn hlc_orders_writes_under_clock_skew() {
     )
     .await;
 
-    slow.shutdown().await;
-    fast.shutdown().await;
+    slow.shutdown().await.unwrap();
+    fast.shutdown().await.unwrap();
 }
 
 /// Phase 5: kill a peer mid-replication. The sender's buffer overflows,
@@ -2614,7 +3068,7 @@ async fn sender_buffer_reset_and_reconcile() {
     .await;
 
     // Kill b. a's sender buffers; overflow → buffer_reset.
-    b.shutdown().await;
+    b.shutdown().await.unwrap();
     for i in 1..30 {
         a.put(format!("k{i}"), format!("v{i}").into_bytes())
             .await
@@ -2656,8 +3110,8 @@ async fn sender_buffer_reset_and_reconcile() {
     )
     .await;
 
-    a.shutdown().await;
-    b2.shutdown().await;
+    a.shutdown().await.unwrap();
+    b2.shutdown().await.unwrap();
 }
 
 /// A live transport must recover immediately after sender-buffer overflow.
@@ -2727,8 +3181,8 @@ async fn live_connected_overflow_reconciles_without_reconnect() {
 
     assert_eq!(a.peer_count().await, 1);
     assert_eq!(b.peer_count().await, 1);
-    a.shutdown().await;
-    b.shutdown().await;
+    a.shutdown().await.unwrap();
+    b.shutdown().await.unwrap();
 }
 
 /// Unchanged dynamic-placement polls reuse the current peer channel. They
@@ -2814,8 +3268,8 @@ async fn unchanged_placement_polls_preserve_sender_session() {
         "steady placement polls rotated a live sender session"
     );
 
-    a.shutdown().await;
-    b.shutdown().await;
+    a.shutdown().await.unwrap();
+    b.shutdown().await.unwrap();
 }
 
 /// A response from an older or fabricated reconcile round must not complete
@@ -3020,7 +3474,7 @@ async fn stale_reconcile_round_cannot_complete_live_reset() {
     )
     .await;
 
-    node.shutdown().await;
+    node.shutdown().await.unwrap();
 }
 
 /// A bootstrap round that fetched remote winners has only fenced those
@@ -3208,7 +3662,7 @@ async fn placement_bootstrap_fetch_requires_verification_round() {
     )
     .await;
 
-    node.shutdown().await;
+    node.shutdown().await.unwrap();
 }
 
 /// Reconciliation liveness is independent of the normal batch timer. A live
@@ -3291,7 +3745,7 @@ async fn silent_reconcile_phase_times_out_and_retries() {
         "buffer_reset"
     );
 
-    node.shutdown().await;
+    node.shutdown().await.unwrap();
 }
 
 /// Reset completion is fenced by the fragment-wide mutation revision, not
@@ -3448,7 +3902,7 @@ async fn inbound_mutation_after_snapshot_invalidates_reset_completion() {
     assert_eq!(report.state, "buffer_reset");
     assert_eq!(report.reconcile_rounds, 0);
 
-    node.shutdown().await;
+    node.shutdown().await.unwrap();
 }
 
 /// Fetched reconciliation data is an exact response contract: a prematurely
@@ -3601,7 +4055,7 @@ async fn malformed_reconcile_data_is_rejected_without_partial_apply() {
     assert_eq!(report.state, "buffer_reset");
     assert_eq!(report.reconcile_rounds, 0);
 
-    node.shutdown().await;
+    node.shutdown().await.unwrap();
 }
 
 /// Phase 5: batches from a stale session are discarded. We replay a
@@ -3646,7 +4100,7 @@ async fn stale_session_batches_discarded() {
     tokio::time::sleep(Duration::from_millis(500)).await;
     assert!(b.get("evil".to_string()).await.unwrap().is_none());
 
-    b.shutdown().await;
+    b.shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -3708,7 +4162,7 @@ async fn session_start_for_out_of_range_fragment_is_not_admitted() {
         .await
         .unwrap()
         .is_none());
-    node.shutdown().await;
+    node.shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -3827,7 +4281,7 @@ async fn session_started_before_actor_installation_survives_placement_race() {
         batch.ops[0].value
     );
 
-    node.shutdown().await;
+    node.shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -3870,7 +4324,7 @@ async fn current_session_rejects_far_future_timestamp() {
 
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert!(node.get("poisoned".to_string()).await.unwrap().is_none());
-    node.shutdown().await;
+    node.shutdown().await.unwrap();
 }
 
 /// Phase 6: multi-key put/get spanning fragments and nodes.
@@ -3913,8 +4367,8 @@ async fn multi_key_fanout() {
     let res = a.get_multi(keys).await;
     assert_eq!(res.len(), 20);
 
-    a.shutdown().await;
-    b.shutdown().await;
+    a.shutdown().await.unwrap();
+    b.shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -3970,8 +4424,8 @@ async fn remote_batches_split_at_wire_item_limit_without_dropping_connection() {
     }
     assert_eq!(client.peer_count().await, 1);
 
-    client.shutdown().await;
-    owner.shutdown().await;
+    client.shutdown().await.unwrap();
+    owner.shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -4043,8 +4497,8 @@ async fn remote_batches_split_at_encoded_byte_limits_without_false_misses() {
     assert!(get_results[3].as_ref().unwrap().is_none());
     assert_eq!(client.peer_count().await, 1);
 
-    client.shutdown().await;
-    owner.shutdown().await;
+    client.shutdown().await.unwrap();
+    owner.shutdown().await.unwrap();
 }
 
 /// Phase 6: partial failure + replica failover — one replica down,
@@ -4133,7 +4587,7 @@ async fn multi_key_partial_failure() {
 
     // Kill b (preferred owner). Fragment-1 reads must fail over to c
     // and still succeed; fragment-0 keys stay local.
-    b.shutdown().await;
+    b.shutdown().await.unwrap();
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     let results = a.get_multi(all_keys.clone()).await;
@@ -4155,7 +4609,7 @@ async fn multi_key_partial_failure() {
 
     // Kill c too. Now no replica of fragment 1 is reachable: its keys
     // must error per-key while fragment-0 keys still succeed.
-    c.shutdown().await;
+    c.shutdown().await.unwrap();
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     let results = a.get_multi(all_keys.clone()).await;
@@ -4170,7 +4624,7 @@ async fn multi_key_partial_failure() {
         );
     }
 
-    a.shutdown().await;
+    a.shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -4238,9 +4692,9 @@ async fn batch_operations_fail_over_after_a_stale_owner_returns_unavailable() {
         b"value".to_vec()
     );
 
-    a.shutdown().await;
-    b.shutdown().await;
-    c.shutdown().await;
+    a.shutdown().await.unwrap();
+    b.shutdown().await.unwrap();
+    c.shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -4297,9 +4751,9 @@ async fn mutation_relay_scans_past_the_origin_to_a_connected_owner() {
         Some(b"value".to_vec())
     );
 
-    a.shutdown().await;
-    b.shutdown().await;
-    c.shutdown().await;
+    a.shutdown().await.unwrap();
+    b.shutdown().await.unwrap();
+    c.shutdown().await.unwrap();
 }
 
 /// Phase 7: saturating the background pool must not degrade
@@ -4365,7 +4819,7 @@ async fn background_saturation_leaves_high_priority_p99_unaffected() {
         "high-priority p99 {p99:?} degraded under background saturation"
     );
 
-    n.shutdown().await;
+    n.shutdown().await.unwrap();
 }
 
 /// Phase 7: a queue-cap hit is explicit, counted, and surfaced. A shed
@@ -4412,7 +4866,7 @@ async fn queue_cap_shed_is_explicit_and_counted() {
         "expected shed counts to reflect the shed ops, got {default_shed}"
     );
 
-    n.shutdown().await;
+    n.shutdown().await.unwrap();
 }
 
 /// Phase 7: forwarded priority is preserved end-to-end. A background
@@ -4513,8 +4967,8 @@ async fn forwarded_priority_preserved_end_to_end() {
         "default-priority batch must not shed on b's healthy default pool"
     );
 
-    a.shutdown().await;
-    b.shutdown().await;
+    a.shutdown().await.unwrap();
+    b.shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -4560,8 +5014,8 @@ async fn forwarded_single_put_returns_remote_backpressure() {
     );
     assert!(!b.get_all().await.unwrap().contains_key(&key));
 
-    a.shutdown().await;
-    b.shutdown().await;
+    a.shutdown().await.unwrap();
+    b.shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -4602,8 +5056,8 @@ async fn forwarded_put_returns_remote_storage_failure() {
         "remote storage failure must be returned exactly, got {result:?}"
     );
 
-    a.shutdown().await;
-    b.shutdown().await;
+    a.shutdown().await.unwrap();
+    assert!(matches!(b.shutdown().await, Err(NodeError::Storage(_))));
 }
 
 #[tokio::test]
@@ -4666,9 +5120,9 @@ async fn simultaneous_fragment_gains_bootstrap_only_from_serving_source() {
         );
     }
 
-    a.shutdown().await;
-    b.shutdown().await;
-    c.shutdown().await;
+    a.shutdown().await.unwrap();
+    b.shutdown().await.unwrap();
+    c.shutdown().await.unwrap();
 }
 
 /// Phase 8: migrate a fragment between two live nodes under continuous
@@ -4899,8 +5353,8 @@ async fn placement_migration_no_lost_writes() {
         );
     }
 
-    a.shutdown().await;
-    b.shutdown().await;
+    a.shutdown().await.unwrap();
+    b.shutdown().await.unwrap();
 }
 
 /// A sender awaiting overflow reconciliation is not drained merely because
@@ -5080,7 +5534,107 @@ async fn placement_drain_waits_for_buffer_reset() {
         "completed drain retained its sender"
     );
 
-    node.shutdown().await;
+    node.shutdown().await.unwrap();
+}
+
+/// Once placement has detached a fragment, a failed final flush keeps the
+/// retained subtree non-authoritative. Re-adding the node cannot revive that
+/// quiesced cache; recovery must finish the flush, stop the old subtree, and
+/// start a fresh one from the durable value.
+#[tokio::test]
+async fn placement_readd_waits_for_failed_final_flush_and_reloads() {
+    use actordb::placement::{FragmentPlacementState, ManualPlacement};
+    use actordb::shard::FragmentId;
+
+    let fragment = FragmentId(0);
+    let controller = Arc::new(ManualPlacement::new(HashMap::from([(
+        fragment,
+        vec!["flush-readd-a".to_string()],
+    )])));
+    let store = Arc::new(ToggleFailStore::default());
+    let node = Node::start(
+        "flush-readd-a".to_string(),
+        "127.0.0.1:0".parse().unwrap(),
+        NodeConfig {
+            fragment_count: 1,
+            placement_controller: Some(controller.clone()),
+            placement_poll_interval: Duration::from_millis(200),
+            placement_drain_warn_interval: Duration::from_millis(50),
+            store: Some(store.clone()),
+            flush_batch_size: usize::MAX,
+            flush_interval: Duration::from_secs(3600),
+            snapshot_interval: Duration::from_secs(3600),
+            clean_interval: Duration::from_secs(3600),
+            ..NodeConfig::default()
+        },
+    )
+    .await
+    .unwrap();
+    common::wait_for(
+        || async {
+            node.placement_report().await.states.get(&fragment)
+                == Some(&FragmentPlacementState::Serving)
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+    let original_workers = node.health().await.unwrap()[&fragment].worker_names.clone();
+
+    node.put("flush-readd-key".to_string(), b"durable".to_vec())
+        .await
+        .unwrap();
+    let attempts_before_loss = store.attempts.load(Ordering::SeqCst);
+    controller.set_placement(HashMap::from([(fragment, vec!["other-owner".to_string()])]));
+    common::wait_for(
+        || async {
+            store.attempts.load(Ordering::SeqCst) > attempts_before_loss
+                && node.placement_report().await.states.get(&fragment)
+                    == Some(&FragmentPlacementState::Draining)
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    controller.set_placement(HashMap::from([(
+        fragment,
+        vec!["flush-readd-a".to_string()],
+    )]));
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        node.placement_report().await.states.get(&fragment),
+        Some(&FragmentPlacementState::Draining),
+        "re-add revived a detached fragment whose final flush still failed"
+    );
+
+    store.failing.store(false, Ordering::SeqCst);
+    common::wait_for(
+        || async {
+            node.placement_report().await.states.get(&fragment)
+                == Some(&FragmentPlacementState::Stopped)
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+    common::wait_for(
+        || async {
+            node.placement_report().await.states.get(&fragment)
+                == Some(&FragmentPlacementState::Serving)
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    let restarted_workers = node.health().await.unwrap()[&fragment].worker_names.clone();
+    assert_ne!(original_workers, restarted_workers);
+    assert_eq!(
+        node.get("flush-readd-key".to_string())
+            .await
+            .unwrap()
+            .unwrap()
+            .value,
+        b"durable".to_vec()
+    );
+    node.shutdown().await.unwrap();
 }
 
 /// A placement reversal cancels an in-progress loss transition. The stale
@@ -5275,7 +5829,7 @@ async fn placement_readd_while_draining_cancels_teardown() {
         b"second".to_vec()
     );
 
-    node.shutdown().await;
+    node.shutdown().await.unwrap();
 }
 
 /// Phase 8: rolling restart with dynamic placement. The survivor keeps
@@ -5364,7 +5918,7 @@ async fn placement_rolling_restart_delta_reconcile_only() {
     .await;
 
     // Restart A: same node_id, fresh (empty) state.
-    a.shutdown().await;
+    a.shutdown().await.unwrap();
     // The surviving replica keeps serving throughout.
     assert_eq!(
         b.get("rk-0".to_string())
@@ -5440,8 +5994,8 @@ async fn placement_rolling_restart_delta_reconcile_only() {
         "protocol-v3 placement bootstrap used the retired sync path"
     );
 
-    a2.shutdown().await;
-    b.shutdown().await;
+    a2.shutdown().await.unwrap();
+    b.shutdown().await.unwrap();
 }
 
 /// Regression test for adversarial review #1: a shed write must never
@@ -5485,7 +6039,7 @@ async fn shed_write_never_acked_ok() {
         );
     }
 
-    n.shutdown().await;
+    n.shutdown().await.unwrap();
 }
 
 /// Shed deletes must surface as `Backpressure`, not masquerade as
@@ -5522,7 +6076,7 @@ async fn shed_delete_never_acked_ok() {
         );
     }
 
-    n.shutdown().await;
+    n.shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -5566,7 +6120,7 @@ async fn inbound_limit_sheds_excess_and_handshake_timeout_releases_capacity() {
         Duration::from_secs(2),
     )
     .await;
-    node.shutdown().await;
+    node.shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -5612,7 +6166,7 @@ async fn pre_auth_frames_have_a_small_cap_and_one_absolute_body_deadline() {
         0
     );
 
-    node.shutdown().await;
+    node.shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -5660,7 +6214,7 @@ async fn hello_auth_second_flight_uses_the_original_handshake_deadline() {
         0
     );
     assert_eq!(node.peer_count().await, 0);
-    node.shutdown().await;
+    node.shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -5697,7 +6251,7 @@ async fn established_idle_is_allowed_but_partial_frame_body_times_out() {
         Duration::from_secs(2),
     )
     .await;
-    node.shutdown().await;
+    node.shutdown().await.unwrap();
 }
 
 /// A ForwardedPut arriving before the mutual handshake completes must close
@@ -5745,7 +6299,7 @@ async fn pre_handshake_forwarded_put_ignored() {
         "pre-handshake ForwardedPut was applied! got {got:?}"
     );
 
-    a.shutdown().await;
+    a.shutdown().await.unwrap();
 }
 
 /// With a cluster secret configured, a valid Hello followed by an invalid
@@ -5804,7 +6358,7 @@ async fn hello_auth_mismatch_drops_connection() {
     // And "b" must not be a peer.
     assert_eq!(a.peer_count().await, 0, "unauthenticated peer was accepted");
 
-    a.shutdown().await;
+    a.shutdown().await.unwrap();
 }
 
 /// A peer must explicitly negotiate the wire version and every semantic bit
@@ -5851,7 +6405,7 @@ async fn incompatible_hello_capabilities_are_rejected() {
         assert_eq!(read, 0);
     }
     assert_eq!(node.peer_count().await, 0);
-    node.shutdown().await;
+    node.shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -5880,7 +6434,7 @@ async fn retired_full_state_sync_frames_close_protocol_v3_connection() {
     )
     .await;
 
-    node.shutdown().await;
+    node.shutdown().await.unwrap();
 }
 
 /// Regression test for adversarial review #4: a Hello claiming our own
@@ -5916,7 +6470,7 @@ async fn hello_claiming_self_id_rejected() {
         .unwrap();
     assert_eq!(n, 0, "expected connection to be closed on self-id Hello");
 
-    a.shutdown().await;
+    a.shutdown().await.unwrap();
 }
 
 /// Peer identity is immutable for the life of a connection. Accepting a
@@ -5958,7 +6512,7 @@ async fn second_hello_closes_established_connection() {
     )
     .await;
 
-    node.shutdown().await;
+    node.shutdown().await.unwrap();
 }
 
 /// Replaying SessionStart with the same id must not clear a failed-repair
@@ -6041,7 +6595,7 @@ async fn same_session_replay_does_not_clear_reconcile_failure() {
     };
     assert!(nack.error.contains("injected permanent failure"));
 
-    node.shutdown().await;
+    assert!(matches!(node.shutdown().await, Err(NodeError::Storage(_))));
 }
 
 /// Positive case: two nodes with the same cluster secret complete the
@@ -6071,8 +6625,8 @@ async fn cluster_secret_handshake_succeeds() {
     assert_eq!(a.peer_count().await, 1);
     assert_eq!(b.peer_count().await, 1);
 
-    a.shutdown().await;
-    b.shutdown().await;
+    a.shutdown().await.unwrap();
+    b.shutdown().await.unwrap();
 }
 
 /// Regression test for adversarial review #2: replicated ops must not
@@ -6128,8 +6682,8 @@ async fn replication_not_shed_under_backpressure() {
         "replicated op was shed under backpressure (ack would be a lie)"
     );
 
-    a.shutdown().await;
-    b.shutdown().await;
+    a.shutdown().await.unwrap();
+    b.shutdown().await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -6214,8 +6768,8 @@ async fn memory_applied_ack_does_not_force_a_receiver_store_flush() {
     // Clean shutdown flushes the buffered write, so release the test store
     // only after proving that the ACK itself did not enter it.
     store.release();
-    a.shutdown().await;
-    b.shutdown().await;
+    a.shutdown().await.unwrap();
+    b.shutdown().await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -6309,8 +6863,8 @@ async fn replication_ack_waits_for_the_receiver_store_fence() {
         Some(b"value".to_vec())
     );
 
-    a.shutdown().await;
-    b.shutdown().await;
+    a.shutdown().await.unwrap();
+    b.shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -6364,8 +6918,8 @@ async fn replication_rejects_an_ack_below_the_configured_durability() {
         0
     );
 
-    a.shutdown().await;
-    b.shutdown().await;
+    a.shutdown().await.unwrap();
+    b.shutdown().await.unwrap();
 }
 
 /// An admitted ordinary batch cannot remain in flight forever. A silent peer
@@ -6518,7 +7072,7 @@ async fn ordinary_ack_timeout_rotates_session_and_replays_exact_batch() {
     )
     .await;
 
-    node.shutdown().await;
+    node.shutdown().await.unwrap();
 }
 
 /// ACKs may arrive out of order. Retiring a newer batch must neither refresh
@@ -6686,7 +7240,7 @@ async fn older_batch_timeout_replays_only_the_unacknowledged_batch() {
     )
     .await;
 
-    node.shutdown().await;
+    node.shutdown().await.unwrap();
 }
 
 /// A correlated ACK below the requested durability is not a keepalive. It
@@ -6838,7 +7392,7 @@ async fn weak_ack_does_not_prevent_timeout_and_exact_replay() {
     )
     .await;
 
-    node.shutdown().await;
+    node.shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -6909,8 +7463,8 @@ async fn replication_nack_retries_the_exact_batch_after_store_failure() {
         Some(b"retry-value".to_vec())
     );
 
-    a.shutdown().await;
-    b.shutdown().await;
+    a.shutdown().await.unwrap();
+    b.shutdown().await.unwrap();
 }
 
 /// A failed untracked reconciliation repair must poison that receiver
@@ -6991,8 +7545,8 @@ async fn failed_reconcile_repair_cannot_be_hidden_by_barrier_ack() {
         "repair failure was not retried through a fresh session"
     );
 
-    a.shutdown().await;
-    b.shutdown().await;
+    a.shutdown().await.unwrap();
+    b.shutdown().await.unwrap();
 }
 
 /// A failed local StoreCommitted fence remains required even when the retry
@@ -7171,5 +7725,5 @@ async fn fetched_reconcile_value_retries_failed_local_store_fence() {
     )
     .await;
 
-    node.shutdown().await;
+    node.shutdown().await.unwrap();
 }

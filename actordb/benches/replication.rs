@@ -142,8 +142,8 @@ fn bench_replication(c: &mut Criterion) {
     }
     group.finish();
 
-    rt.block_on(node_a.shutdown());
-    rt.block_on(node_b.shutdown());
+    rt.block_on(node_a.shutdown()).unwrap();
+    rt.block_on(node_b.shutdown()).unwrap();
 }
 
 criterion_group!(benches, bench_replication);

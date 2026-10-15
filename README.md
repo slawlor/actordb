@@ -151,9 +151,9 @@ let puts = node.put_multi(vec![
 let gets = node.get_multi(vec!["k1".to_string(), "k2".to_string()]).await;
 let peers = node.peer_count().await;
 
-// Stop admitting application work and await it before this call. shutdown()
-// then joins Node-owned transport work and flushes/stops fragment actors.
-node.shutdown().await;
+// shutdown() closes public-operation admission, joins Node-owned transport
+// work, drains fragment actors, and reports the exact final store flush.
+node.shutdown().await?;
 ```
 
 `Node::start` uses the default transport and replication liveness policy. Use
@@ -489,12 +489,18 @@ as issues in the [issue tracker](https://github.com/slawlor/actordb/issues):
   and the public `replication::SenderMsg`: reconciliation messages gained
   cursor, revision, page, and completion fields, so struct literals and
   exhaustive assumptions must be updated.
-- **Shutdown is explicit** — `Node::shutdown().await` closes Node-owned task
-  admission, joins listener/connection/dial work, stops replication senders,
-  and waits for fragment supervisors to flush and exit. Dropping `Node` only
-  requests best-effort cancellation and stop; it cannot await a flush or join.
-  The Node does not fence arbitrary calls already executing in other tasks, so
-  callers must stop admitting operations and await them before shutdown.
+- **Shutdown is explicit and fallible** — `Node::shutdown().await` atomically
+  closes public-operation admission (`NodeError::ShuttingDown` for later
+  calls), joins listener/connection/dial work, waits for already-admitted API
+  work, stops replication senders, drains every fragment mailbox, and reports
+  the final local-store flush. A flush error retains the quiesced fragment and
+  its batch; retry `shutdown` until it succeeds. The node does not resume after
+  an error. This local fence does not wait for replication ACKs. Dropping
+  `Node` only requests best-effort cancellation and stop; it cannot report a
+  flush failure or await a join. This pre-release change is a Rust source break:
+  callers must handle the new shutdown `Result`, and exhaustive matches over
+  `NodeError` or the advanced `SupervisorMessage` API must include their new
+  lifecycle variants.
 - **Tombstones are retained** — `Node::start` rejects every
   `tombstone_gc_age: Some(..)` setting. Safe reclamation needs durable
   per-replica convergence evidence plus a durable store delete path; elapsed

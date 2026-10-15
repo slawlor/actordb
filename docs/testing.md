@@ -82,7 +82,18 @@ process — the bulk of behavioral coverage:
   `fetched_reconcile_value_retries_failed_local_store_fence`.
 - **Persistence**: `persistence_roundtrip`,
   `persistence_keeps_gossiped_winner`, `persistence_flushes_on_shutdown`,
-  `memory_store_exercises_persistence_plumbing`.
+  `shutdown_flush_failure_is_retryable_across_all_fragments`,
+  `cancelled_shutdown_waiter_resumes_retained_final_flush`,
+  `shutdown_rejects_new_calls_and_waits_for_an_admitted_put`,
+  `shutdown_materializes_expiry_before_the_final_flush`, and
+  `memory_store_exercises_persistence_plumbing`. The supervision unit test
+  `quiesce_drains_preaccepted_worker_messages_before_flushing` proves accepted
+  worker work reaches the authoritative final flush, while
+  `standalone_dispatcher_drain_flushes_buffered_writes` pins the public actor
+  contract. `failed_supervisor_start_joins_partial_worker_tree` and
+  `failed_snapshotter_start_joins_completed_supervisor_children` cover nested
+  startup rollback; `cancelled_subtree_start_remains_registered_until_startup_completes`
+  covers the placement-task cancellation race.
 - **Multi-key**: `multi_key_fanout`, `multi_key_partial_failure`,
   `batch_operations_fail_over_after_a_stale_owner_returns_unavailable`,
   `mutation_relay_scans_past_the_origin_to_a_connected_owner`,
@@ -107,7 +118,8 @@ process — the bulk of behavioral coverage:
   through reconciliation with the retired sync counter still zero),
   `placement_bootstrap_fetch_requires_verification_round`,
   `placement_drain_waits_for_buffer_reset`, and
-  `placement_readd_while_draining_cancels_teardown`.
+  `placement_readd_while_draining_cancels_teardown`, and
+  `placement_readd_waits_for_failed_final_flush_and_reloads`.
 
 Shared helpers (`wait_for` poll-until-timeout) live in
 `actordb/tests/common/mod.rs`.
