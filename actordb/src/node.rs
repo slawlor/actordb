@@ -4595,6 +4595,85 @@ mod tests {
         )
     }
 
+    fn test_sender_report() -> Arc<Mutex<SenderStateReport>> {
+        Arc::new(Mutex::new(SenderStateReport {
+            state: "disconnected".to_string(),
+            session_id: 0,
+            buffered: 0,
+            in_flight: 0,
+            last_ack_durability: None,
+            ack_durability_mismatch: false,
+            reconcile_rounds: 0,
+        }))
+    }
+
+    fn test_placement_deps(
+        router: FragmentRouter,
+        serving: Arc<RwLock<HashSet<FragmentId>>>,
+        placement: Arc<RwLock<HashMap<FragmentId, Vec<String>>>>,
+        supervisors: Arc<Mutex<HashMap<FragmentId, ActorRef<SupervisorMessage>>>>,
+        senders: SenderMap,
+        sender_reports: SenderReportMap,
+    ) -> PlacementDriverDeps {
+        PlacementDriverDeps {
+            node_id: "node-a".to_string(),
+            controller: Arc::new(crate::placement::StaticPlacement::new(HashMap::new())),
+            poll_interval: Duration::from_secs(3600),
+            drain_warn_interval: Duration::from_secs(3600),
+            fragment_count: 1,
+            subtree_config: NodeConfig::default(),
+            router,
+            serving,
+            placement,
+            supervisors,
+            placement_states: Arc::new(Mutex::new(HashMap::from([(
+                FragmentId(0),
+                FragmentPlacementState::Draining,
+            )]))),
+            senders,
+            sender_reports,
+            sender_config: SenderConfig::default(),
+            sender_runtime: SenderRuntimeOptions::default(),
+            peers: Arc::new(Mutex::new(HashMap::new())),
+            hlc: Arc::new(Mutex::new(HlcClock::new())),
+        }
+    }
+
+    fn test_connection_context(
+        router: FragmentRouter,
+        serving: Arc<RwLock<HashSet<FragmentId>>>,
+        placement: Arc<RwLock<HashMap<FragmentId, Vec<String>>>>,
+        dynamic_placement: bool,
+        senders: SenderMap,
+        sender_reports: SenderReportMap,
+        peers: PeerMap,
+    ) -> ConnContext {
+        ConnContext {
+            node_id: "local".to_string(),
+            router,
+            serving,
+            placement,
+            dynamic_placement,
+            pending_gets: Arc::new(StdMutex::new(HashMap::new())),
+            pending_batch_gets: Arc::new(StdMutex::new(HashMap::new())),
+            pending_mutations: Arc::new(StdMutex::new(HashMap::new())),
+            pending_relays: Arc::new(Mutex::new(HashMap::new())),
+            pending_mutation_relays: Arc::new(Mutex::new(HashMap::new())),
+            next_req_id: Arc::new(AtomicU64::new(1)),
+            peers,
+            tasks: Arc::new(Mutex::new(Vec::new())),
+            hlc: Arc::new(Mutex::new(HlcClock::new())),
+            senders,
+            sender_config: SenderConfig::default(),
+            sender_runtime: SenderRuntimeOptions::default(),
+            runtime_options: NodeRuntimeOptions::default(),
+            sender_reports,
+            sync_entries_applied: Arc::new(AtomicU64::new(0)),
+            membership_tx: None,
+            cluster_secret: None,
+        }
+    }
+
     fn result(key: &str, request_index: u32) -> MutationResult {
         MutationResult {
             key: key.to_string(),
@@ -4605,6 +4684,23 @@ mod tests {
             winner_is_tombstone: false,
             request_index,
         }
+    }
+
+    async fn write_test_envelope(stream: &mut tokio::io::DuplexStream, envelope: Envelope) {
+        let frame = envelope.encode_to_vec();
+        stream.write_u32(frame.len() as u32).await.unwrap();
+        stream.write_all(&frame).await.unwrap();
+    }
+
+    async fn read_test_envelope(stream: &mut tokio::io::DuplexStream) -> Envelope {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            let len = stream.read_u32().await.unwrap() as usize;
+            let mut frame = vec![0; len];
+            stream.read_exact(&mut frame).await.unwrap();
+            Envelope::decode(frame.as_slice()).unwrap()
+        })
+        .await
+        .expect("timed out waiting for test protocol frame")
     }
 
     #[test]
@@ -4677,6 +4773,226 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn saturated_ack_and_nack_control_lanes_close_the_connection() {
+        for nack in [false, true] {
+            let fragment = FragmentId(0);
+            let report = test_sender_report();
+            let report_guard = report.lock().await;
+            let sender = spawn_node_sender(
+                fragment,
+                "peer".to_string(),
+                SenderConfig::default(),
+                SenderDeps {
+                    router: FragmentRouter::new(1, 0),
+                    hlc: Arc::new(Mutex::new(HlcClock::new())),
+                    reset_senders: Arc::new(Mutex::new(HashMap::new())),
+                    state_report: report.clone(),
+                },
+                SenderRuntimeOptions::default().with_control_channel_capacity(1),
+            )
+            .unwrap();
+            sender
+                .send(SenderMsg::Ack {
+                    session_id: 1,
+                    batch_seq: 1,
+                    durability: ReplicationAckDurability::MemoryApplied,
+                })
+                .unwrap();
+
+            let senders = Arc::new(Mutex::new(HashMap::from([(
+                (fragment, "peer".to_string()),
+                sender.clone(),
+            )])));
+            let sender_reports = Arc::new(Mutex::new(HashMap::from([(
+                (fragment, "peer".to_string()),
+                report.clone(),
+            )])));
+            let peers: PeerMap = Arc::new(Mutex::new(HashMap::new()));
+            let ctx = test_connection_context(
+                FragmentRouter::new(1, 0),
+                Arc::new(RwLock::new(HashSet::new())),
+                Arc::new(RwLock::new(HashMap::new())),
+                true,
+                senders,
+                sender_reports,
+                peers.clone(),
+            );
+            let (mut client, server) = tokio::io::duplex(4096);
+            let connection = tokio::spawn(handle_connection(ctx, Box::pin(server), false));
+            write_test_envelope(
+                &mut client,
+                Envelope {
+                    msg: Some(EnvelopeMsg::Hello(Hello {
+                        node_id: "peer".to_string(),
+                        auth_tag: Vec::new(),
+                        min_protocol_version: WIRE_PROTOCOL_VERSION,
+                        max_protocol_version: WIRE_PROTOCOL_VERSION,
+                        capabilities: REQUIRED_WIRE_CAPABILITIES,
+                    })),
+                },
+            )
+            .await;
+            tokio::time::timeout(Duration::from_secs(1), async {
+                loop {
+                    if peers.lock().await.contains_key("peer") {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("peer Hello was not installed");
+
+            let response = if nack {
+                EnvelopeMsg::BatchNack(BatchNack {
+                    session_id: 1,
+                    batch_seq: 2,
+                    fragment: fragment.0,
+                    error: "retry".to_string(),
+                })
+            } else {
+                EnvelopeMsg::BatchAck(BatchAck {
+                    session_id: 1,
+                    batch_seq: 2,
+                    fragment: fragment.0,
+                    level: ReplicationAckLevel::Applied as i32,
+                })
+            };
+            write_test_envelope(
+                &mut client,
+                Envelope {
+                    msg: Some(response),
+                },
+            )
+            .await;
+            tokio::time::timeout(Duration::from_secs(1), connection)
+                .await
+                .expect("saturated sender control lane did not close the connection")
+                .unwrap();
+            assert!(peers.lock().await.is_empty());
+
+            drop(report_guard);
+            sender.stop().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn dynamic_mutations_at_routing_boundaries_fail_closed() {
+        let fragment = FragmentId(0);
+        let router = FragmentRouter::new(1, 0);
+        let serving = Arc::new(RwLock::new(HashSet::new()));
+        let peers: PeerMap = Arc::new(Mutex::new(HashMap::new()));
+        let ctx = test_connection_context(
+            router,
+            serving.clone(),
+            Arc::new(RwLock::new(HashMap::new())),
+            true,
+            Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(Mutex::new(HashMap::new())),
+            peers.clone(),
+        );
+        let (mut client, server) = tokio::io::duplex(4096);
+        let connection = tokio::spawn(handle_connection(ctx, Box::pin(server), false));
+        write_test_envelope(
+            &mut client,
+            Envelope {
+                msg: Some(EnvelopeMsg::Hello(Hello {
+                    node_id: "peer".to_string(),
+                    auth_tag: Vec::new(),
+                    min_protocol_version: WIRE_PROTOCOL_VERSION,
+                    max_protocol_version: WIRE_PROTOCOL_VERSION,
+                    capabilities: REQUIRED_WIRE_CAPABILITIES,
+                })),
+            },
+        )
+        .await;
+        assert!(matches!(
+            read_test_envelope(&mut client).await.msg,
+            Some(EnvelopeMsg::Hello(_))
+        ));
+
+        write_test_envelope(
+            &mut client,
+            Envelope {
+                msg: Some(EnvelopeMsg::ForwardedPut(ForwardedPut {
+                    key: "hop-limit".to_string(),
+                    value: b"value".to_vec(),
+                    timestamp_ms: 1,
+                    node_id: "peer".to_string(),
+                    seq: 1,
+                    boot_id: 1,
+                    expires_at_ms: 0,
+                    is_tombstone: false,
+                    priority: ProtoPriority::Default as i32,
+                    hops: MAX_FORWARD_HOPS,
+                    req_id: 11,
+                })),
+            },
+        )
+        .await;
+        let hop_envelope = read_test_envelope(&mut client).await;
+        assert!(matches!(
+            hop_envelope.msg.as_ref(),
+            Some(EnvelopeMsg::MutationResponse(_))
+        ));
+        if let Some(EnvelopeMsg::MutationResponse(hop_response)) = hop_envelope.msg {
+            assert_eq!(hop_response.req_id, 11);
+            assert_eq!(hop_response.results.len(), 1);
+            assert_eq!(
+                hop_response.results[0].status,
+                MutationStatus::Unavailable as i32
+            );
+        }
+
+        // This state is an invariant violation, but the defensive path must
+        // fail the whole batch instead of applying without an owned actor.
+        serving.write().unwrap().insert(fragment);
+        write_test_envelope(
+            &mut client,
+            Envelope {
+                msg: Some(EnvelopeMsg::BatchPut(BatchPut {
+                    puts: vec![ForwardedPut {
+                        key: "missing-actor".to_string(),
+                        value: b"value".to_vec(),
+                        timestamp_ms: 2,
+                        node_id: "peer".to_string(),
+                        seq: 2,
+                        boot_id: 1,
+                        expires_at_ms: 0,
+                        is_tombstone: false,
+                        priority: ProtoPriority::Default as i32,
+                        hops: 0,
+                        req_id: 12,
+                    }],
+                    priority: ProtoPriority::Default as i32,
+                    req_id: 12,
+                })),
+            },
+        )
+        .await;
+        let batch_envelope = read_test_envelope(&mut client).await;
+        assert!(matches!(
+            batch_envelope.msg.as_ref(),
+            Some(EnvelopeMsg::MutationResponse(_))
+        ));
+        if let Some(EnvelopeMsg::MutationResponse(batch_response)) = batch_envelope.msg {
+            assert_eq!(batch_response.req_id, 12);
+            assert_eq!(batch_response.results.len(), 1);
+            assert_eq!(
+                batch_response.results[0].status,
+                MutationStatus::Unavailable as i32
+            );
+        }
+
+        drop(client);
+        tokio::time::timeout(Duration::from_secs(1), connection)
+            .await
+            .expect("connection did not close after its stream was dropped")
+            .unwrap();
+        assert!(peers.lock().await.is_empty());
+    }
+
+    #[tokio::test]
     async fn placement_revocation_waits_for_admitted_mutation_lease() {
         let router = FragmentRouter::new(1, 0);
         let fragment = FragmentId(0);
@@ -4732,6 +5048,358 @@ mod tests {
 
         assert!(!fragment_sender_set_is_drained(fragment, &senders, &reports).await);
         sender.stop().await;
+    }
+
+    #[tokio::test]
+    async fn stopped_sender_entry_is_replaced_in_snapshot_recovery() {
+        let fragment = FragmentId(0);
+        let router = FragmentRouter::new(1, 0);
+        let hlc = Arc::new(Mutex::new(HlcClock::new()));
+        let config = NodeConfig::default();
+        let (supervisor, dispatcher) =
+            spawn_fragment_subtree("replace-sender-test", fragment, &config, &hlc)
+                .await
+                .unwrap();
+        router.insert(fragment, dispatcher);
+        let senders: SenderMap = Arc::new(Mutex::new(HashMap::new()));
+        let reports: SenderReportMap = Arc::new(Mutex::new(HashMap::new()));
+        let peers: PeerMap = Arc::new(Mutex::new(HashMap::new()));
+        let sender_config = SenderConfig::default();
+        let runtime = SenderRuntimeOptions::default();
+
+        ensure_sender_entry(
+            fragment,
+            "peer",
+            SenderEntryDeps {
+                config: &sender_config,
+                runtime: &runtime,
+                router: &router,
+                hlc: &hlc,
+                senders: &senders,
+                reports: &reports,
+                peers: &peers,
+            },
+        )
+        .await;
+        let original = senders
+            .lock()
+            .await
+            .get(&(fragment, "peer".to_string()))
+            .cloned()
+            .unwrap();
+        original.stop().await;
+
+        ensure_sender_entry(
+            fragment,
+            "peer",
+            SenderEntryDeps {
+                config: &sender_config,
+                runtime: &runtime,
+                router: &router,
+                hlc: &hlc,
+                senders: &senders,
+                reports: &reports,
+                peers: &peers,
+            },
+        )
+        .await;
+        let replacement = senders
+            .lock()
+            .await
+            .get(&(fragment, "peer".to_string()))
+            .cloned()
+            .unwrap();
+        assert!(!replacement.is_closed());
+        assert!(!replacement.ingress_is_idle());
+        assert_eq!(reports.lock().await.len(), 1);
+
+        replacement.stop().await;
+        router.remove(fragment);
+        let _ = supervisor.stop_and_wait(None, None).await;
+    }
+
+    #[tokio::test]
+    async fn drain_set_ignores_other_fragments_and_requires_a_matching_report() {
+        let target = FragmentId(0);
+        let other = FragmentId(1);
+        let other_report = test_sender_report();
+        let other_sender = spawn_node_sender(
+            other,
+            "peer".to_string(),
+            SenderConfig::default(),
+            SenderDeps {
+                router: FragmentRouter::new(2, 0),
+                hlc: Arc::new(Mutex::new(HlcClock::new())),
+                reset_senders: Arc::new(Mutex::new(HashMap::new())),
+                state_report: other_report.clone(),
+            },
+            SenderRuntimeOptions::default(),
+        )
+        .unwrap();
+        let other_key = (other, "peer".to_string());
+        let mut senders = HashMap::from([(other_key.clone(), other_sender.clone())]);
+        let reports = HashMap::from([(other_key, other_report)]);
+        assert!(fragment_sender_set_is_drained(target, &senders, &reports).await);
+
+        let target_sender = spawn_node_sender(
+            target,
+            "peer".to_string(),
+            SenderConfig::default(),
+            SenderDeps {
+                router: FragmentRouter::new(2, 0),
+                hlc: Arc::new(Mutex::new(HlcClock::new())),
+                reset_senders: Arc::new(Mutex::new(HashMap::new())),
+                state_report: test_sender_report(),
+            },
+            SenderRuntimeOptions::default(),
+        )
+        .unwrap();
+        senders.insert((target, "peer".to_string()), target_sender.clone());
+        assert!(!fragment_sender_set_is_drained(target, &senders, &reports).await);
+
+        target_sender.stop().await;
+        other_sender.stop().await;
+    }
+
+    #[tokio::test]
+    async fn final_teardown_commit_restores_a_concurrently_readded_fragment() {
+        let fragment = FragmentId(0);
+        let router = FragmentRouter::new(1, 0);
+        let config = NodeConfig::default();
+        let hlc = Arc::new(Mutex::new(HlcClock::new()));
+        let (supervisor, dispatcher) =
+            spawn_fragment_subtree("readd-at-commit-test", fragment, &config, &hlc)
+                .await
+                .unwrap();
+        router.insert(fragment, dispatcher);
+        let supervisors = Arc::new(Mutex::new(HashMap::from([(fragment, supervisor.clone())])));
+        let serving = Arc::new(RwLock::new(HashSet::from([fragment])));
+        let placement = Arc::new(RwLock::new(HashMap::from([(
+            fragment,
+            vec!["peer".to_string()],
+        )])));
+        let report = test_sender_report();
+        let report_guard = report.lock().await;
+        let sender = spawn_node_sender(
+            fragment,
+            "peer".to_string(),
+            SenderConfig::default(),
+            SenderDeps {
+                router: router.clone(),
+                hlc: hlc.clone(),
+                reset_senders: Arc::new(Mutex::new(HashMap::new())),
+                state_report: report.clone(),
+            },
+            SenderRuntimeOptions::default(),
+        )
+        .unwrap();
+        let key = (fragment, "peer".to_string());
+        let senders = Arc::new(Mutex::new(HashMap::from([(key.clone(), sender.clone())])));
+        let reports = Arc::new(Mutex::new(HashMap::from([(key, report.clone())])));
+        let deps = test_placement_deps(
+            router.clone(),
+            serving.clone(),
+            placement.clone(),
+            supervisors.clone(),
+            senders.clone(),
+            reports,
+        );
+        let loss_deps = deps.clone();
+        let loss = tokio::spawn(async move {
+            lose_fragment(&loss_deps, fragment).await;
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if !serving.read().unwrap().contains(&fragment) && senders.try_lock().is_err() {
+                    tokio::task::yield_now().await;
+                    if senders.try_lock().is_err() {
+                        break;
+                    }
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("loss transition did not reach its preliminary drain check");
+        {
+            let _states = deps.placement_states.lock().await;
+            placement
+                .write()
+                .unwrap()
+                .insert(fragment, vec!["node-a".to_string()]);
+        }
+        drop(report_guard);
+        tokio::time::timeout(Duration::from_secs(1), loss)
+            .await
+            .expect("re-added fragment did not leave teardown")
+            .unwrap();
+
+        assert!(serving.read().unwrap().contains(&fragment));
+        assert_eq!(
+            deps.placement_states.lock().await.get(&fragment),
+            Some(&FragmentPlacementState::Serving)
+        );
+        assert!(router.route_for_fragment(fragment).is_some());
+        assert!(supervisors.lock().await.contains_key(&fragment));
+        sender.stop().await;
+        router.remove(fragment);
+        supervisors.lock().await.remove(&fragment);
+        let _ = supervisor.stop_and_wait(None, None).await;
+    }
+
+    #[tokio::test]
+    async fn final_teardown_commit_retries_when_sender_state_changes() {
+        let fragment = FragmentId(0);
+        let router = FragmentRouter::new(1, 0);
+        let config = NodeConfig::default();
+        let hlc = Arc::new(Mutex::new(HlcClock::new()));
+        let (supervisor, dispatcher) =
+            spawn_fragment_subtree("sender-change-at-commit-test", fragment, &config, &hlc)
+                .await
+                .unwrap();
+        router.insert(fragment, dispatcher);
+        let supervisors = Arc::new(Mutex::new(HashMap::from([(fragment, supervisor.clone())])));
+        let mutation_gate = router.mutation_gate(fragment);
+        let serving = Arc::new(RwLock::new(HashSet::from([fragment])));
+        let placement = Arc::new(RwLock::new(HashMap::from([(
+            fragment,
+            vec!["peer".to_string()],
+        )])));
+        let report = test_sender_report();
+        let report_guard = report.lock().await;
+        let sender = spawn_node_sender(
+            fragment,
+            "peer".to_string(),
+            SenderConfig::default(),
+            SenderDeps {
+                router: router.clone(),
+                hlc: hlc.clone(),
+                reset_senders: Arc::new(Mutex::new(HashMap::new())),
+                state_report: report.clone(),
+            },
+            SenderRuntimeOptions::default(),
+        )
+        .unwrap();
+        let key = (fragment, "peer".to_string());
+        let senders = Arc::new(Mutex::new(HashMap::from([(key.clone(), sender.clone())])));
+        let reports = Arc::new(Mutex::new(HashMap::from([(key, report.clone())])));
+        let deps = test_placement_deps(
+            router.clone(),
+            serving.clone(),
+            placement.clone(),
+            supervisors.clone(),
+            senders.clone(),
+            reports,
+        );
+        let loss_deps = deps.clone();
+        let loss = tokio::spawn(async move {
+            lose_fragment(&loss_deps, fragment).await;
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if !serving.read().unwrap().contains(&fragment) && senders.try_lock().is_err() {
+                    tokio::task::yield_now().await;
+                    if senders.try_lock().is_err() {
+                        break;
+                    }
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("loss transition did not reach its preliminary drain check");
+        let admitted = mutation_gate.read_owned().await;
+        drop(report_guard);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if deps.placement_states.try_lock().is_err() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("loss transition did not reach its final commit fence");
+
+        sender.schedule_reset();
+        let publish_states = deps.placement_states.clone();
+        let publish_placement = placement.clone();
+        let (publisher_started_tx, publisher_started_rx) = oneshot::channel();
+        let publisher = tokio::spawn(async move {
+            let _ = publisher_started_tx.send(());
+            let _states = publish_states.lock().await;
+            publish_placement
+                .write()
+                .unwrap()
+                .insert(fragment, vec!["node-a".to_string()]);
+        });
+        publisher_started_rx.await.unwrap();
+        drop(admitted);
+        tokio::time::timeout(Duration::from_secs(1), publisher)
+            .await
+            .expect("re-add publication remained blocked behind teardown")
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), loss)
+            .await
+            .expect("teardown did not retry after sender state changed")
+            .unwrap();
+
+        assert!(serving.read().unwrap().contains(&fragment));
+        assert_eq!(
+            deps.placement_states.lock().await.get(&fragment),
+            Some(&FragmentPlacementState::Serving)
+        );
+        assert!(senders
+            .lock()
+            .await
+            .contains_key(&(fragment, "peer".to_string())));
+        assert!(router.route_for_fragment(fragment).is_some());
+        assert!(supervisors.lock().await.contains_key(&fragment));
+        sender.stop().await;
+        router.remove(fragment);
+        supervisors.lock().await.remove(&fragment);
+        let _ = supervisor.stop_and_wait(None, None).await;
+    }
+
+    #[tokio::test]
+    async fn completed_teardown_without_registered_supervisor_marks_stopped() {
+        let fragment = FragmentId(0);
+        let router = FragmentRouter::new(1, 0);
+        let config = NodeConfig::default();
+        let hlc = Arc::new(Mutex::new(HlcClock::new()));
+        let (supervisor, dispatcher) =
+            spawn_fragment_subtree("teardown-supervisor-test", fragment, &config, &hlc)
+                .await
+                .unwrap();
+        router.insert(fragment, dispatcher);
+        let serving = Arc::new(RwLock::new(HashSet::from([fragment])));
+        let placement = Arc::new(RwLock::new(HashMap::from([(
+            fragment,
+            vec!["peer".to_string()],
+        )])));
+        let supervisors = Arc::new(Mutex::new(HashMap::new()));
+        let deps = test_placement_deps(
+            router.clone(),
+            serving.clone(),
+            placement,
+            supervisors.clone(),
+            Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(Mutex::new(HashMap::new())),
+        );
+
+        tokio::time::timeout(Duration::from_secs(1), lose_fragment(&deps, fragment))
+            .await
+            .expect("drained fragment teardown did not complete");
+        assert!(!serving.read().unwrap().contains(&fragment));
+        assert!(router.route_for_fragment(fragment).is_none());
+        assert!(supervisors.lock().await.is_empty());
+        assert_eq!(
+            deps.placement_states.lock().await.get(&fragment),
+            Some(&FragmentPlacementState::Stopped)
+        );
+        let _ = supervisor.stop_and_wait(None, None).await;
     }
 
     #[tokio::test]

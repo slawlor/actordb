@@ -3378,7 +3378,7 @@ async fn placement_migration_no_lost_writes() {
         .filter(|k| fragment_of(k, frag_count) == FragmentId(0))
         .take(12)
         .collect();
-    assert!(!keys.is_empty(), "need keys in fragment 0");
+    assert!(keys.len() >= 2, "need at least two keys in fragment 0");
 
     // Seed initial values via A.
     for k in &keys {
@@ -3480,6 +3480,21 @@ async fn placement_migration_no_lost_writes() {
         Duration::from_secs(15),
     )
     .await;
+
+    // Once A has retired the fragment, a grouped write must travel through
+    // B's dynamic BatchPut mutation lease as one ownership decision.
+    let migrated_batch = vec![
+        (keys[0].clone(), b"batch-after-move-0".to_vec()),
+        (keys[1].clone(), b"batch-after-move-1".to_vec()),
+    ];
+    let batch_results = a.put_multi(migrated_batch.clone()).await;
+    assert!(batch_results.into_iter().all(|result| result.is_ok()));
+    for (key, expected_value) in migrated_batch {
+        assert_eq!(
+            b.get(key).await.unwrap().map(|value| value.value),
+            Some(expected_value)
+        );
+    }
 
     a.shutdown().await;
     b.shutdown().await;

@@ -423,21 +423,7 @@ impl NodeSender {
             return Err(NodeSenderSendError::Closed);
         }
         match msg {
-            SenderMsg::Enqueue(op) => {
-                self.ingress.pending_data.fetch_add(1, Ordering::AcqRel);
-                match self.data_tx.try_send(op) {
-                    Ok(()) => Ok(()),
-                    Err(mpsc::error::TrySendError::Full(_)) => {
-                        self.ingress.pending_data.fetch_sub(1, Ordering::AcqRel);
-                        self.schedule_reset();
-                        Ok(())
-                    }
-                    Err(mpsc::error::TrySendError::Closed(_)) => {
-                        self.ingress.pending_data.fetch_sub(1, Ordering::AcqRel);
-                        Err(NodeSenderSendError::Closed)
-                    }
-                }
-            }
+            SenderMsg::Enqueue(op) => self.send_data(op),
             SenderMsg::PeerConnected { peer_tx } => {
                 self.signals_tx.send_if_modified(|signals| {
                     if signals
@@ -474,11 +460,31 @@ impl NodeSender {
                 });
                 Ok(())
             }
-            control => match self.control_tx.try_send(control) {
-                Ok(()) => Ok(()),
-                Err(mpsc::error::TrySendError::Full(_)) => Err(NodeSenderSendError::Full),
-                Err(mpsc::error::TrySendError::Closed(_)) => Err(NodeSenderSendError::Closed),
-            },
+            control => self.send_control(control),
+        }
+    }
+
+    fn send_data(&self, op: crate::actor::ReplicatedOp) -> Result<(), NodeSenderSendError> {
+        self.ingress.pending_data.fetch_add(1, Ordering::AcqRel);
+        match self.data_tx.try_send(op) {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                self.ingress.pending_data.fetch_sub(1, Ordering::AcqRel);
+                self.schedule_reset();
+                Ok(())
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                self.ingress.pending_data.fetch_sub(1, Ordering::AcqRel);
+                Err(NodeSenderSendError::Closed)
+            }
+        }
+    }
+
+    fn send_control(&self, control: SenderMsg) -> Result<(), NodeSenderSendError> {
+        match self.control_tx.try_send(control) {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Full(_)) => Err(NodeSenderSendError::Full),
+            Err(mpsc::error::TrySendError::Closed(_)) => Err(NodeSenderSendError::Closed),
         }
     }
 
@@ -2491,6 +2497,7 @@ fn rand_session_id() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use prost::Message as _;
     use std::sync::atomic::{AtomicBool, Ordering};
 
     fn op(key: &str) -> crate::actor::ReplicatedOp {
@@ -2514,6 +2521,41 @@ mod tests {
         }))
     }
 
+    async fn wait_for_sender_report(
+        report: &Arc<Mutex<SenderStateReport>>,
+        predicate: impl Fn(&SenderStateReport) -> bool,
+    ) -> SenderStateReport {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let state = report.lock().await.clone();
+                if predicate(&state) {
+                    return state;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("sender state did not converge")
+    }
+
+    #[test]
+    fn sender_option_diagnostics_cover_node_ingress_limits() {
+        let debug = format!("{:?}", SenderRuntimeOptions::default());
+        assert!(debug.contains("control_channel_capacity: 64"));
+        assert_eq!(
+            SenderOptionsError::BufferCapacityTooLarge.to_string(),
+            "replication buffer capacity exceeds Tokio's maximum"
+        );
+        assert_eq!(
+            SenderOptionsError::ZeroControlChannelCapacity.to_string(),
+            "replication control channel capacity must be non-zero"
+        );
+        assert_eq!(
+            SenderOptionsError::ControlChannelCapacityTooLarge.to_string(),
+            "replication control channel capacity exceeds Tokio's maximum"
+        );
+    }
+
     #[tokio::test]
     async fn node_sender_bounds_data_and_control_without_losing_signals() {
         let (data_tx, mut data_rx) = mpsc::channel(1);
@@ -2521,9 +2563,12 @@ mod tests {
         let (signals_tx, signals_rx) = watch::channel(NodeSenderSignals::default());
         let ingress = Arc::new(NodeSenderIngress::default());
         let (stopped_tx, stopped) = watch::channel(false);
+        let (started_tx, started_rx) = oneshot::channel();
+        let (finish_tx, finish_rx) = oneshot::channel();
         let task = tokio::spawn(async move {
-            let _stopped_tx = stopped_tx;
-            std::future::pending::<()>().await;
+            let _exit = NodeSenderTaskExit(stopped_tx);
+            let _ = started_tx.send(());
+            let _ = finish_rx.await;
         });
         let sender = NodeSender {
             data_tx,
@@ -2534,6 +2579,8 @@ mod tests {
             stopped,
             stop_lock: Arc::new(Mutex::new(())),
         };
+        started_rx.await.unwrap();
+        assert!(!task.is_finished());
 
         sender.send(SenderMsg::Enqueue(op("queued"))).unwrap();
         // This command is shed only after a persistent reset generation is
@@ -2590,6 +2637,32 @@ mod tests {
             control_rx.recv().await,
             Some(SenderMsg::Ack { .. })
         ));
+        let pending_before_closed_send = sender.ingress.pending_data.load(Ordering::Acquire);
+        let overflow_before_closed_send = sender.signals_tx.borrow().overflow_generation;
+        drop(data_rx);
+        assert_eq!(
+            sender.send_data(op("closed-data")),
+            Err(NodeSenderSendError::Closed)
+        );
+        assert_eq!(
+            sender.ingress.pending_data.load(Ordering::Acquire),
+            pending_before_closed_send
+        );
+        assert_eq!(
+            sender.signals_tx.borrow().overflow_generation,
+            overflow_before_closed_send
+        );
+        drop(control_rx);
+        assert_eq!(
+            sender.send_control(SenderMsg::Ack {
+                session_id: 1,
+                batch_seq: 3,
+                durability: ReplicationAckDurability::MemoryApplied,
+            }),
+            Err(NodeSenderSendError::Closed)
+        );
+        finish_tx.send(()).unwrap();
+        task.await.unwrap();
         sender.stop().await;
         assert_eq!(
             sender.send(SenderMsg::ReconcileNow),
@@ -2640,6 +2713,47 @@ mod tests {
             tokio::time::timeout(Duration::from_secs(1), inbox.recv()).await,
             Ok(SenderInput::ReconcileNow)
         ));
+    }
+
+    #[tokio::test]
+    async fn node_sender_observes_signal_lane_close_and_reports_task_exit() {
+        let (data_tx, data_rx) = mpsc::channel(1);
+        let (control_tx, control_rx) = mpsc::channel(1);
+        let (signals_tx, signals_rx) = watch::channel(NodeSenderSignals::default());
+        let mut inbox = SenderInbox::Node {
+            data_rx,
+            control_rx,
+            signals_rx,
+            delivered_overflow_generation: 0,
+            delivered_reconcile_generation: 0,
+            delivered_peer_generation: 0,
+            ingress: Arc::new(NodeSenderIngress::default()),
+        };
+        drop(signals_tx);
+        assert!(matches!(inbox.recv().await, SenderInput::Closed));
+        drop(data_tx);
+        drop(control_tx);
+
+        let sender = spawn_node_sender(
+            FragmentId(0),
+            "peer".to_string(),
+            SenderConfig::default(),
+            SenderDeps {
+                router: crate::node::FragmentRouter::new(1, 0),
+                hlc: Arc::new(Mutex::new(HlcClock::new())),
+                reset_senders: Arc::new(Mutex::new(HashMap::new())),
+                state_report: state_report(),
+            },
+            SenderRuntimeOptions::default(),
+        )
+        .unwrap();
+        let mut stopped = sender.stopped.clone();
+        drop(sender);
+        tokio::time::timeout(Duration::from_secs(1), stopped.changed())
+            .await
+            .expect("sender task did not exit after every ingress handle closed")
+            .expect("sender task dropped its exit signal without publishing completion");
+        assert!(*stopped.borrow());
     }
 
     #[tokio::test]
@@ -2741,6 +2855,7 @@ mod tests {
         assert_eq!(allocate_batch_seq(&mut connection), u64::MAX - 1);
         assert_eq!(allocate_batch_seq(&mut connection), 0);
         assert_eq!(allocate_batch_seq(&mut connection), 1);
+        assert_eq!(next_generation(u64::MAX), 1);
     }
 
     #[test]
@@ -2895,6 +3010,87 @@ mod tests {
         assert!(failed.load(Ordering::SeqCst));
         assert_eq!(rx.recv().await, Some(vec![1]));
         assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn live_overflow_handles_reset_reconcile_admission_failure() {
+        let report = state_report();
+        let sender = spawn_sender_with_options(
+            FragmentId(0),
+            "peer".to_string(),
+            SenderConfig {
+                batch_interval: Duration::from_secs(3600),
+                buffer_capacity: 1,
+                consistency_interval: Duration::from_secs(3600),
+                ..SenderConfig::default()
+            },
+            SenderDeps {
+                router: crate::node::FragmentRouter::new(1, 0),
+                hlc: Arc::new(Mutex::new(HlcClock::new())),
+                reset_senders: Arc::new(Mutex::new(HashMap::new())),
+                state_report: report.clone(),
+            },
+            SenderRuntimeOptions::default().with_queue_admission_timeout(Duration::from_millis(10)),
+        )
+        .unwrap();
+        let (peer_tx, mut peer_rx) = mpsc::channel(1);
+        sender.send(SenderMsg::PeerConnected { peer_tx }).unwrap();
+        wait_for_sender_report(&report, |state| state.state == "connected").await;
+        peer_rx.recv().await.expect("initial SessionStart missing");
+
+        sender.send(SenderMsg::Enqueue(op("first"))).unwrap();
+        sender.send(SenderMsg::Enqueue(op("overflow"))).unwrap();
+        let reset = wait_for_sender_report(&report, |state| state.state == "buffer_reset").await;
+        assert_ne!(reset.session_id, 0);
+        let frame = peer_rx.recv().await.expect("reset SessionStart missing");
+        match Envelope::decode(frame.as_slice()).unwrap().msg {
+            Some(EnvelopeMsg::SessionStart(session)) => {
+                assert_eq!(session.session_id, reset.session_id);
+            }
+            other => panic!("expected reset SessionStart, got {other:?}"),
+        }
+        assert!(peer_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn live_overflow_handles_reset_session_start_admission_failure() {
+        let report = state_report();
+        let sender = spawn_sender_with_options(
+            FragmentId(0),
+            "peer".to_string(),
+            SenderConfig {
+                batch_interval: Duration::from_secs(3600),
+                buffer_capacity: 1,
+                consistency_interval: Duration::from_secs(3600),
+                ..SenderConfig::default()
+            },
+            SenderDeps {
+                router: crate::node::FragmentRouter::new(1, 0),
+                hlc: Arc::new(Mutex::new(HlcClock::new())),
+                reset_senders: Arc::new(Mutex::new(HashMap::new())),
+                state_report: report.clone(),
+            },
+            SenderRuntimeOptions::default().with_queue_admission_timeout(Duration::from_millis(10)),
+        )
+        .unwrap();
+        let (peer_tx, mut peer_rx) = mpsc::channel(1);
+        sender.send(SenderMsg::PeerConnected { peer_tx }).unwrap();
+        let connected = wait_for_sender_report(&report, |state| state.state == "connected").await;
+
+        // Leave the initial SessionStart queued so the reset SessionStart
+        // itself reaches the admission deadline while the transport stays live.
+        sender.send(SenderMsg::Enqueue(op("first"))).unwrap();
+        sender.send(SenderMsg::Enqueue(op("overflow"))).unwrap();
+        let reset = wait_for_sender_report(&report, |state| state.state == "buffer_reset").await;
+        assert_ne!(reset.session_id, 0);
+        let frame = peer_rx.recv().await.expect("initial SessionStart missing");
+        match Envelope::decode(frame.as_slice()).unwrap().msg {
+            Some(EnvelopeMsg::SessionStart(session)) => {
+                assert_eq!(session.session_id, connected.session_id);
+            }
+            other => panic!("expected initial SessionStart, got {other:?}"),
+        }
+        assert!(peer_rx.try_recv().is_err());
     }
 
     #[tokio::test]
