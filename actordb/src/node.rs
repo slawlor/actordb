@@ -36,7 +36,7 @@ use prost::Message as ProstMessage;
 use ractor::rpc::CallResult;
 #[cfg(test)]
 use ractor::Actor;
-use ractor::{ActorRef, ActorRuntime};
+use ractor::{ActorRef, ActorRuntime, SpawnErr};
 use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{
     mpsc, oneshot, watch, Mutex, Notify, OwnedSemaphorePermit, RwLock as AsyncRwLock, Semaphore,
@@ -63,9 +63,10 @@ use crate::replication::{
 };
 use crate::runtime_tasks::RuntimeTasks;
 use crate::shard::{fragment_of, FragmentId};
-use crate::store::{KvStore, PrefixedStore};
+use crate::store::{KvStore, PrefixedStore, StoreBinding, StoreIdentity};
 use crate::supervision::{
-    FragmentHealth, FragmentShutdownError, FragmentSupervisor, SupervisorArgs, SupervisorMessage,
+    FragmentHealth, FragmentShutdownError, FragmentStartupStorageError, FragmentSupervisor,
+    SupervisorArgs, SupervisorMessage,
 };
 use crate::wire::{
     bytes_field_len, check_envelope_budget, check_record_budget, encode_envelope,
@@ -882,8 +883,10 @@ pub enum NodeError {
     /// limit). The caller should retry with backoff or reduce load.
     /// Distinct from "not found" — a shed Get never returns Ok(None).
     Backpressure(String),
-    /// A store failed while applying a mutation or completing a requested
-    /// durability fence such as shutdown.
+    /// Durable state failed to load, validate, or persist during startup; a
+    /// durable timestamp could not seed the clock; or a store failed while
+    /// applying a mutation or completing a requested durability fence such as
+    /// shutdown.
     Storage(String),
     /// A different version already wins the LWW merge. The attempted write
     /// was not applied and is never reported as successful.
@@ -1634,6 +1637,10 @@ pub struct Node {
     shutdown_state: Mutex<ShutdownProgress>,
     replication_drain_report: StdMutex<Option<ReplicationDrainReport>>,
     network: Arc<dyn Network>,
+    /// Exclusive live attachment to the configured store. Clean shutdown
+    /// releases it only after every fragment actor has stopped; cancellation
+    /// and best-effort Drop leave managed backends fail-closed.
+    store_binding: StdMutex<Option<StoreBinding>>,
 }
 
 enum ShutdownProgress {
@@ -1666,6 +1673,13 @@ impl Drop for Node {
         }
         self.retiring_senders.request_stop_all();
         self.supervisor_stops.stop_all();
+        let store_binding = match self.store_binding.get_mut() {
+            Ok(binding) => binding,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let Some(binding) = store_binding.as_mut() {
+            binding.abandon();
+        }
     }
 }
 
@@ -1897,11 +1911,13 @@ async fn spawn_fragment_subtree_registered(
             Ok(Ok(_lifecycle_handle)) => SupervisorStartupState::Ready,
             Ok(Err(error)) => {
                 cleanup_failed_supervisor_start(&startup_supervisor).await;
-                SupervisorStartupState::Failed(error.to_string())
+                SupervisorStartupState::Failed(SupervisorStartupFailure::from_spawn(error))
             }
             Err(error) => {
                 cleanup_failed_supervisor_start(&startup_supervisor).await;
-                SupervisorStartupState::Failed(format!("startup task failed: {error}"))
+                SupervisorStartupState::Failed(SupervisorStartupFailure::Actor(format!(
+                    "startup task failed: {error}"
+                )))
             }
         };
         startup_tx.send_replace(state);
@@ -1911,7 +1927,7 @@ async fn spawn_fragment_subtree_registered(
         Ok(SupervisorStartupState::Ready) => {}
         Ok(SupervisorStartupState::Failed(error)) => {
             registry.remove_if(fragment, &supervisor);
-            return Err(NodeError::Actor(error));
+            return Err(error.into_node_error());
         }
         Ok(SupervisorStartupState::Starting) => unreachable!("startup wait returned pending"),
         Err(error) => {
@@ -2072,7 +2088,42 @@ struct RegisteredSupervisor {
 enum SupervisorStartupState {
     Starting,
     Ready,
-    Failed(String),
+    Failed(SupervisorStartupFailure),
+}
+
+#[derive(Clone, Debug)]
+enum SupervisorStartupFailure {
+    Actor(String),
+    Storage(String),
+}
+
+impl SupervisorStartupFailure {
+    fn from_spawn(error: SpawnErr) -> Self {
+        match error {
+            SpawnErr::StartupFailed(error) => {
+                match error.downcast::<FragmentStartupStorageError>() {
+                    Ok(error) => Self::Storage(error.to_string()),
+                    Err(error) => Self::Actor(SpawnErr::StartupFailed(error).to_string()),
+                }
+            }
+            error => Self::Actor(error.to_string()),
+        }
+    }
+
+    fn into_node_error(self) -> NodeError {
+        match self {
+            Self::Actor(error) => NodeError::Actor(error),
+            Self::Storage(error) => NodeError::Storage(error),
+        }
+    }
+}
+
+impl std::fmt::Display for SupervisorStartupFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Actor(error) | Self::Storage(error) => f.write_str(error),
+        }
+    }
 }
 
 async fn wait_for_supervisor_startup(
@@ -2185,6 +2236,21 @@ impl SupervisorRegistry {
     fn clear(&self) {
         self.supervisors.lock().unwrap().clear();
     }
+
+    async fn stop_and_join_all(&self) {
+        let supervisors = self.snapshot();
+        for (_, entry) in &supervisors {
+            entry.actor.stop(None);
+        }
+        for (_, entry) in supervisors {
+            // pre_start may still own child actors. Its independent observer
+            // publishes completion only after failed-start child cleanup.
+            let _ = wait_for_supervisor_startup(entry.startup.clone()).await;
+            entry.actor.stop(None);
+            let _ = entry.actor.wait(None).await;
+        }
+        self.clear();
+    }
 }
 
 impl Drop for SupervisorRegistry {
@@ -2236,19 +2302,6 @@ impl SupervisorStartupGuard {
         self.supervisors.push(supervisor);
     }
 
-    async fn rollback(&mut self) {
-        if !self.armed {
-            return;
-        }
-        for supervisor in &self.supervisors {
-            supervisor.stop(None);
-        }
-        for supervisor in self.supervisors.drain(..) {
-            let _ = supervisor.wait(None).await;
-        }
-        self.armed = false;
-    }
-
     fn disarm(&mut self) {
         self.armed = false;
         self.supervisors.clear();
@@ -2260,6 +2313,45 @@ impl Drop for SupervisorStartupGuard {
         if self.armed {
             for supervisor in &self.supervisors {
                 supervisor.stop(None);
+            }
+        }
+    }
+}
+
+/// Owns a store binding until startup either transfers it to [`Node`] or
+/// proves that every partially created store user has exited.
+struct StoreBindingStartupGuard {
+    binding: Option<StoreBinding>,
+    actors_may_exist: bool,
+}
+
+impl StoreBindingStartupGuard {
+    fn new(binding: Option<StoreBinding>) -> Self {
+        Self {
+            binding,
+            actors_may_exist: false,
+        }
+    }
+
+    fn mark_actors_may_exist(&mut self) {
+        self.actors_may_exist = true;
+    }
+
+    fn allow_release_after_join(&mut self) {
+        self.actors_may_exist = false;
+    }
+
+    fn transfer_to_node(&mut self) -> Option<StoreBinding> {
+        self.actors_may_exist = false;
+        self.binding.take()
+    }
+}
+
+impl Drop for StoreBindingStartupGuard {
+    fn drop(&mut self) {
+        if self.actors_may_exist {
+            if let Some(binding) = self.binding.as_mut() {
+                binding.abandon();
             }
         }
     }
@@ -2571,6 +2663,8 @@ pub struct NodeConfig {
     ///
     /// Must be identical on every node: all nodes must agree on
     /// `fragment_of(key)`, or keys become unreachable.
+    /// Must not exceed `u32::MAX`; the offered RocksDB backend binds this value
+    /// into its persistent identity manifest.
     pub fragment_count: usize,
     /// Static placement: fragment -> replica node_ids. Must be identical
     /// on every node. A non-empty map must cover exactly
@@ -2691,12 +2785,23 @@ impl Default for NodeConfig {
 #[cfg(feature = "rocksdb")]
 impl NodeConfig {
     /// Convenience: a config persisting to RocksDB at `path`, the
-    /// preferred durable implementation.
+    /// preferred durable implementation. Ordinary batches use synchronous WAL
+    /// commits; use [`NodeConfig::with_rocksdb_options`] for an explicit policy.
     pub fn with_rocksdb(
         path: impl AsRef<std::path::Path>,
     ) -> Result<Self, crate::store::StoreError> {
+        Self::with_rocksdb_options(path, crate::store::RocksDbOptions::default())
+    }
+
+    /// Convenience: a config persisting to RocksDB with explicit open options.
+    pub fn with_rocksdb_options(
+        path: impl AsRef<std::path::Path>,
+        options: crate::store::RocksDbOptions,
+    ) -> Result<Self, crate::store::StoreError> {
         Ok(Self {
-            store: Some(Arc::new(crate::store::RocksDbStore::open(path)?)),
+            store: Some(Arc::new(crate::store::RocksDbStore::open_with_options(
+                path, options,
+            )?)),
             ..Self::default()
         })
     }
@@ -2756,6 +2861,12 @@ impl Node {
             return Err(NodeError::Actor(
                 "fragment_count must be non-zero".to_string(),
             ));
+        }
+        if config.fragment_count > u32::MAX as usize {
+            return Err(NodeError::Actor(format!(
+                "fragment_count must not exceed {}",
+                u32::MAX
+            )));
         }
         config
             .replication
@@ -2827,6 +2938,17 @@ impl Node {
             config.fragment_map.clone()
         };
 
+        // Bind immutable storage identity before network or actor side effects.
+        // The binding remains owned by Node until every fragment has stopped.
+        let store_identity = StoreIdentity::new(node_id.clone(), config.fragment_count as u32);
+        let store_binding = config
+            .store
+            .as_ref()
+            .map(|store| store.bind(&store_identity))
+            .transpose()
+            .map_err(|error| NodeError::Storage(error.to_string()))?;
+        let mut store_binding = StoreBindingStartupGuard::new(store_binding);
+
         // One actor per fragment. With persistence, each fragment gets
         // its own key namespace via PrefixedStore, sharing the one
         // underlying store.
@@ -2896,6 +3018,9 @@ impl Node {
         let placement_tasks = RuntimeTasks::new(TASK_COMMAND_CAPACITY);
         let mut startup_supervisors = SupervisorStartupGuard::new(my_fragments.len());
         for fragment in my_fragments {
+            // From this point cancellation may leave a synchronously starting
+            // actor alive. The binding must then remain fail-closed.
+            store_binding.mark_actors_may_exist();
             let (supervisor, dispatcher) = match spawn_fragment_subtree_registered(
                 &node_id,
                 fragment,
@@ -2908,7 +3033,9 @@ impl Node {
                 Ok(subtree) => subtree,
                 Err(error) => {
                     tasks.shutdown().await;
-                    startup_supervisors.rollback().await;
+                    supervisor_stops.stop_and_join_all().await;
+                    startup_supervisors.disarm();
+                    store_binding.allow_release_after_join();
                     return Err(error);
                 }
             };
@@ -2930,7 +3057,9 @@ impl Node {
             {
                 router.remove_if_generation(fragment, generation);
                 tasks.shutdown().await;
-                startup_supervisors.rollback().await;
+                supervisor_stops.stop_and_join_all().await;
+                startup_supervisors.disarm();
+                store_binding.allow_release_after_join();
                 return Err(NodeError::Actor(
                     "node runtime stopped during dispatcher-monitor startup".to_string(),
                 ));
@@ -2990,6 +3119,7 @@ impl Node {
             shutdown_state: Mutex::new(ShutdownProgress::Running),
             replication_drain_report: StdMutex::new(None),
             network: config.network.clone(),
+            store_binding: StdMutex::new(store_binding.transfer_to_node()),
         };
 
         if !node
@@ -4495,6 +4625,8 @@ impl Node {
             }
             self.supervisors.lock().await.clear();
             self.supervisor_stops.clear();
+            let store_binding = self.store_binding.lock().unwrap().take();
+            drop(store_binding);
             self.operation_gate.finish_shutdown();
             *progress = ShutdownProgress::Stopped;
         }
@@ -4510,7 +4642,8 @@ impl Node {
     /// stopping any supervisor. A failed store flush leaves the fragment state
     /// and retryable batch owned by its supervisor; this method returns the
     /// error and a later call resumes shutdown. Only a successful return drops
-    /// all fragment state and releases a configured RocksDB lock.
+    /// all fragment state and releases a configured RocksDB lock and live
+    /// attachment.
     ///
     /// This local durability fence does not wait for peer replication ACKs;
     /// transport convergence has its own lifecycle policy. Calling this after
@@ -8413,6 +8546,107 @@ mod tests {
         }
     }
 
+    struct BlockingExclusiveLoadStore {
+        attached: Arc<AtomicBool>,
+        entered: AtomicBool,
+        exited: AtomicBool,
+        release: (StdMutex<bool>, Condvar),
+    }
+
+    struct ExclusiveTestLease(Arc<AtomicBool>);
+
+    impl Drop for ExclusiveTestLease {
+        fn drop(&mut self) {
+            self.0.store(false, Ordering::Release);
+        }
+    }
+
+    fn exclusive_test_binding(attached: &Arc<AtomicBool>) -> StoreBinding {
+        let lease = ExclusiveTestLease(attached.clone());
+        StoreBinding::managed(move || drop(lease))
+    }
+
+    impl Default for BlockingExclusiveLoadStore {
+        fn default() -> Self {
+            Self {
+                attached: Arc::new(AtomicBool::new(false)),
+                entered: AtomicBool::new(false),
+                exited: AtomicBool::new(false),
+                release: (StdMutex::new(false), Condvar::new()),
+            }
+        }
+    }
+
+    impl BlockingExclusiveLoadStore {
+        fn release(&self) {
+            *self.release.0.lock().unwrap() = true;
+            self.release.1.notify_all();
+        }
+    }
+
+    impl KvStore for BlockingExclusiveLoadStore {
+        fn bind(&self, _identity: &StoreIdentity) -> Result<StoreBinding, StoreError> {
+            self.attached
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .map_err(|_| StoreError("exclusive store is already attached".to_string()))?;
+            Ok(exclusive_test_binding(&self.attached))
+        }
+
+        fn load(&self) -> Result<Vec<(Vec<u8>, VersionedValue)>, StoreError> {
+            self.entered.store(true, Ordering::SeqCst);
+            let mut released = self.release.0.lock().unwrap();
+            while !*released {
+                released = self.release.1.wait(released).unwrap();
+            }
+            self.exited.store(true, Ordering::SeqCst);
+            Ok(Vec::new())
+        }
+
+        fn write_batch(&self, _writes: &[(Vec<u8>, VersionedValue)]) -> Result<(), StoreError> {
+            Ok(())
+        }
+    }
+
+    struct FailFirstLoadExclusiveStore {
+        attached: Arc<AtomicBool>,
+        loads: AtomicUsize,
+    }
+
+    impl Default for FailFirstLoadExclusiveStore {
+        fn default() -> Self {
+            Self {
+                attached: Arc::new(AtomicBool::new(false)),
+                loads: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl KvStore for FailFirstLoadExclusiveStore {
+        fn bind(&self, _identity: &StoreIdentity) -> Result<StoreBinding, StoreError> {
+            self.attached
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .map_err(|_| StoreError("exclusive store is already attached".to_string()))?;
+            Ok(exclusive_test_binding(&self.attached))
+        }
+
+        fn load(&self) -> Result<Vec<(Vec<u8>, VersionedValue)>, StoreError> {
+            if self.loads.fetch_add(1, Ordering::SeqCst) == 0 {
+                let mut key = 0u32.to_be_bytes().to_vec();
+                key.push(0xff);
+                Ok(vec![(
+                    key,
+                    VersionedValue::new(Vec::new(), 1, "writer".to_string()),
+                )])
+            } else {
+                Ok(Vec::new())
+            }
+        }
+
+        fn write_batch(&self, _writes: &[(Vec<u8>, VersionedValue)]) -> Result<(), StoreError> {
+            Ok(())
+        }
+    }
+
     #[test]
     fn operation_admission_loses_a_race_with_shutdown() {
         let gate = OperationGate::new();
@@ -8790,6 +9024,77 @@ mod tests {
         let _ = entry.actor.wait(None).await;
         assert!(registry.remove_if(fragment, &entry.actor));
         assert!(registry.snapshot().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn cancelled_node_start_keeps_exclusive_store_fail_closed() {
+        let store = Arc::new(BlockingExclusiveLoadStore::default());
+        let config = || NodeConfig {
+            store: Some(store.clone()),
+            ..NodeConfig::default()
+        };
+        let startup = tokio::spawn(Node::start(
+            "cancelled-node-start".to_string(),
+            "127.0.0.1:0".parse().unwrap(),
+            config(),
+        ));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !store.entered.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("Node startup never entered the blocking store load");
+
+        startup.abort();
+        let join_error = match startup.await {
+            Err(error) => error,
+            Ok(_) => panic!("aborted Node startup completed normally"),
+        };
+        assert!(join_error.is_cancelled());
+        let retry = Node::start(
+            "cancelled-node-start".to_string(),
+            "127.0.0.1:0".parse().unwrap(),
+            config(),
+        )
+        .await;
+        assert!(matches!(retry, Err(NodeError::Storage(_))));
+        assert!(store.attached.load(Ordering::SeqCst));
+
+        store.release();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !store.exited.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancelled startup's store load did not exit");
+    }
+
+    #[tokio::test]
+    async fn joined_node_start_failure_releases_exclusive_store() {
+        let store = Arc::new(FailFirstLoadExclusiveStore::default());
+        let config = || NodeConfig {
+            store: Some(store.clone()),
+            ..NodeConfig::default()
+        };
+        let first = Node::start(
+            "retry-node-start".to_string(),
+            "127.0.0.1:0".parse().unwrap(),
+            config(),
+        )
+        .await;
+        assert!(first.is_err());
+        assert!(!store.attached.load(Ordering::SeqCst));
+
+        let second = Node::start(
+            "retry-node-start".to_string(),
+            "127.0.0.1:0".parse().unwrap(),
+            config(),
+        )
+        .await
+        .expect("joined startup rollback did not release the store binding");
+        second.shutdown().await.unwrap();
     }
 
     #[test]

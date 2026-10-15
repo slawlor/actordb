@@ -93,6 +93,28 @@ impl std::fmt::Display for FragmentShutdownError {
 
 impl std::error::Error for FragmentShutdownError {}
 
+/// A fragment could not construct its initial state from durable storage.
+///
+/// This concrete type is preserved inside ractor's `SpawnErr::StartupFailed`
+/// so Node startup can distinguish durable-data failures from actor/framework
+/// startup failures without parsing an error string.
+#[derive(Debug)]
+pub(crate) struct FragmentStartupStorageError(String);
+
+impl FragmentStartupStorageError {
+    fn boxed(error: impl std::fmt::Display) -> ActorProcessingErr {
+        Box::new(Self(error.to_string()))
+    }
+}
+
+impl std::fmt::Display for FragmentStartupStorageError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for FragmentStartupStorageError {}
+
 /// Arguments to spawn a [`FragmentSupervisor`].
 #[derive(Clone)]
 pub struct SupervisorArgs {
@@ -160,17 +182,14 @@ impl SupervisorState {
                 let mut expiry_updates = Vec::new();
                 let mut high_water: Option<u64> = None;
                 let now = now_ms();
-                for (k, v) in kvstore
-                    .load()
-                    .map_err(|e| ActorProcessingErr::from(e.to_string()))?
-                {
+                for (k, v) in kvstore.load().map_err(FragmentStartupStorageError::boxed)? {
                     high_water = Some(
                         high_water
                             .map(|current| current.max(v.timestamp_ms))
                             .unwrap_or(v.timestamp_ms),
                     );
-                    let key = String::from_utf8(k.clone())
-                        .map_err(|e| ActorProcessingErr::from(e.to_string()))?;
+                    let key =
+                        String::from_utf8(k.clone()).map_err(FragmentStartupStorageError::boxed)?;
                     let value = if v.is_expired(now) {
                         let tombstone = v.expiry_tombstone();
                         expiry_updates.push((k, tombstone.clone()));
@@ -180,7 +199,7 @@ impl SupervisorState {
                     };
                     check_versioned_value_budget(&key, &value).map_err(|error| {
                         let prefix: String = key.chars().take(64).collect();
-                        ActorProcessingErr::from(format!(
+                        FragmentStartupStorageError::boxed(format!(
                             "persisted record (key bytes {}, prefix {prefix:?}) cannot be replicated: {error}",
                             key.len()
                         ))
@@ -193,7 +212,7 @@ impl SupervisorState {
                 if !expiry_updates.is_empty() {
                     kvstore
                         .write_batch(&expiry_updates)
-                        .map_err(|e| ActorProcessingErr::from(e.to_string()))?;
+                        .map_err(FragmentStartupStorageError::boxed)?;
                 }
                 Ok((map, high_water))
             }
@@ -302,7 +321,7 @@ impl FragmentSupervisor {
                 .lock()
                 .await
                 .seed_persisted(timestamp_ms)
-                .map_err(|error| ActorProcessingErr::from(error.to_string()))?;
+                .map_err(FragmentStartupStorageError::boxed)?;
         }
         let shared = Arc::new(FragmentState::new(
             cache,

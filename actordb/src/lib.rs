@@ -27,8 +27,8 @@ pub mod network;
 /// Protobuf wire protocol (generated via [prost])
 pub mod proto;
 
-/// Pluggable durable storage for a node's local copy. The default is
-/// an in-memory no-op; enable the `rocksdb` feature for RocksDB.
+/// Pluggable durable storage for a node's local copy. Persistence is disabled
+/// by default; enable the `rocksdb` feature for the offered backend.
 pub mod store;
 
 /// Sharding: deterministic key → fragment mapping.

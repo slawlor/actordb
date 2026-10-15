@@ -14,6 +14,9 @@ A rust actor-based distributed database based on *RocksDb*
 
 A working, tested prototype of the actor-first sharded database vision:
 
+The workspace requires Rust 1.88 or newer; CI pins 1.88 as the minimum
+supported toolchain.
+
 * **`shard`**: deterministic key → fragment mapping (`fragment_of`
   via seahash). The keyspace is partitioned into `fragment_count`
   fragments; every node agrees on the mapping.
@@ -41,7 +44,9 @@ A working, tested prototype of the actor-first sharded database vision:
   correlated, byte-bounded reconciliation after the peer handshake.
 * **`store`**: pluggable durable storage. In-memory by default; enable
   the `rocksdb` feature for RocksDB (per-fragment key namespacing via
-  `PrefixedStore`).
+  `PrefixedStore`, a fail-closed identity/layout manifest, exclusive live
+  attachment, validated physical routing, and synchronous WAL writes by
+  default).
 * **`proto`**: the wire protocol — prost-encoded `Envelope` frames,
   length-delimited over TCP.
 
@@ -237,7 +242,7 @@ Key `NodeConfig` knobs:
 
 | Field | Default | Meaning |
 |---|---|---|
-| `fragment_count` | 1 | Fragments in the keyspace (must agree cluster-wide) |
+| `fragment_count` | 1 | Fragments in the keyspace, at most `u32::MAX` (must agree cluster-wide and with an existing RocksDB manifest) |
 | `fragment_map` | {} | Static placement: fragment → replica node ids (empty = serve all); non-empty maps must cover every in-range fragment with a non-empty, duplicate-free replica list |
 | `members` | {} | Static membership: node id → unique address; each configured id is enforced from the first authentication attempt |
 | `default_pool` / `high_pool` / `background_pool` | see below | Per-priority `PoolConfig { workers, queue_cap, rate_limit_per_sec }` |
@@ -251,10 +256,15 @@ Key `NodeConfig` knobs:
 | `placement_controller` | None | Phase 8: `Some(Arc<dyn PlacementController>)` opts into dynamic placement |
 | `placement_poll_interval` | 1s | Phase 8: how often the driver re-evaluates desired placement |
 | `placement_drain_warn_interval` | 10s | Warning cadence for a safe, non-destructive stalled drain |
-| `store` | None | `Some(Arc<dyn KvStore>)`; `NodeConfig::with_rocksdb(path)` with the `rocksdb` feature |
+| `store` | None | `Some(Arc<dyn KvStore>)`; `NodeConfig::with_rocksdb(path)` uses `SyncWal`, while `with_rocksdb_options` selects explicit RocksDB policy |
 
 The local node id, every `members` key, and every placement replica id must
 contain 1 to 255 UTF-8 bytes. Placement replica lists must be duplicate-free.
+RocksDB permanently binds its first Node id and fragment count in a separate
+metadata column family and rejects mismatches before network bind. Non-empty
+pre-manifest databases are rejected without mutating their column-family layout
+and require explicit one-time legacy adoption; see
+[Persistence](docs/persistence.md).
 
 - Local and remote writes await the serving worker's exact apply outcome;
   after `Ok`, that owner reads the version or a newer winner. Replication to
@@ -508,17 +518,24 @@ as issues in the [issue tracker](https://github.com/slawlor/actordb/issues):
   abandons the peer guarantee. `RetryableSender` requests a fresh exact sender
   fence, while `Unavailable` means local-only shutdown has already made the
   guarantee impossible. Its report proves a per-target fenced LWW version
-  floor, not exact/global cache equality, quorum, or fsync. Legacy empty-map
+  floor, not exact/global cache equality, quorum, or a backend-independent
+  fsync guarantee. Offered RocksDB defaults to `SyncWal`; explicit `AsyncWal`
+  is weaker. Legacy empty-map
   mode covers only senders known at the fence. Dropping `Node` only requests
-  best-effort cancellation and stop; it cannot report a flush failure or await
-  a join. This pre-release change is a Rust source break:
+  best-effort cancellation and stop; it cannot report a flush failure, await
+  a join, or safely release the same live RocksDB attachment. This pre-release change is a Rust source break:
   callers must handle the new shutdown `Result`, and exhaustive matches over
   `NodeError` or the advanced `SupervisorMessage` API must include their new
   lifecycle variants.
 - **Tombstones are retained** — `Node::start` rejects every
   `tombstone_gc_age: Some(..)` setting. Safe reclamation needs durable
-  per-replica convergence evidence plus a durable store delete path; elapsed
-  wall-clock time cannot prove either condition.
+  per-replica convergence evidence before the new durable prefix-delete
+  primitive can be used; elapsed wall-clock time cannot prove that condition.
+- **Revoked RocksDB prefixes are retained for now** — the storage primitive is
+  a synchronous, idempotent range tombstone (logical removal; compaction owns
+  later physical reclamation), but current placement queue emptiness is not a
+  snapshot-transfer certificate. Automatic deletion is gated on a fresh exact
+  reconciliation/durability fence rather than risking the last complete copy.
 - **Custom worker-pool supervision is incomplete** — a worker crash can drop
   accepted mailbox work and leak admission accounting. A restarted dispatcher
   is republished through a generation-checked fragment route, but migration to

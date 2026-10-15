@@ -8,15 +8,23 @@ touches disk. Set a store to get durability.
 
 ```rust
 pub trait KvStore: Send + Sync + 'static {
+    fn bind(&self, identity: &StoreIdentity) -> Result<StoreBinding, StoreError>;
     fn load(&self) -> Result<Vec<(Vec<u8>, VersionedValue)>, StoreError>;
     fn load_prefix(&self, prefix: &[u8])
         -> Result<Vec<(Vec<u8>, VersionedValue)>, StoreError>;
     fn write_batch(&self, writes: &[(Vec<u8>, VersionedValue)]) -> Result<(), StoreError>;
+    fn delete_prefix(&self, prefix: &[u8])
+        -> Result<PrefixDeleteOutcome, StoreError>;
 }
 ```
 
 The contract is deliberately narrow:
 
+- `bind` runs once per Node startup after pure configuration/placement
+  validation and before network bind or actor startup. Its default returns an
+  unmanaged binding; custom stores remain source compatible. RocksDB validates
+  its persistent identity and holds an exclusive live attachment until clean
+  Node shutdown.
 - `load` is called **once at actor boot** and returns the full dataset.
   Corrupt entries fail boot loudly — they are not silently skipped.
 - `load_prefix` has a source-compatible default that filters `load`. Ordered
@@ -28,6 +36,9 @@ The contract is deliberately narrow:
 - Writes are serialized per fragment and each batch contains at most one
   version per key. A failed or cancelled attempt can be retried, so custom
   stores must apply identical key/version writes idempotently.
+- `delete_prefix` is an idempotent, quiesced-writer namespace operation. The
+  source-compatible custom-store default reports `Retained`; RocksDB commits a
+  prefix range tombstone synchronously and reports `Deleted`.
 - Keys are raw bytes; the actor converts `String` keys at the boundary, so
   non-UTF-8 keys fail boot loudly rather than corrupting the store.
 - Loaded records are preflighted against every required single-record wire
@@ -47,18 +58,89 @@ The contract is deliberately narrow:
 | `RocksDbStore` | Production backend, behind the `rocksdb` cargo feature. |
 | `PrefixedStore` | Namespace wrapper: prepends a 4-byte big-endian fragment id to every key so N fragment actors can share one store without collisions. |
 
-`RocksDbStore::open(path)` creates the directory and opens with
-`DB::open_default` — a **single default column family**, no custom CFs.
-`write_batch` builds one `rocksdb::WriteBatch` and commits it with
-`db.write(batch)`, so a flush is a single atomic RocksDB write.
+`RocksDbStore::open(path)` creates the directory and opens the default CF for
+fragment-prefixed data. Existing initialized stores also open their
+`actordb-metadata` CF; a new or legacy store creates that CF only after the
+first successful identity/data validation in `bind`. `write_batch` builds one
+`rocksdb::WriteBatch`, so a flush is one atomic RocksDB write.
+
+RocksDB data operations require the live `StoreBinding` created by
+`Node::start` (or an explicit `KvStore::bind` call). Direct base-store keys use
+the same physical format as Node: a 4-byte fragment prefix followed by the
+UTF-8 logical key. Each read and write validates that prefix, the bound fragment
+count, deterministic key mapping, provenance, and wire-size budget. This is a
+pre-release behavioral break for direct `RocksDbStore` users. A custom wrapper
+around a bind-requiring backend must delegate `bind` and retain the returned
+binding; the built-in `PrefixedStore` is deliberately only a fragment view and
+is rejected as a Node root.
 
 With the `rocksdb` feature enabled, `NodeConfig::with_rocksdb(path)` builds a
-config on top of the defaults with a `RocksDbStore` wired in.
+config on top of the defaults with a `RocksDbStore` wired in. It now defaults
+to `RocksDbDurability::SyncWal`: successful store batches force the WAL through
+the operating-system buffer cache. To choose the faster, weaker policy:
+
+```rust
+use actordb::node::NodeConfig;
+use actordb::store::{RocksDbDurability, RocksDbOptions};
+
+let options = RocksDbOptions::default()
+    .with_durability(RocksDbDurability::AsyncWal);
+let config = NodeConfig::with_rocksdb_options("./data/node-a", options)?;
+```
+
+`AsyncWal` keeps the WAL enabled but does not synchronously flush it to stable
+media. There is deliberately no WAL-disabled mode advertised as committed.
+Manifest writes and prefix deletion are always synchronous regardless of this
+ordinary-batch setting.
+
+### RocksDB manifest and upgrades
+
+The first successful storage bind during `Node::start` synchronously stores a
+manifest containing the node id, fragment count, data-format version, and
+partitioner/prefix-layout version. The manifest remains committed if a later
+network or actor startup phase fails. Later starts must use the same node id and
+fragment count; a mismatch,
+unknown version, corrupt manifest, unknown column family, or unknown metadata
+record fails closed before a listener binds or a fragment actor loads. Identity
+binding errors surface as `NodeError::Storage`; errors detected while the path
+is opened surface from `RocksDbStore::open` or `NodeConfig::with_rocksdb*` as
+`StoreError`. Placement, membership, replication tuning, and WAL policy are
+intentionally not pinned. A cloned/restored database retains the original
+identity.
+
+Two live Nodes cannot attach to the same `Arc<RocksDbStore>`. Clean shutdown
+releases that attachment only after all fragment actors stop. A fully joined
+startup rollback also releases it. Cancelling startup, or merely dropping a
+Node, keeps the same live store object fail-closed because actor exit was not
+observed.
+
+An empty pre-manifest database is initialized automatically. A non-empty,
+default-CF-only database from an older actordb release has no trustworthy
+original node id or fragment count and is rejected during strict open *before*
+the metadata column family is created, preserving rollback to the old binary.
+Likewise, a non-empty directory with a missing or non-regular RocksDB `CURRENT`
+file is rejected before RocksDB can initialize or mutate it.
+After verifying the path, fragment layout, and a backup, perform the one-time
+explicit adoption:
+
+```rust
+let options = RocksDbOptions::default()
+    .with_legacy_manifest_adoption(true);
+let config = NodeConfig::with_rocksdb_options("./data/legacy-node-a", options)?;
+// The first successful storage bind during Node::start writes the manifest.
+```
+
+Adoption validates every legacy key's UTF-8 suffix, stored fragment, hash
+mapping under the claimed fragment count, value encoding, provenance, and wire
+budget before writing the manifest. This detects inconsistent claims but cannot
+recover the original identity from legacy data; the operator remains
+responsible for supplying it. Adoption never overwrites an existing corrupt,
+future, or mismatched manifest. Subsequent opens should remove the flag.
 
 ## On-disk format
 
-Keys on disk are the raw key bytes, optionally prefixed by `PrefixedStore`'s
-4-byte big-endian fragment id. Values are encoded as:
+Keys in the offered RocksDB data CF are always a 4-byte big-endian fragment id
+followed by the UTF-8 logical key. Values are encoded as:
 
 ```
 [timestamp_ms: u64 BE][expires_at_ms: u64 BE, 0 = none][is_tombstone: u8]
@@ -67,9 +149,17 @@ Keys on disk are the raw key bytes, optionally prefixed by `PrefixedStore`'s
 
 - The fixed header is 21 bytes (8 + 8 + 1 + 4).
 - TTLs are stored exactly as `expires_at_ms`; `0` means "no expiry".
+- `is_tombstone` must be exactly `0` or `1`; other bytes are corruption and
+  fail loading/adoption.
 - Tombstones are stored as tombstone-flagged entries — deletes and TTL expiry
   markers are durable, not physical removals. An expiry marker keeps the TTL
   write's timestamp, node id, and expiry deadline while clearing its value.
+- The metadata CF's `manifest` record begins with `ACTORDB\0`, independent
+  manifest/data/partitioner versions, the fixed fragment count, and node id.
+  Metadata never shares the user-key namespace.
+- Prefix deletion writes a durable RocksDB range tombstone. Successful reads
+  and reopens no longer expose the covered keys, but physical bytes are reclaimed
+  later by compaction; this is not secure erasure.
 
 ## Flush batching and "snapshots"
 
@@ -104,10 +194,10 @@ effect. Untracked reconciliation repairs are memory-applied; their final
 barrier forces a flush only when it requests `StoreCommitted`. With a configured
 store, `BatchAck::STORE_COMMITTED` means
 `KvStore::write_batch` returned successfully for every update ordered before
-the fence. It does **not** mean fsync: `RocksDbStore` currently uses RocksDB's
-default WAL-backed, non-sync write options. Deployments that require
-power-loss durability need the later configurable-sync storage work; the wire
-ACK deliberately reports only the guarantee implemented here.
+the fence. The wire level deliberately describes the store contract rather
+than an fsync bit. The offered RocksDB default is `SyncWal`; `AsyncWal` weakens
+that guarantee, so every replica in a deployment should use an intentional,
+uniform policy.
 
 Despite the name, the `Snapshotter` is **not** a RocksDB checkpoint — it is a
 periodic durable-flush actor (`SnapshotterMessage::Snap` → `shared.flush()`).
@@ -118,7 +208,7 @@ waits for admitted calls, drains fragment mailboxes, and returns only after each
 final local flush succeeds and the RocksDB lock is released. A flush error is
 returned while the quiesced fragment and its retryable batch remain owned;
 retry shutdown after storage recovers. Dropping `Node` requests a best-effort
-stop but cannot await or report that flush or lock release; `kill -9` can lose
+stop but cannot await or report that flush or lock/attachment release; `kill -9` can lose
 the unflushed write-buffer tail. Recovery for that tail comes from correlated
 peer reconciliation after reconnect — which is why production deployments
 want at least two replicas per fragment.
@@ -128,8 +218,8 @@ peer durability fence before that local flush. Each reported target completed a
 stable full reconciliation after the local mutation-admission cut and
 acknowledged `SenderConfig::required_ack_durability`. `MemoryApplied` still
 loses data if that receiver crashes. `StoreCommitted` means its `KvStore`
-accepted the flush; for the offered RocksDB implementation this is currently a
-default WAL-backed, non-sync write, not an fsync guarantee. A timeout leaves the
+accepted the flush; the offered RocksDB backend defaults to a synchronously
+flushed WAL, while `AsyncWal` is explicitly weaker. A timeout leaves the
 origin's transport, senders, cache, and retryable persistence state alive;
 retry after peer/store recovery or explicitly fall back to local-only
 `shutdown`. If the peer fence succeeds but the origin's final store flush
@@ -164,5 +254,9 @@ explicitly widen the bound after investigating the data.
   time bound cannot prove durable replica convergence. Safe reclamation needs
   such evidence plus store deletion support (see
   [Tombstones & deletes](tombstones.md)).
-- **No per-fragment drop/migrate at the store layer yet.** Prefix-bounded loads
-  are implemented, but deletion/export lifecycle operations are not.
+- **Prefix deletion is not yet a placement handoff certificate.** The offered
+  store has synchronous, idempotent prefix deletion, but dynamic placement does
+  not invoke it yet. Queue emptiness alone cannot prove that a newly added owner
+  received the old snapshot; automatic cleanup must first require a fresh,
+  exact reconciliation/durability fence. Until that lifecycle lands, revoked
+  RocksDB prefixes are safely retained.

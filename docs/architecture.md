@@ -24,7 +24,9 @@ credentials, multi-datacenter support, or transactional semantics.
   (see [Replication](replication.md)).
 - **Opt-in persistence**: RocksDB behind the `rocksdb` cargo feature. Threshold,
   write-age, periodic, and requested `StoreCommitted` ACK or reconciliation
-  barrier flushes ordered batches (see [Persistence](persistence.md)).
+  barrier flushes ordered batches. The offered backend has a fail-closed
+  node/layout manifest and uses synchronous WAL commits by default (see
+  [Persistence](persistence.md)).
 
 ## Crate layout
 
@@ -38,7 +40,7 @@ integration crate, and an `xtask` for coverage.
 | `actordb::replication` | Phase 5 async sender/receiver: `ReplicationSender` state machine, sessions, acks, protocol-v3 paged `ReconcileRequest/Response/Fetch/Data` anti-entropy |
 | `actordb::supervision` | `FragmentSupervisor` + children: dispatcher, `Cleaner` (TTL-expiry markers), `Snapshotter` (periodic flush) |
 | `actordb::placement` | Phase 8 dynamic placement: `PlacementController` trait, `StaticPlacement`, `ManualPlacement`, migration lifecycle states |
-| `actordb::store` | `KvStore` trait, `MemoryStore`, `PrefixedStore`, `RocksDbStore` (feature-gated) |
+| `actordb::store` | `KvStore` identity/batch/prefix contract, `MemoryStore`, fragment-view `PrefixedStore`, fail-closed `RocksDbStore` (feature-gated) |
 | `actordb::shard` | `FragmentId`, `hash_key` (seahash), `fragment_of` |
 | `actordb::network` | Transport abstraction: `Network`, `TcpNetwork`, `PeerStream`; 4-byte length-prefixed `Envelope` framing |
 | `actordb::proto` | prost-generated `meta` protocol-buffer messages (ids 1–20), priorities, mutation outcomes, challenge handshake, replication and reconcile messages |

@@ -22,16 +22,31 @@ Time-based collection is rejected at startup because elapsed time alone cannot
 prove that every replica has durably observed a delete (see
 [Tombstones](tombstones.md)).
 
+The offered RocksDB backend also validates its persistent manifest before
+network bind or actor startup. A restart must use the same `node_id` and
+`fragment_count`; cloned/restored database directories retain that identity.
+Unknown/corrupt versions and mismatches return `NodeError::Storage` without
+rewriting the manifest. Unknown column families and metadata records are also
+rejected. A strict open of a non-empty default-CF-only database from a
+pre-manifest release fails before adding the metadata CF, so an attempted
+upgrade does not prevent rollback. Adoption must be explicitly enabled once,
+after the operator verifies the path, fragment layout, and backup. It validates
+that every key hashes to its stored fragment under the claimed count. Two live
+Nodes cannot share one `Arc<RocksDbStore>`; cancelled startup and best-effort
+Node drop leave that same object fail-closed.
+
 Startup also seeds the node HLC from the highest durable version. A persisted
 timestamp farther in the future than `max_clock_skew` fails startup rather
 than allowing that version to freeze its key; investigate clock rollback or
 poisoned data before widening the bound.
 
-Startup also preflights every durable record against the protocol's required
-single-record envelopes. A legacy key/value that cannot fit the 16 MiB hard
-frame limit, or whose provenance node id is empty or exceeds 255 UTF-8 bytes,
-fails startup instead of loading permanently unreplicable data. Repair or
-remove the record offline before restarting; actordb does not rewrite it.
+Fragment startup preflights every durable record in the locally assigned
+prefixes against the protocol's required single-record envelopes. Explicit
+legacy adoption separately scans every record before writing the manifest. A
+key/value that cannot fit the 16 MiB hard frame limit, has malformed encoding,
+or whose provenance node id is empty or exceeds 255 UTF-8 bytes fails startup
+instead of loading permanently unreplicable data. Repair or remove the record
+offline before restarting; actordb does not rewrite it.
 
 ### Rolling restart with placement
 
@@ -171,7 +186,8 @@ senders without waiting for peer ACKs. Transport cancellation can also drop an
 inbound mutation response after that mutation applied locally, so peers and
 clients must retry stamped/idempotent requests after disconnect. Dropping
 `Node` remains best effort and cannot await or report flush, join, or RocksDB
-lock-release outcomes.
+lock-release outcomes. It therefore leaves the same live RocksDB object
+fail-closed to reattachment; call and await `shutdown` for reusable ownership.
 
 When stopping a healthy replica intentionally, use
 `shutdown_with_replication_drain(ReplicationDrainOptions)` to request a bounded
@@ -195,8 +211,9 @@ work on retry.
 This is not a cluster convergence or response-delivery certificate. For every
 reported target it proves the receiver acknowledged the LWW state at the
 mutation-admission fence or a newer winner, at `MemoryApplied` or
-`StoreCommitted` as configured. The latter is store acceptance, not necessarily
-fsync. Explicit placement supplies the closed target set; legacy empty-map mode
+`StoreCommitted` as configured. The latter is store acceptance under the
+backend's policy: offered RocksDB defaults to `SyncWal`, while explicitly
+configured `AsyncWal` is weaker. Explicit placement supplies the closed target set; legacy empty-map mode
 can cover only authenticated peers whose senders existed at the fence. Clients
 must still retry a stamped mutation if its network response was lost.
 

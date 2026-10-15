@@ -104,7 +104,8 @@ actually achieved in
 - `APPLIED`: every operation is visible in memory; a configured store may not
   have flushed it yet;
 - `STORE_COMMITTED`: the configured `KvStore` accepted the flush. This is not
-  an fsync guarantee unless the store itself provides one.
+  an fsync guarantee independent of the store policy. Offered RocksDB defaults
+  to a synchronous WAL; explicit `AsyncWal` is weaker.
 
 The default `MemoryApplied` requirement therefore does not force one backend
 write per network batch. A `StoreCommitted` requirement forces a fragment

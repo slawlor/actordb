@@ -12,7 +12,7 @@ readme = "../README.md"
 homepage = "https://github.com/slawlor/actordb"
 categories = ["actor", "erlang"]
 build = "src/build.rs"
-rust-version = "1.64"
+rust-version = "1.88"
 
 # [features]
 # filewatcher = ["notify"]

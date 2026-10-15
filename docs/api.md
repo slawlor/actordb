@@ -139,7 +139,9 @@ The report is deliberately narrow: each listed peer has the fenced LWW winner
 or a newer winner for that fragment. It does not prove byte-for-byte cache
 equality, a quorum, cluster-wide convergence, response delivery, or fsync.
 `MemoryApplied` is volatile; `StoreCommitted` means the receiver's configured
-store accepted its flush under that store's contract. Explicit placement
+store accepted its flush under that store's contract. Offered RocksDB defaults
+to `SyncWal`; explicitly selected `AsyncWal` does not force stable media.
+Explicit placement
 targets every configured remote replica for each locally active fragment after
 placement freezes. Empty-map legacy mode can only target senders already known
 at the fence; an empty target report is therefore possible.
@@ -160,7 +162,8 @@ operations idempotently.
 
 Merely dropping a `Node` requests best-effort transport cancellation and actor
 stop, but cannot await or report a peer fence, durable flush, task join, or
-RocksDB lock release.
+RocksDB lock/attachment release. Reusing the same live `RocksDbStore` object
+therefore requires explicit successful shutdown.
 
 ## Single-key operations
 

@@ -660,6 +660,23 @@ async fn invalid_zero_sized_replication_and_placement_config_is_rejected() {
         Err(NodeError::Actor(_))
     ));
 
+    #[cfg(target_pointer_width = "64")]
+    {
+        let too_many_fragments = NodeConfig {
+            fragment_count: u32::MAX as usize + 1,
+            ..NodeConfig::default()
+        };
+        assert!(matches!(
+            Node::start(
+                "invalid-fragment-count".to_string(),
+                "127.0.0.1:0".parse().unwrap(),
+                too_many_fragments,
+            )
+            .await,
+            Err(NodeError::Actor(_))
+        ));
+    }
+
     // Runtime liveness policy is validated before the network bind. Holding
     // this address open distinguishes the intended Actor error from a later
     // bind failure.
@@ -3080,6 +3097,95 @@ async fn persistence_roundtrip() {
 
 #[cfg(feature = "rocksdb")]
 #[tokio::test]
+async fn rocksdb_manifest_rejects_wrong_identity_before_network_bind() {
+    use actordb::node::NodeError;
+
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("manifest");
+    let original = Node::start(
+        "manifest-a".to_string(),
+        "127.0.0.1:0".parse().unwrap(),
+        NodeConfig::with_rocksdb(&db_path).unwrap(),
+    )
+    .await
+    .unwrap();
+    original.shutdown().await.unwrap();
+    drop(original);
+
+    // The occupied address proves manifest validation runs before transport
+    // bind: a mismatched database must report Storage, not Network.
+    let occupied = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let occupied_addr = occupied.local_addr().unwrap();
+    let wrong_node = Node::start(
+        "manifest-b".to_string(),
+        occupied_addr,
+        NodeConfig::with_rocksdb(&db_path).unwrap(),
+    )
+    .await;
+    assert!(matches!(wrong_node, Err(NodeError::Storage(_))));
+    drop(occupied);
+
+    let mut wrong_count = NodeConfig::with_rocksdb(&db_path).unwrap();
+    wrong_count.fragment_count = 2;
+    let wrong_count = Node::start(
+        "manifest-a".to_string(),
+        "127.0.0.1:0".parse().unwrap(),
+        wrong_count,
+    )
+    .await;
+    assert!(matches!(wrong_count, Err(NodeError::Storage(_))));
+
+    // Failed mismatches never rewrite or poison the original identity.
+    let reopened = Node::start(
+        "manifest-a".to_string(),
+        "127.0.0.1:0".parse().unwrap(),
+        NodeConfig::with_rocksdb(&db_path).unwrap(),
+    )
+    .await
+    .unwrap();
+    reopened.shutdown().await.unwrap();
+}
+
+#[cfg(feature = "rocksdb")]
+#[tokio::test]
+async fn rocksdb_store_allows_only_one_live_node_attachment() {
+    use actordb::node::NodeError;
+    use actordb::store::RocksDbStore;
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(RocksDbStore::open(dir.path()).unwrap());
+    let config = || NodeConfig {
+        store: Some(store.clone()),
+        ..NodeConfig::default()
+    };
+    let first = Node::start(
+        "shared-store".to_string(),
+        "127.0.0.1:0".parse().unwrap(),
+        config(),
+    )
+    .await
+    .unwrap();
+    let second = Node::start(
+        "shared-store".to_string(),
+        "127.0.0.1:0".parse().unwrap(),
+        config(),
+    )
+    .await;
+    assert!(matches!(second, Err(NodeError::Storage(_))));
+
+    first.shutdown().await.unwrap();
+    let replacement = Node::start(
+        "shared-store".to_string(),
+        "127.0.0.1:0".parse().unwrap(),
+        config(),
+    )
+    .await
+    .unwrap();
+    replacement.shutdown().await.unwrap();
+}
+
+#[cfg(feature = "rocksdb")]
+#[tokio::test]
 async fn persistence_keeps_gossiped_winner() {
     // The write-through path must persist gossip-received ops too, and
     // after a restart the node must hold the LWW *winner*, then keep
@@ -3733,10 +3839,11 @@ async fn startup_rejects_out_of_policy_persisted_timestamp() {
             node.shutdown().await.unwrap();
             panic!("node accepted a poisoned durable timestamp");
         }
-        Err(error) => assert!(
-            error.to_string().contains("exceeds maximum allowed"),
-            "unexpected startup error: {error}"
+        Err(NodeError::Storage(error)) => assert!(
+            error.contains("exceeds maximum allowed"),
+            "unexpected storage startup error: {error}"
         ),
+        Err(error) => panic!("durable timestamp failure was not classified as Storage: {error}"),
     }
 }
 
@@ -3755,10 +3862,13 @@ async fn startup_rejects_invalid_persisted_provenance() {
                 node.shutdown().await.unwrap();
                 panic!("node accepted invalid durable provenance");
             }
-            Err(error) => assert!(
-                error.to_string().contains("record node id is"),
-                "unexpected startup error: {error}"
+            Err(NodeError::Storage(error)) => assert!(
+                error.contains("record node id is"),
+                "unexpected storage startup error: {error}"
             ),
+            Err(error) => {
+                panic!("durable provenance failure was not classified as Storage: {error}")
+            }
         }
     }
 }

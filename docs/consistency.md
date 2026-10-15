@@ -71,9 +71,11 @@ awaits every batch apply, attempts the fence requested on the wire, and reports
 the level it actually achieved:
 `MemoryApplied` requires cache application only, while `StoreCommitted`
 requires the configured `KvStore` to accept a flush. `StoreCommitted` is not
-an fsync guarantee unless that store provides one. The sender retires the batch
-only if the reported level is sufficient. Apply failure, or a configured-store
-flush failure, sends a NACK and the exact stamped batch is retried.
+an fsync guarantee independent of backend policy: offered RocksDB defaults to
+`SyncWal`, while explicit `AsyncWal` acknowledges after a non-synchronous WAL
+append. The sender retires the batch only if the reported level is sufficient.
+Apply failure, or a configured-store flush failure, sends a NACK and the exact
+stamped batch is retried.
 
 The Node's asynchronous sender path is count-bounded. If its mutation ingress
 or owned deque fills after a local apply, it records a non-droppable overflow
