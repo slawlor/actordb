@@ -11,6 +11,14 @@ admission and shed counting, token-bucket behavior, seahash fragment mapping,
 and store encode/decode round-trips. These pin the semantics that the
 integration tests rely on.
 
+Storage-contract tests additionally cover fail-closed manifest versions and
+metadata schemas, exact identity and exclusive attachment, concurrent bind,
+strict non-mutating rejection of legacy databases, explicit adoption with
+UTF-8/fragment-hash/wire-budget validation, bounded prefix reads, direct-write
+validation, and synchronous isolated/idempotent range deletion. Node lifecycle
+tests abort startup inside a gated store load and prove the lease remains
+fail-closed, while a fully joined failed startup releases it for retry.
+
 Protocol-v3 pagination tests cover lexicographically ordered/exclusive summary
 cursors (including the empty-string key), revision-drift detection, zero-limit
 clamping, metadata-byte bounds, pinned TTL tombstone synthesis shared by
@@ -95,6 +103,8 @@ process — the bulk of behavioral coverage:
   `replication_report_survives_a_later_local_flush_failure`.
 - **Persistence**: `persistence_roundtrip`,
   `persistence_keeps_gossiped_winner`, `persistence_flushes_on_shutdown`,
+  `rocksdb_manifest_rejects_wrong_identity_before_network_bind`,
+  `rocksdb_store_allows_only_one_live_node_attachment`,
   `shutdown_flush_failure_is_retryable_across_all_fragments`,
   `cancelled_shutdown_waiter_resumes_retained_final_flush`,
   `shutdown_rejects_new_calls_and_waits_for_an_admitted_put`,
@@ -159,5 +169,6 @@ cargo run --bin xtask -- coverage # coverage report (CI enforces it)
 # Docker scenarios run in CI; see docker/run-scenario.sh to run locally.
 ```
 
-CI additionally enforces `cargo fmt --check`, Clippy with warnings denied,
-rustdoc with warnings denied, and benches.
+CI additionally pins Rust 1.88 as the workspace MSRV and enforces
+`cargo fmt --check`, Clippy with warnings denied, rustdoc with warnings denied,
+and benches.

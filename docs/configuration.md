@@ -2,17 +2,19 @@
 
 Start with `NodeConfig::default()` and set the fields you need. With the
 `rocksdb` feature, `NodeConfig::with_rocksdb(path)` layers persistence on top
-of the defaults.
+of the defaults using synchronous WAL commits. Use
+`NodeConfig::with_rocksdb_options(path, RocksDbOptions)` for an explicit
+durability or one-time legacy-manifest adoption policy.
 
 ## `NodeConfig`
 
 | Field | Type | Default | Guidance |
 |---|---|---|---|
-| `store` | `Option<Arc<dyn KvStore>>` | `None` | `None` = purely in-memory node. Set to a `RocksDbStore` (or `PrefixedStore`-wrapped) for durability. |
+| `store` | `Option<Arc<dyn KvStore>>` | `None` | `None` = purely in-memory node. Set to a base `RocksDbStore` or custom store; Node applies the per-fragment `PrefixedStore` views itself. |
 | `network` | `Arc<dyn Network>` | `TcpNetwork` | Plain TCP. Implement `Network` for TLS or custom transports. |
 | `flush_batch_size` | `usize` | `1000` | Ops buffered before a store flush. Ignored when `store` is `None`. Larger = fewer, bigger RocksDB write batches. |
 | `flush_interval` | `Duration` | `100 ms` | A new write triggers a flush when the previous attempt is this old; idle fragments are bounded by `snapshot_interval`. |
-| `fragment_count` | `usize` | `1` | Number of keyspace fragments. **Must be identical on every node** or keys become unreachable. |
+| `fragment_count` | `usize` | `1` | Number of keyspace fragments, from 1 through `u32::MAX`. **Must be identical on every node** or keys become unreachable. RocksDB pins it in the database manifest. |
 | `fragment_map` | `HashMap<FragmentId, Vec<String>>` | empty | Fragment → replica node ids. Empty = this node serves all fragments. A non-empty map must contain exactly `0..fragment_count`, with a non-empty, duplicate-free replica list per fragment. **Must be identical on every node** (static mode). |
 | `members` | `HashMap<String, SocketAddr>` | empty | Static membership. Each non-local `(node_id, address)` becomes a persistent dial intent at startup, retries from the first failure, and knows the expected Hello id before its first authentication attempt. Member ids and addresses must map one-to-one. |
 | `default_pool` | `PoolConfig` | `4` workers, cap `10_000`, no rate limit | Normal traffic. |
@@ -43,6 +45,31 @@ explicitly configured `cluster_secret` must contain at least 32 bytes; generate
 it with a cryptographically secure random source. Fresh challenges prevent
 replay, but because a captured transcript includes a verifiable HMAC over known
 fields, a low-entropy password remains vulnerable to offline guessing.
+
+## `RocksDbOptions`
+
+`RocksDbOptions::default()` uses `RocksDbDurability::SyncWal`. Every successful
+ordinary store batch keeps the WAL enabled and synchronously flushes it through
+the operating-system buffer cache. Select `AsyncWal` with `with_durability` to
+keep WAL recovery while allowing acknowledged recent writes to be lost on an
+OS crash or power loss. Manifest creation and prefix deletion remain
+synchronous in either mode; there is no WAL-disabled committed mode.
+
+RocksDB binds its first Node's id, `fragment_count`, data-format version, and
+partitioner version in a metadata column family. A mismatch or corrupt/future
+manifest returns `NodeError::Storage` before network bind. Unknown column
+families and metadata records are also rejected. A non-empty database from a
+pre-manifest release is rejected without adding a metadata column family unless
+its one-time open explicitly uses `with_legacy_manifest_adoption(true)`; verify
+the claimed fragment layout and back it up first, then remove the flag after a
+successful start. Open-time rejection is a `StoreError` from the constructor.
+Placement, membership, and durability policy may change without changing the
+identity manifest.
+
+One `Arc<RocksDbStore>` supports only one attached live Node. Explicit clean
+shutdown and fully joined startup rollback release the attachment. Cancelled
+startup and best-effort Node drop deliberately leave that same object
+fail-closed because actor completion was not observed.
 
 ## `NodeRuntimeOptions`
 
@@ -83,7 +110,7 @@ lanes are still bounded by operation/message count.
 | `buffer_capacity` | `10_000` | Bound on both the Node sender's locally-applied-mutation ingress lane and its sender-owned deque. Either overflow advances a persistent `BufferReset` generation; a live sender rotates the session and starts correlated reconciliation without blocking the client write. Total retained operations also include bounded in-flight batches. This is an operation-count bound, not a byte bound. |
 | `consistency_interval` | `300 s` | Periodic anti-entropy reconcile cadence per sender. |
 | `reconcile_timeout` | `30 s` | Max wait after enqueueing each reconcile summary, data, or barrier phase. Timeout rotates the session and retries. This also governs reconciliation barrier ACKs; ordinary streaming ACKs use the runtime ACK timeout. |
-| `required_ack_durability` | `MemoryApplied` | Minimum receiver fence allowed to retire a batch. Set `StoreCommitted` only when every target has a configured store. Store acceptance does not imply fsync unless the backend guarantees it. |
+| `required_ack_durability` | `MemoryApplied` | Minimum receiver fence allowed to retire a batch. Set `StoreCommitted` only when every target has a configured store. It means store acceptance under each backend's policy: offered RocksDB defaults to `SyncWal`, while explicit `AsyncWal` is weaker. |
 
 The batch size, in-flight limit, buffer capacity, intervals, and timeout must
 all be nonzero. Timer values must also be representable by Tokio's clock.

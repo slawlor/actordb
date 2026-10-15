@@ -536,9 +536,7 @@ async fn raw_replication_drain_source(
             source
                 .sender_report(FragmentId(0), peer_id)
                 .await
-                .map_or(false, |report| {
-                    report.reconcile_rounds >= 1 && report.in_flight == 0
-                })
+                .is_some_and(|report| report.reconcile_rounds >= 1 && report.in_flight == 0)
         },
         Duration::from_secs(5),
     )
@@ -659,6 +657,23 @@ async fn invalid_zero_sized_replication_and_placement_config_is_rejected() {
         .await,
         Err(NodeError::Actor(_))
     ));
+
+    #[cfg(target_pointer_width = "64")]
+    {
+        let too_many_fragments = NodeConfig {
+            fragment_count: u32::MAX as usize + 1,
+            ..NodeConfig::default()
+        };
+        assert!(matches!(
+            Node::start(
+                "invalid-fragment-count".to_string(),
+                "127.0.0.1:0".parse().unwrap(),
+                too_many_fragments,
+            )
+            .await,
+            Err(NodeError::Actor(_))
+        ));
+    }
 
     // Runtime liveness policy is validated before the network bind. Holding
     // this address open distinguishes the intended Actor error from a later
@@ -1029,7 +1044,7 @@ async fn drain_ignores_stale_old_session_ack_after_rotation() {
             source
                 .sender_report(FragmentId(0), peer_id)
                 .await
-                .map_or(false, |report| report.in_flight == 0)
+                .is_some_and(|report| report.in_flight == 0)
         },
         Duration::from_secs(5),
     )
@@ -1072,7 +1087,7 @@ async fn drain_ignores_stale_old_session_ack_after_rotation() {
             source
                 .sender_report(FragmentId(0), peer_id)
                 .await
-                .map_or(false, |report| {
+                .is_some_and(|report| {
                     report.session_id == drain_session.session_id
                         && report.in_flight == 1
                         && report.ack_durability_mismatch
@@ -1259,7 +1274,7 @@ async fn manual_placement_drain_freezes_target_and_keeps_replication_runtime_ali
                 && source
                     .sender_report(fragment, peer_id)
                     .await
-                    .map_or(false, |report| report.session_id != 0)
+                    .is_some_and(|report| report.session_id != 0)
         },
         Duration::from_secs(5),
     )
@@ -2407,7 +2422,7 @@ async fn late_joiner_converges_via_immediate_reconciliation() {
         || async {
             c.sender_report(FragmentId(0), "b")
                 .await
-                .map_or(false, |report| report.reconcile_rounds >= 1)
+                .is_some_and(|report| report.reconcile_rounds >= 1)
         },
         Duration::from_secs(5),
     )
@@ -2464,7 +2479,7 @@ async fn reconciliation_paginates_summaries_and_fetches_without_restart_storms()
             target
                 .sender_report(FragmentId(0), "paged-source")
                 .await
-                .map_or(false, |report| report.reconcile_rounds >= 1)
+                .is_some_and(|report| report.reconcile_rounds >= 1)
         },
         Duration::from_secs(20),
     )
@@ -2595,11 +2610,11 @@ async fn bidirectional_large_reconciliation_keeps_connection_reader_live() {
                 if !a
                     .sender_report(fragment, "large-b")
                     .await
-                    .map_or(false, |report| report.reconcile_rounds >= 1)
+                    .is_some_and(|report| report.reconcile_rounds >= 1)
                     || !b
                         .sender_report(fragment, "large-a")
                         .await
-                        .map_or(false, |report| report.reconcile_rounds >= 1)
+                        .is_some_and(|report| report.reconcile_rounds >= 1)
                 {
                     return false;
                 }
@@ -3076,6 +3091,95 @@ async fn persistence_roundtrip() {
         assert_eq!(got.node_id, "a");
     }
     a2.shutdown().await.unwrap();
+}
+
+#[cfg(feature = "rocksdb")]
+#[tokio::test]
+async fn rocksdb_manifest_rejects_wrong_identity_before_network_bind() {
+    use actordb::node::NodeError;
+
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("manifest");
+    let original = Node::start(
+        "manifest-a".to_string(),
+        "127.0.0.1:0".parse().unwrap(),
+        NodeConfig::with_rocksdb(&db_path).unwrap(),
+    )
+    .await
+    .unwrap();
+    original.shutdown().await.unwrap();
+    drop(original);
+
+    // The occupied address proves manifest validation runs before transport
+    // bind: a mismatched database must report Storage, not Network.
+    let occupied = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let occupied_addr = occupied.local_addr().unwrap();
+    let wrong_node = Node::start(
+        "manifest-b".to_string(),
+        occupied_addr,
+        NodeConfig::with_rocksdb(&db_path).unwrap(),
+    )
+    .await;
+    assert!(matches!(wrong_node, Err(NodeError::Storage(_))));
+    drop(occupied);
+
+    let mut wrong_count = NodeConfig::with_rocksdb(&db_path).unwrap();
+    wrong_count.fragment_count = 2;
+    let wrong_count = Node::start(
+        "manifest-a".to_string(),
+        "127.0.0.1:0".parse().unwrap(),
+        wrong_count,
+    )
+    .await;
+    assert!(matches!(wrong_count, Err(NodeError::Storage(_))));
+
+    // Failed mismatches never rewrite or poison the original identity.
+    let reopened = Node::start(
+        "manifest-a".to_string(),
+        "127.0.0.1:0".parse().unwrap(),
+        NodeConfig::with_rocksdb(&db_path).unwrap(),
+    )
+    .await
+    .unwrap();
+    reopened.shutdown().await.unwrap();
+}
+
+#[cfg(feature = "rocksdb")]
+#[tokio::test]
+async fn rocksdb_store_allows_only_one_live_node_attachment() {
+    use actordb::node::NodeError;
+    use actordb::store::RocksDbStore;
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(RocksDbStore::open(dir.path()).unwrap());
+    let config = || NodeConfig {
+        store: Some(store.clone()),
+        ..NodeConfig::default()
+    };
+    let first = Node::start(
+        "shared-store".to_string(),
+        "127.0.0.1:0".parse().unwrap(),
+        config(),
+    )
+    .await
+    .unwrap();
+    let second = Node::start(
+        "shared-store".to_string(),
+        "127.0.0.1:0".parse().unwrap(),
+        config(),
+    )
+    .await;
+    assert!(matches!(second, Err(NodeError::Storage(_))));
+
+    first.shutdown().await.unwrap();
+    let replacement = Node::start(
+        "shared-store".to_string(),
+        "127.0.0.1:0".parse().unwrap(),
+        config(),
+    )
+    .await
+    .unwrap();
+    replacement.shutdown().await.unwrap();
 }
 
 #[cfg(feature = "rocksdb")]
@@ -3584,7 +3688,7 @@ async fn ttl_expiry_is_persisted_as_a_versioned_tombstone() {
         || async {
             store
                 .get_fragment_zero("ephemeral")
-                .map_or(false, |value| value.is_tombstone)
+                .is_some_and(|value| value.is_tombstone)
         },
         Duration::from_secs(5),
     )
@@ -3733,10 +3837,11 @@ async fn startup_rejects_out_of_policy_persisted_timestamp() {
             node.shutdown().await.unwrap();
             panic!("node accepted a poisoned durable timestamp");
         }
-        Err(error) => assert!(
-            error.to_string().contains("exceeds maximum allowed"),
-            "unexpected startup error: {error}"
+        Err(NodeError::Storage(error)) => assert!(
+            error.contains("exceeds maximum allowed"),
+            "unexpected storage startup error: {error}"
         ),
+        Err(error) => panic!("durable timestamp failure was not classified as Storage: {error}"),
     }
 }
 
@@ -3755,10 +3860,13 @@ async fn startup_rejects_invalid_persisted_provenance() {
                 node.shutdown().await.unwrap();
                 panic!("node accepted invalid durable provenance");
             }
-            Err(error) => assert!(
-                error.to_string().contains("record node id is"),
-                "unexpected startup error: {error}"
+            Err(NodeError::Storage(error)) => assert!(
+                error.contains("record node id is"),
+                "unexpected storage startup error: {error}"
             ),
+            Err(error) => {
+                panic!("durable provenance failure was not classified as Storage: {error}")
+            }
         }
     }
 }
@@ -8016,9 +8124,7 @@ async fn replication_ack_waits_for_the_receiver_store_fence() {
         || async {
             a.sender_report(FragmentId(0), "ack-b")
                 .await
-                .map_or(false, |report| {
-                    report.reconcile_rounds >= 1 && report.in_flight == 0
-                })
+                .is_some_and(|report| report.reconcile_rounds >= 1 && report.in_flight == 0)
         },
         Duration::from_secs(5),
     )
@@ -8179,9 +8285,7 @@ async fn ordinary_ack_timeout_rotates_session_and_replays_exact_batch() {
         || async {
             node.sender_report(FragmentId(0), "raw-ack-timeout-peer")
                 .await
-                .map_or(false, |report| {
-                    report.reconcile_rounds >= 1 && report.in_flight == 0
-                })
+                .is_some_and(|report| report.reconcile_rounds >= 1 && report.in_flight == 0)
         },
         Duration::from_secs(5),
     )
@@ -8331,9 +8435,7 @@ async fn older_batch_timeout_replays_only_the_unacknowledged_batch() {
         || async {
             node.sender_report(FragmentId(0), "raw-out-of-order-ack-peer")
                 .await
-                .map_or(false, |report| {
-                    report.reconcile_rounds >= 1 && report.in_flight == 0
-                })
+                .is_some_and(|report| report.reconcile_rounds >= 1 && report.in_flight == 0)
         },
         Duration::from_secs(5),
     )
@@ -8499,9 +8601,7 @@ async fn weak_ack_does_not_prevent_timeout_and_exact_replay() {
         || async {
             node.sender_report(FragmentId(0), "raw-weak-ack-peer")
                 .await
-                .map_or(false, |report| {
-                    report.reconcile_rounds >= 1 && report.in_flight == 0
-                })
+                .is_some_and(|report| report.reconcile_rounds >= 1 && report.in_flight == 0)
         },
         Duration::from_secs(5),
     )

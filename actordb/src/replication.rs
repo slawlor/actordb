@@ -485,7 +485,7 @@ impl NodeSender {
                     if !signals
                         .peer
                         .as_ref()
-                        .map_or(false, |current| current.tx.same_channel(&peer_tx))
+                        .is_some_and(|current| current.tx.same_channel(&peer_tx))
                     {
                         return false;
                     }
@@ -530,7 +530,7 @@ impl NodeSender {
                             .budgeted
                             .as_ref()
                             .zip(budgeted.as_ref())
-                            .map_or(false, |(current, next)| current.same_channel(next))
+                            .is_some_and(|(current, next)| current.same_channel(next))
                     {
                         return false;
                     }
@@ -815,7 +815,7 @@ impl SenderPeer {
     ) -> Self {
         debug_assert!(budgeted
             .as_ref()
-            .map_or(true, |peer| peer.identity.same_channel(&tx)));
+            .is_none_or(|peer| peer.identity.same_channel(&tx)));
         Self {
             tx,
             budgeted,
@@ -922,9 +922,10 @@ fn disconnect_transport(
     delivery: DeliveryState,
     buffer: &mut VecDeque<crate::actor::ReplicatedOp>,
 ) -> bool {
-    if connection.as_ref().map_or(false, |connection| {
-        !connection.peer_tx.must_disconnect_after_failure()
-    }) {
+    if connection
+        .as_ref()
+        .is_some_and(|connection| !connection.peer_tx.must_disconnect_after_failure())
+    {
         return false;
     }
     if let Some(mut connection) = connection.take() {
@@ -1360,7 +1361,7 @@ async fn sender_task(
                 DeliveryState::Streaming
                     if connection
                         .as_ref()
-                        .map_or(false, |connection| connection.session_ready) =>
+                        .is_some_and(|connection| connection.session_ready) =>
                 {
                     "connected"
                 }
@@ -1395,7 +1396,7 @@ async fn sender_task(
                     .filter(|_| {
                         connection
                             .as_ref()
-                            .map_or(false, |connection| connection.session_ready)
+                            .is_some_and(|connection| connection.session_ready)
                     })
                     .map(|(deadline, _)| deadline),
             )
@@ -1443,7 +1444,7 @@ async fn sender_task(
                     }
                     SenderInput::Closed => break,
                 };
-                let data_overflow = msg.as_ref().map_or(false, |msg| {
+                let data_overflow = msg.as_ref().is_some_and(|msg| {
                     matches!(msg, SenderMsg::Enqueue(_))
                         && buffer.len() >= config.buffer_capacity
                 });
@@ -1538,7 +1539,7 @@ async fn sender_task(
                     SenderMsg::PeerConnected { peer_tx: tx } => {
                         if connection
                             .as_ref()
-                            .map_or(false, |current| current.peer_tx.same_channel(&tx))
+                            .is_some_and(|current| current.peer_tx.same_channel(&tx))
                         {
                             // Dynamic placement polls and duplicate
                             // notifications must not rotate live sessions.
@@ -1639,7 +1640,7 @@ async fn sender_task(
                     SenderMsg::PeerDisconnected { peer_tx } => {
                         if connection
                             .as_ref()
-                            .map_or(true, |current| !current.peer_tx.same_channel(&peer_tx))
+                            .is_none_or(|current| !current.peer_tx.same_channel(&peer_tx))
                         {
                             continue;
                         }
@@ -1689,7 +1690,7 @@ async fn sender_task(
                                 } else {
                                     ack_durability_mismatch = false;
                                     conn.in_flight.remove(pos);
-                                    let is_barrier = active_reconcile.as_ref().map_or(false, |round| {
+                                    let is_barrier = active_reconcile.as_ref().is_some_and(|round| {
                                         round.session_id == ack_session
                                             && matches!(
                                                 round.phase,
@@ -1931,7 +1932,7 @@ async fn sender_task(
                                 .position(|b| b.batch_seq == batch_seq)
                             {
                                 if let Some(batch) = conn.in_flight.remove(pos) {
-                                    let is_barrier = active_reconcile.as_ref().map_or(false, |round| {
+                                    let is_barrier = active_reconcile.as_ref().is_some_and(|round| {
                                         round.session_id == nack_session
                                             && matches!(
                                                 round.phase,
@@ -2065,7 +2066,7 @@ async fn sender_task(
                         summaries,
                         connection_valid,
                     } => {
-                        let expected = active_reconcile.as_ref().map_or(false, |round| {
+                        let expected = active_reconcile.as_ref().is_some_and(|round| {
                             round.session_id == session_id
                                 && round.round_id == round_id
                                 && matches!(
@@ -2078,7 +2079,7 @@ async fn sender_task(
                             let _ = connection_valid.send(true);
                             continue;
                         }
-                        let structurally_valid = active_reconcile.as_ref().map_or(false, |round| {
+                        let structurally_valid = active_reconcile.as_ref().is_some_and(|round| {
                             let ReconcilePhase::Response(summary) = &round.phase else {
                                 return false;
                             };
@@ -2296,7 +2297,7 @@ async fn sender_task(
                         entries,
                         connection_valid,
                     } => {
-                        let expected = active_reconcile.as_ref().map_or(false, |round| {
+                        let expected = active_reconcile.as_ref().is_some_and(|round| {
                             round.session_id == session_id
                                 && round.round_id == round_id
                                 && matches!(
@@ -2601,7 +2602,7 @@ async fn sender_task(
                 }
             } => {
                 let now = Instant::now();
-                if session_retry.map_or(false, |deadline| now >= deadline) {
+                if session_retry.is_some_and(|deadline| now >= deadline) {
                     let restarted = match connection.as_mut() {
                         Some(conn) if !conn.session_ready => {
                             send_session_start(fragment, conn).await
@@ -2618,7 +2619,7 @@ async fn sender_task(
                 }
                 if active_reconcile
                     .as_ref()
-                    .map_or(false, |round| now >= round.phase_deadline)
+                    .is_some_and(|round| now >= round.phase_deadline)
                 {
                     let round = active_reconcile.take().expect("checked above");
                     tracing::warn!(
@@ -2649,7 +2650,7 @@ async fn sender_task(
                     continue;
                 }
 
-                let ordinary_ack_timed_out = connection.as_ref().map_or(false, |conn| {
+                let ordinary_ack_timed_out = connection.as_ref().is_some_and(|conn| {
                     conn.in_flight.iter().any(|batch| {
                         matches!(
                             batch.kind,
@@ -3029,7 +3030,7 @@ fn reconcile_summaries_are_well_formed(
     }
     summaries
         .last()
-        .map_or(false, |summary| summary.key == next_after_key)
+        .is_some_and(|summary| summary.key == next_after_key)
 }
 
 fn reconcile_entries_are_well_formed(
@@ -3103,7 +3104,7 @@ async fn ensure_local_summary(
                 && page
                     .summaries
                     .first()
-                    .map_or(false, |summary| summary.key <= local.after_key))
+                    .is_some_and(|summary| summary.key <= local.after_key))
             || page
                 .summaries
                 .windows(2)
@@ -3802,7 +3803,7 @@ mod tests {
         let signals = signals_rx.borrow().clone();
         assert!(signals
             .peer
-            .map_or(false, |current| current.tx.same_channel(&new_peer)));
+            .is_some_and(|current| current.tx.same_channel(&new_peer)));
         assert_eq!(signals.reconcile_generation, 1);
 
         assert_eq!(data_rx.recv().await.unwrap().key, "queued");

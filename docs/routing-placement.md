@@ -148,6 +148,16 @@ one another's empty state.
    without admitting local work. A re-add before detach restores the existing
    subtree; one after detach waits for durable `Stopped` and performs a clean
    bootstrap. Only a successful flush publishes `Stopped`.
+5. The actor/cache is gone at `Stopped`, but the RocksDB fragment prefix is
+   deliberately retained in this release. The store exposes synchronous
+   idempotent prefix deletion; placement will invoke it only after a fresh exact
+   reconciliation/durability fence replaces the weaker queue-emptiness test.
+
+The controller sequencing rule is therefore mandatory for data transfer today:
+add the destination during an overlap, wait for its `on_fragment_ready`, and
+only then revoke the source. Directly replacing the sole source with an absent
+or unbootstrapped owner is not a migration certificate; `Draining` queue
+emptiness alone does not prove that owner received the existing snapshot.
 
 **Overlap-window safety.** While peers' maps transiently disagree, a node that
 receives an op for a fragment it no longer serves **re-forwards** it

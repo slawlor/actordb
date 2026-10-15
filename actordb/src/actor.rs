@@ -668,7 +668,7 @@ impl FragmentState {
         let cache = self.cache.read().await;
         let revision = self.revision.load(Ordering::Acquire);
         let snapshot_time_ms = snapshot_time_ms.unwrap_or_else(now_ms);
-        if expected_revision.map_or(false, |expected| expected != revision) {
+        if expected_revision.is_some_and(|expected| expected != revision) {
             return SummaryPage {
                 summaries: Vec::new(),
                 revision,

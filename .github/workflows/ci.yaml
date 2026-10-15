@@ -7,6 +7,16 @@ on:
     types: [opened, reopened, synchronize]
 
 jobs:
+  msrv:
+    name: Rust 1.88 minimum version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@main
+      - name: Install Rust 1.88
+        uses: dtolnay/rust-toolchain@1.88.0
+      - name: Check the locked workspace
+        run: cargo check --workspace --all-targets --locked
+
   test:
     name: ${{matrix.name}}
     runs-on: ubuntu-latest
@@ -16,8 +26,8 @@ jobs:
         include:
           - name: Run the default tests
             package: actordb
-            # flags: 
-            
+            # flags:
+
     steps:
       - uses: actions/checkout@main
 
@@ -111,4 +121,3 @@ jobs:
         with:
           command: bench
           args: --no-run
-          
