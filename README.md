@@ -500,9 +500,9 @@ as issues in the [issue tracker](https://github.com/slawlor/actordb/issues):
   per-replica convergence evidence plus a durable store delete path; elapsed
   wall-clock time cannot prove either condition.
 - **Custom worker-pool supervision is incomplete** — a worker crash can drop
-  accepted mailbox work and leak admission accounting, and a restarted
-  dispatcher is not yet republished through the fragment router. Migration to
-  ractor's `Factory` lifecycle is tracked before production use.
+  accepted mailbox work and leak admission accounting. A restarted dispatcher
+  is republished through a generation-checked fragment route, but migration to
+  ractor's `Factory` lifecycle is still tracked before production use.
 
 ## Contributors
 

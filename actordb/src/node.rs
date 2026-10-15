@@ -583,7 +583,8 @@ const MAX_FORWARD_HOPS: u32 = 4;
 /// adds/removes fragment subtrees at runtime.
 #[derive(Clone)]
 pub struct FragmentRouter {
-    actors: Arc<RwLock<HashMap<FragmentId, ActorRef<KvMessage>>>>,
+    actors: Arc<RwLock<HashMap<FragmentId, FragmentRoute>>>,
+    next_generation: Arc<AtomicU64>,
     fragment_count: usize,
     /// A mutation holds a shared lease from its serving decision through
     /// apply and replication fan-out. Placement revocation takes the exclusive
@@ -591,10 +592,17 @@ pub struct FragmentRouter {
     mutation_gates: Arc<Vec<Arc<AsyncRwLock<()>>>>,
 }
 
+#[derive(Clone)]
+struct FragmentRoute {
+    generation: u64,
+    actor: ActorRef<KvMessage>,
+}
+
 impl FragmentRouter {
     pub(crate) fn new(fragment_count: usize, actor_capacity: usize) -> Self {
         Self {
             actors: Arc::new(RwLock::new(HashMap::with_capacity(actor_capacity))),
+            next_generation: Arc::new(AtomicU64::new(1)),
             fragment_count,
             mutation_gates: Arc::new(
                 (0..fragment_count)
@@ -619,7 +627,11 @@ impl FragmentRouter {
     /// The actor running `fragment`, if this node runs it (includes
     /// fragments still bootstrapping under Phase 8).
     pub fn route_for_fragment(&self, fragment: FragmentId) -> Option<ActorRef<KvMessage>> {
-        self.actors.read().unwrap().get(&fragment).cloned()
+        self.actors
+            .read()
+            .unwrap()
+            .get(&fragment)
+            .map(|route| route.actor.clone())
     }
 
     pub(crate) fn key_belongs_to(&self, fragment: FragmentId, key: &str) -> bool {
@@ -631,8 +643,13 @@ impl FragmentRouter {
     }
 
     /// Add (or replace) the actor for `fragment`.
-    fn insert(&self, fragment: FragmentId, actor: ActorRef<KvMessage>) {
-        self.actors.write().unwrap().insert(fragment, actor);
+    fn insert(&self, fragment: FragmentId, actor: ActorRef<KvMessage>) -> u64 {
+        let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
+        self.actors
+            .write()
+            .unwrap()
+            .insert(fragment, FragmentRoute { generation, actor });
+        generation
     }
 
     /// Remove the actor for `fragment`.
@@ -640,10 +657,63 @@ impl FragmentRouter {
         self.actors.write().unwrap().remove(&fragment);
     }
 
+    /// Publish a supervisor replacement only while the exact subtree route
+    /// that installed `expected` is still current. Placement may remove and
+    /// re-add the same fragment while an old monitor is waking up; the
+    /// generation check prevents that stale monitor from overwriting the new
+    /// subtree (including an actor-id ABA after a very long process lifetime).
+    fn replace_if_current(
+        &self,
+        fragment: FragmentId,
+        generation: u64,
+        expected: &ActorRef<KvMessage>,
+        replacement: ActorRef<KvMessage>,
+    ) -> bool {
+        let mut actors = self.actors.write().unwrap();
+        let Some(route) = actors.get_mut(&fragment) else {
+            return false;
+        };
+        if route.generation != generation || route.actor.get_id() != expected.get_id() {
+            return false;
+        }
+        route.actor = replacement;
+        true
+    }
+
+    fn is_current(
+        &self,
+        fragment: FragmentId,
+        generation: u64,
+        expected: &ActorRef<KvMessage>,
+    ) -> bool {
+        self.actors
+            .read()
+            .unwrap()
+            .get(&fragment)
+            .map_or(false, |route| {
+                route.generation == generation && route.actor.get_id() == expected.get_id()
+            })
+    }
+
+    fn remove_if_generation(&self, fragment: FragmentId, generation: u64) {
+        let mut actors = self.actors.write().unwrap();
+        if actors
+            .get(&fragment)
+            .map_or(false, |route| route.generation == generation)
+        {
+            actors.remove(&fragment);
+        }
+    }
+
     async fn get_all(&self) -> Result<HashMap<String, VersionedValue>, NodeError> {
         // Clone the refs first; don't hold the lock across awaits.
-        let actors: Vec<ActorRef<KvMessage>> =
-            self.actors.read().unwrap().values().cloned().collect();
+        let actors: Vec<ActorRef<KvMessage>> = self
+            .actors
+            .read()
+            .unwrap()
+            .values()
+            .map(|route| route.actor.clone())
+            .collect();
         let mut all = HashMap::new();
         for actor in actors {
             let res = actor
@@ -1512,6 +1582,91 @@ async fn spawn_fragment_subtree_registered(
     Ok((supervisor, dispatcher))
 }
 
+/// Keep the router pointed at the dispatcher currently owned by one fragment
+/// supervisor. The supervisor is the lifecycle authority and already replaces
+/// a failed dispatcher in place; this monitor republishes that replacement to
+/// every local and replication call site which resolves through the router.
+///
+/// Route generation plus actor identity make publication ABA-safe when a
+/// dynamic placement loss/re-add races the old subtree's final failure event.
+async fn monitor_fragment_dispatcher(
+    fragment: FragmentId,
+    generation: u64,
+    supervisor: ActorRef<SupervisorMessage>,
+    router: FragmentRouter,
+    mut current: ActorRef<KvMessage>,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    loop {
+        if *shutdown.borrow() || !router.is_current(fragment, generation, &current) {
+            return;
+        }
+
+        tokio::select! {
+            biased;
+            changed = shutdown.changed() => {
+                let _ = changed;
+                return;
+            }
+            _ = current.wait(None) => {}
+        }
+
+        let replacement = loop {
+            if *shutdown.borrow() || !router.is_current(fragment, generation, &current) {
+                return;
+            }
+            match supervisor
+                .call(
+                    |reply| SupervisorMessage::GetDispatcher { reply },
+                    Some(RECONNECT_BASE),
+                )
+                .await
+            {
+                Ok(CallResult::Success(candidate)) if candidate.get_id() != current.get_id() => {
+                    break candidate;
+                }
+                Ok(CallResult::Success(_)) | Ok(CallResult::Timeout) => {}
+                Ok(CallResult::SenderError) | Err(_) => return,
+            }
+            tokio::select! {
+                biased;
+                changed = shutdown.changed() => {
+                    let _ = changed;
+                    return;
+                }
+                _ = tokio::time::sleep(RECONNECT_BASE) => {}
+            }
+        };
+
+        if !router.replace_if_current(fragment, generation, &current, replacement.clone()) {
+            return;
+        }
+        tracing::warn!(
+            fragment = fragment.0,
+            previous_dispatcher = ?current.get_id(),
+            replacement_dispatcher = ?replacement.get_id(),
+            "republished restarted fragment dispatcher"
+        );
+        current = replacement;
+    }
+}
+
+async fn register_fragment_dispatcher_monitor(
+    tasks: &Arc<RuntimeTasks>,
+    fragment: FragmentId,
+    generation: u64,
+    supervisor: ActorRef<SupervisorMessage>,
+    router: FragmentRouter,
+    dispatcher: ActorRef<KvMessage>,
+) -> bool {
+    let shutdown = tasks.shutdown_signal();
+    tasks
+        .spawn(monitor_fragment_dispatcher(
+            fragment, generation, supervisor, router, dispatcher, shutdown,
+        ))
+        .await
+}
+
 #[cfg(test)]
 async fn spawn_fragment_subtree(
     node_id: &str,
@@ -2237,6 +2392,7 @@ impl Node {
                     .map(|f| (*f, FragmentPlacementState::Serving))
                     .collect()
             }));
+        let tasks = RuntimeTasks::new(TASK_COMMAND_CAPACITY);
         let mut startup_supervisors = SupervisorStartupGuard::new(my_fragments.len());
         for fragment in my_fragments {
             let (supervisor, dispatcher) = match spawn_fragment_subtree_registered(
@@ -2250,13 +2406,34 @@ impl Node {
             {
                 Ok(subtree) => subtree,
                 Err(error) => {
+                    tasks.shutdown().await;
                     startup_supervisors.rollback().await;
                     return Err(error);
                 }
             };
             startup_supervisors.push(supervisor.clone());
-            supervisors.lock().await.insert(fragment, supervisor);
-            router.insert(fragment, dispatcher);
+            supervisors
+                .lock()
+                .await
+                .insert(fragment, supervisor.clone());
+            let generation = router.insert(fragment, dispatcher.clone());
+            if !register_fragment_dispatcher_monitor(
+                &tasks,
+                fragment,
+                generation,
+                supervisor,
+                router.clone(),
+                dispatcher,
+            )
+            .await
+            {
+                router.remove_if_generation(fragment, generation);
+                tasks.shutdown().await;
+                startup_supervisors.rollback().await;
+                return Err(NodeError::Actor(
+                    "node runtime stopped during dispatcher-monitor startup".to_string(),
+                ));
+            }
         }
 
         let fragment_map: Arc<RwLock<HashMap<FragmentId, Vec<String>>>> =
@@ -2269,7 +2446,6 @@ impl Node {
         };
         let (peer_changes, _) = watch::channel(0u64);
         let (dial_intent_changes, _) = watch::channel(0u64);
-        let tasks = RuntimeTasks::new(TASK_COMMAND_CAPACITY);
         let node = Self {
             node_id: node_id.clone(),
             boot_id: fresh_boot_id(),
@@ -3952,11 +4128,36 @@ async fn gain_fragment(deps: &PlacementDriverDeps, fragment: FragmentId, preload
         };
         let mut startup_supervisor = SupervisorStartupGuard::new(1);
         startup_supervisor.push(supervisor.clone());
-        deps.supervisors.lock().await.insert(fragment, supervisor);
-        startup_supervisor.disarm();
+        deps.supervisors
+            .lock()
+            .await
+            .insert(fragment, supervisor.clone());
         // The actor exists in the router now (so the reconciler can merge
         // into it), but the fragment is not serving yet.
-        deps.router.insert(fragment, dispatcher);
+        let generation = deps.router.insert(fragment, dispatcher.clone());
+        let monitor_registered = match deps.tasks.upgrade() {
+            Some(tasks) => {
+                register_fragment_dispatcher_monitor(
+                    &tasks,
+                    fragment,
+                    generation,
+                    supervisor,
+                    deps.router.clone(),
+                    dispatcher,
+                )
+                .await
+            }
+            None => false,
+        };
+        if !monitor_registered {
+            deps.router.remove_if_generation(fragment, generation);
+            deps.supervisors.lock().await.remove(&fragment);
+            startup_supervisor.rollback().await;
+            deps.supervisor_stops.remove(fragment);
+            deps.placement_states.lock().await.remove(&fragment);
+            return;
+        }
+        startup_supervisor.disarm();
     }
 
     if converge_fragment_gain(deps, fragment).await {
@@ -7000,6 +7201,54 @@ mod tests {
         }
     }
 
+    struct BlockingDispatcherSupervisor;
+
+    struct BlockingDispatcherSupervisorState {
+        replacement: ActorRef<KvMessage>,
+        requested: Arc<Notify>,
+        release: Arc<Notify>,
+    }
+
+    impl Actor for BlockingDispatcherSupervisor {
+        type Msg = SupervisorMessage;
+        type State = BlockingDispatcherSupervisorState;
+        type Arguments = BlockingDispatcherSupervisorState;
+
+        async fn pre_start(
+            &self,
+            _myself: ActorRef<Self::Msg>,
+            args: Self::Arguments,
+        ) -> Result<Self::State, ractor::ActorProcessingErr> {
+            Ok(args)
+        }
+
+        async fn handle(
+            &self,
+            _myself: ActorRef<Self::Msg>,
+            message: Self::Msg,
+            state: &mut Self::State,
+        ) -> Result<(), ractor::ActorProcessingErr> {
+            match message {
+                SupervisorMessage::GetDispatcher { reply } => {
+                    state.requested.notify_one();
+                    state.release.notified().await;
+                    let _ = reply.send(state.replacement.clone());
+                }
+                SupervisorMessage::GetHealth { reply } => {
+                    let _ = reply.send(FragmentHealth {
+                        fragment: FragmentId(0),
+                        worker_count: 0,
+                        worker_names: Vec::new(),
+                        restarts: HashMap::new(),
+                        last_reaped: 0,
+                        shed_counts: (0, 0, 0),
+                    });
+                }
+            }
+            Ok(())
+        }
+    }
+
     fn test_peer_channel(
         capacity: usize,
     ) -> (
@@ -7466,6 +7715,167 @@ mod tests {
         ] {
             assert!(options.validate().is_err());
         }
+    }
+
+    #[tokio::test]
+    async fn dispatcher_restart_is_republished_to_the_fragment_router() {
+        let node = Node::start(
+            "dispatcher-republish".to_string(),
+            "127.0.0.1:0".parse().unwrap(),
+            NodeConfig {
+                fragment_count: 1,
+                ..NodeConfig::default()
+            },
+        )
+        .await
+        .unwrap();
+        let fragment = FragmentId(0);
+        node.put("before".to_string(), b"value".to_vec())
+            .await
+            .unwrap();
+
+        let dead = node
+            .router
+            .route_for_fragment(fragment)
+            .expect("fragment route missing before dispatcher failure");
+        let dead_id = dead.get_id();
+        dead.kill();
+
+        let replacement = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(candidate) = node.router.route_for_fragment(fragment) {
+                    if candidate.get_id() != dead_id {
+                        break candidate;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("supervisor replacement was not republished");
+        assert_ne!(replacement.get_id(), dead_id);
+        assert_eq!(
+            node.get("before".to_string())
+                .await
+                .unwrap()
+                .expect("replacement dispatcher lost the shared cache")
+                .value,
+            b"value"
+        );
+
+        node.put("after".to_string(), b"replacement".to_vec())
+            .await
+            .unwrap();
+        assert_eq!(
+            node.get("after".to_string())
+                .await
+                .unwrap()
+                .expect("replacement dispatcher lost shared state")
+                .value,
+            b"replacement"
+        );
+
+        let replacement_id = replacement.get_id();
+        replacement.kill();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if node
+                    .router
+                    .route_for_fragment(fragment)
+                    .map_or(false, |candidate| candidate.get_id() != replacement_id)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("monitor did not continue across a second dispatcher restart");
+        node.put("after-second".to_string(), b"replacement-2".to_vec())
+            .await
+            .unwrap();
+        assert!(node.health().await.unwrap()[&fragment]
+            .restarts
+            .get("dispatcher")
+            .map_or(false, |restarts| *restarts >= 2));
+
+        node.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn stale_dispatcher_monitor_cannot_overwrite_a_readded_fragment() {
+        let router = FragmentRouter::new(1, 1);
+        let state = || BlockingPageState {
+            started: Arc::new(Notify::new()),
+            release: Arc::new(Notify::new()),
+        };
+        let (retired, retired_handle) = BlockingPageActor::spawn(None, BlockingPageActor, state())
+            .await
+            .unwrap();
+        let retired_generation = router.insert(FragmentId(0), retired.clone());
+
+        let (stale_replacement, stale_handle) =
+            BlockingPageActor::spawn(None, BlockingPageActor, state())
+                .await
+                .unwrap();
+        let requested = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let (supervisor, supervisor_handle) = BlockingDispatcherSupervisor::spawn(
+            None,
+            BlockingDispatcherSupervisor,
+            BlockingDispatcherSupervisorState {
+                replacement: stale_replacement.clone(),
+                requested: requested.clone(),
+                release: release.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let monitor = tokio::spawn(monitor_fragment_dispatcher(
+            FragmentId(0),
+            retired_generation,
+            supervisor.clone(),
+            router.clone(),
+            retired.clone(),
+            shutdown_rx,
+        ));
+
+        retired.kill();
+        tokio::time::timeout(Duration::from_secs(1), requested.notified())
+            .await
+            .expect("monitor did not request the supervisor replacement");
+
+        // Placement replaces the entire subtree while the old monitor holds
+        // a now-stale replacement response.
+        router.remove(FragmentId(0));
+
+        let (current, current_handle) = BlockingPageActor::spawn(None, BlockingPageActor, state())
+            .await
+            .unwrap();
+        let current_generation = router.insert(FragmentId(0), current.clone());
+        assert_ne!(retired_generation, current_generation);
+        release.notify_one();
+        tokio::time::timeout(Duration::from_secs(1), monitor)
+            .await
+            .expect("stale monitor did not exit")
+            .unwrap();
+        assert_eq!(
+            router
+                .route_for_fragment(FragmentId(0))
+                .expect("readded route disappeared")
+                .get_id(),
+            current.get_id()
+        );
+
+        let _ = shutdown_tx.send(true);
+        current.stop(None);
+        stale_replacement.stop(None);
+        supervisor.stop(None);
+        retired_handle.await.unwrap();
+        current_handle.await.unwrap();
+        stale_handle.await.unwrap();
+        supervisor_handle.await.unwrap();
     }
 
     #[test]
