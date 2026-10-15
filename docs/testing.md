@@ -36,6 +36,10 @@ reconcile reply variants to race sender retirement after control-lane admission
 and proves the multiplexed peer connection remains usable.
 The placement lease test proves revocation waits for an already-admitted
 mutation before changing the serving decision.
+`dispatcher_restart_is_republished_to_the_fragment_router` exercises the full
+supervisor-to-router replacement path, while
+`stale_dispatcher_monitor_cannot_overwrite_a_readded_fragment` pins its
+generation/actor-identity publication fence.
 
 ## Integration tests (`actordb/tests/cluster.rs`)
 

@@ -78,10 +78,11 @@ Key design points:
 - **Supervision is local and shallow, but not yet lossless.** A dead worker is
   replaced with the same `Arc<FragmentState>` and pool slot, but accepted jobs
   in its mailbox are not replayed and pending admission accounting can leak.
-  Cleaner and snapshotter restart in place. A dispatcher restart is not yet
-  republished to `FragmentRouter`, so callers can retain the dead reference.
-  The planned ractor `Factory` migration addresses worker admission/drain and
-  a stable routed facade without coupling failures across fragments.
+  Cleaner and snapshotter restart in place. A Node-owned monitor republishes a
+  replacement dispatcher through a generation-checked `FragmentRouter` entry;
+  a stale monitor from a removed placement generation cannot overwrite a
+  re-added subtree. The planned ractor `Factory` migration addresses lossless
+  worker admission/drain without coupling failures across fragments.
 - **Placement is authoritative input.** In static mode the node routes by
   `fragment_map`. With a `PlacementController` set, a driver polls
   `desired_placement()` every `placement_poll_interval` and spawns/stops
