@@ -5215,13 +5215,19 @@ async fn handle_connection(
                     continue;
                 }
                 if !serving.read().unwrap().contains(&frag) {
-                    tracing::warn!(
+                    // Independent placement observers can legitimately race:
+                    // the serving replica may start its routine round before
+                    // this node has finished bootstrapping the same fragment.
+                    // Ignore that round so its sender times out/retries, while
+                    // preserving the multiplexed connection for this node's
+                    // reverse bootstrap and for unrelated fragments.
+                    tracing::debug!(
                         peer = %peer,
                         fragment = r.fragment,
                         round_id = r.round_id,
-                        "rejecting reconciliation from a non-serving fragment"
+                        "ignoring reconciliation for a non-serving fragment"
                     );
-                    break;
+                    continue;
                 }
                 let first_page = r.page_seq == 0;
                 let reconcile_key = (peer.clone(), frag);
@@ -5395,14 +5401,17 @@ async fn handle_connection(
                     continue;
                 }
                 if !serving.read().unwrap().contains(&frag) {
-                    tracing::warn!(
+                    // A fragment can lose authority between the summary and
+                    // fetch phases. Let the correlated sender expire and retry
+                    // without tearing down other traffic on this connection.
+                    tracing::debug!(
                         peer = %peer,
                         fragment = f.fragment,
                         round_id = f.round_id,
                         chunk_seq = f.chunk_seq,
-                        "rejecting reconciliation fetch from a non-serving fragment"
+                        "ignoring reconciliation fetch for a non-serving fragment"
                     );
-                    break;
+                    continue;
                 }
                 if f.keys.is_empty() || f.keys.len() > MAX_RECONCILE_FETCH_KEYS {
                     tracing::warn!(
@@ -6953,6 +6962,7 @@ async fn try_send_envelope_with_deadline(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::proto::{ReconcileRequest, SessionStart};
     use crate::replication::spawn_sender_with_options;
 
     struct BlockingPageActor;
@@ -7785,6 +7795,96 @@ mod tests {
                 .unwrap();
             runtime_tasks.shutdown().await;
             retired.stop().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn non_serving_reconcile_races_do_not_close_shared_connection() {
+        for fetch in [false, true] {
+            let fragment = FragmentId(0);
+            let peers: PeerMap = Arc::new(Mutex::new(HashMap::new()));
+            let (ctx, runtime_tasks) = test_connection_context(
+                FragmentRouter::new(1, 0),
+                Arc::new(RwLock::new(HashSet::new())),
+                Arc::new(RwLock::new(HashMap::from([(
+                    fragment,
+                    vec!["local".to_string(), "peer".to_string()],
+                )]))),
+                true,
+                Arc::new(Mutex::new(HashMap::new())),
+                Arc::new(Mutex::new(HashMap::new())),
+                peers.clone(),
+            );
+            let (mut client, server) = tokio::io::duplex(4096);
+            let connection =
+                tokio::spawn(handle_connection(ctx, Box::pin(server), false, None, None));
+            complete_test_handshake(&mut client, "peer").await;
+
+            write_test_envelope(
+                &mut client,
+                Envelope {
+                    msg: Some(EnvelopeMsg::SessionStart(SessionStart {
+                        session_id: 1,
+                        fragment: fragment.0,
+                    })),
+                },
+            )
+            .await;
+            let reconcile = if fetch {
+                EnvelopeMsg::ReconcileFetch(ReconcileFetch {
+                    fragment: fragment.0,
+                    keys: vec!["connection-probe".to_string()],
+                    session_id: 1,
+                    round_id: 1,
+                    chunk_seq: 0,
+                })
+            } else {
+                EnvelopeMsg::ReconcileRequest(ReconcileRequest {
+                    fragment: fragment.0,
+                    session_id: 1,
+                    round_id: 1,
+                    page_seq: 0,
+                    after_key: String::new(),
+                    snapshot_revision: 0,
+                    snapshot_time_ms: 0,
+                })
+            };
+            write_test_envelope(
+                &mut client,
+                Envelope {
+                    msg: Some(reconcile),
+                },
+            )
+            .await;
+
+            // A request for another multiplexed protocol proves that the
+            // honest placement race did not sacrifice either connection half.
+            write_test_envelope(
+                &mut client,
+                Envelope {
+                    msg: Some(EnvelopeMsg::BatchGet(BatchGet {
+                        req_id: 99,
+                        keys: vec!["connection-probe".to_string()],
+                        priority: ProtoPriority::Default as i32,
+                    })),
+                },
+            )
+            .await;
+            assert!(matches!(
+                read_test_envelope(&mut client).await.msg,
+                Some(EnvelopeMsg::BatchGetResponse(BatchGetResponse {
+                    req_id: 99,
+                    results,
+                })) if results.is_empty()
+            ));
+            assert!(peers.lock().await.contains_key("peer"));
+
+            drop(client);
+            tokio::time::timeout(Duration::from_secs(1), connection)
+                .await
+                .expect("connection did not stop after its stream closed")
+                .unwrap();
+            runtime_tasks.shutdown().await;
         }
     }
 

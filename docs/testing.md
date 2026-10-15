@@ -87,7 +87,9 @@ process — the bulk of behavioral coverage:
   Node and wire unit tests separately verify exact Prost length accounting,
   positional ordered-prefix validation with duplicate keys, the shed-bit hard
   boundary, UTF-8-safe diagnostic truncation, valid provenance bounds, and the
-  reserved full-frame response lane under complete producer saturation.
+  reserved full-frame response lane under complete producer saturation. The
+  connection tests also prove that a reconcile request/fetch racing a
+  non-serving fragment cannot tear down unrelated multiplexed traffic.
 - **Backpressure**: `background_saturation_leaves_high_priority_p99_unaffected`,
   `queue_cap_shed_is_explicit_and_counted`,
   `forwarded_priority_preserved_end_to_end`,

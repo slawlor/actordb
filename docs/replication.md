@@ -243,6 +243,10 @@ retry on their own one-second timer rather than waiting for `batch_interval` or
 the next consistency tick. Reset rounds restart on reconnect before streaming
 resumes. Local, transport, NACK, and phase-timeout failures all fail closed:
 they never increment the completed-round counter or clear the reset state.
+An authenticated reconcile request or fetch that races a fragment's
+bootstrapping/non-serving state is ignored until the sender's bounded phase
+timeout; it does not tear down the multiplexed connection needed by the reverse
+bootstrap or unrelated fragments.
 Placement drain likewise treats `BufferReset` as active work even when its
 ordinary buffer and in-flight counts are zero.
 
