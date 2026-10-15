@@ -26,7 +26,7 @@
 //! Wire format: prost-encoded [`crate::proto::Envelope`]
 //! frames, each prefixed with a 4-byte big-endian length.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, RwLock, Weak};
@@ -64,15 +64,16 @@ use crate::shard::{fragment_of, FragmentId};
 use crate::store::{KvStore, PrefixedStore};
 use crate::supervision::{FragmentHealth, FragmentSupervisor, SupervisorArgs, SupervisorMessage};
 use crate::wire::{
-    check_envelope_budget, check_record_budget, encode_envelope, message_field_len,
-    preflight_envelope_decode, BudgetedFrame, BudgetedPeerTx, ReconcileGate,
-    ANTI_ENTROPY_PAGE_BYTES, MAX_FRAME_BYTES, MAX_RECONCILE_FETCH_KEYS, MAX_RECONCILE_PAGE_ITEMS,
-    MAX_WIRE_BATCH_ITEMS,
+    bytes_field_len, check_envelope_budget, check_record_budget, encode_envelope,
+    message_field_len, preflight_envelope_decode, varint_field_len, BudgetedFrame, BudgetedPeerTx,
+    ReconcileGate, ANTI_ENTROPY_PAGE_BYTES, MAX_FRAME_BYTES, MAX_RECONCILE_FETCH_KEYS,
+    MAX_RECONCILE_PAGE_ITEMS, MAX_WIRE_BATCH_ITEMS, MAX_WIRE_ERROR_BYTES, MAX_WIRE_NODE_ID_BYTES,
 };
 
 /// Current peer wire protocol version. Hello ranges must include this value.
 /// Version 3 replaces monolithic full-state sync with byte-bounded,
-/// cursor-correlated reconciliation pages.
+/// cursor-correlated reconciliation pages. Required capabilities additionally
+/// gate ordered-prefix batch-get semantics within v3.
 pub const WIRE_PROTOCOL_VERSION: u32 = 3;
 /// The peer returns exact forwarded-mutation outcomes.
 pub const CAPABILITY_MUTATION_RESULTS: u64 = 1 << 0;
@@ -85,12 +86,16 @@ pub const CAPABILITY_CORRELATED_RECONCILIATION: u64 = 1 << 2;
 pub const CAPABILITY_CHALLENGE_AUTH: u64 = 1 << 3;
 /// Anti-entropy uses stable cursor pages with exact encoded-byte bounds.
 pub const CAPABILITY_PAGED_ANTI_ENTROPY: u64 = 1 << 4;
+/// Aggregate batch requests and replies are exact-byte-bounded. Batch-get
+/// replies may contain an ordered prefix that the caller resumes explicitly.
+pub const CAPABILITY_BYTE_BOUNDED_BATCHES: u64 = 1 << 5;
 /// Capabilities required by this binary before it installs a peer connection.
 pub const REQUIRED_WIRE_CAPABILITIES: u64 = CAPABILITY_MUTATION_RESULTS
     | CAPABILITY_DURABILITY_ACKS
     | CAPABILITY_CORRELATED_RECONCILIATION
     | CAPABILITY_CHALLENGE_AUTH
-    | CAPABILITY_PAGED_ANTI_ENTROPY;
+    | CAPABILITY_PAGED_ANTI_ENTROPY
+    | CAPABILITY_BYTE_BOUNDED_BATCHES;
 
 /// Outbound queue depth per peer connection.
 const PEER_CHANNEL_DEPTH: usize = 256;
@@ -100,10 +105,18 @@ const PEER_CHANNEL_BYTE_CAPACITY: usize = 32 * 1024 * 1024;
 /// Bound control preference so sustained replies cannot starve ordinary RPC
 /// and replication traffic on the shared socket.
 const PEER_RESPONSE_BURST_LIMIT: usize = 16;
-/// Bytes unavailable to ordinary producers so reader-generated ACKs and
-/// reconciliation summaries can still enter the priority lane under load.
-const PEER_RESPONSE_BYTE_RESERVE: usize = ANTI_ENTROPY_PAGE_BYTES;
+/// Bytes unavailable to ordinary producers so every legal reader-generated
+/// response can still enter the priority lane under load. Most aggregate
+/// responses target one MiB, but one individually valid record may approach
+/// the hard frame limit.
+const PEER_RESPONSE_BYTE_RESERVE: usize = MAX_FRAME_BYTES;
 const MIN_PEER_CHANNEL_BYTE_CAPACITY: usize = MAX_FRAME_BYTES + PEER_RESPONSE_BYTE_RESERVE;
+/// Soft encoded-byte target for aggregate request and response frames. One
+/// individually valid item may exceed this target up to `MAX_FRAME_BYTES`.
+const WIRE_BATCH_PAGE_BYTES: usize = ANTI_ENTROPY_PAGE_BYTES;
+/// Bound pull-request suffixes so a value-heavy batch cannot resend thousands
+/// of key bytes quadratically while responses advance one item at a time.
+const MAX_BATCH_GET_REQUEST_KEYS: usize = 256;
 /// Protocol-control messages retained per fragment/peer sender. Mutation
 /// ingress has its own lane sized by `SenderConfig::buffer_capacity`.
 const REPLICATION_CONTROL_CHANNEL_DEPTH: usize = 64;
@@ -457,8 +470,10 @@ struct GetRelay {
 /// read due to backpressure.
 type PendingGets =
     Arc<StdMutex<HashMap<u64, oneshot::Sender<Result<Option<VersionedValue>, String>>>>>;
-/// Pending batched forwarded reads: req_id -> reply channel.
-type PendingBatchGets = Arc<StdMutex<HashMap<u64, oneshot::Sender<Vec<BatchKeyValue>>>>>;
+/// Pending batched forwarded reads. The expected connection-bound responder and ordered
+/// key prefix are retained so a colliding or malformed reply cannot complete
+/// another peer's request.
+type PendingBatchGets = Arc<StdMutex<HashMap<u64, PendingBatchGet>>>;
 /// Pending single or batched forwarded mutations. Results preserve request
 /// order and cardinality.
 type PendingMutations = Arc<StdMutex<HashMap<u64, PendingMutation>>>;
@@ -467,6 +482,12 @@ struct PendingMutation {
     expected_peer: String,
     expected_keys: Vec<String>,
     reply: oneshot::Sender<Vec<MutationResult>>,
+}
+
+struct PendingBatchGet {
+    expected_peer: String,
+    expected_keys: Vec<String>,
+    reply: oneshot::Sender<Result<Vec<BatchKeyValue>, NodeError>>,
 }
 
 /// Removes a pending request even if its future is cancelled while waiting
@@ -790,6 +811,101 @@ async fn enqueue_to_senders(senders: &SenderMap, frag: FragmentId, op: &Replicat
     }
 }
 
+fn truncate_wire_error(mut error: String) -> String {
+    if error.len() <= MAX_WIRE_ERROR_BYTES {
+        return error;
+    }
+    let mut end = MAX_WIRE_ERROR_BYTES;
+    while !error.is_char_boundary(end) {
+        end -= 1;
+    }
+    error.truncate(end);
+    error
+}
+
+/// Conservative encoded size for any result that can be produced for one
+/// mutation key. Mutually exclusive error/winner fields are deliberately
+/// counted together so a request chunk is safe for every outcome.
+fn max_mutation_result_encoded_len(key_len: usize) -> usize {
+    bytes_field_len(1, key_len)
+        + varint_field_len(2, MutationStatus::Unavailable as u64)
+        + bytes_field_len(3, MAX_WIRE_ERROR_BYTES)
+        + varint_field_len(4, u64::MAX)
+        + bytes_field_len(5, MAX_WIRE_NODE_ID_BYTES)
+        + varint_field_len(6, 1)
+        + varint_field_len(7, u64::from(u32::MAX))
+}
+
+fn batch_put_base_encoded_len(priority: i32) -> usize {
+    BatchPut {
+        puts: Vec::new(),
+        priority,
+        req_id: u64::MAX,
+    }
+    .encoded_len()
+}
+
+fn mutation_response_base_encoded_len() -> usize {
+    MutationResponse {
+        req_id: u64::MAX,
+        results: Vec::new(),
+    }
+    .encoded_len()
+}
+
+fn batch_get_base_encoded_len(priority: i32) -> usize {
+    BatchGet {
+        req_id: u64::MAX,
+        keys: Vec::new(),
+        priority,
+    }
+    .encoded_len()
+}
+
+fn batch_get_response_base_encoded_len(req_id: u64) -> usize {
+    BatchGetResponse {
+        req_id,
+        results: Vec::new(),
+    }
+    .encoded_len()
+}
+
+fn max_batch_get_non_value_result_encoded_len(key_len: usize) -> usize {
+    bytes_field_len(1, key_len) + varint_field_len(8, 1)
+}
+
+fn batch_put_envelope_encoded_len(payload_len: usize) -> usize {
+    message_field_len(15, payload_len)
+}
+
+fn batch_get_envelope_encoded_len(payload_len: usize) -> usize {
+    message_field_len(16, payload_len)
+}
+
+fn batch_get_response_envelope_encoded_len(payload_len: usize) -> usize {
+    message_field_len(17, payload_len)
+}
+
+fn mutation_response_envelope_encoded_len(payload_len: usize) -> usize {
+    message_field_len(18, payload_len)
+}
+
+fn validate_batch_put_wire_bounds(batch: &BatchPut) -> Result<(), NodeError> {
+    let request_len = batch_put_envelope_encoded_len(batch.encoded_len());
+    let mut response_payload_len = mutation_response_base_encoded_len();
+    for put in &batch.puts {
+        response_payload_len +=
+            message_field_len(2, max_mutation_result_encoded_len(put.key.len()));
+    }
+    let response_len = mutation_response_envelope_encoded_len(response_payload_len);
+    if request_len > MAX_FRAME_BYTES || response_len > MAX_FRAME_BYTES {
+        return Err(NodeError::Codec(format!(
+            "batch put exceeds the hard request/response frame bound: request={request_len} response={response_len} limit={MAX_FRAME_BYTES}"
+        )));
+    }
+    Ok(())
+}
+
 fn mutation_result(
     key: String,
     request_index: usize,
@@ -849,6 +965,7 @@ fn mutation_result(
             wire.error = error.to_string();
         }
     }
+    wire.error = truncate_wire_error(wire.error);
     wire
 }
 
@@ -899,6 +1016,97 @@ fn validate_mutation_results(
             return Err(NodeError::Codec(format!(
                 "forwarded mutation result {request_index} has unknown status {}",
                 result.status
+            )));
+        }
+        if result.error.len() > MAX_WIRE_ERROR_BYTES {
+            return Err(NodeError::Codec(format!(
+                "forwarded mutation result {request_index} exceeds the wire error limit"
+            )));
+        }
+        match MutationStatus::try_from(result.status) {
+            Ok(MutationStatus::Superseded) => {
+                if !result.error.is_empty()
+                    || result.winner_node_id.is_empty()
+                    || result.winner_node_id.len() > MAX_WIRE_NODE_ID_BYTES
+                {
+                    return Err(NodeError::Codec(format!(
+                        "forwarded mutation result {request_index} has invalid superseded fields"
+                    )));
+                }
+            }
+            Ok(
+                MutationStatus::Backpressure
+                | MutationStatus::StorageError
+                | MutationStatus::ActorError
+                | MutationStatus::Unavailable,
+            ) => {
+                if result.winner_timestamp_ms != 0
+                    || !result.winner_node_id.is_empty()
+                    || result.winner_is_tombstone
+                {
+                    return Err(NodeError::Codec(format!(
+                        "forwarded mutation result {request_index} has unexpected winner fields"
+                    )));
+                }
+            }
+            Ok(
+                MutationStatus::Applied | MutationStatus::AlreadyPresent | MutationStatus::Expired,
+            ) => {
+                if !result.error.is_empty()
+                    || result.winner_timestamp_ms != 0
+                    || !result.winner_node_id.is_empty()
+                    || result.winner_is_tombstone
+                {
+                    return Err(NodeError::Codec(format!(
+                        "forwarded mutation result {request_index} has unexpected fields"
+                    )));
+                }
+            }
+            Ok(MutationStatus::Unknown) | Err(_) => unreachable!("rejected above"),
+        }
+    }
+    Ok(())
+}
+
+fn validate_batch_get_results(
+    expected_keys: &[String],
+    results: &[BatchKeyValue],
+) -> Result<(), NodeError> {
+    if results.len() > expected_keys.len() {
+        return Err(NodeError::Codec(format!(
+            "batch get returned {} results, requested at most {}",
+            results.len(),
+            expected_keys.len()
+        )));
+    }
+    for (request_index, (expected_key, result)) in expected_keys.iter().zip(results).enumerate() {
+        if &result.key != expected_key {
+            return Err(NodeError::Codec(format!(
+                "batch get result {request_index} did not match its request"
+            )));
+        }
+        if result.shed {
+            if result.found
+                || !result.value.is_empty()
+                || result.timestamp_ms != 0
+                || !result.node_id.is_empty()
+                || result.expires_at_ms != 0
+                || result.is_tombstone
+            {
+                return Err(NodeError::Codec(format!(
+                    "batch get result {request_index} has invalid shed fields"
+                )));
+            }
+        } else if result.found {
+            validate_record_wire_budget(&result.key, result.value.len(), &result.node_id)?;
+        } else if !result.value.is_empty()
+            || result.timestamp_ms != 0
+            || !result.node_id.is_empty()
+            || result.expires_at_ms != 0
+            || result.is_tombstone
+        {
+            return Err(NodeError::Codec(format!(
+                "batch get result {request_index} has invalid not-found fields"
             )));
         }
     }
@@ -1874,18 +2082,18 @@ impl Node {
         runtime_options: NodeRuntimeOptions,
     ) -> Result<Self, NodeError> {
         runtime_options.validate()?;
-        if node_id.is_empty() || node_id.len() > 255 {
-            return Err(NodeError::Actor(
-                "node_id must contain 1 to 255 bytes".to_string(),
-            ));
+        if node_id.is_empty() || node_id.len() > MAX_WIRE_NODE_ID_BYTES {
+            return Err(NodeError::Actor(format!(
+                "node_id must contain 1 to {MAX_WIRE_NODE_ID_BYTES} bytes"
+            )));
         }
         if let Some(invalid_member) = config
             .members
             .keys()
-            .find(|member_id| member_id.is_empty() || member_id.len() > 255)
+            .find(|member_id| member_id.is_empty() || member_id.len() > MAX_WIRE_NODE_ID_BYTES)
         {
             return Err(NodeError::Actor(format!(
-                "member node_id {invalid_member:?} must contain 1 to 255 bytes"
+                "member node_id {invalid_member:?} must contain 1 to {MAX_WIRE_NODE_ID_BYTES} bytes"
             )));
         }
         let dynamic = config.placement_controller.is_some();
@@ -2787,7 +2995,7 @@ impl Node {
     /// priority, so fan-out preserves traffic isolation end-to-end.
     ///
     /// Each key is hashed to its fragment; keys are grouped by fragment
-    /// and each fragment's keys are sent in count-bounded `BatchPut` messages,
+    /// and each fragment's keys are sent in exact-byte/count-bounded `BatchPut` messages,
     /// failing over across replica holders (self first) until one
     /// accepts the batch. Returns per-key results in input order.
     ///
@@ -2834,36 +3042,30 @@ impl Node {
             results[i] = Some(r);
         }
 
-        // Remote puts: count-bounded BatchPut chunks per fragment, each
-        // failing over across replica holders until one accepts it.
+        // Remote puts: exact-byte- and count-bounded BatchPut chunks per
+        // fragment, each failing over until one replica holder accepts it.
+        // The request and a conservative worst-case response are both sized
+        // incrementally, avoiding quadratic protobuf rescans.
         let wire_priority = priority_to_proto(priority);
         for (frag, items) in remote {
-            let mut remaining = items.into_iter();
-            loop {
-                let items: Vec<_> = remaining.by_ref().take(MAX_WIRE_BATCH_ITEMS).collect();
-                if items.is_empty() {
-                    break;
+            let mut remaining = VecDeque::new();
+            for (index, key, value) in items {
+                if let Err(error) = validate_record_wire_budget(&key, value.len(), &self.node_id) {
+                    results[index] = Some(Err(error));
+                    continue;
                 }
-                // Build the batch once, with HLC timestamps.
-                let mut puts = Vec::with_capacity(items.len());
-                let mut indices = Vec::with_capacity(items.len());
-                for (i, key, value) in items {
-                    if let Err(error) =
-                        validate_record_wire_budget(&key, value.len(), &self.node_id)
-                    {
-                        results[i] = Some(Err(error));
-                        continue;
-                    }
-                    let seq = {
-                        let mut guard = self.next_seq.lock().await;
-                        *guard += 1;
-                        *guard
-                    };
-                    let now = self.hlc.lock().await.tick();
-                    puts.push(ForwardedPut {
+                let seq = {
+                    let mut guard = self.next_seq.lock().await;
+                    *guard += 1;
+                    *guard
+                };
+                let timestamp_ms = self.hlc.lock().await.tick();
+                remaining.push_back((
+                    index,
+                    ForwardedPut {
                         key,
                         value,
-                        timestamp_ms: now,
+                        timestamp_ms,
                         node_id: self.node_id.clone(),
                         seq,
                         boot_id: self.boot_id,
@@ -2872,12 +3074,48 @@ impl Node {
                         priority: wire_priority,
                         hops: 0,
                         req_id: 0,
-                    });
-                    indices.push(i);
+                    },
+                ));
+            }
+
+            while !remaining.is_empty() {
+                let mut chunk = Vec::new();
+                let mut request_payload_len = batch_put_base_encoded_len(wire_priority);
+                let mut response_payload_len = mutation_response_base_encoded_len();
+                while chunk.len() < MAX_WIRE_BATCH_ITEMS {
+                    let Some((index, put)) = remaining.pop_front() else {
+                        break;
+                    };
+                    let next_request_payload =
+                        request_payload_len + message_field_len(1, put.encoded_len());
+                    let next_response_payload = response_payload_len
+                        + message_field_len(2, max_mutation_result_encoded_len(put.key.len()));
+                    let request_len = batch_put_envelope_encoded_len(next_request_payload);
+                    let response_len =
+                        mutation_response_envelope_encoded_len(next_response_payload);
+
+                    if !chunk.is_empty()
+                        && (request_len > WIRE_BATCH_PAGE_BYTES
+                            || response_len > WIRE_BATCH_PAGE_BYTES)
+                    {
+                        remaining.push_front((index, put));
+                        break;
+                    }
+                    if request_len > MAX_FRAME_BYTES || response_len > MAX_FRAME_BYTES {
+                        results[index] = Some(Err(NodeError::Codec(format!(
+                            "batch put item cannot fit its request/response frames: request={request_len} response={response_len} limit={MAX_FRAME_BYTES}"
+                        ))));
+                        continue;
+                    }
+                    request_payload_len = next_request_payload;
+                    response_payload_len = next_response_payload;
+                    chunk.push((index, put));
                 }
-                if puts.is_empty() {
+                if chunk.is_empty() {
                     continue;
                 }
+
+                let (indices, puts): (Vec<_>, Vec<_>) = chunk.into_iter().unzip();
                 let expected_keys: Vec<String> = puts.iter().map(|put| put.key.clone()).collect();
                 let mut done = false;
                 let mut tried: Vec<String> = Vec::new();
@@ -2944,8 +3182,8 @@ impl Node {
                     }
                 }
                 if !done {
-                    for i in indices {
-                        results[i] = Some(Err(NodeError::Network(format!(
+                    for index in indices {
+                        results[index] = Some(Err(NodeError::Network(format!(
                             "no replica acknowledged batch put for fragment {frag} (tried {})",
                             tried.join(",")
                         ))));
@@ -2958,7 +3196,7 @@ impl Node {
     }
 
     /// Put multiple keys. Each key is hashed to its fragment; keys are
-    /// grouped by fragment and each fragment's keys are sent in count-bounded
+    /// grouped by fragment and each fragment's keys are sent in exact-byte/count-bounded
     /// `BatchPut` messages, failing over across replica holders.
     /// Returns per-key results in input order.
     ///
@@ -2977,7 +3215,8 @@ impl Node {
     /// priority, so fan-out preserves traffic isolation end-to-end.
     ///
     /// Each key is hashed to its fragment; keys are grouped by fragment
-    /// and each fragment's keys are fetched in count-bounded `BatchGet` messages.
+    /// and each fragment's keys are fetched in exact-byte/count-bounded `BatchGet`
+    /// pull requests. Large replies advance as validated ordered prefixes.
     /// Returns per-key results in input order.
     ///
     /// Remote reads use the configured timeout (5 seconds by default) per
@@ -3026,88 +3265,132 @@ impl Node {
             results[i] = Some(r);
         }
 
-        // Remote gets: count-bounded BatchGet chunks per fragment, each
-        // failing over across replica holders on timeout or dropped replies.
+        // Remote gets: byte- and count-bounded requests. A response is an
+        // ordered prefix that stops after crossing the soft byte target;
+        // omitted suffixes are pulled under fresh request ids instead of
+        // becoming false misses.
         let wire_priority = priority_to_proto(priority);
         for (frag, items) in remote {
-            for items in items.chunks(MAX_WIRE_BATCH_ITEMS) {
-                let keys: Vec<String> = items.iter().map(|(_, k)| k.clone()).collect();
-                let indices: Vec<usize> = items.iter().map(|(i, _)| *i).collect();
-                let mut done = false;
-                let mut tried: Vec<String> = Vec::new();
+            let mut remaining: VecDeque<_> = items.into_iter().collect();
+            while !remaining.is_empty() {
+                let mut chunk = Vec::new();
+                let mut request_payload_len = batch_get_base_encoded_len(wire_priority);
+                while chunk.len() < MAX_BATCH_GET_REQUEST_KEYS {
+                    let Some((index, key)) = remaining.pop_front() else {
+                        break;
+                    };
+                    let next_request_payload =
+                        request_payload_len + message_field_len(2, key.len());
+                    let request_len = batch_get_envelope_encoded_len(next_request_payload);
+                    // A missing read may be shed instead. Reserve the explicit
+                    // `shed=true` bit so either non-value outcome fits alone.
+                    let missing_result_len = max_batch_get_non_value_result_encoded_len(key.len());
+                    let response_payload_len = batch_get_response_base_encoded_len(u64::MAX)
+                        + message_field_len(2, missing_result_len);
+                    let response_len =
+                        batch_get_response_envelope_encoded_len(response_payload_len);
+                    if !chunk.is_empty() && request_len > WIRE_BATCH_PAGE_BYTES {
+                        remaining.push_front((index, key));
+                        break;
+                    }
+                    if request_len > MAX_FRAME_BYTES || response_len > MAX_FRAME_BYTES {
+                        results[index] = Some(Err(NodeError::Codec(format!(
+                            "batch get key cannot fit its request/response frames: request={request_len} response={response_len} limit={MAX_FRAME_BYTES}"
+                        ))));
+                        continue;
+                    }
+                    request_payload_len = next_request_payload;
+                    chunk.push((index, key));
+                }
+                if chunk.is_empty() {
+                    continue;
+                }
+
+                let mut offset = 0usize;
+                let mut tried = Vec::new();
                 for owner in self.replica_order(frag) {
+                    if offset == chunk.len() {
+                        break;
+                    }
                     tried.push(owner.clone());
                     let Some(tx) = self.peer_sender(&owner).await else {
                         continue;
                     };
-                    let req_id = self.next_req_id.fetch_add(1, Ordering::Relaxed);
-                    let (resp_tx, resp_rx) = oneshot::channel();
-                    self.pending_batch_gets
-                        .lock()
-                        .unwrap()
-                        .insert(req_id, resp_tx);
-                    let _pending_guard = PendingBatchGetGuard {
-                        req_id,
-                        pending: self.pending_batch_gets.clone(),
-                    };
+                    // One absolute deadline covers every prefix page attempted
+                    // at this owner. A peer cannot stretch a bounded owner
+                    // attempt indefinitely by returning one key at a time.
                     let attempt_deadline =
                         deadline_after(self.runtime_options.forwarded_attempt_timeout);
-                    if !try_send_envelope_until(
-                        &tx,
-                        Envelope {
-                            msg: Some(EnvelopeMsg::BatchGet(BatchGet {
-                                req_id,
-                                keys: keys.clone(),
-                                priority: wire_priority,
-                            })),
-                        },
-                        attempt_deadline,
-                    )
-                    .await
-                    {
-                        continue;
-                    }
-                    let response = tokio::time::timeout_at(attempt_deadline, resp_rx).await;
-                    if let Ok(Ok(kvs)) = response {
-                        // Map back by key.
-                        let by_key: HashMap<String, BatchKeyValue> =
-                            kvs.into_iter().map(|kv| (kv.key.clone(), kv)).collect();
-                        for (i, key) in indices.iter().zip(&keys) {
-                            match by_key.get(key) {
-                                Some(kv) if kv.shed => {
-                                    results[*i] = Some(Err(NodeError::Backpressure(format!(
-                                        "batch get for key {key} shed by remote"
-                                    ))));
-                                }
-                                Some(kv) if kv.found => {
-                                    let mut v = VersionedValue::new(
-                                        kv.value.clone(),
-                                        kv.timestamp_ms,
-                                        kv.node_id.clone(),
-                                    );
-                                    v.expires_at_ms = if kv.expires_at_ms == 0 {
-                                        None
-                                    } else {
-                                        Some(kv.expires_at_ms)
-                                    };
-                                    v.is_tombstone = kv.is_tombstone;
-                                    // Tombstones read as absent.
-                                    results[*i] =
-                                        Some(Ok(if v.is_tombstone { None } else { Some(v) }));
-                                }
-                                _ => results[*i] = Some(Ok(None)),
-                            }
+                    while offset < chunk.len() && Instant::now() < attempt_deadline {
+                        let keys: Vec<String> =
+                            chunk[offset..].iter().map(|(_, key)| key.clone()).collect();
+                        let req_id = self.next_req_id.fetch_add(1, Ordering::Relaxed);
+                        let (resp_tx, resp_rx) = oneshot::channel();
+                        self.pending_batch_gets.lock().unwrap().insert(
+                            req_id,
+                            PendingBatchGet {
+                                expected_peer: owner.clone(),
+                                expected_keys: keys.clone(),
+                                reply: resp_tx,
+                            },
+                        );
+                        let _pending_guard = PendingBatchGetGuard {
+                            req_id,
+                            pending: self.pending_batch_gets.clone(),
+                        };
+                        if !try_send_envelope_until(
+                            &tx,
+                            Envelope {
+                                msg: Some(EnvelopeMsg::BatchGet(BatchGet {
+                                    req_id,
+                                    keys: keys.clone(),
+                                    priority: wire_priority,
+                                })),
+                            },
+                            attempt_deadline,
+                        )
+                        .await
+                        {
+                            break;
                         }
-                        done = true;
-                        break;
+                        let response = tokio::time::timeout_at(attempt_deadline, resp_rx).await;
+                        let Ok(Ok(Ok(kvs))) = response else {
+                            break;
+                        };
+                        // Empty is an explicit unavailable/non-serving reply.
+                        // It must make no progress and therefore tries the next
+                        // holder rather than turning any key into not-found.
+                        if kvs.is_empty() {
+                            break;
+                        }
+                        let page_len = kvs.len();
+                        for ((index, key), kv) in chunk[offset..offset + page_len].iter().zip(kvs) {
+                            let result = if kv.shed {
+                                Err(NodeError::Backpressure(format!(
+                                    "batch get for key {key} shed by remote"
+                                )))
+                            } else if kv.found {
+                                let mut value =
+                                    VersionedValue::new(kv.value, kv.timestamp_ms, kv.node_id);
+                                value.expires_at_ms =
+                                    (kv.expires_at_ms != 0).then_some(kv.expires_at_ms);
+                                value.is_tombstone = kv.is_tombstone;
+                                Ok(if value.is_tombstone {
+                                    None
+                                } else {
+                                    Some(value)
+                                })
+                            } else {
+                                Ok(None)
+                            };
+                            results[*index] = Some(result);
+                        }
+                        offset += page_len;
                     }
-                    // A dropped reply or timeout falls through to the next
-                    // replica. The guard removes this req_id, so a late response
-                    // is ignored by the handler.
                 }
-                if !done {
-                    for i in indices {
-                        results[i] = Some(Err(NodeError::Network(format!(
+                if offset < chunk.len() {
+                    for (index, _) in &chunk[offset..] {
+                        results[*index] = Some(Err(NodeError::Network(format!(
                             "no replica answered batch get for fragment {frag} (tried {})",
                             tried.join(",")
                         ))));
@@ -3120,8 +3403,8 @@ impl Node {
     }
 
     /// Get multiple keys. Each key is hashed to its fragment; keys are
-    /// grouped by fragment and each fragment's keys are fetched in count-bounded
-    /// `BatchGet` messages, failing over across replica holders.
+    /// grouped by fragment and each fragment's keys are fetched in exact-byte/count-bounded
+    /// `BatchGet` pull requests, failing over across replica holders.
     /// Returns per-key results in input order.
     ///
     /// Bulk gets run at [`OpPriority::Background`]; see
@@ -4217,7 +4500,7 @@ fn validate_peer_hello(
     expected_peer_id: Option<&str>,
     hello: &Hello,
 ) -> Result<(), &'static str> {
-    if hello.node_id.is_empty() || hello.node_id.len() > 255 {
+    if hello.node_id.is_empty() || hello.node_id.len() > MAX_WIRE_NODE_ID_BYTES {
         return Err("peer node_id is empty or exceeds 255 bytes");
     }
     if hello.node_id == local_node_id {
@@ -4932,13 +5215,19 @@ async fn handle_connection(
                     continue;
                 }
                 if !serving.read().unwrap().contains(&frag) {
-                    tracing::warn!(
+                    // Independent placement observers can legitimately race:
+                    // the serving replica may start its routine round before
+                    // this node has finished bootstrapping the same fragment.
+                    // Ignore that round so its sender times out/retries, while
+                    // preserving the multiplexed connection for this node's
+                    // reverse bootstrap and for unrelated fragments.
+                    tracing::debug!(
                         peer = %peer,
                         fragment = r.fragment,
                         round_id = r.round_id,
-                        "rejecting reconciliation from a non-serving fragment"
+                        "ignoring reconciliation for a non-serving fragment"
                     );
-                    break;
+                    continue;
                 }
                 let first_page = r.page_seq == 0;
                 let reconcile_key = (peer.clone(), frag);
@@ -5112,14 +5401,17 @@ async fn handle_connection(
                     continue;
                 }
                 if !serving.read().unwrap().contains(&frag) {
-                    tracing::warn!(
+                    // A fragment can lose authority between the summary and
+                    // fetch phases. Let the correlated sender expire and retry
+                    // without tearing down other traffic on this connection.
+                    tracing::debug!(
                         peer = %peer,
                         fragment = f.fragment,
                         round_id = f.round_id,
                         chunk_seq = f.chunk_seq,
-                        "rejecting reconciliation fetch from a non-serving fragment"
+                        "ignoring reconciliation fetch for a non-serving fragment"
                     );
-                    break;
+                    continue;
                 }
                 if f.keys.is_empty() || f.keys.len() > MAX_RECONCILE_FETCH_KEYS {
                     tracing::warn!(
@@ -5317,6 +5609,10 @@ async fn handle_connection(
                 }
             }
             Some(EnvelopeMsg::ForwardedPut(p)) => {
+                if let Err(error) = validate_record_wire_budget(&p.key, p.value.len(), &p.node_id) {
+                    tracing::warn!(%error, "rejecting irreducible forwarded mutation");
+                    break;
+                }
                 if !observe_remote_timestamp(&hlc, p.timestamp_ms, "ForwardedPut").await {
                     break;
                 }
@@ -5587,6 +5883,16 @@ async fn handle_connection(
                     );
                     break;
                 }
+                if let Err(error) = validate_batch_put_wire_bounds(&bp) {
+                    tracing::warn!(%error, "rejecting improperly bounded batch put");
+                    break;
+                }
+                if let Some(error) = bp.puts.iter().find_map(|put| {
+                    validate_record_wire_budget(&put.key, put.value.len(), &put.node_id).err()
+                }) {
+                    tracing::warn!(%error, "rejecting irreducible item in batch put");
+                    break;
+                }
                 let batch_priority = priority_from_proto(bp.priority);
                 if let Some(timestamp_ms) = bp.puts.iter().map(|p| p.timestamp_ms).max() {
                     if !observe_remote_timestamp(&hlc, timestamp_ms, "BatchPut").await {
@@ -5701,28 +6007,67 @@ async fn handle_connection(
                     );
                     break;
                 }
-                // Phase 6: serve a batch of reads. Phase 7: the batch
-                // carries one priority applied to every get.
+                let req_id = bg.req_id;
+                let Some(frag) = bg
+                    .keys
+                    .first()
+                    .map(|key| fragment_of(key, router.fragment_count))
+                else {
+                    if !send_batch_get_response(&tx, req_id, Vec::new()) {
+                        break;
+                    }
+                    continue;
+                };
+                if bg
+                    .keys
+                    .iter()
+                    .any(|key| fragment_of(key, router.fragment_count) != frag)
+                {
+                    tracing::warn!(req_id, "batch get contains keys from multiple fragments");
+                    if !send_batch_get_response(&tx, req_id, Vec::new()) {
+                        break;
+                    }
+                    continue;
+                }
+                if !serving.read().unwrap().contains(&frag) {
+                    if !send_batch_get_response(&tx, req_id, Vec::new()) {
+                        break;
+                    }
+                    continue;
+                }
+                let Some(actor) = router.route_for_fragment(frag) else {
+                    if !send_batch_get_response(&tx, req_id, Vec::new()) {
+                        break;
+                    }
+                    continue;
+                };
+
+                // Return one exact-byte-bounded ordered prefix. The origin
+                // explicitly requests any suffix, so the socket reader emits
+                // at most one response frame and never blocks on a stream of
+                // pages in both directions.
                 let batch_priority = priority_from_proto(bg.priority);
-                let mut results = Vec::with_capacity(bg.keys.len());
+                let mut results = Vec::new();
+                let mut response_payload_len = batch_get_response_base_encoded_len(req_id);
                 for key in bg.keys {
-                    let (value, shed) = match router.route(&key) {
-                        Some(actor) => match actor
-                            .call(
-                                |reply| KvMessage::Get {
-                                    key: key.clone(),
-                                    reply,
-                                    priority: batch_priority,
-                                },
-                                None,
-                            )
-                            .await
-                        {
-                            Ok(CallResult::Success(Ok(v))) => (v, false),
-                            Ok(CallResult::Success(Err(_))) => (None, true),
-                            _ => (None, false),
-                        },
-                        None => (None, false),
+                    let (value, shed) = match actor
+                        .call(
+                            |reply| KvMessage::Get {
+                                key: key.clone(),
+                                reply,
+                                priority: batch_priority,
+                            },
+                            None,
+                        )
+                        .await
+                    {
+                        Ok(CallResult::Success(Ok(value))) => (value, false),
+                        Ok(CallResult::Success(Err(_))) => (None, true),
+                        Ok(CallResult::Timeout | CallResult::SenderError) | Err(_) => {
+                            // An empty first prefix asks the caller to fail over;
+                            // after progress, it will resume this exact key.
+                            break;
+                        }
                     };
                     let (found, bytes, timestamp_ms, node_id, expires_at_ms, is_tombstone) =
                         match value {
@@ -5736,7 +6081,7 @@ async fn handle_connection(
                             ),
                             None => (false, Vec::new(), 0, String::new(), 0, false),
                         };
-                    results.push(BatchKeyValue {
+                    let result = BatchKeyValue {
                         key,
                         found,
                         value: bytes,
@@ -5745,23 +6090,62 @@ async fn handle_connection(
                         expires_at_ms,
                         is_tombstone,
                         shed,
-                    });
+                    };
+                    let next_payload_len =
+                        response_payload_len + message_field_len(2, result.encoded_len());
+                    let response_len = batch_get_response_envelope_encoded_len(next_payload_len);
+                    if response_len > MAX_FRAME_BYTES {
+                        if !results.is_empty() {
+                            // The current item remains individually retryable.
+                            // Return the prefix instead of sacrificing a healthy
+                            // connection because this aggregate cannot fit.
+                            break;
+                        }
+                        tracing::warn!(
+                            req_id,
+                            response_len,
+                            "single batch-get result exceeds the hard frame limit"
+                        );
+                        break 'connection;
+                    }
+                    response_payload_len = next_payload_len;
+                    results.push(result);
+                    if response_len > WIRE_BATCH_PAGE_BYTES {
+                        break;
+                    }
                 }
-                if !send_envelope(
-                    &tx,
-                    Envelope {
-                        msg: Some(EnvelopeMsg::BatchGetResponse(BatchGetResponse {
-                            req_id: bg.req_id,
-                            results,
-                        })),
-                    },
-                ) {
+                if !send_batch_get_response(&tx, req_id, results) {
                     break;
                 }
             }
             Some(EnvelopeMsg::BatchGetResponse(r)) => {
                 if r.results.len() > MAX_WIRE_BATCH_ITEMS {
                     tracing::warn!(item_count = r.results.len(), "read response is too large");
+                    break;
+                }
+                let Some(peer) = peer_node_id.clone() else {
+                    continue;
+                };
+                let validation = {
+                    let pending = pending_batch_gets.lock().unwrap();
+                    pending.get(&r.req_id).and_then(|request| {
+                        (request.expected_peer == peer)
+                            .then(|| validate_batch_get_results(&request.expected_keys, &r.results))
+                    })
+                };
+                let Some(validation) = validation else {
+                    continue;
+                };
+                if let Err(error) = validation {
+                    tracing::warn!(
+                        peer = %peer,
+                        req_id = r.req_id,
+                        %error,
+                        "rejecting malformed batch-get response"
+                    );
+                    if let Some(pending) = pending_batch_gets.lock().unwrap().remove(&r.req_id) {
+                        let _ = pending.reply.send(Err(error));
+                    }
                     break;
                 }
                 if let Some(timestamp_ms) = r
@@ -5775,8 +6159,19 @@ async fn handle_connection(
                         break;
                     }
                 }
-                if let Some(resp_tx) = pending_batch_gets.lock().unwrap().remove(&r.req_id) {
-                    let _ = resp_tx.send(r.results);
+                let pending = {
+                    let mut pending = pending_batch_gets.lock().unwrap();
+                    if matches!(
+                        pending.get(&r.req_id),
+                        Some(request) if request.expected_peer == peer
+                    ) {
+                        pending.remove(&r.req_id)
+                    } else {
+                        None
+                    }
+                };
+                if let Some(pending) = pending {
+                    let _ = pending.reply.send(Ok(r.results));
                 }
             }
             Some(EnvelopeMsg::SyncRequest(_)) | Some(EnvelopeMsg::SyncResponse(_)) => {
@@ -5925,6 +6320,18 @@ fn send_mutation_response(tx: &PeerChannel, response: MutationResponse) -> bool 
         tx,
         Envelope {
             msg: Some(EnvelopeMsg::MutationResponse(response)),
+        },
+    )
+}
+
+fn send_batch_get_response(tx: &PeerChannel, req_id: u64, results: Vec<BatchKeyValue>) -> bool {
+    try_send_envelope_immediate(
+        tx,
+        Envelope {
+            msg: Some(EnvelopeMsg::BatchGetResponse(BatchGetResponse {
+                req_id,
+                results,
+            })),
         },
     )
 }
@@ -6555,6 +6962,7 @@ async fn try_send_envelope_with_deadline(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::proto::{ReconcileRequest, SessionStart};
     use crate::replication::spawn_sender_with_options;
 
     struct BlockingPageActor;
@@ -6795,6 +7203,195 @@ mod tests {
         assert!(validate_mutation_results(&expected, &[result("a", 0)]).is_err());
         assert!(validate_mutation_results(&expected, &[result("b", 0), result("a", 1)]).is_err());
         assert!(validate_mutation_results(&expected, &[result("a", 1), result("b", 0)]).is_err());
+    }
+
+    #[test]
+    fn batch_get_prefix_validation_is_positional_and_preserves_duplicates() {
+        fn missing(key: &str) -> BatchKeyValue {
+            BatchKeyValue {
+                key: key.to_string(),
+                found: false,
+                value: Vec::new(),
+                timestamp_ms: 0,
+                node_id: String::new(),
+                expires_at_ms: 0,
+                is_tombstone: false,
+                shed: false,
+            }
+        }
+
+        let expected = vec!["dup".to_string(), "missing".to_string(), "dup".to_string()];
+        assert!(validate_batch_get_results(&expected, &[]).is_ok());
+        assert!(
+            validate_batch_get_results(&expected, &[missing("dup"), missing("missing")]).is_ok()
+        );
+        assert!(
+            validate_batch_get_results(&expected, &[missing("missing"), missing("dup")]).is_err()
+        );
+        assert!(validate_batch_get_results(
+            &expected,
+            &[
+                missing("dup"),
+                missing("missing"),
+                missing("dup"),
+                missing("extra"),
+            ]
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn aggregate_batch_length_accounting_matches_prost() {
+        let puts = vec![
+            ForwardedPut {
+                key: String::new(),
+                value: Vec::new(),
+                timestamp_ms: 1,
+                node_id: "node".to_string(),
+                seq: 1,
+                boot_id: 1,
+                expires_at_ms: 0,
+                is_tombstone: false,
+                priority: ProtoPriority::Default as i32,
+                hops: 0,
+                req_id: 0,
+            },
+            ForwardedPut {
+                key: "k".repeat(127),
+                value: vec![7; 128],
+                timestamp_ms: u64::MAX,
+                node_id: "node".to_string(),
+                seq: u64::MAX,
+                boot_id: u64::MAX,
+                expires_at_ms: u64::MAX,
+                is_tombstone: true,
+                priority: ProtoPriority::Default as i32,
+                hops: 0,
+                req_id: 0,
+            },
+        ];
+        let priority = ProtoPriority::Default as i32;
+        let put_payload = batch_put_base_encoded_len(priority)
+            + puts
+                .iter()
+                .map(|put| message_field_len(1, put.encoded_len()))
+                .sum::<usize>();
+        let put_envelope = Envelope {
+            msg: Some(EnvelopeMsg::BatchPut(BatchPut {
+                puts,
+                priority,
+                req_id: u64::MAX,
+            })),
+        };
+        assert_eq!(
+            batch_put_envelope_encoded_len(put_payload),
+            put_envelope.encoded_len()
+        );
+
+        let keys = vec![String::new(), "k".repeat(127), "k".repeat(128)];
+        let get_payload = batch_get_base_encoded_len(priority)
+            + keys
+                .iter()
+                .map(|key| message_field_len(2, key.len()))
+                .sum::<usize>();
+        let get_envelope = Envelope {
+            msg: Some(EnvelopeMsg::BatchGet(BatchGet {
+                req_id: u64::MAX,
+                keys,
+                priority,
+            })),
+        };
+        assert_eq!(
+            batch_get_envelope_encoded_len(get_payload),
+            get_envelope.encoded_len()
+        );
+
+        let shed = BatchKeyValue {
+            key: "shed".repeat(32),
+            found: false,
+            value: Vec::new(),
+            timestamp_ms: 0,
+            node_id: String::new(),
+            expires_at_ms: 0,
+            is_tombstone: false,
+            shed: true,
+        };
+        assert_eq!(
+            max_batch_get_non_value_result_encoded_len(shed.key.len()),
+            shed.encoded_len()
+        );
+        let shed_payload = batch_get_response_base_encoded_len(u64::MAX)
+            + message_field_len(2, shed.encoded_len());
+        let shed_envelope = Envelope {
+            msg: Some(EnvelopeMsg::BatchGetResponse(BatchGetResponse {
+                req_id: u64::MAX,
+                results: vec![shed],
+            })),
+        };
+        assert_eq!(
+            batch_get_response_envelope_encoded_len(shed_payload),
+            shed_envelope.encoded_len()
+        );
+
+        let key = "result".to_string();
+        let worst = MutationResult {
+            key: key.clone(),
+            status: MutationStatus::Unavailable as i32,
+            error: "e".repeat(MAX_WIRE_ERROR_BYTES),
+            winner_timestamp_ms: u64::MAX,
+            winner_node_id: "n".repeat(MAX_WIRE_NODE_ID_BYTES),
+            winner_is_tombstone: true,
+            request_index: u32::MAX,
+        };
+        assert_eq!(
+            max_mutation_result_encoded_len(key.len()),
+            worst.encoded_len()
+        );
+        let response_payload =
+            mutation_response_base_encoded_len() + message_field_len(2, worst.encoded_len());
+        let response = Envelope {
+            msg: Some(EnvelopeMsg::MutationResponse(MutationResponse {
+                req_id: u64::MAX,
+                results: vec![worst],
+            })),
+        };
+        assert_eq!(
+            mutation_response_envelope_encoded_len(response_payload),
+            response.encoded_len()
+        );
+    }
+
+    #[test]
+    fn batch_get_single_key_preflight_reserves_the_shed_bit_at_hard_boundary() {
+        let priority = ProtoPriority::Default as i32;
+        let fits = |key_len: usize| {
+            let request_payload =
+                batch_get_base_encoded_len(priority) + message_field_len(2, key_len);
+            let response_payload = batch_get_response_base_encoded_len(u64::MAX)
+                + message_field_len(2, max_batch_get_non_value_result_encoded_len(key_len));
+            batch_get_envelope_encoded_len(request_payload) <= MAX_FRAME_BYTES
+                && batch_get_response_envelope_encoded_len(response_payload) <= MAX_FRAME_BYTES
+        };
+        let mut low = 0usize;
+        let mut high = MAX_FRAME_BYTES;
+        while low < high {
+            let midpoint = low + (high - low + 1) / 2;
+            if fits(midpoint) {
+                low = midpoint;
+            } else {
+                high = midpoint - 1;
+            }
+        }
+        assert!(fits(low));
+        assert!(!fits(low + 1));
+    }
+
+    #[test]
+    fn wire_errors_are_utf8_safely_bounded() {
+        let truncated = truncate_wire_error("🦀".repeat(MAX_WIRE_ERROR_BYTES));
+        assert!(truncated.len() <= MAX_WIRE_ERROR_BYTES);
+        assert!(truncated.is_char_boundary(truncated.len()));
+        assert_eq!(truncate_wire_error("short".to_string()), "short");
     }
 
     #[test]
@@ -7182,7 +7779,10 @@ mod tests {
                     read_test_envelope(&mut client).await.msg
                 {
                     assert_eq!(response.req_id, probe_req_id);
-                    assert_eq!(response.results.len(), 1);
+                    // This dynamic node does not serve the fragment, so an
+                    // empty unavailable prefix is the safe reply. It still
+                    // proves both halves of the shared connection survived.
+                    assert!(response.results.is_empty());
                     break;
                 }
             }
@@ -7195,6 +7795,96 @@ mod tests {
                 .unwrap();
             runtime_tasks.shutdown().await;
             retired.stop().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn non_serving_reconcile_races_do_not_close_shared_connection() {
+        for fetch in [false, true] {
+            let fragment = FragmentId(0);
+            let peers: PeerMap = Arc::new(Mutex::new(HashMap::new()));
+            let (ctx, runtime_tasks) = test_connection_context(
+                FragmentRouter::new(1, 0),
+                Arc::new(RwLock::new(HashSet::new())),
+                Arc::new(RwLock::new(HashMap::from([(
+                    fragment,
+                    vec!["local".to_string(), "peer".to_string()],
+                )]))),
+                true,
+                Arc::new(Mutex::new(HashMap::new())),
+                Arc::new(Mutex::new(HashMap::new())),
+                peers.clone(),
+            );
+            let (mut client, server) = tokio::io::duplex(4096);
+            let connection =
+                tokio::spawn(handle_connection(ctx, Box::pin(server), false, None, None));
+            complete_test_handshake(&mut client, "peer").await;
+
+            write_test_envelope(
+                &mut client,
+                Envelope {
+                    msg: Some(EnvelopeMsg::SessionStart(SessionStart {
+                        session_id: 1,
+                        fragment: fragment.0,
+                    })),
+                },
+            )
+            .await;
+            let reconcile = if fetch {
+                EnvelopeMsg::ReconcileFetch(ReconcileFetch {
+                    fragment: fragment.0,
+                    keys: vec!["connection-probe".to_string()],
+                    session_id: 1,
+                    round_id: 1,
+                    chunk_seq: 0,
+                })
+            } else {
+                EnvelopeMsg::ReconcileRequest(ReconcileRequest {
+                    fragment: fragment.0,
+                    session_id: 1,
+                    round_id: 1,
+                    page_seq: 0,
+                    after_key: String::new(),
+                    snapshot_revision: 0,
+                    snapshot_time_ms: 0,
+                })
+            };
+            write_test_envelope(
+                &mut client,
+                Envelope {
+                    msg: Some(reconcile),
+                },
+            )
+            .await;
+
+            // A request for another multiplexed protocol proves that the
+            // honest placement race did not sacrifice either connection half.
+            write_test_envelope(
+                &mut client,
+                Envelope {
+                    msg: Some(EnvelopeMsg::BatchGet(BatchGet {
+                        req_id: 99,
+                        keys: vec!["connection-probe".to_string()],
+                        priority: ProtoPriority::Default as i32,
+                    })),
+                },
+            )
+            .await;
+            assert!(matches!(
+                read_test_envelope(&mut client).await.msg,
+                Some(EnvelopeMsg::BatchGetResponse(BatchGetResponse {
+                    req_id: 99,
+                    results,
+                })) if results.is_empty()
+            ));
+            assert!(peers.lock().await.contains_key("peer"));
+
+            drop(client);
+            tokio::time::timeout(Duration::from_secs(1), connection)
+                .await
+                .expect("connection did not stop after its stream closed")
+                .unwrap();
+            runtime_tasks.shutdown().await;
         }
     }
 
@@ -8007,7 +8697,14 @@ mod tests {
 
         let pending_batch_gets: PendingBatchGets = Arc::new(StdMutex::new(HashMap::new()));
         let (batch_reply, _batch_response) = oneshot::channel();
-        pending_batch_gets.lock().unwrap().insert(4, batch_reply);
+        pending_batch_gets.lock().unwrap().insert(
+            4,
+            PendingBatchGet {
+                expected_peer: "peer".to_string(),
+                expected_keys: vec!["key".to_string()],
+                reply: batch_reply,
+            },
+        );
         {
             let _guard = PendingBatchGetGuard {
                 req_id: 4,
@@ -8056,6 +8753,44 @@ mod tests {
         assert!(*cancelled.borrow());
         assert!(response_rx.recv().await.is_some());
         assert!(response_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn full_producer_share_still_admits_a_near_limit_response() {
+        let (peer, _rx, mut response_rx) = test_peer_channel(1);
+        let _producer_permit = peer
+            .outbound
+            .producer_byte_budget
+            .clone()
+            .acquire_many_owned(MAX_FRAME_BYTES as u32)
+            .await
+            .unwrap();
+        let _shared_producer_permit = peer
+            .outbound
+            .byte_budget
+            .clone()
+            .acquire_many_owned(MAX_FRAME_BYTES as u32)
+            .await
+            .unwrap();
+        let envelope = Envelope {
+            msg: Some(EnvelopeMsg::BatchGetResponse(BatchGetResponse {
+                req_id: u64::MAX,
+                results: vec![BatchKeyValue {
+                    key: "large".to_string(),
+                    found: true,
+                    value: vec![7; MAX_FRAME_BYTES - 128],
+                    timestamp_ms: u64::MAX,
+                    node_id: "node".to_string(),
+                    expires_at_ms: u64::MAX,
+                    is_tombstone: false,
+                    shed: false,
+                }],
+            })),
+        };
+        assert!(envelope.encoded_len() > MAX_FRAME_BYTES - 256);
+        assert!(envelope.encoded_len() <= MAX_FRAME_BYTES);
+        assert!(try_send_envelope_immediate(&peer, envelope));
+        assert!(response_rx.recv().await.is_some());
     }
 
     #[tokio::test]

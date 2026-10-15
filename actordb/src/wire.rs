@@ -34,6 +34,12 @@ pub(crate) const MAX_RECONCILE_FETCH_KEYS: usize = 256;
 /// frame containing millions of zero-length protobuf elements from amplifying
 /// into unbounded decode allocations.
 pub(crate) const MAX_WIRE_BATCH_ITEMS: usize = 4096;
+/// Provenance ids are carried in result metadata and must match the handshake
+/// and placement identity bound.
+pub(crate) const MAX_WIRE_NODE_ID_BYTES: usize = 255;
+/// Peer-visible diagnostic text is capped so exact mutation response bounds do
+/// not depend on backend-provided error lengths.
+pub(crate) const MAX_WIRE_ERROR_BYTES: usize = 1024;
 
 /// Summary and data page cardinality emitted by protocol v3.
 pub(crate) const MAX_RECONCILE_PAGE_ITEMS: usize = 256;
@@ -266,6 +272,8 @@ impl BudgetedPeerTx {
 pub(crate) enum WireEncodeError {
     /// The protobuf body would exceed the caller's byte budget.
     FrameTooLarge { encoded_len: usize, budget: usize },
+    /// Record provenance is absent or exceeds the cluster identity bound.
+    InvalidNodeIdLength { node_len: usize },
     /// Prost rejected the message while writing into the pre-sized buffer.
     Encode(prost::EncodeError),
 }
@@ -280,6 +288,10 @@ impl fmt::Display for WireEncodeError {
                 f,
                 "encoded envelope is {encoded_len} bytes, exceeding the {budget}-byte budget"
             ),
+            Self::InvalidNodeIdLength { node_len } => write!(
+                f,
+                "record node id is {node_len} bytes; expected 1 to {MAX_WIRE_NODE_ID_BYTES}"
+            ),
             Self::Encode(error) => write!(f, "failed to encode envelope: {error}"),
         }
     }
@@ -288,7 +300,7 @@ impl fmt::Display for WireEncodeError {
 impl std::error::Error for WireEncodeError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::FrameTooLarge { .. } => None,
+            Self::FrameTooLarge { .. } | Self::InvalidNodeIdLength { .. } => None,
             Self::Encode(error) => Some(error),
         }
     }
@@ -544,7 +556,17 @@ fn tag_len(field: u32, wire_type: u8) -> usize {
     varint_len(((field as u64) << 3) | u64::from(wire_type))
 }
 
-fn bytes_field_len(field: u32, payload_len: usize) -> usize {
+/// Exact encoded length of a singular protobuf varint field. Proto3 omits a
+/// zero scalar, matching Prost's generated encoder.
+pub(crate) fn varint_field_len(field: u32, value: u64) -> usize {
+    if value == 0 {
+        0
+    } else {
+        tag_len(field, 0) + varint_len(value)
+    }
+}
+
+pub(crate) fn bytes_field_len(field: u32, payload_len: usize) -> usize {
     if payload_len == 0 {
         0
     } else {
@@ -655,11 +677,25 @@ fn replicated_record_max_encoded_len(
     let batch_get_response = max_u64_field_len(1) + message_field_len(2, batch_key_value);
     let batch_get_envelope = message_field_len(17, batch_get_response);
 
+    // ForwardedPut and BatchPut both return MutationResponse. Count mutually
+    // exclusive error and superseded-winner fields together so every exact
+    // outcome for one admitted record remains encodable.
+    let mutation_result = bytes_field_len(1, key_len)
+        + small_varint_field_len(2)
+        + bytes_field_len(3, MAX_WIRE_ERROR_BYTES)
+        + max_u64_field_len(4)
+        + bytes_field_len(5, MAX_WIRE_NODE_ID_BYTES)
+        + bool_field_len(6, true)
+        + max_u32_field_len(7);
+    let mutation_response = max_u64_field_len(1) + message_field_len(2, mutation_result);
+    let mutation_response_envelope = message_field_len(18, mutation_response);
+
     replicate_envelope
         .max(reconcile_envelope)
         .max(reconcile_summary_envelope)
         .max(batch_put_envelope)
         .max(batch_get_envelope)
+        .max(mutation_response_envelope)
 }
 
 #[cfg(test)]
@@ -677,6 +713,7 @@ pub(crate) fn check_record_budget(
     value_len: usize,
     node_len: usize,
 ) -> Result<(), WireEncodeError> {
+    check_node_id_budget(node_len)?;
     // Every admitted key must remain encodable after an explicit delete or
     // TTL conversion. Size the bool fields as present even for a live value.
     let encoded_len = replicated_record_max_encoded_len(key_len, value_len, node_len, true);
@@ -688,6 +725,13 @@ pub(crate) fn check_record_budget(
     } else {
         Ok(())
     }
+}
+
+pub(crate) fn check_node_id_budget(node_len: usize) -> Result<(), WireEncodeError> {
+    if node_len == 0 || node_len > MAX_WIRE_NODE_ID_BYTES {
+        return Err(WireEncodeError::InvalidNodeIdLength { node_len });
+    }
+    Ok(())
 }
 
 pub(crate) fn check_versioned_value_budget(
@@ -710,8 +754,8 @@ mod tests {
     use crate::actor::VersionedValue;
     use crate::proto::{
         BatchGetResponse, BatchKeyValue, BatchPut, EnvelopeMsg, ForwardedPut, KeySummary,
-        ReconcileData, ReconcileResponse, ReplicateBatch, ReplicateOp as ProtoReplicateOp,
-        ReplicationAckLevel, SyncEntry,
+        MutationResponse, MutationResult, MutationStatus, ReconcileData, ReconcileResponse,
+        ReplicateBatch, ReplicateOp as ProtoReplicateOp, ReplicationAckLevel, SyncEntry,
     };
 
     fn data_envelope(value_len: usize) -> Envelope {
@@ -859,6 +903,20 @@ mod tests {
     }
 
     #[test]
+    fn record_provenance_matches_cluster_identity_bound() {
+        assert!(matches!(
+            check_record_budget(1, 1, 0),
+            Err(WireEncodeError::InvalidNodeIdLength { node_len: 0 })
+        ));
+        assert!(check_record_budget(1, 1, MAX_WIRE_NODE_ID_BYTES).is_ok());
+        assert!(matches!(
+            check_record_budget(1, 1, MAX_WIRE_NODE_ID_BYTES + 1),
+            Err(WireEncodeError::InvalidNodeIdLength { node_len })
+                if node_len == MAX_WIRE_NODE_ID_BYTES + 1
+        ));
+    }
+
+    #[test]
     fn allocation_free_record_bound_covers_every_value_envelope() {
         let op = ReplicatedOp {
             key: "key".to_string(),
@@ -956,6 +1014,20 @@ mod tests {
                         expires_at_ms: u64::MAX,
                         is_tombstone: false,
                         shed: false,
+                    }],
+                })),
+            },
+            Envelope {
+                msg: Some(EnvelopeMsg::MutationResponse(MutationResponse {
+                    req_id: u64::MAX,
+                    results: vec![MutationResult {
+                        key: op.key.clone(),
+                        status: MutationStatus::Unavailable as i32,
+                        error: "e".repeat(MAX_WIRE_ERROR_BYTES),
+                        winner_timestamp_ms: u64::MAX,
+                        winner_node_id: "n".repeat(MAX_WIRE_NODE_ID_BYTES),
+                        winner_is_tombstone: true,
+                        request_index: u32::MAX,
                     }],
                 })),
             },

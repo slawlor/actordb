@@ -130,7 +130,7 @@ original deadline. ACK observations reset on every session.
 
 Protocol-v3 `Hello` advertises an inclusive protocol-version range, capability
 bits for exact mutation results, durability ACKs, correlated reconciliation,
-challenge authentication, and paged anti-entropy, plus a fresh 256-bit
+challenge authentication, paged anti-entropy, and byte-bounded batches, plus a fresh 256-bit
 challenge. Both endpoints then send `HelloAuth`. With `cluster_secret`
 configured, its HMAC-SHA256 binds the ordered dialer/listener roles, both
 complete Hello offers, the selected version/capabilities, and both challenges.
@@ -143,7 +143,10 @@ provides no confidentiality or post-handshake frame integrity. Without a
 secret, `HelloAuth` is empty and provides sequencing/freshness for connection
 election, not authentication. Missing challenge fields, the retired v1 Hello
 tag, and incompatible ranges/capabilities fail closed. The current binary
-supports only wire v3 and requires the paged-anti-entropy capability. V3 is
+supports only wire v3 and requires both paged-anti-entropy and
+byte-bounded-batches capabilities. The latter makes `BatchGetResponse` an
+expected-peer-correlated ordered prefix with explicit suffix pulls; peers without those
+semantics are rejected. V3 is
 wire-incompatible with v2, so upgrades require mutually compatible binaries
 rather than a mixed v2/v3 rolling deployment. It is also a Rust source break
 for advanced users of the public generated `actordb::proto` types:
@@ -222,9 +225,11 @@ complete reconciliation round at a time. Credit release wakes queued retries;
 this bounds responder work without a fragment-count-dependent queue cliff.
 Multi-page fetch responses run in a connection-owned worker so both peers'
 socket readers remain live during symmetric large-value repair.
-An irreducible oversized mutation is rejected before local apply. Persisted
-records created by an older binary are checked during cache load and fail
-startup if they cannot traverse every required single-record envelope.
+An irreducible oversized mutation, or one with empty or over-limit provenance,
+is rejected before local apply. Persisted records created by an older binary
+are checked during cache load and fail startup if they cannot traverse every
+required single-record envelope or their provenance node id is empty or exceeds
+255 UTF-8 bytes. Repair or remove such records offline before restarting.
 
 When a requester with a configured store fetches winners under a
 `StoreCommitted` policy, it also flushes those local applies before sending the
@@ -238,6 +243,10 @@ retry on their own one-second timer rather than waiting for `batch_interval` or
 the next consistency tick. Reset rounds restart on reconnect before streaming
 resumes. Local, transport, NACK, and phase-timeout failures all fail closed:
 they never increment the completed-round counter or clear the reset state.
+An authenticated reconcile request or fetch that races a fragment's
+bootstrapping/non-serving state is ignored until the sender's bounded phase
+timeout; it does not tear down the multiplexed connection needed by the reverse
+bootstrap or unrelated fragments.
 Placement drain likewise treats `BufferReset` as active work even when its
 ordinary buffer and in-flight counts are zero.
 
@@ -275,7 +284,8 @@ counter for the retired protocol and remains zero in every mode.
   `MAX_FRAME_BYTES` is the absolute 16 MiB body limit.
 - Before Prost allocates, an envelope preflight rejects retired/ambiguous
   messages and caps repeated anti-entropy fields at 256 items and general
-  batch fields at 4096. Reader-generated responses use immediate bounded
+  batch fields at 4096. Producers additionally byte-bound batch puts and their
+  worst-case replies, and cap batch-get pulls at 256 keys. Reader-generated responses use immediate bounded
   admission; saturation closes the correlated connection for replay instead
   of parking the reader behind its own writer.
 - Reconnect uses exponential backoff from `RECONNECT_BASE` (100 ms, doubling),

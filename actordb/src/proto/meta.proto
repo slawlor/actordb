@@ -312,6 +312,9 @@ message BatchGetResponse {
     // from not-found).
     bool shed = 8;
   }
+  // With CAPABILITY_BYTE_BOUNDED_BATCHES, a non-empty request returns either
+  // an empty unavailable response or a non-empty ordered prefix. The caller
+  // resumes an omitted suffix under a fresh request id.
   repeated KeyValue results = 2;
 }
 

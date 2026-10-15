@@ -33,10 +33,11 @@ The contract is deliberately narrow:
 - Loaded records are preflighted against every required single-record wire
   envelope, including the duplicated summary continuation key. RocksDB performs
   this check from raw lengths before decoding/retaining another value copy. A
-  legacy key/value that exceeds the 16 MiB hard frame limit fails startup
-  rather than entering the cache in a permanently unreplicable state. Migrate
-  or remove that record offline with a compatible older binary before upgrade;
-  actordb never truncates it automatically.
+  legacy key/value that exceeds the 16 MiB hard frame limit, or whose provenance
+  node id is empty or exceeds 255 UTF-8 bytes, fails startup rather than entering
+  the cache in a permanently unreplicable state. Migrate or remove that record
+  offline with a compatible older binary before upgrade; actordb never truncates
+  or repairs it automatically.
 
 ## Implementations
 

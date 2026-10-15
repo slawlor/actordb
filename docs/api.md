@@ -69,8 +69,8 @@ async fn main() -> Result<(), actordb::node::NodeError> {
   arrives. Locally applied mutations have a separate lane sized by
   `SenderConfig::buffer_capacity`. The peer frame budget must be at least two
   and is split between data and priority responses; the byte budget must be at
-  least 17 MiB so ordinary producers can leave a 1 MiB response reserve beside
-  one maximum-size frame. Other capacities/timeouts must be nonzero. Actor
+  least 32 MiB so ordinary producers leave a full 16 MiB response reserve
+  beside one maximum-size frame. Other capacities/timeouts must be nonzero. Actor
   lanes remain item-count bounded. Every encoded frame is separately limited
   to 16 MiB, with 1 MiB soft pages for anti-entropy and ordinary replication.
 - `node.connect(peer_addr)` tries the first transport dial once and returns an
@@ -130,6 +130,9 @@ let v: Option<actordb::actor::VersionedValue> = node.get("user:42".to_string()).
 Every mutation is preflighted against all required single-record wire
 envelopes before local apply. A key/value that cannot fit the 16 MiB hard frame
 limit returns `NodeError::Codec` rather than creating unreplicable local state.
+The embedded `VersionedValue.node_id` must contain 1 to 255 UTF-8 bytes as
+well; this applies to direct actor calls and records loaded from custom stores,
+not only to `Node::start` identities.
 
 ### Priorities
 
@@ -167,8 +170,12 @@ Semantics (full detail in [Multi-key batching](batching.md)):
 
 - Plain `put_multi`/`get_multi` run at **`OpPriority::Background`**; the
   `_with_priority` variants take an explicit priority.
-- Keys are grouped by destination fragment and split into messages of at most
-  4096 items before each `BatchPut` / `BatchGet` owner attempt.
+- Keys are grouped by destination fragment and split by exact encoded bytes.
+  Puts also reserve their worst-case complete response and retain the 4096-item
+  defensive ceiling. Get requests contain at most 256 keys; a response is a
+  connection-correlated ordered prefix and the caller pulls the omitted suffix under
+  a fresh request id. Duplicate positions and explicit not-found entries are
+  preserved.
 - Remote puts and gets have one **configured per-attempt deadline** (5 seconds
   by default) covering outbound queue admission and the response. Both fail over on a closed
   connection or missing reply; put replies additionally
@@ -214,10 +221,13 @@ variants. Direct `ApplyOp` calls return `ApplyError::InvalidInput` for a record
 that cannot traverse the wire; this is nonfatal and does not restart a worker.
 
 Advanced users of public `actordb::proto` types must upgrade in lockstep with
-the cluster: wire v3 requires the paged-anti-entropy capability and adds cursor,
+the cluster: wire v3 requires the paged-anti-entropy and byte-bounded-batches
+capabilities and adds cursor,
 revision, page-sequence, completion, and restart fields to reconciliation
-messages. The generated `SyncRequest`/`SyncResponse` types remain for source
-compatibility, but a v3 connection rejects either envelope variant.
+messages. A non-empty `BatchGetResponse` may now be an ordered request prefix;
+an empty response is unavailable, never not-found. The generated
+`SyncRequest`/`SyncResponse` types remain for source compatibility, but a v3
+connection rejects either envelope variant.
 The public `replication::SenderMsg::{ReconcileResponse, ReconcileData}` variants
 also gained correlation/page fields, so direct `spawn_sender*` users must update
 struct construction and exhaustive matches.

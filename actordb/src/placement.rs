@@ -42,6 +42,7 @@ use std::fmt::Debug;
 use std::sync::RwLock;
 
 use crate::shard::FragmentId;
+use crate::wire::MAX_WIRE_NODE_ID_BYTES;
 
 /// Source of truth for fragment placement.
 ///
@@ -187,9 +188,9 @@ pub fn validate_placement(
         };
         let mut unique = HashSet::with_capacity(replicas.len());
         for replica in replicas {
-            if replica.is_empty() || replica.len() > 255 {
+            if replica.is_empty() || replica.len() > MAX_WIRE_NODE_ID_BYTES {
                 return Err(format!(
-                    "placement {frag} has a replica id outside 1 to 255 bytes"
+                    "placement {frag} has a replica id outside 1 to {MAX_WIRE_NODE_ID_BYTES} bytes"
                 ));
             }
             if !unique.insert(replica) {

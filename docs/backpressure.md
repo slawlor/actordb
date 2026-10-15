@@ -79,10 +79,12 @@ pages, and enforce a 16 MiB hard frame limit. This prevents an irreducible
 record from wedging replication. The 256-frame peer queue is complemented by
 an independent 32 MiB default encoded-byte budget (configurable through
 `NodeRuntimeOptions`). Its frame slots are split evenly between ordinary data
-and a writer-priority response lane. Ordinary producers also leave 1 MiB of
-the shared byte budget reserved for responses. Connection-reader responses
-never await admission: a response larger than the available reserve, or a full
-response lane, closes the connection for correlated replay. Response priority
+and a writer-priority response lane. Ordinary producers also leave one full
+16 MiB maximum frame of the shared byte budget reserved for responses.
+Connection-reader responses never await admission: a full response lane closes
+the connection for correlated replay, as does shared-byte exhaustion caused by
+other queued responses. The producer-only gate cannot consume the reserved
+maximum frame. Response priority
 is capped at 16 consecutive frames whenever data is ready.
 Anti-entropy additionally admits one peer-wide round at a time through a
 ticketed FIFO gate, and an

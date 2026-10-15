@@ -11,10 +11,14 @@ and results come back in input order.
 2. Local keys (this node serves the fragment) run through the normal single-key
    path — including the exact per-op apply outcome — concurrently via
    `join_all`, then are stamped back into their input positions.
-3. Remote keys are grouped by `FragmentId`, then split into chunks of at most
-   4096 items before `BatchPut` / `BatchGet` owner attempts. This matches the
-   receiver's allocation-safe pre-decode cardinality limit.
-4. Put responses must match the request's cardinality, key order, and explicit
+3. Remote puts are split when either the exact request or a conservative
+   worst-case response would cross the 1 MiB soft target, or at 4096 items.
+   One individually valid item may exceed the soft target but never the
+   16 MiB hard frame limit.
+4. Remote get requests use the same exact 1 MiB request target and at most 256
+   keys. The 4096-item wire ceiling remains a defensive pre-decode limit, not
+   the producer chunk size.
+5. Put responses must match the request's cardinality, key order, and explicit
    request indices before results are mapped into the input-aligned `Vec`:
    `Vec<Result<(), NodeError>>` for puts,
    `Vec<Result<Option<VersionedValue>, NodeError>>` for gets.
@@ -33,12 +37,9 @@ and results come back in input order.
   separate writer-priority lane, independent of `OpPriority`.
 
 Remote fan-out is currently sequential: the caller awaits one fragment group
-and count chunk at a time, and each chunk's replica holders are attempted one
-at a time in placement order. A slow attempt therefore delays later holders,
-chunks, and remote fragments. Chunks are not yet split by aggregate encoded
-bytes: a chunk of individually valid large records can exceed the 16 MiB frame
-limit and fail locally without being sent. Byte-based aggregate chunking is a
-separate follow-up.
+and byte/count chunk at a time, and each chunk's replica holders are attempted
+one at a time in placement order. A slow attempt therefore delays later
+holders, chunks, and remote fragments.
 
 ## Remote puts: exact outcomes and bounded failover
 
@@ -49,6 +50,12 @@ one request id, and waits for one ordered `MutationResult` per put. `Ok(())`
 means the serving worker returned `Applied` or the idempotent
 `AlreadyPresent`; backpressure, storage failure, expiry, and supersession are
 returned per key.
+
+The producer incrementally measures both the exact `BatchPut` request and a
+worst-case `MutationResponse`. Peer diagnostics are capped at 1024 UTF-8 bytes,
+and record provenance ids use the cluster's 1-to-255-byte identity bound, so
+that response estimate is authoritative. A peer preflights the complete batch
+before observing its timestamp, relaying it, or applying any item.
 
 Each attempt has one **configured total deadline (5 seconds by default)
 covering both outbound queue admission and the reply**. A closed connection,
@@ -76,16 +83,36 @@ selects only the first owner rather than failing over.
 ## Remote gets: timeout + failover
 
 Remote gets carry a `req_id` and are awaited with the same **configured total
-per-attempt timeout for enqueue plus response** (5 seconds by default). On
-timeout or a dropped reply channel, the pending request is removed and the node
-fails over to the next replica holder. A key fails only when no replica holder answers:
+per-owner-attempt timeout for enqueue plus every prefix response** (5 seconds
+by default). A peer cannot extend that deadline by returning one result at a
+time. On timeout or a dropped reply channel, the pending request is removed and
+the node fails over to the next replica holder for only the uncompleted suffix.
+A key fails only when no replica holder answers:
 `NodeError::Network("no replica answered batch get for fragment {frag} (tried ...)")`.
 "A dead owner fails only its keys, and only when no replica holder answers."
+
+A non-empty `BatchGet` receives either an empty *unavailable* response or a
+non-empty exact ordered prefix of its requested keys. Empty never means
+not-found. The caller validates the expected connection-bound peer and every
+prefix position—including duplicate keys—before observing timestamps or completing a
+result, then requests the omitted suffix under a fresh id. Missing values are
+represented explicitly by a prefix entry with `found = false`.
+
+The responder targets 1 MiB. Because it learns a value's encoded size only
+after the actor read, it includes the single result that crosses that target
+when the aggregate still fits the 16 MiB hard limit, then stops. This avoids
+charging actor admission twice for the boundary key. If that result cannot
+join the current frame, the existing prefix is returned and the item is pulled
+again alone. That hard-boundary retry consumes actor admission again and can
+therefore return explicit backpressure rather than a false miss. One response
+frame is emitted per request, so the connection reader never waits on a
+multi-frame response stream.
 
 Per-key result mapping in a `BatchGetResponse`:
 
 - entry marked `shed` → `Err(NodeError::Backpressure(..))`;
 - `found` with `is_tombstone` → `Ok(None)` (tombstones read as absent);
+- explicit `found = false` → `Ok(None)`;
 - otherwise → `Ok(Some(value))`.
 
 ## Error semantics

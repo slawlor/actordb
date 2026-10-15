@@ -1300,14 +1300,14 @@ async fn bidirectional_large_reconciliation_keeps_connection_reader_live() {
     use actordb::shard::{fragment_of, FragmentId};
 
     // Two data pages cannot coexist in the minimum legal producer byte budget
-    // (16 MiB plus the writer's reserved 1 MiB response allowance).
+    // (one maximum 16 MiB frame; the other 16 MiB is response-only).
     // Both peers therefore need their connection reader to drain the opposite
     // direction while their responder waits to admit its second page. More
     // fragments than the responder queue depth also prove that the shared
     // connection credit schedules honest work instead of disconnecting a
     // simultaneous startup burst.
     const VALUE_BYTES: usize = 8 * 1024 * 1024;
-    const MIN_WRITER_BYTES: usize = 17 * 1024 * 1024;
+    const MIN_WRITER_BYTES: usize = 32 * 1024 * 1024;
     const FRAGMENT_COUNT: usize = 10;
 
     fn key_for_fragment(prefix: &str, fragment: FragmentId) -> String {
@@ -2079,6 +2079,29 @@ async fn startup_rejects_out_of_policy_persisted_timestamp() {
             error.to_string().contains("exceeds maximum allowed"),
             "unexpected startup error: {error}"
         ),
+    }
+}
+
+#[tokio::test]
+async fn startup_rejects_invalid_persisted_provenance() {
+    for node_id in [String::new(), "x".repeat(256)] {
+        let store = Arc::new(PreloadedStore::default());
+        store.insert_fragment_zero("poisoned", VersionedValue::new(b"bad".to_vec(), 1, node_id));
+        let config = NodeConfig {
+            store: Some(store),
+            ..NodeConfig::default()
+        };
+
+        match Node::start("node".to_string(), "127.0.0.1:0".parse().unwrap(), config).await {
+            Ok(node) => {
+                node.shutdown().await;
+                panic!("node accepted invalid durable provenance");
+            }
+            Err(error) => assert!(
+                error.to_string().contains("record node id is"),
+                "unexpected startup error: {error}"
+            ),
+        }
     }
 }
 
@@ -3951,6 +3974,79 @@ async fn remote_batches_split_at_wire_item_limit_without_dropping_connection() {
     owner.shutdown().await;
 }
 
+#[tokio::test]
+async fn remote_batches_split_at_encoded_byte_limits_without_false_misses() {
+    use actordb::actor::OpPriority;
+    use actordb::shard::FragmentId;
+
+    let fragment_map = HashMap::from([(FragmentId(0), vec!["byte-owner".to_string()])]);
+    let config = || NodeConfig {
+        fragment_count: 1,
+        fragment_map: fragment_map.clone(),
+        ..NodeConfig::default()
+    };
+    let owner = test_node_with_config("byte-owner", config()).await;
+    let client = Node::start_with_options(
+        "byte-client".to_string(),
+        "127.0.0.1:0".parse().unwrap(),
+        config(),
+        NodeRuntimeOptions::default().with_forwarded_attempt_timeout(Duration::from_secs(30)),
+    )
+    .await
+    .unwrap();
+    client.connect(owner.addr()).await.unwrap();
+    wait_for_peers(&client, &owner).await;
+
+    // Each record fits alone. Combined put requests cross the 1 MiB target,
+    // while the first and second get results cross the 16 MiB hard limit and
+    // therefore require an ordered prefix pull. Repeating the first key pins
+    // positional duplicate handling across pages.
+    let small = vec![b's'; 768 * 1024];
+    let large = vec![b'l'; 15 * 1024 * 1024 + 512 * 1024];
+    let writes = vec![
+        ("byte-small".to_string(), small.clone()),
+        ("byte-large".to_string(), large.clone()),
+    ];
+    let put_results = client
+        .put_multi_with_priority(writes, OpPriority::Default)
+        .await;
+    assert!(
+        put_results.iter().all(Result::is_ok),
+        "byte-bounded put failed: {put_results:?}"
+    );
+    assert_eq!(client.peer_count().await, 1);
+
+    let get_results = client
+        .get_multi_with_priority(
+            vec![
+                "byte-small".to_string(),
+                "byte-large".to_string(),
+                "byte-small".to_string(),
+                "byte-missing".to_string(),
+            ],
+            OpPriority::Default,
+        )
+        .await;
+    assert_eq!(get_results.len(), 4);
+    assert_eq!(
+        get_results[0].as_ref().unwrap().as_ref().unwrap().value,
+        small
+    );
+    assert_eq!(
+        get_results[1].as_ref().unwrap().as_ref().unwrap().value,
+        large
+    );
+    assert_eq!(
+        get_results[2].as_ref().unwrap().as_ref().unwrap().value,
+        get_results[0].as_ref().unwrap().as_ref().unwrap().value
+    );
+    assert!(get_results[3].as_ref().unwrap().is_none());
+    assert_eq!(client.peer_count().await, 1);
+
+    client.shutdown().await;
+    owner.shutdown().await;
+}
+
 /// Phase 6: partial failure + replica failover — one replica down,
 /// reads fail over to the surviving replica; errors are reported
 /// per-key only when all replicas are unreachable.
@@ -4078,7 +4174,7 @@ async fn multi_key_partial_failure() {
 }
 
 #[tokio::test]
-async fn batch_put_fails_over_after_a_stale_owner_returns_unavailable() {
+async fn batch_operations_fail_over_after_a_stale_owner_returns_unavailable() {
     use actordb::shard::FragmentId;
 
     let map = |owners: &[&str]| {
@@ -4130,6 +4226,16 @@ async fn batch_put_fails_over_after_a_stale_owner_returns_unavailable() {
             .unwrap()
             .map(|value| value.value),
         Some(b"value".to_vec())
+    );
+
+    // The live but non-serving first owner returns an empty unavailable
+    // BatchGetResponse. The caller must try the next owner instead of treating
+    // the omitted key as a miss.
+    let reads = a.get_multi(vec!["stale-batch".to_string()]).await;
+    assert_eq!(reads.len(), 1);
+    assert_eq!(
+        reads[0].as_ref().unwrap().as_ref().unwrap().value,
+        b"value".to_vec()
     );
 
     a.shutdown().await;
@@ -5702,11 +5808,12 @@ async fn hello_auth_mismatch_drops_connection() {
 }
 
 /// A peer must explicitly negotiate the wire version and every semantic bit
-/// relied on by mutation and replication acknowledgements. Fieldless legacy
-/// Hellos and partial capability sets fail closed before peer installation.
+/// relied on by mutation, batching, and replication acknowledgements.
+/// Fieldless legacy Hellos and partial capability sets fail closed before peer
+/// installation.
 #[tokio::test]
 async fn incompatible_hello_capabilities_are_rejected() {
-    use actordb::node::CAPABILITY_DURABILITY_ACKS;
+    use actordb::node::CAPABILITY_BYTE_BOUNDED_BATCHES;
     use actordb::proto::{EnvelopeMsg, Hello};
 
     let node = test_node("capability-server").await;
@@ -5719,7 +5826,7 @@ async fn incompatible_hello_capabilities_are_rejected() {
             node_id: "partial-peer".to_string(),
             min_protocol_version: WIRE_PROTOCOL_VERSION,
             max_protocol_version: WIRE_PROTOCOL_VERSION,
-            capabilities: REQUIRED_WIRE_CAPABILITIES & !CAPABILITY_DURABILITY_ACKS,
+            capabilities: REQUIRED_WIRE_CAPABILITIES & !CAPABILITY_BYTE_BOUNDED_BATCHES,
             ..Hello::default()
         },
     ];
