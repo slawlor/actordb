@@ -64,7 +64,7 @@ async fn main() {
         }
     }
 
-    a.shutdown().await;
-    b.shutdown().await;
-    c.shutdown().await;
+    a.shutdown().await.unwrap();
+    b.shutdown().await.unwrap();
+    c.shutdown().await.unwrap();
 }

@@ -28,13 +28,15 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, RwLock, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use prost::Message as ProstMessage;
 use ractor::rpc::CallResult;
-use ractor::{Actor, ActorRef};
+#[cfg(test)]
+use ractor::Actor;
+use ractor::{ActorRef, ActorRuntime};
 use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{
     mpsc, oneshot, watch, Mutex, Notify, OwnedSemaphorePermit, RwLock as AsyncRwLock, Semaphore,
@@ -62,7 +64,9 @@ use crate::replication::{
 use crate::runtime_tasks::RuntimeTasks;
 use crate::shard::{fragment_of, FragmentId};
 use crate::store::{KvStore, PrefixedStore};
-use crate::supervision::{FragmentHealth, FragmentSupervisor, SupervisorArgs, SupervisorMessage};
+use crate::supervision::{
+    FragmentHealth, FragmentShutdownError, FragmentSupervisor, SupervisorArgs, SupervisorMessage,
+};
 use crate::wire::{
     bytes_field_len, check_envelope_budget, check_record_budget, encode_envelope,
     message_field_len, preflight_envelope_decode, varint_field_len, BudgetedFrame, BudgetedPeerTx,
@@ -513,6 +517,83 @@ struct PendingBatchGetGuard {
     pending: PendingBatchGets,
 }
 
+const NODE_RUNNING: u8 = 0;
+const NODE_QUIESCING: u8 = 1;
+const NODE_STOPPED: u8 = 2;
+
+/// One-way admission fence for public Node operations. Admission is a
+/// lock-free check/increment/recheck sequence, so shutdown cannot miss a
+/// racing operation and a cancelled operation releases its slot by RAII.
+struct OperationGate {
+    phase: AtomicU8,
+    active: AtomicUsize,
+    drained: Notify,
+}
+
+impl OperationGate {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            phase: AtomicU8::new(NODE_RUNNING),
+            active: AtomicUsize::new(0),
+            drained: Notify::new(),
+        })
+    }
+
+    fn try_enter(self: &Arc<Self>) -> Result<OperationPermit, NodeError> {
+        if self.phase.load(Ordering::SeqCst) != NODE_RUNNING {
+            return Err(NodeError::ShuttingDown);
+        }
+        self.active.fetch_add(1, Ordering::SeqCst);
+        if self.phase.load(Ordering::SeqCst) == NODE_RUNNING {
+            return Ok(OperationPermit { gate: self.clone() });
+        }
+        self.release();
+        Err(NodeError::ShuttingDown)
+    }
+
+    fn begin_shutdown(&self) {
+        let _ = self.phase.compare_exchange(
+            NODE_RUNNING,
+            NODE_QUIESCING,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        );
+    }
+
+    async fn wait_for_drain(&self) {
+        loop {
+            // Register before observing the count so the final release cannot
+            // slip between the check and the wait.
+            let drained = self.drained.notified();
+            if self.active.load(Ordering::SeqCst) == 0 {
+                return;
+            }
+            drained.await;
+        }
+    }
+
+    fn finish_shutdown(&self) {
+        self.phase.store(NODE_STOPPED, Ordering::SeqCst);
+        self.drained.notify_waiters();
+    }
+
+    fn release(&self) {
+        if self.active.fetch_sub(1, Ordering::SeqCst) == 1 {
+            self.drained.notify_waiters();
+        }
+    }
+}
+
+struct OperationPermit {
+    gate: Arc<OperationGate>,
+}
+
+impl Drop for OperationPermit {
+    fn drop(&mut self) {
+        self.gate.release();
+    }
+}
+
 impl Drop for PendingBatchGetGuard {
     fn drop(&mut self) {
         self.pending.lock().unwrap().remove(&self.req_id);
@@ -747,7 +828,8 @@ pub enum NodeError {
     /// limit). The caller should retry with backoff or reduce load.
     /// Distinct from "not found" — a shed Get never returns Ok(None).
     Backpressure(String),
-    /// A store failed while applying a mutation.
+    /// A store failed while applying a mutation or completing a requested
+    /// durability fence such as shutdown.
     Storage(String),
     /// A different version already wins the LWW merge. The attempted write
     /// was not applied and is never reported as successful.
@@ -759,6 +841,9 @@ pub enum NodeError {
     /// A mutation reached the fragment after its TTL deadline. Its expiry
     /// tombstone was installed so older values cannot reappear.
     Expired,
+    /// The node has begun its one-way shutdown fence and no longer admits
+    /// application operations. Retry against another live node.
+    ShuttingDown,
 }
 
 impl std::fmt::Display for NodeError {
@@ -779,6 +864,7 @@ impl std::fmt::Display for NodeError {
                 "write was superseded by timestamp={timestamp_ms} node_id={node_id} tombstone={is_tombstone}"
             ),
             NodeError::Expired => write!(f, "write expired before it could be applied"),
+            NodeError::ShuttingDown => write!(f, "node is shutting down"),
         }
     }
 }
@@ -1318,14 +1404,24 @@ pub struct Node {
     dial_intents: Arc<StdMutex<HashMap<SocketAddr, DialIntentState>>>,
     dial_intent_changes: watch::Sender<u64>,
     peer_changes: watch::Sender<u64>,
-    shutdown_state: Mutex<bool>,
+    operation_gate: Arc<OperationGate>,
+    shutdown_state: Mutex<ShutdownProgress>,
     network: Arc<dyn Network>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShutdownProgress {
+    Running,
+    Quiescing,
+    StoppingFragments,
+    Stopped,
 }
 
 impl Drop for Node {
     fn drop(&mut self) {
         // Async cleanup still belongs to `shutdown`, but never leave task
         // admission open merely because a caller dropped the handle.
+        self.operation_gate.begin_shutdown();
         self.tasks.request_shutdown();
         if let Ok(senders) = self.senders.try_lock() {
             for sender in senders.values() {
@@ -1532,7 +1628,7 @@ async fn spawn_fragment_subtree_registered(
         .store
         .clone()
         .map(|inner| Arc::new(PrefixedStore::new(inner, fragment)) as Arc<dyn KvStore>);
-    let (supervisor, _sup_handle) = FragmentSupervisor::spawn(
+    let (supervisor, startup_handle) = ActorRuntime::<FragmentSupervisor>::spawn_instant(
         None,
         FragmentSupervisor,
         SupervisorArgs {
@@ -1551,11 +1647,41 @@ async fn spawn_fragment_subtree_registered(
             reset_senders: Arc::new(Mutex::new(HashMap::new())),
         },
     )
-    .await
     .map_err(|e| NodeError::Actor(e.to_string()))?;
-    registry.insert(fragment, supervisor.clone());
-    let mut startup_guard = SupervisorStartupGuard::new(1);
-    startup_guard.push(supervisor.clone());
+
+    // Publish ownership before the first await. Dynamic placement tasks are
+    // aborted at the start of Node shutdown; the independent startup observer
+    // keeps pre_start alive and makes its completion (including failed-start
+    // child cleanup) visible to the synchronous supervisor registry.
+    let (startup_tx, startup_rx) = watch::channel(SupervisorStartupState::Starting);
+    registry.insert(fragment, supervisor.clone(), startup_rx.clone());
+    let startup_supervisor = supervisor.clone();
+    drop(tokio::spawn(async move {
+        let state = match startup_handle.await {
+            Ok(Ok(_lifecycle_handle)) => SupervisorStartupState::Ready,
+            Ok(Err(error)) => {
+                cleanup_failed_supervisor_start(&startup_supervisor).await;
+                SupervisorStartupState::Failed(error.to_string())
+            }
+            Err(error) => {
+                cleanup_failed_supervisor_start(&startup_supervisor).await;
+                SupervisorStartupState::Failed(format!("startup task failed: {error}"))
+            }
+        };
+        startup_tx.send_replace(state);
+    }));
+
+    match wait_for_supervisor_startup(startup_rx).await {
+        Ok(SupervisorStartupState::Ready) => {}
+        Ok(SupervisorStartupState::Failed(error)) => {
+            registry.remove_if(fragment, &supervisor);
+            return Err(NodeError::Actor(error));
+        }
+        Ok(SupervisorStartupState::Starting) => unreachable!("startup wait returned pending"),
+        Err(error) => {
+            return Err(NodeError::Actor(error));
+        }
+    }
     let dispatcher_result = supervisor
         .call(|reply| SupervisorMessage::GetDispatcher { reply }, None)
         .await;
@@ -1564,8 +1690,7 @@ async fn spawn_fragment_subtree_registered(
         Ok(_) => {
             supervisor.stop(None);
             let _ = supervisor.wait(None).await;
-            registry.remove(fragment);
-            startup_guard.disarm();
+            registry.remove_if(fragment, &supervisor);
             return Err(NodeError::Actor(
                 "supervisor dropped dispatcher reply".to_string(),
             ));
@@ -1573,13 +1698,24 @@ async fn spawn_fragment_subtree_registered(
         Err(error) => {
             supervisor.stop(None);
             let _ = supervisor.wait(None).await;
-            registry.remove(fragment);
-            startup_guard.disarm();
+            registry.remove_if(fragment, &supervisor);
             return Err(NodeError::Actor(error.to_string()));
         }
     };
-    startup_guard.disarm();
     Ok((supervisor, dispatcher))
+}
+
+/// Supervisor pre_start performs the primary recursive rollback. This
+/// observer-side sweep covers a framework-level startup failure outside that
+/// hook and publishes failure only after any still-linked children exit.
+async fn cleanup_failed_supervisor_start(supervisor: &ActorRef<SupervisorMessage>) {
+    let children = supervisor.get_children();
+    for child in &children {
+        let _ = child.drain();
+    }
+    for child in children {
+        let _ = child.wait(None).await;
+    }
 }
 
 /// Keep the router pointed at the dispatcher currently owned by one fragment
@@ -1676,8 +1812,8 @@ async fn spawn_fragment_subtree(
 ) -> Result<(ActorRef<SupervisorMessage>, ActorRef<KvMessage>), NodeError> {
     let registry = Arc::new(SupervisorRegistry::new(1));
     let result = spawn_fragment_subtree_registered(node_id, fragment, config, hlc, &registry).await;
-    if result.is_ok() {
-        registry.remove(fragment);
+    if let Ok((supervisor, _)) = &result {
+        registry.remove_if(fragment, supervisor);
     }
     result
 }
@@ -1686,7 +1822,36 @@ async fn spawn_fragment_subtree(
 /// implementation closes the late-publication race when a Node is dropped
 /// while a placement task is still unwinding.
 struct SupervisorRegistry {
-    supervisors: StdMutex<HashMap<FragmentId, ActorRef<SupervisorMessage>>>,
+    supervisors: StdMutex<HashMap<FragmentId, Vec<RegisteredSupervisor>>>,
+}
+
+#[derive(Clone)]
+struct RegisteredSupervisor {
+    actor: ActorRef<SupervisorMessage>,
+    prepared: bool,
+    startup: watch::Receiver<SupervisorStartupState>,
+}
+
+#[derive(Clone, Debug)]
+enum SupervisorStartupState {
+    Starting,
+    Ready,
+    Failed(String),
+}
+
+async fn wait_for_supervisor_startup(
+    mut startup: watch::Receiver<SupervisorStartupState>,
+) -> Result<SupervisorStartupState, String> {
+    loop {
+        let state = startup.borrow().clone();
+        if !matches!(state, SupervisorStartupState::Starting) {
+            return Ok(state);
+        }
+        startup
+            .changed()
+            .await
+            .map_err(|_| "supervisor startup observer exited before completion".to_string())?;
+    }
 }
 
 impl SupervisorRegistry {
@@ -1696,24 +1861,88 @@ impl SupervisorRegistry {
         }
     }
 
-    fn insert(&self, fragment: FragmentId, supervisor: ActorRef<SupervisorMessage>) {
+    fn insert(
+        &self,
+        fragment: FragmentId,
+        supervisor: ActorRef<SupervisorMessage>,
+        startup: watch::Receiver<SupervisorStartupState>,
+    ) {
         self.supervisors
             .lock()
             .unwrap()
-            .insert(fragment, supervisor);
+            .entry(fragment)
+            .or_default()
+            .push(RegisteredSupervisor {
+                actor: supervisor,
+                prepared: false,
+                startup,
+            });
     }
 
-    fn remove(&self, fragment: FragmentId) {
-        self.supervisors.lock().unwrap().remove(&fragment);
+    #[cfg(test)]
+    fn insert_ready(&self, fragment: FragmentId, supervisor: ActorRef<SupervisorMessage>) {
+        let (_startup_tx, startup_rx) = watch::channel(SupervisorStartupState::Ready);
+        self.insert(fragment, supervisor, startup_rx);
     }
 
-    fn snapshot(&self) -> Vec<ActorRef<SupervisorMessage>> {
-        self.supervisors.lock().unwrap().values().cloned().collect()
+    fn get(&self, fragment: FragmentId) -> Option<RegisteredSupervisor> {
+        self.supervisors
+            .lock()
+            .unwrap()
+            .get(&fragment)
+            .and_then(|entries| entries.last())
+            .cloned()
+    }
+
+    fn remove_if(&self, fragment: FragmentId, supervisor: &ActorRef<SupervisorMessage>) -> bool {
+        let mut supervisors = self.supervisors.lock().unwrap();
+        let mut removed = false;
+        let mut empty = false;
+        if let Some(entries) = supervisors.get_mut(&fragment) {
+            let before = entries.len();
+            entries.retain(|entry| entry.actor.get_id() != supervisor.get_id());
+            removed = entries.len() != before;
+            empty = entries.is_empty();
+        }
+        if empty {
+            supervisors.remove(&fragment);
+        }
+        removed
+    }
+
+    fn mark_prepared(
+        &self,
+        fragment: FragmentId,
+        supervisor: &ActorRef<SupervisorMessage>,
+    ) -> bool {
+        let mut supervisors = self.supervisors.lock().unwrap();
+        let Some(entries) = supervisors.get_mut(&fragment) else {
+            return false;
+        };
+        let Some(entry) = entries
+            .iter_mut()
+            .find(|entry| entry.actor.get_id() == supervisor.get_id())
+        else {
+            return false;
+        };
+        entry.prepared = true;
+        true
+    }
+
+    fn snapshot(&self) -> Vec<(FragmentId, RegisteredSupervisor)> {
+        self.supervisors
+            .lock()
+            .unwrap()
+            .iter()
+            .flat_map(|(fragment, entries)| entries.iter().cloned().map(|entry| (*fragment, entry)))
+            .collect()
     }
 
     fn stop_all(&self) {
-        for supervisor in self.supervisors.lock().unwrap().values() {
-            supervisor.stop(None);
+        for entries in self.supervisors.lock().unwrap().values() {
+            for entry in entries {
+                entry.actor.stop(None);
+            }
         }
     }
 
@@ -1724,9 +1953,31 @@ impl SupervisorRegistry {
 
 impl Drop for SupervisorRegistry {
     fn drop(&mut self) {
-        for supervisor in self.supervisors.get_mut().unwrap().values() {
-            supervisor.stop(None);
+        for entries in self.supervisors.get_mut().unwrap().values() {
+            for entry in entries {
+                entry.actor.stop(None);
+            }
         }
+    }
+}
+
+async fn quiesce_fragment_supervisor(
+    supervisor: &ActorRef<SupervisorMessage>,
+) -> Result<(), FragmentShutdownError> {
+    let result = supervisor
+        .call(|reply| SupervisorMessage::Quiesce { reply }, None)
+        .await
+        .map_err(|error| {
+            FragmentShutdownError::Actor(format!("quiesce request failed: {error}"))
+        })?;
+    match result {
+        CallResult::Success(result) => result,
+        CallResult::Timeout => Err(FragmentShutdownError::Actor(
+            "quiesce timed out".to_string(),
+        )),
+        CallResult::SenderError => Err(FragmentShutdownError::Actor(
+            "quiesce reply channel dropped".to_string(),
+        )),
     }
 }
 
@@ -2216,6 +2467,19 @@ impl NodeConfig {
 }
 
 impl Node {
+    fn admit_operation(&self) -> Result<OperationPermit, NodeError> {
+        self.operation_gate.try_enter()
+    }
+
+    async fn fail_startup_after_shutdown(&self, message: &str) -> NodeError {
+        match self.shutdown().await {
+            Ok(()) => NodeError::Actor(message.to_string()),
+            Err(cleanup) => {
+                NodeError::Actor(format!("{message}; startup cleanup also failed: {cleanup}"))
+            }
+        }
+    }
+
     /// Start a node: spawn its [crate::actor::KvActor] and begin
     /// listening for peer connections. Binds `listen_addr` (use port 0
     /// for an ephemeral port) and returns the bound address via [Node::addr].
@@ -2484,7 +2748,8 @@ impl Node {
             dial_intents: Arc::new(StdMutex::new(HashMap::new())),
             dial_intent_changes,
             peer_changes,
-            shutdown_state: Mutex::new(false),
+            operation_gate: OperationGate::new(),
+            shutdown_state: Mutex::new(ShutdownProgress::Running),
             network: config.network.clone(),
         };
 
@@ -2493,10 +2758,11 @@ impl Node {
             .spawn(node.peer_failures.clone().run(node.peers.clone()))
             .await
         {
-            node.shutdown().await;
-            return Err(NodeError::Actor(
-                "node runtime stopped during peer-failure worker startup".to_string(),
-            ));
+            return Err(node
+                .fail_startup_after_shutdown(
+                    "node runtime stopped during peer-failure worker startup",
+                )
+                .await);
         }
 
         // Phase 5: spawn a sender per (fragment, replica peer).
@@ -2550,10 +2816,11 @@ impl Node {
                 .spawn(placement_driver(deps, membership_rx))
                 .await
             {
-                node.shutdown().await;
-                return Err(NodeError::Actor(
-                    "node runtime stopped during placement-driver startup".to_string(),
-                ));
+                return Err(node
+                    .fail_startup_after_shutdown(
+                        "node runtime stopped during placement-driver startup",
+                    )
+                    .await);
             }
         }
 
@@ -2607,10 +2874,9 @@ impl Node {
             })
             .await
         {
-            node.shutdown().await;
-            return Err(NodeError::Actor(
-                "node runtime stopped during listener startup".to_string(),
-            ));
+            return Err(node
+                .fail_startup_after_shutdown("node runtime stopped during listener startup")
+                .await);
         }
 
         // Configured dial intents start even when the peer is initially down;
@@ -2622,10 +2888,11 @@ impl Node {
                     .start_dial_supervisor(*addr, Some(id.clone()), None)
                     .await
             {
-                node.shutdown().await;
-                return Err(NodeError::Actor(
-                    "node runtime stopped during member-dialer startup".to_string(),
-                ));
+                return Err(node
+                    .fail_startup_after_shutdown(
+                        "node runtime stopped during member-dialer startup",
+                    )
+                    .await);
             }
         }
 
@@ -2647,8 +2914,9 @@ impl Node {
     /// every later reconnect. Dropped connections are redialed with
     /// exponential backoff until [Node::shutdown].
     pub async fn connect(&self, peer_addr: SocketAddr) -> Result<(), NodeError> {
+        let _operation = self.admit_operation()?;
         if !self.tasks.is_accepting() {
-            return Err(NodeError::Network("node is shutting down".to_string()));
+            return Err(NodeError::ShuttingDown);
         }
         let mut shutdown = self.tasks.shutdown_signal();
         let intent = loop {
@@ -2867,7 +3135,9 @@ impl Node {
     /// supersession are typed errors. `Ok` does not force a persistence flush
     /// or await asynchronous fan-out to the other replicas.
     pub async fn put(&self, key: String, value: Vec<u8>) -> Result<(), NodeError> {
-        self.put_with_ttl(key, value, None).await
+        let _operation = self.admit_operation()?;
+        self.put_with_ttl_and_priority(key, value, None, OpPriority::Default)
+            .await
     }
 
     /// Write with explicit priority (Phase 7). High priority is for
@@ -2884,6 +3154,7 @@ impl Node {
         value: Vec<u8>,
         priority: OpPriority,
     ) -> Result<(), NodeError> {
+        let _operation = self.admit_operation()?;
         self.put_with_ttl_and_priority(key, value, None, priority)
             .await
     }
@@ -2930,6 +3201,7 @@ impl Node {
         value: Vec<u8>,
         ttl: Option<Duration>,
     ) -> Result<(), NodeError> {
+        let _operation = self.admit_operation()?;
         self.put_with_ttl_and_priority(key, value, ttl, OpPriority::Default)
             .await
     }
@@ -2939,6 +3211,7 @@ impl Node {
     /// tombstones so deletes survive node restarts and re-joins. A later
     /// `put` with a higher timestamp resurrects the key.
     pub async fn delete(&self, key: String) -> Result<(), NodeError> {
+        let _operation = self.admit_operation()?;
         let seq = {
             let mut guard = self.next_seq.lock().await;
             *guard += 1;
@@ -3075,7 +3348,9 @@ impl Node {
     /// fragment: read locally if we serve it, otherwise forwarded to a
     /// replica holder with the reply awaited.
     pub async fn get(&self, key: String) -> Result<Option<VersionedValue>, NodeError> {
-        self.get_with_priority(key, OpPriority::Default).await
+        let _operation = self.admit_operation()?;
+        self.get_with_priority_admitted(key, OpPriority::Default)
+            .await
     }
 
     /// Read a key with an explicit priority. High-priority reads go to
@@ -3086,6 +3361,15 @@ impl Node {
     /// the shared fragment cache makes its result visible to reads in every
     /// priority pool.
     pub async fn get_with_priority(
+        &self,
+        key: String,
+        priority: OpPriority,
+    ) -> Result<Option<VersionedValue>, NodeError> {
+        let _operation = self.admit_operation()?;
+        self.get_with_priority_admitted(key, priority).await
+    }
+
+    async fn get_with_priority_admitted(
         &self,
         key: String,
         priority: OpPriority,
@@ -3160,6 +3444,7 @@ impl Node {
 
     /// Read the full local copy across all fragments (debugging / tests).
     pub async fn get_all(&self) -> Result<HashMap<String, VersionedValue>, NodeError> {
+        let _operation = self.admit_operation()?;
         let all = self.router.get_all().await?;
         // Hide tombstones from user reads (sync needs them, users don't).
         Ok(all.into_iter().filter(|(_, v)| !v.is_tombstone).collect())
@@ -3180,6 +3465,23 @@ impl Node {
     /// attempt and fail over idempotently when a connection drops or no
     /// response arrives.
     pub async fn put_multi_with_priority(
+        &self,
+        kvs: Vec<(String, Vec<u8>)>,
+        priority: OpPriority,
+    ) -> Vec<Result<(), NodeError>> {
+        let _operation = match self.admit_operation() {
+            Ok(operation) => operation,
+            Err(_) => {
+                return kvs
+                    .into_iter()
+                    .map(|_| Err(NodeError::ShuttingDown))
+                    .collect()
+            }
+        };
+        self.put_multi_with_priority_admitted(kvs, priority).await
+    }
+
+    async fn put_multi_with_priority_admitted(
         &self,
         kvs: Vec<(String, Vec<u8>)>,
         priority: OpPriority,
@@ -3210,7 +3512,9 @@ impl Node {
         let local_futs = local.into_iter().map(|(i, key, value)| {
             let this = self;
             async move {
-                let r = this.put_with_priority(key, value, priority).await;
+                let r = this
+                    .put_with_ttl_and_priority(key, value, None, priority)
+                    .await;
                 (i, r)
             }
         });
@@ -3381,7 +3685,16 @@ impl Node {
     /// explicit priority. Local and remote keys both return exact per-key
     /// outcomes from the serving fragment.
     pub async fn put_multi(&self, kvs: Vec<(String, Vec<u8>)>) -> Vec<Result<(), NodeError>> {
-        self.put_multi_with_priority(kvs, OpPriority::Background)
+        let _operation = match self.admit_operation() {
+            Ok(operation) => operation,
+            Err(_) => {
+                return kvs
+                    .into_iter()
+                    .map(|_| Err(NodeError::ShuttingDown))
+                    .collect()
+            }
+        };
+        self.put_multi_with_priority_admitted(kvs, OpPriority::Background)
             .await
     }
 
@@ -3405,6 +3718,23 @@ impl Node {
     /// `NodeError::Backpressure` when the (local or remote) pool shed
     /// the read — never confused with "not found".
     pub async fn get_multi_with_priority(
+        &self,
+        keys: Vec<String>,
+        priority: OpPriority,
+    ) -> Vec<Result<Option<VersionedValue>, NodeError>> {
+        let _operation = match self.admit_operation() {
+            Ok(operation) => operation,
+            Err(_) => {
+                return keys
+                    .into_iter()
+                    .map(|_| Err(NodeError::ShuttingDown))
+                    .collect()
+            }
+        };
+        self.get_multi_with_priority_admitted(keys, priority).await
+    }
+
+    async fn get_multi_with_priority_admitted(
         &self,
         keys: Vec<String>,
         priority: OpPriority,
@@ -3433,7 +3763,7 @@ impl Node {
         let local_futs = local.into_iter().map(|(i, key)| {
             let this = self;
             async move {
-                let r = this.get_with_priority(key, priority).await;
+                let r = this.get_with_priority_admitted(key, priority).await;
                 (i, r)
             }
         });
@@ -3592,7 +3922,16 @@ impl Node {
         &self,
         keys: Vec<String>,
     ) -> Vec<Result<Option<VersionedValue>, NodeError>> {
-        self.get_multi_with_priority(keys, OpPriority::Background)
+        let _operation = match self.admit_operation() {
+            Ok(operation) => operation,
+            Err(_) => {
+                return keys
+                    .into_iter()
+                    .map(|_| Err(NodeError::ShuttingDown))
+                    .collect()
+            }
+        };
+        self.get_multi_with_priority_admitted(keys, OpPriority::Background)
             .await
     }
 
@@ -3626,73 +3965,168 @@ impl Node {
         self.peers.lock().await.len()
     }
 
-    /// Shut the node down: close task admission, abort and join all Node-owned
-    /// runtime tasks, disconnect senders, and stop every fragment supervisor.
-    /// Stopping the actors drops their state, which releases the RocksDB lock
-    /// (when persistence is enabled) so the database can be reopened — e.g. by
-    /// a restarted node on the same path. Repeated calls are idempotent.
-    pub async fn shutdown(&self) {
-        let mut stopped = self.shutdown_state.lock().await;
-        if *stopped {
-            return;
+    /// Shut the node down and report whether every local fragment reached its
+    /// final persistence fence.
+    ///
+    /// Shutdown is one-way: it first rejects new public operations, closes and
+    /// joins Node-owned runtime tasks, waits for already-admitted public work,
+    /// and stops replication senders. It then quiesces every fragment before
+    /// stopping any supervisor. A failed store flush leaves the fragment state
+    /// and retryable batch owned by its supervisor; this method returns the
+    /// error and a later call resumes shutdown. Only a successful return drops
+    /// all fragment state and releases a configured RocksDB lock.
+    ///
+    /// This local durability fence does not wait for peer replication ACKs;
+    /// transport convergence has its own lifecycle policy.
+    pub async fn shutdown(&self) -> Result<(), NodeError> {
+        let mut progress = self.shutdown_state.lock().await;
+        if *progress == ShutdownProgress::Stopped {
+            return Ok(());
         }
-        self.tasks.shutdown().await;
-
-        // Release every request/relay waiter retained by a cancelled handler.
-        self.pending_gets.lock().unwrap().clear();
-        self.pending_batch_gets.lock().unwrap().clear();
-        self.pending_mutations.lock().unwrap().clear();
-        self.pending_relays.lock().await.clear();
-        self.pending_mutation_relays.lock().await.clear();
-
-        // A hard shutdown can cancel a handler before its normal exact-channel
-        // cleanup tail. Clear every remaining current entry explicitly before
-        // stopping the long-lived replication senders.
-        let peers: Vec<(String, PeerChannel)> = self.peers.lock().await.drain().collect();
-        for (_, channel) in &peers {
-            channel.cancel();
+        if *progress == ShutdownProgress::Running {
+            self.operation_gate.begin_shutdown();
+            *progress = ShutdownProgress::Quiescing;
         }
-        {
-            let senders = self.senders.lock().await;
-            for (peer, channel) in &peers {
-                for ((_, sender_peer), sender) in senders.iter() {
-                    if sender_peer == peer {
-                        let _ = sender.send(SenderMsg::PeerDisconnected {
-                            peer_tx: channel.raw_sender(),
-                        });
+
+        if *progress == ShutdownProgress::Quiescing {
+            self.tasks.shutdown().await;
+
+            // Release every request/relay waiter retained by a cancelled
+            // handler. Admitted remote operations then leave the public gate
+            // promptly instead of waiting for their normal request deadline.
+            self.pending_gets.lock().unwrap().clear();
+            self.pending_batch_gets.lock().unwrap().clear();
+            self.pending_mutations.lock().unwrap().clear();
+            self.pending_relays.lock().await.clear();
+            self.pending_mutation_relays.lock().await.clear();
+
+            // A hard transport shutdown can cancel a handler before its normal
+            // exact-channel cleanup tail. Clear every remaining peer entry
+            // before stopping the long-lived replication senders.
+            let peers: Vec<(String, PeerChannel)> = self.peers.lock().await.drain().collect();
+            for (_, channel) in &peers {
+                channel.cancel();
+            }
+            {
+                let senders = self.senders.lock().await;
+                for (peer, channel) in &peers {
+                    for ((_, sender_peer), sender) in senders.iter() {
+                        if sender_peer == peer {
+                            let _ = sender.send(SenderMsg::PeerDisconnected {
+                                peer_tx: channel.raw_sender(),
+                            });
+                        }
                     }
                 }
             }
-        }
-        self.peer_changes.send_modify(|generation| {
-            *generation = generation.wrapping_add(1);
-        });
+            self.peer_changes.send_modify(|generation| {
+                *generation = generation.wrapping_add(1);
+            });
 
-        let senders: Vec<NodeSender> = self.senders.lock().await.values().cloned().collect();
-        for sender in senders {
-            sender.stop().await;
+            self.operation_gate.wait_for_drain().await;
+
+            let senders: Vec<NodeSender> = self.senders.lock().await.values().cloned().collect();
+            for sender in senders {
+                sender.stop().await;
+            }
+            let retiring_senders = self.retiring_senders.snapshot();
+            for sender in retiring_senders {
+                sender.stop().await;
+            }
+            self.retiring_senders.clear();
+
+            // Prepare every fragment before destroying any fragment state. A
+            // partial store outage therefore leaves all successful fragments
+            // quiesced and every failed buffer available for an exact retry.
+            let supervisors = self.supervisor_stops.snapshot();
+            let mut failures = Vec::new();
+            let mut saw_storage_failure = false;
+            for (fragment, entry) in supervisors {
+                if entry.prepared {
+                    continue;
+                }
+                let quiesce_result = match wait_for_supervisor_startup(entry.startup.clone()).await
+                {
+                    Ok(SupervisorStartupState::Ready) => {
+                        quiesce_fragment_supervisor(&entry.actor).await
+                    }
+                    Ok(SupervisorStartupState::Failed(error)) => {
+                        tracing::warn!(
+                            fragment = fragment.0,
+                            %error,
+                            "fragment startup failed before shutdown; child cleanup completed"
+                        );
+                        Ok(())
+                    }
+                    Ok(SupervisorStartupState::Starting) => {
+                        unreachable!("startup wait returned pending")
+                    }
+                    Err(error) => Err(FragmentShutdownError::Actor(error)),
+                };
+                match quiesce_result {
+                    Ok(()) => {
+                        if !self.supervisor_stops.mark_prepared(fragment, &entry.actor) {
+                            failures.push(format!(
+                                "fragment {fragment}: supervisor ownership changed during quiesce"
+                            ));
+                        }
+                    }
+                    Err(FragmentShutdownError::Storage(error)) => {
+                        saw_storage_failure = true;
+                        failures.push(format!("fragment {fragment}: {error}"));
+                    }
+                    Err(FragmentShutdownError::Actor(error)) => {
+                        failures.push(format!("fragment {fragment}: {error}"));
+                    }
+                }
+            }
+            if !failures.is_empty() {
+                let message = failures.join("; ");
+                return if saw_storage_failure {
+                    Err(NodeError::Storage(message))
+                } else {
+                    Err(NodeError::Actor(message))
+                };
+            }
+            if self
+                .supervisor_stops
+                .snapshot()
+                .iter()
+                .any(|(_, entry)| !entry.prepared)
+            {
+                return Err(NodeError::Actor(
+                    "fragment supervisor appeared after runtime task shutdown".to_string(),
+                ));
+            }
+            // Persist this transition before sending the first stop signal. A
+            // cancelled caller can then resume joins without asking a stopped
+            // supervisor to prove durability again.
+            *progress = ShutdownProgress::StoppingFragments;
         }
-        let retiring_senders = self.retiring_senders.snapshot();
-        for sender in retiring_senders {
-            sender.stop().await;
+
+        if *progress == ShutdownProgress::StoppingFragments {
+            let supervisors = self.supervisor_stops.snapshot();
+            for (_, entry) in &supervisors {
+                if matches!(&*entry.startup.borrow(), SupervisorStartupState::Ready) {
+                    entry.actor.stop(None);
+                }
+            }
+            for (_, entry) in supervisors {
+                if matches!(&*entry.startup.borrow(), SupervisorStartupState::Ready) {
+                    let _ = entry.actor.wait(None).await;
+                }
+            }
+            self.supervisors.lock().await.clear();
+            self.supervisor_stops.clear();
+            self.operation_gate.finish_shutdown();
+            *progress = ShutdownProgress::Stopped;
         }
-        self.retiring_senders.clear();
-        // Two-phase and retry-safe: signal every active/retiring supervisor
-        // before awaiting any one of them. `wait` remains valid after a prior
-        // stop or a cancelled earlier shutdown waiter.
-        let supervisors = self.supervisor_stops.snapshot();
-        for supervisor in &supervisors {
-            supervisor.stop(None);
-        }
-        for supervisor in supervisors {
-            let _ = supervisor.wait(None).await;
-        }
-        self.supervisor_stops.clear();
-        *stopped = true;
+        Ok(())
     }
 
     /// Health snapshots for every fragment this node serves.
     pub async fn health(&self) -> Result<HashMap<FragmentId, FragmentHealth>, NodeError> {
+        let _operation = self.admit_operation()?;
         let supervisors: Vec<(FragmentId, ActorRef<SupervisorMessage>)> = self
             .supervisors
             .lock()
@@ -4126,8 +4560,6 @@ async fn gain_fragment(deps: &PlacementDriverDeps, fragment: FragmentId, preload
                 return;
             }
         };
-        let mut startup_supervisor = SupervisorStartupGuard::new(1);
-        startup_supervisor.push(supervisor.clone());
         deps.supervisors
             .lock()
             .await
@@ -4141,7 +4573,7 @@ async fn gain_fragment(deps: &PlacementDriverDeps, fragment: FragmentId, preload
                     &tasks,
                     fragment,
                     generation,
-                    supervisor,
+                    supervisor.clone(),
                     deps.router.clone(),
                     dispatcher,
                 )
@@ -4152,12 +4584,33 @@ async fn gain_fragment(deps: &PlacementDriverDeps, fragment: FragmentId, preload
         if !monitor_registered {
             deps.router.remove_if_generation(fragment, generation);
             deps.supervisors.lock().await.remove(&fragment);
-            startup_supervisor.rollback().await;
-            deps.supervisor_stops.remove(fragment);
-            deps.placement_states.lock().await.remove(&fragment);
+            deps.placement_states
+                .lock()
+                .await
+                .insert(fragment, FragmentPlacementState::Draining);
+            match quiesce_fragment_supervisor(&supervisor).await {
+                Ok(()) if deps.supervisor_stops.mark_prepared(fragment, &supervisor) => {
+                    supervisor.stop(None);
+                    let _ = supervisor.wait(None).await;
+                    deps.supervisor_stops.remove_if(fragment, &supervisor);
+                    deps.placement_states.lock().await.remove(&fragment);
+                }
+                Ok(()) => {
+                    tracing::error!(
+                        fragment = fragment.0,
+                        "startup rollback lost exact supervisor ownership"
+                    );
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        fragment = fragment.0,
+                        %error,
+                        "startup rollback retained a fragment with an incomplete final flush"
+                    );
+                }
+            }
             return;
         }
-        startup_supervisor.disarm();
     }
 
     if converge_fragment_gain(deps, fragment).await {
@@ -4367,12 +4820,30 @@ async fn lose_fragment(deps: &PlacementDriverDeps, fragment: FragmentId) {
             // wait. A queued ensure call cannot acquire `senders` until after
             // the router is absent, and an inbound mutation cannot acquire its
             // shared lease until after the same point.
-            let supervisor = deps.supervisors.lock().await.remove(&fragment);
-            if let Some(supervisor) = &supervisor {
-                // The synchronous registry retains join ownership if this
-                // transition is cancelled after the stop signal.
-                supervisor.stop(None);
+            let mut active_supervisors = deps.supervisors.lock().await;
+            let active_supervisor = active_supervisors.get(&fragment).cloned();
+            let registered_supervisor = deps.supervisor_stops.get(fragment);
+            let ownership_matches = match (&active_supervisor, &registered_supervisor) {
+                (Some(active), Some(registered)) => active.get_id() == registered.actor.get_id(),
+                _ => false,
+            };
+            if !ownership_matches {
+                drop(active_supervisors);
+                drop(reports);
+                drop(senders);
+                drop(mutation_commit);
+                drop(states);
+                tracing::error!(
+                    fragment = fragment.0,
+                    "refusing to destroy fragment without exact supervisor ownership"
+                );
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
             }
+            let supervisor = active_supervisors
+                .remove(&fragment)
+                .expect("ownership checked above");
+            drop(active_supervisors);
             deps.router.remove(fragment);
             drop(reports);
             drop(senders);
@@ -4382,9 +4853,46 @@ async fn lose_fragment(deps: &PlacementDriverDeps, fragment: FragmentId) {
             for sender in retiring_senders {
                 sender.join().await;
             }
-            if let Some(supervisor) = supervisor {
-                let _ = supervisor.wait(None).await;
-                deps.supervisor_stops.remove(fragment);
+
+            // The router is now irreversibly detached, but the registry keeps
+            // the quiesced cache and retryable persistence batch alive. A
+            // store outage leaves placement visibly Draining; a re-add waits
+            // for this teardown to finish and starts a fresh, durable subtree.
+            let mut next_flush_warning = std::time::Instant::now();
+            loop {
+                match quiesce_fragment_supervisor(&supervisor).await {
+                    Ok(()) => {
+                        if deps.supervisor_stops.mark_prepared(fragment, &supervisor) {
+                            break;
+                        }
+                        tracing::error!(
+                            fragment = fragment.0,
+                            "fragment quiesced but supervisor ownership changed"
+                        );
+                        return;
+                    }
+                    Err(error) => {
+                        if std::time::Instant::now() >= next_flush_warning {
+                            tracing::warn!(
+                                fragment = fragment.0,
+                                %error,
+                                "fragment remains Draining while its final local flush is incomplete"
+                            );
+                            next_flush_warning =
+                                std::time::Instant::now() + deps.drain_warn_interval;
+                        }
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                }
+            }
+            supervisor.stop(None);
+            let _ = supervisor.wait(None).await;
+            if !deps.supervisor_stops.remove_if(fragment, &supervisor) {
+                tracing::error!(
+                    fragment = fragment.0,
+                    "fragment stopped but exact supervisor ownership was lost"
+                );
+                return;
             }
             deps.placement_states
                 .lock()
@@ -7165,6 +7673,37 @@ mod tests {
     use super::*;
     use crate::proto::{ReconcileRequest, SessionStart};
     use crate::replication::spawn_sender_with_options;
+    use crate::store::StoreError;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Condvar;
+
+    #[derive(Default)]
+    struct BlockingLoadStore {
+        entered: AtomicBool,
+        release: (StdMutex<bool>, Condvar),
+    }
+
+    impl BlockingLoadStore {
+        fn release(&self) {
+            *self.release.0.lock().unwrap() = true;
+            self.release.1.notify_all();
+        }
+    }
+
+    impl KvStore for BlockingLoadStore {
+        fn load(&self) -> Result<Vec<(Vec<u8>, VersionedValue)>, StoreError> {
+            self.entered.store(true, Ordering::SeqCst);
+            let mut released = self.release.0.lock().unwrap();
+            while !*released {
+                released = self.release.1.wait(released).unwrap();
+            }
+            Ok(Vec::new())
+        }
+
+        fn write_batch(&self, _writes: &[(Vec<u8>, VersionedValue)]) -> Result<(), StoreError> {
+            Ok(())
+        }
+    }
 
     struct BlockingPageActor;
 
@@ -7244,6 +7783,9 @@ mod tests {
                         shed_counts: (0, 0, 0),
                     });
                 }
+                SupervisorMessage::Quiesce { reply } => {
+                    let _ = reply.send(Ok(()));
+                }
             }
             Ok(())
         }
@@ -7310,6 +7852,12 @@ mod tests {
         senders: SenderMap,
         sender_reports: SenderReportMap,
     ) -> PlacementDriverDeps {
+        let supervisor_stops = Arc::new(SupervisorRegistry::new(1));
+        if let Ok(active) = supervisors.try_lock() {
+            for (fragment, supervisor) in active.iter() {
+                supervisor_stops.insert_ready(*fragment, supervisor.clone());
+            }
+        }
         PlacementDriverDeps {
             node_id: "node-a".to_string(),
             controller: Arc::new(crate::placement::StaticPlacement::new(HashMap::new())),
@@ -7321,7 +7869,7 @@ mod tests {
             serving,
             placement,
             supervisors,
-            supervisor_stops: Arc::new(SupervisorRegistry::new(1)),
+            supervisor_stops,
             placement_states: Arc::new(Mutex::new(HashMap::from([(
                 FragmentId(0),
                 FragmentPlacementState::Draining,
@@ -7443,6 +7991,75 @@ mod tests {
         })
         .await
         .expect("timed out waiting for test protocol frame")
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn cancelled_subtree_start_remains_registered_until_startup_completes() {
+        let store = Arc::new(BlockingLoadStore::default());
+        let registry = Arc::new(SupervisorRegistry::new(1));
+        let mut config = NodeConfig::default();
+        config.store = Some(store.clone());
+        config.flush_batch_size = usize::MAX;
+        config.flush_interval = Duration::from_secs(3600);
+        config.snapshot_interval = Duration::from_secs(3600);
+        config.clean_interval = Duration::from_secs(3600);
+        let hlc = Arc::new(Mutex::new(HlcClock::new()));
+        let spawn_registry = registry.clone();
+        let spawn_hlc = hlc.clone();
+        let spawn = tokio::spawn(async move {
+            spawn_fragment_subtree_registered(
+                "cancelled-start",
+                FragmentId(0),
+                &config,
+                &spawn_hlc,
+                &spawn_registry,
+            )
+            .await
+        });
+
+        let entered = tokio::time::timeout(Duration::from_secs(5), async {
+            while !store.entered.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        if entered.is_err() {
+            store.release();
+            let _ = spawn.await;
+            panic!("fragment startup never entered the store load");
+        }
+
+        let Some((fragment, entry)) = registry.snapshot().into_iter().next() else {
+            store.release();
+            let _ = spawn.await;
+            panic!("starting supervisor was not synchronously registered");
+        };
+        let was_starting = matches!(&*entry.startup.borrow(), SupervisorStartupState::Starting);
+        spawn.abort();
+        let spawn_cancelled = spawn.await.unwrap_err().is_cancelled();
+
+        let startup = tokio::spawn(wait_for_supervisor_startup(entry.startup.clone()));
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        let wait_blocked = !startup.is_finished();
+        store.release();
+        let startup_state = tokio::time::timeout(Duration::from_secs(5), startup)
+            .await
+            .expect("startup observer did not finish")
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(fragment, FragmentId(0));
+        assert!(was_starting);
+        assert!(spawn_cancelled);
+        assert!(wait_blocked, "shutdown would not have waited for startup");
+        assert!(matches!(startup_state, SupervisorStartupState::Ready));
+
+        quiesce_fragment_supervisor(&entry.actor).await.unwrap();
+        assert!(registry.mark_prepared(fragment, &entry.actor));
+        entry.actor.stop(None);
+        let _ = entry.actor.wait(None).await;
+        assert!(registry.remove_if(fragment, &entry.actor));
+        assert!(registry.snapshot().is_empty());
     }
 
     #[test]
@@ -7799,7 +8416,7 @@ mod tests {
             .get("dispatcher")
             .map_or(false, |restarts| *restarts >= 2));
 
-        node.shutdown().await;
+        node.shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -8982,7 +9599,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn completed_teardown_without_registered_supervisor_marks_stopped() {
+    async fn teardown_without_registered_supervisor_stays_draining() {
         let fragment = FragmentId(0);
         let router = FragmentRouter::new(1, 0);
         let config = NodeConfig::default();
@@ -9007,15 +9624,18 @@ mod tests {
             Arc::new(Mutex::new(HashMap::new())),
         );
 
-        tokio::time::timeout(Duration::from_secs(1), lose_fragment(&deps, fragment))
-            .await
-            .expect("drained fragment teardown did not complete");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), lose_fragment(&deps, fragment))
+                .await
+                .is_err(),
+            "teardown claimed completion without lifecycle ownership"
+        );
         assert!(!serving.read().unwrap().contains(&fragment));
-        assert!(router.route_for_fragment(fragment).is_none());
+        assert!(router.route_for_fragment(fragment).is_some());
         assert!(supervisors.lock().await.is_empty());
         assert_eq!(
             deps.placement_states.lock().await.get(&fragment),
-            Some(&FragmentPlacementState::Stopped)
+            Some(&FragmentPlacementState::Draining)
         );
         let _ = supervisor.stop_and_wait(None, None).await;
     }

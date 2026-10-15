@@ -139,13 +139,15 @@ one another's empty state.
    is no destructive timeout: warnings repeat at
    `placement_drain_warn_interval`, and a placement reversal restores
    `Serving` instead of allowing stale teardown.
-4. Under the placement commit lock, revalidate the authoritative map and the
-   exact sender/report set, take the exclusive mutation lease (including
-   inbound replication), synchronously request sender stop, and detach the
-   router before any teardown wait. Then await sender exit and stop the
-   supervisor subtree (the dispatcher flushes). A re-add before this commit
-   restores the existing subtree; one after it waits for `Stopped` and performs
-   a clean bootstrap. State becomes `Stopped`.
+4. Under the placement commit lock, revalidate the authoritative map, exact
+   sender/report set, mutation lease, and registered supervisor ownership.
+   Detach the router and active supervisor index before any teardown wait, but
+   retain the supervisor in the lifecycle registry. After sender exit, quiesce
+   periodic actors, drain dispatcher/worker mailboxes, and require the final
+   local flush. A failure leaves the retained subtree `Draining` and retries
+   without admitting local work. A re-add before detach restores the existing
+   subtree; one after detach waits for durable `Stopped` and performs a clean
+   bootstrap. Only a successful flush publishes `Stopped`.
 
 **Overlap-window safety.** While peers' maps transiently disagree, a node that
 receives an op for a fragment it no longer serves **re-forwards** it

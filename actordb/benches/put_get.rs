@@ -102,7 +102,7 @@ fn bench_put_get(c: &mut Criterion) {
     }
     group.finish();
 
-    rt.block_on(node.shutdown());
+    rt.block_on(node.shutdown()).unwrap();
 }
 
 criterion_group!(benches, bench_put_get);
