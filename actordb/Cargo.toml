@@ -45,7 +45,7 @@ prost-types = { version = "0.14" }
 ractor = { version = "0.16" }
 rocksdb = { version = "0.25", optional = true }
 seahash = { version = "4" }
-sha2 = { version = "0.10" }
+sha2 = { version = "0.11" }
 tokio = { version = "1", features = ["sync", "time", "net", "io-util"] }
 tracing = "0.1"
 # Optional dependencies
