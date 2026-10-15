@@ -51,7 +51,10 @@ value to reappear.
 For that reason `Node::start` rejects every
 `tombstone_gc_age: Some(..)` configuration before binding its listener or
 spawning actors. Safe reclamation needs durable per-replica convergence
-evidence plus deletion support in the storage layer; neither exists yet.
+evidence scoped to each key; those persisted watermarks do not exist yet.
+Dynamic placement's whole-fragment prefix retirement is different: it has a
+closed replica set, exact full-state handoff, and quiesced namespace, so it
+does not authorize arbitrary tombstone collection.
 The field remains temporarily for source compatibility and must be `None`.
 The public `FragmentState::gc_tombstones` method likewise remains as a
 source-compatible no-op that retains every tombstone and returns zero.

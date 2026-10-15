@@ -73,7 +73,9 @@ the level it actually achieved:
 requires the configured `KvStore` to accept a flush. `StoreCommitted` is not
 an fsync guarantee independent of backend policy: offered RocksDB defaults to
 `SyncWal`, while explicit `AsyncWal` acknowledges after a non-synchronous WAL
-append. The sender retires the batch only if the reported level is sufficient.
+append. `StableCommitted` adds the backend's explicit stable fence; RocksDB
+forces its WAL synchronously at that boundary. The sender retires each batch
+only if its own reported requirement is satisfied.
 Apply failure, or a configured-store flush failure, sends a NACK and the exact
 stamped batch is retried.
 

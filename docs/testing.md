@@ -18,6 +18,8 @@ UTF-8/fragment-hash/wire-budget validation, bounded prefix reads, direct-write
 validation, and synchronous isolated/idempotent range deletion. Node lifecycle
 tests abort startup inside a gated store load and prove the lease remains
 fail-closed, while a fully joined failed startup releases it for retry.
+Stable-fence tests distinguish ordinary buffered commits from the explicit
+backend fence and verify that RocksDB can force its WAL under `AsyncWal`.
 
 Protocol-v3 pagination tests cover lexicographically ordered/exclusive summary
 cursors (including the empty-string key), revision-drift detection, zero-limit
@@ -141,8 +143,12 @@ process — the bulk of behavioral coverage:
   through reconciliation with the retired sync counter still zero),
   `placement_bootstrap_fetch_requires_verification_round`,
   `placement_drain_waits_for_buffer_reset`, and
-  `placement_readd_while_draining_cancels_teardown`, and
-  `placement_readd_waits_for_failed_final_flush_and_reloads`.
+  `placement_readd_while_draining_cancels_teardown`,
+  `placement_readd_waits_for_failed_final_flush_and_reloads`,
+  `placement_retires_rocksdb_prefix_after_stable_handoff`, and
+  `placement_prefix_delete_failure_retries_before_stopped`. Replication unit
+  coverage also proves a `StoreCommitted` ACK cannot retire a privately
+  strengthened `StableCommitted` drain barrier.
 
 Shared helpers (`wait_for` poll-until-timeout) live in
 `actordb/tests/common/mod.rs`.

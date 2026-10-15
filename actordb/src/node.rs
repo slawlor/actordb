@@ -12,7 +12,8 @@
 //! Receivers report the durability they achieved after every operation is
 //! accounted for and any requested flush is attempted: `MemoryApplied` after
 //! cache application, or `StoreCommitted` after a configured store accepts the
-//! flush. Senders retire only ACKs that meet their requested level.
+//! flush, or `StableCommitted` after its explicit stable-storage fence. Senders
+//! retire only ACKs that meet each batch's requested level.
 //! Periodic anti-entropy repairs residual divergence.
 //!
 //! `seq` and the per-process `boot_id` are carried as propagation metadata.
@@ -63,7 +64,9 @@ use crate::replication::{
 };
 use crate::runtime_tasks::RuntimeTasks;
 use crate::shard::{fragment_of, FragmentId};
-use crate::store::{KvStore, PrefixedStore, StoreBinding, StoreIdentity};
+use crate::store::{
+    KvStore, PrefixDeleteOutcome, PrefixDeleteSupport, PrefixedStore, StoreBinding, StoreIdentity,
+};
 use crate::supervision::{
     FragmentHealth, FragmentShutdownError, FragmentStartupStorageError, FragmentSupervisor,
     SupervisorArgs, SupervisorMessage,
@@ -94,13 +97,17 @@ pub const CAPABILITY_PAGED_ANTI_ENTROPY: u64 = 1 << 4;
 /// Aggregate batch requests and replies are exact-byte-bounded. Batch-get
 /// replies may contain an ordered prefix that the caller resumes explicitly.
 pub const CAPABILITY_BYTE_BOUNDED_BATCHES: u64 = 1 << 5;
+/// Replication ACKs can report an explicit stable-storage fence independently
+/// of ordinary store-commit policy.
+pub const CAPABILITY_STABLE_DURABILITY_ACKS: u64 = 1 << 6;
 /// Capabilities required by this binary before it installs a peer connection.
 pub const REQUIRED_WIRE_CAPABILITIES: u64 = CAPABILITY_MUTATION_RESULTS
     | CAPABILITY_DURABILITY_ACKS
     | CAPABILITY_CORRELATED_RECONCILIATION
     | CAPABILITY_CHALLENGE_AUTH
     | CAPABILITY_PAGED_ANTI_ENTROPY
-    | CAPABILITY_BYTE_BOUNDED_BATCHES;
+    | CAPABILITY_BYTE_BOUNDED_BATCHES
+    | CAPABILITY_STABLE_DURABILITY_ACKS;
 
 /// Outbound queue depth per peer connection.
 const PEER_CHANNEL_DEPTH: usize = 256;
@@ -994,12 +1001,21 @@ async fn call_apply(
     }
 }
 
-async fn flush_fence(actor: &ActorRef<KvMessage>) -> Result<ApplyDurability, NodeError> {
-    match actor
-        .call(|reply| KvMessage::Flush { reply }, None)
-        .await
-        .map_err(|error| NodeError::Actor(error.to_string()))?
-    {
+async fn flush_fence(
+    actor: &ActorRef<KvMessage>,
+    required: ReplicationAckDurability,
+) -> Result<ApplyDurability, NodeError> {
+    let result = match required {
+        ReplicationAckDurability::StableCommitted => {
+            actor
+                .call(|reply| KvMessage::FlushStable { reply }, None)
+                .await
+        }
+        ReplicationAckDurability::MemoryApplied | ReplicationAckDurability::StoreCommitted => {
+            actor.call(|reply| KvMessage::Flush { reply }, None).await
+        }
+    };
+    match result.map_err(|error| NodeError::Actor(error.to_string()))? {
         CallResult::Success(Ok(durability)) => Ok(durability),
         CallResult::Success(Err(ApplyError::Storage(error))) => Err(NodeError::Storage(error)),
         CallResult::Success(Err(ApplyError::Backpressure)) => Err(NodeError::Actor(
@@ -4675,7 +4691,8 @@ impl Node {
     /// reported fragment/peer, the receiver acknowledged the fenced winner or
     /// a newer winner. It is not a global cache-equality, quorum, or fsync
     /// guarantee. `MemoryApplied` remains volatile; `StoreCommitted` means the
-    /// receiver store accepted its flush according to that store's contract.
+    /// receiver store accepted its ordinary flush, while `StableCommitted`
+    /// additionally invokes its explicit stable-storage fence.
     ///
     /// The single timeout covers placement freeze, admitted-mutation drain,
     /// sender preparation, reconnect/reconciliation, and remote durability.
@@ -5456,9 +5473,424 @@ async fn restore_fragment_if_readded(deps: &PlacementDriverDeps, fragment: Fragm
     restored
 }
 
+struct FragmentHandoffDrain {
+    peer: String,
+    sender: NodeSender,
+    drain: NodeSenderDrain,
+}
+
+fn fragment_placement_snapshot(
+    deps: &PlacementDriverDeps,
+    fragment: FragmentId,
+) -> (HashMap<FragmentId, Vec<String>>, Vec<String>, u64) {
+    let desired = deps.placement.read().unwrap().clone();
+    let replicas = desired.get(&fragment).cloned().unwrap_or_default();
+    let generation = deps.placement_generation.load(Ordering::Acquire);
+    (desired, replicas, generation)
+}
+
+fn fragment_placement_matches(
+    deps: &PlacementDriverDeps,
+    fragment: FragmentId,
+    expected_replicas: &[String],
+    expected_generation: u64,
+) -> bool {
+    deps.placement
+        .read()
+        .unwrap()
+        .get(&fragment)
+        .is_some_and(|replicas| replicas == expected_replicas)
+        && deps.placement_generation.load(Ordering::Acquire) == expected_generation
+}
+
+async fn routed_fragment_revision(
+    deps: &PlacementDriverDeps,
+    fragment: FragmentId,
+) -> Result<u64, String> {
+    let actor = deps
+        .router
+        .route_for_fragment(fragment)
+        .ok_or_else(|| "fragment route is absent".to_string())?;
+    match actor
+        .call(|reply| KvMessage::GetRevision { reply }, None)
+        .await
+        .map_err(|error| error.to_string())?
+    {
+        CallResult::Success(revision) => Ok(revision),
+        CallResult::Timeout => Err("fragment revision query timed out".to_string()),
+        CallResult::SenderError => Err("fragment revision reply channel dropped".to_string()),
+    }
+}
+
+/// Remove and join every sender for one fragment. Placement handoff drains
+/// permanently seal sender ingress, so any retry or re-add must install fresh
+/// sender tasks before it can publish the fragment again.
+async fn retire_fragment_senders(deps: &PlacementDriverDeps, fragment: FragmentId) {
+    let retiring = {
+        let mut senders = deps.senders.lock().await;
+        let mut reports = deps.sender_reports.lock().await;
+        let keys: Vec<(FragmentId, String)> = senders
+            .keys()
+            .filter(|(sender_fragment, _)| *sender_fragment == fragment)
+            .cloned()
+            .collect();
+        let mut retiring = Vec::with_capacity(keys.len());
+        for key in keys {
+            if let Some(sender) = senders.remove(&key) {
+                retiring.push(deps.retiring_senders.retire(sender));
+            }
+            reports.remove(&key);
+        }
+        retiring
+    };
+    for sender in retiring {
+        sender.join().await;
+    }
+}
+
+async fn restore_fragment_after_handoff_cancelled(
+    deps: &PlacementDriverDeps,
+    fragment: FragmentId,
+) -> bool {
+    retire_fragment_senders(deps, fragment).await;
+    restore_fragment_if_readded(deps, fragment).await
+}
+
+async fn finish_fragment_prefix_retirement(
+    deps: &PlacementDriverDeps,
+    fragment: FragmentId,
+    supervisor: ActorRef<SupervisorMessage>,
+    expected_replicas: Vec<String>,
+    expected_generation: u64,
+) {
+    // The router is irreversibly detached, but the registry keeps the
+    // quiesced cache and retryable persistence batch alive. Flush before
+    // deletion so no later actor write can recreate the retired namespace.
+    let mut next_flush_warning = std::time::Instant::now();
+    loop {
+        match quiesce_fragment_supervisor(&supervisor).await {
+            Ok(()) => {
+                if deps.supervisor_stops.mark_prepared(fragment, &supervisor) {
+                    break;
+                }
+                tracing::error!(
+                    fragment = fragment.0,
+                    "fragment quiesced but supervisor ownership changed"
+                );
+                return;
+            }
+            Err(error) => {
+                if std::time::Instant::now() >= next_flush_warning {
+                    tracing::warn!(
+                        fragment = fragment.0,
+                        %error,
+                        "fragment remains Draining while its final local flush is incomplete"
+                    );
+                    next_flush_warning = std::time::Instant::now() + deps.drain_warn_interval;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+    }
+
+    let base_store = deps
+        .subtree_config
+        .store
+        .as_ref()
+        .expect("prefix retirement requires a configured store")
+        .clone();
+    let fragment_store = PrefixedStore::new(base_store, fragment);
+    let mut next_delete_warning = std::time::Instant::now();
+    loop {
+        // Placement publication uses this same mutex. Holding it through the
+        // synchronous, idempotent delete makes the final revoked-map check and
+        // namespace mutation one atomic lifecycle decision.
+        let states = deps.placement_states.lock().await;
+        if !fragment_placement_matches(deps, fragment, &expected_replicas, expected_generation) {
+            tracing::info!(
+                fragment = fragment.0,
+                "retaining quiesced fragment prefix because placement changed after handoff"
+            );
+            drop(states);
+            break;
+        }
+        match fragment_store.delete_prefix(&[]) {
+            Ok(PrefixDeleteOutcome::Deleted) => {
+                tracing::info!(fragment = fragment.0, "retired durable fragment prefix");
+                drop(states);
+                break;
+            }
+            Ok(PrefixDeleteOutcome::Retained) => {
+                tracing::info!(
+                    fragment = fragment.0,
+                    "store retained fragment prefix after retirement request"
+                );
+                drop(states);
+                break;
+            }
+            Err(error) => {
+                drop(states);
+                if std::time::Instant::now() >= next_delete_warning {
+                    tracing::warn!(
+                        fragment = fragment.0,
+                        %error,
+                        "fragment remains Draining while durable prefix deletion is incomplete"
+                    );
+                    next_delete_warning = std::time::Instant::now() + deps.drain_warn_interval;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+    }
+
+    supervisor.stop(None);
+    let _ = supervisor.wait(None).await;
+    if !deps.supervisor_stops.remove_if(fragment, &supervisor) {
+        tracing::error!(
+            fragment = fragment.0,
+            "fragment stopped but exact supervisor ownership was lost"
+        );
+        return;
+    }
+    deps.placement_states
+        .lock()
+        .await
+        .insert(fragment, FragmentPlacementState::Stopped);
+}
+
+async fn lose_fragment(deps: &PlacementDriverDeps, fragment: FragmentId) {
+    let prefix_delete_support = deps
+        .subtree_config
+        .store
+        .as_ref()
+        .map_or(PrefixDeleteSupport::Retained, |store| {
+            store.prefix_delete_support()
+        });
+    match prefix_delete_support {
+        PrefixDeleteSupport::Supported => {
+            lose_fragment_with_prefix_retirement(deps, fragment).await
+        }
+        PrefixDeleteSupport::Retained => lose_fragment_retaining_prefix(deps, fragment).await,
+    }
+}
+
+/// Retire a persisted fragment only after every replacement replica proves a
+/// stable LWW floor from one unchanged source revision. Placement changes,
+/// fetched winners, or sender replacement invalidate the attempt and rebuild
+/// its sealed sender set from scratch. TTL cleanup may independently
+/// materialize an equivalent tombstone after that revision pin.
+async fn lose_fragment_with_prefix_retirement(deps: &PlacementDriverDeps, fragment: FragmentId) {
+    let mutation_gate = deps.router.mutation_gate(fragment);
+    let mutation_revocation = mutation_gate.write_owned().await;
+    deps.serving.write().unwrap().remove(&fragment);
+    drop(mutation_revocation);
+
+    let mut next_warning = std::time::Instant::now() + deps.drain_warn_interval;
+    loop {
+        let (desired, replicas, generation) = fragment_placement_snapshot(deps, fragment);
+        if replicas.iter().any(|node| node == &deps.node_id) {
+            if restore_fragment_after_handoff_cancelled(deps, fragment).await {
+                return;
+            }
+            continue;
+        }
+        let targets: Vec<String> = replicas
+            .iter()
+            .filter(|peer| *peer != &deps.node_id)
+            .cloned()
+            .collect();
+        if targets.is_empty() {
+            if std::time::Instant::now() >= next_warning {
+                tracing::warn!(
+                    fragment = fragment.0,
+                    "fragment remains Draining because no replacement replica can certify handoff"
+                );
+                next_warning = std::time::Instant::now() + deps.drain_warn_interval;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            continue;
+        }
+
+        ensure_fragment_senders(deps, fragment, &desired).await;
+        let baseline_revision = match routed_fragment_revision(deps, fragment).await {
+            Ok(revision) => revision,
+            Err(error) => {
+                tracing::warn!(fragment = fragment.0, %error, "cannot read handoff baseline");
+                retire_fragment_senders(deps, fragment).await;
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+        };
+
+        let mut waiters = Vec::with_capacity(targets.len());
+        let mut prepare_failed = false;
+        {
+            let senders = deps.senders.lock().await;
+            for peer in &targets {
+                let Some(sender) = senders.get(&(fragment, peer.clone())).cloned() else {
+                    prepare_failed = true;
+                    break;
+                };
+                match sender.request_drain_at(ReplicationAckDurability::StableCommitted) {
+                    Ok(drain) => waiters.push(FragmentHandoffDrain {
+                        peer: peer.clone(),
+                        sender,
+                        drain,
+                    }),
+                    Err(_) => {
+                        prepare_failed = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if prepare_failed {
+            retire_fragment_senders(deps, fragment).await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            continue;
+        }
+
+        let certified = loop {
+            if !fragment_placement_matches(deps, fragment, &replicas, generation) {
+                break false;
+            }
+            if waiters.iter().all(|waiter| waiter.drain.is_complete()) {
+                break true;
+            }
+            if waiters
+                .iter()
+                .any(|waiter| waiter.drain.is_closed() || waiter.sender.is_closed())
+            {
+                break false;
+            }
+            if std::time::Instant::now() >= next_warning {
+                let pending: Vec<&str> = waiters
+                    .iter()
+                    .filter(|waiter| !waiter.drain.is_complete())
+                    .map(|waiter| waiter.peer.as_str())
+                    .collect();
+                tracing::warn!(
+                    fragment = fragment.0,
+                    ?pending,
+                    "fragment remains Draining while stable handoff is incomplete"
+                );
+                next_warning = std::time::Instant::now() + deps.drain_warn_interval;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+        if !certified {
+            if replicas.iter().any(|node| node == &deps.node_id)
+                && restore_fragment_after_handoff_cancelled(deps, fragment).await
+            {
+                return;
+            }
+            retire_fragment_senders(deps, fragment).await;
+            continue;
+        }
+
+        // Point-of-no-return commit. Block placement publication and inbound
+        // mutation, then retire the exact certified sender tasks. A revision
+        // query after their join fences any actor call already admitted by a
+        // cancelled reconcile task.
+        let states = deps.placement_states.lock().await;
+        if !fragment_placement_matches(deps, fragment, &replicas, generation) {
+            drop(states);
+            retire_fragment_senders(deps, fragment).await;
+            continue;
+        }
+        let mutation_commit = deps.router.mutation_gate(fragment).write_owned().await;
+        let mut senders = deps.senders.lock().await;
+        let mut reports = deps.sender_reports.lock().await;
+        let exact_senders = senders
+            .iter()
+            .filter(|((sender_fragment, _), _)| *sender_fragment == fragment)
+            .count()
+            == waiters.len()
+            && waiters.iter().all(|waiter| {
+                waiter.drain.is_complete()
+                    && senders
+                        .get(&(fragment, waiter.peer.clone()))
+                        .is_some_and(|sender| sender.same_task(&waiter.sender))
+                    && reports.contains_key(&(fragment, waiter.peer.clone()))
+            })
+            && reports
+                .keys()
+                .filter(|(report_fragment, _)| *report_fragment == fragment)
+                .count()
+                == waiters.len();
+        if !exact_senders {
+            drop(reports);
+            drop(senders);
+            drop(mutation_commit);
+            drop(states);
+            retire_fragment_senders(deps, fragment).await;
+            continue;
+        }
+
+        let mut retiring_senders = Vec::with_capacity(waiters.len());
+        for waiter in &waiters {
+            let key = (fragment, waiter.peer.clone());
+            if let Some(sender) = senders.remove(&key) {
+                retiring_senders.push(deps.retiring_senders.retire(sender));
+            }
+            reports.remove(&key);
+        }
+        for sender in retiring_senders {
+            sender.join().await;
+        }
+        let final_revision = routed_fragment_revision(deps, fragment).await;
+        if final_revision != Ok(baseline_revision) {
+            tracing::debug!(
+                fragment = fragment.0,
+                baseline_revision,
+                ?final_revision,
+                "fragment changed during handoff; retrying every replacement replica"
+            );
+            drop(reports);
+            drop(senders);
+            drop(mutation_commit);
+            drop(states);
+            continue;
+        }
+
+        let mut active_supervisors = deps.supervisors.lock().await;
+        let active_supervisor = active_supervisors.get(&fragment).cloned();
+        let registered_supervisor = deps.supervisor_stops.get(fragment);
+        let ownership_matches = match (&active_supervisor, &registered_supervisor) {
+            (Some(active), Some(registered)) => active.get_id() == registered.actor.get_id(),
+            _ => false,
+        };
+        if !ownership_matches {
+            drop(active_supervisors);
+            drop(reports);
+            drop(senders);
+            drop(mutation_commit);
+            drop(states);
+            tracing::error!(
+                fragment = fragment.0,
+                "refusing to destroy fragment without exact supervisor ownership"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            continue;
+        }
+        let supervisor = active_supervisors
+            .remove(&fragment)
+            .expect("ownership checked above");
+        deps.router.remove(fragment);
+        drop(active_supervisors);
+        drop(reports);
+        drop(senders);
+        drop(mutation_commit);
+        drop(states);
+
+        finish_fragment_prefix_retirement(deps, fragment, supervisor, replicas, generation).await;
+        return;
+    }
+}
+
 /// Lose a fragment: stop serving new local ops (they forward to the
 /// new owner), drain replication senders, then stop the subtree.
-async fn lose_fragment(deps: &PlacementDriverDeps, fragment: FragmentId) {
+async fn lose_fragment_retaining_prefix(deps: &PlacementDriverDeps, fragment: FragmentId) {
     // First wait for every mutation which already chose this owner to finish
     // both its local apply and sender fan-out. New mutations queue behind this
     // exclusive lease, observe `serving` removed, and forward to the new owner.
@@ -6461,6 +6893,9 @@ async fn handle_connection(
                         Ok(ReplicationAckLevel::StoreCommitted) => {
                             Some(ReplicationAckDurability::StoreCommitted)
                         }
+                        Ok(ReplicationAckLevel::StableCommitted) => {
+                            Some(ReplicationAckDurability::StableCommitted)
+                        }
                         Ok(ReplicationAckLevel::Unknown) | Err(_) => None,
                     }
                 } else {
@@ -6552,8 +6987,16 @@ async fn handle_connection(
                         (false, _) | (true, Some(ReplicationAckDurability::MemoryApplied)) => {
                             Some(ApplyDurability::MemoryApplied)
                         }
-                        (true, Some(ReplicationAckDurability::StoreCommitted)) => {
-                            match flush_fence(actor.as_ref().expect("validated actor")).await {
+                        (
+                            true,
+                            Some(
+                                required @ (ReplicationAckDurability::StoreCommitted
+                                | ReplicationAckDurability::StableCommitted),
+                            ),
+                        ) => {
+                            match flush_fence(actor.as_ref().expect("validated actor"), required)
+                                .await
+                            {
                                 Ok(durability) => Some(durability),
                                 Err(error) => {
                                     failure = Some(error.to_string());
@@ -6586,6 +7029,9 @@ async fn handle_connection(
                         let level = match durability.expect("successful durability fence") {
                             ApplyDurability::MemoryApplied => ReplicationAckLevel::Applied,
                             ApplyDurability::StoreCommitted => ReplicationAckLevel::StoreCommitted,
+                            ApplyDurability::StableCommitted => {
+                                ReplicationAckLevel::StableCommitted
+                            }
                         };
                         EnvelopeMsg::BatchAck(BatchAck {
                             session_id: b.session_id,
@@ -6621,6 +7067,9 @@ async fn handle_connection(
                         Ok(ReplicationAckLevel::Applied) => ReplicationAckDurability::MemoryApplied,
                         Ok(ReplicationAckLevel::StoreCommitted) => {
                             ReplicationAckDurability::StoreCommitted
+                        }
+                        Ok(ReplicationAckLevel::StableCommitted) => {
+                            ReplicationAckDurability::StableCommitted
                         }
                         Ok(ReplicationAckLevel::Unknown) | Err(_) => {
                             tracing::warn!(

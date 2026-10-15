@@ -53,7 +53,9 @@ ordinary store batch keeps the WAL enabled and synchronously flushes it through
 the operating-system buffer cache. Select `AsyncWal` with `with_durability` to
 keep WAL recovery while allowing acknowledged recent writes to be lost on an
 OS crash or power loss. Manifest creation and prefix deletion remain
-synchronous in either mode; there is no WAL-disabled committed mode.
+synchronous in either mode, and a requested `StableCommitted` fence calls
+`flush_wal(true)` even under `AsyncWal`; there is no WAL-disabled committed
+mode.
 
 RocksDB binds its first Node's id, `fragment_count`, data-format version, and
 partitioner version in a metadata column family. A mismatch or corrupt/future
@@ -110,7 +112,7 @@ lanes are still bounded by operation/message count.
 | `buffer_capacity` | `10_000` | Bound on both the Node sender's locally-applied-mutation ingress lane and its sender-owned deque. Either overflow advances a persistent `BufferReset` generation; a live sender rotates the session and starts correlated reconciliation without blocking the client write. Total retained operations also include bounded in-flight batches. This is an operation-count bound, not a byte bound. |
 | `consistency_interval` | `300 s` | Periodic anti-entropy reconcile cadence per sender. |
 | `reconcile_timeout` | `30 s` | Max wait after enqueueing each reconcile summary, data, or barrier phase. Timeout rotates the session and retries. This also governs reconciliation barrier ACKs; ordinary streaming ACKs use the runtime ACK timeout. |
-| `required_ack_durability` | `MemoryApplied` | Minimum receiver fence allowed to retire a batch. Set `StoreCommitted` only when every target has a configured store. It means store acceptance under each backend's policy: offered RocksDB defaults to `SyncWal`, while explicit `AsyncWal` is weaker. |
+| `required_ack_durability` | `MemoryApplied` | Minimum receiver fence allowed to retire an ordinary batch. `StoreCommitted` requires a configured store and means acceptance under its ordinary policy. `StableCommitted` additionally requires the backend's explicit stable fence; RocksDB synchronously flushes its WAL even when ordinary writes use `AsyncWal`. Dynamic prefix retirement privately requires `StableCommitted` regardless of this setting. |
 
 The batch size, in-flight limit, buffer capacity, intervals, and timeout must
 all be nonzero. Timer values must also be representable by Tokio's clock.
@@ -164,7 +166,7 @@ These are `const`s, documented here so they don't surprise you:
 
 | Constant | Value | Meaning |
 |---|---|---|
-| `WIRE_PROTOCOL_VERSION` | `3` | The current binary accepts only wire v3. V3 requires the paged-anti-entropy and byte-bounded-batches capabilities. The latter changes `BatchGetResponse` to ordered-prefix semantics, so binaries without it are rejected and upgrades must be coordinated. |
+| `WIRE_PROTOCOL_VERSION` | `3` | The current binary accepts only wire v3. V3 requires paged-anti-entropy, byte-bounded-batches, and stable-durability-ACK capabilities. Byte-bounded batches change `BatchGetResponse` to ordered-prefix semantics; stable durability ACKs gate destructive RocksDB prefix retirement. Binaries missing either contract are rejected, so upgrades must be coordinated. |
 | `MAX_FORWARD_HOPS` | `4` | Bounds re-forward chains during placement disagreement. |
 | `NACK_RETRY_DELAY` | `1 s` | Minimum delay before retrying a receiver-rejected replication batch. |
 | `BOOTSTRAP_TIMEOUT` | `30 s` | Max wait for one of the connected, already-serving source candidates to complete bootstrap. Timeout leaves the gained fragment non-authoritative and eligible for retry. |

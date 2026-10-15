@@ -12,7 +12,10 @@ pub trait KvStore: Send + Sync + 'static {
     fn load(&self) -> Result<Vec<(Vec<u8>, VersionedValue)>, StoreError>;
     fn load_prefix(&self, prefix: &[u8])
         -> Result<Vec<(Vec<u8>, VersionedValue)>, StoreError>;
+    fn commit_durability(&self) -> StoreCommitDurability;
+    fn stable_fence(&self) -> Result<StoreCommitDurability, StoreError>;
     fn write_batch(&self, writes: &[(Vec<u8>, VersionedValue)]) -> Result<(), StoreError>;
+    fn prefix_delete_support(&self) -> PrefixDeleteSupport;
     fn delete_prefix(&self, prefix: &[u8])
         -> Result<PrefixDeleteOutcome, StoreError>;
 }
@@ -36,6 +39,12 @@ The contract is deliberately narrow:
 - Writes are serialized per fragment and each batch contains at most one
   version per key. A failed or cancelled attempt can be retried, so custom
   stores must apply identical key/version writes idempotently.
+- `commit_durability` describes an ordinary successful batch as `Buffered` or
+  `Stable`. `stable_fence` runs after actor buffers flush and may strengthen
+  buffered writes; custom stores conservatively default to `Buffered`.
+- `prefix_delete_support` is a non-mutating lifecycle capability. Custom stores
+  default to `Retained`, so upgrading actordb never introduces an unexpected
+  destructive call. `Supported` opts into the deletion contract below.
 - `delete_prefix` is an idempotent, quiesced-writer namespace operation. The
   source-compatible custom-store default reports `Retained`; RocksDB commits a
   prefix range tombstone synchronously and reports `Deleted`.
@@ -88,10 +97,11 @@ let options = RocksDbOptions::default()
 let config = NodeConfig::with_rocksdb_options("./data/node-a", options)?;
 ```
 
-`AsyncWal` keeps the WAL enabled but does not synchronously flush it to stable
-media. There is deliberately no WAL-disabled mode advertised as committed.
-Manifest writes and prefix deletion are always synchronous regardless of this
-ordinary-batch setting.
+`AsyncWal` keeps the WAL enabled but does not synchronously flush ordinary
+batches to stable media. There is deliberately no WAL-disabled mode advertised
+as committed. `stable_fence` calls `flush_wal(true)`, so placement handoff can
+establish stable storage even when ordinary writes use `AsyncWal`. Manifest
+writes and prefix deletion are always synchronous regardless of this setting.
 
 ### RocksDB manifest and upgrades
 
@@ -179,7 +189,7 @@ The buffer is pushed to the store when:
 - a write arrives after `flush_interval` has elapsed (default 100 ms), or
 - the periodic **Snapshotter** ticks (every `snapshot_interval`, default 60 s), or
 - a tracked replication batch or reconciliation barrier requests a
-  `StoreCommitted` ACK.
+  `StoreCommitted` or `StableCommitted` ACK.
 
 `flush_interval` is write-triggered, not an independent timer. For an idle
 fragment, `snapshot_interval` is the upper bound before a periodic flush.
@@ -188,16 +198,14 @@ Expired values found during startup are rewritten as tombstones before that
 fragment starts serving, so a crash/restart cannot erase the version floor.
 
 An inbound tracked replication batch adds an explicit flush fence after all of
-its apply replies only when its sender requests `StoreCommitted`; the default
-`MemoryApplied` requirement leaves the normal batch/interval flush policy in
-effect. Untracked reconciliation repairs are memory-applied; their final
-barrier forces a flush only when it requests `StoreCommitted`. With a configured
-store, `BatchAck::STORE_COMMITTED` means
-`KvStore::write_batch` returned successfully for every update ordered before
-the fence. The wire level deliberately describes the store contract rather
-than an fsync bit. The offered RocksDB default is `SyncWal`; `AsyncWal` weakens
-that guarantee, so every replica in a deployment should use an intentional,
-uniform policy.
+its apply replies when its sender requests `StoreCommitted` or stronger; the
+default `MemoryApplied` requirement leaves the normal batch/interval policy in
+effect. Untracked reconciliation repairs are memory-applied and their final
+barrier supplies the requested fence. `STORE_COMMITTED` means
+`KvStore::write_batch` returned for every ordered update under the backend's
+ordinary policy. `STABLE_COMMITTED` additionally means `stable_fence` reported
+`Stable`; RocksDB forces its WAL synchronously at that boundary even under
+`AsyncWal`.
 
 Despite the name, the `Snapshotter` is **not** a RocksDB checkpoint — it is a
 periodic durable-flush actor (`SnapshotterMessage::Snap` → `shared.flush()`).
@@ -219,7 +227,9 @@ stable full reconciliation after the local mutation-admission cut and
 acknowledged `SenderConfig::required_ack_durability`. `MemoryApplied` still
 loses data if that receiver crashes. `StoreCommitted` means its `KvStore`
 accepted the flush; the offered RocksDB backend defaults to a synchronously
-flushed WAL, while `AsyncWal` is explicitly weaker. A timeout leaves the
+flushed WAL, while `AsyncWal` is explicitly weaker. `StableCommitted`
+additionally invokes the backend's stable fence; RocksDB forces its WAL at this
+boundary under either ordinary-write policy. A timeout leaves the
 origin's transport, senders, cache, and retryable persistence state alive;
 retry after peer/store recovery or explicitly fall back to local-only
 `shutdown`. If the peer fence succeeds but the origin's final store flush
@@ -254,9 +264,9 @@ explicitly widen the bound after investigating the data.
   time bound cannot prove durable replica convergence. Safe reclamation needs
   such evidence plus store deletion support (see
   [Tombstones & deletes](tombstones.md)).
-- **Prefix deletion is not yet a placement handoff certificate.** The offered
-  store has synchronous, idempotent prefix deletion, but dynamic placement does
-  not invoke it yet. Queue emptiness alone cannot prove that a newly added owner
-  received the old snapshot; automatic cleanup must first require a fresh,
-  exact reconciliation/durability fence. Until that lifecycle lands, revoked
-  RocksDB prefixes are safely retained.
+- **No orphan-prefix scan after a crash.** Dynamic placement deletes an opted-in
+  prefix only after its live transition obtains exact stable handoff evidence.
+  A crash before that delete safely leaves the namespace behind, but startup
+  does not persist or reconstruct the lost certificate and therefore does not
+  scan/delete unassigned prefixes. Re-adding the fragment loads the retained
+  data and reconciles it normally.

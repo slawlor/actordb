@@ -105,19 +105,26 @@ actually achieved in
   have flushed it yet;
 - `STORE_COMMITTED`: the configured `KvStore` accepted the flush. This is not
   an fsync guarantee independent of the store policy. Offered RocksDB defaults
-  to a synchronous WAL; explicit `AsyncWal` is weaker.
+  to a synchronous WAL; explicit `AsyncWal` is weaker;
+- `STABLE_COMMITTED`: after flushing actor buffers, the receiver's store
+  completed its explicit stable-storage fence. RocksDB implements this with
+  `flush_wal(true)`, including when ordinary writes use `AsyncWal`.
 
 The default `MemoryApplied` requirement therefore does not force one backend
-write per network batch. A `StoreCommitted` requirement forces a fragment
-flush; a storeless receiver can report only `APPLIED`, which is visible as a
-durability mismatch and cannot retire that batch.
+write per network batch. `StoreCommitted` forces a fragment flush, while
+`StableCommitted` additionally forces the backend fence. A storeless receiver
+can report only `APPLIED`; a custom store without a stable fence can report at
+most `STORE_COMMITTED`. Either weak result is visible as a durability mismatch
+and cannot retire a stronger batch.
 
 Reconciliation repairs use untracked batches followed by one tracked empty
 barrier. If any untracked apply fails, the receiver poisons that
 `(peer, fragment, session)` and NACKs the barrier instead of falsely certifying
 the successfully applied prefix. The sender then rotates the session and
-retries. The barrier requests `StoreCommitted` only when configured; a
-`MemoryApplied` reconciliation does not force a store flush.
+retries. The barrier requests the configured level; a `MemoryApplied`
+reconciliation does not force a store flush, and placement retirement can
+privately strengthen its barrier to `StableCommitted` without changing
+ordinary batch policy.
 
 The sender removes the matching `InflightBatch` only when the reported level meets
 `required_ack_durability`. Unknown/omitted levels and stale sessions are
@@ -144,16 +151,19 @@ provides no confidentiality or post-handshake frame integrity. Without a
 secret, `HelloAuth` is empty and provides sequencing/freshness for connection
 election, not authentication. Missing challenge fields, the retired v1 Hello
 tag, and incompatible ranges/capabilities fail closed. The current binary
-supports only wire v3 and requires both paged-anti-entropy and
-byte-bounded-batches capabilities. The latter makes `BatchGetResponse` an
-expected-peer-correlated ordered prefix with explicit suffix pulls; peers without those
-semantics are rejected. V3 is
+supports only wire v3 and requires paged-anti-entropy, byte-bounded-batches,
+and stable-durability-ACK capabilities. Byte-bounded batches make
+`BatchGetResponse` an expected-peer-correlated ordered prefix with explicit
+suffix pulls. Stable durability ACKs let placement prove the backend fence
+before destructive RocksDB prefix retirement. Peers missing either contract
+are rejected. V3 is
 wire-incompatible with v2, so upgrades require mutually compatible binaries
 rather than a mixed v2/v3 rolling deployment. It is also a Rust source break
 for advanced users of the public generated `actordb::proto` types:
 `ReconcileRequest`, `ReconcileResponse`, and `ReconcileData` gained pagination
-and snapshot-correlation fields, so struct literals and protocol assumptions
-must change with the coordinated deployment.
+and snapshot-correlation fields, and `ReplicationAckLevel` gained
+`StableCommitted`. Struct literals, exhaustive matches, and protocol
+assumptions must change with the coordinated deployment.
 
 Every ordinary streaming batch receives an ACK deadline after its frame enters
 the peer queue (30 seconds by default). If any ordinary batch expires, the
@@ -233,10 +243,10 @@ required single-record envelope or their provenance node id is empty or exceeds
 255 UTF-8 bytes. Repair or remove such records offline before restarting.
 
 When a requester with a configured store fetches winners under a
-`StoreCommitted` policy, it also flushes those local applies before sending the
-barrier; a failed flush obligation survives into a no-fetch retry. A storeless
-requester remains memory-only—the policy still describes the durability a
-remote batch receiver must report.
+`StoreCommitted` or stronger policy, it also flushes those local applies before
+sending the barrier; a failed flush obligation survives into a no-fetch retry.
+A storeless requester remains memory-only—the policy still describes the
+durability a remote batch receiver must report.
 
 Rounds run periodically only while streaming. `ReconcileNow` (used by dynamic
 placement bootstrap) is retained across a connection race and local failures
@@ -250,6 +260,19 @@ timeout; it does not tear down the multiplexed connection needed by the reverse
 bootstrap or unrelated fragments.
 Placement drain likewise treats `BufferReset` as active work even when its
 ordinary buffer and in-flight counts are zero.
+
+Dynamic placement uses the same drain machinery for destructive namespace
+retirement, but with stricter commit rules. A store must explicitly advertise
+prefix-delete support. The old owner seals a sender to every exact replacement
+replica and privately requires `StableCommitted` from each. All drains must
+cover one unchanged local revision; a fetched winner restarts the complete set.
+The placement replica vector and generation are revalidated before router
+detach and again before deletion. Re-addition replaces the sealed senders and
+bootstraps normally. After detach, the source quiesces every actor, completes
+its final flush, and retries idempotent prefix deletion while remaining
+`Draining`; only `Deleted` or `Retained` permits `Stopped`. This certifies the
+source's LWW winners and TTL metadata at the revision pin, not byte-for-byte
+cache equality after independent expiry cleanup.
 
 ## Replication-drained node shutdown
 
@@ -282,10 +305,10 @@ is the explicit local-only escape. Socket response delivery is outside the
 barrier, so a client may need to retry an operation whose response was lost
 after its mutation became durable.
 
-Tombstones are retained: `Node::start` rejects time-based GC because neither a
-quiet sender nor an elapsed age proves that every current and future replica
-has durably observed the deletion. Safe reclamation requires durable
-convergence watermarks and durable store deletion, which are not implemented.
+Per-key tombstones are retained: `Node::start` rejects time-based GC because
+neither a quiet sender nor elapsed age proves that every current and future
+replica has durably observed the deletion. Whole-fragment prefix retirement has
+an exact closed replica set; it does not make arbitrary tombstone GC safe.
 
 ## The Hello handshake and unified catch-up
 

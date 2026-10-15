@@ -292,9 +292,11 @@ and require explicit one-time legacy adoption; see
   pinned-time, revision-aware anti-entropy reads without cloning whole
   fragments or arbitrary fetch chunks; existing `GetAll` and `GetSnapshot`
   remain available for compatibility and debugging.
-- `KvMessage::{ApplyOp, Flush, Get, GetAll, GetSnapshot, GetSummaryPage,
-  GetVersioned, GetVersionedPage, GetShedCounts}` — for embedders driving the
-  dispatcher directly instead of through `Node`.
+- `KvMessage::{ApplyOp, Flush, FlushStable, Get, GetAll, GetSnapshot,
+  GetSummaryPage, GetVersioned, GetVersionedPage, GetRevision, GetShedCounts}`
+  — for embedders driving the dispatcher directly instead of through `Node`.
+  `FlushStable` requests the backend's explicit stable fence and reports
+  `ApplyDurability::StableCommitted` only when that fence succeeds.
 
 #### Traffic isolation + backpressure (Phase 7)
 
@@ -494,9 +496,11 @@ as issues in the [issue tracker](https://github.com/slawlor/actordb/issues):
   advertises an inclusive version range, required capability bits, and a fresh
   challenge; `HelloAuth` completes the transcript proof. Missing or
   incompatible fields fail closed before peer installation. The current binary
-  supports only wire v3 and requires the paged-anti-entropy and
-  byte-bounded-batches capabilities. The latter changes batch-get responses to
-  ordered-prefix semantics, so binaries without it are rejected. It is
+  supports only wire v3 and requires the paged-anti-entropy,
+  byte-bounded-batches, and stable-durability-ACK capabilities. Byte-bounded
+  batches change batch-get responses to ordered-prefix semantics, while stable
+  durability ACKs are required before RocksDB may retire a handed-off prefix;
+  binaries missing either contract are rejected. It is
   incompatible with v2, so deploy compatible binaries together rather than
   performing a mixed v2/v3 rolling upgrade. This transition is also a Rust
   source break for advanced users of the public generated `actordb::proto` API
@@ -520,22 +524,30 @@ as issues in the [issue tracker](https://github.com/slawlor/actordb/issues):
   guarantee impossible. Its report proves a per-target fenced LWW version
   floor, not exact/global cache equality, quorum, or a backend-independent
   fsync guarantee. Offered RocksDB defaults to `SyncWal`; explicit `AsyncWal`
-  is weaker. Legacy empty-map
+  is weaker for `StoreCommitted`, while `StableCommitted` forces the explicit
+  WAL fence. Legacy empty-map
   mode covers only senders known at the fence. Dropping `Node` only requests
   best-effort cancellation and stop; it cannot report a flush failure, await
   a join, or safely release the same live RocksDB attachment. This pre-release change is a Rust source break:
   callers must handle the new shutdown `Result`, and exhaustive matches over
-  `NodeError` or the advanced `SupervisorMessage` API must include their new
-  lifecycle variants.
+  `NodeError`, `ReplicationAckDurability`, `ApplyDurability`, `KvMessage`, the
+  generated `ReplicationAckLevel`, or the advanced `SupervisorMessage` API
+  must include their new variants (`StableCommitted` and `FlushStable` where
+  applicable).
 - **Tombstones are retained** — `Node::start` rejects every
   `tombstone_gc_age: Some(..)` setting. Safe reclamation needs durable
-  per-replica convergence evidence before the new durable prefix-delete
-  primitive can be used; elapsed wall-clock time cannot prove that condition.
-- **Revoked RocksDB prefixes are retained for now** — the storage primitive is
-  a synchronous, idempotent range tombstone (logical removal; compaction owns
-  later physical reclamation), but current placement queue emptiness is not a
-  snapshot-transfer certificate. Automatic deletion is gated on a fresh exact
-  reconciliation/durability fence rather than risking the last complete copy.
+  per-replica convergence evidence; elapsed wall-clock time cannot prove that
+  condition. Whole retired fragment namespaces are a separate lifecycle case.
+- **Revoked RocksDB prefixes retire after a stable revision-pinned handoff** — placement
+  seals every replacement sender, requires every current replica to complete a
+  fresh full reconciliation and `StableCommitted` barrier at one unchanged
+  source revision, then quiesces and flushes the source before RocksDB commits
+  a synchronous idempotent range tombstone. A weak ACK, replica-set/generation
+  change, fetched winner, deletion error, or re-add fails closed in `Draining`
+  or retains the namespace. Custom stores retain prefixes unless they
+  explicitly opt into lifecycle deletion. RocksDB compaction owns later
+  physical space reclamation. The certificate covers LWW winners and their TTL
+  metadata; independent expiry cleanup may make later byte snapshots differ.
 - **Custom worker-pool supervision is incomplete** — a worker crash can drop
   accepted mailbox work and leak admission accounting. A restarted dispatcher
   is republished through a generation-checked fragment route, but migration to

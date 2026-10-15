@@ -180,6 +180,7 @@ enum ReplicationAckLevel {
   REPLICATION_ACK_LEVEL_UNKNOWN = 0;
   REPLICATION_ACK_LEVEL_APPLIED = 1;
   REPLICATION_ACK_LEVEL_STORE_COMMITTED = 2;
+  REPLICATION_ACK_LEVEL_STABLE_COMMITTED = 3;
 }
 
 // A receiver could not account for or persist a batch. The sender retains

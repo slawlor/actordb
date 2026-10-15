@@ -24,8 +24,10 @@ credentials, multi-datacenter support, or transactional semantics.
   (see [Replication](replication.md)).
 - **Opt-in persistence**: RocksDB behind the `rocksdb` cargo feature. Threshold,
   write-age, periodic, and requested `StoreCommitted` ACK or reconciliation
-  barrier flushes ordered batches. The offered backend has a fail-closed
-  node/layout manifest and uses synchronous WAL commits by default (see
+  barrier flushes ordered batches; `StableCommitted` additionally runs an
+  explicit backend fence. The offered backend has a fail-closed node/layout
+  manifest, uses synchronous WAL commits by default, and retires revoked
+  fragment prefixes only after exact stable handoff (see
   [Persistence](persistence.md)).
 
 ## Crate layout

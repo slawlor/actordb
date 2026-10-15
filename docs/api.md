@@ -140,7 +140,11 @@ or a newer winner for that fragment. It does not prove byte-for-byte cache
 equality, a quorum, cluster-wide convergence, response delivery, or fsync.
 `MemoryApplied` is volatile; `StoreCommitted` means the receiver's configured
 store accepted its flush under that store's contract. Offered RocksDB defaults
-to `SyncWal`; explicitly selected `AsyncWal` does not force stable media.
+to `SyncWal`; explicitly selected `AsyncWal` does not force stable media for
+ordinary commits. `StableCommitted` additionally invokes the store's explicit
+stable fence; RocksDB synchronously flushes its WAL for that fence under either
+ordinary-write policy. Dynamic prefix retirement privately requires this
+strongest level from every replacement replica.
 Explicit placement
 targets every configured remote replica for each locally active fragment after
 placement freezes. Empty-map legacy mode can only target senders already known
@@ -269,26 +273,31 @@ Protocol v3 uses the same correlated reconciliation engine for static and
 dynamic placement. Summary, fetch, data, repair, and ordinary replication
 frames are split using their exact protobuf-encoded size, with a 1 MiB soft
 page target and 16 MiB hard limit. The public actor surface includes
-`SnapshotSummary`, `SummaryPage`, `VersionedPage`, and
-`KvMessage::{GetSummaryPage, GetVersioned, GetVersionedPage}` for embedders
-that need ordered, revision-guarded, pinned-TTL and memory-bounded exact-value
-primitives. `GetAll` and `GetSnapshot` remain source-compatible, but the
+`SnapshotSummary`, `SummaryPage`, `VersionedPage`,
+`KvMessage::{GetSummaryPage, GetVersioned, GetVersionedPage, GetRevision}`, and
+`KvMessage::FlushStable` for embedders that need ordered, revision-guarded,
+pinned-TTL and memory-bounded exact-value primitives or an explicit backend
+fence. `FlushStable` returns `ApplyDurability::StableCommitted` only after that
+fence succeeds. `GetAll` and `GetSnapshot` remain source-compatible, but the
 network responder no longer uses them to clone an entire fragment. Because
 `KvMessage` is public, embedders with exhaustive matches must add the new
 variants. Direct `ApplyOp` calls return `ApplyError::InvalidInput` for a record
 that cannot traverse the wire; this is nonfatal and does not restart a worker.
 
 Advanced users of public `actordb::proto` types must upgrade in lockstep with
-the cluster: wire v3 requires the paged-anti-entropy and byte-bounded-batches
-capabilities and adds cursor,
-revision, page-sequence, completion, and restart fields to reconciliation
-messages. A non-empty `BatchGetResponse` may now be an ordered request prefix;
-an empty response is unavailable, never not-found. The generated
+the cluster: wire v3 requires the paged-anti-entropy, byte-bounded-batches, and
+stable-durability-ACK capabilities and adds cursor, revision, page-sequence,
+completion, and restart fields to reconciliation messages. The generated
+`ReplicationAckLevel` also gains `StableCommitted`. A non-empty
+`BatchGetResponse` may now be an ordered request prefix; an empty response is
+unavailable, never not-found. The generated
 `SyncRequest`/`SyncResponse` types remain for source compatibility, but a v3
 connection rejects either envelope variant.
 The public `replication::SenderMsg::{ReconcileResponse, ReconcileData}` variants
 also gained correlation/page fields, so direct `spawn_sender*` users must update
-struct construction and exhaustive matches.
+struct construction and exhaustive matches. Exhaustive matches over public
+`ApplyDurability` and `ReplicationAckDurability` must likewise handle
+`StableCommitted`.
 
 ## Health and observability
 
