@@ -132,32 +132,37 @@ one another's empty state.
    remove the fragment from the serving set. New mutations acquire their lease
    afterward, observe revocation, and forward to the new owner. State becomes
    `Draining`.
-2. Ensure senders to the current replicas so queued ops drain out.
-3. Wait until every bounded sender ingress lane is empty, every issued overflow
-   generation has completed correlated reset reconciliation, and every sender
-   report shows `buffered == 0 && in_flight == 0` outside `BufferReset`. There
-   is no destructive timeout: warnings repeat at
-   `placement_drain_warn_interval`, and a placement reversal restores
-   `Serving` instead of allowing stale teardown.
-4. Under the placement commit lock, revalidate the authoritative map, exact
-   sender/report set, mutation lease, and registered supervisor ownership.
-   Detach the router and active supervisor index before any teardown wait, but
-   retain the supervisor in the lifecycle registry. After sender exit, quiesce
-   periodic actors, drain dispatcher/worker mailboxes, and require the final
-   local flush. A failure leaves the retained subtree `Draining` and retries
-   without admitting local work. A re-add before detach restores the existing
-   subtree; one after detach waits for durable `Stopped` and performs a clean
-   bootstrap. Only a successful flush publishes `Stopped`.
-5. The actor/cache is gone at `Stopped`, but the RocksDB fragment prefix is
-   deliberately retained in this release. The store exposes synchronous
-   idempotent prefix deletion; placement will invoke it only after a fresh exact
-   reconciliation/durability fence replaces the weaker queue-emptiness test.
+2. A store which leaves `prefix_delete_support` at `Retained` follows the
+   compatibility path: ensure current senders, wait for bounded ingress,
+   overflow recovery, buffers, and in-flight batches to drain, then retain the
+   namespace. This preserves existing custom-store behavior.
+3. A store which opts into `Supported` deletion takes the stronger path. The
+   driver snapshots the exact replacement replica vector and placement
+   generation, seals every corresponding sender, and requires a fresh stable
+   full reconciliation plus `StableCommitted` barrier from every target. All
+   certificates must cover one unchanged source revision; a fetched winner or
+   sender replacement restarts the complete set. Queue emptiness alone never
+   authorizes deletion.
+4. Under the placement commit lock and exclusive mutation lease, revalidate the
+   exact vector, generation, sender tasks, and registered supervisor. Stop/join
+   those senders and re-read the actor revision before detaching its router. An
+   ABA/target change retries; a pre-detach re-add replaces the sealed senders,
+   reconciles, and restores `Serving`.
+5. After detach, quiesce periodic actors, drain dispatcher/worker mailboxes,
+   and require the final local flush before touching storage. Revalidate the
+   certified placement, then invoke idempotent fragment-prefix deletion while
+   placement publication is excluded. An error remains `Draining` and retries;
+   `Deleted` or the backend's terminal `Retained` outcome permits supervisor
+   stop and `Stopped`. A post-detach re-add waits for that outcome and starts a
+   fresh subtree. RocksDB uses a synchronous range tombstone; compaction later
+   reclaims physical space.
 
-The controller sequencing rule is therefore mandatory for data transfer today:
+The controller sequencing rule is therefore mandatory for data transfer:
 add the destination during an overlap, wait for its `on_fragment_ready`, and
 only then revoke the source. Directly replacing the sole source with an absent
-or unbootstrapped owner is not a migration certificate; `Draining` queue
-emptiness alone does not prove that owner received the existing snapshot.
+or unbootstrapped owner is not a migration certificate. A deletion-capable
+source remains `Draining` until every published replacement proves the stable
+handoff.
 
 **Overlap-window safety.** While peers' maps transiently disagree, a node that
 receives an op for a fragment it no longer serves **re-forwards** it

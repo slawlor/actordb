@@ -278,8 +278,9 @@ pub struct SenderConfig {
     /// but silent peer cannot strand bootstrap or overflow recovery forever.
     pub reconcile_timeout: Duration,
     /// Minimum receiver fence that may retire an in-flight batch.
-    /// `MemoryApplied` accepts either acknowledgement level;
-    /// `StoreCommitted` requires a receiver with a configured store.
+    /// `MemoryApplied` accepts any stronger acknowledgement level;
+    /// `StoreCommitted` requires a receiver with a configured store, and
+    /// `StableCommitted` additionally requires its explicit stable fence.
     pub required_ack_durability: ReplicationAckDurability,
 }
 
@@ -399,9 +400,15 @@ pub enum SenderMsg {
 struct NodeSenderSignals {
     overflow_generation: u64,
     reconcile_generation: u64,
-    drain_generation: u64,
+    drain: Option<NodeSenderDrainRequest>,
     peer_generation: u64,
     peer: Option<NodeSenderPeer>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct NodeSenderDrainRequest {
+    generation: u64,
+    required_ack_durability: ReplicationAckDurability,
 }
 
 #[derive(Clone)]
@@ -445,6 +452,7 @@ pub(crate) struct NodeSender {
     abort: AbortHandle,
     stopped: watch::Receiver<bool>,
     drain_completed: watch::Receiver<u64>,
+    configured_ack_durability: ReplicationAckDurability,
     stop_lock: Arc<Mutex<()>>,
 }
 
@@ -598,6 +606,16 @@ impl NodeSender {
     /// to this exact sender task, so replacing a sender cannot satisfy an old
     /// shutdown fence.
     pub(crate) fn request_drain(&self) -> Result<NodeSenderDrain, NodeSenderSendError> {
+        self.request_drain_at(self.configured_ack_durability)
+    }
+
+    /// Request a drain using an explicit receiver durability fence. This is
+    /// crate-private so placement can demand a stronger handoff certificate
+    /// without changing the durability of ordinary replication batches.
+    pub(crate) fn request_drain_at(
+        &self,
+        required_ack_durability: ReplicationAckDurability,
+    ) -> Result<NodeSenderDrain, NodeSenderSendError> {
         // Serialize with data try_send so every accepted item is either ahead
         // of this fence or rejected after it. The task consumes the admitted
         // lane before taking its authoritative reconciliation snapshot.
@@ -608,8 +626,16 @@ impl NodeSender {
         *draining = true;
         let mut generation = 0;
         self.signals_tx.send_modify(|signals| {
-            signals.drain_generation = next_generation(signals.drain_generation);
-            generation = signals.drain_generation;
+            generation = next_generation(signals.drain.map_or(0, |drain| drain.generation));
+            // A later request may satisfy an earlier waiter only if it keeps
+            // the strongest outstanding durability requirement.
+            let required_ack_durability = signals.drain.map_or(required_ack_durability, |drain| {
+                drain.required_ack_durability.max(required_ack_durability)
+            });
+            signals.drain = Some(NodeSenderDrainRequest {
+                generation,
+                required_ack_durability,
+            });
         });
         debug_assert_ne!(generation, 0);
         Ok(NodeSenderDrain {
@@ -658,7 +684,7 @@ enum SenderInput {
     Overflow(u64, Arc<NodeSenderIngress>),
     PeerChanged(Option<NodeSenderPeer>),
     ReconcileNow,
-    Drain(u64),
+    Drain(NodeSenderDrainRequest),
     Closed,
 }
 
@@ -720,9 +746,12 @@ impl SenderInbox {
                     *delivered_reconcile_generation = signals.reconcile_generation;
                     return SenderInput::ReconcileNow;
                 }
-                if signals.drain_generation != *delivered_drain_generation {
-                    *delivered_drain_generation = signals.drain_generation;
-                    return SenderInput::Drain(signals.drain_generation);
+                if let Some(drain) = signals
+                    .drain
+                    .filter(|drain| drain.generation != *delivered_drain_generation)
+                {
+                    *delivered_drain_generation = drain.generation;
+                    return SenderInput::Drain(drain);
                 }
                 tokio::select! {
                     biased;
@@ -764,6 +793,19 @@ pub enum ReplicationAckDurability {
     /// The receiver applied every op and its configured store accepted a
     /// flush. This is not an fsync guarantee unless that store says so.
     StoreCommitted,
+    /// The receiver applied every op and its configured store completed an
+    /// explicit stable-storage fence.
+    StableCommitted,
+}
+
+impl ReplicationAckDurability {
+    fn proto_level(self) -> ReplicationAckLevel {
+        match self {
+            Self::MemoryApplied => ReplicationAckLevel::Applied,
+            Self::StoreCommitted => ReplicationAckLevel::StoreCommitted,
+            Self::StableCommitted => ReplicationAckLevel::StableCommitted,
+        }
+    }
 }
 
 /// A batch awaiting its ack.
@@ -771,12 +813,43 @@ struct InflightBatch {
     batch_seq: u64,
     ops: Vec<crate::actor::ReplicatedOp>,
     kind: InflightKind,
+    required_ack_durability: ReplicationAckDurability,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum InflightKind {
     Streaming { ack_deadline: Instant },
     ReconcileBarrier,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InflightAckResult {
+    Missing,
+    BelowRequired { required: ReplicationAckDurability },
+    Accepted { kind: InflightKind },
+}
+
+fn acknowledge_in_flight(
+    connection: &mut ActiveConnection,
+    batch_seq: u64,
+    durability: ReplicationAckDurability,
+) -> InflightAckResult {
+    let Some(position) = connection
+        .in_flight
+        .iter()
+        .position(|batch| batch.batch_seq == batch_seq)
+    else {
+        return InflightAckResult::Missing;
+    };
+    let required = connection.in_flight[position].required_ack_durability;
+    if durability < required {
+        return InflightAckResult::BelowRequired { required };
+    }
+    let batch = connection
+        .in_flight
+        .remove(position)
+        .expect("in-flight batch position was just resolved");
+    InflightAckResult::Accepted { kind: batch.kind }
 }
 
 struct ActiveConnection {
@@ -851,8 +924,72 @@ enum DeliveryState {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ReconcilePurpose {
     Routine,
-    Reset { epoch: u64 },
-    Drain { generation: u64 },
+    Reset {
+        epoch: u64,
+    },
+    Drain {
+        generation: u64,
+        required_ack_durability: ReplicationAckDurability,
+    },
+}
+
+impl ReconcilePurpose {
+    fn required_ack_durability(
+        self,
+        configured: ReplicationAckDurability,
+    ) -> ReplicationAckDurability {
+        match self {
+            Self::Drain {
+                required_ack_durability,
+                ..
+            } => required_ack_durability,
+            Self::Routine | Self::Reset { .. } => configured,
+        }
+    }
+}
+
+#[derive(Default)]
+struct SenderDrainState {
+    pending: Option<NodeSenderDrainRequest>,
+    prepared_generation: Option<u64>,
+    // Completion is a terminal certificate for this sender incarnation.
+    // Placement either retires it or explicitly issues a newer drain; routine
+    // reconciliation must not mutate the source behind the certificate.
+    sealed_after_completion: bool,
+}
+
+impl SenderDrainState {
+    fn request(&mut self, drain: NodeSenderDrainRequest) {
+        self.pending = Some(drain);
+        self.sealed_after_completion = false;
+    }
+
+    fn pending_preparation(&self) -> Option<NodeSenderDrainRequest> {
+        self.pending
+            .filter(|drain| self.prepared_generation != Some(drain.generation))
+    }
+
+    fn mark_prepared(&mut self, generation: u64) {
+        self.prepared_generation = Some(generation);
+    }
+
+    fn prepared_purpose(&self) -> Option<ReconcilePurpose> {
+        let drain = self.pending?;
+        (self.prepared_generation == Some(drain.generation)).then_some(ReconcilePurpose::Drain {
+            generation: drain.generation,
+            required_ack_durability: drain.required_ack_durability,
+        })
+    }
+
+    fn complete(&mut self) {
+        self.pending = None;
+        self.prepared_generation = None;
+        self.sealed_after_completion = true;
+    }
+
+    fn routine_reconcile_allowed(&self) -> bool {
+        self.pending.is_none() && !self.sealed_after_completion
+    }
 }
 
 struct ReconcileSummaryState {
@@ -948,11 +1085,11 @@ pub struct SenderStateReport {
     /// Batches in flight.
     pub in_flight: usize,
     /// Durability fence reported by the most recent well-formed ACK. This may
-    /// be below `required_ack_durability`, in which case the batch remains in
-    /// flight and the mismatch is observable here.
+    /// be below that specific batch's requirement, in which case the batch
+    /// remains in flight and the mismatch is observable here.
     pub last_ack_durability: Option<ReplicationAckDurability>,
-    /// The most recent matching ACK was below the configured minimum and did
-    /// not retire its batch.
+    /// The most recent matching ACK was below its batch's minimum and did not
+    /// retire that batch.
     pub ack_durability_mismatch: bool,
     /// Completed anti-entropy reconcile rounds. The Phase 8 placement
     /// driver polls this to detect bootstrap completion.
@@ -1040,6 +1177,7 @@ pub(crate) fn spawn_node_sender(
     let ingress = Arc::new(NodeSenderIngress::default());
     let (stopped_tx, stopped) = watch::channel(false);
     let (drain_completed_tx, drain_completed) = watch::channel(0u64);
+    let configured_ack_durability = config.required_ack_durability;
     let task_ingress = ingress.clone();
     let inbox = SenderInbox::Node {
         data_rx,
@@ -1075,6 +1213,7 @@ pub(crate) fn spawn_node_sender(
         abort: task.abort_handle(),
         stopped,
         drain_completed,
+        configured_ack_durability,
         stop_lock: Arc::new(Mutex::new(())),
     })
 }
@@ -1285,21 +1424,18 @@ async fn sender_task(
     let mut local_reconcile_flush_pending = false;
     let mut publish_data_completion: Option<Arc<NodeSenderIngress>> = None;
     let mut active_ingress_overflow: Option<(Arc<NodeSenderIngress>, u64)> = None;
-    let mut pending_drain_generation: Option<u64> = None;
-    let mut prepared_drain_generation: Option<u64> = None;
+    let mut drain_state = SenderDrainState::default();
 
     loop {
         if connection.is_none() {
             reconcile_credit_rx = None;
             reconcile_ticket = None;
         }
-        if let (Some(generation), Some(node_drain)) =
-            (pending_drain_generation, node_drain.as_ref())
+        if let (Some(drain), Some(node_drain)) =
+            (drain_state.pending_preparation(), node_drain.as_ref())
         {
             let ingress = &node_drain.ingress;
-            if prepared_drain_generation != Some(generation)
-                && ingress.pending_data.load(Ordering::Acquire) == 0
-            {
+            if ingress.pending_data.load(Ordering::Acquire) == 0 {
                 // The cache is the authoritative source for Drain. Once every
                 // pre-fence data item has left the ingress lane, a fresh
                 // session makes delayed ACK/NACK/control frames harmless and
@@ -1330,26 +1466,18 @@ async fn sender_task(
                 } else {
                     session_retry = Some(deadline_after(NACK_RETRY_DELAY));
                 }
-                prepared_drain_generation = Some(generation);
+                drain_state.mark_prepared(drain.generation);
             }
         }
         // A shutdown drain is stronger than ordinary queue emptiness: run a
         // fresh stable full reconciliation after the producer fence so an op
         // recovered from bounded-ingress overflow or a previously closed
         // sender is covered by the same correlated durability barrier.
-        if let Some(generation) = pending_drain_generation {
-            if prepared_drain_generation == Some(generation)
-                && matches!(delivery, DeliveryState::Streaming)
-                && active_reconcile.is_none()
-            {
-                let scheduled = matches!(
-                    reconcile_retry,
-                    Some((_, ReconcilePurpose::Drain { generation: current }))
-                        if current == generation
-                );
+        if let Some(purpose) = drain_state.prepared_purpose() {
+            if matches!(delivery, DeliveryState::Streaming) && active_reconcile.is_none() {
+                let scheduled = matches!(reconcile_retry, Some((_, current)) if current == purpose);
                 if !scheduled {
-                    reconcile_retry =
-                        Some((Instant::now(), ReconcilePurpose::Drain { generation }));
+                    reconcile_retry = Some((Instant::now(), purpose));
                 }
                 pause_new_streaming = true;
             }
@@ -1381,7 +1509,7 @@ async fn sender_task(
         // resulting buffer/reset state above has been published.
         if let Some(ingress) = publish_data_completion.take() {
             ingress.pending_data.fetch_sub(1, Ordering::AcqRel);
-            if pending_drain_generation != prepared_drain_generation
+            if drain_state.pending.map(|drain| drain.generation) != drain_state.prepared_generation
                 && ingress.pending_data.load(Ordering::Acquire) == 0
             {
                 continue;
@@ -1435,11 +1563,8 @@ async fn sender_task(
                         }
                     }),
                     SenderInput::ReconcileNow => Some(SenderMsg::ReconcileNow),
-                    SenderInput::Drain(generation) => {
-                        pending_drain_generation = Some(
-                            pending_drain_generation
-                                .map_or(generation, |current| current.max(generation)),
-                        );
+                    SenderInput::Drain(drain) => {
+                        drain_state.request(drain);
                         None
                     }
                     SenderInput::Closed => break,
@@ -1670,34 +1795,32 @@ async fn sender_task(
                             if ack_session != conn.session_id {
                                 continue;
                             }
-                            if let Some(pos) = conn
-                                .in_flight
-                                .iter()
-                                .position(|b| b.batch_seq == batch_seq)
-                            {
-                                last_ack_durability = Some(durability);
-                                ack_durability_mismatch =
-                                    durability < config.required_ack_durability;
-                                if ack_durability_mismatch {
+                            match acknowledge_in_flight(conn, batch_seq, durability) {
+                                InflightAckResult::Missing => {}
+                                InflightAckResult::BelowRequired { required } => {
+                                    last_ack_durability = Some(durability);
+                                    ack_durability_mismatch = true;
                                     tracing::warn!(
                                         peer = %peer_id,
                                         fragment = fragment.0,
                                         batch_seq,
                                         ?durability,
-                                        required = ?config.required_ack_durability,
-                                        "replication ack did not meet the configured durability fence"
+                                        ?required,
+                                        "replication ack did not meet the batch durability fence"
                                     );
-                                } else {
+                                }
+                                InflightAckResult::Accepted { kind } => {
+                                    last_ack_durability = Some(durability);
                                     ack_durability_mismatch = false;
-                                    conn.in_flight.remove(pos);
-                                    let is_barrier = active_reconcile.as_ref().is_some_and(|round| {
-                                        round.session_id == ack_session
-                                            && matches!(
-                                                round.phase,
-                                                ReconcilePhase::Barrier { batch_seq: seq }
-                                                    if seq == batch_seq
-                                            )
-                                    });
+                                    let is_barrier = kind == InflightKind::ReconcileBarrier
+                                        && active_reconcile.as_ref().is_some_and(|round| {
+                                            round.session_id == ack_session
+                                                && matches!(
+                                                    round.phase,
+                                                    ReconcilePhase::Barrier { batch_seq: seq }
+                                                        if seq == batch_seq
+                                                )
+                                        });
                                     if is_barrier {
                                         completed_round = active_reconcile.take();
                                     }
@@ -1718,7 +1841,8 @@ async fn sender_task(
                                     };
                                     if snapshot_is_current {
                                         reconcile_rounds = reconcile_rounds.saturating_add(1);
-                                        if let ReconcilePurpose::Drain { generation } = round.purpose
+                                        if let ReconcilePurpose::Drain { generation, .. } =
+                                            round.purpose
                                         {
                                             // The fresh session and stable
                                             // barrier supersede every fenced
@@ -1726,8 +1850,7 @@ async fn sender_task(
                                             // enter this exact sender after
                                             // request_drain closed ingress.
                                             buffer.clear();
-                                            pending_drain_generation = None;
-                                            prepared_drain_generation = None;
+                                            drain_state.complete();
                                             if let Some(node_drain) = node_drain.as_ref() {
                                                 let issued = node_drain
                                                     .ingress
@@ -1827,7 +1950,18 @@ async fn sender_task(
                                             }
                                             continue;
                                         };
-                                        match send_reconcile_barrier(fragment, &config, conn).await {
+                                        let required_ack_durability = round
+                                            .purpose
+                                            .required_ack_durability(
+                                                config.required_ack_durability,
+                                            );
+                                        match send_reconcile_barrier(
+                                            fragment,
+                                            required_ack_durability,
+                                            conn,
+                                        )
+                                        .await
+                                        {
                                             Ok(batch_seq) => {
                                                 round.phase =
                                                     ReconcilePhase::Barrier { batch_seq };
@@ -2000,7 +2134,7 @@ async fn sender_task(
                         }
                     }
                     SenderMsg::ReconcileNow => {
-                        if pending_drain_generation.is_none()
+                        if drain_state.routine_reconcile_allowed()
                             && matches!(delivery, DeliveryState::Streaming)
                             && active_reconcile.is_none()
                         {
@@ -2376,8 +2510,10 @@ async fn sender_task(
                         else {
                             continue;
                         };
-                        if config.required_ack_durability
-                            == ReplicationAckDurability::StoreCommitted
+                        if round
+                            .purpose
+                            .required_ack_durability(config.required_ack_durability)
+                            >= ReplicationAckDurability::StoreCommitted
                         {
                             // Apply is not transactional: an error or lost RPC
                             // reply may follow a successful prefix. Record the
@@ -2530,14 +2666,7 @@ async fn sender_task(
                     Some(conn) => allocate_batch_seq(conn),
                     None => continue,
                 };
-                let required_ack_level = match config.required_ack_durability {
-                    ReplicationAckDurability::MemoryApplied => {
-                        ReplicationAckLevel::Applied as i32
-                    }
-                    ReplicationAckDurability::StoreCommitted => {
-                        ReplicationAckLevel::StoreCommitted as i32
-                    }
-                };
+                let required_ack_level = config.required_ack_durability.proto_level() as i32;
                 let (ops, proto_ops) = match take_streaming_batch(
                     &mut buffer,
                     config.batch_size,
@@ -2577,6 +2706,7 @@ async fn sender_task(
                             kind: InflightKind::Streaming {
                                 ack_deadline: deadline_after(runtime.ack_timeout),
                             },
+                            required_ack_durability: config.required_ack_durability,
                         });
                     }
                 } else {
@@ -2749,7 +2879,7 @@ async fn sender_task(
                 }
             }
             _ = consistency_timer.tick() => {
-                if pending_drain_generation.is_none()
+                if drain_state.routine_reconcile_allowed()
                     && matches!(delivery, DeliveryState::Streaming)
                     && active_reconcile.is_none()
                     && reconcile_retry.is_none()
@@ -2918,7 +3048,7 @@ async fn begin_reconcile(
 
 async fn send_reconcile_barrier(
     fragment: FragmentId,
-    config: &SenderConfig,
+    required_ack_durability: ReplicationAckDurability,
     connection: &mut ActiveConnection,
 ) -> Result<u64, ()> {
     let batch_seq = allocate_batch_seq(connection);
@@ -2930,12 +3060,7 @@ async fn send_reconcile_barrier(
             batch_seq,
             fragment: fragment.0,
             ops: Vec::new(),
-            required_ack_level: match config.required_ack_durability {
-                ReplicationAckDurability::MemoryApplied => ReplicationAckLevel::Applied as i32,
-                ReplicationAckDurability::StoreCommitted => {
-                    ReplicationAckLevel::StoreCommitted as i32
-                }
-            },
+            required_ack_level: required_ack_durability.proto_level() as i32,
         }),
     )
     .await;
@@ -2946,6 +3071,7 @@ async fn send_reconcile_barrier(
         batch_seq,
         ops: Vec::new(),
         kind: InflightKind::ReconcileBarrier,
+        required_ack_durability,
     });
     Ok(batch_seq)
 }
@@ -3481,7 +3607,10 @@ async fn enter_reconcile_barrier(
         flush_reconcile(fragment, router).await?;
         *local_reconcile_flush_pending = false;
     }
-    let batch_seq = send_reconcile_barrier(fragment, config, connection)
+    let required_ack_durability = round
+        .purpose
+        .required_ack_durability(config.required_ack_durability);
+    let batch_seq = send_reconcile_barrier(fragment, required_ack_durability, connection)
         .await
         .map_err(|()| ReconcileError::Transport)?;
     round.phase = ReconcilePhase::Barrier { batch_seq };
@@ -3514,7 +3643,9 @@ async fn flush_reconcile(
         .ok_or(ReconcileError::Local)?;
     match actor.call(|reply| KvMessage::Flush { reply }, None).await {
         Ok(CallResult::Success(Ok(
-            ApplyDurability::StoreCommitted | ApplyDurability::MemoryApplied,
+            ApplyDurability::StableCommitted
+            | ApplyDurability::StoreCommitted
+            | ApplyDurability::MemoryApplied,
         ))) => Ok(()),
         Ok(CallResult::Success(Err(error))) => {
             tracing::warn!(fragment = fragment.0, %error, "reconcile flush failed");
@@ -3751,6 +3882,7 @@ mod tests {
             abort: task.abort_handle(),
             stopped,
             drain_completed,
+            configured_ack_durability: ReplicationAckDurability::MemoryApplied,
             stop_lock: Arc::new(Mutex::new(())),
         };
         started_rx.await.unwrap();
@@ -3842,6 +3974,177 @@ mod tests {
             sender.send(SenderMsg::ReconcileNow),
             Err(NodeSenderSendError::Closed)
         );
+    }
+
+    #[tokio::test]
+    async fn placement_stable_drain_barrier_rejects_store_committed_ack() {
+        let (data_tx, _data_rx) = mpsc::channel(1);
+        let (control_tx, _control_rx) = mpsc::channel(1);
+        let (signals_tx, signals_rx) = watch::channel(NodeSenderSignals::default());
+        let ingress = Arc::new(NodeSenderIngress::default());
+        let (stopped_tx, stopped) = watch::channel(false);
+        let (_drain_completed_tx, drain_completed) = watch::channel(0u64);
+        let (finish_tx, finish_rx) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            let _exit = NodeSenderTaskExit(stopped_tx);
+            let _ = finish_rx.await;
+        });
+        let sender = NodeSender {
+            data_tx,
+            control_tx,
+            signals_tx,
+            ingress,
+            abort: task.abort_handle(),
+            stopped,
+            drain_completed,
+            configured_ack_durability: ReplicationAckDurability::MemoryApplied,
+            stop_lock: Arc::new(Mutex::new(())),
+        };
+
+        let drain = sender
+            .request_drain_at(ReplicationAckDurability::StableCommitted)
+            .unwrap();
+        let request = signals_rx.borrow().drain.expect("drain signal missing");
+        assert_eq!(request.generation, drain.generation);
+        assert_eq!(
+            request.required_ack_durability,
+            ReplicationAckDurability::StableCommitted
+        );
+
+        let (peer_tx, mut peer_rx) = mpsc::channel(1);
+        let mut connection = ActiveConnection {
+            peer_tx: SenderPeer::new(peer_tx, None, &SenderRuntimeOptions::default()),
+            session_id: 7,
+            session_ready: true,
+            next_batch_seq: 0,
+            in_flight: VecDeque::new(),
+        };
+        let purpose = ReconcilePurpose::Drain {
+            generation: request.generation,
+            required_ack_durability: request.required_ack_durability,
+        };
+        let batch_seq = send_reconcile_barrier(
+            FragmentId(0),
+            purpose.required_ack_durability(sender.configured_ack_durability),
+            &mut connection,
+        )
+        .await
+        .unwrap();
+        let frame = peer_rx.recv().await.expect("stable barrier missing");
+        let batch = match Envelope::decode(frame.as_slice()).unwrap().msg {
+            Some(EnvelopeMsg::ReplicateBatch(batch)) => batch,
+            other => panic!("expected stable ReplicateBatch barrier, got {other:?}"),
+        };
+        assert!(batch.ops.is_empty());
+        assert_eq!(
+            ReplicationAckLevel::try_from(batch.required_ack_level),
+            Ok(ReplicationAckLevel::StableCommitted)
+        );
+
+        assert_eq!(
+            acknowledge_in_flight(
+                &mut connection,
+                batch_seq,
+                ReplicationAckDurability::StoreCommitted,
+            ),
+            InflightAckResult::BelowRequired {
+                required: ReplicationAckDurability::StableCommitted,
+            }
+        );
+        assert_eq!(connection.in_flight.len(), 1);
+        assert!(!drain.is_complete());
+        assert_eq!(
+            acknowledge_in_flight(
+                &mut connection,
+                batch_seq,
+                ReplicationAckDurability::StableCommitted,
+            ),
+            InflightAckResult::Accepted {
+                kind: InflightKind::ReconcileBarrier,
+            }
+        );
+        assert!(connection.in_flight.is_empty());
+
+        finish_tx.send(()).unwrap();
+        task.await.unwrap();
+        sender.stop().await;
+    }
+
+    #[tokio::test]
+    async fn completed_drain_suppresses_routine_tick_until_newer_drain_rearms() {
+        let first = NodeSenderDrainRequest {
+            generation: 1,
+            required_ack_durability: ReplicationAckDurability::StableCommitted,
+        };
+        let mut drain_state = SenderDrainState::default();
+        drain_state.request(first);
+        drain_state.mark_prepared(first.generation);
+        drain_state.complete();
+
+        let consistency_interval = Duration::from_millis(10);
+        let started = Instant::now();
+        let mut consistency_timer =
+            tokio::time::interval_at(started + consistency_interval, consistency_interval);
+        consistency_timer.tick().await;
+        assert!(Instant::now().duration_since(started) >= consistency_interval);
+
+        let (peer_tx, mut peer_rx) = mpsc::channel(2);
+        let connection = ActiveConnection {
+            peer_tx: SenderPeer::new(peer_tx, None, &SenderRuntimeOptions::default()),
+            session_id: 41,
+            session_ready: true,
+            next_batch_seq: 0,
+            in_flight: VecDeque::new(),
+        };
+        let mut reconcile_ticket = None;
+        let mut next_round_id = 0;
+        let mut active_reconcile = None;
+        if drain_state.routine_reconcile_allowed() {
+            active_reconcile = begin_reconcile(
+                FragmentId(0),
+                ReconcilePurpose::Routine,
+                &connection,
+                &mut reconcile_ticket,
+                &mut next_round_id,
+                Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
+        }
+        assert!(active_reconcile.is_none());
+        assert!(peer_rx.try_recv().is_err());
+
+        let newer = NodeSenderDrainRequest {
+            generation: 2,
+            required_ack_durability: ReplicationAckDurability::StableCommitted,
+        };
+        drain_state.request(newer);
+        assert!(drain_state.prepared_purpose().is_none());
+        drain_state.mark_prepared(newer.generation);
+        let purpose = drain_state
+            .prepared_purpose()
+            .expect("newer drain did not re-arm reconciliation");
+        let round = begin_reconcile(
+            FragmentId(0),
+            purpose,
+            &connection,
+            &mut reconcile_ticket,
+            &mut next_round_id,
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap()
+        .expect("newer drain did not start a round");
+        assert_eq!(round.purpose, purpose);
+
+        let frame = peer_rx.recv().await.expect("new drain request missing");
+        let request = match Envelope::decode(frame.as_slice()).unwrap().msg {
+            Some(EnvelopeMsg::ReconcileRequest(request)) => request,
+            other => panic!("expected ReconcileRequest, got {other:?}"),
+        };
+        assert_eq!(request.session_id, connection.session_id);
+        assert_eq!(request.round_id, round.round_id);
+        assert_eq!(request.page_seq, 0);
     }
 
     #[tokio::test]
@@ -4022,6 +4325,7 @@ mod tests {
                 kind: InflightKind::Streaming {
                     ack_deadline: Instant::now() + Duration::from_secs(1),
                 },
+                required_ack_durability: ReplicationAckDurability::MemoryApplied,
             },
             InflightBatch {
                 batch_seq: 1,
@@ -4029,6 +4333,7 @@ mod tests {
                 kind: InflightKind::Streaming {
                     ack_deadline: Instant::now() + Duration::from_secs(1),
                 },
+                required_ack_durability: ReplicationAckDurability::MemoryApplied,
             },
         ]);
         let mut buffer = VecDeque::from([op("d")]);

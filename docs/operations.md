@@ -211,9 +211,10 @@ work on retry.
 This is not a cluster convergence or response-delivery certificate. For every
 reported target it proves the receiver acknowledged the LWW state at the
 mutation-admission fence or a newer winner, at `MemoryApplied` or
-`StoreCommitted` as configured. The latter is store acceptance under the
-backend's policy: offered RocksDB defaults to `SyncWal`, while explicitly
-configured `AsyncWal` is weaker. Explicit placement supplies the closed target set; legacy empty-map mode
+`StoreCommitted`/`StableCommitted` as configured. `StoreCommitted` is ordinary
+store acceptance; `StableCommitted` invokes the backend's explicit stable
+fence. Offered RocksDB can force that fence even when ordinary writes use
+`AsyncWal`. Explicit placement supplies the closed target set; legacy empty-map mode
 can cover only authenticated peers whose senders existed at the fence. Clients
 must still retry a stamped mutation if its network response was lost.
 
@@ -234,7 +235,12 @@ placement); a failed subtree spawn clears the `Bootstrapping` mark so the next
 tick retries; bootstrap timeout leaves the fragment non-authoritative for a
 later retry; an incomplete revoke remains `Draining` and warns every
 `placement_drain_warn_interval` rather than discarding recovery state.
-Re-adding the node cancels that stale teardown.
+For a deletion-capable store, a revoked fragment also remains `Draining` until
+every exact replacement replica completes a stable full reconcile at one
+unchanged source revision. Prefix-delete errors retry idempotently; target-set
+changes retain the namespace. Re-adding the node before detach replaces sealed
+senders and cancels that stale teardown, while a re-add after detach waits for
+`Stopped` and boots a fresh subtree.
 During map disagreement, ops re-forward hop-limited
 (`MAX_FORWARD_HOPS = 4`) instead of being dropped. If a controller publishes a
 bad map, `placement_report()` shows the authoritative map and per-fragment

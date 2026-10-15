@@ -123,6 +123,33 @@ impl Drop for StoreBinding {
     }
 }
 
+/// Whether a backend opts into lifecycle-driven prefix deletion.
+///
+/// The conservative default is [`PrefixDeleteSupport::Retained`], so adding
+/// prefix retirement to actordb does not cause existing custom stores to begin
+/// receiving destructive calls without an explicit implementation choice.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PrefixDeleteSupport {
+    /// Keep retired namespaces. Callers must not invoke `delete_prefix` as an
+    /// automatic lifecycle side effect.
+    #[default]
+    Retained,
+    /// The backend supports quiesced, durable, idempotent prefix deletion.
+    Supported,
+}
+
+/// Crash durability of an ordinary successful [`KvStore::write_batch`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum StoreCommitDurability {
+    /// The backend accepted the write, but an operating-system crash or power
+    /// loss may still discard it.
+    #[default]
+    Buffered,
+    /// The backend reports that the write reached its stable crash-recovery
+    /// boundary before returning.
+    Stable,
+}
+
 /// Result of asking a store to remove a key prefix.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PrefixDeleteOutcome {
@@ -173,9 +200,36 @@ pub trait KvStore: Send + Sync + 'static {
             .filter(|(key, _)| key.starts_with(prefix))
             .collect())
     }
+    /// Crash durability provided by an ordinary successful `write_batch`.
+    ///
+    /// Existing custom stores default to [`StoreCommitDurability::Buffered`].
+    /// A wrapper must delegate this method if the wrapped backend offers a
+    /// stronger guarantee.
+    fn commit_durability(&self) -> StoreCommitDurability {
+        StoreCommitDurability::Buffered
+    }
+    /// Force writes completed before this call through the backend's strongest
+    /// available crash-recovery fence.
+    ///
+    /// Callers flush actor-side buffers before invoking this method. The default
+    /// performs no additional work and reports [`KvStore::commit_durability`],
+    /// preserving compatibility for custom stores. Implementations may override
+    /// it when an explicit fence can strengthen buffered ordinary writes.
+    fn stable_fence(&self) -> Result<StoreCommitDurability, StoreError> {
+        Ok(self.commit_durability())
+    }
     /// Atomically persist a batch of winning writes. Each key occurs at most
     /// once in a batch.
     fn write_batch(&self, writes: &[(Vec<u8>, VersionedValue)]) -> Result<(), StoreError>;
+    /// Declare whether lifecycle code may invoke [`KvStore::delete_prefix`].
+    ///
+    /// Existing custom stores retain namespaces by default. Opting in promises
+    /// that `delete_prefix` obeys its quiescence, durability, and idempotency
+    /// contract; the returned [`PrefixDeleteOutcome`] remains authoritative for
+    /// each call.
+    fn prefix_delete_support(&self) -> PrefixDeleteSupport {
+        PrefixDeleteSupport::Retained
+    }
     /// Durably remove keys beginning with `prefix` after their writers have
     /// been quiesced. The operation must be idempotent because lifecycle work
     /// can retry it after an ambiguous failure.
@@ -204,6 +258,18 @@ impl KvStore for MemoryStore {
 
     fn write_batch(&self, _writes: &[(Vec<u8>, VersionedValue)]) -> Result<(), StoreError> {
         Ok(())
+    }
+
+    fn commit_durability(&self) -> StoreCommitDurability {
+        StoreCommitDurability::Buffered
+    }
+
+    fn stable_fence(&self) -> Result<StoreCommitDurability, StoreError> {
+        Ok(StoreCommitDurability::Buffered)
+    }
+
+    fn prefix_delete_support(&self) -> PrefixDeleteSupport {
+        PrefixDeleteSupport::Retained
     }
 
     fn delete_prefix(&self, _prefix: &[u8]) -> Result<PrefixDeleteOutcome, StoreError> {
@@ -251,6 +317,14 @@ impl KvStore for PrefixedStore {
         Ok(out)
     }
 
+    fn commit_durability(&self) -> StoreCommitDurability {
+        self.inner.commit_durability()
+    }
+
+    fn stable_fence(&self) -> Result<StoreCommitDurability, StoreError> {
+        self.inner.stable_fence()
+    }
+
     fn write_batch(&self, writes: &[(Vec<u8>, VersionedValue)]) -> Result<(), StoreError> {
         let prefixed: Vec<(Vec<u8>, VersionedValue)> = writes
             .iter()
@@ -262,6 +336,10 @@ impl KvStore for PrefixedStore {
             })
             .collect();
         self.inner.write_batch(&prefixed)
+    }
+
+    fn prefix_delete_support(&self) -> PrefixDeleteSupport {
+        self.inner.prefix_delete_support()
     }
 
     fn delete_prefix(&self, prefix: &[u8]) -> Result<PrefixDeleteOutcome, StoreError> {
@@ -898,6 +976,21 @@ impl KvStore for RocksDbStore {
         self.load_matching(Some(prefix))
     }
 
+    fn commit_durability(&self) -> StoreCommitDurability {
+        match self.options.durability {
+            RocksDbDurability::AsyncWal => StoreCommitDurability::Buffered,
+            RocksDbDurability::SyncWal => StoreCommitDurability::Stable,
+        }
+    }
+
+    fn stable_fence(&self) -> Result<StoreCommitDurability, StoreError> {
+        self.attached_identity()?;
+        self.db
+            .flush_wal(true)
+            .map_err(|error| StoreError(error.to_string()))?;
+        Ok(StoreCommitDurability::Stable)
+    }
+
     fn write_batch(&self, writes: &[(Vec<u8>, VersionedValue)]) -> Result<(), StoreError> {
         let identity = self.attached_identity()?;
         let mut batch = rocksdb::WriteBatch::default();
@@ -914,6 +1007,10 @@ impl KvStore for RocksDbStore {
         self.db
             .write_opt(batch, self.write_options(false))
             .map_err(|e| StoreError(e.to_string()))
+    }
+
+    fn prefix_delete_support(&self) -> PrefixDeleteSupport {
+        PrefixDeleteSupport::Supported
     }
 
     fn delete_prefix(&self, prefix: &[u8]) -> Result<PrefixDeleteOutcome, StoreError> {
@@ -969,12 +1066,21 @@ mod tests {
             fn load(&self) -> Result<Vec<(Vec<u8>, VersionedValue)>, StoreError> {
                 Ok(self.written.lock().unwrap().clone())
             }
+            fn commit_durability(&self) -> StoreCommitDurability {
+                StoreCommitDurability::Stable
+            }
+            fn stable_fence(&self) -> Result<StoreCommitDurability, StoreError> {
+                Ok(StoreCommitDurability::Stable)
+            }
             fn write_batch(&self, writes: &[(Vec<u8>, VersionedValue)]) -> Result<(), StoreError> {
                 self.written
                     .lock()
                     .unwrap()
                     .extend(writes.iter().map(|(k, v)| (k.clone(), v.clone())));
                 Ok(())
+            }
+            fn prefix_delete_support(&self) -> PrefixDeleteSupport {
+                PrefixDeleteSupport::Supported
             }
             fn delete_prefix(&self, prefix: &[u8]) -> Result<PrefixDeleteOutcome, StoreError> {
                 self.written
@@ -990,6 +1096,10 @@ mod tests {
         });
         let f0 = PrefixedStore::new(inner.clone(), FragmentId(0));
         let f1 = PrefixedStore::new(inner.clone(), FragmentId(1));
+
+        assert_eq!(f0.commit_durability(), StoreCommitDurability::Stable);
+        assert_eq!(f0.stable_fence().unwrap(), StoreCommitDurability::Stable);
+        assert_eq!(f0.prefix_delete_support(), PrefixDeleteSupport::Supported);
 
         let v = VersionedValue::new(b"x".to_vec(), 1, "n".to_string());
         f0.write_batch(&[(b"key".to_vec(), v.clone())]).unwrap();
@@ -1023,6 +1133,9 @@ mod tests {
     #[test]
     fn memory_store_is_a_noop() {
         let s = MemoryStore;
+        assert_eq!(s.commit_durability(), StoreCommitDurability::Buffered);
+        assert_eq!(s.stable_fence().unwrap(), StoreCommitDurability::Buffered);
+        assert_eq!(s.prefix_delete_support(), PrefixDeleteSupport::Retained);
         assert!(s.load().unwrap().is_empty());
         s.write_batch(&[(
             b"k".to_vec(),
@@ -1030,6 +1143,29 @@ mod tests {
         )])
         .unwrap();
         assert!(s.load().unwrap().is_empty());
+    }
+
+    #[test]
+    fn custom_store_capabilities_default_to_retention_and_buffering() {
+        struct CustomStore;
+
+        impl KvStore for CustomStore {
+            fn load(&self) -> Result<Vec<(Vec<u8>, VersionedValue)>, StoreError> {
+                Ok(Vec::new())
+            }
+
+            fn write_batch(&self, _writes: &[(Vec<u8>, VersionedValue)]) -> Result<(), StoreError> {
+                Ok(())
+            }
+        }
+
+        let store = CustomStore;
+        assert_eq!(store.commit_durability(), StoreCommitDurability::Buffered);
+        assert_eq!(
+            store.stable_fence().unwrap(),
+            StoreCommitDurability::Buffered
+        );
+        assert_eq!(store.prefix_delete_support(), PrefixDeleteSupport::Retained);
     }
 
     #[cfg(feature = "rocksdb")]
@@ -1229,8 +1365,17 @@ mod tests {
     #[test]
     fn rocksdb_options_default_to_sync_wal() {
         let dir = tempfile::tempdir().unwrap();
+        let identity = StoreIdentity::new("node".to_string(), 1);
         let store = RocksDbStore::open(dir.path()).unwrap();
         assert_eq!(store.durability(), RocksDbDurability::SyncWal);
+        assert_eq!(store.commit_durability(), StoreCommitDurability::Stable);
+        assert_eq!(
+            store.prefix_delete_support(),
+            PrefixDeleteSupport::Supported
+        );
+        let binding = store.bind(&identity).unwrap();
+        assert_eq!(store.stable_fence().unwrap(), StoreCommitDurability::Stable);
+        drop(binding);
         drop(store);
 
         let store = RocksDbStore::open_with_options(
@@ -1239,6 +1384,21 @@ mod tests {
         )
         .unwrap();
         assert_eq!(store.durability(), RocksDbDurability::AsyncWal);
+        assert_eq!(store.commit_durability(), StoreCommitDurability::Buffered);
+        assert_eq!(
+            store.prefix_delete_support(),
+            PrefixDeleteSupport::Supported
+        );
+        let _binding = store.bind(&identity).unwrap();
+        let mut key = 0u32.to_be_bytes().to_vec();
+        key.extend_from_slice(b"key");
+        store
+            .write_batch(&[(
+                key,
+                VersionedValue::new(b"value".to_vec(), 1, "writer".to_string()),
+            )])
+            .unwrap();
+        assert_eq!(store.stable_fence().unwrap(), StoreCommitDurability::Stable);
     }
 
     #[cfg(feature = "rocksdb")]

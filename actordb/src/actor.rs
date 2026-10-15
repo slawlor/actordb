@@ -105,7 +105,7 @@ impl TokenBucket {
 }
 
 use crate::shard::{hash_key, FragmentId};
-use crate::store::KvStore;
+use crate::store::{KvStore, StoreCommitDurability};
 use crate::wire::check_versioned_value_budget;
 
 /// A value stamped with its last-writer-wins version.
@@ -283,6 +283,10 @@ pub enum ApplyDurability {
     /// The configured [`KvStore`] accepted the fragment flush. This does not
     /// imply an fsync unless the store implementation provides that guarantee.
     StoreCommitted,
+    /// The configured [`KvStore`] completed its explicit stable-storage fence.
+    /// The exact guarantee is backend-defined, but is stronger than merely
+    /// accepting the write batch into a volatile or buffered layer.
+    StableCommitted,
 }
 
 /// Failure before a fragment can produce an [`ApplyOutcome`].
@@ -333,6 +337,12 @@ pub enum KvMessage {
     /// Flush every persistence update currently ordered before this message.
     /// Replication uses this as an acknowledgement fence.
     Flush {
+        reply: RpcReplyPort<Result<ApplyDurability, ApplyError>>,
+    },
+    /// Flush every persistence update ordered before this message, then ask the
+    /// configured store for its explicit stable-storage fence. The existing
+    /// [`KvMessage::Flush`] retains its buffered-store semantics.
+    FlushStable {
         reply: RpcReplyPort<Result<ApplyDurability, ApplyError>>,
     },
     /// Read a single key from the local copy. The reply is
@@ -583,6 +593,27 @@ impl FragmentState {
         self.write_batch(&batch)?;
         self.flush.lock().await.commit_batch();
         Ok(())
+    }
+
+    /// Flush the fragment's ordered persistence buffer, then ask the backend
+    /// for its strongest explicit stable-storage fence.
+    ///
+    /// Storeless fragments remain memory-only. A backend which reports a
+    /// buffered fence preserves the ordinary [`ApplyDurability::StoreCommitted`]
+    /// result; only an explicit stable fence yields
+    /// [`ApplyDurability::StableCommitted`].
+    pub async fn flush_stable(&self) -> Result<ApplyDurability, ActorProcessingErr> {
+        self.flush().await?;
+        let Some(kvstore) = &self.kvstore else {
+            return Ok(ApplyDurability::MemoryApplied);
+        };
+        kvstore
+            .stable_fence()
+            .map(|durability| match durability {
+                StoreCommitDurability::Buffered => ApplyDurability::StoreCommitted,
+                StoreCommitDurability::Stable => ApplyDurability::StableCommitted,
+            })
+            .map_err(|error| ActorProcessingErr::from(error.to_string()))
     }
 
     fn write_batch(&self, batch: &[(String, VersionedValue)]) -> Result<(), ActorProcessingErr> {
@@ -992,7 +1023,7 @@ impl Actor for KvWorker {
             }
             // Flush fences are handled by the dispatcher against the shared
             // state. They are never routed through a worker pool.
-            KvMessage::Flush { reply } => {
+            KvMessage::Flush { reply } | KvMessage::FlushStable { reply } => {
                 let _ = reply.send(Err(ApplyError::Storage(
                     "flush fence was routed to a worker".to_string(),
                 )));
@@ -1473,6 +1504,17 @@ impl Actor for KvActor {
                 // dispatcher reference.
                 Ok(())
             }
+            KvMessage::FlushStable { reply } => {
+                let result = state
+                    .shared
+                    .flush_stable()
+                    .await
+                    .map_err(|error| ApplyError::Storage(error.to_string()));
+                let _ = reply.send(result);
+                // As with the ordinary flush fence, keep the stable dispatcher
+                // reference alive so a backend failure can be retried.
+                Ok(())
+            }
             KvMessage::GetAll { reply } => {
                 let _ = reply.send(state.shared.get_all().await);
                 Ok(())
@@ -1723,6 +1765,37 @@ impl Default for HlcClock {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::StoreError;
+
+    struct StableFenceStore {
+        reported: StoreCommitDurability,
+        events: std::sync::Mutex<Vec<&'static str>>,
+    }
+
+    impl StableFenceStore {
+        fn new(reported: StoreCommitDurability) -> Self {
+            Self {
+                reported,
+                events: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl KvStore for StableFenceStore {
+        fn load(&self) -> Result<Vec<(Vec<u8>, VersionedValue)>, StoreError> {
+            Ok(Vec::new())
+        }
+
+        fn write_batch(&self, _writes: &[(Vec<u8>, VersionedValue)]) -> Result<(), StoreError> {
+            self.events.lock().unwrap().push("write");
+            Ok(())
+        }
+
+        fn stable_fence(&self) -> Result<StoreCommitDurability, StoreError> {
+            self.events.lock().unwrap().push("fence");
+            Ok(self.reported)
+        }
+    }
 
     #[test]
     fn lww_orders_by_timestamp_then_node_id() {
@@ -1750,6 +1823,44 @@ mod tests {
             seq: 0,
             boot_id: 0,
         }
+    }
+
+    #[tokio::test]
+    async fn stable_flush_maps_store_guarantees_after_flushing_pending_writes() {
+        for (reported, expected) in [
+            (
+                StoreCommitDurability::Buffered,
+                ApplyDurability::StoreCommitted,
+            ),
+            (
+                StoreCommitDurability::Stable,
+                ApplyDurability::StableCommitted,
+            ),
+        ] {
+            let store = Arc::new(StableFenceStore::new(reported));
+            let state = FragmentState::new(
+                HashMap::new(),
+                Some(store.clone()),
+                100,
+                Duration::from_secs(3600),
+            );
+            state
+                .apply(&test_op(
+                    "stable",
+                    VersionedValue::new(b"value".to_vec(), 1, "node".to_string()),
+                ))
+                .await
+                .unwrap();
+
+            assert_eq!(state.flush_stable().await.unwrap(), expected);
+            assert_eq!(*store.events.lock().unwrap(), vec!["write", "fence"]);
+        }
+
+        let storeless = test_state(HashMap::new());
+        assert_eq!(
+            storeless.flush_stable().await.unwrap(),
+            ApplyDurability::MemoryApplied
+        );
     }
 
     #[tokio::test]

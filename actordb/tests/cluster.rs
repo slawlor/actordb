@@ -16,7 +16,9 @@ use actordb::node::{
     WIRE_PROTOCOL_VERSION,
 };
 use actordb::proto::{Envelope, EnvelopeMsg, Hello, HelloAuth};
-use actordb::store::{KvStore, StoreError};
+use actordb::store::{
+    KvStore, PrefixDeleteOutcome, PrefixDeleteSupport, StoreCommitDurability, StoreError,
+};
 use prost::Message;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -160,6 +162,68 @@ struct ToggleFailStore {
     failing: AtomicBool,
     attempts: AtomicUsize,
     entries: StdMutex<HashMap<Vec<u8>, VersionedValue>>,
+}
+
+#[derive(Default)]
+struct RetirementStore {
+    entries: StdMutex<HashMap<Vec<u8>, VersionedValue>>,
+    delete_attempts: AtomicUsize,
+    fail_delete: AtomicBool,
+}
+
+impl RetirementStore {
+    fn fragment_is_empty(&self, fragment: u32) -> bool {
+        let prefix = fragment.to_be_bytes();
+        self.entries
+            .lock()
+            .unwrap()
+            .keys()
+            .all(|key| !key.starts_with(&prefix))
+    }
+}
+
+impl KvStore for RetirementStore {
+    fn load(&self) -> Result<Vec<(Vec<u8>, VersionedValue)>, StoreError> {
+        Ok(self
+            .entries
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect())
+    }
+
+    fn write_batch(&self, writes: &[(Vec<u8>, VersionedValue)]) -> Result<(), StoreError> {
+        let mut entries = self.entries.lock().unwrap();
+        for (key, value) in writes {
+            entries.insert(key.clone(), value.clone());
+        }
+        Ok(())
+    }
+
+    fn commit_durability(&self) -> StoreCommitDurability {
+        StoreCommitDurability::Stable
+    }
+
+    fn stable_fence(&self) -> Result<StoreCommitDurability, StoreError> {
+        Ok(StoreCommitDurability::Stable)
+    }
+
+    fn prefix_delete_support(&self) -> PrefixDeleteSupport {
+        PrefixDeleteSupport::Supported
+    }
+
+    fn delete_prefix(&self, prefix: &[u8]) -> Result<PrefixDeleteOutcome, StoreError> {
+        self.delete_attempts.fetch_add(1, Ordering::SeqCst);
+        if self.fail_delete.load(Ordering::SeqCst) {
+            return Err(StoreError("injected prefix deletion failure".to_string()));
+        }
+        self.entries
+            .lock()
+            .unwrap()
+            .retain(|key, _| !key.starts_with(prefix));
+        Ok(PrefixDeleteOutcome::Deleted)
+    }
 }
 
 impl Default for ToggleFailStore {
@@ -6669,6 +6733,272 @@ async fn placement_migration_no_lost_writes() {
     b.shutdown().await.unwrap();
 }
 
+/// RocksDB prefix retirement is destructive only after the replacement
+/// replica completes an exact stable-storage handoff. Reopening the retired
+/// source must not expose any fragment data, while reopening the destination
+/// must recover the migrated value from its stable handoff.
+#[cfg(feature = "rocksdb")]
+#[tokio::test]
+async fn placement_retires_rocksdb_prefix_after_stable_handoff() {
+    use actordb::placement::{FragmentPlacementState, ManualPlacement};
+    use actordb::replication::SenderConfig;
+    use actordb::shard::FragmentId;
+    use actordb::store::{PrefixedStore, RocksDbStore, StoreIdentity};
+
+    let fragment = FragmentId(0);
+    let controller = Arc::new(ManualPlacement::new(HashMap::from([(
+        fragment,
+        vec!["rocks-source".to_string()],
+    )])));
+    let source_dir = tempfile::tempdir().unwrap();
+    let target_dir = tempfile::tempdir().unwrap();
+
+    let config = |path: &std::path::Path| {
+        let mut config = NodeConfig::with_rocksdb(path).unwrap();
+        config.placement_controller = Some(controller.clone());
+        config.placement_poll_interval = Duration::from_millis(25);
+        config.placement_drain_warn_interval = Duration::from_millis(100);
+        config.snapshot_interval = Duration::from_secs(3600);
+        config.clean_interval = Duration::from_secs(3600);
+        config.replication = SenderConfig {
+            batch_interval: Duration::from_millis(10),
+            consistency_interval: Duration::from_millis(100),
+            ..SenderConfig::default()
+        };
+        config
+    };
+
+    let source = Node::start(
+        "rocks-source".to_string(),
+        "127.0.0.1:0".parse().unwrap(),
+        config(source_dir.path()),
+    )
+    .await
+    .unwrap();
+    let target = Node::start(
+        "rocks-target".to_string(),
+        "127.0.0.1:0".parse().unwrap(),
+        config(target_dir.path()),
+    )
+    .await
+    .unwrap();
+    source.connect(target.addr()).await.unwrap();
+    common::wait_for(
+        || async { source.peer_count().await == 1 && target.peer_count().await == 1 },
+        Duration::from_secs(5),
+    )
+    .await;
+    common::wait_for(
+        || async {
+            source.placement_report().await.states.get(&fragment)
+                == Some(&FragmentPlacementState::Serving)
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    source
+        .put("durable-migration-key".to_string(), b"value".to_vec())
+        .await
+        .unwrap();
+    controller.set_placement(HashMap::from([(
+        fragment,
+        vec!["rocks-source".to_string(), "rocks-target".to_string()],
+    )]));
+    common::wait_for(
+        || async {
+            target.placement_report().await.states.get(&fragment)
+                == Some(&FragmentPlacementState::Serving)
+        },
+        Duration::from_secs(20),
+    )
+    .await;
+
+    controller.set_placement(HashMap::from([(
+        fragment,
+        vec!["rocks-target".to_string()],
+    )]));
+    common::wait_for(
+        || async {
+            source.placement_report().await.states.get(&fragment)
+                == Some(&FragmentPlacementState::Stopped)
+        },
+        Duration::from_secs(20),
+    )
+    .await;
+    assert_eq!(
+        target
+            .get("durable-migration-key".to_string())
+            .await
+            .unwrap()
+            .map(|value| value.value),
+        Some(b"value".to_vec())
+    );
+
+    source.shutdown().await.unwrap();
+    drop(source);
+    let reopened = Arc::new(RocksDbStore::open(source_dir.path()).unwrap());
+    let _binding = reopened
+        .bind(&StoreIdentity::new("rocks-source".to_string(), 1))
+        .unwrap();
+    let retired_fragment = PrefixedStore::new(reopened, fragment);
+    assert!(retired_fragment.load().unwrap().is_empty());
+
+    target.shutdown().await.unwrap();
+    drop(target);
+    let reopened_target = Arc::new(RocksDbStore::open(target_dir.path()).unwrap());
+    let _target_binding = reopened_target
+        .bind(&StoreIdentity::new("rocks-target".to_string(), 1))
+        .unwrap();
+    let durable_target = PrefixedStore::new(reopened_target, fragment);
+    assert_eq!(
+        durable_target
+            .load()
+            .unwrap()
+            .into_iter()
+            .find(|(key, _)| key == b"durable-migration-key")
+            .map(|(_, value)| value.value),
+        Some(b"value".to_vec())
+    );
+}
+
+/// An ambiguous prefix-delete failure keeps the retired subtree owned and the
+/// lifecycle visibly Draining. A re-add after router detach retains the prefix
+/// and starts a fresh subtree; a later revocation retries deletion and may
+/// publish Stopped only after the backend confirms it.
+#[tokio::test]
+async fn placement_prefix_delete_failure_retries_before_stopped() {
+    use actordb::placement::{FragmentPlacementState, ManualPlacement};
+    use actordb::replication::SenderConfig;
+    use actordb::shard::FragmentId;
+
+    let fragment = FragmentId(0);
+    let controller = Arc::new(ManualPlacement::new(HashMap::from([(
+        fragment,
+        vec!["delete-source".to_string()],
+    )])));
+    let source_store = Arc::new(RetirementStore::default());
+    source_store.fail_delete.store(true, Ordering::SeqCst);
+    let target_store = Arc::new(RetirementStore::default());
+    let config = |store: Arc<RetirementStore>| NodeConfig {
+        store: Some(store),
+        placement_controller: Some(controller.clone()),
+        placement_poll_interval: Duration::from_millis(25),
+        placement_drain_warn_interval: Duration::from_millis(50),
+        snapshot_interval: Duration::from_secs(3600),
+        clean_interval: Duration::from_secs(3600),
+        replication: SenderConfig {
+            batch_interval: Duration::from_millis(10),
+            consistency_interval: Duration::from_millis(100),
+            ..SenderConfig::default()
+        },
+        ..NodeConfig::default()
+    };
+    let source = Node::start(
+        "delete-source".to_string(),
+        "127.0.0.1:0".parse().unwrap(),
+        config(source_store.clone()),
+    )
+    .await
+    .unwrap();
+    let target = Node::start(
+        "delete-target".to_string(),
+        "127.0.0.1:0".parse().unwrap(),
+        config(target_store),
+    )
+    .await
+    .unwrap();
+    source.connect(target.addr()).await.unwrap();
+    common::wait_for(
+        || async { source.peer_count().await == 1 && target.peer_count().await == 1 },
+        Duration::from_secs(5),
+    )
+    .await;
+    common::wait_for(
+        || async {
+            source.placement_report().await.states.get(&fragment)
+                == Some(&FragmentPlacementState::Serving)
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+    source
+        .put("delete-retry-key".to_string(), b"value".to_vec())
+        .await
+        .unwrap();
+
+    let overlap = HashMap::from([(
+        fragment,
+        vec!["delete-source".to_string(), "delete-target".to_string()],
+    )]);
+    let target_only = HashMap::from([(fragment, vec!["delete-target".to_string()])]);
+    controller.set_placement(overlap.clone());
+    common::wait_for(
+        || async {
+            target.placement_report().await.states.get(&fragment)
+                == Some(&FragmentPlacementState::Serving)
+        },
+        Duration::from_secs(20),
+    )
+    .await;
+    controller.set_placement(target_only.clone());
+    common::wait_for(
+        || async {
+            source_store.delete_attempts.load(Ordering::SeqCst) != 0
+                && source.placement_report().await.states.get(&fragment)
+                    == Some(&FragmentPlacementState::Draining)
+        },
+        Duration::from_secs(20),
+    )
+    .await;
+    assert!(!source_store.fragment_is_empty(fragment.0));
+
+    // The old subtree is already detached here. Changing placement must make
+    // the failing delete retain its namespace, stop, and bootstrap a fresh
+    // serving subtree instead of reviving the quiesced cache.
+    controller.set_placement(overlap);
+    common::wait_for(
+        || async {
+            source.placement_report().await.states.get(&fragment)
+                == Some(&FragmentPlacementState::Serving)
+        },
+        Duration::from_secs(20),
+    )
+    .await;
+    assert!(!source_store.fragment_is_empty(fragment.0));
+    assert_eq!(
+        source
+            .get("delete-retry-key".to_string())
+            .await
+            .unwrap()
+            .map(|value| value.value),
+        Some(b"value".to_vec())
+    );
+
+    source_store.fail_delete.store(false, Ordering::SeqCst);
+    controller.set_placement(target_only);
+    common::wait_for(
+        || async {
+            source.placement_report().await.states.get(&fragment)
+                == Some(&FragmentPlacementState::Stopped)
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+    assert!(source_store.fragment_is_empty(fragment.0));
+    assert_eq!(
+        target
+            .get("delete-retry-key".to_string())
+            .await
+            .unwrap()
+            .map(|value| value.value),
+        Some(b"value".to_vec())
+    );
+
+    source.shutdown().await.unwrap();
+    target.shutdown().await.unwrap();
+}
+
 /// A sender awaiting overflow reconciliation is not drained merely because
 /// its ordinary buffer and in-flight batch count are both zero. Placement
 /// revocation must keep the fragment subtree alive past the warning threshold
@@ -6967,11 +7297,13 @@ async fn placement_readd_while_draining_cancels_teardown() {
         FragmentId(0),
         vec!["readd-a".to_string()],
     )])));
+    let retirement_store = Arc::new(RetirementStore::default());
     let node = Node::start(
         "readd-a".to_string(),
         "127.0.0.1:0".parse().unwrap(),
         NodeConfig {
             placement_controller: Some(controller.clone()),
+            store: Some(retirement_store),
             placement_poll_interval: Duration::from_millis(25),
             placement_drain_warn_interval: Duration::from_millis(100),
             replication: SenderConfig {
@@ -7679,7 +8011,7 @@ async fn hello_auth_mismatch_drops_connection() {
 /// installation.
 #[tokio::test]
 async fn incompatible_hello_capabilities_are_rejected() {
-    use actordb::node::CAPABILITY_BYTE_BOUNDED_BATCHES;
+    use actordb::node::{CAPABILITY_BYTE_BOUNDED_BATCHES, CAPABILITY_STABLE_DURABILITY_ACKS};
     use actordb::proto::{EnvelopeMsg, Hello};
 
     let node = test_node("capability-server").await;
@@ -7693,6 +8025,13 @@ async fn incompatible_hello_capabilities_are_rejected() {
             min_protocol_version: WIRE_PROTOCOL_VERSION,
             max_protocol_version: WIRE_PROTOCOL_VERSION,
             capabilities: REQUIRED_WIRE_CAPABILITIES & !CAPABILITY_BYTE_BOUNDED_BATCHES,
+            ..Hello::default()
+        },
+        Hello {
+            node_id: "no-stable-fence-peer".to_string(),
+            min_protocol_version: WIRE_PROTOCOL_VERSION,
+            max_protocol_version: WIRE_PROTOCOL_VERSION,
+            capabilities: REQUIRED_WIRE_CAPABILITIES & !CAPABILITY_STABLE_DURABILITY_ACKS,
             ..Hello::default()
         },
     ];
