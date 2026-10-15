@@ -106,16 +106,25 @@ authoritative and tears down local state for revoked fragments.
 
 **Losing a fragment** (`lose_fragment`):
 
-1. Remove from the serving set first — new local ops forward to the new owner.
-   State becomes `Draining`.
+1. Take the fragment's exclusive mutation-admission lease, wait for mutations
+   that already chose this owner to finish apply plus replication fan-out, then
+   remove the fragment from the serving set. New mutations acquire their lease
+   afterward, observe revocation, and forward to the new owner. State becomes
+   `Draining`.
 2. Ensure senders to the current replicas so queued ops drain out.
-3. Wait until every sender report for the fragment shows
-   `buffered == 0 && in_flight == 0` and is not in `BufferReset`. There is no
-   destructive timeout: warnings repeat at `placement_drain_warn_interval`,
-   and a placement reversal restores `Serving` instead of allowing stale
-   teardown.
-4. Stop the supervisor subtree (dispatcher drains its pools and flushes),
-   remove the router entry, drop all sender state. State becomes `Stopped`.
+3. Wait until every bounded sender ingress lane is empty, every issued overflow
+   generation has completed correlated reset reconciliation, and every sender
+   report shows `buffered == 0 && in_flight == 0` outside `BufferReset`. There
+   is no destructive timeout: warnings repeat at
+   `placement_drain_warn_interval`, and a placement reversal restores
+   `Serving` instead of allowing stale teardown.
+4. Under the placement commit lock, revalidate the authoritative map and the
+   exact sender/report set, take the exclusive mutation lease (including
+   inbound replication), synchronously request sender stop, and detach the
+   router before any teardown wait. Then await sender exit and stop the
+   supervisor subtree (the dispatcher flushes). A re-add before this commit
+   restores the existing subtree; one after it waits for `Stopped` and performs
+   a clean bootstrap. State becomes `Stopped`.
 
 **Overlap-window safety.** While peers' maps transiently disagree, a node that
 receives an op for a fragment it no longer serves **re-forwards** it

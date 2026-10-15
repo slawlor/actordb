@@ -62,7 +62,11 @@ Shed behavior by operation:
   worker and did not apply.
 - **Replicated/reconciled write** → currently bypasses admission control. This
   avoids shedding an operation that the receiver must account for before ACK,
-  but means the actor mailbox itself is not yet a bounded replication queue.
+  but means the actor mailbox itself is not yet a node-wide bounded
+  replication queue. Each connection awaits replication and legacy sync
+  applies sequentially, and each outbound Node sender now has bounded mutation
+  and control lanes; those count bounds do not constitute a receiver-side byte
+  budget across connections.
 - **Forwarded client write** → the remote owner returns an ordered typed
   mutation result. A shed single put or batch entry reaches the origin as
   `NodeError::Backpressure`; it is never reported as success.

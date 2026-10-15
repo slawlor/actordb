@@ -11,6 +11,12 @@ admission and shed counting, token-bucket behavior, seahash fragment mapping,
 and store encode/decode round-trips. These pin the semantics that the
 integration tests rely on.
 
+Bounded replication-ingress unit tests additionally pin that a full mutation
+lane publishes a persistent reset generation, that the independent control
+lane fails fast at its cap, and that peer/reconcile signals remain available.
+The placement lease test proves revocation waits for an already-admitted
+mutation before changing the serving decision.
+
 ## Integration tests (`actordb/tests/cluster.rs`)
 
 The cluster suite runs over real TCP on localhost with multiple `Node`s in one
@@ -22,7 +28,8 @@ process — the bulk of behavioral coverage:
   `disjoint_fragments_route_to_owner`, `replica_fanout_reaches_other_holder`.
 - **Failures**: `dropped_connection_redials`,
   `restarted_node_writes_are_accepted`, `late_joiner_receives_full_state`,
-  `worker_kill_triggers_supervised_restart`.
+  `worker_kill_triggers_supervised_restart`, and
+  `incompatible_hello_capabilities_are_rejected`.
 - **TTL/tombstones**: `ttl_expiry_removes_key`,
   `ttl_expiry_is_persisted_as_a_versioned_tombstone`,
   `ttl_expiry_does_not_resurrect_an_older_partitioned_value`,

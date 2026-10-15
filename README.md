@@ -161,6 +161,7 @@ use std::time::Duration;
 
 let runtime = NodeRuntimeOptions::default()
     .with_peer_queue_frame_capacity(512)
+    .with_replication_control_message_capacity(128)
     .with_queue_admission_timeout(Duration::from_secs(2))
     .with_forwarded_attempt_timeout(Duration::from_secs(8))
     .with_socket_write_timeout(Duration::from_secs(20))
@@ -175,10 +176,13 @@ let node = Node::start_with_options(
 .await?;
 ```
 
-The defaults are a 256-frame queue per peer, 5 seconds to reserve a queue
-slot, 5 seconds total for each forwarded owner attempt (enqueue plus response),
-30 seconds for one socket frame write, and 30 seconds for an acceptable
-ordinary replication ACK. Reconciliation barriers use
+The defaults are a 256-frame queue per peer, 64 protocol-control messages per
+fragment/peer sender, 5 seconds to reserve a queue slot, 5 seconds total for
+each forwarded owner attempt (enqueue plus response), 30 seconds for one
+socket frame write, and 30 seconds for an acceptable ordinary replication ACK.
+Locally applied mutations have a separate per-sender ingress lane sized by
+`SenderConfig::buffer_capacity`; saturation schedules lossless reset
+reconciliation without blocking the write path. Reconciliation barriers use
 `SenderConfig::reconcile_timeout` instead of the ordinary ACK timeout. The
 queue limit counts frames, not encoded bytes.
 
@@ -372,30 +376,39 @@ as issues in the [issue tracker](https://github.com/slawlor/actordb/issues):
 - **Persistence is opt-in** — pass a `store` in `NodeConfig` for
   durability; without it the dataset lives in memory and a restart
   wipes it (recoverable only via peer sync).
-- **No TLS** — plaintext TCP. Handshake authentication via a
-  pre-shared cluster secret (`NodeConfig::cluster_secret`): when set,
-  every `Hello` carries an HMAC-SHA256(secret, node_id) tag, mismatches
-  drop the connection, and non-`Hello` messages arriving before a
-  completed handshake are ignored. Without a secret the mesh is
-  unauthenticated (a warning is logged at startup).
+- **No TLS or replay-resistant peer identity** — plaintext TCP. A non-empty
+  pre-shared `NodeConfig::cluster_secret` adds a static HMAC-SHA256 tag over a
+  Hello's identity, protocol range, and capabilities; mismatches drop the
+  connection and pre-Hello messages are ignored. The tag has no fresh
+  challenge, so a captured Hello can be replayed to impersonate its node. Use a
+  protected custom `Network` transport when peer identity matters.
 - **Full-state handshake anti-entropy** — in static mode every
   handshake ships the whole dataset (tombstones included);
   steady-state replication is incremental (batches + reconciliation).
   With dynamic placement enabled the handshake skips the full-state
   sync and the reconciler owns anti-entropy (delta-only).
-- **Transport bounds are frame-count based** — the shared per-peer outbound
+- **Transport bounds are count based** — the shared per-peer outbound
   queue defaults to 256 frames, not a byte budget, and a single accepted frame
   can approach 16 MiB. Queue admission and socket writes have bounded waits;
-  expiry cancels the connection so the dialer can reconnect. Receiver
-  mailboxes are not byte-bounded either, and the command mailbox feeding each
-  sender's bounded owned deque is still unbounded. Reconciliation fetches use
-  500-key chunks, but the summary and encoded byte size are not paginated yet.
+  expiry cancels the connection so the dialer can reconnect. Each Node sender
+  has a bounded mutation lane and a separate bounded protocol-control lane;
+  mutation overflow advances a persistent reset generation, while control
+  overflow closes the contributing connection for replay. These are item-count
+  bounds, not byte bounds: receiver actor mailboxes and individual values or
+  control frames are not byte-budgeted. Reconciliation fetches use 500-key
+  chunks, but the summary and encoded byte size are not paginated yet. Accepted
+  connection tasks are also not yet capped or reaped until shutdown, and a
+  pre-Hello socket currently has no handshake deadline.
 - **Fan-out is sequential** — remote fragment groups and their replica-holder
   attempts are currently awaited one at a time. Operation priority chooses the
   destination actor pool but does not schedule the shared socket queue.
-- **Wire upgrades must be coordinated** — `Hello` does not yet negotiate
-  protocol capabilities. The mutation-response and durability-ACK fields fail
-  closed across old/new peers rather than silently claiming success.
+- **Wire upgrades are negotiated but coordinated** — `Hello` advertises an
+  inclusive protocol-version range and required capability bits for exact
+  mutation results, durability ACKs, and correlated reconciliation. Missing or
+  incompatible fields fail closed before peer installation. When configured,
+  the static Hello HMAC also binds the range and bits against rewriting (but
+  remains replayable as described above). The current binary supports one wire
+  version, so deploy compatible binaries together.
 - **Tombstones are retained** — `Node::start` rejects every
   `tombstone_gc_age: Some(..)` setting. Safe reclamation needs durable
   per-replica convergence evidence plus a durable store delete path; elapsed

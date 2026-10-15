@@ -9,7 +9,9 @@ use std::sync::{Arc, Condvar, Mutex as StdMutex};
 use std::time::Duration;
 
 use actordb::actor::{now_ms, VersionedValue};
-use actordb::node::{Node, NodeConfig, NodeRuntimeOptions};
+use actordb::node::{
+    Node, NodeConfig, NodeRuntimeOptions, REQUIRED_WIRE_CAPABILITIES, WIRE_PROTOCOL_VERSION,
+};
 use actordb::proto::Envelope;
 use actordb::store::{KvStore, StoreError};
 use prost::Message;
@@ -201,11 +203,16 @@ async fn invalid_zero_sized_replication_and_placement_config_is_rejected() {
     in_flight_zero.replication.max_in_flight = 0;
     let mut reconcile_zero = NodeConfig::default();
     reconcile_zero.replication.reconcile_timeout = Duration::ZERO;
+    let empty_cluster_secret = NodeConfig {
+        cluster_secret: Some(Vec::new()),
+        ..NodeConfig::default()
+    };
 
     for (id, config) in [
         ("invalid-batch", batch_zero),
         ("invalid-in-flight", in_flight_zero),
         ("invalid-reconcile", reconcile_zero),
+        ("invalid-empty-cluster-secret", empty_cluster_secret),
     ] {
         assert!(matches!(
             Node::start(id.to_string(), "127.0.0.1:0".parse().unwrap(), config).await,
@@ -241,6 +248,10 @@ async fn invalid_zero_sized_replication_and_placement_config_is_rejected() {
         (
             "invalid-peer-queue-capacity",
             NodeRuntimeOptions::default().with_peer_queue_frame_capacity(0),
+        ),
+        (
+            "invalid-replication-control-capacity",
+            NodeRuntimeOptions::default().with_replication_control_message_capacity(0),
         ),
         (
             "invalid-queue-admission-timeout",
@@ -361,7 +372,6 @@ async fn two_nodes_replicate() {
         Duration::from_secs(5),
     )
     .await;
-
     a.shutdown().await;
     b.shutdown().await;
 }
@@ -556,10 +566,73 @@ async fn late_joiner_receives_full_state() {
         Duration::from_secs(5),
     )
     .await;
+    assert!(c.sync_entries_applied() >= 1);
 
     a.shutdown().await;
     b.shutdown().await;
     c.shutdown().await;
+}
+
+#[tokio::test]
+async fn failed_full_state_sync_is_not_counted_and_retries_by_disconnect() {
+    use actordb::proto::{EnvelopeMsg, Hello, SyncEntry, SyncResponse};
+
+    let node = Node::start(
+        "sync-failure-receiver".to_string(),
+        "127.0.0.1:0".parse().unwrap(),
+        NodeConfig {
+            store: Some(Arc::new(AlwaysFailStore)),
+            flush_batch_size: 1,
+            ..NodeConfig::default()
+        },
+    )
+    .await
+    .unwrap();
+    let mut stream = tokio::net::TcpStream::connect(node.addr()).await.unwrap();
+    send_frame(
+        &mut stream,
+        Envelope {
+            msg: Some(EnvelopeMsg::Hello(Hello {
+                node_id: "raw-sync-source".to_string(),
+                auth_tag: Vec::new(),
+                min_protocol_version: WIRE_PROTOCOL_VERSION,
+                max_protocol_version: WIRE_PROTOCOL_VERSION,
+                capabilities: REQUIRED_WIRE_CAPABILITIES,
+            })),
+        },
+    )
+    .await;
+    loop {
+        if matches!(
+            recv_frame(&mut stream).await.msg,
+            Some(EnvelopeMsg::SessionStart(_))
+        ) {
+            break;
+        }
+    }
+    send_frame(
+        &mut stream,
+        Envelope {
+            msg: Some(EnvelopeMsg::SyncResponse(SyncResponse {
+                entries: vec![SyncEntry {
+                    key: "failed-sync".to_string(),
+                    value: b"value".to_vec(),
+                    timestamp_ms: now_ms(),
+                    node_id: "raw-sync-source".to_string(),
+                    expires_at_ms: 0,
+                    is_tombstone: false,
+                }],
+            })),
+        },
+    )
+    .await;
+    let mut remainder = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut remainder))
+        .await
+        .expect("failed sync did not close for retry")
+        .unwrap();
+    assert_eq!(node.sync_entries_applied(), 0);
+    node.shutdown().await;
 }
 
 #[cfg(feature = "rocksdb")]
@@ -1635,6 +1708,9 @@ async fn stale_reconcile_round_cannot_complete_live_reset() {
             msg: Some(EnvelopeMsg::Hello(Hello {
                 node_id: "raw-reset-peer".to_string(),
                 auth_tag: Vec::new(),
+                min_protocol_version: WIRE_PROTOCOL_VERSION,
+                max_protocol_version: WIRE_PROTOCOL_VERSION,
+                capabilities: REQUIRED_WIRE_CAPABILITIES,
             })),
         },
     )
@@ -1851,6 +1927,9 @@ async fn placement_bootstrap_fetch_requires_verification_round() {
             msg: Some(EnvelopeMsg::Hello(Hello {
                 node_id: "raw-bootstrap-source".to_string(),
                 auth_tag: Vec::new(),
+                min_protocol_version: WIRE_PROTOCOL_VERSION,
+                max_protocol_version: WIRE_PROTOCOL_VERSION,
+                capabilities: REQUIRED_WIRE_CAPABILITIES,
             })),
         },
     )
@@ -2052,6 +2131,9 @@ async fn silent_reconcile_phase_times_out_and_retries() {
             msg: Some(EnvelopeMsg::Hello(Hello {
                 node_id: "raw-timeout-peer".to_string(),
                 auth_tag: Vec::new(),
+                min_protocol_version: WIRE_PROTOCOL_VERSION,
+                max_protocol_version: WIRE_PROTOCOL_VERSION,
+                capabilities: REQUIRED_WIRE_CAPABILITIES,
             })),
         },
     )
@@ -2151,6 +2233,9 @@ async fn inbound_mutation_after_snapshot_invalidates_reset_completion() {
             msg: Some(EnvelopeMsg::Hello(Hello {
                 node_id: "raw-revision-peer".to_string(),
                 auth_tag: Vec::new(),
+                min_protocol_version: WIRE_PROTOCOL_VERSION,
+                max_protocol_version: WIRE_PROTOCOL_VERSION,
+                capabilities: REQUIRED_WIRE_CAPABILITIES,
             })),
         },
     )
@@ -2317,6 +2402,9 @@ async fn malformed_reconcile_data_is_rejected_and_retried() {
             msg: Some(EnvelopeMsg::Hello(Hello {
                 node_id: "raw-data-peer".to_string(),
                 auth_tag: Vec::new(),
+                min_protocol_version: WIRE_PROTOCOL_VERSION,
+                max_protocol_version: WIRE_PROTOCOL_VERSION,
+                capabilities: REQUIRED_WIRE_CAPABILITIES,
             })),
         },
     )
@@ -2472,6 +2560,9 @@ async fn stale_session_batches_discarded() {
             msg: Some(EnvelopeMsg::Hello(Hello {
                 node_id: "raw-stale-peer".to_string(),
                 auth_tag: Vec::new(),
+                min_protocol_version: WIRE_PROTOCOL_VERSION,
+                max_protocol_version: WIRE_PROTOCOL_VERSION,
+                capabilities: REQUIRED_WIRE_CAPABILITIES,
             })),
         },
     )
@@ -2512,6 +2603,82 @@ async fn stale_session_batches_discarded() {
 }
 
 #[tokio::test]
+async fn session_start_for_unhosted_fragment_is_not_admitted() {
+    use actordb::proto::{
+        EnvelopeMsg, Hello, ReplicateBatch, ReplicateOp, ReplicationAckLevel, SessionStart,
+    };
+
+    let node = test_node("session-bound-receiver").await;
+    let mut stream = tokio::net::TcpStream::connect(node.addr()).await.unwrap();
+    send_frame(
+        &mut stream,
+        Envelope {
+            msg: Some(EnvelopeMsg::Hello(Hello {
+                node_id: "unhosted-session-peer".to_string(),
+                auth_tag: Vec::new(),
+                min_protocol_version: WIRE_PROTOCOL_VERSION,
+                max_protocol_version: WIRE_PROTOCOL_VERSION,
+                capabilities: REQUIRED_WIRE_CAPABILITIES,
+            })),
+        },
+    )
+    .await;
+    loop {
+        if matches!(
+            recv_frame(&mut stream).await.msg,
+            Some(EnvelopeMsg::SessionStart(_))
+        ) {
+            break;
+        }
+    }
+
+    let invalid_fragment = u32::MAX;
+    send_frame(
+        &mut stream,
+        Envelope {
+            msg: Some(EnvelopeMsg::SessionStart(SessionStart {
+                session_id: 77,
+                fragment: invalid_fragment,
+            })),
+        },
+    )
+    .await;
+    send_frame(
+        &mut stream,
+        Envelope {
+            msg: Some(EnvelopeMsg::ReplicateBatch(ReplicateBatch {
+                session_id: 77,
+                batch_seq: 1,
+                fragment: invalid_fragment,
+                ops: vec![ReplicateOp {
+                    key: "never-admitted".to_string(),
+                    value: b"bad".to_vec(),
+                    timestamp_ms: now_ms(),
+                    node_id: "unhosted-session-peer".to_string(),
+                    seq: 1,
+                    boot_id: 1,
+                    expires_at_ms: 0,
+                    is_tombstone: false,
+                }],
+                required_ack_level: ReplicationAckLevel::Applied as i32,
+            })),
+        },
+    )
+    .await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), recv_frame(&mut stream))
+            .await
+            .is_err()
+    );
+    assert!(node
+        .get("never-admitted".to_string())
+        .await
+        .unwrap()
+        .is_none());
+    node.shutdown().await;
+}
+
+#[tokio::test]
 async fn current_session_rejects_far_future_timestamp() {
     use actordb::proto::{
         Envelope, EnvelopeMsg, Hello, ReplicateBatch, ReplicateOp, ReplicationAckLevel,
@@ -2526,6 +2693,9 @@ async fn current_session_rejects_far_future_timestamp() {
             msg: Some(EnvelopeMsg::Hello(Hello {
                 node_id: "raw-peer".to_string(),
                 auth_tag: Vec::new(),
+                min_protocol_version: WIRE_PROTOCOL_VERSION,
+                max_protocol_version: WIRE_PROTOCOL_VERSION,
+                capabilities: REQUIRED_WIRE_CAPABILITIES,
             })),
         },
         Envelope {
@@ -3208,7 +3378,7 @@ async fn placement_migration_no_lost_writes() {
         .filter(|k| fragment_of(k, frag_count) == FragmentId(0))
         .take(12)
         .collect();
-    assert!(!keys.is_empty(), "need keys in fragment 0");
+    assert!(keys.len() >= 2, "need at least two keys in fragment 0");
 
     // Seed initial values via A.
     for k in &keys {
@@ -3311,6 +3481,21 @@ async fn placement_migration_no_lost_writes() {
     )
     .await;
 
+    // Once A has retired the fragment, a grouped write must travel through
+    // B's dynamic BatchPut mutation lease as one ownership decision.
+    let migrated_batch = vec![
+        (keys[0].clone(), b"batch-after-move-0".to_vec()),
+        (keys[1].clone(), b"batch-after-move-1".to_vec()),
+    ];
+    let batch_results = a.put_multi(migrated_batch.clone()).await;
+    assert!(batch_results.into_iter().all(|result| result.is_ok()));
+    for (key, expected_value) in migrated_batch {
+        assert_eq!(
+            b.get(key).await.unwrap().map(|value| value.value),
+            Some(expected_value)
+        );
+    }
+
     a.shutdown().await;
     b.shutdown().await;
 }
@@ -3362,6 +3547,9 @@ async fn placement_drain_waits_for_buffer_reset() {
             msg: Some(EnvelopeMsg::Hello(Hello {
                 node_id: "raw-drain-peer".to_string(),
                 auth_tag: Vec::new(),
+                min_protocol_version: WIRE_PROTOCOL_VERSION,
+                max_protocol_version: WIRE_PROTOCOL_VERSION,
+                capabilities: REQUIRED_WIRE_CAPABILITIES,
             })),
         },
     )
@@ -3520,6 +3708,9 @@ async fn placement_readd_while_draining_cancels_teardown() {
             msg: Some(EnvelopeMsg::Hello(Hello {
                 node_id: "raw-readd-peer".to_string(),
                 auth_tag: Vec::new(),
+                min_protocol_version: WIRE_PROTOCOL_VERSION,
+                max_protocol_version: WIRE_PROTOCOL_VERSION,
+                capabilities: REQUIRED_WIRE_CAPABILITIES,
             })),
         },
     )
@@ -3880,6 +4071,9 @@ async fn hello_auth_mismatch_drops_connection() {
         msg: Some(EnvelopeMsg::Hello(Hello {
             node_id: "b".to_string(),
             auth_tag: b"wrong-tag".to_vec(),
+            min_protocol_version: WIRE_PROTOCOL_VERSION,
+            max_protocol_version: WIRE_PROTOCOL_VERSION,
+            capabilities: REQUIRED_WIRE_CAPABILITIES,
         })),
     }
     .encode(&mut buf)
@@ -3901,6 +4095,48 @@ async fn hello_auth_mismatch_drops_connection() {
     a.shutdown().await;
 }
 
+/// A peer must explicitly negotiate the wire version and every semantic bit
+/// relied on by mutation and replication acknowledgements. Fieldless legacy
+/// Hellos and partial capability sets fail closed before peer installation.
+#[tokio::test]
+async fn incompatible_hello_capabilities_are_rejected() {
+    use actordb::node::CAPABILITY_DURABILITY_ACKS;
+    use actordb::proto::{EnvelopeMsg, Hello};
+
+    let node = test_node("capability-server").await;
+    let incompatible = [
+        Hello {
+            node_id: "legacy-peer".to_string(),
+            ..Hello::default()
+        },
+        Hello {
+            node_id: "partial-peer".to_string(),
+            min_protocol_version: WIRE_PROTOCOL_VERSION,
+            max_protocol_version: WIRE_PROTOCOL_VERSION,
+            capabilities: REQUIRED_WIRE_CAPABILITIES & !CAPABILITY_DURABILITY_ACKS,
+            ..Hello::default()
+        },
+    ];
+    for hello in incompatible {
+        let mut stream = tokio::net::TcpStream::connect(node.addr()).await.unwrap();
+        send_frame(
+            &mut stream,
+            Envelope {
+                msg: Some(EnvelopeMsg::Hello(hello)),
+            },
+        )
+        .await;
+        let mut read_buf = [0u8; 1];
+        let read = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut read_buf))
+            .await
+            .expect("incompatible Hello connection was not closed")
+            .unwrap();
+        assert_eq!(read, 0);
+    }
+    assert_eq!(node.peer_count().await, 0);
+    node.shutdown().await;
+}
+
 /// Regression test for adversarial review #4: a Hello claiming our own
 /// node_id must be rejected.
 #[tokio::test]
@@ -3915,6 +4151,9 @@ async fn hello_claiming_self_id_rejected() {
         msg: Some(EnvelopeMsg::Hello(Hello {
             node_id: "a".to_string(), // our own id!
             auth_tag: Vec::new(),
+            min_protocol_version: WIRE_PROTOCOL_VERSION,
+            max_protocol_version: WIRE_PROTOCOL_VERSION,
+            capabilities: REQUIRED_WIRE_CAPABILITIES,
         })),
     }
     .encode(&mut buf)
@@ -3947,6 +4186,9 @@ async fn second_hello_closes_established_connection() {
             msg: Some(EnvelopeMsg::Hello(Hello {
                 node_id: peer.to_string(),
                 auth_tag: Vec::new(),
+                min_protocol_version: WIRE_PROTOCOL_VERSION,
+                max_protocol_version: WIRE_PROTOCOL_VERSION,
+                capabilities: REQUIRED_WIRE_CAPABILITIES,
             })),
         }
         .encode(&mut encoded)
@@ -4000,6 +4242,9 @@ async fn same_session_replay_does_not_clear_reconcile_failure() {
             msg: Some(EnvelopeMsg::Hello(Hello {
                 node_id: "raw-poison-sender".to_string(),
                 auth_tag: Vec::new(),
+                min_protocol_version: WIRE_PROTOCOL_VERSION,
+                max_protocol_version: WIRE_PROTOCOL_VERSION,
+                capabilities: REQUIRED_WIRE_CAPABILITIES,
             })),
         },
     )
@@ -4408,6 +4653,9 @@ async fn ordinary_ack_timeout_rotates_session_and_replays_exact_batch() {
             msg: Some(EnvelopeMsg::Hello(Hello {
                 node_id: "raw-ack-timeout-peer".to_string(),
                 auth_tag: Vec::new(),
+                min_protocol_version: WIRE_PROTOCOL_VERSION,
+                max_protocol_version: WIRE_PROTOCOL_VERSION,
+                capabilities: REQUIRED_WIRE_CAPABILITIES,
             })),
         },
     )
@@ -4557,6 +4805,9 @@ async fn older_batch_timeout_replays_only_the_unacknowledged_batch() {
             msg: Some(EnvelopeMsg::Hello(Hello {
                 node_id: "raw-out-of-order-ack-peer".to_string(),
                 auth_tag: Vec::new(),
+                min_protocol_version: WIRE_PROTOCOL_VERSION,
+                max_protocol_version: WIRE_PROTOCOL_VERSION,
+                capabilities: REQUIRED_WIRE_CAPABILITIES,
             })),
         },
     )
@@ -4722,6 +4973,9 @@ async fn weak_ack_does_not_prevent_timeout_and_exact_replay() {
             msg: Some(EnvelopeMsg::Hello(Hello {
                 node_id: "raw-weak-ack-peer".to_string(),
                 auth_tag: Vec::new(),
+                min_protocol_version: WIRE_PROTOCOL_VERSION,
+                max_protocol_version: WIRE_PROTOCOL_VERSION,
+                capabilities: REQUIRED_WIRE_CAPABILITIES,
             })),
         },
     )
@@ -5026,6 +5280,9 @@ async fn fetched_reconcile_value_retries_failed_local_store_fence() {
             msg: Some(EnvelopeMsg::Hello(Hello {
                 node_id: "raw-fetch-peer".to_string(),
                 auth_tag: Vec::new(),
+                min_protocol_version: WIRE_PROTOCOL_VERSION,
+                max_protocol_version: WIRE_PROTOCOL_VERSION,
+                capabilities: REQUIRED_WIRE_CAPABILITIES,
             })),
         },
     )

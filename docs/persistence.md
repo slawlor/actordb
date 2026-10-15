@@ -104,6 +104,14 @@ but `kill -9` can lose the unflushed write-buffer tail. Recovery for that tail
 comes from peer sync on reconnect — which is why production deployments want
 at least two replicas per fragment.
 
+Sender-ingress overflow recovery reads this same authoritative cache and
+revision; it never clears the persistence buffer. Because overflow commands
+represent writes that have already merged locally, a correlated reset can
+reconstruct their current LWW winners and tombstones. That mechanism bounds
+asynchronous fan-out memory but does not strengthen origin crash durability:
+a storeless or unflushed origin can still fail before any peer receives the
+snapshot.
+
 ## Clock recovery and timestamp admission
 
 Each fragment load reports the highest persisted `timestamp_ms` to the

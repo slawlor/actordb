@@ -36,6 +36,7 @@ async fn main() -> Result<(), actordb::node::NodeError> {
 
   let runtime = NodeRuntimeOptions::default()
       .with_peer_queue_frame_capacity(512)
+      .with_replication_control_message_capacity(128)
       .with_queue_admission_timeout(Duration::from_secs(2))
       .with_forwarded_attempt_timeout(Duration::from_secs(8))
       .with_socket_write_timeout(Duration::from_secs(20))
@@ -49,17 +50,19 @@ async fn main() -> Result<(), actordb::node::NodeError> {
   .await?;
   ```
 
-  Defaults are 256 queued frames per peer, 5 seconds for queue admission,
-  5 seconds total per forwarded owner attempt (enqueue plus response), 30
-  seconds per socket frame write, and 30 seconds for an acceptable ordinary
-  replication ACK. All capacities/timeouts must be nonzero. The queue is
-  frame-bounded, not byte-bounded.
+  Defaults are 256 queued frames per peer, 64 protocol-control messages per
+  fragment/peer sender, 5 seconds for queue admission, 5 seconds total per
+  forwarded owner attempt (enqueue plus response), 30 seconds per socket frame
+  write, and 30 seconds for an acceptable ordinary replication ACK. Locally
+  applied mutations have a separate lane sized by
+  `SenderConfig::buffer_capacity`. All capacities/timeouts must be nonzero.
+  These are count bounds, not byte bounds.
 - `node.connect(peer_addr)` dials one peer. Dialing is best-effort and
   retried by the redial supervisor; dropping a connection triggers redial.
 - `node.id()`, `node.addr()`, `node.peer_count()` are the basic inspectors.
-- `node.shutdown().await` aborts connection tasks and stops each fragment
-  supervisor (each dispatcher drains its pools and flushes the store, releasing
-  the RocksDB lock).
+- `node.shutdown().await` aborts connection tasks, stops Node-owned replication
+  sender tasks, and stops each fragment supervisor (each dispatcher drains its
+  pools and flushes the store, releasing the RocksDB lock).
 
 ## Single-key operations
 

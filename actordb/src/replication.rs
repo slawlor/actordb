@@ -17,25 +17,31 @@
 //! ```
 //!
 //! - **Connected**: dequeued mutations (writes + tombstoned deletes)
-//!   accumulate in a bounded local buffer. The sender command mailbox that
-//!   feeds it is currently unbounded. The sender ships batches on a timer,
-//!   keeps a bounded number of batches in flight, and drops acked
-//!   records. Each sender↔receiver pairing gets a fresh `session_id`;
-//!   the receiver discards batches from stale sessions.
+//!   accumulate in a bounded local buffer. A [`crate::node::Node`] feeds it
+//!   through separate bounded data/control lanes plus persistent coalesced
+//!   recovery signals. The public standalone constructors retain their
+//!   source-compatible unbounded command channel. The sender ships batches on
+//!   a timer, keeps a bounded number of batches in flight, and drops acked
+//!   records. Each sender↔receiver pairing gets a fresh `session_id`; the
+//!   receiver discards batches from stale sessions.
 //! - **Disconnected**: the peer is down; the buffer is retained for
 //!   resume on reconnect.
-//! - **BufferReset**: the bounded buffer overflowed. The buffer is shed and,
+//! - **BufferReset**: bounded ingress or the owned buffer overflowed. The
+//!   overflowing command represents an already-applied mutation; a persistent
+//!   overflow generation is recorded, the buffer is shed, and,
 //!   if the transport is live, reconciliation starts immediately. Every
 //!   round is correlated to its session and round id, fetched values are
 //!   awaited locally, and a tracked empty batch fences outbound repairs
 //!   before the reset completes.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use ractor::rpc::CallResult;
-use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::sync::{mpsc, oneshot, watch, Mutex};
+use tokio::task::AbortHandle;
 use tokio::time::Instant;
 
 use crate::actor::{ApplyDurability, HlcClock, KvMessage, OpPriority, VersionedValue};
@@ -67,6 +73,7 @@ type QueueFailureHandler = Arc<dyn Fn(mpsc::Sender<Vec<u8>>) + Send + Sync>;
 pub struct SenderRuntimeOptions {
     ack_timeout: Duration,
     queue_admission_timeout: Duration,
+    control_channel_capacity: usize,
     queue_failure_handler: Option<QueueFailureHandler>,
 }
 
@@ -75,6 +82,7 @@ impl std::fmt::Debug for SenderRuntimeOptions {
         f.debug_struct("SenderRuntimeOptions")
             .field("ack_timeout", &self.ack_timeout)
             .field("queue_admission_timeout", &self.queue_admission_timeout)
+            .field("control_channel_capacity", &self.control_channel_capacity)
             .finish_non_exhaustive()
     }
 }
@@ -84,6 +92,7 @@ impl Default for SenderRuntimeOptions {
         Self {
             ack_timeout: Duration::from_secs(30),
             queue_admission_timeout: Duration::from_secs(5),
+            control_channel_capacity: 64,
             queue_failure_handler: None,
         }
     }
@@ -101,6 +110,8 @@ pub enum SenderOptionsError {
     ZeroMaxInFlight,
     /// No operation could be buffered before reset.
     ZeroBufferCapacity,
+    /// The Node mutation lane exceeds Tokio's supported bound.
+    BufferCapacityTooLarge,
     /// Periodic reconciliation would spin continuously.
     ZeroConsistencyInterval,
     /// A reconciliation phase would expire immediately.
@@ -113,6 +124,10 @@ pub enum SenderOptionsError {
     AckTimeoutTooLarge,
     /// The queue timeout cannot be represented by Tokio's clock.
     QueueAdmissionTimeoutTooLarge,
+    /// The Node-only control lane could never accept a protocol response.
+    ZeroControlChannelCapacity,
+    /// The Node-only control lane exceeds Tokio's supported bound.
+    ControlChannelCapacityTooLarge,
     /// The batch interval cannot be represented by Tokio's clock.
     BatchIntervalTooLarge,
     /// The consistency interval cannot be represented by Tokio's clock.
@@ -130,6 +145,9 @@ impl std::fmt::Display for SenderOptionsError {
             Self::ZeroBufferCapacity => {
                 write!(f, "replication buffer capacity must be non-zero")
             }
+            Self::BufferCapacityTooLarge => {
+                write!(f, "replication buffer capacity exceeds Tokio's maximum")
+            }
             Self::ZeroConsistencyInterval => {
                 write!(f, "replication consistency interval must be non-zero")
             }
@@ -146,6 +164,13 @@ impl std::fmt::Display for SenderOptionsError {
             Self::QueueAdmissionTimeoutTooLarge => {
                 write!(f, "replication queue admission timeout is too large")
             }
+            Self::ZeroControlChannelCapacity => {
+                write!(f, "replication control channel capacity must be non-zero")
+            }
+            Self::ControlChannelCapacityTooLarge => write!(
+                f,
+                "replication control channel capacity exceeds Tokio's maximum"
+            ),
             Self::BatchIntervalTooLarge => {
                 write!(f, "replication batch interval is too large")
             }
@@ -187,6 +212,11 @@ impl SenderRuntimeOptions {
         self.queue_admission_timeout
     }
 
+    pub(crate) fn with_control_channel_capacity(mut self, capacity: usize) -> Self {
+        self.control_channel_capacity = capacity;
+        self
+    }
+
     pub(crate) fn with_queue_failure_handler(mut self, handler: QueueFailureHandler) -> Self {
         self.queue_failure_handler = Some(handler);
         self
@@ -198,6 +228,12 @@ impl SenderRuntimeOptions {
         }
         if self.queue_admission_timeout.is_zero() {
             return Err(SenderOptionsError::ZeroQueueAdmissionTimeout);
+        }
+        if self.control_channel_capacity == 0 {
+            return Err(SenderOptionsError::ZeroControlChannelCapacity);
+        }
+        if self.control_channel_capacity > tokio::sync::Semaphore::MAX_PERMITS {
+            return Err(SenderOptionsError::ControlChannelCapacityTooLarge);
         }
         let now = Instant::now();
         if now.checked_add(self.ack_timeout).is_none() {
@@ -220,8 +256,10 @@ pub struct SenderConfig {
     pub batch_interval: Duration,
     /// Max batches in flight awaiting acks.
     pub max_in_flight: usize,
-    /// Max buffered (unshipped) ops per sender. Overflow sheds the
-    /// buffer and enters `BufferReset`.
+    /// Max buffered (unshipped) ops per sender. A [`crate::node::Node`] also
+    /// uses this as the capacity of the preceding local-mutation ingress lane.
+    /// Either overflow sheds queued history and enters `BufferReset`; recovery
+    /// reads the authoritative fragment snapshot.
     pub buffer_capacity: usize,
     /// How often a connected sender runs anti-entropy reconciliation
     /// to repair divergence.
@@ -283,11 +321,20 @@ impl SenderConfig {
         }
         Ok(())
     }
+
+    pub(crate) fn validate_node_ingress(&self) -> Result<(), SenderOptionsError> {
+        if self.buffer_capacity > tokio::sync::Semaphore::MAX_PERMITS {
+            return Err(SenderOptionsError::BufferCapacityTooLarge);
+        }
+        Ok(())
+    }
 }
 
 /// Messages driving a `ReplicationSender` (the task spawned by `spawn_sender`).
 pub enum SenderMsg {
-    /// A locally-applied mutation to replicate.
+    /// An already-applied mutation to replicate. Buffer-reset recovery reads
+    /// the authoritative fragment snapshot, so callers must not enqueue an
+    /// operation before its local merge has completed.
     Enqueue(crate::actor::ReplicatedOp),
     /// The peer (re)connected; start a new session on this channel.
     PeerConnected { peer_tx: mpsc::Sender<Vec<u8>> },
@@ -330,6 +377,242 @@ pub enum SenderMsg {
     /// Used by the Phase 8 placement driver to bootstrap a newly
     /// assigned fragment without waiting for the periodic timer.
     ReconcileNow,
+}
+
+#[derive(Clone, Default)]
+struct NodeSenderSignals {
+    overflow_generation: u64,
+    reconcile_generation: u64,
+    peer_generation: u64,
+    peer_tx: Option<mpsc::Sender<Vec<u8>>>,
+}
+
+#[derive(Default)]
+struct NodeSenderIngress {
+    pending_data: AtomicUsize,
+    settled_overflow_generation: AtomicU64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NodeSenderSendError {
+    Full,
+    Closed,
+}
+
+/// Node-owned bounded ingress for one replication sender.
+///
+/// The public standalone sender constructors intentionally keep returning
+/// their original unbounded Tokio sender for source compatibility. Nodes use
+/// this handle instead: locally applied mutations enter a bounded data lane,
+/// protocol responses enter a separate bounded control lane, and coalescible
+/// lifecycle/recovery signals remain available even when either lane is full.
+#[derive(Clone)]
+pub(crate) struct NodeSender {
+    data_tx: mpsc::Sender<crate::actor::ReplicatedOp>,
+    control_tx: mpsc::Sender<SenderMsg>,
+    signals_tx: watch::Sender<NodeSenderSignals>,
+    ingress: Arc<NodeSenderIngress>,
+    abort: AbortHandle,
+    stopped: watch::Receiver<bool>,
+    stop_lock: Arc<Mutex<()>>,
+}
+
+impl NodeSender {
+    pub(crate) fn send(&self, msg: SenderMsg) -> Result<(), NodeSenderSendError> {
+        if self.is_closed() {
+            return Err(NodeSenderSendError::Closed);
+        }
+        match msg {
+            SenderMsg::Enqueue(op) => self.send_data(op),
+            SenderMsg::PeerConnected { peer_tx } => {
+                self.signals_tx.send_if_modified(|signals| {
+                    if signals
+                        .peer_tx
+                        .as_ref()
+                        .map_or(false, |current| current.same_channel(&peer_tx))
+                    {
+                        return false;
+                    }
+                    signals.peer_generation = next_generation(signals.peer_generation);
+                    signals.peer_tx = Some(peer_tx);
+                    true
+                });
+                Ok(())
+            }
+            SenderMsg::PeerDisconnected { peer_tx } => {
+                self.signals_tx.send_if_modified(|signals| {
+                    if !signals
+                        .peer_tx
+                        .as_ref()
+                        .map_or(false, |current| current.same_channel(&peer_tx))
+                    {
+                        return false;
+                    }
+                    signals.peer_generation = next_generation(signals.peer_generation);
+                    signals.peer_tx = None;
+                    true
+                });
+                Ok(())
+            }
+            SenderMsg::ReconcileNow => {
+                self.signals_tx.send_modify(|signals| {
+                    signals.reconcile_generation = next_generation(signals.reconcile_generation);
+                });
+                Ok(())
+            }
+            control => self.send_control(control),
+        }
+    }
+
+    fn send_data(&self, op: crate::actor::ReplicatedOp) -> Result<(), NodeSenderSendError> {
+        self.ingress.pending_data.fetch_add(1, Ordering::AcqRel);
+        match self.data_tx.try_send(op) {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                self.ingress.pending_data.fetch_sub(1, Ordering::AcqRel);
+                self.schedule_reset();
+                Ok(())
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                self.ingress.pending_data.fetch_sub(1, Ordering::AcqRel);
+                Err(NodeSenderSendError::Closed)
+            }
+        }
+    }
+
+    fn send_control(&self, control: SenderMsg) -> Result<(), NodeSenderSendError> {
+        match self.control_tx.try_send(control) {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Full(_)) => Err(NodeSenderSendError::Full),
+            Err(mpsc::error::TrySendError::Closed(_)) => Err(NodeSenderSendError::Closed),
+        }
+    }
+
+    pub(crate) fn is_closed(&self) -> bool {
+        self.abort.is_finished() || self.data_tx.is_closed() || self.control_tx.is_closed()
+    }
+
+    pub(crate) fn schedule_reset(&self) {
+        self.signals_tx.send_modify(|signals| {
+            signals.overflow_generation = next_generation(signals.overflow_generation);
+        });
+    }
+
+    /// True only after every admitted data item has been reflected in a
+    /// published sender state and every coalesced overflow has completed its
+    /// correlated reset reconciliation.
+    pub(crate) fn ingress_is_idle(&self) -> bool {
+        let issued = self.signals_tx.borrow().overflow_generation;
+        self.ingress.pending_data.load(Ordering::Acquire) == 0
+            && self
+                .ingress
+                .settled_overflow_generation
+                .load(Ordering::Acquire)
+                == issued
+    }
+
+    pub(crate) fn request_stop(&self) {
+        self.abort.abort();
+    }
+
+    pub(crate) async fn stop(&self) {
+        // Serialize concurrent placement/shutdown removal so they wait on the
+        // same task completion instead of racing cloned watch receivers.
+        let _guard = self.stop_lock.lock().await;
+        self.request_stop();
+        let mut stopped = self.stopped.clone();
+        while !*stopped.borrow() {
+            if stopped.changed().await.is_err() {
+                break;
+            }
+        }
+    }
+}
+
+enum SenderInput {
+    Message(SenderMsg),
+    Data(crate::actor::ReplicatedOp, Arc<NodeSenderIngress>),
+    Overflow(u64, Arc<NodeSenderIngress>),
+    PeerChanged(Option<mpsc::Sender<Vec<u8>>>),
+    ReconcileNow,
+    Closed,
+}
+
+enum SenderInbox {
+    Legacy(mpsc::UnboundedReceiver<SenderMsg>),
+    Node {
+        data_rx: mpsc::Receiver<crate::actor::ReplicatedOp>,
+        control_rx: mpsc::Receiver<SenderMsg>,
+        signals_rx: watch::Receiver<NodeSenderSignals>,
+        delivered_overflow_generation: u64,
+        delivered_reconcile_generation: u64,
+        delivered_peer_generation: u64,
+        ingress: Arc<NodeSenderIngress>,
+    },
+}
+
+impl SenderInbox {
+    async fn recv(&mut self) -> SenderInput {
+        match self {
+            Self::Legacy(rx) => rx
+                .recv()
+                .await
+                .map(SenderInput::Message)
+                .unwrap_or(SenderInput::Closed),
+            Self::Node {
+                data_rx,
+                control_rx,
+                signals_rx,
+                delivered_overflow_generation,
+                delivered_reconcile_generation,
+                delivered_peer_generation,
+                ingress,
+            } => loop {
+                // Compare and advance each latest-value field independently.
+                // An unrelated update must never erase an overflow reset that
+                // was observed but has not yet reached the state machine.
+                let signals = signals_rx.borrow().clone();
+                if signals.overflow_generation != *delivered_overflow_generation {
+                    *delivered_overflow_generation = signals.overflow_generation;
+                    return SenderInput::Overflow(signals.overflow_generation, ingress.clone());
+                }
+                if signals.peer_generation != *delivered_peer_generation {
+                    *delivered_peer_generation = signals.peer_generation;
+                    return SenderInput::PeerChanged(signals.peer_tx);
+                }
+                if signals.reconcile_generation != *delivered_reconcile_generation {
+                    *delivered_reconcile_generation = signals.reconcile_generation;
+                    return SenderInput::ReconcileNow;
+                }
+                tokio::select! {
+                    biased;
+                    changed = signals_rx.changed() => {
+                        if changed.is_err() {
+                            return SenderInput::Closed;
+                        }
+                    }
+                    control = control_rx.recv() => {
+                        return control
+                            .map(SenderInput::Message)
+                            .unwrap_or(SenderInput::Closed);
+                    }
+                    data = data_rx.recv() => {
+                        return data
+                            .map(|op| SenderInput::Data(op, ingress.clone()))
+                            .unwrap_or(SenderInput::Closed);
+                    }
+                }
+            },
+        }
+    }
+}
+
+struct NodeSenderTaskExit(watch::Sender<bool>);
+
+impl Drop for NodeSenderTaskExit {
+    fn drop(&mut self) {
+        let _ = self.0.send(true);
+    }
 }
 
 /// Receiver guarantee attached to the most recent accepted batch ACK.
@@ -509,6 +792,9 @@ pub struct SenderDeps {
 
 /// Spawn a replication sender for (`fragment`, `peer_id`).
 ///
+/// This standalone compatibility API returns an unbounded command sender.
+/// [`crate::node::Node`] uses an internal bounded ingress handle instead.
+///
 /// # Panics
 ///
 /// Panics when `config` contains a zero or unrepresentable limit. Prefer
@@ -532,7 +818,8 @@ pub fn spawn_sender(
 /// Spawn a replication sender with explicit runtime liveness policy.
 ///
 /// [`spawn_sender`] remains the source-compatible default entry point. This
-/// variant validates both `config` and `options` before spawning the task.
+/// variant validates both `config` and `options` before spawning the task and
+/// retains the same unbounded command-channel return type.
 pub fn spawn_sender_with_options(
     fragment: FragmentId,
     peer_id: String,
@@ -543,8 +830,54 @@ pub fn spawn_sender_with_options(
     config.validate()?;
     options.validate()?;
     let (tx, rx) = mpsc::unbounded_channel();
-    tokio::spawn(sender_task(fragment, peer_id, config, deps, options, rx));
+    tokio::spawn(sender_task(
+        fragment,
+        peer_id,
+        config,
+        deps,
+        options,
+        SenderInbox::Legacy(rx),
+    ));
     Ok(tx)
+}
+
+pub(crate) fn spawn_node_sender(
+    fragment: FragmentId,
+    peer_id: String,
+    config: SenderConfig,
+    deps: SenderDeps,
+    options: SenderRuntimeOptions,
+) -> Result<NodeSender, SenderOptionsError> {
+    config.validate()?;
+    config.validate_node_ingress()?;
+    options.validate()?;
+    let (data_tx, data_rx) = mpsc::channel(config.buffer_capacity);
+    let (control_tx, control_rx) = mpsc::channel(options.control_channel_capacity);
+    let (signals_tx, signals_rx) = watch::channel(NodeSenderSignals::default());
+    let ingress = Arc::new(NodeSenderIngress::default());
+    let (stopped_tx, stopped) = watch::channel(false);
+    let inbox = SenderInbox::Node {
+        data_rx,
+        control_rx,
+        signals_rx,
+        delivered_overflow_generation: 0,
+        delivered_reconcile_generation: 0,
+        delivered_peer_generation: 0,
+        ingress: ingress.clone(),
+    };
+    let task = tokio::spawn(async move {
+        let _exit = NodeSenderTaskExit(stopped_tx);
+        sender_task(fragment, peer_id, config, deps, options, inbox).await;
+    });
+    Ok(NodeSender {
+        data_tx,
+        control_tx,
+        signals_tx,
+        ingress,
+        abort: task.abort_handle(),
+        stopped,
+        stop_lock: Arc::new(Mutex::new(())),
+    })
 }
 
 fn proto_op(op: &crate::actor::ReplicatedOp) -> ProtoReplicateOp {
@@ -605,7 +938,7 @@ async fn sender_task(
     config: SenderConfig,
     deps: SenderDeps,
     runtime: SenderRuntimeOptions,
-    mut rx: mpsc::UnboundedReceiver<SenderMsg>,
+    mut inbox: SenderInbox,
 ) {
     let mut delivery = DeliveryState::Streaming;
     let mut connection: Option<ActiveConnection> = None;
@@ -639,6 +972,8 @@ async fn sender_task(
     // rounds; ordinary no-fetch reconciliation on a storeless sender must not
     // acquire a new local durability requirement.
     let mut local_reconcile_flush_pending = false;
+    let mut publish_data_completion: Option<Arc<NodeSenderIngress>> = None;
+    let mut active_ingress_overflow: Option<(Arc<NodeSenderIngress>, u64)> = None;
 
     loop {
         // Publish state for health checks and tests.
@@ -663,6 +998,11 @@ async fn sender_task(
                 ack_durability_mismatch,
                 reconcile_rounds,
             };
+        }
+        // Keep a dequeued data item visible to placement drain until the
+        // resulting buffer/reset state above has been published.
+        if let Some(ingress) = publish_data_completion.take() {
+            ingress.pending_data.fetch_sub(1, Ordering::AcqRel);
         }
         let sender_wakeup = active_reconcile
             .as_ref()
@@ -689,86 +1029,112 @@ async fn sender_task(
             }))
             .min();
         tokio::select! {
-            msg = rx.recv() => {
-                let Some(msg) = msg else { break };
-                match msg {
-                    SenderMsg::Enqueue(op) => {
-                        if let DeliveryState::Reset { epoch } = &mut delivery {
-                            // Preserve post-snapshot local deltas so a busy
-                            // fragment can finish reset without requiring a
-                            // completely quiet network round. A second
-                            // overflow invalidates the snapshot and falls back
-                            // to another full round.
-                            if buffer.len() >= config.buffer_capacity {
-                                buffer.clear();
-                                *epoch = next_nonzero(&mut next_reset_epoch);
-                            } else {
-                                buffer.push_back(op);
-                            }
-                            continue;
+            input = inbox.recv() => {
+                let mut overflow = None;
+                let msg = match input {
+                    SenderInput::Message(msg) => Some(msg),
+                    SenderInput::Data(op, ingress) => {
+                        publish_data_completion = Some(ingress);
+                        Some(SenderMsg::Enqueue(op))
+                    }
+                    SenderInput::Overflow(generation, ingress) => {
+                        overflow = Some((ingress, generation));
+                        None
+                    }
+                    SenderInput::PeerChanged(Some(peer_tx)) => {
+                        Some(SenderMsg::PeerConnected { peer_tx })
+                    }
+                    SenderInput::PeerChanged(None) => connection.as_ref().map(|current| {
+                        SenderMsg::PeerDisconnected {
+                            peer_tx: current.peer_tx.tx.clone(),
                         }
-                        if buffer.len() >= config.buffer_capacity {
-                            // The overflowing op is already in local state and
-                            // is recovered by the correlated reconciliation
-                            // snapshot.
-                            buffer.clear();
-                            let epoch = next_nonzero(&mut next_reset_epoch);
-                            delivery = DeliveryState::Reset { epoch };
-                            active_reconcile = None;
-                            reconcile_retry = None;
-                            pause_new_streaming = false;
+                    }),
+                    SenderInput::ReconcileNow => Some(SenderMsg::ReconcileNow),
+                    SenderInput::Closed => break,
+                };
+                let data_overflow = msg.as_ref().map_or(false, |msg| {
+                    matches!(msg, SenderMsg::Enqueue(_))
+                        && buffer.len() >= config.buffer_capacity
+                });
+                if overflow.is_some() || data_overflow {
+                    if let Some(overflow) = overflow {
+                        active_ingress_overflow = Some(overflow);
+                    }
+                    if let DeliveryState::Reset { epoch } = &mut delivery {
+                        // The current round is still useful as a durability
+                        // fence, but its epoch can no longer complete reset.
+                        // Finish it, then take a fresh snapshot without
+                        // needlessly rotating the healthy transport session.
+                        buffer.clear();
+                        *epoch = next_nonzero(&mut next_reset_epoch);
+                        continue;
+                    }
+                    // Every shed command names an already-applied mutation.
+                    // Discard queued deltas and recover the authoritative
+                    // winner set through a newly correlated reset round.
+                    buffer.clear();
+                    let epoch = next_nonzero(&mut next_reset_epoch);
+                    delivery = DeliveryState::Reset { epoch };
+                    active_reconcile = None;
+                    reconcile_retry = None;
+                    pause_new_streaming = false;
 
-                            // Invalidate old streaming batches before taking
-                            // the reset snapshot. Delayed ACKs and reconcile
-                            // responses from that session are then harmless.
-                            let session_started = if let Some(conn) = connection.as_mut() {
-                                conn.in_flight.clear();
-                                conn.session_id = rand_session_id();
-                                conn.next_batch_seq = 0;
-                                send_session_start(fragment, conn).await
-                            } else {
-                                false
-                            };
-                            if session_started {
-                                let conn = connection.as_ref().expect("checked above");
-                                match begin_reconcile(
-                                    fragment,
-                                    ReconcilePurpose::Reset { epoch },
-                                    conn,
-                                    &mut next_round_id,
-                                    config.reconcile_timeout,
-                                )
-                                .await
-                                {
-                                    Ok(round) => active_reconcile = Some(round),
-                                    Err(()) => {
-                                        reconcile_retry = Some((
-                                            Instant::now() + NACK_RETRY_DELAY,
-                                            ReconcilePurpose::Reset { epoch },
-                                        ));
-                                        disconnect_transport(
-                                            &mut connection,
-                                            delivery,
-                                            &mut buffer,
-                                        );
-                                    }
-                                }
-                            } else if connection.is_some() {
+                    // Invalidate old streaming batches before taking the
+                    // reset snapshot. Delayed ACKs and reconcile responses
+                    // from that session are then harmless.
+                    let session_started = if let Some(conn) = connection.as_mut() {
+                        conn.in_flight.clear();
+                        conn.session_id = rand_session_id();
+                        conn.next_batch_seq = 0;
+                        send_session_start(fragment, conn).await
+                    } else {
+                        false
+                    };
+                    if session_started {
+                        let conn = connection.as_ref().expect("checked above");
+                        match begin_reconcile(
+                            fragment,
+                            ReconcilePurpose::Reset { epoch },
+                            conn,
+                            &mut next_round_id,
+                            config.reconcile_timeout,
+                        )
+                        .await
+                        {
+                            Ok(round) => active_reconcile = Some(round),
+                            Err(()) => {
                                 reconcile_retry = Some((
                                     Instant::now() + NACK_RETRY_DELAY,
                                     ReconcilePurpose::Reset { epoch },
                                 ));
-                                if !disconnect_transport(
+                                disconnect_transport(
                                     &mut connection,
                                     delivery,
                                     &mut buffer,
-                                ) {
-                                    session_retry =
-                                        Some(Instant::now() + NACK_RETRY_DELAY);
-                                }
+                                );
                             }
-                            continue;
                         }
+                    } else if connection.is_some() {
+                        reconcile_retry = Some((
+                            Instant::now() + NACK_RETRY_DELAY,
+                            ReconcilePurpose::Reset { epoch },
+                        ));
+                        if !disconnect_transport(
+                            &mut connection,
+                            delivery,
+                            &mut buffer,
+                        ) {
+                            session_retry = Some(Instant::now() + NACK_RETRY_DELAY);
+                        }
+                    }
+                    continue;
+                }
+                let Some(msg) = msg else { continue };
+                match msg {
+                    SenderMsg::Enqueue(op) => {
+                        // During reset these are post-snapshot deltas. If this
+                        // bounded deque fills, the common branch above advances
+                        // the reset epoch and takes a fresh snapshot.
                         buffer.push_back(op);
                     }
                     SenderMsg::PeerConnected { peer_tx: tx } => {
@@ -1049,8 +1415,15 @@ async fn sender_task(
                                         DeliveryState::Reset { epoch }
                                             if epoch == completed_epoch && snapshot_is_current =>
                                         {
-                                        delivery = DeliveryState::Streaming;
-                                        reconcile_rounds = reconcile_rounds.saturating_add(1);
+                                            delivery = DeliveryState::Streaming;
+                                            reconcile_rounds = reconcile_rounds.saturating_add(1);
+                                            if let Some((ingress, generation)) =
+                                                active_ingress_overflow.take()
+                                            {
+                                                ingress
+                                                    .settled_overflow_generation
+                                                    .store(generation, Ordering::Release);
+                                            }
                                         }
                                         DeliveryState::Reset { epoch } => {
                                             if let Some(conn) = connection.as_ref() {
@@ -1756,6 +2129,15 @@ fn next_nonzero(counter: &mut u64) -> u64 {
     *counter
 }
 
+fn next_generation(current: u64) -> u64 {
+    let next = current.wrapping_add(1);
+    if next == 0 {
+        1
+    } else {
+        next
+    }
+}
+
 fn allocate_batch_seq(connection: &mut ActiveConnection) -> u64 {
     let seq = connection.next_batch_seq;
     connection.next_batch_seq = if seq == u64::MAX - 1 { 0 } else { seq + 1 };
@@ -2115,6 +2497,7 @@ fn rand_session_id() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use prost::Message as _;
     use std::sync::atomic::{AtomicBool, Ordering};
 
     fn op(key: &str) -> crate::actor::ReplicatedOp {
@@ -2124,6 +2507,312 @@ mod tests {
             seq: 0,
             boot_id: 0,
         }
+    }
+
+    fn state_report() -> Arc<Mutex<SenderStateReport>> {
+        Arc::new(Mutex::new(SenderStateReport {
+            state: "disconnected".to_string(),
+            session_id: 0,
+            buffered: 0,
+            in_flight: 0,
+            last_ack_durability: None,
+            ack_durability_mismatch: false,
+            reconcile_rounds: 0,
+        }))
+    }
+
+    async fn wait_for_sender_report(
+        report: &Arc<Mutex<SenderStateReport>>,
+        predicate: impl Fn(&SenderStateReport) -> bool,
+    ) -> SenderStateReport {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let state = report.lock().await.clone();
+                if predicate(&state) {
+                    return state;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("sender state did not converge")
+    }
+
+    #[test]
+    fn sender_option_diagnostics_cover_node_ingress_limits() {
+        let debug = format!("{:?}", SenderRuntimeOptions::default());
+        assert!(debug.contains("control_channel_capacity: 64"));
+        assert_eq!(
+            SenderOptionsError::BufferCapacityTooLarge.to_string(),
+            "replication buffer capacity exceeds Tokio's maximum"
+        );
+        assert_eq!(
+            SenderOptionsError::ZeroControlChannelCapacity.to_string(),
+            "replication control channel capacity must be non-zero"
+        );
+        assert_eq!(
+            SenderOptionsError::ControlChannelCapacityTooLarge.to_string(),
+            "replication control channel capacity exceeds Tokio's maximum"
+        );
+    }
+
+    #[tokio::test]
+    async fn node_sender_bounds_data_and_control_without_losing_signals() {
+        let (data_tx, mut data_rx) = mpsc::channel(1);
+        let (control_tx, mut control_rx) = mpsc::channel(1);
+        let (signals_tx, signals_rx) = watch::channel(NodeSenderSignals::default());
+        let ingress = Arc::new(NodeSenderIngress::default());
+        let (stopped_tx, stopped) = watch::channel(false);
+        let (started_tx, started_rx) = oneshot::channel();
+        let (finish_tx, finish_rx) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            let _exit = NodeSenderTaskExit(stopped_tx);
+            let _ = started_tx.send(());
+            let _ = finish_rx.await;
+        });
+        let sender = NodeSender {
+            data_tx,
+            control_tx,
+            signals_tx,
+            ingress,
+            abort: task.abort_handle(),
+            stopped,
+            stop_lock: Arc::new(Mutex::new(())),
+        };
+        started_rx.await.unwrap();
+        assert!(!task.is_finished());
+
+        sender.send(SenderMsg::Enqueue(op("queued"))).unwrap();
+        // This command is shed only after a persistent reset generation is
+        // published. The caller does not block and the data lane stays at one.
+        sender.send(SenderMsg::Enqueue(op("overflow"))).unwrap();
+        sender
+            .send(SenderMsg::Enqueue(op("coalesced-overflow")))
+            .unwrap();
+        assert_eq!(data_rx.len(), 1);
+        assert_eq!(signals_rx.borrow().overflow_generation, 2);
+        assert!(!sender.ingress_is_idle());
+
+        sender
+            .send(SenderMsg::Ack {
+                session_id: 1,
+                batch_seq: 1,
+                durability: ReplicationAckDurability::MemoryApplied,
+            })
+            .unwrap();
+        assert_eq!(control_rx.len(), 1);
+        assert_eq!(
+            sender.send(SenderMsg::Ack {
+                session_id: 1,
+                batch_seq: 2,
+                durability: ReplicationAckDurability::MemoryApplied,
+            }),
+            Err(NodeSenderSendError::Full)
+        );
+
+        let (old_peer, _old_rx) = mpsc::channel(1);
+        let (new_peer, _new_rx) = mpsc::channel(1);
+        sender
+            .send(SenderMsg::PeerConnected {
+                peer_tx: old_peer.clone(),
+            })
+            .unwrap();
+        sender
+            .send(SenderMsg::PeerConnected {
+                peer_tx: new_peer.clone(),
+            })
+            .unwrap();
+        sender
+            .send(SenderMsg::PeerDisconnected { peer_tx: old_peer })
+            .unwrap();
+        sender.send(SenderMsg::ReconcileNow).unwrap();
+        let signals = signals_rx.borrow().clone();
+        assert!(signals
+            .peer_tx
+            .map_or(false, |current| current.same_channel(&new_peer)));
+        assert_eq!(signals.reconcile_generation, 1);
+
+        assert_eq!(data_rx.recv().await.unwrap().key, "queued");
+        assert!(matches!(
+            control_rx.recv().await,
+            Some(SenderMsg::Ack { .. })
+        ));
+        let pending_before_closed_send = sender.ingress.pending_data.load(Ordering::Acquire);
+        let overflow_before_closed_send = sender.signals_tx.borrow().overflow_generation;
+        drop(data_rx);
+        assert_eq!(
+            sender.send_data(op("closed-data")),
+            Err(NodeSenderSendError::Closed)
+        );
+        assert_eq!(
+            sender.ingress.pending_data.load(Ordering::Acquire),
+            pending_before_closed_send
+        );
+        assert_eq!(
+            sender.signals_tx.borrow().overflow_generation,
+            overflow_before_closed_send
+        );
+        drop(control_rx);
+        assert_eq!(
+            sender.send_control(SenderMsg::Ack {
+                session_id: 1,
+                batch_seq: 3,
+                durability: ReplicationAckDurability::MemoryApplied,
+            }),
+            Err(NodeSenderSendError::Closed)
+        );
+        finish_tx.send(()).unwrap();
+        task.await.unwrap();
+        sender.stop().await;
+        assert_eq!(
+            sender.send(SenderMsg::ReconcileNow),
+            Err(NodeSenderSendError::Closed)
+        );
+    }
+
+    #[tokio::test]
+    async fn node_sender_delivers_each_sideband_field_across_unrelated_updates() {
+        let (_data_tx, data_rx) = mpsc::channel(1);
+        let (_control_tx, control_rx) = mpsc::channel(1);
+        let (signals_tx, signals_rx) = watch::channel(NodeSenderSignals::default());
+        let ingress = Arc::new(NodeSenderIngress::default());
+        let (first_peer, _first_peer_rx) = mpsc::channel(1);
+        let (latest_peer, _latest_peer_rx) = mpsc::channel(1);
+        let mut inbox = SenderInbox::Node {
+            data_rx,
+            control_rx,
+            signals_rx,
+            delivered_overflow_generation: 0,
+            delivered_reconcile_generation: 0,
+            delivered_peer_generation: 0,
+            ingress: ingress.clone(),
+        };
+
+        signals_tx.send_modify(|signals| {
+            signals.overflow_generation = 1;
+            signals.peer_generation = 1;
+            signals.peer_tx = Some(first_peer);
+            signals.reconcile_generation = 1;
+        });
+        assert!(matches!(
+            inbox.recv().await,
+            SenderInput::Overflow(1, event_ingress) if Arc::ptr_eq(&event_ingress, &ingress)
+        ));
+
+        // Updating only the peer after overflow delivery must not erase the
+        // still-undelivered reconcile generation from the prior snapshot.
+        signals_tx.send_modify(|signals| {
+            signals.peer_generation = 2;
+            signals.peer_tx = Some(latest_peer.clone());
+        });
+        assert!(matches!(
+            inbox.recv().await,
+            SenderInput::PeerChanged(Some(peer)) if peer.same_channel(&latest_peer)
+        ));
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), inbox.recv()).await,
+            Ok(SenderInput::ReconcileNow)
+        ));
+    }
+
+    #[tokio::test]
+    async fn node_sender_observes_signal_lane_close_and_reports_task_exit() {
+        let (data_tx, data_rx) = mpsc::channel(1);
+        let (control_tx, control_rx) = mpsc::channel(1);
+        let (signals_tx, signals_rx) = watch::channel(NodeSenderSignals::default());
+        let mut inbox = SenderInbox::Node {
+            data_rx,
+            control_rx,
+            signals_rx,
+            delivered_overflow_generation: 0,
+            delivered_reconcile_generation: 0,
+            delivered_peer_generation: 0,
+            ingress: Arc::new(NodeSenderIngress::default()),
+        };
+        drop(signals_tx);
+        assert!(matches!(inbox.recv().await, SenderInput::Closed));
+        drop(data_tx);
+        drop(control_tx);
+
+        let sender = spawn_node_sender(
+            FragmentId(0),
+            "peer".to_string(),
+            SenderConfig::default(),
+            SenderDeps {
+                router: crate::node::FragmentRouter::new(1, 0),
+                hlc: Arc::new(Mutex::new(HlcClock::new())),
+                reset_senders: Arc::new(Mutex::new(HashMap::new())),
+                state_report: state_report(),
+            },
+            SenderRuntimeOptions::default(),
+        )
+        .unwrap();
+        let mut stopped = sender.stopped.clone();
+        drop(sender);
+        tokio::time::timeout(Duration::from_secs(1), stopped.changed())
+            .await
+            .expect("sender task did not exit after every ingress handle closed")
+            .expect("sender task dropped its exit signal without publishing completion");
+        assert!(*stopped.borrow());
+    }
+
+    #[tokio::test]
+    async fn full_node_data_ingress_forces_buffer_reset() {
+        let report = state_report();
+        let sender = spawn_node_sender(
+            FragmentId(0),
+            "peer".to_string(),
+            SenderConfig {
+                buffer_capacity: 1,
+                batch_interval: Duration::from_secs(3600),
+                consistency_interval: Duration::from_secs(3600),
+                ..SenderConfig::default()
+            },
+            SenderDeps {
+                router: crate::node::FragmentRouter::new(1, 0),
+                hlc: Arc::new(Mutex::new(HlcClock::new())),
+                reset_senders: Arc::new(Mutex::new(HashMap::new())),
+                state_report: report.clone(),
+            },
+            SenderRuntimeOptions::default()
+                .with_queue_admission_timeout(Duration::from_millis(10))
+                .with_control_channel_capacity(1),
+        )
+        .unwrap();
+
+        sender.send(SenderMsg::Enqueue(op("queued"))).unwrap();
+        sender.send(SenderMsg::Enqueue(op("overflow"))).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if report.lock().await.state == "buffer_reset" {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("overflow signal never reached the sender state machine");
+        assert!(!sender.ingress_is_idle());
+        sender.stop().await;
+    }
+
+    #[tokio::test]
+    async fn standalone_sender_api_remains_unbounded() {
+        fn assert_unbounded(_: &mpsc::UnboundedSender<SenderMsg>) {}
+        let sender = spawn_sender(
+            FragmentId(0),
+            "peer".to_string(),
+            SenderConfig::default(),
+            SenderDeps {
+                router: crate::node::FragmentRouter::new(1, 0),
+                hlc: Arc::new(Mutex::new(HlcClock::new())),
+                reset_senders: Arc::new(Mutex::new(HashMap::new())),
+                state_report: state_report(),
+            },
+        );
+        assert_unbounded(&sender);
+        drop(sender);
+        tokio::task::yield_now().await;
     }
 
     #[test]
@@ -2166,6 +2855,7 @@ mod tests {
         assert_eq!(allocate_batch_seq(&mut connection), u64::MAX - 1);
         assert_eq!(allocate_batch_seq(&mut connection), 0);
         assert_eq!(allocate_batch_seq(&mut connection), 1);
+        assert_eq!(next_generation(u64::MAX), 1);
     }
 
     #[test]
@@ -2198,6 +2888,20 @@ mod tests {
             Err(SenderOptionsError::QueueAdmissionTimeoutTooLarge)
         );
         assert_eq!(
+            SenderRuntimeOptions::default()
+                .with_control_channel_capacity(0)
+                .validate(),
+            Err(SenderOptionsError::ZeroControlChannelCapacity)
+        );
+        assert_eq!(
+            SenderRuntimeOptions::default()
+                .with_control_channel_capacity(
+                    tokio::sync::Semaphore::MAX_PERMITS.saturating_add(1),
+                )
+                .validate(),
+            Err(SenderOptionsError::ControlChannelCapacityTooLarge)
+        );
+        assert_eq!(
             SenderConfig {
                 batch_size: 0,
                 ..SenderConfig::default()
@@ -2228,6 +2932,15 @@ mod tests {
             }
             .validate(),
             Err(SenderOptionsError::ZeroBufferCapacity)
+        );
+        let legacy_unbounded_capacity = SenderConfig {
+            buffer_capacity: tokio::sync::Semaphore::MAX_PERMITS.saturating_add(1),
+            ..SenderConfig::default()
+        };
+        assert_eq!(legacy_unbounded_capacity.validate(), Ok(()));
+        assert_eq!(
+            legacy_unbounded_capacity.validate_node_ingress(),
+            Err(SenderOptionsError::BufferCapacityTooLarge)
         );
         assert_eq!(
             SenderConfig {
@@ -2297,6 +3010,87 @@ mod tests {
         assert!(failed.load(Ordering::SeqCst));
         assert_eq!(rx.recv().await, Some(vec![1]));
         assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn live_overflow_handles_reset_reconcile_admission_failure() {
+        let report = state_report();
+        let sender = spawn_sender_with_options(
+            FragmentId(0),
+            "peer".to_string(),
+            SenderConfig {
+                batch_interval: Duration::from_secs(3600),
+                buffer_capacity: 1,
+                consistency_interval: Duration::from_secs(3600),
+                ..SenderConfig::default()
+            },
+            SenderDeps {
+                router: crate::node::FragmentRouter::new(1, 0),
+                hlc: Arc::new(Mutex::new(HlcClock::new())),
+                reset_senders: Arc::new(Mutex::new(HashMap::new())),
+                state_report: report.clone(),
+            },
+            SenderRuntimeOptions::default().with_queue_admission_timeout(Duration::from_millis(10)),
+        )
+        .unwrap();
+        let (peer_tx, mut peer_rx) = mpsc::channel(1);
+        sender.send(SenderMsg::PeerConnected { peer_tx }).unwrap();
+        wait_for_sender_report(&report, |state| state.state == "connected").await;
+        peer_rx.recv().await.expect("initial SessionStart missing");
+
+        sender.send(SenderMsg::Enqueue(op("first"))).unwrap();
+        sender.send(SenderMsg::Enqueue(op("overflow"))).unwrap();
+        let reset = wait_for_sender_report(&report, |state| state.state == "buffer_reset").await;
+        assert_ne!(reset.session_id, 0);
+        let frame = peer_rx.recv().await.expect("reset SessionStart missing");
+        match Envelope::decode(frame.as_slice()).unwrap().msg {
+            Some(EnvelopeMsg::SessionStart(session)) => {
+                assert_eq!(session.session_id, reset.session_id);
+            }
+            other => panic!("expected reset SessionStart, got {other:?}"),
+        }
+        assert!(peer_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn live_overflow_handles_reset_session_start_admission_failure() {
+        let report = state_report();
+        let sender = spawn_sender_with_options(
+            FragmentId(0),
+            "peer".to_string(),
+            SenderConfig {
+                batch_interval: Duration::from_secs(3600),
+                buffer_capacity: 1,
+                consistency_interval: Duration::from_secs(3600),
+                ..SenderConfig::default()
+            },
+            SenderDeps {
+                router: crate::node::FragmentRouter::new(1, 0),
+                hlc: Arc::new(Mutex::new(HlcClock::new())),
+                reset_senders: Arc::new(Mutex::new(HashMap::new())),
+                state_report: report.clone(),
+            },
+            SenderRuntimeOptions::default().with_queue_admission_timeout(Duration::from_millis(10)),
+        )
+        .unwrap();
+        let (peer_tx, mut peer_rx) = mpsc::channel(1);
+        sender.send(SenderMsg::PeerConnected { peer_tx }).unwrap();
+        let connected = wait_for_sender_report(&report, |state| state.state == "connected").await;
+
+        // Leave the initial SessionStart queued so the reset SessionStart
+        // itself reaches the admission deadline while the transport stays live.
+        sender.send(SenderMsg::Enqueue(op("first"))).unwrap();
+        sender.send(SenderMsg::Enqueue(op("overflow"))).unwrap();
+        let reset = wait_for_sender_report(&report, |state| state.state == "buffer_reset").await;
+        assert_ne!(reset.session_id, 0);
+        let frame = peer_rx.recv().await.expect("initial SessionStart missing");
+        match Envelope::decode(frame.as_slice()).unwrap().msg {
+            Some(EnvelopeMsg::SessionStart(session)) => {
+                assert_eq!(session.session_id, connected.session_id);
+            }
+            other => panic!("expected initial SessionStart, got {other:?}"),
+        }
+        assert!(peer_rx.try_recv().is_err());
     }
 
     #[tokio::test]
