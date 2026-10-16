@@ -30,6 +30,19 @@ admission and shed counting, token-bucket behavior, seahash fragment mapping,
 and store encode/decode round-trips. These pin the semantics that the
 integration tests rely on.
 
+Periodic-expiry tests bound visited keys for sparse/high-capacity and non-TTL
+caches, distinguish empty-string cursors, exercise the soft work-byte target
+and oversized terminal records (including spare payload capacity), and pin
+current-winner checks, pass-time expiry decisions, per-page revision drift,
+finite insert-churn quotas and weakly consistent later-pass materialization.
+Failure/cancellation regressions retain ordered expiry markers and coalesce
+their retries with newer durable winners. Deterministic timer/actor gates prove that
+repeated stalled ticks do not leave queued automatic jobs, active cancellation
+and failed sends release leases, drain stops cleaner continuations, and a
+multi-page final quiesce still persists every remaining expiry floor. Gate
+fixtures release blocking stores on unwind so a failed assertion cannot hang
+runtime teardown.
+
 Storage-contract tests additionally cover fail-closed manifest versions and
 metadata schemas, exact identity and exclusive attachment, concurrent bind,
 strict non-mutating rejection of legacy databases, explicit adoption with

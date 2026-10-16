@@ -364,6 +364,18 @@ monitoring should use `health()` and `placement_report()`. There is also
 `sync_entries_applied()` — a compatibility counter for the retired
 `SyncResponse` path. It remains zero in protocol v3 for every placement mode.
 
+## Low-level maintenance message migration
+
+`CleanerMessage::Sweep` and `SnapshotterMessage::Snap` still construct the same
+manual full operations, and all maintenance/supervisor argument structs keep
+their existing fields. `FragmentState::expire_values(now)` still performs a
+full sweep and returns the total converted count. Automatic periodic work now
+uses doc-hidden variants carrying opaque, non-forgeable admission leases.
+Both public maintenance message enums are `#[non_exhaustive]`: downstream
+exhaustive matches must add a wildcard arm. This is a pre-release API change,
+not a claim of complete source compatibility. See
+[maintenance bounds and consistency](persistence.md#bounded-automatic-maintenance).
+
 ## Errors
 
 ```rust

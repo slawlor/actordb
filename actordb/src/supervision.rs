@@ -21,6 +21,7 @@
 use futures::FutureExt;
 use std::collections::HashMap;
 use std::panic::AssertUnwindSafe;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
@@ -32,7 +33,8 @@ use ractor::{
 };
 
 use crate::actor::{
-    now_ms, FragmentState, HlcClock, KvActor, KvArgs, KvMessage, PoolConfig, VersionedValue,
+    now_ms, ExpiryPass, FragmentState, HlcClock, KvActor, KvArgs, KvMessage, PoolConfig,
+    VersionedValue,
 };
 use crate::shard::FragmentId;
 use crate::store::KvStore;
@@ -568,9 +570,29 @@ impl Actor for FragmentSupervisor {
 }
 
 /// Messages for the [`Cleaner`].
+#[non_exhaustive]
 pub enum CleanerMessage {
-    /// Sweep for expired keys now.
+    /// Perform a full sweep for expired keys now. Explicit manual messages
+    /// are not covered by the automatic ticker's admission bound.
     Sweep,
+    /// Internal, coalesced automatic pass. Direct callers use `Sweep`.
+    #[doc(hidden)]
+    AutomaticSweep(MaintenanceTrigger),
+}
+
+/// Opaque ownership of one admitted automatic maintenance job.
+///
+/// Public only because maintenance messages are public. The unique lease
+/// moves through cleaner continuations; manual messages cannot release it.
+#[doc(hidden)]
+pub struct MaintenanceTrigger {
+    pending: Arc<AtomicBool>,
+}
+
+impl Drop for MaintenanceTrigger {
+    fn drop(&mut self) {
+        self.pending.store(false, Ordering::Release);
+    }
 }
 
 /// Background actor: periodically converts TTL-expired values into
@@ -594,6 +616,7 @@ pub struct CleanerArgs {
 pub struct CleanerState {
     shared: Arc<FragmentState>,
     ticker: TickerTask,
+    pass: Option<ExpiryPass>,
 }
 
 struct TickerTask(Option<JoinHandle<()>>);
@@ -619,6 +642,41 @@ impl Drop for TickerTask {
     }
 }
 
+/// At most one automatic job is queued or executing, including every page
+/// of a cleaner pass. Skip alone would still enqueue ticks behind a stall.
+fn coalesced_ticker<M: ractor::Message>(
+    myself: ActorRef<M>,
+    interval: Duration,
+    immediate: bool,
+    message: fn(MaintenanceTrigger) -> M,
+) -> TickerTask {
+    let start = tokio::time::Instant::now();
+    let mut ticker =
+        tokio::time::interval_at(if immediate { start } else { start + interval }, interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let pending = Arc::new(AtomicBool::new(false));
+    TickerTask::new(tokio::spawn(async move {
+        loop {
+            ticker.tick().await;
+            if myself.get_status() >= ActorStatus::Draining {
+                break;
+            }
+            if pending
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+            {
+                continue;
+            }
+            let trigger = MaintenanceTrigger {
+                pending: pending.clone(),
+            };
+            if myself.send_message(message(trigger)).is_err() {
+                break;
+            }
+        }
+    }))
+}
+
 impl Actor for Cleaner {
     type Msg = CleanerMessage;
     type State = CleanerState;
@@ -629,19 +687,11 @@ impl Actor for Cleaner {
         myself: ActorRef<Self::Msg>,
         args: Self::Arguments,
     ) -> Result<Self::State, ActorProcessingErr> {
-        let mut ticker = tokio::time::interval(args.interval);
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        let ticker = tokio::spawn(async move {
-            loop {
-                ticker.tick().await;
-                if myself.send_message(CleanerMessage::Sweep).is_err() {
-                    break;
-                }
-            }
-        });
+        let ticker = coalesced_ticker(myself, args.interval, true, CleanerMessage::AutomaticSweep);
         Ok(CleanerState {
             shared: args.shared,
-            ticker: TickerTask::new(ticker),
+            ticker,
+            pass: None,
         })
     }
 
@@ -656,7 +706,7 @@ impl Actor for Cleaner {
 
     async fn handle(
         &self,
-        _myself: ActorRef<Self::Msg>,
+        myself: ActorRef<Self::Msg>,
         message: Self::Msg,
         state: &mut Self::State,
     ) -> Result<(), ActorProcessingErr> {
@@ -666,14 +716,51 @@ impl Actor for Cleaner {
                 state.shared.expire_values(now).await?;
                 Ok(())
             }
+            CleanerMessage::AutomaticSweep(trigger) => {
+                if myself.get_status() >= ActorStatus::Draining {
+                    state.pass = None;
+                    return Ok(());
+                }
+                let pass = state.pass.get_or_insert_with(|| ExpiryPass::new(now_ms()));
+                let page = state.shared.expire_values_page(pass).await?;
+                tracing::trace!(
+                    visited = page.visited,
+                    converted = page.converted,
+                    work_bytes = page.work_bytes,
+                    done = page.done,
+                    "automatic expiry page"
+                );
+                if page.done || myself.get_status() >= ActorStatus::Draining {
+                    state.pass = None;
+                } else {
+                    // A ready ractor mailbox can otherwise consume several
+                    // pages before Tokio's cooperative budget expires. Yield
+                    // with no data locks held and retain the unique admission
+                    // lease; this is an opportunity, not a priority guarantee.
+                    tokio::task::yield_now().await;
+                    if myself.get_status() >= ActorStatus::Draining {
+                        state.pass = None;
+                    } else {
+                        // Move, rather than opening a new slot between pages.
+                        // Failed typed sends drop the lease with the message.
+                        let _ = myself.send_message(CleanerMessage::AutomaticSweep(trigger));
+                    }
+                }
+                Ok(())
+            }
         }
     }
 }
 
 /// Messages for the [`Snapshotter`].
+#[non_exhaustive]
 pub enum SnapshotterMessage {
-    /// Flush the write buffer to the store now.
+    /// Flush the write buffer to the store now. Explicit manual messages
+    /// are not covered by the automatic ticker's admission bound.
     Snap,
+    /// Internal, coalesced automatic flush. Direct callers use `Snap`.
+    #[doc(hidden)]
+    AutomaticSnap(MaintenanceTrigger),
 }
 
 /// Background actor: periodically flushes the fragment's write buffer,
@@ -705,20 +792,15 @@ impl Actor for Snapshotter {
         // `interval()` yields its first tick immediately. Start at one full
         // interval so a write arriving just after startup is not flushed by a
         // delayed "initial" tick.
-        let mut ticker =
-            tokio::time::interval_at(tokio::time::Instant::now() + args.interval, args.interval);
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        let ticker = tokio::spawn(async move {
-            loop {
-                ticker.tick().await;
-                if myself.send_message(SnapshotterMessage::Snap).is_err() {
-                    break;
-                }
-            }
-        });
+        let ticker = coalesced_ticker(
+            myself,
+            args.interval,
+            false,
+            SnapshotterMessage::AutomaticSnap,
+        );
         Ok(SnapshotterState {
             shared: args.shared,
-            ticker: TickerTask::new(ticker),
+            ticker,
         })
     }
 
@@ -739,6 +821,7 @@ impl Actor for Snapshotter {
     ) -> Result<(), ActorProcessingErr> {
         match message {
             SnapshotterMessage::Snap => state.shared.flush().await,
+            SnapshotterMessage::AutomaticSnap(_trigger) => state.shared.flush().await,
         }
     }
 }
@@ -786,6 +869,14 @@ mod tests {
         }
     }
 
+    struct ReleaseMaintenanceStore(Arc<GatedStore>);
+
+    impl Drop for ReleaseMaintenanceStore {
+        fn drop(&mut self) {
+            self.0.release();
+        }
+    }
+
     struct DropSignalStore(Option<std::sync::mpsc::Sender<()>>);
 
     impl KvStore for DropSignalStore {
@@ -804,6 +895,312 @@ mod tests {
                 let _ = dropped.send(());
             }
         }
+    }
+
+    enum TickTestMessage {
+        Automatic(MaintenanceTrigger),
+        Barrier(RpcReplyPort<()>),
+    }
+
+    struct TickTestActor;
+
+    struct TickTestState {
+        entered: Arc<std::sync::atomic::AtomicUsize>,
+        gate: Arc<tokio::sync::Notify>,
+        pending: Arc<StdMutex<Option<Arc<AtomicBool>>>>,
+    }
+
+    impl Actor for TickTestActor {
+        type Msg = TickTestMessage;
+        type State = TickTestState;
+        type Arguments = TickTestState;
+
+        async fn pre_start(
+            &self,
+            _: ActorRef<Self::Msg>,
+            args: Self::Arguments,
+        ) -> Result<Self::State, ActorProcessingErr> {
+            Ok(args)
+        }
+
+        async fn handle(
+            &self,
+            _: ActorRef<Self::Msg>,
+            message: Self::Msg,
+            state: &mut Self::State,
+        ) -> Result<(), ActorProcessingErr> {
+            match message {
+                TickTestMessage::Automatic(trigger) => {
+                    *state.pending.lock().unwrap() = Some(trigger.pending.clone());
+                    state.entered.fetch_add(1, Ordering::SeqCst);
+                    state.gate.notified().await;
+                    drop(trigger);
+                }
+                TickTestMessage::Barrier(reply) => {
+                    let _ = reply.send(());
+                }
+            }
+            Ok(())
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn automatic_maintenance_ticks_coalesce_stalls_and_release_on_terminal_paths() {
+        for immediate in [true, false] {
+            let entered = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let gate = Arc::new(tokio::sync::Notify::new());
+            let pending = Arc::new(StdMutex::new(None));
+            let (actor, handle) = TickTestActor::spawn(
+                None,
+                TickTestActor,
+                TickTestState {
+                    entered: entered.clone(),
+                    gate: gate.clone(),
+                    pending: pending.clone(),
+                },
+            )
+            .await
+            .unwrap();
+            let mut ticker = coalesced_ticker(
+                actor.clone(),
+                Duration::from_millis(2),
+                immediate,
+                TickTestMessage::Automatic,
+            );
+            tokio::time::advance(Duration::from_millis(2)).await;
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while entered.load(Ordering::SeqCst) == 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            let lease = pending.lock().unwrap().clone().unwrap();
+            assert!(lease.load(Ordering::Acquire));
+            // Deterministic interval ticks while the actor handler is stalled. Stopping
+            // the producer before release makes the following FIFO barrier
+            // prove there is no hidden queued automatic backlog.
+            for _ in 0..20 {
+                tokio::time::advance(Duration::from_millis(2)).await;
+                tokio::task::yield_now().await;
+            }
+            ticker.stop().await;
+            gate.notify_one();
+            assert!(matches!(
+                actor
+                    .call(TickTestMessage::Barrier, Some(Duration::from_secs(2)))
+                    .await
+                    .unwrap(),
+                CallResult::Success(())
+            ));
+            assert_eq!(entered.load(Ordering::SeqCst), 1);
+            assert!(!lease.load(Ordering::Acquire));
+
+            // Cancellation of an active handler retains no abandoned latch.
+            lease.store(true, Ordering::Release);
+            actor
+                .send_message(TickTestMessage::Automatic(MaintenanceTrigger {
+                    pending: lease.clone(),
+                }))
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while entered.load(Ordering::SeqCst) < 2 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            actor.kill();
+            handle.await.unwrap();
+            assert!(!lease.load(Ordering::Acquire));
+            lease.store(true, Ordering::Release);
+            let result = actor.send_message(TickTestMessage::Automatic(MaintenanceTrigger {
+                pending: lease.clone(),
+            }));
+            assert!(result.is_err());
+            drop(result); // failed typed send owns the rejected message
+            assert!(!lease.load(Ordering::Acquire));
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn automatic_cleaner_stops_pages_on_drain_but_final_quiesce_sweeps_all() {
+        let store = Arc::new(GatedStore::default());
+        let _release = ReleaseMaintenanceStore(store.clone());
+        let values = (0..600)
+            .map(|i| {
+                let mut value = VersionedValue::new(vec![1], 10, "writer".into());
+                value.expires_at_ms = Some(1);
+                (format!("k{i:04}"), value)
+            })
+            .collect();
+        let shared = Arc::new(FragmentState::new(
+            values,
+            Some(store.clone()),
+            1,
+            Duration::from_secs(3600),
+        ));
+        let pool = PoolConfig {
+            workers: 1,
+            queue_cap: 16,
+            rate_limit_per_sec: None,
+        };
+        let args = SupervisorArgs {
+            fragment: FragmentId(0),
+            worker_prefix: "paged-final-quiesce".into(),
+            store: Some(store.clone()),
+            hlc: Arc::new(Mutex::new(HlcClock::new())),
+            default_pool: pool.clone(),
+            high_pool: pool.clone(),
+            background_pool: pool.clone(),
+            flush_batch_size: 1,
+            flush_interval: Duration::from_secs(3600),
+            clean_interval: Duration::from_millis(2),
+            snapshot_interval: Duration::from_secs(3600),
+            tombstone_gc_age: None,
+            reset_senders: Arc::new(Mutex::new(HashMap::new())),
+        };
+        let (dispatcher, _) = KvActor::spawn(
+            None,
+            KvActor,
+            KvArgs {
+                shared: shared.clone(),
+                fragment: args.fragment,
+                worker_prefix: args.worker_prefix.clone(),
+                default_pool: pool.clone(),
+                high_pool: pool.clone(),
+                background_pool: pool,
+            },
+        )
+        .await
+        .unwrap();
+        let (cleaner, _) = Cleaner::spawn(
+            None,
+            Cleaner,
+            CleanerArgs {
+                fragment: args.fragment,
+                shared: shared.clone(),
+                interval: args.clean_interval,
+                tombstone_gc_age: None,
+                reset_senders: args.reset_senders.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        let (snapshotter, _) = Snapshotter::spawn(
+            None,
+            Snapshotter,
+            SnapshotterArgs {
+                shared: shared.clone(),
+                interval: args.snapshot_interval,
+            },
+        )
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !store.entered.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        // Do not depend on the timer driver while a synchronous store blocks
+        // a Tokio worker. Coalesced repeated ticks are proven separately with
+        // a paused-clock async gate; this gate proves drain and final fencing.
+        cleaner.drain().unwrap();
+        store.release();
+        tokio::time::timeout(Duration::from_secs(2), cleaner.wait(None))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            store.entries.lock().unwrap().len(),
+            256,
+            "drain admitted another automatic page"
+        );
+        let mut state = SupervisorState {
+            fragment: args.fragment,
+            dispatcher,
+            cleaner,
+            snapshotter,
+            shared,
+            args,
+            restarts: HashMap::new(),
+            lifecycle: SupervisorLifecycle::Running,
+        };
+        state.quiesce().await.unwrap();
+        let entries = store.entries.lock().unwrap();
+        assert_eq!(entries.len(), 600);
+        assert!(entries.values().all(|value| value.is_tombstone
+            && value.timestamp_ms == 10
+            && value.expires_at_ms == Some(1)));
+        assert!(state.restarts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn automatic_cleaner_completes_multiple_pages_and_manual_snap_flushes_markers() {
+        let store = Arc::new(GatedStore::default());
+        let _release = ReleaseMaintenanceStore(store.clone());
+        store.release();
+        let values = (0..600)
+            .map(|i| {
+                let mut value = VersionedValue::new(vec![1], 10, "writer".into());
+                value.expires_at_ms = Some(1);
+                (format!("k{i:04}"), value)
+            })
+            .collect();
+        let shared = Arc::new(FragmentState::new(
+            values,
+            Some(store.clone()),
+            usize::MAX,
+            Duration::from_secs(3600),
+        ));
+        let (cleaner, _) = Cleaner::spawn(
+            None,
+            Cleaner,
+            CleanerArgs {
+                fragment: FragmentId(0),
+                shared: shared.clone(),
+                interval: Duration::from_secs(3600),
+                tombstone_gc_age: None,
+                reset_senders: Arc::new(Mutex::new(HashMap::new())),
+            },
+        )
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while shared.snapshot_with_revision().await.1 != 600 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            store.entries.lock().unwrap().is_empty(),
+            "idle buffer flushed before explicit snapshot"
+        );
+        assert_eq!(shared.expire_values(now_ms()).await.unwrap(), 0);
+        cleaner.send_message(CleanerMessage::Sweep).unwrap();
+        cleaner.drain().unwrap();
+        cleaner.wait(None).await.unwrap();
+        let (snapshotter, _) = Snapshotter::spawn(
+            None,
+            Snapshotter,
+            SnapshotterArgs {
+                shared,
+                interval: Duration::from_secs(3600),
+            },
+        )
+        .await
+        .unwrap();
+        snapshotter.send_message(SnapshotterMessage::Snap).unwrap();
+        snapshotter.drain().unwrap();
+        snapshotter.wait(None).await.unwrap();
+        let entries = store.entries.lock().unwrap();
+        assert_eq!(entries.len(), 600);
+        assert!(entries
+            .iter()
+            .all(|(_, value)| value.is_tombstone && value.expires_at_ms == Some(1)));
     }
 
     #[test]

@@ -542,9 +542,9 @@ impl BatchReadContinuation {
 /// The fragment's shared state: one in-memory cache, one persistence
 /// buffer, one [`KvStore`].
 ///
-/// All `KvWorker`s of a fragment share this. Sticky dispatch routes each
-/// key to one worker, so workers rarely contend on the same key; the
-/// `RwLock` is a safety net, not a hot path.
+/// Workers, the dispatcher, and background maintenance share this cache.
+/// The lock serializes winning merges with the ordered index and snapshot
+/// revision; periodic expiry releases it between bounded pages.
 ///
 /// Applied writes are buffered and flushed to the [`KvStore`]
 /// in batches (see `NodeConfig` flush knobs); the cache is reloaded from
@@ -574,6 +574,64 @@ pub struct FragmentState {
 struct FragmentCache {
     values: HashMap<String, VersionedValue>,
     ordered_keys: BTreeSet<String>,
+}
+
+pub(crate) const EXPIRY_PAGE_VISIT_LIMIT: usize = 256;
+pub(crate) const EXPIRY_PAGE_WORK_BYTES: usize = 1024 * 1024;
+
+/// A weakly consistent, finite periodic pass. The first page captures its
+/// ordered high-water key and cardinality under the same cache write lock.
+pub(crate) struct ExpiryPass {
+    now_ms: u64,
+    initialized: bool,
+    remaining: usize,
+    after_key: Option<String>,
+    high_water: Option<String>,
+}
+
+impl ExpiryPass {
+    pub(crate) fn new(now_ms: u64) -> Self {
+        Self {
+            now_ms,
+            initialized: false,
+            remaining: 0,
+            after_key: None,
+            high_water: None,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct ExpiryPage {
+    pub(crate) visited: usize,
+    pub(crate) converted: usize,
+    pub(crate) work_bytes: usize,
+    pub(crate) done: bool,
+}
+
+fn expiry_record_work_bytes(
+    key: &str,
+    value: &VersionedValue,
+    expired: bool,
+    durable: bool,
+) -> usize {
+    // A conservative work charge, not a heap or wall-clock bound: inspected
+    // metadata, cursor-key cloning, and expired payload/buffer destruction.
+    let mut bytes = std::mem::size_of::<(String, VersionedValue)>()
+        .saturating_add(key.len())
+        .saturating_add(value.node_id.capacity());
+    if expired {
+        bytes = bytes
+            .saturating_add(value.value.capacity())
+            .saturating_add(value.node_id.len());
+        if durable {
+            bytes = bytes
+                .saturating_add(std::mem::size_of::<(String, VersionedValue)>())
+                .saturating_add(key.len())
+                .saturating_add(value.node_id.len());
+        }
+    }
+    bytes
 }
 
 struct FlushBuffer {
@@ -1035,6 +1093,105 @@ impl FragmentState {
             self.flush().await?;
         }
         Ok(converted)
+    }
+
+    /// Periodic maintenance only; authoritative shutdown still uses the full
+    /// public sweep. Every visited current value counts, including non-TTL
+    /// records. One terminal record may cross the soft work-byte target.
+    pub(crate) async fn expire_values_page(
+        &self,
+        pass: &mut ExpiryPass,
+    ) -> Result<ExpiryPage, ActorProcessingErr> {
+        let (page, should_flush) = {
+            // Preserve normal apply's lock order and adjacent cache/enqueue/
+            // revision publication. No await occurs after the cache is locked.
+            let mut flush = if self.kvstore.is_some() {
+                Some(self.flush.lock().await)
+            } else {
+                None
+            };
+            let mut cache = self.cache.write().await;
+            let mut initial_work = 0usize;
+            if !pass.initialized {
+                pass.remaining = cache.ordered_keys.len();
+                pass.high_water = cache.ordered_keys.last().cloned();
+                if let Some(high_water) = &pass.high_water {
+                    // Charge this single pass-metadata clone to the first
+                    // visited record, including an oversized first record.
+                    initial_work = std::mem::size_of::<String>().saturating_add(high_water.len());
+                }
+                pass.initialized = true;
+            }
+            let mut page = ExpiryPage {
+                visited: 0,
+                converted: 0,
+                work_bytes: 0,
+                done: pass.remaining == 0,
+            };
+            let mut next_cursor = None;
+            let mut exhausted = false;
+            if let Some(high_water) = pass.high_water.as_deref().filter(|_| !page.done) {
+                use std::ops::Bound::{Excluded, Included, Unbounded};
+                let lower = pass.after_key.as_deref().map_or(Unbounded, Excluded);
+                let FragmentCache {
+                    values,
+                    ordered_keys,
+                } = &mut *cache;
+                let mut keys = ordered_keys.range::<str, _>((lower, Included(high_water)));
+                let limit = pass.remaining.min(EXPIRY_PAGE_VISIT_LIMIT);
+                while page.visited < limit
+                    && (page.visited == 0 || page.work_bytes < EXPIRY_PAGE_WORK_BYTES)
+                {
+                    let Some(key) = keys.next() else {
+                        exhausted = true;
+                        break;
+                    };
+                    let value = values.get_mut(key).expect("ordered cache key has a value");
+                    let expired = value.is_expired(pass.now_ms);
+                    let charge = expiry_record_work_bytes(key, value, expired, flush.is_some())
+                        .saturating_add(std::mem::take(&mut initial_work));
+                    page.work_bytes = page.work_bytes.saturating_add(charge);
+                    page.visited += 1;
+                    next_cursor = Some(key.clone());
+                    if expired {
+                        let tombstone = value.expiry_tombstone();
+                        if let Some(flush) = &mut flush {
+                            *value = tombstone.clone();
+                            flush.pending.push((key.clone(), tombstone));
+                        } else {
+                            *value = tombstone;
+                        }
+                        page.converted += 1;
+                    }
+                }
+            }
+            pass.remaining -= page.visited;
+            if let Some(cursor) = next_cursor {
+                pass.after_key = Some(cursor);
+            }
+            page.done |= exhausted
+                || pass.remaining == 0
+                || pass.after_key.as_deref() == pass.high_water.as_deref();
+            if page.done {
+                pass.remaining = 0;
+            }
+            if page.converted != 0 {
+                self.revision.fetch_add(
+                    u64::try_from(page.converted).unwrap_or(u64::MAX),
+                    Ordering::Release,
+                );
+            }
+            let should_flush = page.converted > 0
+                && flush.as_ref().is_some_and(|flush| {
+                    flush.pending.len() >= self.flush_batch_size
+                        || flush.last_flush.elapsed() >= self.flush_interval
+                });
+            (page, should_flush)
+        };
+        if should_flush {
+            self.flush().await?;
+        }
+        Ok(page)
     }
 }
 
@@ -2289,8 +2446,10 @@ impl Default for HlcClock {
 
 #[cfg(test)]
 mod tests {
+    use super::flush_retention_tests::FlakyStore;
     use super::*;
     use crate::store::StoreError;
+    use std::sync::Mutex as StdMutex;
 
     struct StableFenceStore {
         reported: StoreCommitDurability,
@@ -2348,6 +2507,257 @@ mod tests {
             seq: 0,
             boot_id: 0,
         }
+    }
+
+    fn expiring_value(payload: Vec<u8>, deadline: u64) -> VersionedValue {
+        let mut value = VersionedValue::new(payload, 10, "writer".to_string());
+        value.expires_at_ms = Some(deadline);
+        value
+    }
+
+    #[tokio::test]
+    async fn expiry_pages_bound_visits_even_for_sparse_non_ttl_cache_and_empty_key() {
+        let mut values = HashMap::with_capacity(100_000);
+        values.insert(String::new(), VersionedValue::new(vec![], 1, "n".into()));
+        for i in 0..600 {
+            values.insert(
+                format!("k{i:04}"),
+                VersionedValue::new(vec![], 1, "n".into()),
+            );
+        }
+        let state = test_state(values);
+        let mut pass = ExpiryPass::new(100);
+        let first = state.expire_values_page(&mut pass).await.unwrap();
+        assert_eq!(
+            (first.visited, first.converted, first.done),
+            (256, 0, false)
+        );
+        assert_eq!(pass.after_key.as_deref(), Some("k0254"));
+        let second = state.expire_values_page(&mut pass).await.unwrap();
+        assert_eq!(
+            (second.visited, second.converted, second.done),
+            (256, 0, false)
+        );
+        let third = state.expire_values_page(&mut pass).await.unwrap();
+        assert_eq!((third.visited, third.converted, third.done), (89, 0, true));
+        assert_eq!(state.revision.load(Ordering::Acquire), 0);
+        assert_eq!(
+            state.expire_values_page(&mut pass).await.unwrap().visited,
+            0
+        );
+
+        let empty = test_state(HashMap::new());
+        let page = empty
+            .expire_values_page(&mut ExpiryPass::new(100))
+            .await
+            .unwrap();
+        assert_eq!(
+            (page.visited, page.converted, page.work_bytes, page.done),
+            (0, 0, 0, true)
+        );
+        let empty_key = test_state(HashMap::from([(
+            String::new(),
+            expiring_value(vec![1], 100),
+        )]));
+        let mut pass = ExpiryPass::new(100);
+        let page = empty_key.expire_values_page(&mut pass).await.unwrap();
+        assert_eq!((page.visited, page.converted, page.done), (1, 1, true));
+        assert_eq!(pass.after_key.as_deref(), Some(""));
+    }
+
+    #[tokio::test]
+    async fn expiry_pages_soft_bytes_charge_capacity_and_allow_one_terminal_record() {
+        let mut payload = Vec::with_capacity(EXPIRY_PAGE_WORK_BYTES + 17);
+        payload.push(1);
+        let oversized = expiring_value(payload, 100);
+        let oversized_charge = expiry_record_work_bytes("a", &oversized, true, false);
+        let state = test_state(HashMap::from([
+            ("a".into(), oversized),
+            ("z".into(), expiring_value(vec![1], 100)),
+        ]));
+        let mut pass = ExpiryPass::new(100);
+        let page = state.expire_values_page(&mut pass).await.unwrap();
+        assert_eq!((page.visited, page.converted, page.done), (1, 1, false));
+        assert_eq!(
+            page.work_bytes,
+            oversized_charge + std::mem::size_of::<String>() + 1
+        );
+        assert!(page.work_bytes >= EXPIRY_PAGE_WORK_BYTES);
+        assert_eq!(
+            state.expire_values_page(&mut pass).await.unwrap().visited,
+            1
+        );
+
+        let payload = vec![1; EXPIRY_PAGE_WORK_BYTES];
+        let state = test_state(HashMap::from([
+            ("a".into(), expiring_value(vec![1], 100)),
+            ("b".into(), expiring_value(payload, 100)),
+            ("c".into(), expiring_value(vec![1], 100)),
+        ]));
+        let mut pass = ExpiryPass::new(100);
+        let page = state.expire_values_page(&mut pass).await.unwrap();
+        assert_eq!((page.visited, page.converted, page.done), (2, 2, false));
+        assert_eq!(pass.after_key.as_deref(), Some("b"));
+        assert_eq!(
+            state.expire_values_page(&mut pass).await.unwrap().visited,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn expiry_pages_publish_each_revision_and_recheck_current_winners_at_pinned_time() {
+        let values = (0..520)
+            .map(|i| (format!("k{i:04}"), expiring_value(vec![1], 100)))
+            .collect();
+        let state = test_state(values);
+        let mut pass = ExpiryPass::new(100);
+        let first = state.expire_values_page(&mut pass).await.unwrap();
+        assert_eq!(first.converted, 256);
+        let first_revision = state.revision.load(Ordering::Acquire);
+        let winner = VersionedValue::new(vec![2], 11, "writer".into());
+        state
+            .apply(&test_op("k0256", winner.clone()))
+            .await
+            .unwrap();
+        // This future expiry is not expired at the pass's pinned instant.
+        let mut future = expiring_value(vec![3], u64::MAX);
+        future.timestamp_ms = 11;
+        state.apply(&test_op("k0257", future)).await.unwrap();
+        let before_second = state.revision.load(Ordering::Acquire);
+        let second = state.expire_values_page(&mut pass).await.unwrap();
+        assert_eq!((second.visited, second.converted), (256, 254));
+        assert_eq!(state.revision.load(Ordering::Acquire), before_second + 254);
+        assert_eq!(state.cache.read().await.values.get("k0256"), Some(&winner));
+        assert!(!state.cache.read().await.values["k0257"].is_tombstone);
+        let summary = state
+            .summary_page(Some("k0255"), Some(first_revision), Some(100), 10)
+            .await;
+        assert!(summary.restart);
+        assert!(state.expire_values_page(&mut pass).await.unwrap().done);
+    }
+
+    #[tokio::test]
+    async fn expiry_pages_initial_quota_and_high_water_make_insert_churn_finite() {
+        let values = (0..300)
+            .map(|i| (format!("k{i:04}"), expiring_value(vec![1], 100)))
+            .collect();
+        let state = test_state(values);
+        let mut pass = ExpiryPass::new(100);
+        assert_eq!(
+            state.expire_values_page(&mut pass).await.unwrap().visited,
+            256
+        );
+        // Use current live future-TTL values to avoid apply's immediate expiry
+        // materialization, then move their deadline under the shared cache lock.
+        for key in ["a-behind", "k0255-new", "z-beyond"] {
+            state
+                .apply(&test_op(key, expiring_value(vec![2], u64::MAX)))
+                .await
+                .unwrap();
+            state
+                .cache
+                .write()
+                .await
+                .values
+                .get_mut(key)
+                .unwrap()
+                .expires_at_ms = Some(100);
+        }
+        let page = state.expire_values_page(&mut pass).await.unwrap();
+        assert_eq!((page.visited, page.converted, page.done), (44, 44, true));
+        let cache = state.cache.read().await;
+        assert!(cache.values["k0255-new"].is_tombstone);
+        assert!(!cache.values["a-behind"].is_tombstone);
+        assert!(!cache.values["z-beyond"].is_tombstone);
+        assert!(
+            !cache.values["k0299"].is_tombstone,
+            "insert consumed one original visit"
+        );
+        drop(cache);
+        // Public full sweep remains authoritative and returns its full count.
+        assert_eq!(state.expire_values(100).await.unwrap(), 3);
+    }
+
+    #[tokio::test]
+    async fn expiry_pages_failed_flush_retains_marker_and_newer_durable_winner() {
+        let store = Arc::new(FlakyStore {
+            failures_left: StdMutex::new(1),
+            written: StdMutex::new(Vec::new()),
+        });
+        let value = expiring_value(vec![1], 100);
+        let state = FragmentState::new(
+            HashMap::from([("key".into(), value.clone())]),
+            Some(store.clone()),
+            1,
+            Duration::from_secs(3600),
+        );
+        let mut pass = ExpiryPass::new(100);
+        assert!(state
+            .expire_values_page(&mut pass)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("injected failure"));
+        assert_eq!(pass.after_key.as_deref(), Some("key"));
+        assert_eq!(
+            state.cache.read().await.values["key"],
+            value.expiry_tombstone()
+        );
+        assert_eq!(state.revision.load(Ordering::Acquire), 1);
+        assert!(state.flush.lock().await.in_flight.is_some());
+        let winner = VersionedValue::new(vec![2], 11, "writer".into());
+        state.apply(&test_op("key", winner.clone())).await.unwrap();
+        assert_eq!(
+            store.written.lock().unwrap().as_slice(),
+            &[(b"key".to_vec(), winner)]
+        );
+        assert!(state.expire_values_page(&mut pass).await.unwrap().done);
+        state.flush().await.unwrap();
+        assert_eq!(store.written.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn expiry_pages_cancelled_flush_wait_retains_pending_and_allows_safe_rescan() {
+        let store = Arc::new(FlakyStore {
+            failures_left: StdMutex::new(0),
+            written: StdMutex::new(Vec::new()),
+        });
+        let value = expiring_value(vec![1], 100);
+        let state = Arc::new(FragmentState::new(
+            HashMap::from([("key".into(), value)]),
+            Some(store.clone()),
+            1,
+            Duration::from_secs(3600),
+        ));
+        let flush_fence = state.flush_in_progress.lock().await;
+        let task_state = state.clone();
+        let task = tokio::spawn(async move {
+            task_state
+                .expire_values_page(&mut ExpiryPass::new(100))
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while state.revision.load(Ordering::Acquire) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(state.flush.lock().await.pending.len(), 1);
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        drop(flush_fence);
+        let page = state
+            .expire_values_page(&mut ExpiryPass::new(100))
+            .await
+            .unwrap();
+        assert_eq!((page.visited, page.converted, page.done), (1, 0, true));
+        let winner = VersionedValue::new(vec![2], 11, "writer".into());
+        state.apply(&test_op("key", winner.clone())).await.unwrap();
+        assert_eq!(
+            store.written.lock().unwrap().as_slice(),
+            &[(b"key".to_vec(), winner)]
+        );
     }
 
     #[tokio::test]
@@ -3941,9 +4351,9 @@ mod flush_retention_tests {
     /// A store that fails the first `failures` writes, then succeeds,
     /// recording everything it receives. Regression test for
     /// adversarial review #7 (failed flush must not discard data).
-    struct FlakyStore {
-        failures_left: StdMutex<usize>,
-        written: StdMutex<Vec<(Vec<u8>, VersionedValue)>>,
+    pub(super) struct FlakyStore {
+        pub(super) failures_left: StdMutex<usize>,
+        pub(super) written: StdMutex<Vec<(Vec<u8>, VersionedValue)>>,
     }
 
     impl KvStore for FlakyStore {
