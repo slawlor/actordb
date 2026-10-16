@@ -29,8 +29,9 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          # Test and Clippy use the same stable debug dependency artifacts.
-          shared-key: stable-debug
+          # Test/link native artifacts differ from Clippy's check-only cache.
+          # Exact-hit caches are immutable, so tests need their own warmed key.
+          shared-key: stable-debug-tests
 
       - name: Test everything
         run: cargo test --workspace --locked

@@ -4,15 +4,9 @@
 #
 #   docker compose --env-file docker/envs/replication.env up
 #
-# Build cache: layers are shared with GitHub Actions' cache backend so
-# dependency compilation is reused across workflow runs. Requires Buildx
-# (docker/setup-buildx-action@v3) in the workflow for `type=gha` to work.
-
-x-build-cache: &build-cache
-  cache_from:
-    - type=gha
-  cache_to:
-    - type=gha,mode=max
+# CI builds and loads this shared image once with docker/build-push-action,
+# which configures authenticated GitHub Actions layer caching in the workflow.
+# These build definitions remain usable locally without GitHub credentials.
 
 services:
   node-a:
@@ -20,7 +14,6 @@ services:
     build:
       context: .
       dockerfile: docker-tests/Dockerfile
-      <<: *build-cache
     image: actordb-docker-test:latest
     networks:
       - test-net
@@ -33,7 +26,6 @@ services:
     build:
       context: .
       dockerfile: docker-tests/Dockerfile
-      <<: *build-cache
     image: actordb-docker-test:latest
     networks:
       - test-net
@@ -46,7 +38,6 @@ services:
     build:
       context: .
       dockerfile: docker-tests/Dockerfile
-      <<: *build-cache
     image: actordb-docker-test:latest
     networks:
       - test-net
