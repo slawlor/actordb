@@ -19,10 +19,10 @@ jobs:
           toolchain: 1.88.0
       - uses: Swatinem/rust-cache@v2
       - name: Check backend-free defaults
-        run: cargo check --workspace --exclude docker-tests --all-targets --locked
+        run: cargo check --workspace --exclude docker-tests --all-targets
 
-      - name: Check the locked workspace with every opt-in
-        run: cargo check --workspace --all-features --all-targets --locked
+      - name: Check the workspace with every opt-in
+        run: cargo check --workspace --all-features --all-targets
 
   test:
     name: Run the default tests
@@ -44,13 +44,13 @@ jobs:
       - name: Test backend-free defaults
         # The Docker role explicitly opts into RocksDB. Exclude it to verify
         # the actual default library, not workspace feature unification.
-        run: cargo test --workspace --exclude docker-tests --locked
+        run: cargo test --workspace --exclude docker-tests
 
       - name: Test the memory test double without RocksDB
-        run: cargo test --workspace --exclude docker-tests --features actordb/memory --locked
+        run: cargo test --workspace --exclude docker-tests --features actordb/memory
 
       - name: Test everything with explicit backend opt-ins
-        run: cargo test --workspace --all-features --locked
+        run: cargo test --workspace --all-features
 
   clippy:
     name: Clippy
@@ -68,13 +68,13 @@ jobs:
           shared-key: stable-debug
 
       - name: Run Clippy on backend-free defaults
-        run: cargo clippy --workspace --exclude docker-tests --all-targets --locked -- -D clippy::all -D warnings
+        run: cargo clippy --workspace --exclude docker-tests --all-targets -- -D clippy::all -D warnings
 
       - name: Run Clippy with only the memory test double
-        run: cargo clippy --workspace --exclude docker-tests --features actordb/memory --all-targets --locked -- -D clippy::all -D warnings
+        run: cargo clippy --workspace --exclude docker-tests --features actordb/memory --all-targets -- -D clippy::all -D warnings
 
       - name: Run Clippy with every backend opt-in
-        run: cargo clippy --workspace --all-features --all-targets --locked -- -D clippy::all -D warnings
+        run: cargo clippy --workspace --all-features --all-targets -- -D clippy::all -D warnings
 
   rustfmt:
     name: rustfmt
@@ -105,7 +105,7 @@ jobs:
           key: release-docs
 
       - name: Run cargo doc on release profile
-        run: cargo doc --lib --release --all-features --locked
+        run: cargo doc --lib --release --all-features
 
   benches:
     name: benches
@@ -122,4 +122,4 @@ jobs:
           key: release-benches
 
       - name: Compile benchmarks
-        run: cargo bench --workspace --all-features --no-run --locked
+        run: cargo bench --workspace --all-features --no-run

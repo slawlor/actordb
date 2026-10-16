@@ -30,13 +30,16 @@ an invalid limit or weak secret into a valid one.
 | `actor` | `PoolConfig` | None | 4 workers, cap 10,000, no rate limit |
 | `actor` | `KvArgs` | `shared`, `fragment`, `worker_prefix` | Node-style Default/High/Background pool profiles |
 | `actor` | `KvWorkerArgs` | `shared` | No pending-admission tracker |
-| `supervision` | `SupervisorArgs` | `fragment`, `worker_prefix`, `hlc` | No store, Node-style pools, 1,000-op/100 ms flush, 30 s cleaner, 60 s snapshotter, no tombstone GC |
-| `supervision` | `CleanerArgs` | `fragment`, `shared` | 30-second interval, no tombstone GC |
-| `supervision` | `SnapshotterArgs` | `shared` | 60-second interval |
+| `actor` | `SupervisorArgs` | `fragment`, `worker_prefix`, `hlc` | No store, Node-style pools, 1,000-op/100 ms flush, 30 s cleaner, 60 s snapshotter, no tombstone GC |
+| `actor` | `CleanerArgs` | `fragment`, `shared` | 30-second interval, no tombstone GC |
+| `actor` | `SnapshotterArgs` | `shared` | 60-second interval |
 | `replication` | `SenderConfig` | None | Existing batching, reconciliation, and `MemoryApplied` ACK policy |
 | `replication` | `SenderRuntimeOptions` | None | 30-second ACK and 5-second queue-admission deadlines |
 | `replication` | `SenderDeps` | `router`, `hlc`, `state_report` | Fresh legacy reset-sender map |
 | `store` (`rocksdb` feature) | `RocksDbOptions` | None | `SyncWal`, legacy adoption disabled |
+
+Supervisor, cleaner, and snapshotter types are also reexported from
+`supervision` for compatibility.
 
 Required shared state, clocks, routers, and reports must come from the actual
 embedding; builders do not manufacture these dependencies or a fragment/node

@@ -2,6 +2,12 @@
 
 Three layers, each catching what the others can't.
 
+Unit tests use inline `#[cfg(test)]` modules in their owning source files,
+including grouped private-state regressions and small shared actor fixtures.
+Integration tests stay in `actordb/tests` to exercise real-node behavior and
+public APIs from outside the library. Test project behavior and failure modes,
+not generated builder plumbing or repetitive default/override assertions.
+
 The separate `Verify release package` workflow check additionally verifies
 unpacked crates.io packages for backend-free defaults and opted-in storage
 features, and runs stdlib release-guard regressions. PR and `main` runs have no
@@ -16,9 +22,9 @@ backend:
 
 | Configuration | Test command |
 |---|---|
-| Backend-free default | `cargo test --workspace --exclude docker-tests --locked` |
-| Memory test double only | `cargo test --workspace --exclude docker-tests --features actordb/memory --locked` |
-| All features, including RocksDB and Docker role compilation | `cargo test --workspace --all-features --locked` |
+| Backend-free default | `cargo test --workspace --exclude docker-tests` |
+| Memory test double only | `cargo test --workspace --exclude docker-tests --features actordb/memory` |
+| All features, including RocksDB and Docker role compilation | `cargo test --workspace --all-features` |
 
 The Docker exclusion matters: `docker-tests` explicitly enables RocksDB through
 its dependency, so including it unifies that feature into a workspace build.
@@ -35,11 +41,20 @@ debug tests use `stable-debug-tests`; Clippy keeps `stable-debug`. Check-only
 and test/link native artifacts can differ, and an exact cache hit is immutable:
 the test job cannot augment an existing Clippy-only entry. Rust 1.88 and the
 release docs/benchmark jobs use separate caches. The action also keys artifacts
-by the actual Rust compiler, Cargo manifests/lockfile, and compiler environment,
+by the actual Rust compiler, available Cargo dependency inputs, and compiler environment,
 and does not cache workspace build outputs by default. Coverage keeps its
 separate instrumented cache. A new test-cache key starts cold; native RocksDB
 compilation can take many minutes. Compatible warm dependency artifacts reduce
 that work, but every build/check still runs and workspace crates still compile.
+
+`Cargo.lock` is not tracked. Fresh checkouts resolve compatible dependency
+versions, with `.cargo/config.toml` preferring versions that support each
+crate's declared Rust minimum. Cargo-generated local lockfiles are ignored;
+repeated commands can reuse them. Use `cargo update` to refresh a local
+resolution and rerun the feature matrix. CI and package checks do not freeze
+dependencies; passing a previous run does not guarantee a later fresh
+resolution will select the same versions. Dependencies with inaccurate or
+undeclared MSRVs can still fail compilation.
 
 The Rust installation action is pinned to a reviewed commit, with explicit
 `toolchain: 1.88.0` for MSRV and `stable` for the remaining jobs. Dependabot can
@@ -67,6 +82,11 @@ image/dependency changes, cache access, and eviction. CI logs should show cache
 import/export and `CACHED` steps on a compatible warm run; no fixed speedup is
 guaranteed.
 
+The Docker context excludes locally generated lockfiles. Cold dependency builds
+resolve compatible versions; warm cargo-chef layers can retain their earlier
+resolution until invalidated. Rebuild without Docker's layer cache when checking
+fresh dependency resolution, rather than assuming every cached build upgrades it.
+
 Coverage checks out a pull request's exact head SHA, matching the commit
 identity used by Codecov's default PR upload. Push reports instead measure
 `github.sha`; an early guard verifies the actual checkout matches that identity.
@@ -76,7 +96,7 @@ uncovered even though a different source revision was measured. Coverage is a
 head-source report, not evidence that the PR integrates cleanly with main:
 the test matrix, Clippy and Docker workflows retain their merge-based
 integration checks. The coverage job installs stable Rust with
-`llvm-tools-preview` and invokes `cargo run --locked --bin xtask -- coverage`;
+`llvm-tools-preview` and invokes `cargo run --bin xtask -- coverage`;
 the existing xtask instrumentation, tests and LCOV generation are unchanged.
 That helper runs workspace tests, so the Docker crate's explicit dependency
 feature enables RocksDB in the coverage build. It does not select the `memory`
@@ -130,7 +150,7 @@ thresholds, and setup/worker startup are excluded. The diagnostic is storeless;
 durable flush-buffer and disk-latency comparisons need a separate benchmark.
 
 ```bash
-cargo test -p actordb --release --locked \
+cargo test -p actordb --release \
   maintenance_foreground_latency_distribution -- --ignored --nocapture
 ```
 
@@ -413,25 +433,24 @@ re-establishment.
 
 ## Running them
 
-Configuration-builder regressions exercise omitted-default parity, explicit
-overrides, optional setters, and independently allocated legacy reset maps.
-Compile-fail rustdoc examples cover missing required dependencies and the
-absence of public setters for private sender hooks. Examples, benchmarks, and
-the Docker role executable use the same generated builders; their normal
-all-target compilation checks setter names and feature-gated RocksDB usage.
-Runtime validation regressions remain separate: successful `build()` does not
-prove that startup/spawn will accept a configuration.
+Examples, benchmarks, and the Docker role executable use the generated
+builders; normal all-target compilation exercises their use without duplicating
+Bon's setter/default tests. Runtime regressions verify startup, serving,
+shutdown, child restart, and rejection of invalid settings before transport
+bind. Successful `build()` does not prove startup/spawn will accept a
+configuration. Backend-feature compile-fail examples retain coverage of the
+crate's actual opt-in API contract.
 
 ```bash
-cargo test --workspace --exclude docker-tests --locked
-cargo test --workspace --exclude docker-tests --features actordb/memory --locked
-cargo test --workspace --all-features --locked
+cargo test --workspace --exclude docker-tests
+cargo test --workspace --exclude docker-tests --features actordb/memory
+cargo test --workspace --all-features
 
-cargo clippy --workspace --exclude docker-tests --all-targets --locked -- -D clippy::all -D warnings
-cargo clippy --workspace --exclude docker-tests --features actordb/memory --all-targets --locked -- -D clippy::all -D warnings
-cargo clippy --workspace --all-features --all-targets --locked -- -D clippy::all -D warnings
+cargo clippy --workspace --exclude docker-tests --all-targets -- -D clippy::all -D warnings
+cargo clippy --workspace --exclude docker-tests --features actordb/memory --all-targets -- -D clippy::all -D warnings
+cargo clippy --workspace --all-features --all-targets -- -D clippy::all -D warnings
 
-cargo run --locked --bin xtask -- coverage # workspace/RocksDB coverage, not memory
+cargo run --bin xtask -- coverage # workspace/RocksDB coverage, not memory
 # Docker scenarios run in CI; see docker/run-scenario.sh to run locally.
 ```
 

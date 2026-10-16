@@ -8,12 +8,13 @@
 #
 # Layer-caching strategy (previously every build recompiled the world):
 #   1. `chef`    - cargo-chef installed once; cached until rust:latest moves.
-#   2. `planner` - computes recipe.json from the Cargo manifests only.
-#                  Invalidated only when a Cargo.toml / Cargo.lock changes.
+#   2. `planner` - computes recipe.json from the Cargo manifests and source
+#                  layout. There is no committed dependency lockfile.
 #   3. `builder` - system deps (clang for librocksdb-sys bindgen) in their own
 #                  early layer, then `cargo chef cook` compiles ALL third-party
-#                  dependencies into a cached layer. Invalidated only when
-#                  recipe.json changes, i.e. almost never on a code-only push.
+#                  dependencies into a cached layer. Compatible cached layers
+#                  can be reused while the recipe and build environment match;
+#                  later cold builds can resolve different dependency versions.
 #   4. final build copies the real source and compiles just our crates.
 #   5. `runtime` - slim image containing only the test binary: no toolchain,
 #                  no source tree, no cargo registry (the old image shipped
@@ -21,7 +22,7 @@
 
 FROM rust:latest AS chef
 WORKDIR /usr/src/app
-RUN cargo install cargo-chef --locked
+RUN cargo install cargo-chef
 
 FROM chef AS planner
 COPY . .
@@ -34,8 +35,8 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends cmake build-essential clang \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=planner /usr/src/app/recipe.json recipe.json
-# Compile third-party dependencies only. This layer is cached until the
-# dependency recipe changes.
+# Compile third-party dependencies only. A compatible cache can retain an older
+# resolution; rebuilding without that cache resolves the manifest ranges anew.
 RUN cargo chef cook --release --recipe-path recipe.json
 COPY . .
 # Now compile just our workspace crates on top of the cached dependencies.

@@ -715,8 +715,1186 @@ impl FragmentState {
 }
 
 #[cfg(test)]
-mod flush_tests;
+mod flush_tests {
+    //! Ordered flush retention and final expiry-fence regressions.
+
+    use super::*;
+    use crate::actor::{KvActor, KvArgs, KvMessage, OpPriority, PoolConfig};
+    use crate::shard::FragmentId;
+    use crate::store::{KvStore, StoreError};
+    use ractor::{rpc::CallResult, Actor};
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+    use std::sync::{Condvar, Mutex as StdMutex};
+    use std::time::Duration;
+    fn op(key: &str, value: VersionedValue) -> ReplicatedOp {
+        ReplicatedOp {
+            key: key.to_string(),
+            value,
+            seq: 0,
+            boot_id: 0,
+        }
+    }
+
+    /// A store that fails the first `failures` writes, then succeeds,
+    /// recording everything it receives. Regression test for
+    /// adversarial review #7 (failed flush must not discard data).
+    pub(super) struct FlakyStore {
+        pub(super) failures_left: StdMutex<usize>,
+        pub(super) written: StdMutex<Vec<(Vec<u8>, VersionedValue)>>,
+    }
+
+    impl KvStore for FlakyStore {
+        fn load(&self) -> Result<Vec<(Vec<u8>, VersionedValue)>, StoreError> {
+            Ok(Vec::new())
+        }
+
+        fn write_batch(&self, writes: &[(Vec<u8>, VersionedValue)]) -> Result<(), StoreError> {
+            {
+                let mut left = self.failures_left.lock().unwrap();
+                if *left > 0 {
+                    *left -= 1;
+                    return Err(StoreError("injected failure".to_string()));
+                }
+            }
+            self.written
+                .lock()
+                .unwrap()
+                .extend(writes.iter().map(|(k, v)| (k.clone(), v.clone())));
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn standalone_dispatcher_drain_flushes_buffered_writes() {
+        let store = Arc::new(FlakyStore {
+            failures_left: StdMutex::new(0),
+            written: StdMutex::new(Vec::new()),
+        });
+        let shared = Arc::new(FragmentState::new(
+            HashMap::new(),
+            Some(store.clone() as Arc<dyn KvStore>),
+            usize::MAX,
+            Duration::from_secs(3600),
+        ));
+        let pool = PoolConfig {
+            workers: 1,
+            queue_cap: 16,
+            rate_limit_per_sec: None,
+        };
+        let (dispatcher, _handle) = KvActor::spawn(
+            None,
+            KvActor,
+            KvArgs {
+                shared,
+                fragment: FragmentId(0),
+                worker_prefix: "standalone-drain-flush".to_string(),
+                default_pool: pool.clone(),
+                high_pool: pool.clone(),
+                background_pool: pool,
+            },
+        )
+        .await
+        .unwrap();
+        let value = VersionedValue::new(b"value".to_vec(), 100, "node".to_string());
+        let result = dispatcher
+            .call(
+                |reply| KvMessage::ApplyOp {
+                    op: op("key", value.clone()),
+                    priority: OpPriority::Default,
+                    is_replication: false,
+                    reply: Some(reply),
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(result, CallResult::Success(Ok(ApplyOutcome::Applied)));
+        assert!(store.written.lock().unwrap().is_empty());
+
+        dispatcher.drain().unwrap();
+        dispatcher.wait(None).await.unwrap();
+        assert_eq!(
+            store.written.lock().unwrap().as_slice(),
+            &[(b"key".to_vec(), value)]
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_flush_retains_batch_for_retry() {
+        let store = Arc::new(FlakyStore {
+            failures_left: StdMutex::new(1), // first write fails
+            written: StdMutex::new(Vec::new()),
+        });
+        let state = FragmentState::new(
+            HashMap::new(),
+            Some(store.clone() as Arc<dyn KvStore>),
+            2, // flush every 2 buffered ops
+            Duration::from_secs(3600),
+        );
+
+        let v1 = VersionedValue::new(b"v1".to_vec(), 100, "n1".to_string());
+        let v2 = VersionedValue::new(b"v2".to_vec(), 101, "n1".to_string());
+        state.apply(&op("k1", v1)).await.unwrap();
+        // Second buffered op triggers the flush, which fails.
+        let err = state.apply(&op("k2", v2)).await.unwrap_err();
+        assert!(
+            err.to_string().contains("injected failure"),
+            "expected injected failure, got {err}"
+        );
+        // Nothing reached the store.
+        assert!(store.written.lock().unwrap().is_empty());
+
+        // Retry: the retained batch must flush successfully now.
+        state.flush().await.unwrap();
+        let written_count = store.written.lock().unwrap().len();
+        assert_eq!(written_count, 2, "retained batch must be retried");
+        {
+            let written = store.written.lock().unwrap();
+            assert!(written.iter().any(|(k, _)| k == b"k1"));
+            assert!(written.iter().any(|(k, _)| k == b"k2"));
+        }
+
+        // And the buffer is drained — a further flush is a no-op.
+        state.flush().await.unwrap();
+        assert_eq!(store.written.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn flush_coalesces_each_key_to_its_lww_winner() {
+        let store = Arc::new(FlakyStore {
+            failures_left: StdMutex::new(0),
+            written: StdMutex::new(Vec::new()),
+        });
+        let state = FragmentState::new(
+            HashMap::new(),
+            Some(store.clone() as Arc<dyn KvStore>),
+            100,
+            Duration::from_secs(3600),
+        );
+
+        let old = VersionedValue::new(b"old".to_vec(), 100, "n1".to_string());
+        let winner = VersionedValue::new(b"winner".to_vec(), 300, "n1".to_string());
+        let stale = VersionedValue::new(b"stale".to_vec(), 200, "n1".to_string());
+        assert_eq!(
+            state.apply(&op("key", old)).await.unwrap(),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            state.apply(&op("key", winner.clone())).await.unwrap(),
+            ApplyOutcome::Applied
+        );
+        assert!(matches!(
+            state.apply(&op("key", stale)).await.unwrap(),
+            ApplyOutcome::Superseded { .. }
+        ));
+
+        state.flush().await.unwrap();
+        let written = store.written.lock().unwrap();
+        assert_eq!(written.len(), 1);
+        assert_eq!(written[0], (b"key".to_vec(), winner));
+    }
+
+    #[tokio::test]
+    async fn apply_reports_exact_lww_outcome() {
+        let state = FragmentState::new(HashMap::new(), None, 100, Duration::from_secs(3600));
+        let winner = VersionedValue::new(b"winner".to_vec(), 300, "n1".to_string());
+        assert_eq!(
+            state.apply(&op("key", winner.clone())).await.unwrap(),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            state.apply(&op("key", winner.clone())).await.unwrap(),
+            ApplyOutcome::AlreadyPresent
+        );
+
+        let stale = VersionedValue::new(b"stale".to_vec(), 200, "n1".to_string());
+        assert_eq!(
+            state.apply(&op("key", stale)).await.unwrap(),
+            ApplyOutcome::Superseded {
+                timestamp_ms: winner.timestamp_ms,
+                node_id: winner.node_id,
+                is_tombstone: winner.is_tombstone,
+            }
+        );
+
+        let mut expired = VersionedValue::new(b"expired".to_vec(), 400, "n1".to_string());
+        expired.expires_at_ms = Some(1);
+        assert_eq!(
+            state.apply(&op("expired", expired.clone())).await.unwrap(),
+            ApplyOutcome::Expired
+        );
+        let marker = state.get_all().await.remove("expired").unwrap();
+        assert!(marker.is_tombstone);
+        assert_eq!(marker.timestamp_ms, expired.timestamp_ms);
+        assert_eq!(marker.node_id, expired.node_id);
+        assert_eq!(marker.expires_at_ms, expired.expires_at_ms);
+    }
+
+    #[tokio::test]
+    async fn cleaner_persists_expiry_marker_and_preserves_version_floor() {
+        let store = Arc::new(FlakyStore {
+            failures_left: StdMutex::new(0),
+            written: StdMutex::new(Vec::new()),
+        });
+        let mut expired = VersionedValue::new(b"ttl".to_vec(), 200, "n1".to_string());
+        expired.expires_at_ms = Some(300);
+        let state = FragmentState::new(
+            HashMap::from([("key".to_string(), expired.clone())]),
+            Some(store.clone() as Arc<dyn KvStore>),
+            1,
+            Duration::from_secs(3600),
+        );
+
+        assert_eq!(state.expire_values(300).await.unwrap(), 1);
+        let marker = expired.expiry_tombstone();
+        assert_eq!(
+            store.written.lock().unwrap().as_slice(),
+            &[(b"key".to_vec(), marker.clone())]
+        );
+        assert_eq!(state.get_all().await.get("key"), Some(&marker));
+
+        let older = VersionedValue::new(b"old".to_vec(), 199, "n9".to_string());
+        assert!(matches!(
+            state.apply(&op("key", older)).await.unwrap(),
+            ApplyOutcome::Superseded { .. }
+        ));
+        let newer = VersionedValue::new(b"new".to_vec(), 201, "n1".to_string());
+        assert_eq!(
+            state.apply(&op("key", newer.clone())).await.unwrap(),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(state.get("key").await, Some(newer));
+    }
+
+    #[tokio::test]
+    async fn cleaner_sweeps_retain_existing_and_new_tombstones() {
+        let existing = VersionedValue::tombstone(100, "n1".to_string());
+        let mut expired = VersionedValue::new(b"ttl".to_vec(), 200, "n1".to_string());
+        expired.expires_at_ms = Some(300);
+        let state = FragmentState::new(
+            HashMap::from([
+                ("deleted".to_string(), existing.clone()),
+                ("expired".to_string(), expired.clone()),
+            ]),
+            None,
+            100,
+            Duration::from_secs(3600),
+        );
+
+        assert_eq!(state.expire_values(300).await.unwrap(), 1);
+        assert_eq!(state.expire_values(u64::MAX).await.unwrap(), 0);
+        assert_eq!(state.gc_tombstones(u64::MAX, 0).await, 0);
+
+        let values = state.get_all().await;
+        assert_eq!(values.get("deleted"), Some(&existing));
+        assert_eq!(values.get("expired"), Some(&expired.expiry_tombstone()));
+    }
+
+    /// Store whose first write waits until the test releases it. A second
+    /// write, if allowed to overlap, completes first and exposes durable
+    /// version regression deterministically.
+    struct GatedStore {
+        calls: AtomicUsize,
+        release_first: (StdMutex<bool>, Condvar),
+        stored: StdMutex<HashMap<Vec<u8>, VersionedValue>>,
+    }
+
+    impl GatedStore {
+        fn release_first(&self) {
+            let (released, wake) = &self.release_first;
+            *released.lock().unwrap() = true;
+            wake.notify_all();
+        }
+    }
+
+    impl KvStore for GatedStore {
+        fn load(&self) -> Result<Vec<(Vec<u8>, VersionedValue)>, StoreError> {
+            Ok(self
+                .stored
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect())
+        }
+
+        fn write_batch(&self, writes: &[(Vec<u8>, VersionedValue)]) -> Result<(), StoreError> {
+            let call = self.calls.fetch_add(1, AtomicOrdering::SeqCst);
+            if call == 0 {
+                let (released, wake) = &self.release_first;
+                let mut released = released.lock().unwrap();
+                while !*released {
+                    released = wake.wait(released).unwrap();
+                }
+            }
+
+            let mut stored = self.stored.lock().unwrap();
+            for (key, value) in writes {
+                stored.insert(key.clone(), value.clone());
+            }
+            Ok(())
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn overlapping_flushes_are_serialized_and_preserve_latest_version() {
+        let store = Arc::new(GatedStore {
+            calls: AtomicUsize::new(0),
+            release_first: (StdMutex::new(false), Condvar::new()),
+            stored: StdMutex::new(HashMap::new()),
+        });
+        let state = Arc::new(FragmentState::new(
+            HashMap::new(),
+            Some(store.clone() as Arc<dyn KvStore>),
+            100,
+            Duration::from_secs(3600),
+        ));
+
+        let old = VersionedValue::new(b"old".to_vec(), 100, "n1".to_string());
+        let new = VersionedValue::new(b"new".to_vec(), 200, "n1".to_string());
+        state.apply(&op("key", old)).await.unwrap();
+
+        let first_state = state.clone();
+        let first = tokio::spawn(async move { first_state.flush().await });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while store.calls.load(AtomicOrdering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("first flush did not reach the store");
+
+        // The newer version is applied while the old batch is blocked in the
+        // store. A second flush must wait rather than commit ahead of it.
+        state.apply(&op("key", new.clone())).await.unwrap();
+        let second_state = state.clone();
+        let second = tokio::spawn(async move { second_state.flush().await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            store.calls.load(AtomicOrdering::SeqCst),
+            1,
+            "a second store write overlapped the first"
+        );
+
+        store.release_first();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            first.await.unwrap().unwrap();
+            second.await.unwrap().unwrap();
+        })
+        .await
+        .expect("serialized flushes did not complete");
+
+        assert_eq!(
+            store.stored.lock().unwrap().get(b"key".as_slice()),
+            Some(&new),
+            "durable state regressed behind the in-memory LWW winner"
+        );
+    }
+}
 #[cfg(test)]
-mod maintenance_diagnostics;
+mod maintenance_diagnostics {
+    //! Opt-in, descriptive latency samples, not a CI performance assertion.
+    //! Full-sweep baseline uses the retained public primitive; paged mode runs the
+    //! actual Cleaner. Both contend with actual dispatcher/worker foreground RPCs.
+
+    use super::*;
+    use crate::actor::{
+        Cleaner, CleanerArgs, KvActor, KvArgs, KvMessage, OpPriority, PoolConfig, ReplicatedOp,
+    };
+    use crate::shard::FragmentId;
+    use ractor::rpc::CallResult;
+    use ractor::Actor;
+    use tokio::sync::Barrier;
+
+    const MAX_SAMPLES_PER_CLASS: usize = 20_000;
+
+    #[derive(Clone, Copy, Debug)]
+    enum Mode {
+        FullSweep,
+        AutomaticCleaner,
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "manual release diagnostic; no shared-runner latency threshold"]
+    async fn maintenance_foreground_latency_distribution() {
+        eprintln!("mode,keys,map_capacity,ttl_percent,materialization_us,total_through_drain_us,class,operations,stored_samples,p50_us,p95_us,p99_us,max_us");
+        for cardinality in [10_000usize, 100_000] {
+            for capacity_multiple in [1usize, 8] {
+                for ttl_percent in [0usize, 1, 100] {
+                    for mode in [Mode::FullSweep, Mode::AutomaticCleaner] {
+                        measure_case(cardinality, capacity_multiple, ttl_percent, mode).await;
+                    }
+                }
+            }
+        }
+    }
+
+    async fn measure_case(
+        cardinality: usize,
+        capacity_multiple: usize,
+        ttl_percent: usize,
+        mode: Mode,
+    ) {
+        let mut values = HashMap::with_capacity(cardinality * capacity_multiple + 4);
+        for i in 0..cardinality {
+            let mut value = VersionedValue::new(vec![1; 32], 10, "seed".into());
+            if i < cardinality * ttl_percent / 100 {
+                value.expires_at_ms = Some(1);
+            }
+            values.insert(format!("k{i:08}"), value);
+        }
+        // A last ordered witness makes even the near-zero-expiry pass observable.
+        // This is not a literal zero-expiry dataset: one witness always expires.
+        let mut witness = VersionedValue::new(vec![1; 32], 10, "seed".into());
+        witness.expires_at_ms = Some(1);
+        values.insert("zz-witness".into(), witness);
+        let classes = [
+            ("high-hit", OpPriority::High, false, "foreground-high"),
+            (
+                "default-hit",
+                OpPriority::Default,
+                false,
+                "foreground-default",
+            ),
+            (
+                "overwrite",
+                OpPriority::Default,
+                true,
+                "foreground-overwrite",
+            ),
+        ];
+        for (_, _, _, key) in classes {
+            values.insert(
+                key.into(),
+                VersionedValue::new(vec![1; 32], 10, "seed".into()),
+            );
+        }
+        let map_capacity = values.capacity();
+        let shared = Arc::new(FragmentState::new(
+            values,
+            None,
+            usize::MAX,
+            Duration::from_secs(3600),
+        ));
+        let pool = PoolConfig {
+            workers: 2,
+            queue_cap: 128,
+            rate_limit_per_sec: None,
+        };
+        let (dispatcher, _) = KvActor::spawn(
+            None,
+            KvActor,
+            KvArgs {
+                shared: shared.clone(),
+                fragment: FragmentId(0),
+                worker_prefix: format!(
+                    "maintenance-diag-{cardinality}-{capacity_multiple}-{ttl_percent}-{mode:?}"
+                ),
+                default_pool: pool.clone(),
+                high_pool: pool.clone(),
+                background_pool: pool,
+            },
+        )
+        .await
+        .unwrap();
+        let start_gate = Arc::new(Barrier::new(4));
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut foreground = Vec::new();
+        for (label, priority, write, key) in classes {
+            let dispatcher = dispatcher.clone();
+            let start_gate = start_gate.clone();
+            let stop = stop.clone();
+            foreground.push(tokio::spawn(async move {
+                let mut samples = Vec::with_capacity(MAX_SAMPLES_PER_CLASS);
+                let mut operations = 0usize;
+                start_gate.wait().await;
+                while !stop.load(Ordering::Acquire) {
+                    let started = Instant::now();
+                    if write {
+                        let outcome = dispatcher
+                            .call(
+                                |reply| KvMessage::ApplyOp {
+                                    op: ReplicatedOp {
+                                        key: key.into(),
+                                        value: VersionedValue::new(
+                                            vec![2; 32],
+                                            100 + operations as u64,
+                                            "foreground".into(),
+                                        ),
+                                        seq: 0,
+                                        boot_id: 0,
+                                    },
+                                    priority,
+                                    is_replication: false,
+                                    reply: Some(reply),
+                                },
+                                Some(Duration::from_secs(5)),
+                            )
+                            .await
+                            .unwrap();
+                        assert!(matches!(
+                            outcome,
+                            CallResult::Success(Ok(ApplyOutcome::Applied))
+                        ));
+                    } else {
+                        let outcome = dispatcher
+                            .call(
+                                |reply| KvMessage::Get {
+                                    key: key.into(),
+                                    priority,
+                                    reply,
+                                },
+                                Some(Duration::from_secs(5)),
+                            )
+                            .await
+                            .unwrap();
+                        assert!(matches!(outcome, CallResult::Success(Ok(Some(_)))));
+                    }
+                    if samples.len() < MAX_SAMPLES_PER_CLASS {
+                        samples
+                            .push(u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX));
+                    }
+                    operations += 1;
+                }
+                (label, operations, samples)
+            }));
+        }
+        start_gate.wait().await;
+        let started = Instant::now();
+        let mut full_sweep = None;
+        let mut cleaner = None;
+        match mode {
+            Mode::FullSweep => {
+                let shared = shared.clone();
+                full_sweep = Some(tokio::spawn(async move {
+                    shared.expire_values(now_ms()).await.unwrap()
+                }));
+            }
+            Mode::AutomaticCleaner => {
+                cleaner = Some(
+                    Cleaner::spawn(
+                        None,
+                        Cleaner,
+                        CleanerArgs {
+                            fragment: FragmentId(0),
+                            shared: shared.clone(),
+                            interval: Duration::from_secs(3600),
+                            tombstone_gc_age: None,
+                            reset_senders: Arc::new(Mutex::new(HashMap::new())),
+                        },
+                    )
+                    .await
+                    .unwrap()
+                    .0,
+                );
+            }
+        }
+        tokio::time::timeout(Duration::from_secs(60), async {
+            loop {
+                if shared.cache.read().await.values["zz-witness"].is_tombstone {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let materialization = started.elapsed();
+        stop.store(true, Ordering::Release);
+        if let Some(full_sweep) = full_sweep {
+            assert_eq!(
+                full_sweep.await.unwrap(),
+                cardinality * ttl_percent / 100 + 1
+            );
+        }
+        if let Some(cleaner) = cleaner {
+            cleaner.drain().unwrap();
+            cleaner.wait(None).await.unwrap();
+        }
+        let mut results = Vec::new();
+        for task in foreground {
+            results.push(task.await.unwrap());
+        }
+        dispatcher.drain().unwrap();
+        dispatcher.wait(None).await.unwrap();
+        let total = started.elapsed();
+        for (label, operations, mut samples) in results {
+            samples.sort_unstable();
+            let quantile = |percent: usize| {
+                // One blocked RPC is a useful maximum observation, not evidence
+                // for a meaningful tail distribution. Report sparse tails as NA.
+                if (percent == 99 && samples.len() < 100) || (percent == 95 && samples.len() < 20) {
+                    return "na".into();
+                }
+                samples
+                    .get(samples.len().saturating_sub(1) * percent / 100)
+                    .map(|ns| format!("{:.3}", *ns as f64 / 1000.0))
+                    .unwrap_or_else(|| "na".into())
+            };
+            eprintln!("{mode:?},{cardinality},{map_capacity},{ttl_percent},{},{},{label},{operations},{},{},{},{},{}",
+                materialization.as_micros(), total.as_micros(), samples.len(), quantile(50), quantile(95), quantile(99), quantile(100));
+        }
+    }
+}
 #[cfg(test)]
-mod tests;
+mod tests {
+    //! Shared-state expiry, snapshots, and storage-fence regressions.
+
+    use super::flush_tests::FlakyStore;
+    use super::*;
+    use crate::actor::test_support::{test_op, test_state};
+    use crate::store::StoreError;
+    use std::sync::Mutex as StdMutex;
+    struct StableFenceStore {
+        reported: StoreCommitDurability,
+        events: std::sync::Mutex<Vec<&'static str>>,
+    }
+
+    impl StableFenceStore {
+        fn new(reported: StoreCommitDurability) -> Self {
+            Self {
+                reported,
+                events: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl KvStore for StableFenceStore {
+        fn load(&self) -> Result<Vec<(Vec<u8>, VersionedValue)>, StoreError> {
+            Ok(Vec::new())
+        }
+
+        fn write_batch(&self, _writes: &[(Vec<u8>, VersionedValue)]) -> Result<(), StoreError> {
+            self.events.lock().unwrap().push("write");
+            Ok(())
+        }
+
+        fn stable_fence(&self) -> Result<StoreCommitDurability, StoreError> {
+            self.events.lock().unwrap().push("fence");
+            Ok(self.reported)
+        }
+    }
+    fn expiring_value(payload: Vec<u8>, deadline: u64) -> VersionedValue {
+        let mut value = VersionedValue::new(payload, 10, "writer".to_string());
+        value.expires_at_ms = Some(deadline);
+        value
+    }
+
+    #[tokio::test]
+    async fn expiry_pages_bound_visits_even_for_sparse_non_ttl_cache_and_empty_key() {
+        let mut values = HashMap::with_capacity(100_000);
+        values.insert(String::new(), VersionedValue::new(vec![], 1, "n".into()));
+        for i in 0..600 {
+            values.insert(
+                format!("k{i:04}"),
+                VersionedValue::new(vec![], 1, "n".into()),
+            );
+        }
+        let state = test_state(values);
+        let mut pass = ExpiryPass::new(100);
+        let first = state.expire_values_page(&mut pass).await.unwrap();
+        assert_eq!(
+            (first.visited, first.converted, first.done),
+            (256, 0, false)
+        );
+        assert_eq!(pass.after_key.as_deref(), Some("k0254"));
+        let second = state.expire_values_page(&mut pass).await.unwrap();
+        assert_eq!(
+            (second.visited, second.converted, second.done),
+            (256, 0, false)
+        );
+        let third = state.expire_values_page(&mut pass).await.unwrap();
+        assert_eq!((third.visited, third.converted, third.done), (89, 0, true));
+        assert_eq!(state.revision.load(Ordering::Acquire), 0);
+        assert_eq!(
+            state.expire_values_page(&mut pass).await.unwrap().visited,
+            0
+        );
+
+        let empty = test_state(HashMap::new());
+        let page = empty
+            .expire_values_page(&mut ExpiryPass::new(100))
+            .await
+            .unwrap();
+        assert_eq!(
+            (page.visited, page.converted, page.work_bytes, page.done),
+            (0, 0, 0, true)
+        );
+        let empty_key = test_state(HashMap::from([(
+            String::new(),
+            expiring_value(vec![1], 100),
+        )]));
+        let mut pass = ExpiryPass::new(100);
+        let page = empty_key.expire_values_page(&mut pass).await.unwrap();
+        assert_eq!((page.visited, page.converted, page.done), (1, 1, true));
+        assert_eq!(pass.after_key.as_deref(), Some(""));
+    }
+
+    #[tokio::test]
+    async fn expiry_pages_soft_bytes_charge_capacity_and_allow_one_terminal_record() {
+        let mut payload = Vec::with_capacity(EXPIRY_PAGE_WORK_BYTES + 17);
+        payload.push(1);
+        let oversized = expiring_value(payload, 100);
+        let oversized_charge = expiry_record_work_bytes("a", &oversized, true, false);
+        let state = test_state(HashMap::from([
+            ("a".into(), oversized),
+            ("z".into(), expiring_value(vec![1], 100)),
+        ]));
+        let mut pass = ExpiryPass::new(100);
+        let page = state.expire_values_page(&mut pass).await.unwrap();
+        assert_eq!((page.visited, page.converted, page.done), (1, 1, false));
+        assert_eq!(
+            page.work_bytes,
+            oversized_charge + std::mem::size_of::<String>() + 1
+        );
+        assert!(page.work_bytes >= EXPIRY_PAGE_WORK_BYTES);
+        assert_eq!(
+            state.expire_values_page(&mut pass).await.unwrap().visited,
+            1
+        );
+
+        let payload = vec![1; EXPIRY_PAGE_WORK_BYTES];
+        let state = test_state(HashMap::from([
+            ("a".into(), expiring_value(vec![1], 100)),
+            ("b".into(), expiring_value(payload, 100)),
+            ("c".into(), expiring_value(vec![1], 100)),
+        ]));
+        let mut pass = ExpiryPass::new(100);
+        let page = state.expire_values_page(&mut pass).await.unwrap();
+        assert_eq!((page.visited, page.converted, page.done), (2, 2, false));
+        assert_eq!(pass.after_key.as_deref(), Some("b"));
+        assert_eq!(
+            state.expire_values_page(&mut pass).await.unwrap().visited,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn expiry_pages_publish_each_revision_and_recheck_current_winners_at_pinned_time() {
+        let values = (0..520)
+            .map(|i| (format!("k{i:04}"), expiring_value(vec![1], 100)))
+            .collect();
+        let state = test_state(values);
+        let mut pass = ExpiryPass::new(100);
+        let first = state.expire_values_page(&mut pass).await.unwrap();
+        assert_eq!(first.converted, 256);
+        let first_revision = state.revision.load(Ordering::Acquire);
+        let winner = VersionedValue::new(vec![2], 11, "writer".into());
+        // This future expiry is not expired at the pass's pinned instant.
+        let mut future = expiring_value(vec![3], u64::MAX);
+        future.timestamp_ms = 11;
+        let winner_op = test_op("k0256", winner.clone());
+        let future_op = test_op("k0257", future);
+        // Register concurrent mutations ahead of the next page on Tokio's
+        // fair write-lock queue, rather than relying on scheduling sleeps.
+        let cache_gate = state.cache.write().await;
+        let mut apply_winner = Box::pin(state.apply(&winner_op));
+        let mut apply_future = Box::pin(state.apply(&future_op));
+        assert!(futures::poll!(apply_winner.as_mut()).is_pending());
+        assert!(futures::poll!(apply_future.as_mut()).is_pending());
+        let mut next_page = Box::pin(state.expire_values_page(&mut pass));
+        assert!(futures::poll!(next_page.as_mut()).is_pending());
+        drop(cache_gate);
+        assert_eq!(apply_winner.await.unwrap(), ApplyOutcome::Applied);
+        assert_eq!(apply_future.await.unwrap(), ApplyOutcome::Applied);
+        let before_second = state.revision.load(Ordering::Acquire);
+        let second = next_page.await.unwrap();
+        assert_eq!((second.visited, second.converted), (256, 254));
+        assert_eq!(state.revision.load(Ordering::Acquire), before_second + 254);
+        assert_eq!(state.cache.read().await.values.get("k0256"), Some(&winner));
+        assert!(!state.cache.read().await.values["k0257"].is_tombstone);
+        let summary = state
+            .summary_page(Some("k0255"), Some(first_revision), Some(100), 10)
+            .await;
+        assert!(summary.restart);
+        assert!(state.expire_values_page(&mut pass).await.unwrap().done);
+    }
+
+    #[tokio::test]
+    async fn expiry_pages_initial_quota_and_high_water_make_insert_churn_finite() {
+        let values = (0..300)
+            .map(|i| (format!("k{i:04}"), expiring_value(vec![1], 100)))
+            .collect();
+        let state = test_state(values);
+        let mut pass = ExpiryPass::new(100);
+        assert_eq!(
+            state.expire_values_page(&mut pass).await.unwrap().visited,
+            256
+        );
+        // Use current live future-TTL values to avoid apply's immediate expiry
+        // materialization, then move their deadline under the shared cache lock.
+        for key in ["a-behind", "k0255-new", "z-beyond"] {
+            state
+                .apply(&test_op(key, expiring_value(vec![2], u64::MAX)))
+                .await
+                .unwrap();
+            state
+                .cache
+                .write()
+                .await
+                .values
+                .get_mut(key)
+                .unwrap()
+                .expires_at_ms = Some(100);
+        }
+        let page = state.expire_values_page(&mut pass).await.unwrap();
+        assert_eq!((page.visited, page.converted, page.done), (44, 44, true));
+        let cache = state.cache.read().await;
+        assert!(cache.values["k0255-new"].is_tombstone);
+        assert!(!cache.values["a-behind"].is_tombstone);
+        assert!(!cache.values["z-beyond"].is_tombstone);
+        assert!(
+            !cache.values["k0299"].is_tombstone,
+            "insert consumed one original visit"
+        );
+        drop(cache);
+        // Public full sweep remains authoritative and returns its full count.
+        assert_eq!(state.expire_values(100).await.unwrap(), 3);
+    }
+
+    #[tokio::test]
+    async fn expiry_pages_failed_flush_retains_marker_and_newer_durable_winner() {
+        let store = Arc::new(FlakyStore {
+            failures_left: StdMutex::new(1),
+            written: StdMutex::new(Vec::new()),
+        });
+        let value = expiring_value(vec![1], 100);
+        let state = FragmentState::new(
+            HashMap::from([("key".into(), value.clone())]),
+            Some(store.clone()),
+            1,
+            Duration::from_secs(3600),
+        );
+        let mut pass = ExpiryPass::new(100);
+        assert!(state
+            .expire_values_page(&mut pass)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("injected failure"));
+        assert_eq!(pass.after_key.as_deref(), Some("key"));
+        assert_eq!(
+            state.cache.read().await.values["key"],
+            value.expiry_tombstone()
+        );
+        assert_eq!(state.revision.load(Ordering::Acquire), 1);
+        assert!(state.flush.lock().await.in_flight.is_some());
+        let winner = VersionedValue::new(vec![2], 11, "writer".into());
+        state.apply(&test_op("key", winner.clone())).await.unwrap();
+        assert_eq!(
+            store.written.lock().unwrap().as_slice(),
+            &[(b"key".to_vec(), winner)]
+        );
+        assert!(state.expire_values_page(&mut pass).await.unwrap().done);
+        state.flush().await.unwrap();
+        assert_eq!(store.written.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn expiry_pages_cancelled_flush_wait_retains_pending_and_allows_safe_rescan() {
+        let store = Arc::new(FlakyStore {
+            failures_left: StdMutex::new(0),
+            written: StdMutex::new(Vec::new()),
+        });
+        let value = expiring_value(vec![1], 100);
+        let state = Arc::new(FragmentState::new(
+            HashMap::from([("key".into(), value)]),
+            Some(store.clone()),
+            1,
+            Duration::from_secs(3600),
+        ));
+        let flush_fence = state.flush_in_progress.lock().await;
+        let task_state = state.clone();
+        let task = tokio::spawn(async move {
+            task_state
+                .expire_values_page(&mut ExpiryPass::new(100))
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while state.revision.load(Ordering::Acquire) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(state.flush.lock().await.pending.len(), 1);
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        drop(flush_fence);
+        let page = state
+            .expire_values_page(&mut ExpiryPass::new(100))
+            .await
+            .unwrap();
+        assert_eq!((page.visited, page.converted, page.done), (1, 0, true));
+        let winner = VersionedValue::new(vec![2], 11, "writer".into());
+        state.apply(&test_op("key", winner.clone())).await.unwrap();
+        assert_eq!(
+            store.written.lock().unwrap().as_slice(),
+            &[(b"key".to_vec(), winner)]
+        );
+    }
+
+    #[tokio::test]
+    async fn stable_flush_maps_store_guarantees_after_flushing_pending_writes() {
+        for (reported, expected) in [
+            (
+                StoreCommitDurability::Buffered,
+                ApplyDurability::StoreCommitted,
+            ),
+            (
+                StoreCommitDurability::Stable,
+                ApplyDurability::StableCommitted,
+            ),
+        ] {
+            let store = Arc::new(StableFenceStore::new(reported));
+            let state = FragmentState::new(
+                HashMap::new(),
+                Some(store.clone()),
+                100,
+                Duration::from_secs(3600),
+            );
+            state
+                .apply(&test_op(
+                    "stable",
+                    VersionedValue::new(b"value".to_vec(), 1, "node".to_string()),
+                ))
+                .await
+                .unwrap();
+
+            assert_eq!(state.flush_stable().await.unwrap(), expected);
+            assert_eq!(*store.events.lock().unwrap(), vec!["write", "fence"]);
+        }
+
+        let storeless = test_state(HashMap::new());
+        assert_eq!(
+            storeless.flush_stable().await.unwrap(),
+            ApplyDurability::MemoryApplied
+        );
+    }
+
+    #[tokio::test]
+    async fn summary_pages_are_ordered_exclusive_and_revision_guarded() {
+        let state = test_state(HashMap::from([
+            (
+                "zulu".to_string(),
+                VersionedValue::new(vec![3], 30, "n1".to_string()),
+            ),
+            (
+                "alpha".to_string(),
+                VersionedValue::new(vec![1], 10, "n1".to_string()),
+            ),
+            (
+                "charlie".to_string(),
+                VersionedValue::new(vec![2], 20, "n1".to_string()),
+            ),
+        ]));
+
+        let first = state.summary_page(None, None, Some(123), 2).await;
+        assert_eq!(first.revision, 0);
+        assert_eq!(first.snapshot_time_ms, 123);
+        assert!(!first.done);
+        assert!(!first.restart);
+        assert_eq!(
+            first
+                .summaries
+                .iter()
+                .map(|summary| summary.key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["alpha", "charlie"]
+        );
+
+        let second = state
+            .summary_page(
+                Some("charlie"),
+                Some(first.revision),
+                Some(first.snapshot_time_ms),
+                2,
+            )
+            .await;
+        assert!(second.done);
+        assert!(!second.restart);
+        assert_eq!(
+            second
+                .summaries
+                .iter()
+                .map(|summary| summary.key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["zulu"]
+        );
+
+        state
+            .apply(&test_op(
+                "bravo",
+                VersionedValue::new(vec![4], 40, "n1".to_string()),
+            ))
+            .await
+            .unwrap();
+        let stale = state
+            .summary_page(
+                Some("charlie"),
+                Some(first.revision),
+                Some(first.snapshot_time_ms),
+                2,
+            )
+            .await;
+        assert!(stale.restart);
+        assert!(!stale.done);
+        assert!(stale.summaries.is_empty());
+        assert_eq!(stale.revision, 1);
+
+        let restarted = state.summary_page(None, None, Some(123), 10).await;
+        assert_eq!(
+            restarted
+                .summaries
+                .iter()
+                .map(|summary| summary.key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["alpha", "bravo", "charlie", "zulu"]
+        );
+        assert!(restarted.done);
+    }
+
+    #[tokio::test]
+    async fn summary_cursor_can_advance_past_an_empty_key() {
+        let state = test_state(HashMap::from([
+            (
+                String::new(),
+                VersionedValue::new(vec![0], 1, "n1".to_string()),
+            ),
+            (
+                "next".to_string(),
+                VersionedValue::new(vec![1], 2, "n1".to_string()),
+            ),
+        ]));
+
+        let first = state.summary_page(None, None, Some(123), 1).await;
+        assert_eq!(first.summaries[0].key, "");
+        assert!(!first.done);
+        let second = state
+            .summary_page(
+                Some(""),
+                Some(first.revision),
+                Some(first.snapshot_time_ms),
+                1,
+            )
+            .await;
+        assert_eq!(second.summaries[0].key, "next");
+        assert!(second.done);
+    }
+
+    #[tokio::test]
+    async fn summary_pages_clamp_zero_limit_and_bound_cloned_metadata() {
+        let large_suffix = "k".repeat(SUMMARY_PAGE_TARGET_BYTES / 2);
+        let alpha = format!("alpha-{large_suffix}");
+        let bravo = format!("bravo-{large_suffix}");
+        let state = test_state(HashMap::from([
+            (
+                alpha.clone(),
+                VersionedValue::new(Vec::new(), 1, "n".to_string()),
+            ),
+            (
+                bravo.clone(),
+                VersionedValue::new(Vec::new(), 2, "n".to_string()),
+            ),
+        ]));
+
+        let first = state.summary_page(None, None, Some(123), 0).await;
+        assert_eq!(first.summaries.len(), 1);
+        assert_eq!(first.summaries[0].key, alpha);
+        assert!(!first.done);
+
+        let second = state
+            .summary_page(
+                Some(&alpha),
+                Some(first.revision),
+                Some(first.snapshot_time_ms),
+                usize::MAX,
+            )
+            .await;
+        assert_eq!(second.summaries.len(), 1);
+        assert_eq!(second.summaries[0].key, bravo);
+        assert!(second.done);
+    }
+
+    #[tokio::test]
+    async fn summary_and_get_versioned_share_pinned_expiry_semantics() {
+        let mut expiring = VersionedValue::new(b"value".to_vec(), 50, "n1".to_string());
+        expiring.expires_at_ms = Some(100);
+        let tombstone = VersionedValue::tombstone(60, "n2".to_string());
+        let state = test_state(HashMap::from([
+            ("expiring".to_string(), expiring.clone()),
+            ("deleted".to_string(), tombstone.clone()),
+        ]));
+
+        let before = state.summary_page(None, None, Some(99), 10).await;
+        assert!(
+            !before
+                .summaries
+                .iter()
+                .find(|summary| summary.key == "expiring")
+                .unwrap()
+                .is_tombstone
+        );
+        let at_expiry = state.summary_page(None, None, Some(100), 10).await;
+        assert!(
+            at_expiry
+                .summaries
+                .iter()
+                .find(|summary| summary.key == "expiring")
+                .unwrap()
+                .is_tombstone
+        );
+        assert!(
+            at_expiry
+                .summaries
+                .iter()
+                .find(|summary| summary.key == "deleted")
+                .unwrap()
+                .is_tombstone
+        );
+
+        assert_eq!(
+            state.get_versioned("expiring", Some(99)).await,
+            Some(expiring.clone())
+        );
+        assert_eq!(
+            state.get_versioned("deleted", Some(99)).await,
+            Some(tombstone)
+        );
+        assert_eq!(state.get_versioned("missing", Some(99)).await, None);
+        assert_eq!(
+            state.get_versioned("expiring", Some(100)).await,
+            Some(expiring.expiry_tombstone())
+        );
+    }
+
+    #[tokio::test]
+    async fn versioned_pages_bound_value_clones_and_advance_over_missing_keys() {
+        let state = test_state(HashMap::from([
+            (
+                "a".to_string(),
+                VersionedValue::new(vec![1; 600 * 1024], 1, "n".to_string()),
+            ),
+            (
+                "b".to_string(),
+                VersionedValue::new(vec![2; 600 * 1024], 2, "n".to_string()),
+            ),
+        ]));
+        let keys = vec!["missing".to_string(), "a".to_string(), "b".to_string()];
+
+        let first = state.get_versioned_page(&keys, 0, Some(u64::MAX)).await;
+        assert!(first.missing);
+        assert_eq!(first.next_index, 2);
+        assert_eq!(first.entries.len(), 1);
+        assert_eq!(first.entries[0].0, "a");
+
+        let second = state
+            .get_versioned_page(&keys, first.next_index, Some(u64::MAX))
+            .await;
+        assert!(!second.missing);
+        assert_eq!(second.next_index, keys.len());
+        assert_eq!(second.entries.len(), 1);
+        assert_eq!(second.entries[0].0, "b");
+    }
+}

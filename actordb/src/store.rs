@@ -385,39 +385,6 @@ impl RocksDbOptions {
 mod tests {
     use super::*;
 
-    #[cfg(feature = "rocksdb")]
-    #[test]
-    fn rocksdb_options_builder_defaults_and_overrides_match_existing_policy() {
-        let defaults = RocksDbOptions::builder().build();
-        assert_eq!(defaults, RocksDbOptions::default());
-        assert_eq!(defaults.durability(), RocksDbDurability::SyncWal);
-        assert!(!defaults.legacy_manifest_adoption());
-        let adoption = RocksDbOptions::builder()
-            .legacy_manifest_adoption(true)
-            .build();
-        assert_eq!(adoption.durability(), RocksDbDurability::SyncWal);
-        let async_wal = RocksDbOptions::builder()
-            .durability(RocksDbDurability::AsyncWal)
-            .build();
-        assert!(!async_wal.legacy_manifest_adoption());
-        let overrides = RocksDbOptions::builder()
-            .durability(RocksDbDurability::AsyncWal)
-            .legacy_manifest_adoption(true)
-            .build();
-        assert_eq!(
-            overrides,
-            RocksDbOptions::default()
-                .with_durability(RocksDbDurability::AsyncWal)
-                .with_legacy_manifest_adoption(true)
-        );
-        assert_eq!(
-            overrides
-                .with_durability(RocksDbDurability::SyncWal)
-                .with_legacy_manifest_adoption(false),
-            defaults
-        );
-    }
-
     #[test]
     fn custom_store_capabilities_default_to_retention_and_buffering() {
         struct CustomStore;

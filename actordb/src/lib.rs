@@ -11,7 +11,7 @@
 // #![cfg_attr(docsrs, feature(doc_cfg))]
 
 /// The actor-first heart of the database: per-fragment dispatchers
-/// routing to worker pools over shared fragment state, with
+/// routing to worker pools, supervisors, and maintenance actors over shared fragment state, with
 /// last-writer-wins merge, TTLs, and tombstones.
 pub mod actor;
 
@@ -37,7 +37,7 @@ pub mod store;
 /// Sharding: deterministic key → fragment mapping.
 pub mod shard;
 
-/// Per-fragment supervision: dispatcher pool, TTL cleaner, snapshotter.
+/// Compatibility reexports of the supervisor and maintenance actors in [`actor`].
 pub mod supervision;
 
 /// Phase 5: async sender/receiver replication (per-fragment, per-peer
@@ -55,4 +55,41 @@ mod runtime_tasks;
 pub(crate) mod wire;
 
 #[cfg(test)]
-pub(crate) mod common_test;
+pub(crate) mod common_test {
+    #![allow(dead_code)]
+
+    use std::future::Future;
+
+    use ractor::concurrency::sleep;
+    use ractor::concurrency::Duration;
+    use ractor::concurrency::Instant;
+
+    pub async fn periodic_check<F>(check: F, timeout: Duration)
+    where
+        F: Fn() -> bool,
+    {
+        let start = Instant::now();
+        while start.elapsed() < timeout {
+            if check() {
+                break;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+        assert!(check());
+    }
+
+    pub async fn periodic_async_check<F, Fut>(check: F, timeout: Duration)
+    where
+        F: Fn() -> Fut,
+        Fut: Future<Output = bool>,
+    {
+        let start = Instant::now();
+        while start.elapsed() < timeout {
+            if check().await {
+                break;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+        assert!(check().await);
+    }
+}

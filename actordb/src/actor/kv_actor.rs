@@ -22,16 +22,6 @@ use crate::shard::FragmentId;
 /// Arguments to spawn a [KvActor].
 /// State, fragment identity and the unique worker prefix remain required;
 /// omitted pool settings match [`crate::node::NodeConfig`] defaults.
-///
-/// ```compile_fail
-/// use actordb::{actor::{FragmentState, KvArgs}, shard::FragmentId};
-/// use std::{collections::HashMap, sync::Arc, time::Duration};
-/// let shared = Arc::new(FragmentState::new(
-///     HashMap::new(), None, 1000, Duration::from_millis(100),
-/// ));
-/// // A builder cannot invent the dispatcher's unique worker names.
-/// let args = KvArgs::builder().shared(shared).fragment(FragmentId(0)).build();
-/// ```
 #[derive(Clone, bon::Builder)]
 pub struct KvArgs {
     /// The fragment's shared state, created by the supervisor (which
@@ -477,6 +467,3 @@ impl Actor for KvActor {
         Ok(())
     }
 }
-
-#[cfg(test)]
-mod tests;

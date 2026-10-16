@@ -1,0 +1,4 @@
+[resolver]
+# Prefer the newest compatible dependencies without pinning their versions.
+# Keep fresh resolution compatible with each workspace crate's declared MSRV.
+incompatible-rust-versions = "fallback"

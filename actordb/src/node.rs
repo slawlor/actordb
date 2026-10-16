@@ -46,8 +46,9 @@ use tokio::sync::{
 use tokio::time::Instant;
 
 use crate::actor::{
-    ApplyDurability, ApplyError, ApplyOutcome, HlcClock, KvMessage, OpPriority, PoolConfig,
-    ReplicatedOp, VersionedValue,
+    ApplyDurability, ApplyError, ApplyOutcome, FragmentHealth, FragmentShutdownError,
+    FragmentStartupStorageError, FragmentSupervisor, HlcClock, KvMessage, OpPriority, PoolConfig,
+    ReplicatedOp, SupervisorArgs, SupervisorMessage, VersionedValue,
 };
 use crate::network::{BoxStream, Network, TcpNetwork};
 use crate::placement::{
@@ -67,10 +68,6 @@ use crate::runtime_tasks::RuntimeTasks;
 use crate::shard::{fragment_of, FragmentId};
 use crate::store::{
     KvStore, PrefixDeleteOutcome, PrefixDeleteSupport, PrefixedStore, StoreBinding, StoreIdentity,
-};
-use crate::supervision::{
-    FragmentHealth, FragmentShutdownError, FragmentStartupStorageError, FragmentSupervisor,
-    SupervisorArgs, SupervisorMessage,
 };
 use crate::wire::{
     bytes_field_len, check_envelope_budget, check_record_budget, encode_envelope,
@@ -3247,7 +3244,7 @@ pub struct NodeConfig {
     pub network: Arc<dyn Network>,
     /// Flush the store write buffer after this many buffered ops.
     /// Ignored when `store` is `None`.
-    #[builder(default = crate::supervision::DEFAULT_FLUSH_BATCH_SIZE)]
+    #[builder(default = crate::actor::DEFAULT_FLUSH_BATCH_SIZE)]
     pub flush_batch_size: usize,
     /// Flush the store write buffer after this long, even if the batch
     /// isn't full (checked on each applied write). Ignored when `store`
@@ -3256,7 +3253,7 @@ pub struct NodeConfig {
     /// Crash window: a `kill -9` can lose the unflushed tail, which is
     /// then recovered via peer sync on reconnect. Clean shutdowns
     /// always flush.
-    #[builder(default = crate::supervision::DEFAULT_FLUSH_INTERVAL)]
+    #[builder(default = crate::actor::DEFAULT_FLUSH_INTERVAL)]
     pub flush_interval: Duration,
     /// Number of fragments the keyspace is partitioned into. Each
     /// fragment gets its own actor (and, with persistence, its own
@@ -3294,12 +3291,12 @@ pub struct NodeConfig {
     pub background_pool: PoolConfig,
     /// How often each fragment's cleaner sweeps for TTL-expired keys.
     /// Default 30 seconds. Must be nonzero and representable by Tokio's clock.
-    #[builder(default = crate::supervision::DEFAULT_CLEAN_INTERVAL)]
+    #[builder(default = crate::actor::DEFAULT_CLEAN_INTERVAL)]
     pub clean_interval: Duration,
     /// How often each fragment's snapshotter flushes the write buffer
     /// to the store. Default 60 seconds. Must be nonzero and representable by
     /// Tokio's clock, including for in-memory nodes.
-    #[builder(default = crate::supervision::DEFAULT_SNAPSHOT_INTERVAL)]
+    #[builder(default = crate::actor::DEFAULT_SNAPSHOT_INTERVAL)]
     pub snapshot_interval: Duration,
     /// Reserved compatibility field for the removed time-based tombstone
     /// collector. Must be `None`; [`Node::start`] rejects every `Some` value
@@ -10151,162 +10148,8 @@ mod tests {
     use std::sync::atomic::AtomicBool;
     use std::sync::Condvar;
 
-    #[test]
-    fn runtime_builder_defaults_and_every_override_match_legacy_options() {
-        let expected = NodeRuntimeOptions {
-            peer_queue_frame_capacity: PEER_CHANNEL_DEPTH,
-            peer_queue_byte_capacity: PEER_CHANNEL_BYTE_CAPACITY,
-            replication_control_message_capacity: REPLICATION_CONTROL_CHANNEL_DEPTH,
-            inbound_connection_capacity: INBOUND_CONNECTION_CAPACITY,
-            receive_byte_capacity: RECEIVE_BYTE_CAPACITY,
-            relay_capacity: RELAY_CAPACITY,
-            relay_key_byte_capacity: RELAY_KEY_BYTE_CAPACITY,
-            serving_read_queue_capacity: READ_QUEUE_CAPACITY,
-            serving_read_key_byte_capacity: READ_KEY_BYTE_CAPACITY,
-            forwarded_mutation_capacity: FORWARDED_MUTATION_CAPACITY,
-            forwarded_mutation_byte_capacity: FORWARDED_MUTATION_BYTE_CAPACITY,
-            queue_admission_timeout: REMOTE_RPC_TIMEOUT,
-            reconcile_data_admission_timeout: RECONCILE_DATA_ADMISSION_TIMEOUT,
-            forwarded_attempt_timeout: REMOTE_RPC_TIMEOUT,
-            connect_timeout: REMOTE_RPC_TIMEOUT,
-            handshake_timeout: HANDSHAKE_TIMEOUT,
-            socket_read_timeout: SOCKET_WRITE_TIMEOUT,
-            socket_write_timeout: SOCKET_WRITE_TIMEOUT,
-            replication_ack_timeout: Duration::from_secs(30),
-            health_timeout: Duration::from_secs(5),
-        };
-        let defaults = NodeRuntimeOptions::builder().build();
-        assert_eq!(format!("{defaults:?}"), format!("{expected:?}"));
-        assert_eq!(
-            format!("{defaults:?}"),
-            format!("{:?}", NodeRuntimeOptions::default())
-        );
-        defaults.validate().unwrap();
-
-        let timeout = Duration::from_secs(17);
-        let built = NodeRuntimeOptions::builder()
-            .peer_queue_frame_capacity(20)
-            .peer_queue_byte_capacity(64 * 1024 * 1024)
-            .replication_control_message_capacity(29)
-            .inbound_connection_capacity(31)
-            .receive_byte_capacity(32 * 1024 * 1024)
-            .relay_capacity(37)
-            .relay_key_byte_capacity(41)
-            .serving_read_queue_capacity(43)
-            .serving_read_key_byte_capacity(32 * 1024 * 1024)
-            .forwarded_mutation_capacity(47)
-            .forwarded_mutation_byte_capacity(32 * 1024 * 1024)
-            .queue_admission_timeout(timeout)
-            .reconcile_data_admission_timeout(timeout)
-            .forwarded_attempt_timeout(timeout)
-            .connect_timeout(timeout)
-            .handshake_timeout(timeout)
-            .socket_read_timeout(timeout)
-            .socket_write_timeout(timeout)
-            .replication_ack_timeout(timeout)
-            .health_timeout(timeout)
-            .build();
-        let legacy = NodeRuntimeOptions::default()
-            .with_peer_queue_frame_capacity(20)
-            .with_peer_queue_byte_capacity(64 * 1024 * 1024)
-            .with_replication_control_message_capacity(29)
-            .with_inbound_connection_capacity(31)
-            .with_receive_byte_capacity(32 * 1024 * 1024)
-            .with_relay_capacity(37)
-            .with_relay_key_byte_capacity(41)
-            .with_serving_read_queue_capacity(43)
-            .with_serving_read_key_byte_capacity(32 * 1024 * 1024)
-            .with_forwarded_mutation_capacity(47)
-            .with_forwarded_mutation_byte_capacity(32 * 1024 * 1024)
-            .with_queue_admission_timeout(timeout)
-            .with_reconcile_data_admission_timeout(timeout)
-            .with_forwarded_attempt_timeout(timeout)
-            .with_connect_timeout(timeout)
-            .with_handshake_timeout(timeout)
-            .with_socket_read_timeout(timeout)
-            .with_socket_write_timeout(timeout)
-            .with_replication_ack_timeout(timeout)
-            .with_health_timeout(timeout);
-        assert_eq!(format!("{built:?}"), format!("{legacy:?}"));
-        built.validate().unwrap();
-
-        let drain = ReplicationDrainOptions::builder().build();
-        assert_eq!(drain.timeout(), Duration::from_secs(30));
-        assert_eq!(
-            drain.timeout(),
-            ReplicationDrainOptions::default().timeout()
-        );
-        assert_eq!(
-            ReplicationDrainOptions::builder()
-                .timeout(timeout)
-                .build()
-                .timeout(),
-            ReplicationDrainOptions::default()
-                .with_timeout(timeout)
-                .timeout()
-        );
-    }
-
-    #[test]
-    fn node_config_builder_omits_settings_without_changing_priority_or_security_defaults() {
-        let config = NodeConfig::builder().build();
-        assert!(config.store.is_none());
-        assert_eq!(config.flush_batch_size, 1000);
-        assert_eq!(config.flush_interval, Duration::from_millis(100));
-        assert_eq!(config.fragment_count, 1);
-        assert!(config.fragment_map.is_empty());
-        assert!(config.members.is_empty());
-        assert_eq!(
-            (config.default_pool.workers, config.default_pool.queue_cap),
-            (4, 10_000)
-        );
-        assert_eq!(
-            (config.high_pool.workers, config.high_pool.queue_cap),
-            (2, 5_000)
-        );
-        assert_eq!(
-            (
-                config.background_pool.workers,
-                config.background_pool.queue_cap
-            ),
-            (2, 5_000)
-        );
-        assert_eq!(config.default_pool.rate_limit_per_sec, None);
-        assert_eq!(config.high_pool.rate_limit_per_sec, None);
-        assert_eq!(config.background_pool.rate_limit_per_sec, Some(1000));
-        assert_eq!(config.clean_interval, Duration::from_secs(30));
-        assert_eq!(config.snapshot_interval, Duration::from_secs(60));
-        assert_eq!(config.tombstone_gc_age, None);
-        assert_eq!(config.clock_skew_ms, 0);
-        assert_eq!(config.max_clock_skew, Duration::from_secs(300));
-        assert!(config.cluster_secret.is_none());
-        assert_eq!(config.replication.batch_size, 100);
-        assert!(config.placement_controller.is_none());
-        assert_eq!(config.placement_poll_interval, Duration::from_secs(1));
-        assert_eq!(
-            config.placement_drain_warn_interval,
-            Duration::from_secs(10)
-        );
-
-        let config = NodeConfig::builder()
-            .fragment_count(3)
-            .high_pool(PoolConfig::builder().workers(7).build())
-            .cluster_secret(vec![42; 32])
-            .maybe_store(None)
-            .maybe_placement_controller(None)
-            .maybe_tombstone_gc_age(None)
-            .build();
-        assert_eq!(config.fragment_count, 3);
-        assert_eq!(config.high_pool.workers, 7);
-        assert_eq!(config.high_pool.queue_cap, 10_000);
-        assert_eq!(config.cluster_secret.as_deref(), Some(&[42; 32][..]));
-        assert!(config.store.is_none());
-        assert!(config.placement_controller.is_none());
-        assert_eq!(config.tombstone_gc_age, None);
-    }
-
     #[tokio::test]
-    async fn builder_constructed_nodes_serve_and_invalid_settings_still_fail_before_bind() {
+    async fn nodes_serve_and_invalid_settings_fail_before_bind() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let error = match Node::start_with_options(
@@ -11896,34 +11739,6 @@ mod tests {
         assert!(truncated.len() <= MAX_WIRE_ERROR_BYTES);
         assert!(truncated.is_char_boundary(truncated.len()));
         assert_eq!(truncate_wire_error("short".to_string()), "short");
-    }
-
-    #[test]
-    fn runtime_option_defaults_are_explicit_and_source_compatible() {
-        let options = NodeRuntimeOptions::default();
-        assert_eq!(options.peer_queue_frame_capacity(), 256);
-        assert_eq!(options.peer_queue_byte_capacity(), 32 * 1024 * 1024);
-        assert_eq!(options.replication_control_message_capacity(), 64);
-        assert_eq!(options.inbound_connection_capacity(), 1024);
-        assert_eq!(options.receive_byte_capacity(), 64 * 1024 * 1024);
-        assert_eq!(options.relay_capacity(), 1024);
-        assert_eq!(options.relay_key_byte_capacity(), 64 * 1024 * 1024);
-        assert_eq!(options.serving_read_queue_capacity(), 64);
-        assert_eq!(options.serving_read_key_byte_capacity(), 64 * 1024 * 1024);
-        assert_eq!(options.forwarded_mutation_capacity(), 128);
-        assert_eq!(options.forwarded_mutation_byte_capacity(), 64 * 1024 * 1024);
-        assert_eq!(options.queue_admission_timeout(), Duration::from_secs(5));
-        assert_eq!(
-            options.reconcile_data_admission_timeout(),
-            Duration::from_secs(30)
-        );
-        assert_eq!(options.forwarded_attempt_timeout(), Duration::from_secs(5));
-        assert_eq!(options.connect_timeout(), Duration::from_secs(5));
-        assert_eq!(options.handshake_timeout(), Duration::from_secs(5));
-        assert_eq!(options.socket_read_timeout(), Duration::from_secs(30));
-        assert_eq!(options.socket_write_timeout(), Duration::from_secs(30));
-        assert_eq!(options.replication_ack_timeout(), Duration::from_secs(30));
-        assert_eq!(options.health_timeout(), Duration::from_secs(5));
     }
 
     #[test]

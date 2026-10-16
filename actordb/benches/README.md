@@ -59,7 +59,7 @@ p99 improvement has been recorded. See [test strategy](../../docs/testing.md)
 for the witness, sampling and storeless-scope caveats.
 
 ```bash
-cargo test -p actordb --release --locked \
+cargo test -p actordb --release \
   maintenance_foreground_latency_distribution -- --ignored --nocapture
 ```
 
