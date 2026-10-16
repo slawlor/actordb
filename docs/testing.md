@@ -96,6 +96,11 @@ process — the bulk of behavioral coverage:
   `failed_reconcile_repair_cannot_be_hidden_by_barrier_ack`,
   `fetched_reconcile_value_retries_failed_local_store_fence`, and
   `reconcile_barrier_rejects_a_replaced_fragment_incarnation`.
+  The gated receiver tests disable incidental apply/snapshot flushes when
+  testing ACK durability. Every `GatedStore` test retains a release-on-drop
+  guard so assertion failure or cancellation unblocks synchronous store calls
+  before runtime teardown; `gated_store_release_guard_unblocks_a_write_on_unwind`
+  verifies that a blocked write completes after an injected panic.
 - **Replication-drained shutdown**:
   `replication_drained_shutdown_fences_an_immediate_write`,
   `drain_requires_no_change_verification_round`,

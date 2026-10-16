@@ -326,9 +326,24 @@ struct GatedStore {
 }
 
 impl GatedStore {
+    fn release_on_drop(self: &Arc<Self>) -> GatedStoreReleaseGuard {
+        GatedStoreReleaseGuard(self.clone())
+    }
+
     fn release(&self) {
         *self.release.0.lock().unwrap() = true;
         self.release.1.notify_all();
+    }
+}
+
+// A failed assertion or cancelled test future must unblock synchronous store
+// calls before Tokio tears down its runtime. Aborting the actor task cannot
+// interrupt a thread already waiting on this Condvar.
+struct GatedStoreReleaseGuard(Arc<GatedStore>);
+
+impl Drop for GatedStoreReleaseGuard {
+    fn drop(&mut self) {
+        self.0.release();
     }
 }
 
@@ -356,6 +371,43 @@ impl KvStore for GatedStore {
         }
         Ok(())
     }
+}
+
+#[test]
+fn gated_store_release_guard_unblocks_a_write_on_unwind() {
+    let store = Arc::new(GatedStore::default());
+    let value = VersionedValue::new(b"retained".to_vec(), 1, "test".to_string());
+    let writer_store = store.clone();
+    let writer_value = value.clone();
+    let (done, completion) = std::sync::mpsc::channel();
+    let writer = std::thread::spawn(move || {
+        let result = writer_store.write_batch(&[(b"key".to_vec(), writer_value)]);
+        done.send(result).unwrap();
+    });
+
+    let injected_failure = AtomicBool::new(false);
+    let unwind = std::panic::catch_unwind(|| {
+        let _release_on_drop = store.release_on_drop();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !store.entered.load(Ordering::SeqCst) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "writer did not enter gate"
+            );
+            std::thread::yield_now();
+        }
+        assert!(completion.try_recv().is_err(), "write bypassed the gate");
+        injected_failure.store(true, Ordering::SeqCst);
+        panic!("injected failure while the store write is blocked");
+    });
+    assert!(unwind.is_err());
+    assert!(injected_failure.load(Ordering::SeqCst));
+    completion
+        .recv_timeout(Duration::from_secs(2))
+        .expect("unwind did not release the blocked store write")
+        .unwrap();
+    writer.join().unwrap();
+    assert_eq!(store.load().unwrap(), vec![(b"key".to_vec(), value)]);
 }
 
 async fn test_node(id: &str) -> Node {
@@ -3546,6 +3598,7 @@ async fn shutdown_retry_skips_fragments_that_already_reached_the_durability_fenc
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cancelled_shutdown_waiter_resumes_retained_final_flush() {
     let store = Arc::new(GatedStore::default());
+    let _release_on_drop = store.release_on_drop();
     let node = Arc::new(
         Node::start(
             "cancelled-shutdown".to_string(),
@@ -3601,6 +3654,7 @@ async fn shutdown_rejects_new_calls_and_waits_for_an_admitted_put() {
     use actordb::actor::OpPriority;
 
     let store = Arc::new(GatedStore::default());
+    let _release_on_drop = store.release_on_drop();
     let node = Arc::new(
         Node::start(
             "operation-fence".to_string(),
@@ -8979,6 +9033,7 @@ async fn memory_applied_ack_does_not_force_a_receiver_store_flush() {
     use actordb::shard::FragmentId;
 
     let store = Arc::new(GatedStore::default());
+    let _release_on_drop = store.release_on_drop();
     let config_a = NodeConfig {
         replication: SenderConfig {
             batch_size: 1,
@@ -9065,6 +9120,7 @@ async fn replication_ack_waits_for_the_receiver_store_fence() {
     use actordb::shard::FragmentId;
 
     let store = Arc::new(GatedStore::default());
+    let _release_on_drop = store.release_on_drop();
     let config_a = NodeConfig {
         replication: SenderConfig {
             batch_size: 1,
@@ -9077,6 +9133,10 @@ async fn replication_ack_waits_for_the_receiver_store_fence() {
     let config_b = NodeConfig {
         store: Some(store.clone()),
         flush_batch_size: 1_000_000,
+        // Observe the explicit replication ACK fence rather than an apply's
+        // age-triggered flush after a slow handshake under parallel load.
+        flush_interval: Duration::from_secs(3600),
+        snapshot_interval: Duration::from_secs(3600),
         ..NodeConfig::default()
     };
     let a = Node::start(

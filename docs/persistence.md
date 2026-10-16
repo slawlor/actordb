@@ -61,11 +61,19 @@ The contract is deliberately narrow:
 
 ## Implementations
 
-| Store | Role |
-|---|---|
-| `MemoryStore` | Test double. `load` returns empty, `write_batch` is a no-op. Never for production. |
-| `RocksDbStore` | Production backend, behind the `rocksdb` cargo feature. |
-| `PrefixedStore` | Namespace wrapper: prepends a 4-byte big-endian fragment id to every key so N fragment actors can share one store without collisions. |
+| Store | Implementation module | Role |
+|---|---|---|
+| `MemoryStore` | `actordb::store::memory` | Test double. `load` returns empty, `write_batch` is a no-op. Never for production. |
+| `RocksDbStore` | `actordb::store::rocksdb` | Production backend, behind the `rocksdb` cargo feature. |
+| `PrefixedStore` | `actordb::store::prefixed` | Namespace wrapper: prepends a 4-byte big-endian fragment id to every key so N fragment actors can share one store without collisions. |
+
+The `store` parent module owns the shared `KvStore` contract, errors, identity
+and capability types, and backend options. Backend code and its unit tests live
+in dedicated child modules. Existing imports such as
+`actordb::store::{KvStore, RocksDbStore, RocksDbOptions, PrefixedStore}` remain
+available through parent reexports; RocksDB types and its child module retain
+the same `rocksdb` feature gate. Add future supported backends in their own
+`store` child modules and reexport their public entry points from the parent.
 
 `RocksDbStore::open(path)` creates the directory and opens the default CF for
 fragment-prefixed data. Existing initialized stores also open their

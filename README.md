@@ -47,7 +47,9 @@ supported toolchain.
   the `rocksdb` feature for RocksDB (per-fragment key namespacing via
   `PrefixedStore`, a fail-closed identity/layout manifest, exclusive live
   attachment, validated physical routing, and synchronous WAL writes by
-  default).
+  default). Shared contracts and options stay in `store`; implementations
+  live in its `memory`, `prefixed`, and feature-gated `rocksdb` child modules,
+  with existing `store::*` imports preserved through reexports.
 * **`proto`**: the wire protocol — prost-encoded `Envelope` frames,
   length-delimited over TCP.
 
