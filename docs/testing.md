@@ -43,6 +43,28 @@ multi-page final quiesce still persists every remaining expiry floor. Gate
 fixtures release blocking stores on unwind so a failed assertion cannot hang
 runtime teardown.
 
+An ignored internal diagnostic compares the retained full-sweep primitive with
+the actual automatic Cleaner while an actual KvActor serves High/default cache
+hits and overwrites. It samples fresh 10k/100k keysets at 1×/8× reserved HashMap
+capacity and 0%/1%/100% seeded TTL fractions; one final ordered expiry witness
+is additional even in the near-zero-TTL case. Each foreground class retains
+up to 20,000 initial latency samples while counting all operations. Sparse
+sample sets report `na` for p95 below 20 samples and p99 below 100. CSV output
+separates cache-materialization time from total time through admitted-operation completion
+and actor drain. Paged timing includes Cleaner startup; full timing uses the
+public primitive as a conservative algorithm baseline. These are descriptive
+finite-pass samples, not steady-state population percentiles or performance
+thresholds, and setup/worker startup are excluded. The diagnostic is storeless;
+durable flush-buffer and disk-latency comparisons need a separate benchmark.
+
+```bash
+cargo test -p actordb --release --no-default-features --locked \
+  maintenance_foreground_latency_distribution -- --ignored --nocapture
+```
+
+Repeat on the same idle host before drawing conclusions. This harness has not
+yet produced a recorded release baseline; no p99 improvement is claimed.
+
 Storage-contract tests additionally cover fail-closed manifest versions and
 metadata schemas, exact identity and exclusive attachment, concurrent bind,
 strict non-mutating rejection of legacy databases, explicit adoption with

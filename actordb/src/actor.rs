@@ -296,6 +296,9 @@ pub struct BatchReadContinuation {
 const SUMMARY_PAGE_TARGET_BYTES: usize = 1024 * 1024;
 const VERSIONED_PAGE_TARGET_BYTES: usize = 1024 * 1024;
 
+#[cfg(test)]
+mod maintenance_diagnostics;
+
 /// Result of merging one exact version into a fragment.
 ///
 /// Callers must use this result rather than infer success from a later read:
@@ -2615,16 +2618,25 @@ mod tests {
         assert_eq!(first.converted, 256);
         let first_revision = state.revision.load(Ordering::Acquire);
         let winner = VersionedValue::new(vec![2], 11, "writer".into());
-        state
-            .apply(&test_op("k0256", winner.clone()))
-            .await
-            .unwrap();
         // This future expiry is not expired at the pass's pinned instant.
         let mut future = expiring_value(vec![3], u64::MAX);
         future.timestamp_ms = 11;
-        state.apply(&test_op("k0257", future)).await.unwrap();
+        let winner_op = test_op("k0256", winner.clone());
+        let future_op = test_op("k0257", future);
+        // Register concurrent mutations ahead of the next page on Tokio's
+        // fair write-lock queue, rather than relying on scheduling sleeps.
+        let cache_gate = state.cache.write().await;
+        let mut apply_winner = Box::pin(state.apply(&winner_op));
+        let mut apply_future = Box::pin(state.apply(&future_op));
+        assert!(futures::poll!(apply_winner.as_mut()).is_pending());
+        assert!(futures::poll!(apply_future.as_mut()).is_pending());
+        let mut next_page = Box::pin(state.expire_values_page(&mut pass));
+        assert!(futures::poll!(next_page.as_mut()).is_pending());
+        drop(cache_gate);
+        assert_eq!(apply_winner.await.unwrap(), ApplyOutcome::Applied);
+        assert_eq!(apply_future.await.unwrap(), ApplyOutcome::Applied);
         let before_second = state.revision.load(Ordering::Acquire);
-        let second = state.expire_values_page(&mut pass).await.unwrap();
+        let second = next_page.await.unwrap();
         assert_eq!((second.visited, second.converted), (256, 254));
         assert_eq!(state.revision.load(Ordering::Acquire), before_second + 254);
         assert_eq!(state.cache.read().await.values.get("k0256"), Some(&winner));
