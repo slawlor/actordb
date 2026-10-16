@@ -40,12 +40,6 @@ fail-closed, while a fully joined failed startup releases it for retry.
 Stable-fence tests distinguish ordinary buffered commits from the explicit
 backend fence and verify that RocksDB can force its WAL under `AsyncWal`.
 
-Health regressions reject missing/stopped/nonresponding dispatcher evidence,
-exclude foreign and stopped workers from exact linked-worker counts, and prove
-one aggregate deadline covers registry contention and sequential fragment
-probes. A real healthy node still reports its live workers; planned quiescence
-reports unavailable health without restarting the stopped dispatcher.
-
 Protocol-v3 pagination tests cover lexicographically ordered/exclusive summary
 cursors (including the empty-string key), revision-drift detection, zero-limit
 clamping, metadata-byte bounds, pinned TTL tombstone synthesis shared by
@@ -80,6 +74,17 @@ mutation before changing the serving decision.
 supervisor-to-router replacement path, while
 `stale_dispatcher_monitor_cannot_overwrite_a_readded_fragment` pins its
 generation/actor-identity publication fence.
+
+### Local health
+
+Health regressions reject missing/stopped/nonresponding dispatcher evidence,
+exclude foreign and stopped workers from exact linked-worker counts, and prove
+one aggregate deadline covers registry contention and sequential fragment
+probes. A real healthy node still reports its live workers; planned quiescence
+reports unavailable health without restarting the stopped dispatcher.
+An exact stopped supervisor retained in the Node registry returns a bounded,
+fragment-specific RPC error; restoring its live supervisor recovers health and
+ordinary reads on the same Node before clean shutdown.
 
 ## Integration tests (`actordb/tests/cluster.rs`)
 

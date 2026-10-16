@@ -2728,7 +2728,6 @@ pub struct NodeRuntimeOptions {
     receive_byte_capacity: usize,
     relay_capacity: usize,
     relay_key_byte_capacity: usize,
-    health_timeout: Duration,
     queue_admission_timeout: Duration,
     reconcile_data_admission_timeout: Duration,
     forwarded_attempt_timeout: Duration,
@@ -2737,6 +2736,7 @@ pub struct NodeRuntimeOptions {
     socket_read_timeout: Duration,
     socket_write_timeout: Duration,
     replication_ack_timeout: Duration,
+    health_timeout: Duration,
 }
 
 impl Default for NodeRuntimeOptions {
@@ -2749,7 +2749,6 @@ impl Default for NodeRuntimeOptions {
             receive_byte_capacity: RECEIVE_BYTE_CAPACITY,
             relay_capacity: RELAY_CAPACITY,
             relay_key_byte_capacity: RELAY_KEY_BYTE_CAPACITY,
-            health_timeout: Duration::from_secs(5),
             queue_admission_timeout: REMOTE_RPC_TIMEOUT,
             reconcile_data_admission_timeout: RECONCILE_DATA_ADMISSION_TIMEOUT,
             forwarded_attempt_timeout: REMOTE_RPC_TIMEOUT,
@@ -2758,6 +2757,7 @@ impl Default for NodeRuntimeOptions {
             socket_read_timeout: SOCKET_WRITE_TIMEOUT,
             socket_write_timeout: SOCKET_WRITE_TIMEOUT,
             replication_ack_timeout: Duration::from_secs(30),
+            health_timeout: Duration::from_secs(5),
         }
     }
 }
@@ -2826,15 +2826,6 @@ impl NodeRuntimeOptions {
         self
     }
 
-    /// Set one aggregate deadline for a local health snapshot, including
-    /// supervisor-registry acquisition and every fragment probe. Default 5s.
-    /// This does not measure cluster readiness, worker responsiveness, or
-    /// durability. Unavailable evidence is returned as an error, not zeros.
-    pub fn with_health_timeout(mut self, timeout: Duration) -> Self {
-        self.health_timeout = timeout;
-        self
-    }
-
     /// Set one absolute maximum wait to reserve a peer queue slot and its
     /// exact encoded-byte permits.
     pub fn with_queue_admission_timeout(mut self, timeout: Duration) -> Self {
@@ -2891,6 +2882,15 @@ impl NodeRuntimeOptions {
         self
     }
 
+    /// Set one aggregate deadline for a local health snapshot, including
+    /// supervisor-registry acquisition and every fragment probe. Default 5s.
+    /// This does not measure cluster readiness, worker responsiveness, or
+    /// durability. Unavailable evidence is returned as an error, not zeros.
+    pub fn with_health_timeout(mut self, timeout: Duration) -> Self {
+        self.health_timeout = timeout;
+        self
+    }
+
     /// Current per-peer outbound frame capacity.
     pub fn peer_queue_frame_capacity(&self) -> usize {
         self.peer_queue_frame_capacity
@@ -2924,11 +2924,6 @@ impl NodeRuntimeOptions {
     /// Current node-wide retained relay request-key storage budget.
     pub fn relay_key_byte_capacity(&self) -> usize {
         self.relay_key_byte_capacity
-    }
-
-    /// Current aggregate local-health snapshot deadline.
-    pub fn health_timeout(&self) -> Duration {
-        self.health_timeout
     }
 
     /// Current peer-queue admission timeout.
@@ -2971,6 +2966,11 @@ impl NodeRuntimeOptions {
         self.replication_ack_timeout
     }
 
+    /// Current aggregate local-health snapshot deadline.
+    pub fn health_timeout(&self) -> Duration {
+        self.health_timeout
+    }
+
     fn sender_options(&self) -> SenderRuntimeOptions {
         SenderRuntimeOptions::default()
             .with_ack_timeout(self.replication_ack_timeout)
@@ -2989,13 +2989,6 @@ impl NodeRuntimeOptions {
                     Semaphore::MAX_PERMITS
                 )));
             }
-        }
-        if self.health_timeout.is_zero()
-            || Instant::now().checked_add(self.health_timeout).is_none()
-        {
-            return Err(NodeError::Actor(
-                "health timeout must be non-zero and representable".to_string(),
-            ));
         }
         if self.peer_queue_frame_capacity < 2 {
             return Err(NodeError::Actor(
@@ -3081,6 +3074,13 @@ impl NodeRuntimeOptions {
         {
             return Err(NodeError::Actor(
                 "runtime transport and replication timeouts must be representable".to_string(),
+            ));
+        }
+        if self.health_timeout.is_zero()
+            || Instant::now().checked_add(self.health_timeout).is_none()
+        {
+            return Err(NodeError::Actor(
+                "health timeout must be non-zero and representable".to_string(),
             ));
         }
         Ok(())
@@ -10247,6 +10247,80 @@ mod tests {
         node.shutdown().await.unwrap();
     }
 
+    #[tokio::test]
+    async fn health_stopped_registered_supervisor_reports_fragment_and_recovers() {
+        let node = Node::start_with_options(
+            "health-stopped-supervisor".to_string(),
+            "127.0.0.1:0".parse().unwrap(),
+            NodeConfig {
+                fragment_count: 2,
+                ..Default::default()
+            },
+            NodeRuntimeOptions::default().with_health_timeout(Duration::from_secs(1)),
+        )
+        .await
+        .unwrap();
+        let fragment = FragmentId(1);
+        let observed_timeout = Arc::new(StdMutex::new(None));
+        let (stopped, _) = DelayedHealthSupervisor::spawn(
+            None,
+            DelayedHealthSupervisor,
+            DelayedHealthArgs {
+                fragment,
+                release: None,
+                observed_timeout: observed_timeout.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        stopped.stop(None);
+        tokio::time::timeout(Duration::from_secs(5), stopped.wait(None))
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Keep the exact stopped ref in the owned registry: this must exercise
+        // failed RPC admission, not the missing-supervisor or probe-timeout path.
+        let original = node
+            .supervisors
+            .lock()
+            .await
+            .insert(fragment, stopped.clone())
+            .unwrap();
+        let failed = tokio::time::timeout(Duration::from_secs(5), node.health()).await;
+
+        // Restore ownership before any failure assertion, so cleanup still
+        // reaches the original live supervisor even if the regression fires.
+        let replaced = node
+            .supervisors
+            .lock()
+            .await
+            .insert(fragment, original)
+            .unwrap();
+        let recovered = tokio::time::timeout(Duration::from_secs(5), node.health()).await;
+        let query = tokio::time::timeout(
+            Duration::from_secs(5),
+            node.get("health-recovered-query".to_string()),
+        )
+        .await;
+        let shutdown = tokio::time::timeout(Duration::from_secs(5), node.shutdown()).await;
+
+        assert_eq!(replaced.get_id(), stopped.get_id());
+        assert!(observed_timeout.lock().unwrap().is_none());
+        assert!(matches!(
+            failed.unwrap(),
+            Err(NodeError::Actor(error))
+                if error.starts_with(&format!("health unavailable for fragment {fragment}:"))
+                    && !error.contains("probe failed")
+        ));
+        let recovered = recovered.unwrap().unwrap();
+        assert_eq!(recovered.len(), 2);
+        assert_eq!(recovered[&fragment].worker_count, 8);
+        assert_eq!(recovered[&fragment].shed_counts, (0, 0, 0));
+        assert!(query.unwrap().unwrap().is_none());
+        shutdown.unwrap().unwrap();
+    }
+
     #[derive(Default)]
     struct BlockingLoadStore {
         entered: AtomicBool,
@@ -11233,7 +11307,6 @@ mod tests {
         assert_eq!(options.receive_byte_capacity(), 64 * 1024 * 1024);
         assert_eq!(options.relay_capacity(), 1024);
         assert_eq!(options.relay_key_byte_capacity(), 64 * 1024 * 1024);
-        assert_eq!(options.health_timeout(), Duration::from_secs(5));
         assert_eq!(options.queue_admission_timeout(), Duration::from_secs(5));
         assert_eq!(
             options.reconcile_data_admission_timeout(),
@@ -11245,6 +11318,7 @@ mod tests {
         assert_eq!(options.socket_read_timeout(), Duration::from_secs(30));
         assert_eq!(options.socket_write_timeout(), Duration::from_secs(30));
         assert_eq!(options.replication_ack_timeout(), Duration::from_secs(30));
+        assert_eq!(options.health_timeout(), Duration::from_secs(5));
     }
 
     #[test]
@@ -11264,12 +11338,6 @@ mod tests {
             .with_relay_key_byte_capacity(1)
             .validate()
             .is_ok());
-        for timeout in [Duration::ZERO, Duration::MAX] {
-            assert!(NodeRuntimeOptions::default()
-                .with_health_timeout(timeout)
-                .validate()
-                .is_err());
-        }
         assert!(NodeRuntimeOptions::default()
             .with_socket_write_timeout(Duration::MAX)
             .validate()
@@ -11329,6 +11397,12 @@ mod tests {
             NodeRuntimeOptions::default().with_reconcile_data_admission_timeout(Duration::ZERO),
         ] {
             assert!(options.validate().is_err());
+        }
+        for timeout in [Duration::ZERO, Duration::MAX] {
+            assert!(NodeRuntimeOptions::default()
+                .with_health_timeout(timeout)
+                .validate()
+                .is_err());
         }
     }
 
