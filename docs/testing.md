@@ -42,6 +42,10 @@ and failed sends release leases, drain stops cleaner continuations, and a
 multi-page final quiesce still persists every remaining expiry floor. Gate
 fixtures release blocking stores on unwind so a failed assertion cannot hang
 runtime teardown.
+An actual Snapshotter regression advances a paused clock through two automatic
+flush intervals, proving buffered values and expiry floors persist without
+manual `Snap` messages, the completion lease rearms, and actor drain joins the
+ticker. Its recording store never blocks the timer driver.
 
 An ignored internal diagnostic compares the retained full-sweep primitive with
 the actual automatic Cleaner while an actual KvActor serves High/default cache
