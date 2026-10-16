@@ -14682,7 +14682,8 @@ mod tests {
             Arc::new(Mutex::new(HashMap::new())),
             Arc::new(Mutex::new(HashMap::new())),
             Arc::new(Mutex::new(HashMap::new())),
-        );
+        )
+        .await;
         let (mut owner, server) = tokio::io::duplex(4096);
         let connection = tokio::spawn(handle_connection(
             ctx.clone(),
@@ -15077,7 +15078,8 @@ mod tests {
             Arc::new(Mutex::new(HashMap::new())),
             Arc::new(Mutex::new(HashMap::new())),
             Arc::new(Mutex::new(HashMap::new())),
-        );
+        )
+        .await;
         ctx.relay_admission = RelayAdmission::new(1, 1024);
         ctx.runtime_options = ctx
             .runtime_options
@@ -15227,7 +15229,8 @@ mod tests {
                 Arc::new(Mutex::new(HashMap::new())),
                 Arc::new(Mutex::new(HashMap::new())),
                 peers,
-            );
+            )
+            .await;
             let slots = if bound_by_bytes { 8 } else { 2 };
             let bytes = if bound_by_bytes {
                 relay_key_storage_bytes(3) + relay_keys_storage_bytes(&["key".to_string()], 1)
