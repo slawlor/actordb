@@ -2629,9 +2629,11 @@ async fn bidirectional_large_reconciliation_keeps_connection_reader_live() {
             )
         })
         .collect();
-    let mut replication = SenderConfig::default();
-    replication.consistency_interval = Duration::from_secs(3600);
-    replication.reconcile_timeout = Duration::from_secs(20);
+    let replication = SenderConfig {
+        consistency_interval: Duration::from_secs(3600),
+        reconcile_timeout: Duration::from_secs(20),
+        ..SenderConfig::default()
+    };
     let runtime = NodeRuntimeOptions::default()
         .with_peer_queue_byte_capacity(MIN_WRITER_BYTES)
         .with_reconcile_data_admission_timeout(Duration::from_secs(20));

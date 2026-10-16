@@ -102,6 +102,12 @@ Key design points:
   `fragment_map`. With a `PlacementController` set, a driver polls
   `desired_placement()` every `placement_poll_interval` and spawns/stops
   fragment subtrees as the map changes (see [Routing & Placement](routing-placement.md)).
+- **Replication registries are snapshot-only on data paths.** Mutation fan-out,
+  ACK/NACK delivery, peer notifications, and report inspection clone cheap
+  exact-task handles under the node-global registries, then perform payload
+  cloning, channel admission, or report waits after releasing them. Durable
+  handoff uses a per-fragment finalization seal, so stopping its sender tasks
+  and querying its actor cannot stall unrelated fragments or peer lifecycle.
 
 ## What actordb is not
 

@@ -1076,7 +1076,7 @@ mod tests {
         let mut low = 0usize;
         let mut high = MAX_FRAME_BYTES;
         while low < high {
-            let midpoint = low + (high - low + 1) / 2;
+            let midpoint = low + (high - low).div_ceil(2);
             if replicated_record_max_encoded_len(midpoint, 0, 4, false) <= MAX_FRAME_BYTES {
                 low = midpoint;
             } else {
