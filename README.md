@@ -1,6 +1,6 @@
 # actordb
 
-A rust actor-based distributed database based on *RocksDb*
+A Rust actor-based distributed database with pluggable, opt-in storage
 
 * [<img alt="github" src="https://img.shields.io/badge/github-slawlor/actordb-8da0cb?style=for-the-badge&labelColor=555555&logo=github" height="20">](https://github.com/slawlor/actordb)
 * [<img alt="crates.io" src="https://img.shields.io/crates/v/actordb.svg?style=for-the-badge&color=fc8d62&logo=rust" height="20">](https://crates.io/crates/actordb)
@@ -9,6 +9,33 @@ A rust actor-based distributed database based on *RocksDb*
 * [![codecov](https://codecov.io/gh/slawlor/actordb/branch/main/graph/badge.svg)](https://codecov.io/gh/slawlor/actordb)
 
 * `actordb`: ![actordb Downloads](https://img.shields.io/crates/d/actordb.svg)
+
+## Crate installation
+
+The next release is `0.2.0` (Rust 1.88+). After it is published:
+
+```toml
+[dependencies]
+actordb = "0.2"
+```
+
+The default crate includes no concrete storage backend. Its actor cache and
+`KvStore` contracts work without a database; `NodeConfig.store` remains `None`
+unless you supply a custom store. RocksDB is an independent opt-in:
+
+```toml
+actordb = { version = "0.2", features = ["rocksdb"] }
+```
+
+The separate `memory` feature exposes the no-op `MemoryStore` test double; it
+is not persistent storage. Neither backend feature enables the other. All
+configurations build protobuf from source; only opting into RocksDB requires
+its native library and libclang bindings. `default-features = false` is not
+necessary to avoid RocksDB: the default feature set is empty.
+
+This remains pre-1.0 software, and `0.2` includes breaking API, wire-protocol,
+and legacy-store compatibility changes. Read the [release notes](CHANGELOG.md)
+and [release procedure](docs/releases.md) before upgrading or publishing.
 
 ## Working prototype
 
@@ -49,7 +76,8 @@ supported toolchain.
   attachment, validated physical routing, and synchronous WAL writes by
   default). Shared contracts and options stay in `store`; implementations
   live in its `memory`, `prefixed`, and feature-gated `rocksdb` child modules,
-  with existing `store::*` imports preserved through reexports.
+  with `store::*` imports available through reexports when the corresponding
+  backend feature is enabled. No bundled backend is enabled by default.
 * **`proto`**: the wire protocol — prost-encoded `Envelope` frames,
   length-delimited over TCP.
 
@@ -92,6 +120,7 @@ Comprehensive guides live in [`docs/`](docs/):
 - [Operations](docs/operations.md) — crash/restart, rolling restart,
   partitions, overload, what to monitor
 - [Test strategy](docs/testing.md) — unit vs integration vs Docker scenarios
+- [Releases](docs/releases.md) — package checks, version tags, and crates.io publication
 
 ## Docker integration tests
 

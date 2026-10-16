@@ -16,6 +16,10 @@ We actively welcome your pull requests!
 3. If you've changed APIs, update the documentation.
 4. Ensure the test suite passes.
 
+Release maintainers should follow the [release procedure](docs/releases.md).
+PRs validate the crates.io package without credentials or uploads; merging a
+version bump does not itself publish a release.
+
 ## Issues
 
 We use GitHub issues to track issues.

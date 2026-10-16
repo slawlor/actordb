@@ -12,11 +12,11 @@ The single-node fixture omits overrides and keeps the Node defaults.
 ## Running them
 
 ```bash
-# Full run (default features; needs libclang for RocksDB — CI has it)
+# Full run (backend-free defaults; storeless fixtures need no libclang)
 cargo bench -p actordb
 
-# Lean run (in-memory store only; works without libclang)
-cargo bench -p actordb --no-default-features
+# Optional RocksDB-enabled build (requires libclang; fixtures remain storeless)
+cargo bench -p actordb --features rocksdb
 
 # Quick smoke run (~10x faster, coarser numbers)
 cargo bench -p actordb -- --quick
@@ -31,6 +31,12 @@ cargo bench -p actordb --bench sender_registry
 Criterion saves results under `target/criterion/` and compares against the
 previous run automatically — the second run of the same bench shows
 regressions/improvements vs the first.
+
+Neither backend feature is needed for these cache/replication benchmarks.
+`memory` only exposes a no-op store test double; it is not the fragment cache
+and enabling it would not turn these fixtures into persistence benchmarks.
+`--no-default-features` is currently equivalent to the backend-free default.
+All configurations still compile the bundled protobuf toolchain from source.
 
 ## What each bench measures
 
@@ -53,13 +59,13 @@ p99 improvement has been recorded. See [test strategy](../../docs/testing.md)
 for the witness, sampling and storeless-scope caveats.
 
 ```bash
-cargo test -p actordb --release --no-default-features --locked \
+cargo test -p actordb --release --locked \
   maintenance_foreground_latency_distribution -- --ignored --nocapture
 ```
 
 ## Baselines
 
-Recorded 2026-10-14 on a shared dev VM (multi-thread tokio, in-memory store,
+Recorded 2026-10-14 on a shared dev VM (multi-thread tokio, storeless fragment cache,
 `--no-default-features`, release profile). Your numbers will differ; what
 matters is the trend on the *same* machine.
 

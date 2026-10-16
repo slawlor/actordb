@@ -1,15 +1,22 @@
 # Configuration reference
 
 Start with `NodeConfig::builder()`, set only the fields you need, and call
-`build()`. Omitted tuning retains the existing defaults. With the
-`rocksdb` feature, `NodeConfig::with_rocksdb(path)` layers persistence on top
-of the defaults using synchronous WAL commits. Use
+`build()`. Omitted tuning retains the existing defaults, including `store: None`.
+The crate is backend-free by default; its fragment cache does not require a
+storage feature. Opt into the `rocksdb` feature to make the offered durable
+backend available. `NodeConfig::with_rocksdb(path)` layers persistence on top of
+the defaults using synchronous WAL commits. Use
 `NodeConfig::with_rocksdb_options(path, RocksDbOptions)` for an explicit
 durability or one-time legacy-manifest adoption policy.
 
+The independent `memory` feature only exposes the no-op `MemoryStore` test
+double, not an in-memory database backend or durable storage. Custom `KvStore`
+implementations and the `PrefixedStore` wrapper remain available without
+either backend feature. Enabling a feature does not itself attach a Node store.
+
 ## Configuration builders
 
-All 13 configuration and actor-input types use Bon's typed builders. A missing
+The configuration and actor-input types use Bon's typed builders. A missing
 required dependency prevents `build()` from compiling. Numeric, timer,
 placement, storage-identity, and authentication checks still happen at the
 startup/spawn boundary: `build()` is not runtime validation and does not turn
@@ -72,7 +79,7 @@ below before using the default plain-TCP transport in production.
 
 | Field | Type | Default | Guidance |
 |---|---|---|---|
-| `store` | `Option<Arc<dyn KvStore>>` | `None` | `None` = purely in-memory node. Set to a base `RocksDbStore` or custom store; Node applies the per-fragment `PrefixedStore` views itself. |
+| `store` | `Option<Arc<dyn KvStore>>` | `None` | `None` = purely in-memory node using its fragment cache, with no backend feature required. Set to a base `RocksDbStore` (`rocksdb` feature) or custom store; Node applies the per-fragment `PrefixedStore` views itself. The opt-in `MemoryStore` is a no-op test double, not persistence. |
 | `network` | `Arc<dyn Network>` | `TcpNetwork` | Plain TCP. Implement `Network` for TLS or custom transports. |
 | `flush_batch_size` | `usize` | `1000` | Ops buffered before a store flush. Ignored when `store` is `None`. Larger = fewer, bigger RocksDB write batches. |
 | `flush_interval` | `Duration` | `100 ms` | A new write triggers a flush when the previous attempt is this old; idle fragments are bounded by `snapshot_interval`. |
@@ -116,6 +123,9 @@ replay, but because a captured transcript includes a verifiable HMAC over known
 fields, a low-entropy password remains vulnerable to offline guessing.
 
 ## `RocksDbOptions`
+
+This type, the other RocksDB types, and `NodeConfig::with_rocksdb*` require
+the opt-in `rocksdb` feature. They are absent from a default build.
 
 `RocksDbOptions::default()` uses `RocksDbDurability::SyncWal`. Every successful
 ordinary store batch keeps the WAL enabled and synchronously flushes it through
