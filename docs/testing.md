@@ -119,8 +119,10 @@ process — the bulk of behavioral coverage:
   `failed_snapshotter_start_joins_completed_supervisor_children` cover nested
   startup rollback; `cancelled_subtree_start_remains_registered_until_startup_completes`
   covers the placement-task cancellation race.
-- **Multi-key**: `multi_key_fanout`, `multi_key_partial_failure`,
+- **Routing and batching**: `multi_key_fanout`, `multi_key_partial_failure`,
   `batch_operations_fail_over_after_a_stale_owner_returns_unavailable`,
+  `timed_out_single_put_retries_the_exact_stamped_operation`,
+  `timed_out_single_get_tries_the_next_holder`,
   `mutation_relay_scans_past_the_origin_to_a_connected_owner`,
   `remote_batches_split_at_wire_item_limit_without_dropping_connection`,
   `remote_batches_split_at_encoded_byte_limits_without_false_misses`.
@@ -129,7 +131,9 @@ process — the bulk of behavioral coverage:
   boundary, UTF-8-safe diagnostic truncation, valid provenance bounds, and the
   reserved full-frame response lane under complete producer saturation. The
   connection tests also prove that a reconcile request/fetch racing a
-  non-serving fragment cannot tear down unrelated multiplexed traffic.
+  non-serving fragment cannot tear down unrelated multiplexed traffic, actor
+  unavailability cannot become a false single-read miss, and direct or relayed
+  single-read responses are pinned to the expected authenticated peer.
 - **Backpressure**: `background_saturation_leaves_high_priority_p99_unaffected`,
   `queue_cap_shed_is_explicit_and_counted`,
   `forwarded_priority_preserved_end_to_end`,

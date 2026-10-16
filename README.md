@@ -224,14 +224,15 @@ Multi-key semantics:
   outcome. Remote batches preserve request order/cardinality and use the
   configured per-attempt deadline (5 seconds by default), including outbound
   queueing and the response.
-- Batch APIs fail over across replica holders in placement order on transport,
-  timeout, or malformed-response failures. Every owner attempt has one
-  configured budget (5 seconds by default) covering queue admission and the
-  response. A typed
-  all-`Unavailable` mutation response tries the next
-  holder; other valid per-key outcomes are returned directly.
+- Remotely routed single-key and batch operations fail over across replica
+  holders in placement order on transport, timeout, or malformed-response
+  failures. Every owner attempt has one configured budget (5 seconds by
+  default) covering queue admission and the response. A typed `Unavailable`
+  single mutation or all-`Unavailable` batch response tries the next holder;
+  other valid per-key outcomes are returned directly.
 - Errors are per-key and classified: `NodeError::Actor` for
-  misconfiguration (no replica listed for a fragment),
+  misconfiguration (no replica listed for a fragment) or local actor-framework
+  failure,
   `NodeError::Network` for connectivity failures, plus exact
   `Backpressure`, `Storage`, `Superseded`, and `Expired` mutation outcomes.
 - `put_multi_with_priority` / `get_multi_with_priority` set the
@@ -313,7 +314,7 @@ Each fragment runs **three isolated worker pools** instead of one:
   shed counter, and the caller gets `NodeError::Backpressure` — a shed
   `Get` never returns `Ok(None)`, so backpressure is never confused
   with "not found".
-- Priority is preserved end-to-end: forwarded single-key ops and batch
+- Priority is preserved end-to-end: forwarded single-key operations and batch
   messages carry the originator's priority on the wire, and the owner
   applies/serves them in the matching pool. Priority selects that remote actor
   pool; it does not prioritize the per-peer socket's ordinary data lane.

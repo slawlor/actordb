@@ -5983,6 +5983,23 @@ async fn multi_key_partial_failure() {
         }
     }
 
+    let single_key = keys_f1[0].clone();
+    assert_eq!(
+        a.get(single_key.clone())
+            .await
+            .unwrap()
+            .map(|value| value.value),
+        Some(format!("v{single_key}").into_bytes()),
+        "single read did not skip the disconnected preferred owner"
+    );
+    a.put(single_key.clone(), b"single-failover".to_vec())
+        .await
+        .expect("single write did not skip the disconnected preferred owner");
+    assert_eq!(
+        c.get(single_key).await.unwrap().map(|value| value.value),
+        Some(b"single-failover".to_vec())
+    );
+
     // Kill c too. Now no replica of fragment 1 is reachable: its keys
     // must error per-key while fragment-0 keys still succeed.
     c.shutdown().await.unwrap();
@@ -6017,10 +6034,11 @@ async fn batch_operations_fail_over_after_a_stale_owner_returns_unavailable() {
         fragment_map,
         ..NodeConfig::default()
     };
-    let a = Node::start(
+    let a = Node::start_with_options(
         "stale-a".to_string(),
         "127.0.0.1:0".parse().unwrap(),
         config(map(&["stale-b", "stale-c"])),
+        NodeRuntimeOptions::default().with_forwarded_attempt_timeout(Duration::from_millis(100)),
     )
     .await
     .unwrap();
@@ -6058,6 +6076,17 @@ async fn batch_operations_fail_over_after_a_stale_owner_returns_unavailable() {
         Some(b"value".to_vec())
     );
 
+    a.put("stale-single".to_string(), b"single".to_vec())
+        .await
+        .expect("single put did not fail over after unavailable");
+    assert_eq!(
+        c.get("stale-single".to_string())
+            .await
+            .unwrap()
+            .map(|value| value.value),
+        Some(b"single".to_vec())
+    );
+
     // The live but non-serving first owner returns an empty unavailable
     // BatchGetResponse. The caller must try the next owner instead of treating
     // the omitted key as a miss.
@@ -6067,10 +6096,244 @@ async fn batch_operations_fail_over_after_a_stale_owner_returns_unavailable() {
         reads[0].as_ref().unwrap().as_ref().unwrap().value,
         b"value".to_vec()
     );
+    assert_eq!(
+        a.get("stale-single".to_string())
+            .await
+            .unwrap()
+            .map(|value| value.value),
+        Some(b"single".to_vec()),
+        "single get treated an unavailable preferred owner as not-found"
+    );
 
     a.shutdown().await.unwrap();
     b.shutdown().await.unwrap();
     c.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn timed_out_single_put_retries_the_exact_stamped_operation() {
+    use actordb::proto::{MutationResponse, MutationResult, MutationStatus};
+    use actordb::shard::FragmentId;
+
+    let config = NodeConfig {
+        fragment_map: HashMap::from([(
+            FragmentId(0),
+            vec!["silent-first".to_string(), "responding-second".to_string()],
+        )]),
+        ..NodeConfig::default()
+    };
+    let client = Node::start_with_options(
+        "retry-client".to_string(),
+        "127.0.0.1:0".parse().unwrap(),
+        config,
+        NodeRuntimeOptions::default().with_forwarded_attempt_timeout(Duration::from_millis(100)),
+    )
+    .await
+    .unwrap();
+
+    let mut first = tokio::net::TcpStream::connect(client.addr()).await.unwrap();
+    complete_no_secret_handshake(&mut first, "silent-first").await;
+    let mut second = tokio::net::TcpStream::connect(client.addr()).await.unwrap();
+    complete_no_secret_handshake(&mut second, "responding-second").await;
+    common::wait_for(
+        || async { client.peer_count().await == 2 },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    let capture = async {
+        let first_put = loop {
+            if let Some(EnvelopeMsg::ForwardedPut(put)) = recv_frame(&mut first).await.msg {
+                break put;
+            }
+        };
+        // Deliberately do not answer the preferred holder. The second attempt
+        // must carry the same version even though the first may have applied.
+        let second_put = loop {
+            if let Some(EnvelopeMsg::ForwardedPut(put)) = recv_frame(&mut second).await.msg {
+                break put;
+            }
+        };
+        send_frame(
+            &mut second,
+            Envelope {
+                msg: Some(EnvelopeMsg::MutationResponse(MutationResponse {
+                    req_id: second_put.req_id,
+                    results: vec![MutationResult {
+                        key: second_put.key.clone(),
+                        status: MutationStatus::Applied as i32,
+                        error: String::new(),
+                        winner_timestamp_ms: 0,
+                        winner_node_id: String::new(),
+                        winner_is_tombstone: false,
+                        request_index: 0,
+                    }],
+                })),
+            },
+        )
+        .await;
+        (first_put, second_put)
+    };
+    let ((mut first_put, second_put), result) =
+        tokio::time::timeout(Duration::from_secs(3), async {
+            tokio::join!(
+                capture,
+                client.put("retry-key".to_string(), b"value".to_vec())
+            )
+        })
+        .await
+        .expect("single-put retry exchange timed out");
+    result.expect("single put did not retry after the first response timed out");
+
+    assert_ne!(first_put.req_id, second_put.req_id);
+    first_put.req_id = second_put.req_id;
+    assert_eq!(first_put, second_put, "retry changed the stamped mutation");
+
+    drop(first);
+    drop(second);
+    client.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn timed_out_single_get_tries_the_next_holder() {
+    use actordb::actor::OpPriority;
+    use actordb::proto::{GetResponse, Priority};
+    use actordb::shard::FragmentId;
+
+    let config = NodeConfig {
+        fragment_map: HashMap::from([(
+            FragmentId(0),
+            vec!["silent-reader".to_string(), "responding-reader".to_string()],
+        )]),
+        ..NodeConfig::default()
+    };
+    let client = Node::start_with_options(
+        "read-retry-client".to_string(),
+        "127.0.0.1:0".parse().unwrap(),
+        config,
+        NodeRuntimeOptions::default().with_forwarded_attempt_timeout(Duration::from_millis(100)),
+    )
+    .await
+    .unwrap();
+
+    let mut first = tokio::net::TcpStream::connect(client.addr()).await.unwrap();
+    complete_no_secret_handshake(&mut first, "silent-reader").await;
+    let mut second = tokio::net::TcpStream::connect(client.addr()).await.unwrap();
+    complete_no_secret_handshake(&mut second, "responding-reader").await;
+    common::wait_for(
+        || async { client.peer_count().await == 2 },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    let exchange = async {
+        let first_get = loop {
+            if let Some(EnvelopeMsg::ForwardedGet(get)) = recv_frame(&mut first).await.msg {
+                break get;
+            }
+        };
+        let second_get = loop {
+            if let Some(EnvelopeMsg::ForwardedGet(get)) = recv_frame(&mut second).await.msg {
+                break get;
+            }
+        };
+        send_frame(
+            &mut first,
+            Envelope {
+                msg: Some(EnvelopeMsg::GetResponse(GetResponse {
+                    req_id: first_get.req_id,
+                    found: false,
+                    value: Vec::new(),
+                    timestamp_ms: 0,
+                    node_id: String::new(),
+                    expires_at_ms: 0,
+                    is_tombstone: false,
+                    shed: false,
+                })),
+            },
+        )
+        .await;
+        send_frame(
+            &mut second,
+            Envelope {
+                msg: Some(EnvelopeMsg::GetResponse(GetResponse {
+                    req_id: second_get.req_id,
+                    found: true,
+                    value: b"value".to_vec(),
+                    timestamp_ms: 7,
+                    node_id: "responding-reader".to_string(),
+                    expires_at_ms: 0,
+                    is_tombstone: false,
+                    shed: false,
+                })),
+            },
+        )
+        .await;
+        (first_get, second_get)
+    };
+    let ((first_get, second_get), result) = tokio::time::timeout(Duration::from_secs(3), async {
+        tokio::join!(
+            exchange,
+            client.get_with_priority("retry-key".to_string(), OpPriority::High)
+        )
+    })
+    .await
+    .expect("single-get retry exchange timed out");
+    assert_eq!(
+        result.unwrap().map(|value| value.value),
+        Some(b"value".to_vec())
+    );
+    assert_ne!(first_get.req_id, second_get.req_id);
+    assert_eq!(first_get.key, second_get.key);
+    assert_eq!(first_get.priority, Priority::High as i32);
+    assert_eq!(second_get.priority, Priority::High as i32);
+    assert_eq!(first_get.hops, 0);
+    assert_eq!(second_get.hops, 0);
+
+    let shed_exchange = async {
+        let request = loop {
+            if let Some(EnvelopeMsg::ForwardedGet(get)) = recv_frame(&mut first).await.msg {
+                break get;
+            }
+        };
+        send_frame(
+            &mut first,
+            Envelope {
+                msg: Some(EnvelopeMsg::GetResponse(GetResponse {
+                    req_id: request.req_id,
+                    found: false,
+                    value: Vec::new(),
+                    timestamp_ms: 0,
+                    node_id: String::new(),
+                    expires_at_ms: 0,
+                    is_tombstone: false,
+                    shed: true,
+                })),
+            },
+        )
+        .await;
+        request
+    };
+    let (shed_request, shed_result) = tokio::time::timeout(Duration::from_secs(3), async {
+        tokio::join!(
+            shed_exchange,
+            client.get_with_priority("shed-key".to_string(), OpPriority::Background)
+        )
+    })
+    .await
+    .expect("single-get shed exchange timed out");
+    assert_eq!(shed_request.priority, Priority::Background as i32);
+    assert!(matches!(shed_result, Err(NodeError::Backpressure(_))));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), recv_frame(&mut second))
+            .await
+            .is_err(),
+        "a typed backpressure response incorrectly failed over"
+    );
+
+    drop(first);
+    drop(second);
+    client.shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -6125,6 +6388,14 @@ async fn mutation_relay_scans_past_the_origin_to_a_connected_owner() {
             .unwrap()
             .map(|value| value.value),
         Some(b"value".to_vec())
+    );
+    assert_eq!(
+        a.get("relayed-write".to_string())
+            .await
+            .unwrap()
+            .map(|value| value.value),
+        Some(b"value".to_vec()),
+        "single read did not re-forward across disagreeing placement maps"
     );
 
     a.shutdown().await.unwrap();

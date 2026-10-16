@@ -76,9 +76,11 @@ Other valid typed responses end failover and return their exact per-key
 outcomes. A fragment with no usable replica is a configuration
 `NodeError::Actor(..)`.
 
-Single-key `put` also waits for the remote exact outcome, with the same
-configured send-and-response deadline (5 seconds by default), but currently
-selects only the first owner rather than failing over.
+Single-key `put` uses the same per-owner deadline and exact mutation result. It
+retries transport, timeout, malformed-response, and typed `Unavailable`
+failures across `replica_order`, carrying the original timestamp, origin, boot
+id, and sequence on every attempt so a lost response remains an idempotent
+retry. Any other valid typed result is terminal.
 
 ## Remote gets: timeout + failover
 
@@ -97,6 +99,13 @@ not-found. The caller validates the expected connection-bound peer and every
 prefix position—including duplicate keys—before observing timestamps or completing a
 result, then requests the omitted suffix under a fresh id. Missing values are
 represented explicitly by a prefix entry with `found = false`.
+
+Remote single-key reads retain `ForwardedGet` so a non-serving holder can
+re-forward across temporarily disagreeing placement maps. Direct and relayed
+responses are pinned to the authenticated expected peer and validated before
+they affect the clock or caller. Because `GetResponse` cannot encode
+unavailable, actor or routing failure produces no false `found = false`
+response; the bounded attempt expires and the origin tries its next holder.
 
 The responder targets 1 MiB. Because it learns a value's encoded size only
 after the actor read, it includes the single result that crosses that target
@@ -117,12 +126,15 @@ Per-key result mapping in a `BatchGetResponse`:
 
 ## Error semantics
 
-`NodeError::Actor` = misconfiguration (no usable replica listed).
+`NodeError::Actor` = misconfiguration (no usable replica listed) or a local
+actor-framework failure.
 `NodeError::Network` = connectivity (no replica reachable).
 `NodeError::Backpressure` = shed locally or remotely — **a shed read never
 returns `Ok(None)`**, so callers can't mistake backpressure for "not found".
 `NodeError::Storage`, `Superseded`, and `Expired` preserve the serving
 fragment's exact mutation outcome.
 
-The `multi_key_partial_failure` integration test covers the headline case: a
-disconnected owner fails only its keys while the rest succeed.
+The `multi_key_partial_failure` and
+`batch_operations_fail_over_after_a_stale_owner_returns_unavailable`
+integration tests cover disconnected and live-but-stale preferred owners for
+both single-key and batch operations.

@@ -96,8 +96,10 @@ message ForwardedPut {
   uint64 req_id = 11;
 }
 
-// A client-routed read: "you own this key's fragment — read it and
-// reply." One network hop.
+// A single-key routed read. The origin tries configured holders in order; a
+// non-serving holder may relay it under a fresh request id while placement
+// maps converge. GetResponse has no unavailable value, so routing/actor
+// unavailability produces no false not-found reply and the origin times out.
 message ForwardedGet {
   string key = 1;
   uint64 req_id = 2;

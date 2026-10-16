@@ -79,10 +79,12 @@ nodes certify one another.
   `tombstone_gc_age: Some(..)` setting: buffered delivery, `MemoryApplied`
   receiver crashes, and restart can all erase convergence evidence that a
   time bound cannot replace.
-- While partitioned, batch reads and writes fail over across `replica_order`
-  while single-key forwarded puts/gets currently select one owner. If no
-  selected/retried replica is reachable, the operation returns
-  `NodeError::Network`.
+- While partitioned, remotely routed single-key and batch reads and writes fail
+  over across `replica_order`. Single writes retry the same stamped LWW
+  version, and single reads source-pin each response and retry when an
+  unavailable holder remains silent, so actor/routing failure cannot be
+  confused with a valid not-found result. If no replica answers, the operation
+  returns `NodeError::Network`.
 
 ### Slow or non-reading peer
 
@@ -107,9 +109,10 @@ nodes certify one another.
   repairs it. Peer connect/disconnect and `ReconcileNow` are persistent
   side-band signals and cannot be hidden by either full lane.
 - A forwarded owner attempt has one 5-second default budget for both enqueue
-  and response. Expiry removes the pending request; batch APIs then try the next
-  holder. Remote fragments and holder attempts are sequential, so a slow
-  attempt delays those that follow.
+  and response. Expiry removes the pending request; single-key and batch APIs
+  then try the next holder. Remote batch fragment groups are sequential, and
+  every operation's holder attempts are sequential, so a slow attempt delays
+  those that follow.
 - An ordinary replication batch must receive an acceptable ACK within 30
   seconds by default. Expiry rotates the sender session and replays every
   unacknowledged exact stamped operation in original order. Duplicate applies

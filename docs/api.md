@@ -218,6 +218,14 @@ data lane.
 See
 [Consistency](consistency.md) and [Traffic classes & backpressure](backpressure.md).
 
+Remote single-key operations try configured replica holders in placement
+order. Writes retain one exact stamped version across retries and terminate on
+the first valid non-`Unavailable` outcome. Reads use source-pinned
+`ForwardedGet` attempts, preserving hop-bounded re-forwarding while placement
+maps converge. A timeout, dropped connection, or malformed response tries the
+next holder, while an explicit `found = false` remains a successful miss.
+Exhausting the holders returns `NodeError::Network`.
+
 ## Multi-key batching
 
 ```rust
@@ -246,7 +254,8 @@ Semantics (full detail in [Multi-key batching](batching.md)):
 - Remote fragment groups are awaited sequentially, as are holder attempts
   within a group; these APIs do not issue all fan-out attempts concurrently.
 - Per-key errors use `NodeError`: `Actor` = misconfiguration (no usable
-  replica), `Network` = no replica reachable, `Backpressure` = shed.
+  replica) or local actor-framework failure, `Network` = no remote replica
+  answered, `Backpressure` = shed.
 
 ## Advanced replication embedding
 
