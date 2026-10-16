@@ -20,6 +20,7 @@ does not upload anything. GitHub prereleases are intentionally excluded.
    python3 .github/scripts/verify_release.py
    cargo publish --dry-run --locked --package actordb --registry crates-io
    cargo publish --dry-run --locked --package actordb --registry crates-io --no-default-features
+   cargo package --locked --package actordb
    ```
 
    These commands do not publish and need no registry token. Cargo verifies the
@@ -32,7 +33,10 @@ does not upload anything. GitHub prereleases are intentionally excluded.
    Docker, and the `Verify release package` check. Merge into `main`.
 
 The package workflow uploads an `actordb-VERSION` build artifact containing the
-verified `.crate` for inspection. It is not a crates.io release.
+verified `.crate` for inspection. An explicit, verified `cargo package` produces
+the artifact in Cargo's normal package directory: recent Cargo versions stage
+publish dry-runs in a temporary registry instead. No internal staging path is
+assumed. The artifact is not a crates.io release.
 
 ## Credentials
 

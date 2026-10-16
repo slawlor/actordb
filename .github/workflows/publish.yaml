@@ -65,6 +65,11 @@ jobs:
       - name: Verify the package without RocksDB
         run: cargo publish --dry-run --locked --package actordb --registry crates-io --no-default-features
 
+      - name: Create the verified release artifact
+        # Modern Cargo stages publish dry-runs in a temporary registry rather
+        # than the normal package directory. Do not depend on internal paths.
+        run: cargo package --locked --package actordb
+
       # PR/main already have the full CI suite. Repeat crate tests on a release
       # event so publication does not rely solely on an earlier branch check.
       - name: Test the release with and without RocksDB
