@@ -1073,24 +1073,28 @@ struct PoolWorkerArgs {
     pool_pending: Arc<AtomicU64>,
     slot_pending: Arc<AtomicU64>,
     #[cfg(test)]
-    startup_gate: Option<WorkerStartupGate>,
+    startup_gate: Option<WorkerTestGate>,
 }
 
 #[cfg(test)]
 #[derive(Clone, Default)]
-struct WorkerStartupGate {
+struct WorkerTestGate {
     entered: Arc<tokio::sync::Notify>,
     release: Arc<tokio::sync::Notify>,
 }
 
 #[cfg(test)]
 static WORKER_STARTUP_GATES: std::sync::LazyLock<
-    std::sync::Mutex<HashMap<String, WorkerStartupGate>>,
+    std::sync::Mutex<HashMap<String, WorkerTestGate>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
 
 #[cfg(test)]
-fn install_worker_startup_gate(name: String) -> WorkerStartupGate {
-    let gate = WorkerStartupGate::default();
+static WORKER_GET_GATES: std::sync::LazyLock<std::sync::Mutex<HashMap<String, WorkerTestGate>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+#[cfg(test)]
+fn install_worker_startup_gate(name: String) -> WorkerTestGate {
+    let gate = WorkerTestGate::default();
     let replaced = WORKER_STARTUP_GATES
         .lock()
         .expect("worker startup gate registry poisoned")
@@ -1100,11 +1104,30 @@ fn install_worker_startup_gate(name: String) -> WorkerStartupGate {
 }
 
 #[cfg(test)]
-fn take_worker_startup_gate(name: &str) -> Option<WorkerStartupGate> {
+fn take_worker_startup_gate(name: &str) -> Option<WorkerTestGate> {
     WORKER_STARTUP_GATES
         .lock()
         .expect("worker startup gate registry poisoned")
         .remove(name)
+}
+
+#[cfg(test)]
+fn install_worker_get_gate(key: String) -> WorkerTestGate {
+    let gate = WorkerTestGate::default();
+    let replaced = WORKER_GET_GATES
+        .lock()
+        .expect("worker Get gate registry poisoned")
+        .insert(key, gate.clone());
+    assert!(replaced.is_none(), "worker Get gate already installed");
+    gate
+}
+
+#[cfg(test)]
+fn take_worker_get_gate(key: &str) -> Option<WorkerTestGate> {
+    WORKER_GET_GATES
+        .lock()
+        .expect("worker Get gate registry poisoned")
+        .remove(key)
 }
 
 impl Actor for PoolWorker {
@@ -1169,6 +1192,11 @@ impl Actor for PoolWorker {
                 reply,
                 priority: _,
             } => {
+                #[cfg(test)]
+                if let Some(gate) = take_worker_get_gate(&key) {
+                    gate.entered.notify_one();
+                    gate.release.notified().await;
+                }
                 let value = state.shared.get(&key).await;
                 release_pool_reservation(state);
                 let _ = reply.send(Ok(value));
@@ -1196,16 +1224,25 @@ fn release_pool_reservation(state: &PoolWorkerArgs) {
 }
 
 fn release_pending(pending: &AtomicU64, count: u64) -> bool {
-    let released = pending
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-            current.checked_sub(count)
-        })
-        .is_ok();
-    debug_assert!(
-        released,
-        "pending counter underflow while releasing {count} jobs"
-    );
-    released
+    let mut current = pending.load(Ordering::Relaxed);
+    loop {
+        debug_assert!(
+            current >= count,
+            "pending counter underflow while releasing {count} jobs"
+        );
+        if current < count {
+            return false;
+        }
+        match pending.compare_exchange_weak(
+            current,
+            current - count,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return true,
+            Err(actual) => current = actual,
+        }
+    }
 }
 
 /// The worker index for `key`: sticky across calls within one pool, so a key's
@@ -2409,10 +2446,7 @@ mod tests {
 #[cfg(test)]
 mod worker_pool_tests {
     use super::*;
-    use crate::store::StoreError;
     use ractor::registry::where_is;
-    use std::sync::atomic::AtomicBool;
-    use std::sync::{Condvar, Mutex as StdMutex};
 
     static NEXT_PREFIX: AtomicU64 = AtomicU64::new(0);
 
@@ -2484,34 +2518,6 @@ mod worker_pool_tests {
         })
         .await
         .expect("condition did not become true");
-    }
-
-    #[derive(Default)]
-    struct BlockingStore {
-        entered: AtomicBool,
-        release: (StdMutex<bool>, Condvar),
-    }
-
-    impl BlockingStore {
-        fn release(&self) {
-            *self.release.0.lock().unwrap() = true;
-            self.release.1.notify_all();
-        }
-    }
-
-    impl KvStore for BlockingStore {
-        fn load(&self) -> Result<Vec<(Vec<u8>, VersionedValue)>, StoreError> {
-            Ok(Vec::new())
-        }
-
-        fn write_batch(&self, _writes: &[(Vec<u8>, VersionedValue)]) -> Result<(), StoreError> {
-            self.entered.store(true, Ordering::SeqCst);
-            let mut released = self.release.0.lock().unwrap();
-            while !*released {
-                released = self.release.1.wait(released).unwrap();
-            }
-            Ok(())
-        }
     }
 
     #[tokio::test]
@@ -2847,14 +2853,17 @@ mod worker_pool_tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn drain_racing_worker_restart_still_drains_accepted_sibling_work() {
-        let store = Arc::new(BlockingStore::default());
+        let prefix = unique_prefix("restart-drain-race");
+        let accepted_key = format!("{prefix}-accepted-before-drain");
         let shared = Arc::new(FragmentState::new(
-            HashMap::new(),
-            Some(store.clone()),
-            1,
+            HashMap::from([(
+                accepted_key.clone(),
+                VersionedValue::new(b"value".to_vec(), 1, "test-node".to_string()),
+            )]),
+            None,
+            100,
             Duration::from_secs(3600),
         ));
-        let prefix = unique_prefix("restart-drain-race");
         let pool = pool_config(8, None);
         let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
         let (probe, probe_handle) = SupervisionProbe::spawn(None, SupervisionProbe, event_tx)
@@ -2880,16 +2889,18 @@ mod worker_pool_tests {
         // Keep accepted work active in a sibling pool. If the replacement
         // race turns into a dispatcher handler failure, ractor skips
         // `post_stop` and this worker is killed before it can reply.
-        let (apply_reply, apply_response) = tokio::sync::oneshot::channel();
+        let accepted_gate = install_worker_get_gate(accepted_key.clone());
+        let (accepted_reply, accepted_response) = tokio::sync::oneshot::channel();
         dispatcher
-            .send_message(KvMessage::ApplyOp {
-                op: op("accepted-before-drain", 1),
+            .send_message(KvMessage::Get {
+                key: accepted_key.clone(),
                 priority: OpPriority::High,
-                is_replication: false,
-                reply: Some(apply_reply.into()),
+                reply: accepted_reply.into(),
             })
             .unwrap();
-        wait_for(|| store.entered.load(Ordering::SeqCst)).await;
+        tokio::time::timeout(Duration::from_secs(2), accepted_gate.entered.notified())
+            .await
+            .expect("accepted sibling work did not enter its worker");
 
         // Pause a default-worker replacement in pre_start. Draining the
         // dispatcher before releasing it makes ractor reject the new link,
@@ -2906,13 +2917,13 @@ mod worker_pool_tests {
         dispatcher.drain().unwrap();
         assert!(dispatcher.get_status() >= ActorStatus::Draining);
         startup_gate.release.notify_one();
-        store.release();
+        accepted_gate.release.notify_one();
 
-        assert!(tokio::time::timeout(Duration::from_secs(2), apply_response)
+        let accepted = tokio::time::timeout(Duration::from_secs(2), accepted_response)
             .await
             .expect("accepted sibling work did not finish during drain")
-            .unwrap()
-            .is_ok());
+            .unwrap();
+        assert!(matches!(accepted, Ok(Some(_))));
         tokio::time::timeout(Duration::from_secs(2), dispatcher.wait(None))
             .await
             .expect("dispatcher did not complete its orderly drain")
@@ -2941,7 +2952,7 @@ mod worker_pool_tests {
             terminated_cleanly,
             "replacement/drain race failed the dispatcher instead of terminating cleanly"
         );
-        assert!(shared.get("accepted-before-drain").await.is_some());
+        assert!(shared.get(&accepted_key).await.is_some());
         probe.stop(None);
         tokio::time::timeout(Duration::from_secs(2), probe_handle)
             .await
@@ -2951,17 +2962,17 @@ mod worker_pool_tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn blocked_background_get_does_not_stall_high_priority_or_health() {
-        let store = Arc::new(BlockingStore::default());
+        let prefix = unique_prefix("get-hol");
+        let blocked_key = format!("{prefix}-blocked");
         let shared = Arc::new(FragmentState::new(
             HashMap::from([(
                 "hot".to_string(),
                 VersionedValue::new(b"value".to_vec(), 1, "test-node".to_string()),
             )]),
-            Some(store.clone()),
-            1,
+            None,
+            100,
             Duration::from_secs(3600),
         ));
-        let prefix = unique_prefix("get-hol");
         let pool = pool_config(8, None);
         let (dispatcher, _handle) = KvActor::spawn(
             None,
@@ -2978,25 +2989,18 @@ mod worker_pool_tests {
         .await
         .unwrap();
 
-        let (apply_reply, apply_response) = tokio::sync::oneshot::channel();
-        dispatcher
-            .send_message(KvMessage::ApplyOp {
-                op: op("blocked-write", 2),
-                priority: OpPriority::Background,
-                is_replication: false,
-                reply: Some(apply_reply.into()),
-            })
-            .unwrap();
-        wait_for(|| store.entered.load(Ordering::SeqCst)).await;
-
+        let worker_gate = install_worker_get_gate(blocked_key.clone());
         let (background_reply, background_response) = tokio::sync::oneshot::channel();
         dispatcher
             .send_message(KvMessage::Get {
-                key: "hot".to_string(),
+                key: blocked_key,
                 reply: background_reply.into(),
                 priority: OpPriority::Background,
             })
             .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), worker_gate.entered.notified())
+            .await
+            .expect("background Get did not enter its worker");
 
         let health = tokio::time::timeout(
             Duration::from_secs(2),
@@ -3016,11 +3020,10 @@ mod worker_pool_tests {
         )
         .await;
 
-        // Always release the synchronous store call before asserting, so a
-        // regression cannot strand a Tokio worker thread after test failure.
-        store.release();
-        assert!(apply_response.await.unwrap().is_ok());
-        assert!(background_response.await.unwrap().is_ok());
+        // Always release the worker before asserting so the old nested-RPC
+        // behavior cannot strand the dispatcher after the timeout.
+        worker_gate.release.notify_one();
+        assert!(matches!(background_response.await.unwrap(), Ok(None)));
         assert!(matches!(
             health
                 .expect("health query stalled behind a background worker")
