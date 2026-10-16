@@ -38,6 +38,12 @@ the artifact in Cargo's normal package directory: recent Cargo versions stage
 publish dry-runs in a temporary registry instead. No internal staging path is
 assumed. The artifact is not a crates.io release.
 
+Package verification uses a separate `stable-release-package` dependency cache:
+an unpacked crate does not unify the workspace's dev/test features, so its
+native dependency artifacts can differ from workspace CI. The first compatible
+package cache is cold; later reuse depends on toolchain, dependency, and cache
+availability. Both feature checks still run; no fixed build speed is promised.
+
 ## Credentials
 
 Configure the repository Actions secret `CARGO_REGISTRY_TOKEN` with a valid

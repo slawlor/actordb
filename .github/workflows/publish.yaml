@@ -37,7 +37,9 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: stable-debug-tests
+          # Unpacked package builds do not unify the workspace's dev features.
+          # Keep their native artifacts separate from immutable test caches.
+          shared-key: stable-release-package
 
       - name: Test release guards
         env:
