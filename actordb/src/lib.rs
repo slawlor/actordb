@@ -55,4 +55,41 @@ mod runtime_tasks;
 pub(crate) mod wire;
 
 #[cfg(test)]
-pub(crate) mod common_test;
+pub(crate) mod common_test {
+    #![allow(dead_code)]
+
+    use std::future::Future;
+
+    use ractor::concurrency::sleep;
+    use ractor::concurrency::Duration;
+    use ractor::concurrency::Instant;
+
+    pub async fn periodic_check<F>(check: F, timeout: Duration)
+    where
+        F: Fn() -> bool,
+    {
+        let start = Instant::now();
+        while start.elapsed() < timeout {
+            if check() {
+                break;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+        assert!(check());
+    }
+
+    pub async fn periodic_async_check<F, Fut>(check: F, timeout: Duration)
+    where
+        F: Fn() -> Fut,
+        Fut: Future<Output = bool>,
+    {
+        let start = Instant::now();
+        while start.elapsed() < timeout {
+            if check().await {
+                break;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+        assert!(check().await);
+    }
+}

@@ -79,8 +79,11 @@ new public APIs.
   maintenance actors; `actor/maintenance.rs` holds their shared ticker
   and coalesced trigger support.
 
-Tests live beside their owning implementation in separate child files so
-private invariants can be tested without exposing runtime internals. This is
+Unit tests and small shared test fixtures use inline `#[cfg(test)]` modules in
+their owning source files. Tests retain access to private invariants without
+exposing runtime internals or creating a separate file for each test group.
+Downstream API and multi-node integration tests remain under `actordb/tests`.
+This is
 an organizational refactor: it does not change scheduling, locking, admission,
 durability, or replace the worker pools with ractor's `Factory`. The
 `ReplicationSender` is a Tokio task/state machine, not a ractor actor; the node

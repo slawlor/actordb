@@ -32,7 +32,8 @@ actor-first, sharded database implementation. This is a breaking upgrade from
 - Actor-per-file runtime organization under `actor`, with `supervision`
   compatibility reexports preserving public imports and Bon
   builder paths; shared cache, clock, protocol, pool, and maintenance helpers
-  have separate modules.
+  have separate modules. Unit tests remain inline in the owning source files;
+  downstream API and cluster integration tests stay separate.
 - Consolidated `getrandom` 0.4, `hmac` 0.13, `sha2` 0.11, and `tracing-glog` 0.4
   upgrades, current compatible dependency patches, and grouped future Dependabot
   updates. OS challenge generation and constant-time handshake verification

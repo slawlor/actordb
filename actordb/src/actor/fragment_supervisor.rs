@@ -605,4 +605,1129 @@ impl Actor for FragmentSupervisor {
 }
 
 #[cfg(test)]
-mod tests;
+mod tests {
+    //! Supervisor regression groups retain access to their private runtime owner.
+
+    use super::*;
+    use crate::actor::maintenance_test_support::{
+        GatedStore, ReleaseMaintenanceStore, ReleaseStore,
+    };
+    use crate::actor::{ApplyOutcome, KvWorker, KvWorkerArgs, ReplicatedOp};
+    use crate::store::StoreError;
+    use ractor::registry::where_is;
+    use std::sync::atomic::Ordering;
+    use std::sync::Mutex as StdMutex;
+
+    mod builders {
+        //! Builder defaults, explicit settings and real child recovery.
+
+        use super::*;
+
+        #[tokio::test]
+        async fn supervision_builders_omit_settings_without_inventing_shared_dependencies() {
+            let hlc = Arc::new(Mutex::new(HlcClock::new()));
+            let make = || {
+                SupervisorArgs::builder()
+                    .fragment(FragmentId(7))
+                    .worker_prefix("builder-supervisor")
+                    .hlc(hlc.clone())
+                    .build()
+            };
+            let args = make();
+            let other = make();
+            let defaults = crate::node::NodeConfig::default();
+            assert!(Arc::ptr_eq(&args.hlc, &hlc));
+            assert_eq!(args.fragment, FragmentId(7));
+            assert_eq!(args.worker_prefix, "builder-supervisor");
+            assert!(args.store.is_none());
+            assert!(args.tombstone_gc_age.is_none());
+            assert_eq!(args.flush_batch_size, defaults.flush_batch_size);
+            assert_eq!(args.flush_interval, defaults.flush_interval);
+            assert_eq!(args.clean_interval, defaults.clean_interval);
+            assert_eq!(args.snapshot_interval, defaults.snapshot_interval);
+            for (actual, expected) in [
+                (&args.high_pool, &defaults.high_pool),
+                (&args.default_pool, &defaults.default_pool),
+                (&args.background_pool, &defaults.background_pool),
+            ] {
+                assert_eq!(
+                    (actual.workers, actual.queue_cap, actual.rate_limit_per_sec),
+                    (
+                        expected.workers,
+                        expected.queue_cap,
+                        expected.rate_limit_per_sec
+                    )
+                );
+            }
+            assert!(!Arc::ptr_eq(&args.reset_senders, &other.reset_senders));
+            args.reset_senders
+                .lock()
+                .await
+                .insert((FragmentId(7), "peer".into()), 1);
+            assert!(other.reset_senders.lock().await.is_empty());
+
+            let shared = Arc::new(FragmentState::new(
+                HashMap::new(),
+                None,
+                1000,
+                Duration::from_millis(100),
+            ));
+            let make_cleaner = || {
+                CleanerArgs::builder()
+                    .fragment(FragmentId(7))
+                    .shared(shared.clone())
+                    .build()
+            };
+            let cleaner = make_cleaner();
+            assert!(Arc::ptr_eq(&cleaner.shared, &shared));
+            assert_eq!(cleaner.fragment, FragmentId(7));
+            assert_eq!(cleaner.interval, defaults.clean_interval);
+            assert!(cleaner.tombstone_gc_age.is_none());
+            assert!(!Arc::ptr_eq(
+                &cleaner.reset_senders,
+                &make_cleaner().reset_senders
+            ));
+            assert!(!Arc::ptr_eq(&cleaner.reset_senders, &args.reset_senders));
+            let snapshotter = SnapshotterArgs::builder().shared(shared.clone()).build();
+            assert!(Arc::ptr_eq(&snapshotter.shared, &shared));
+            assert_eq!(snapshotter.interval, defaults.snapshot_interval);
+        }
+
+        #[tokio::test]
+        async fn supervision_builders_preserve_explicit_settings_and_legacy_overrides() {
+            let hlc = Arc::new(Mutex::new(HlcClock::new()));
+            let store: Arc<dyn KvStore> = Arc::new(GatedStore::default());
+            let resets = Arc::new(Mutex::new(HashMap::from([(
+                (FragmentId(8), "peer".into()),
+                9,
+            )])));
+            let custom_pool = || {
+                PoolConfig::builder()
+                    .workers(1)
+                    .queue_cap(3)
+                    .rate_limit_per_sec(5)
+                    .build()
+            };
+            let legacy_age = Duration::from_secs(6);
+            let args = SupervisorArgs::builder()
+                .fragment(FragmentId(8))
+                .worker_prefix(String::from("builder-overrides"))
+                .hlc(hlc.clone())
+                .store(store.clone())
+                .high_pool(custom_pool())
+                .default_pool(custom_pool())
+                .background_pool(custom_pool())
+                .flush_batch_size(7)
+                .flush_interval(Duration::from_millis(8))
+                .clean_interval(Duration::from_secs(9))
+                .snapshot_interval(Duration::from_secs(10))
+                .tombstone_gc_age(legacy_age)
+                .reset_senders(resets.clone())
+                .build();
+            assert!(Arc::ptr_eq(args.store.as_ref().unwrap(), &store));
+            assert!(Arc::ptr_eq(&args.hlc, &hlc));
+            assert!(Arc::ptr_eq(&args.reset_senders, &resets));
+            assert_eq!(args.tombstone_gc_age, Some(legacy_age));
+            assert_eq!(args.flush_batch_size, 7);
+            assert_eq!(args.flush_interval, Duration::from_millis(8));
+            assert_eq!(args.clean_interval, Duration::from_secs(9));
+            assert_eq!(args.snapshot_interval, Duration::from_secs(10));
+            for pool in [args.high_pool, args.default_pool, args.background_pool] {
+                assert_eq!(
+                    (pool.workers, pool.queue_cap, pool.rate_limit_per_sec),
+                    (1, 3, Some(5))
+                );
+            }
+            let no_store = SupervisorArgs::builder()
+                .fragment(FragmentId(8))
+                .worker_prefix("no-store")
+                .hlc(hlc)
+                .maybe_store(None)
+                .maybe_tombstone_gc_age(None)
+                .build();
+            assert!(no_store.store.is_none());
+            assert!(no_store.tombstone_gc_age.is_none());
+            let shared = Arc::new(FragmentState::new(
+                HashMap::new(),
+                None,
+                1000,
+                Duration::from_millis(100),
+            ));
+            let cleaner = CleanerArgs::builder()
+                .fragment(FragmentId(8))
+                .shared(shared.clone())
+                .interval(Duration::from_secs(11))
+                .maybe_tombstone_gc_age(Some(legacy_age))
+                .reset_senders(resets.clone())
+                .build();
+            assert_eq!(cleaner.interval, Duration::from_secs(11));
+            assert_eq!(cleaner.tombstone_gc_age, Some(legacy_age));
+            assert!(Arc::ptr_eq(&cleaner.reset_senders, &resets));
+            let snapshotter = SnapshotterArgs::builder()
+                .shared(shared)
+                .interval(Duration::from_secs(12))
+                .build();
+            assert_eq!(snapshotter.interval, Duration::from_secs(12));
+        }
+
+        #[tokio::test]
+        async fn supervisor_builder_defaults_start_and_quiesce_real_owned_workers() {
+            let (supervisor, handle) = FragmentSupervisor::spawn(
+                None,
+                FragmentSupervisor,
+                SupervisorArgs::builder()
+                    .fragment(FragmentId(0))
+                    .worker_prefix("builder-owned-workers")
+                    .hlc(Arc::new(Mutex::new(HlcClock::new())))
+                    .build(),
+            )
+            .await
+            .unwrap();
+            let CallResult::Success(health) = supervisor
+                .call(
+                    |reply| SupervisorMessage::GetHealth { reply },
+                    Some(Duration::from_secs(2)),
+                )
+                .await
+                .unwrap()
+            else {
+                panic!("builder defaults failed health probe")
+            };
+            assert_eq!(health.fragment, FragmentId(0));
+            assert_eq!(health.worker_count, 8);
+            assert_eq!(health.shed_counts, (0, 0, 0));
+            assert!(matches!(
+                supervisor
+                    .call(
+                        |reply| SupervisorMessage::Quiesce { reply },
+                        Some(Duration::from_secs(2))
+                    )
+                    .await
+                    .unwrap(),
+                CallResult::Success(Ok(()))
+            ));
+            supervisor.drain().unwrap();
+            handle.await.unwrap();
+        }
+
+        #[derive(Default)]
+        struct RestartRecordingStore {
+            entries: StdMutex<HashMap<Vec<u8>, VersionedValue>>,
+        }
+
+        impl KvStore for RestartRecordingStore {
+            fn load(&self) -> Result<Vec<(Vec<u8>, VersionedValue)>, StoreError> {
+                Ok(self
+                    .entries
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect())
+            }
+
+            fn write_batch(&self, writes: &[(Vec<u8>, VersionedValue)]) -> Result<(), StoreError> {
+                let mut entries = self.entries.lock().unwrap();
+                for (key, value) in writes {
+                    entries.insert(key.clone(), value.clone());
+                }
+                Ok(())
+            }
+        }
+
+        struct StopRestartSupervisor(ActorCell);
+
+        impl Drop for StopRestartSupervisor {
+            fn drop(&mut self) {
+                self.0.stop_children(None);
+                self.0.kill();
+            }
+        }
+
+        async fn restart_owned_maintenance_child<M: ractor::Message>(
+            supervisor: &ActorRef<SupervisorMessage>,
+            name: &str,
+        ) -> ActorRef<M> {
+            let original = supervisor
+                .get_children()
+                .into_iter()
+                .find(|child| child.is_message_type_of::<M>() == Some(true))
+                .unwrap();
+            original.kill();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                original.wait(None).await.unwrap();
+                loop {
+                    let replacement = supervisor.get_children().into_iter().find(|child| {
+                        child.is_message_type_of::<M>() == Some(true)
+                            && child.get_id() != original.get_id()
+                            && child.get_status() == ActorStatus::Running
+                    });
+                    let health = supervisor
+                        .call(
+                            |reply| SupervisorMessage::GetHealth { reply },
+                            Some(Duration::from_secs(2)),
+                        )
+                        .await
+                        .unwrap();
+                    if let (Some(replacement), CallResult::Success(health)) = (replacement, health)
+                    {
+                        if health.restarts.get(name) == Some(&1) {
+                            return ActorRef::from(replacement);
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("owned maintenance child did not restart")
+        }
+
+        #[tokio::test]
+        async fn maintenance_child_builder_restarts_preserve_shared_state_and_periodic_policy() {
+            let store = Arc::new(RestartRecordingStore::default());
+            let pool = |workers, queue_cap| {
+                PoolConfig::builder()
+                    .workers(workers)
+                    .queue_cap(queue_cap)
+                    .build()
+            };
+            let (supervisor, handle) = FragmentSupervisor::spawn(
+                None,
+                FragmentSupervisor,
+                SupervisorArgs::builder()
+                    .fragment(FragmentId(7))
+                    .worker_prefix("builder-maintenance-restart")
+                    .hlc(Arc::new(Mutex::new(HlcClock::new())))
+                    .store(store.clone())
+                    .high_pool(pool(3, 101))
+                    .default_pool(pool(3, 103))
+                    .background_pool(
+                        PoolConfig::builder()
+                            .workers(2)
+                            .queue_cap(107)
+                            .rate_limit_per_sec(7)
+                            .build(),
+                    )
+                    .flush_batch_size(usize::MAX)
+                    .flush_interval(Duration::from_secs(3600))
+                    .clean_interval(Duration::from_millis(17))
+                    .snapshot_interval(Duration::from_millis(11))
+                    .build(),
+            )
+            .await
+            .unwrap();
+            let _stop = StopRestartSupervisor(supervisor.get_cell());
+            let CallResult::Success(dispatcher) = supervisor
+                .call(
+                    |reply| SupervisorMessage::GetDispatcher { reply },
+                    Some(Duration::from_secs(2)),
+                )
+                .await
+                .unwrap()
+            else {
+                panic!("dispatcher lookup failed")
+            };
+            let ordinary = VersionedValue::new(b"retained".to_vec(), 10, "writer".into());
+            let apply = |key: &str, value: VersionedValue| ReplicatedOp {
+                key: key.into(),
+                value,
+                seq: 1,
+                boot_id: 1,
+            };
+            assert_eq!(
+                dispatcher
+                    .call(
+                        |reply| KvMessage::ApplyOp {
+                            op: apply("ordinary", ordinary.clone()),
+                            priority: crate::actor::OpPriority::High,
+                            is_replication: false,
+                            reply: Some(reply)
+                        },
+                        Some(Duration::from_secs(2)),
+                    )
+                    .await
+                    .unwrap(),
+                CallResult::Success(Ok(ApplyOutcome::Applied))
+            );
+
+            // Identify the exact linked actor by its local message type, not a
+            // global name, and join its old task before checking the replacement.
+            let _cleaner =
+                restart_owned_maintenance_child::<CleanerMessage>(&supervisor, "cleaner").await;
+            let _snapshotter =
+                restart_owned_maintenance_child::<SnapshotterMessage>(&supervisor, "snapshotter")
+                    .await;
+            let mut expiring = VersionedValue::new(b"temporary".to_vec(), 20, "writer".into());
+            // Capture after both actors are running so their immediate startup
+            // tick cannot already expire this value. The real wall clock, rather
+            // than paused Tokio time, governs TTL; the store never blocks it.
+            expiring.expires_at_ms = Some(now_ms() + 1000);
+            let floor = expiring.expiry_tombstone();
+            assert_eq!(
+                dispatcher
+                    .call(
+                        |reply| KvMessage::ApplyOp {
+                            op: apply("expiring", expiring.clone()),
+                            priority: crate::actor::OpPriority::High,
+                            is_replication: false,
+                            reply: Some(reply)
+                        },
+                        Some(Duration::from_secs(2)),
+                    )
+                    .await
+                    .unwrap(),
+                CallResult::Success(Ok(ApplyOutcome::Applied))
+            );
+
+            // No manual Sweep/Snap and no write-trigger flush: both replacement
+            // actors must retain their short configured intervals and shared cache
+            // for the exact expiry floor to reach the original store within 5 s.
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if store.entries.lock().unwrap().get(b"expiring".as_slice()) == Some(&floor) {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("replacement maintenance actors lost state or periodic policy");
+            assert_eq!(
+                store.entries.lock().unwrap().get(b"ordinary".as_slice()),
+                Some(&ordinary)
+            );
+            assert_eq!(
+                dispatcher
+                    .call(
+                        |reply| KvMessage::Get {
+                            key: "ordinary".into(),
+                            priority: crate::actor::OpPriority::High,
+                            reply
+                        },
+                        Some(Duration::from_secs(2)),
+                    )
+                    .await
+                    .unwrap(),
+                CallResult::Success(Ok(Some(ordinary)))
+            );
+            assert_eq!(
+                dispatcher
+                    .call(
+                        |reply| KvMessage::Get {
+                            key: "expiring".into(),
+                            priority: crate::actor::OpPriority::High,
+                            reply
+                        },
+                        Some(Duration::from_secs(2)),
+                    )
+                    .await
+                    .unwrap(),
+                CallResult::Success(Ok(None))
+            );
+            let CallResult::Success(health) = supervisor
+                .call(
+                    |reply| SupervisorMessage::GetHealth { reply },
+                    Some(Duration::from_secs(2)),
+                )
+                .await
+                .unwrap()
+            else {
+                panic!("restart health probe failed")
+            };
+            assert_eq!(health.fragment, FragmentId(7));
+            assert_eq!(health.worker_count, 8);
+            for (suffix, expected) in [("high", 3), ("default", 3), ("bg", 2)] {
+                assert_eq!(
+                    health
+                        .worker_names
+                        .iter()
+                        .filter(|name| name.contains(&format!("-{suffix}-worker-")))
+                        .count(),
+                    expected
+                );
+            }
+            assert_eq!(
+                health.restarts,
+                HashMap::from([("cleaner".into(), 1), ("snapshotter".into(), 1)])
+            );
+            assert!(matches!(
+                supervisor
+                    .call(
+                        |reply| SupervisorMessage::Quiesce { reply },
+                        Some(Duration::from_secs(2)),
+                    )
+                    .await
+                    .unwrap(),
+                CallResult::Success(Ok(()))
+            ));
+            assert!(
+                supervisor.get_children().is_empty(),
+                "planned quiesce restarted a child"
+            );
+            supervisor.drain().unwrap();
+            handle.await.unwrap();
+        }
+    }
+    mod health {
+        //! Exact worker ownership and bounded local health evidence.
+
+        use super::*;
+
+        enum HealthDispatcherMode {
+            Reply,
+            DropReply,
+            Block(Arc<tokio::sync::Notify>),
+        }
+
+        struct HealthDispatcher;
+
+        impl Actor for HealthDispatcher {
+            type Msg = KvMessage;
+            type State = HealthDispatcherMode;
+            type Arguments = HealthDispatcherMode;
+
+            async fn pre_start(
+                &self,
+                _myself: ActorRef<Self::Msg>,
+                args: Self::Arguments,
+            ) -> Result<Self::State, ActorProcessingErr> {
+                Ok(args)
+            }
+
+            async fn handle(
+                &self,
+                _myself: ActorRef<Self::Msg>,
+                message: Self::Msg,
+                state: &mut Self::State,
+            ) -> Result<(), ActorProcessingErr> {
+                if let KvMessage::GetShedCounts { reply } = message {
+                    match state {
+                        HealthDispatcherMode::Reply => {}
+                        HealthDispatcherMode::DropReply => return Ok(()),
+                        HealthDispatcherMode::Block(release) => release.notified().await,
+                    }
+                    let _ = reply.send((7, 11, 13));
+                }
+                Ok(())
+            }
+
+            async fn handle_supervisor_evt(
+                &self,
+                _myself: ActorRef<Self::Msg>,
+                _message: SupervisionEvent,
+                _state: &mut Self::State,
+            ) -> Result<(), ActorProcessingErr> {
+                // Keep a stopped child absent; this probe fixture intentionally
+                // does not restart workers or terminate itself on child exit.
+                Ok(())
+            }
+        }
+
+        fn health_args(prefix: &str) -> SupervisorArgs {
+            let pool = PoolConfig {
+                workers: 1,
+                queue_cap: 16,
+                rate_limit_per_sec: None,
+            };
+            SupervisorArgs {
+                fragment: FragmentId(0),
+                worker_prefix: prefix.to_string(),
+                store: None,
+                hlc: Arc::new(Mutex::new(HlcClock::new())),
+                default_pool: pool.clone(),
+                high_pool: pool.clone(),
+                background_pool: pool,
+                flush_batch_size: 100,
+                flush_interval: Duration::from_secs(3600),
+                clean_interval: Duration::from_secs(3600),
+                snapshot_interval: Duration::from_secs(3600),
+                tombstone_gc_age: None,
+                reset_senders: Arc::new(Mutex::new(HashMap::new())),
+            }
+        }
+
+        #[tokio::test]
+        async fn health_counts_only_exact_owned_running_worker_names() {
+            let args = health_args("health-owned-workers");
+            let (dispatcher, _) =
+                HealthDispatcher::spawn(None, HealthDispatcher, HealthDispatcherMode::Reply)
+                    .await
+                    .unwrap();
+            let shared = Arc::new(FragmentState::new(
+                HashMap::new(),
+                None,
+                100,
+                Duration::from_secs(3600),
+            ));
+            let mut children = Vec::new();
+            for suffix in ["high", "default", "bg"] {
+                let worker_args = KvWorkerArgs {
+                    shared: shared.clone(),
+                    pending: None,
+                };
+                let name = Some(format!("{}-{suffix}-worker-0", args.worker_prefix));
+                let (child, _) = if suffix == "default" {
+                    // Same configured name, but not owned by this dispatcher.
+                    KvWorker::spawn(name, KvWorker, worker_args).await.unwrap()
+                } else {
+                    KvWorker::spawn_linked(name, KvWorker, worker_args, dispatcher.get_cell())
+                        .await
+                        .unwrap()
+                };
+                children.push(child);
+            }
+            children[2].stop(None);
+            children[2].wait(None).await.unwrap();
+            let restarts = HashMap::from([("dispatcher".to_string(), 3)]);
+            let health = probe_health(&dispatcher, &args, &restarts, Duration::from_secs(1))
+                .await
+                .unwrap();
+            assert_eq!(health.worker_count, 1);
+            assert_eq!(
+                health.worker_names,
+                vec!["health-owned-workers-high-worker-0"]
+            );
+            assert_eq!(health.shed_counts, (7, 11, 13));
+            assert_eq!(health.restarts, restarts);
+            for child in children {
+                child.stop(None);
+                child.wait(None).await.unwrap();
+            }
+            dispatcher.stop(None);
+            dispatcher.wait(None).await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn health_dispatcher_missing_reply_stopped_and_blocked_are_unavailable() {
+            let args = health_args("health-unavailable");
+            let restarts = HashMap::new();
+            let (missing_reply, _) =
+                HealthDispatcher::spawn(None, HealthDispatcher, HealthDispatcherMode::DropReply)
+                    .await
+                    .unwrap();
+            assert!(
+                probe_health(&missing_reply, &args, &restarts, Duration::from_secs(1))
+                    .await
+                    .is_none()
+            );
+            missing_reply.stop(None);
+            missing_reply.wait(None).await.unwrap();
+            assert!(
+                probe_health(&missing_reply, &args, &restarts, Duration::from_secs(1))
+                    .await
+                    .is_none()
+            );
+
+            let release = Arc::new(tokio::sync::Notify::new());
+            let (blocked, _) = HealthDispatcher::spawn(
+                None,
+                HealthDispatcher,
+                HealthDispatcherMode::Block(release.clone()),
+            )
+            .await
+            .unwrap();
+            assert!(tokio::time::timeout(
+                Duration::from_secs(1),
+                probe_health(&blocked, &args, &restarts, Duration::from_millis(20)),
+            )
+            .await
+            .unwrap()
+            .is_none());
+            release.notify_one();
+            blocked.stop(None);
+            blocked.wait(None).await.unwrap();
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn health_closed_ports_skip_and_blocked_dispatcher_does_not_pin_supervisor() {
+            let store = Arc::new(GatedStore::default());
+            let _release = ReleaseStore(store.clone());
+            let mut args = health_args("health-blocked-real-dispatcher");
+            args.store = Some(store.clone());
+            args.flush_batch_size = 1;
+            let (supervisor, _) = FragmentSupervisor::spawn(None, FragmentSupervisor, args)
+                .await
+                .unwrap();
+            let dispatcher = match supervisor
+                .call(|reply| SupervisorMessage::GetDispatcher { reply }, None)
+                .await
+                .unwrap()
+            {
+                CallResult::Success(dispatcher) => dispatcher,
+                other => panic!("dispatcher lookup failed: {other:?}"),
+            };
+            let (applied, mut apply_result) = tokio::sync::oneshot::channel();
+            dispatcher
+                .send_message(KvMessage::ApplyOp {
+                    op: ReplicatedOp {
+                        key: "blocked".to_string(),
+                        value: VersionedValue::new(b"value".to_vec(), 1, "writer".to_string()),
+                        seq: 1,
+                        boot_id: 1,
+                    },
+                    priority: crate::actor::OpPriority::Default,
+                    is_replication: false,
+                    reply: Some(applied.into()),
+                })
+                .unwrap();
+            crate::common_test::periodic_async_check(
+                || async { store.entered.load(Ordering::SeqCst) },
+                Duration::from_secs(2),
+            )
+            .await;
+            let (flushed, flush_result) = tokio::sync::oneshot::channel();
+            dispatcher
+                .send_message(KvMessage::Flush {
+                    reply: flushed.into(),
+                })
+                .unwrap();
+
+            // The dispatcher is held behind the store fence. Abandoned health
+            // requests must not start an unnecessary five-second nested probe.
+            let (abandoned, receiver) = tokio::sync::oneshot::channel();
+            drop(receiver);
+            supervisor
+                .send_message(SupervisorMessage::GetHealth {
+                    reply: abandoned.into(),
+                })
+                .unwrap();
+            assert!(matches!(
+                supervisor
+                    .call(
+                        |reply| SupervisorMessage::GetDispatcher { reply },
+                        Some(Duration::from_millis(200)),
+                    )
+                    .await
+                    .unwrap(),
+                CallResult::Success(_)
+            ));
+            assert!(matches!(
+                supervisor
+                    .call(
+                        |reply| SupervisorMessage::GetHealth { reply },
+                        Some(Duration::from_millis(20)),
+                    )
+                    .await
+                    .unwrap(),
+                CallResult::Timeout | CallResult::SenderError
+            ));
+            // Inner health timeout uses the caller's budget; the supervisor can
+            // answer again while the actual dispatcher/store is still blocked.
+            assert!(matches!(
+                supervisor
+                    .call(
+                        |reply| SupervisorMessage::GetDispatcher { reply },
+                        Some(Duration::from_millis(200)),
+                    )
+                    .await
+                    .unwrap(),
+                CallResult::Success(_)
+            ));
+            assert!(matches!(
+                apply_result.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            ));
+            store.release();
+            assert_eq!(apply_result.await.unwrap().unwrap(), ApplyOutcome::Applied);
+            assert!(flush_result.await.unwrap().is_ok());
+            match supervisor
+                .call(|reply| SupervisorMessage::Quiesce { reply }, None)
+                .await
+                .unwrap()
+            {
+                CallResult::Success(Ok(())) => {}
+                other => panic!("quiesce failed: {other:?}"),
+            }
+            supervisor.stop(None);
+            supervisor.wait(None).await.unwrap();
+        }
+    }
+    mod lifecycle {
+        //! Startup rollback and authoritative post-quiescence flush ordering.
+
+        use super::*;
+
+        struct DropSignalStore(Option<std::sync::mpsc::Sender<()>>);
+
+        impl KvStore for DropSignalStore {
+            fn load(&self) -> Result<Vec<(Vec<u8>, VersionedValue)>, StoreError> {
+                Ok(Vec::new())
+            }
+
+            fn write_batch(&self, _writes: &[(Vec<u8>, VersionedValue)]) -> Result<(), StoreError> {
+                Ok(())
+            }
+        }
+
+        impl Drop for DropSignalStore {
+            fn drop(&mut self) {
+                if let Some(dropped) = self.0.take() {
+                    let _ = dropped.send(());
+                }
+            }
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn automatic_cleaner_stops_pages_on_drain_but_final_quiesce_sweeps_all() {
+            let store = Arc::new(GatedStore::default());
+            let _release = ReleaseMaintenanceStore(store.clone());
+            let values = (0..600)
+                .map(|i| {
+                    let mut value = VersionedValue::new(vec![1], 10, "writer".into());
+                    value.expires_at_ms = Some(1);
+                    (format!("k{i:04}"), value)
+                })
+                .collect();
+            let shared = Arc::new(FragmentState::new(
+                values,
+                Some(store.clone()),
+                1,
+                Duration::from_secs(3600),
+            ));
+            let pool = PoolConfig {
+                workers: 1,
+                queue_cap: 16,
+                rate_limit_per_sec: None,
+            };
+            let args = SupervisorArgs {
+                fragment: FragmentId(0),
+                worker_prefix: "paged-final-quiesce".into(),
+                store: Some(store.clone()),
+                hlc: Arc::new(Mutex::new(HlcClock::new())),
+                default_pool: pool.clone(),
+                high_pool: pool.clone(),
+                background_pool: pool.clone(),
+                flush_batch_size: 1,
+                flush_interval: Duration::from_secs(3600),
+                clean_interval: Duration::from_millis(2),
+                snapshot_interval: Duration::from_secs(3600),
+                tombstone_gc_age: None,
+                reset_senders: Arc::new(Mutex::new(HashMap::new())),
+            };
+            let (dispatcher, _) = KvActor::spawn(
+                None,
+                KvActor,
+                KvArgs {
+                    shared: shared.clone(),
+                    fragment: args.fragment,
+                    worker_prefix: args.worker_prefix.clone(),
+                    default_pool: pool.clone(),
+                    high_pool: pool.clone(),
+                    background_pool: pool,
+                },
+            )
+            .await
+            .unwrap();
+            let (cleaner, _) = Cleaner::spawn(
+                None,
+                Cleaner,
+                CleanerArgs {
+                    fragment: args.fragment,
+                    shared: shared.clone(),
+                    interval: args.clean_interval,
+                    tombstone_gc_age: None,
+                    reset_senders: args.reset_senders.clone(),
+                },
+            )
+            .await
+            .unwrap();
+            let (snapshotter, _) = Snapshotter::spawn(
+                None,
+                Snapshotter,
+                SnapshotterArgs {
+                    shared: shared.clone(),
+                    interval: args.snapshot_interval,
+                },
+            )
+            .await
+            .unwrap();
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while !store.entered.load(Ordering::SeqCst) {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            // Do not depend on the timer driver while a synchronous store blocks
+            // a Tokio worker. Coalesced repeated ticks are proven separately with
+            // a paused-clock async gate; this gate proves drain and final fencing.
+            cleaner.drain().unwrap();
+            store.release();
+            tokio::time::timeout(Duration::from_secs(2), cleaner.wait(None))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                store.entries.lock().unwrap().len(),
+                256,
+                "drain admitted another automatic page"
+            );
+            let mut state = SupervisorState {
+                fragment: args.fragment,
+                dispatcher,
+                cleaner,
+                snapshotter,
+                shared,
+                args,
+                restarts: HashMap::new(),
+                lifecycle: SupervisorLifecycle::Running,
+            };
+            state.quiesce().await.unwrap();
+            let entries = store.entries.lock().unwrap();
+            assert_eq!(entries.len(), 600);
+            assert!(entries.values().all(|value| value.is_tombstone
+                && value.timestamp_ms == 10
+                && value.expires_at_ms == Some(1)));
+            assert!(state.restarts.is_empty());
+        }
+
+        #[test]
+        fn fragment_shutdown_errors_identify_the_failed_phase() {
+            assert_eq!(
+                FragmentShutdownError::Actor("worker stopped".to_string()).to_string(),
+                "actor drain failed: worker stopped"
+            );
+            assert_eq!(
+                FragmentShutdownError::Storage("disk full".to_string()).to_string(),
+                "final persistence flush failed: disk full"
+            );
+        }
+
+        #[tokio::test]
+        async fn failed_supervisor_start_joins_partial_worker_tree() {
+            let shared = Arc::new(FragmentState::new(
+                HashMap::new(),
+                None,
+                100,
+                Duration::from_secs(3600),
+            ));
+            let collision_name = "failed-supervisor-default-worker-0".to_string();
+            let (collision, _handle) = KvWorker::spawn(
+                Some(collision_name.clone()),
+                KvWorker,
+                KvWorkerArgs {
+                    shared,
+                    pending: None,
+                },
+            )
+            .await
+            .unwrap();
+            let pool = PoolConfig {
+                workers: 1,
+                queue_cap: 16,
+                rate_limit_per_sec: None,
+            };
+
+            let result = FragmentSupervisor::spawn(
+                None,
+                FragmentSupervisor,
+                SupervisorArgs {
+                    fragment: FragmentId(0),
+                    worker_prefix: "failed-supervisor".to_string(),
+                    store: None,
+                    hlc: Arc::new(Mutex::new(HlcClock::new())),
+                    default_pool: pool.clone(),
+                    high_pool: pool.clone(),
+                    background_pool: pool,
+                    flush_batch_size: 100,
+                    flush_interval: Duration::from_secs(3600),
+                    clean_interval: Duration::from_secs(3600),
+                    snapshot_interval: Duration::from_secs(3600),
+                    tombstone_gc_age: None,
+                    reset_senders: Arc::new(Mutex::new(HashMap::new())),
+                },
+            )
+            .await;
+
+            assert!(result.is_err());
+            assert!(
+                where_is("failed-supervisor-high-worker-0").is_none(),
+                "failed dispatcher startup left an earlier worker running"
+            );
+            assert_eq!(
+                where_is(collision_name).map(|cell| cell.get_id()),
+                Some(collision.get_id()),
+                "startup rollback stopped an actor it did not own"
+            );
+            collision.stop(None);
+            let _ = collision.wait(None).await;
+        }
+
+        #[tokio::test]
+        async fn failed_snapshotter_start_joins_completed_supervisor_children() {
+            let (store_dropped, store_drop) = std::sync::mpsc::channel();
+            let pool = PoolConfig {
+                workers: 1,
+                queue_cap: 16,
+                rate_limit_per_sec: None,
+            };
+            let result = FragmentSupervisor::spawn(
+                None,
+                FragmentSupervisor,
+                SupervisorArgs {
+                    fragment: FragmentId(0),
+                    worker_prefix: "failed-snapshotter".to_string(),
+                    store: Some(Arc::new(DropSignalStore(Some(store_dropped)))),
+                    hlc: Arc::new(Mutex::new(HlcClock::new())),
+                    default_pool: pool.clone(),
+                    high_pool: pool.clone(),
+                    background_pool: pool,
+                    flush_batch_size: 100,
+                    flush_interval: Duration::from_secs(3600),
+                    clean_interval: Duration::from_secs(3600),
+                    snapshot_interval: Duration::ZERO,
+                    tombstone_gc_age: None,
+                    reset_senders: Arc::new(Mutex::new(HashMap::new())),
+                },
+            )
+            .await;
+
+            assert!(result.is_err());
+            assert!(
+                store_drop.try_recv().is_ok(),
+                "supervisor startup returned before completed children released their shared store"
+            );
+            for pool_name in ["high", "default", "bg"] {
+                assert!(
+                    where_is(format!("failed-snapshotter-{pool_name}-worker-0")).is_none(),
+                    "failed supervisor startup left {pool_name} worker registered"
+                );
+            }
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn quiesce_drains_preaccepted_worker_messages_before_flushing() {
+            let store = Arc::new(GatedStore::default());
+            let _release = ReleaseStore(store.clone());
+            let pool = PoolConfig {
+                workers: 1,
+                queue_cap: 16,
+                rate_limit_per_sec: None,
+            };
+            let (supervisor, _handle) = FragmentSupervisor::spawn(
+                None,
+                FragmentSupervisor,
+                SupervisorArgs {
+                    fragment: FragmentId(0),
+                    worker_prefix: "quiesce-drain-test".to_string(),
+                    store: Some(store.clone()),
+                    hlc: Arc::new(Mutex::new(HlcClock::new())),
+                    default_pool: pool.clone(),
+                    high_pool: pool.clone(),
+                    background_pool: pool,
+                    flush_batch_size: 1,
+                    flush_interval: Duration::from_secs(3600),
+                    clean_interval: Duration::from_secs(3600),
+                    snapshot_interval: Duration::from_secs(3600),
+                    tombstone_gc_age: None,
+                    reset_senders: Arc::new(Mutex::new(HashMap::new())),
+                },
+            )
+            .await
+            .unwrap();
+            let dispatcher = match supervisor
+                .call(|reply| SupervisorMessage::GetDispatcher { reply }, None)
+                .await
+                .unwrap()
+            {
+                CallResult::Success(dispatcher) => dispatcher,
+                other => panic!("dispatcher lookup failed: {other:?}"),
+            };
+            let health = match supervisor
+                .call(|reply| SupervisorMessage::GetHealth { reply }, None)
+                .await
+                .unwrap()
+            {
+                CallResult::Success(health) => health,
+                other => panic!("running health failed: {other:?}"),
+            };
+            assert_eq!(health.worker_count, 3);
+            assert!(health.restarts.is_empty());
+
+            let (first_tx, first_rx) = tokio::sync::oneshot::channel();
+            dispatcher
+                .send_message(KvMessage::ApplyOp {
+                    op: ReplicatedOp {
+                        key: "same-key".to_string(),
+                        value: VersionedValue::new(b"first".to_vec(), 1, "test".to_string()),
+                        seq: 1,
+                        boot_id: 1,
+                    },
+                    priority: crate::actor::OpPriority::Default,
+                    is_replication: false,
+                    reply: Some(first_tx.into()),
+                })
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while !store.entered.load(Ordering::SeqCst) {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+
+            let (second_tx, second_rx) = tokio::sync::oneshot::channel();
+            dispatcher
+                .send_message(KvMessage::ApplyOp {
+                    op: ReplicatedOp {
+                        key: "same-key".to_string(),
+                        value: VersionedValue::new(b"second".to_vec(), 2, "test".to_string()),
+                        seq: 2,
+                        boot_id: 1,
+                    },
+                    priority: crate::actor::OpPriority::Default,
+                    is_replication: false,
+                    reply: Some(second_tx.into()),
+                })
+                .unwrap();
+
+            let quiesce_supervisor = supervisor.clone();
+            let quiesce = tokio::spawn(async move {
+                quiesce_supervisor
+                    .call(|reply| SupervisorMessage::Quiesce { reply }, None)
+                    .await
+            });
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            assert!(
+                !quiesce.is_finished(),
+                "quiesce skipped blocked worker work"
+            );
+
+            store.release();
+            assert_eq!(first_rx.await.unwrap().unwrap(), ApplyOutcome::Applied);
+            assert_eq!(second_rx.await.unwrap().unwrap(), ApplyOutcome::Applied);
+            match quiesce.await.unwrap().unwrap() {
+                CallResult::Success(Ok(())) => {}
+                other => panic!("quiesce failed: {other:?}"),
+            }
+            let health = supervisor
+                .call(|reply| SupervisorMessage::GetHealth { reply }, None)
+                .await
+                .unwrap();
+            assert!(matches!(health, CallResult::SenderError));
+            let stopped_dispatcher = match supervisor
+                .call(|reply| SupervisorMessage::GetDispatcher { reply }, None)
+                .await
+                .unwrap()
+            {
+                CallResult::Success(dispatcher) => dispatcher,
+                other => panic!("post-quiesce dispatcher lookup failed: {other:?}"),
+            };
+            assert_eq!(stopped_dispatcher.get_id(), dispatcher.get_id());
+            assert_eq!(stopped_dispatcher.get_status(), ActorStatus::Stopped);
+            assert!(stopped_dispatcher.get_children().is_empty());
+            assert_eq!(
+                store
+                    .entries
+                    .lock()
+                    .unwrap()
+                    .get(b"same-key".as_slice())
+                    .map(|value| value.value.clone()),
+                Some(b"second".to_vec())
+            );
+
+            supervisor.stop(None);
+            supervisor.wait(None).await.unwrap();
+        }
+    }
+}

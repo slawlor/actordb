@@ -2,6 +2,11 @@
 
 Three layers, each catching what the others can't.
 
+Unit tests use inline `#[cfg(test)]` modules in their owning source files,
+including grouped private-state regressions and small shared actor fixtures.
+Integration tests stay in `actordb/tests` to exercise public imports/builders
+and real-node behavior from outside the library.
+
 The separate `Verify release package` workflow check additionally verifies
 unpacked crates.io packages for backend-free defaults and opted-in storage
 features, and runs stdlib release-guard regressions. PR and `main` runs have no

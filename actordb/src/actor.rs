@@ -67,6 +67,84 @@ pub(crate) use fragment_supervisor::{
 };
 
 #[cfg(test)]
-mod maintenance_test_support;
+mod maintenance_test_support {
+    //! Test-only synchronous store gates shared by the owning actor regressions.
+
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Condvar, Mutex as StdMutex};
+
+    use crate::actor::VersionedValue;
+    use crate::store::{KvStore, StoreError};
+
+    #[derive(Default)]
+    pub(super) struct GatedStore {
+        pub(super) entered: AtomicBool,
+        release: (StdMutex<bool>, Condvar),
+        pub(super) entries: StdMutex<HashMap<Vec<u8>, VersionedValue>>,
+    }
+
+    impl GatedStore {
+        pub(super) fn release(&self) {
+            *self.release.0.lock().unwrap() = true;
+            self.release.1.notify_all();
+        }
+    }
+
+    pub(super) struct ReleaseStore(pub(super) Arc<GatedStore>);
+
+    impl Drop for ReleaseStore {
+        fn drop(&mut self) {
+            self.0.release();
+        }
+    }
+
+    impl KvStore for GatedStore {
+        fn load(&self) -> Result<Vec<(Vec<u8>, VersionedValue)>, StoreError> {
+            Ok(Vec::new())
+        }
+
+        fn write_batch(&self, writes: &[(Vec<u8>, VersionedValue)]) -> Result<(), StoreError> {
+            self.entered.store(true, Ordering::SeqCst);
+            let mut released = self.release.0.lock().unwrap();
+            while !*released {
+                released = self.release.1.wait(released).unwrap();
+            }
+            drop(released);
+            let mut entries = self.entries.lock().unwrap();
+            for (key, value) in writes {
+                entries.insert(key.clone(), value.clone());
+            }
+            Ok(())
+        }
+    }
+
+    pub(super) struct ReleaseMaintenanceStore(pub(super) Arc<GatedStore>);
+
+    impl Drop for ReleaseMaintenanceStore {
+        fn drop(&mut self) {
+            self.0.release();
+        }
+    }
+}
 #[cfg(test)]
-mod test_support;
+mod test_support {
+    //! Small fixtures shared by actor-owned tests.
+
+    use std::collections::HashMap;
+    use std::time::Duration;
+
+    use super::{FragmentState, ReplicatedOp, VersionedValue};
+    pub(super) fn test_state(cache: HashMap<String, VersionedValue>) -> FragmentState {
+        FragmentState::new(cache, None, 100, Duration::from_secs(3600))
+    }
+
+    pub(super) fn test_op(key: &str, value: VersionedValue) -> ReplicatedOp {
+        ReplicatedOp {
+            key: key.to_string(),
+            value,
+            seq: 0,
+            boot_id: 0,
+        }
+    }
+}

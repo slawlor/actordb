@@ -16,6 +16,10 @@ We actively welcome your pull requests!
 3. If you've changed APIs, update the documentation.
 4. Ensure the test suite passes.
 
+Keep unit tests in an inline `#[cfg(test)] mod tests` in the owning source file.
+Use separate files under `tests/` for integration tests exercising the crate's
+public API; do not expose production internals just to test them.
+
 Release maintainers should follow the [release procedure](docs/releases.md).
 The library workspace does not track `Cargo.lock`. Keep dependency requirements
 as compatible semver ranges; generated local lockfiles remain ignored. Run
