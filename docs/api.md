@@ -206,6 +206,19 @@ let v: Option<actordb::actor::VersionedValue> = node.get("user:42".to_string()).
 
 `VersionedValue` carries `value: Vec<u8>`, `timestamp_ms: u64` (HLC),
 `node_id: String`, `expires_at_ms: Option<u64>`, and `is_tombstone: bool`.
+
+TTL expiry is anchored to the originating node's wall clock before waiting
+for sequence/HLC state or routing the write. Forwarding preserves that exact
+deadline; an HLC timestamp ahead of wall time does not extend it. Durations
+are truncated to whole milliseconds: `None` means no expiry, while zero or
+a positive sub-millisecond TTL sets the deadline to the captured origin wall
+time. The serving node returns an expired apply outcome if its own wall clock
+has reached that deadline; a slower clock can delay expiry there.
+An unrepresentable duration or absolute deadline returns
+`NodeError::Codec` before consuming a sequence/HLC stamp or applying a write.
+Expiry must fit a nonzero `u64` because zero encodes absent expiry. TTL relies
+on nodes' wall clocks, not a lease or a guarantee against clock adjustments.
+
 Every mutation is preflighted against all required single-record wire
 envelopes before local apply. A key/value that cannot fit the 16 MiB hard frame
 limit returns `NodeError::Codec` rather than creating unreplicable local state.

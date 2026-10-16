@@ -37,6 +37,12 @@ guaranteed.
 
 ## Unit tests (`cargo test --lib`)
 
+TTL tests cover millisecond truncation, exact `u64` boundaries, overflow and
+large-duration rejection before sequence/HLC locks or storage/forwarding.
+Real-node tests pin absent and immediate expiry, wall-clock deadlines under
+a future-seeded HLC for local and forwarded writes, preserved expiry/version
+provenance on restart, and time spent waiting for the originating clock.
+
 Fast, in-process tests of the building blocks: `FragmentState` apply/LWW
 merge semantics, `VersionedValue::wins_over` ordering (including the
 tombstone-wins-ties rule), `HlcClock` tick/observe monotonicity, worker-pool

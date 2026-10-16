@@ -32,6 +32,10 @@ durability or one-time legacy-manifest adoption policy.
 
 `clock_skew_ms` exists but is `#[doc(hidden)]` — it is a test-only HLC skew
 simulator, not a tuning knob.
+`max_clock_skew` constrains version timestamps, not TTL duration: TTL deadlines
+use the originating node's wall clock independently of its HLC. See the
+[single-key API contract](api.md#single-key-operations) for TTL precision and
+checked-deadline errors.
 
 `fragment_count`, `replication.batch_size`, `replication.max_in_flight`, and
 `replication.buffer_capacity` must be nonzero. Replication and
