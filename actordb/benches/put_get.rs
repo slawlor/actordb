@@ -28,7 +28,7 @@
 //! * A size-proportional regression (100 B fine, 1 MB bad) points at
 //!   per-byte copies in cache reads/insertion or protocol encoding.
 //!
-//! The node uses `NodeConfig::default()` (in-memory, default worker pools,
+//! The node uses `NodeConfig::builder().build()` (in-memory, default worker pools,
 //! no persistence). Nothing here touches the network or RocksDB.
 
 use std::hint::black_box;
@@ -51,7 +51,7 @@ fn runtime() -> tokio::runtime::Runtime {
 
 fn bench_put_get(c: &mut Criterion) {
     let rt = runtime();
-    let config = NodeConfig::default();
+    let config = NodeConfig::builder().build();
     let fragment_count = config.fragment_count;
     let default_workers = config.default_pool.workers.max(1);
     let node = rt.block_on(async {

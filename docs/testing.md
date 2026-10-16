@@ -374,6 +374,15 @@ re-establishment.
 
 ## Running them
 
+Configuration-builder regressions exercise omitted-default parity, explicit
+overrides, optional setters, and independently allocated legacy reset maps.
+Compile-fail rustdoc examples cover missing required dependencies and the
+absence of public setters for private sender hooks. Examples, benchmarks, and
+the Docker role executable use the same generated builders; their normal
+all-target compilation checks setter names and feature-gated RocksDB usage.
+Runtime validation regressions remain separate: successful `build()` does not
+prove that startup/spawn will accept a configuration.
+
 ```bash
 cargo test -p actordb            # unit + integration
 cargo run --bin xtask -- coverage # coverage report (CI enforces it)

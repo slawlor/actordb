@@ -47,6 +47,28 @@ The background pool is rate-limited by default: bulk APIs (`put_multi`,
 `get_multi`) can't exceed 1000 ops/s even when idle
 capacity exists elsewhere.
 
+To override a pool, use a nested Bon builder:
+
+```rust
+use actordb::actor::PoolConfig;
+use actordb::node::NodeConfig;
+
+let config = NodeConfig::builder()
+    .background_pool(PoolConfig::builder()
+        .workers(2)
+        .queue_cap(8_000)
+        .rate_limit_per_sec(1000)
+        .build())
+    .build();
+```
+
+The nested builder replaces the whole profile. Its standalone defaults are
+four workers, cap 10,000, and no limit, so preserve the Background rate
+explicitly when replacing that pool. `.maybe_rate_limit_per_sec(None)` is an
+intentional unlimited setting, not an instruction to inherit the Node profile.
+Omitting `background_pool` keeps the original profile unchanged. See
+[Configuration builders](configuration.md#configuration-builders).
+
 ## Admission and shedding
 
 The dispatcher's internal pool reservation checks the token bucket first, then

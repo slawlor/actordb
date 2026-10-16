@@ -123,11 +123,14 @@ impl std::fmt::Display for FragmentStartupStorageError {
 impl std::error::Error for FragmentStartupStorageError {}
 
 /// Arguments to spawn a [`FragmentSupervisor`].
-#[derive(Clone)]
+/// The fragment, worker prefix and Node-wide HLC remain required. Omitted
+/// tuning settings match [`crate::node::NodeConfig`] defaults.
+#[derive(Clone, bon::Builder)]
 pub struct SupervisorArgs {
     /// Which fragment this supervisor owns.
     pub fragment: FragmentId,
     /// Prefix for worker actor names (unique per supervisor).
+    #[builder(into)]
     pub worker_prefix: String,
     /// Durable storage behind the cache. `None` = purely in-memory.
     pub store: Option<Arc<dyn KvStore>>,
@@ -135,24 +138,37 @@ pub struct SupervisorArgs {
     /// fragment before that fragment starts serving writes.
     pub hlc: Arc<Mutex<HlcClock>>,
     /// Worker pool configs by priority.
+    #[builder(default = PoolConfig::default())]
     pub default_pool: PoolConfig,
+    #[builder(default = PoolConfig::high_priority_defaults())]
     pub high_pool: PoolConfig,
+    #[builder(default = PoolConfig::background_defaults())]
     pub background_pool: PoolConfig,
     /// Flush the write buffer after this many buffered ops.
+    #[builder(default = DEFAULT_FLUSH_BATCH_SIZE)]
     pub flush_batch_size: usize,
     /// A new write triggers a flush after this long, even if not full.
     /// The snapshotter separately flushes idle fragments.
+    #[builder(default = DEFAULT_FLUSH_INTERVAL)]
     pub flush_interval: Duration,
     /// How often the cleaner sweeps for expired keys.
+    #[builder(default = DEFAULT_CLEAN_INTERVAL)]
     pub clean_interval: Duration,
     /// How often the snapshotter flushes to the store.
+    #[builder(default = DEFAULT_SNAPSHOT_INTERVAL)]
     pub snapshot_interval: Duration,
     /// Legacy compatibility field. Ignored; node startup rejects `Some`.
     pub tombstone_gc_age: Option<Duration>,
     /// Legacy compatibility field. The removed collector no longer consults
     /// replication reset state.
+    #[builder(default = Arc::new(Mutex::new(HashMap::new())))]
     pub reset_senders: Arc<Mutex<HashMap<(FragmentId, String), u64>>>,
 }
+
+pub(crate) const DEFAULT_FLUSH_BATCH_SIZE: usize = 1000;
+pub(crate) const DEFAULT_FLUSH_INTERVAL: Duration = Duration::from_millis(100);
+pub(crate) const DEFAULT_CLEAN_INTERVAL: Duration = Duration::from_secs(30);
+pub(crate) const DEFAULT_SNAPSHOT_INTERVAL: Duration = Duration::from_secs(60);
 
 /// The per-fragment supervisor: owns the dispatcher, cleaner and
 /// snapshotter, restarts dead children in place, and reports health.
@@ -391,14 +407,14 @@ impl FragmentSupervisor {
         let (dispatcher, _h) = KvActor::spawn_linked(
             None,
             KvActor,
-            KvArgs {
-                shared: shared.clone(),
-                fragment: args.fragment,
-                worker_prefix: args.worker_prefix.clone(),
-                default_pool: args.default_pool.clone(),
-                high_pool: args.high_pool.clone(),
-                background_pool: args.background_pool.clone(),
-            },
+            KvArgs::builder()
+                .shared(shared.clone())
+                .fragment(args.fragment)
+                .worker_prefix(args.worker_prefix.clone())
+                .default_pool(args.default_pool.clone())
+                .high_pool(args.high_pool.clone())
+                .background_pool(args.background_pool.clone())
+                .build(),
             cell.clone(),
         )
         .await
@@ -408,13 +424,13 @@ impl FragmentSupervisor {
         let (cleaner, _h) = Cleaner::spawn_linked(
             None,
             Cleaner,
-            CleanerArgs {
-                fragment: args.fragment,
-                shared: shared.clone(),
-                interval: args.clean_interval,
-                tombstone_gc_age: args.tombstone_gc_age,
-                reset_senders: args.reset_senders.clone(),
-            },
+            CleanerArgs::builder()
+                .fragment(args.fragment)
+                .shared(shared.clone())
+                .interval(args.clean_interval)
+                .maybe_tombstone_gc_age(args.tombstone_gc_age)
+                .reset_senders(args.reset_senders.clone())
+                .build(),
             cell.clone(),
         )
         .await
@@ -424,10 +440,10 @@ impl FragmentSupervisor {
         let (snapshotter, _h) = Snapshotter::spawn_linked(
             None,
             Snapshotter,
-            SnapshotterArgs {
-                shared: shared.clone(),
-                interval: args.snapshot_interval,
-            },
+            SnapshotterArgs::builder()
+                .shared(shared.clone())
+                .interval(args.snapshot_interval)
+                .build(),
             cell,
         )
         .await
@@ -548,14 +564,14 @@ impl Actor for FragmentSupervisor {
                 let (dispatcher, _h) = KvActor::spawn_linked(
                     None,
                     KvActor,
-                    KvArgs {
-                        shared: state.shared.clone(),
-                        fragment: state.fragment,
-                        worker_prefix: state.args.worker_prefix.clone(),
-                        default_pool: state.args.default_pool.clone(),
-                        high_pool: state.args.high_pool.clone(),
-                        background_pool: state.args.background_pool.clone(),
-                    },
+                    KvArgs::builder()
+                        .shared(state.shared.clone())
+                        .fragment(state.fragment)
+                        .worker_prefix(state.args.worker_prefix.clone())
+                        .default_pool(state.args.default_pool.clone())
+                        .high_pool(state.args.high_pool.clone())
+                        .background_pool(state.args.background_pool.clone())
+                        .build(),
                     myself_cell,
                 )
                 .await
@@ -566,13 +582,13 @@ impl Actor for FragmentSupervisor {
                 let (cleaner, _h) = Cleaner::spawn_linked(
                     None,
                     Cleaner,
-                    CleanerArgs {
-                        fragment: state.args.fragment,
-                        shared: state.shared.clone(),
-                        interval: state.args.clean_interval,
-                        tombstone_gc_age: state.args.tombstone_gc_age,
-                        reset_senders: state.args.reset_senders.clone(),
-                    },
+                    CleanerArgs::builder()
+                        .fragment(state.args.fragment)
+                        .shared(state.shared.clone())
+                        .interval(state.args.clean_interval)
+                        .maybe_tombstone_gc_age(state.args.tombstone_gc_age)
+                        .reset_senders(state.args.reset_senders.clone())
+                        .build(),
                     myself_cell,
                 )
                 .await
@@ -583,10 +599,10 @@ impl Actor for FragmentSupervisor {
                 let (snapshotter, _h) = Snapshotter::spawn_linked(
                     None,
                     Snapshotter,
-                    SnapshotterArgs {
-                        shared: state.shared.clone(),
-                        interval: state.args.snapshot_interval,
-                    },
+                    SnapshotterArgs::builder()
+                        .shared(state.shared.clone())
+                        .interval(state.args.snapshot_interval)
+                        .build(),
                     myself_cell,
                 )
                 .await
@@ -632,16 +648,20 @@ impl Drop for MaintenanceTrigger {
 /// version floor prevents older replicas from resurrecting them.
 pub struct Cleaner;
 
-#[derive(Clone)]
+/// The fragment and shared state are required; the default sweep interval is
+/// 30 seconds. Legacy compatibility fields may be omitted.
+#[derive(Clone, bon::Builder)]
 pub struct CleanerArgs {
     /// Legacy compatibility field. The cleaner no longer uses fragment ids.
     pub fragment: FragmentId,
     pub shared: Arc<FragmentState>,
+    #[builder(default = DEFAULT_CLEAN_INTERVAL)]
     pub interval: Duration,
     /// Legacy compatibility field. Ignored; tombstones are retained.
     pub tombstone_gc_age: Option<Duration>,
     /// Legacy compatibility field. Ignored because time-based collection was
     /// removed rather than guarded by transient sender state.
+    #[builder(default = Arc::new(Mutex::new(HashMap::new())))]
     pub reset_senders: Arc<Mutex<HashMap<(FragmentId, String), u64>>>,
 }
 
@@ -800,9 +820,11 @@ pub enum SnapshotterMessage {
 /// writes that never fills the batch.
 pub struct Snapshotter;
 
-#[derive(Clone)]
+/// Shared state is required; the default periodic flush interval is 60 seconds.
+#[derive(Clone, bon::Builder)]
 pub struct SnapshotterArgs {
     pub shared: Arc<FragmentState>,
+    #[builder(default = DEFAULT_SNAPSHOT_INTERVAL)]
     pub interval: Duration,
 }
 
@@ -866,6 +888,193 @@ mod tests {
     use ractor::registry::where_is;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Condvar, Mutex as StdMutex};
+
+    #[tokio::test]
+    async fn supervision_builders_omit_settings_without_inventing_shared_dependencies() {
+        let hlc = Arc::new(Mutex::new(HlcClock::new()));
+        let make = || {
+            SupervisorArgs::builder()
+                .fragment(FragmentId(7))
+                .worker_prefix("builder-supervisor")
+                .hlc(hlc.clone())
+                .build()
+        };
+        let args = make();
+        let other = make();
+        let defaults = crate::node::NodeConfig::default();
+        assert!(Arc::ptr_eq(&args.hlc, &hlc));
+        assert_eq!(args.fragment, FragmentId(7));
+        assert_eq!(args.worker_prefix, "builder-supervisor");
+        assert!(args.store.is_none());
+        assert!(args.tombstone_gc_age.is_none());
+        assert_eq!(args.flush_batch_size, defaults.flush_batch_size);
+        assert_eq!(args.flush_interval, defaults.flush_interval);
+        assert_eq!(args.clean_interval, defaults.clean_interval);
+        assert_eq!(args.snapshot_interval, defaults.snapshot_interval);
+        for (actual, expected) in [
+            (&args.high_pool, &defaults.high_pool),
+            (&args.default_pool, &defaults.default_pool),
+            (&args.background_pool, &defaults.background_pool),
+        ] {
+            assert_eq!(
+                (actual.workers, actual.queue_cap, actual.rate_limit_per_sec),
+                (
+                    expected.workers,
+                    expected.queue_cap,
+                    expected.rate_limit_per_sec
+                )
+            );
+        }
+        assert!(!Arc::ptr_eq(&args.reset_senders, &other.reset_senders));
+        args.reset_senders
+            .lock()
+            .await
+            .insert((FragmentId(7), "peer".into()), 1);
+        assert!(other.reset_senders.lock().await.is_empty());
+
+        let shared = Arc::new(FragmentState::new(
+            HashMap::new(),
+            None,
+            1000,
+            Duration::from_millis(100),
+        ));
+        let make_cleaner = || {
+            CleanerArgs::builder()
+                .fragment(FragmentId(7))
+                .shared(shared.clone())
+                .build()
+        };
+        let cleaner = make_cleaner();
+        assert!(Arc::ptr_eq(&cleaner.shared, &shared));
+        assert_eq!(cleaner.fragment, FragmentId(7));
+        assert_eq!(cleaner.interval, defaults.clean_interval);
+        assert!(cleaner.tombstone_gc_age.is_none());
+        assert!(!Arc::ptr_eq(
+            &cleaner.reset_senders,
+            &make_cleaner().reset_senders
+        ));
+        assert!(!Arc::ptr_eq(&cleaner.reset_senders, &args.reset_senders));
+        let snapshotter = SnapshotterArgs::builder().shared(shared.clone()).build();
+        assert!(Arc::ptr_eq(&snapshotter.shared, &shared));
+        assert_eq!(snapshotter.interval, defaults.snapshot_interval);
+    }
+
+    #[tokio::test]
+    async fn supervision_builders_preserve_explicit_settings_and_legacy_overrides() {
+        let hlc = Arc::new(Mutex::new(HlcClock::new()));
+        let store: Arc<dyn KvStore> = Arc::new(GatedStore::default());
+        let resets = Arc::new(Mutex::new(HashMap::from([(
+            (FragmentId(8), "peer".into()),
+            9,
+        )])));
+        let custom_pool = || {
+            PoolConfig::builder()
+                .workers(1)
+                .queue_cap(3)
+                .rate_limit_per_sec(5)
+                .build()
+        };
+        let legacy_age = Duration::from_secs(6);
+        let args = SupervisorArgs::builder()
+            .fragment(FragmentId(8))
+            .worker_prefix(String::from("builder-overrides"))
+            .hlc(hlc.clone())
+            .store(store.clone())
+            .high_pool(custom_pool())
+            .default_pool(custom_pool())
+            .background_pool(custom_pool())
+            .flush_batch_size(7)
+            .flush_interval(Duration::from_millis(8))
+            .clean_interval(Duration::from_secs(9))
+            .snapshot_interval(Duration::from_secs(10))
+            .tombstone_gc_age(legacy_age)
+            .reset_senders(resets.clone())
+            .build();
+        assert!(Arc::ptr_eq(args.store.as_ref().unwrap(), &store));
+        assert!(Arc::ptr_eq(&args.hlc, &hlc));
+        assert!(Arc::ptr_eq(&args.reset_senders, &resets));
+        assert_eq!(args.tombstone_gc_age, Some(legacy_age));
+        assert_eq!(args.flush_batch_size, 7);
+        assert_eq!(args.flush_interval, Duration::from_millis(8));
+        assert_eq!(args.clean_interval, Duration::from_secs(9));
+        assert_eq!(args.snapshot_interval, Duration::from_secs(10));
+        for pool in [args.high_pool, args.default_pool, args.background_pool] {
+            assert_eq!(
+                (pool.workers, pool.queue_cap, pool.rate_limit_per_sec),
+                (1, 3, Some(5))
+            );
+        }
+        let no_store = SupervisorArgs::builder()
+            .fragment(FragmentId(8))
+            .worker_prefix("no-store")
+            .hlc(hlc)
+            .maybe_store(None)
+            .maybe_tombstone_gc_age(None)
+            .build();
+        assert!(no_store.store.is_none());
+        assert!(no_store.tombstone_gc_age.is_none());
+        let shared = Arc::new(FragmentState::new(
+            HashMap::new(),
+            None,
+            1000,
+            Duration::from_millis(100),
+        ));
+        let cleaner = CleanerArgs::builder()
+            .fragment(FragmentId(8))
+            .shared(shared.clone())
+            .interval(Duration::from_secs(11))
+            .maybe_tombstone_gc_age(Some(legacy_age))
+            .reset_senders(resets.clone())
+            .build();
+        assert_eq!(cleaner.interval, Duration::from_secs(11));
+        assert_eq!(cleaner.tombstone_gc_age, Some(legacy_age));
+        assert!(Arc::ptr_eq(&cleaner.reset_senders, &resets));
+        let snapshotter = SnapshotterArgs::builder()
+            .shared(shared)
+            .interval(Duration::from_secs(12))
+            .build();
+        assert_eq!(snapshotter.interval, Duration::from_secs(12));
+    }
+
+    #[tokio::test]
+    async fn supervisor_builder_defaults_start_and_quiesce_real_owned_workers() {
+        let (supervisor, handle) = FragmentSupervisor::spawn(
+            None,
+            FragmentSupervisor,
+            SupervisorArgs::builder()
+                .fragment(FragmentId(0))
+                .worker_prefix("builder-owned-workers")
+                .hlc(Arc::new(Mutex::new(HlcClock::new())))
+                .build(),
+        )
+        .await
+        .unwrap();
+        let CallResult::Success(health) = supervisor
+            .call(
+                |reply| SupervisorMessage::GetHealth { reply },
+                Some(Duration::from_secs(2)),
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("builder defaults failed health probe")
+        };
+        assert_eq!(health.fragment, FragmentId(0));
+        assert_eq!(health.worker_count, 8);
+        assert_eq!(health.shed_counts, (0, 0, 0));
+        assert!(matches!(
+            supervisor
+                .call(
+                    |reply| SupervisorMessage::Quiesce { reply },
+                    Some(Duration::from_secs(2))
+                )
+                .await
+                .unwrap(),
+            CallResult::Success(Ok(()))
+        ));
+        supervisor.drain().unwrap();
+        handle.await.unwrap();
+    }
 
     enum HealthDispatcherMode {
         Reply,

@@ -51,6 +51,12 @@ cargo test -p actordb --release --no-default-features --locked \
   maintenance_foreground_latency_distribution -- --ignored --nocapture
 ```
 
+Configurations use Bon builders without changing benchmark tuning. The
+replication/fan-out fixtures deliberately replace all priority profiles with
+large unlimited pools; a standalone `PoolConfig` builder defaults to four
+workers and no rate limit, unlike the Node's rate-limited Background profile.
+The single-node fixture omits overrides and keeps the Node defaults.
+
 ## Baselines
 
 Recorded 2026-10-14 on a shared dev VM (multi-thread tokio, in-memory store,

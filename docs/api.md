@@ -1,9 +1,14 @@
 # Public API guide
 
 The main application surface lives in `actordb::node`. Start from
-`NodeConfig::default()` for database behavior and `NodeRuntimeOptions::default()`
-for transport/replication liveness policy — see
+`NodeConfig::builder()` for database behavior and `NodeRuntimeOptions::builder()`
+for transport/replication liveness policy, overriding only the settings you need
+before calling `build()` — see
 [Configuration](configuration.md) for every knob.
+Existing literals, `Default`, `with_*` helpers, and getters remain supported.
+Builders require actual dependencies for low-level actor arguments; they do not
+invent node identities, shared state, HLCs, or routers. See the
+[13-type builder reference](configuration.md#configuration-builders).
 
 ## Starting a node
 
@@ -12,8 +17,8 @@ use actordb::node::{Node, NodeConfig};
 use std::net::SocketAddr;
 
 #[tokio::main]
-async fn main() -> Result<(), actordb::node::NodeError> {
-    let config = NodeConfig::default();
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let config = NodeConfig::builder().build();
     let node = Node::start("node-a".to_string(), "127.0.0.1:7447".parse::<SocketAddr>()?, config).await?;
     println!("listening on {}", node.addr());
 
@@ -36,28 +41,25 @@ async fn main() -> Result<(), actordb::node::NodeError> {
   use actordb::node::NodeRuntimeOptions;
   use std::time::Duration;
 
-  let runtime = NodeRuntimeOptions::default()
-      .with_peer_queue_frame_capacity(512)
-      .with_peer_queue_byte_capacity(64 * 1024 * 1024)
-      .with_replication_control_message_capacity(128)
-      .with_inbound_connection_capacity(512)
-      .with_receive_byte_capacity(128 * 1024 * 1024)
-      .with_relay_capacity(1024)
-      .with_relay_key_byte_capacity(64 * 1024 * 1024)
-      .with_serving_read_queue_capacity(64)
-      .with_serving_read_key_byte_capacity(64 * 1024 * 1024)
-      .with_queue_admission_timeout(Duration::from_secs(2))
-      .with_reconcile_data_admission_timeout(Duration::from_secs(20))
-      .with_forwarded_attempt_timeout(Duration::from_secs(8))
-      .with_connect_timeout(Duration::from_secs(3))
-      .with_handshake_timeout(Duration::from_secs(3))
-      .with_socket_read_timeout(Duration::from_secs(20))
-      .with_socket_write_timeout(Duration::from_secs(20))
-      .with_replication_ack_timeout(Duration::from_secs(20));
+  let runtime = NodeRuntimeOptions::builder()
+      .peer_queue_frame_capacity(512)
+      .peer_queue_byte_capacity(64 * 1024 * 1024)
+      .replication_control_message_capacity(128)
+      .inbound_connection_capacity(512)
+      .receive_byte_capacity(128 * 1024 * 1024)
+      .queue_admission_timeout(Duration::from_secs(2))
+      .reconcile_data_admission_timeout(Duration::from_secs(20))
+      .forwarded_attempt_timeout(Duration::from_secs(8))
+      .connect_timeout(Duration::from_secs(3))
+      .handshake_timeout(Duration::from_secs(3))
+      .socket_read_timeout(Duration::from_secs(20))
+      .socket_write_timeout(Duration::from_secs(20))
+      .replication_ack_timeout(Duration::from_secs(20))
+      .build(); // Unspecified settings keep their defaults.
   let node = Node::start_with_options(
       "node-a".to_string(),
       "127.0.0.1:7447".parse()?,
-      NodeConfig::default(),
+      NodeConfig::builder().build(),
       runtime,
   )
   .await?;
@@ -140,7 +142,7 @@ use std::time::Duration;
 
 let report = node
     .shutdown_with_replication_drain(
-        ReplicationDrainOptions::default().with_timeout(Duration::from_secs(30)),
+        ReplicationDrainOptions::builder().timeout(Duration::from_secs(30)).build(),
     )
     .await?;
 println!("fenced {} fragment/peer senders", report.targets().len());
@@ -307,6 +309,30 @@ sender limits and timeouts. Its public options are:
   ordinary streaming batch after queue admission;
 - `with_queue_admission_timeout` (default 5 seconds): maximum wait to reserve a
   frame slot in the peer queue.
+
+The Bon builder uses the field names without `with_`:
+
+```rust
+use actordb::replication::{SenderConfig, SenderDeps, SenderRuntimeOptions};
+use std::time::Duration;
+
+let config = SenderConfig::builder().batch_size(256).build();
+let options = SenderRuntimeOptions::builder()
+    .ack_timeout(Duration::from_secs(20))
+    .queue_admission_timeout(Duration::from_secs(2))
+    .build();
+// Supply the real router, shared clock, and report used by this embedding.
+let deps = SenderDeps::builder()
+    .router(router)
+    .hlc(hlc)
+    .state_report(state_report)
+    .build();
+```
+
+`build()` checks that dependencies were supplied, not that runtime limits are
+valid. Prefer the fallible `spawn_sender_with_options`; the legacy
+`spawn_sender` still panics for invalid configuration. Private Node control
+capacity and queue-failure hooks are not exposed as builder setters.
 
 An ordinary ACK timeout rotates the sender session, restores all unacknowledged
 exact stamped operations to the front of the buffer in original order, and

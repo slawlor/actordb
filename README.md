@@ -132,7 +132,7 @@ use std::time::Duration;
 let node = Node::start(
     "node-a".to_string(),
     "0.0.0.0:7447".parse().unwrap(),
-    NodeConfig::default(),
+    NodeConfig::builder().build(),
 )
 .await?;
 // port 0 picks an ephemeral port; the bound address is available via `node.addr()`
@@ -164,7 +164,7 @@ node.shutdown().await?;
 
 // Alternatively, choose the bounded peer fence before local shutdown:
 // let report = node.shutdown_with_replication_drain(
-//     ReplicationDrainOptions::default().with_timeout(Duration::from_secs(30)),
+//     ReplicationDrainOptions::builder().timeout(Duration::from_secs(30)).build(),
 // ).await?;
 ```
 
@@ -175,33 +175,37 @@ node.shutdown().await?;
 use actordb::node::NodeRuntimeOptions;
 use std::time::Duration;
 
-let runtime = NodeRuntimeOptions::default()
-    .with_peer_queue_frame_capacity(512)
-    .with_peer_queue_byte_capacity(64 * 1024 * 1024)
-    .with_replication_control_message_capacity(128)
-    .with_inbound_connection_capacity(512)
-    .with_receive_byte_capacity(128 * 1024 * 1024)
-    .with_relay_capacity(1024)
-    .with_relay_key_byte_capacity(64 * 1024 * 1024)
-    .with_serving_read_queue_capacity(64)
-    .with_serving_read_key_byte_capacity(64 * 1024 * 1024)
-    .with_queue_admission_timeout(Duration::from_secs(2))
-    .with_reconcile_data_admission_timeout(Duration::from_secs(20))
-    .with_forwarded_attempt_timeout(Duration::from_secs(8))
-    .with_connect_timeout(Duration::from_secs(3))
-    .with_handshake_timeout(Duration::from_secs(3))
-    .with_socket_read_timeout(Duration::from_secs(20))
-    .with_socket_write_timeout(Duration::from_secs(20))
-    .with_replication_ack_timeout(Duration::from_secs(20));
+let runtime = NodeRuntimeOptions::builder()
+    .peer_queue_frame_capacity(512)
+    .peer_queue_byte_capacity(64 * 1024 * 1024)
+    .replication_control_message_capacity(128)
+    .inbound_connection_capacity(512)
+    .receive_byte_capacity(128 * 1024 * 1024)
+    .queue_admission_timeout(Duration::from_secs(2))
+    .reconcile_data_admission_timeout(Duration::from_secs(20))
+    .forwarded_attempt_timeout(Duration::from_secs(8))
+    .connect_timeout(Duration::from_secs(3))
+    .handshake_timeout(Duration::from_secs(3))
+    .socket_read_timeout(Duration::from_secs(20))
+    .socket_write_timeout(Duration::from_secs(20))
+    .replication_ack_timeout(Duration::from_secs(20))
+    .build(); // Omitted relay, read, mutation, and health settings retain defaults.
 
 let node = Node::start_with_options(
     "node-a".to_string(),
     "0.0.0.0:7447".parse().unwrap(),
-    NodeConfig::default(),
+    NodeConfig::builder().build(),
     runtime,
 )
 .await?;
 ```
+
+All configuration and actor argument types provide Bon builders with defaults
+for optional tuning and compile-time checks for required dependencies. Existing
+struct literals, `Default`, `with_*` helpers, and getters remain available.
+`build()` constructs settings; startup/spawn still validates their values.
+See the [builder reference](docs/configuration.md#configuration-builders) for
+nested pool defaults, optional setters, and the 13 supported input types.
 
 The defaults are a 256-frame queue per peer, 64 protocol-control messages per
 fragment/peer sender, at most 1024 concurrent inbound handshakes or
@@ -395,11 +399,10 @@ use actordb::placement::ManualPlacement;
 use std::sync::Arc;
 
 let controller = Arc::new(ManualPlacement::new(initial_map));
-let config = NodeConfig {
-    placement_controller: Some(controller.clone()),
-    placement_poll_interval: Duration::from_millis(500),
-    ..NodeConfig::default()
-};
+let config = NodeConfig::builder()
+    .placement_controller(controller.clone())
+    .placement_poll_interval(Duration::from_millis(500))
+    .build();
 // ... later, migrate fragment 0 from "a" to "b":
 let mut overlap = HashMap::new();
 overlap.insert(FragmentId(0), vec!["a".to_string(), "b".to_string()]);
