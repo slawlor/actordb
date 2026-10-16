@@ -163,6 +163,12 @@ process — the bulk of behavioral coverage:
 - **Remote mutation failures**:
   `forwarded_put_returns_remote_storage_failure`; node unit tests reject
   unspecified statuses and malformed result order/cardinality.
+  `mixed_batch_put_retries_only_unavailable_positions_with_exact_stamps`
+  exercises three holders, shrinking noncontiguous retry subsets, duplicate
+  keys, unchanged stamps, and terminal outcomes.
+  `mixed_batch_put_malformed_subset_exhaustion_preserves_terminal_results`
+  rejects an entire malformed subset response and returns network errors only
+  for positions still unresolved after holder exhaustion.
 - **Placement**: `placement_migration_no_lost_writes` (single writer during a
   live migration asserts zero lost writes),
   `placement_rolling_restart_delta_reconcile_only` (restarted node converges
