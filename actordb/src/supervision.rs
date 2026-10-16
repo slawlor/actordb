@@ -1076,6 +1076,262 @@ mod tests {
         handle.await.unwrap();
     }
 
+    #[derive(Default)]
+    struct RestartRecordingStore {
+        entries: StdMutex<HashMap<Vec<u8>, VersionedValue>>,
+    }
+
+    impl KvStore for RestartRecordingStore {
+        fn load(&self) -> Result<Vec<(Vec<u8>, VersionedValue)>, StoreError> {
+            Ok(self
+                .entries
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect())
+        }
+
+        fn write_batch(&self, writes: &[(Vec<u8>, VersionedValue)]) -> Result<(), StoreError> {
+            let mut entries = self.entries.lock().unwrap();
+            for (key, value) in writes {
+                entries.insert(key.clone(), value.clone());
+            }
+            Ok(())
+        }
+    }
+
+    struct StopRestartSupervisor(ActorCell);
+
+    impl Drop for StopRestartSupervisor {
+        fn drop(&mut self) {
+            self.0.stop_children(None);
+            self.0.kill();
+        }
+    }
+
+    async fn restart_owned_maintenance_child<M: ractor::Message>(
+        supervisor: &ActorRef<SupervisorMessage>,
+        name: &str,
+    ) -> ActorRef<M> {
+        let original = supervisor
+            .get_children()
+            .into_iter()
+            .find(|child| child.is_message_type_of::<M>() == Some(true))
+            .unwrap();
+        original.kill();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            original.wait(None).await.unwrap();
+            loop {
+                let replacement = supervisor.get_children().into_iter().find(|child| {
+                    child.is_message_type_of::<M>() == Some(true)
+                        && child.get_id() != original.get_id()
+                        && child.get_status() == ActorStatus::Running
+                });
+                let health = supervisor
+                    .call(
+                        |reply| SupervisorMessage::GetHealth { reply },
+                        Some(Duration::from_secs(2)),
+                    )
+                    .await
+                    .unwrap();
+                if let (Some(replacement), CallResult::Success(health)) = (replacement, health) {
+                    if health.restarts.get(name) == Some(&1) {
+                        return ActorRef::from(replacement);
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("owned maintenance child did not restart")
+    }
+
+    #[tokio::test]
+    async fn maintenance_child_builder_restarts_preserve_shared_state_and_periodic_policy() {
+        let store = Arc::new(RestartRecordingStore::default());
+        let pool = |workers, queue_cap| {
+            PoolConfig::builder()
+                .workers(workers)
+                .queue_cap(queue_cap)
+                .build()
+        };
+        let (supervisor, handle) = FragmentSupervisor::spawn(
+            None,
+            FragmentSupervisor,
+            SupervisorArgs::builder()
+                .fragment(FragmentId(7))
+                .worker_prefix("builder-maintenance-restart")
+                .hlc(Arc::new(Mutex::new(HlcClock::new())))
+                .store(store.clone())
+                .high_pool(pool(3, 101))
+                .default_pool(pool(3, 103))
+                .background_pool(
+                    PoolConfig::builder()
+                        .workers(2)
+                        .queue_cap(107)
+                        .rate_limit_per_sec(7)
+                        .build(),
+                )
+                .flush_batch_size(usize::MAX)
+                .flush_interval(Duration::from_secs(3600))
+                .clean_interval(Duration::from_millis(17))
+                .snapshot_interval(Duration::from_millis(11))
+                .build(),
+        )
+        .await
+        .unwrap();
+        let _stop = StopRestartSupervisor(supervisor.get_cell());
+        let CallResult::Success(dispatcher) = supervisor
+            .call(
+                |reply| SupervisorMessage::GetDispatcher { reply },
+                Some(Duration::from_secs(2)),
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("dispatcher lookup failed")
+        };
+        let ordinary = VersionedValue::new(b"retained".to_vec(), 10, "writer".into());
+        let apply = |key: &str, value: VersionedValue| ReplicatedOp {
+            key: key.into(),
+            value,
+            seq: 1,
+            boot_id: 1,
+        };
+        assert_eq!(
+            dispatcher
+                .call(
+                    |reply| KvMessage::ApplyOp {
+                        op: apply("ordinary", ordinary.clone()),
+                        priority: crate::actor::OpPriority::High,
+                        is_replication: false,
+                        reply: Some(reply)
+                    },
+                    Some(Duration::from_secs(2)),
+                )
+                .await
+                .unwrap(),
+            CallResult::Success(Ok(ApplyOutcome::Applied))
+        );
+
+        // Identify the exact linked actor by its local message type, not a
+        // global name, and join its old task before checking the replacement.
+        let _cleaner =
+            restart_owned_maintenance_child::<CleanerMessage>(&supervisor, "cleaner").await;
+        let _snapshotter =
+            restart_owned_maintenance_child::<SnapshotterMessage>(&supervisor, "snapshotter").await;
+        let mut expiring = VersionedValue::new(b"temporary".to_vec(), 20, "writer".into());
+        // Capture after both actors are running so their immediate startup
+        // tick cannot already expire this value. The real wall clock, rather
+        // than paused Tokio time, governs TTL; the store never blocks it.
+        expiring.expires_at_ms = Some(now_ms() + 1000);
+        let floor = expiring.expiry_tombstone();
+        assert_eq!(
+            dispatcher
+                .call(
+                    |reply| KvMessage::ApplyOp {
+                        op: apply("expiring", expiring.clone()),
+                        priority: crate::actor::OpPriority::High,
+                        is_replication: false,
+                        reply: Some(reply)
+                    },
+                    Some(Duration::from_secs(2)),
+                )
+                .await
+                .unwrap(),
+            CallResult::Success(Ok(ApplyOutcome::Applied))
+        );
+
+        // No manual Sweep/Snap and no write-trigger flush: both replacement
+        // actors must retain their short configured intervals and shared cache
+        // for the exact expiry floor to reach the original store within 5 s.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if store.entries.lock().unwrap().get(b"expiring".as_slice()) == Some(&floor) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("replacement maintenance actors lost state or periodic policy");
+        assert_eq!(
+            store.entries.lock().unwrap().get(b"ordinary".as_slice()),
+            Some(&ordinary)
+        );
+        assert_eq!(
+            dispatcher
+                .call(
+                    |reply| KvMessage::Get {
+                        key: "ordinary".into(),
+                        priority: crate::actor::OpPriority::High,
+                        reply
+                    },
+                    Some(Duration::from_secs(2)),
+                )
+                .await
+                .unwrap(),
+            CallResult::Success(Ok(Some(ordinary)))
+        );
+        assert_eq!(
+            dispatcher
+                .call(
+                    |reply| KvMessage::Get {
+                        key: "expiring".into(),
+                        priority: crate::actor::OpPriority::High,
+                        reply
+                    },
+                    Some(Duration::from_secs(2)),
+                )
+                .await
+                .unwrap(),
+            CallResult::Success(Ok(None))
+        );
+        let CallResult::Success(health) = supervisor
+            .call(
+                |reply| SupervisorMessage::GetHealth { reply },
+                Some(Duration::from_secs(2)),
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("restart health probe failed")
+        };
+        assert_eq!(health.fragment, FragmentId(7));
+        assert_eq!(health.worker_count, 8);
+        for (suffix, expected) in [("high", 3), ("default", 3), ("bg", 2)] {
+            assert_eq!(
+                health
+                    .worker_names
+                    .iter()
+                    .filter(|name| name.contains(&format!("-{suffix}-worker-")))
+                    .count(),
+                expected
+            );
+        }
+        assert_eq!(
+            health.restarts,
+            HashMap::from([("cleaner".into(), 1), ("snapshotter".into(), 1)])
+        );
+        assert!(matches!(
+            supervisor
+                .call(
+                    |reply| SupervisorMessage::Quiesce { reply },
+                    Some(Duration::from_secs(2)),
+                )
+                .await
+                .unwrap(),
+            CallResult::Success(Ok(()))
+        ));
+        assert!(
+            supervisor.get_children().is_empty(),
+            "planned quiesce restarted a child"
+        );
+        supervisor.drain().unwrap();
+        handle.await.unwrap();
+    }
+
     enum HealthDispatcherMode {
         Reply,
         DropReply,
