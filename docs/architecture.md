@@ -38,7 +38,7 @@ integration crate, and an `xtask` for coverage.
 | Module | Role |
 |---|---|
 | `actordb::node` | Public API: `Node`, `NodeConfig`, `NodeError`, peer mesh, routing, forwarding, replication wiring, placement driver |
-| `actordb::actor` | Per-fragment `KvActor` dispatcher, `WorkerPool`, indexed `FragmentState` cache, bounded summary/single-value primitives, `VersionedValue`, `wins_over`, `HlcClock`, priority enum |
+| `actordb::actor` | Per-fragment `KvActor` dispatcher, internal managed worker pools, indexed `FragmentState` cache, bounded summary/single-value primitives, `VersionedValue`, `wins_over`, `HlcClock`, priority enum |
 | `actordb::replication` | Phase 5 async sender/receiver: `ReplicationSender` state machine, sessions, acks, protocol-v3 paged `ReconcileRequest/Response/Fetch/Data` anti-entropy |
 | `actordb::supervision` | `FragmentSupervisor` + children: dispatcher, `Cleaner` (TTL-expiry markers), `Snapshotter` (periodic flush) |
 | `actordb::placement` | Phase 8 dynamic placement: `PlacementController` trait, `StaticPlacement`, `ManualPlacement`, migration lifecycle states |
@@ -68,10 +68,11 @@ Key design points:
 
 - **Shared state, isolated execution.** All workers of a fragment share one
   `Arc<FragmentState>` (the in-memory cache), but operations execute in three
-  independent worker pools keyed by `OpPriority`. A background bulk scan can
-  saturate its pool without touching the p99 of high-priority traffic — this is
-  covered by the `background_saturation_leaves_high_priority_p99_unaffected`
-  integration test.
+  independent worker pools keyed by `OpPriority`. Workers and admitted
+  backlogs are isolated; the dispatcher mailbox, fragment cache locks, and
+  peer connection reader remain shared. Accepted reads are handed directly to
+  their sticky worker, so one blocked background worker does not hold the
+  dispatcher behind a nested RPC.
 - **Sticky key routing.** Inside one priority pool, a key's operations land on
   the same worker (`seahash(key) % workers`). Different priorities use
   different workers; `FragmentState` therefore serializes each LWW merge with
@@ -81,12 +82,14 @@ Key design points:
   [Consistency](consistency.md)).
 - **Supervision is local and shallow, but not yet lossless.** A dead worker is
   replaced with the same `Arc<FragmentState>` and pool slot, but accepted jobs
-  in its mailbox are not replayed and pending admission accounting can leak.
-  Cleaner and snapshotter restart in place. A Node-owned monitor republishes a
-  replacement dispatcher through a generation-checked `FragmentRouter` entry;
-  a stale monitor from a removed placement generation cannot overwrite a
-  re-added subtree. The planned ractor `Factory` migration addresses lossless
-  worker admission/drain without coupling failures across fragments.
+  in its mailbox are not replayed. Their reply ports close, and exact
+  per-worker generation accounting restores the replacement's capacity.
+  Cleaner and snapshotter restart in place. A Node-owned monitor republishes
+  a replacement dispatcher through a generation-checked `FragmentRouter`
+  entry; a stale monitor from a removed placement generation cannot overwrite
+  a re-added subtree. The planned ractor `Factory` migration addresses
+  discard/requeue policy and lossless restart without coupling failures across
+  fragments.
 - **Shutdown preserves the retry boundary.** A one-way Node admission gate
   rejects new public data calls, while operations admitted before the fence
   finish or receive their transport failure. Each fragment closes and joins

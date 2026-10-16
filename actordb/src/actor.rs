@@ -27,6 +27,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use futures::FutureExt;
+#[cfg(test)]
 use ractor::rpc::CallResult;
 use ractor::{
     Actor, ActorCell, ActorProcessingErr, ActorRef, ActorStatus, RpcReplyPort, SupervisionEvent,
@@ -35,8 +36,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::{Mutex, RwLock};
 
 /// Priority for an operation. The dispatcher routes to separate worker
-/// pools by priority, so bulk/background traffic can never starve
-/// latency-sensitive ops.
+/// pools by priority, so bulk/background work cannot occupy the workers or
+/// worker-queue capacity reserved for latency-sensitive ops. Dispatcher
+/// ingress remains a shared serialization point.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum OpPriority {
     /// Latency-sensitive reads/writes.
@@ -53,8 +55,9 @@ pub enum OpPriority {
 pub struct PoolConfig {
     /// Number of worker actors.
     pub workers: usize,
-    /// Max pending ops before shedding. Shed ops are dropped and counted
-    /// (explicit, not silent).
+    /// Max active-plus-queued jobs accepted into this priority's workers
+    /// before shedding. This does not bound the shared dispatcher mailbox.
+    /// Shed ops are dropped and counted (explicit, not silent).
     pub queue_cap: usize,
     /// Token-bucket rate limit (ops/sec). `None` = unlimited.
     pub rate_limit_per_sec: Option<u32>,
@@ -978,17 +981,166 @@ impl Actor for KvWorker {
         message: Self::Msg,
         state: &mut Self::State,
     ) -> Result<(), ActorProcessingErr> {
-        let result = match message {
+        let result = handle_worker_message(&state.0, message).await;
+        // Release the optional caller-owned pending slot. Production pools
+        // use `PoolWorker`, below, which also tracks the exact worker slot so
+        // supervision can reclaim queued work discarded by a failed worker.
+        if let Some(pending) = &state.1 {
+            release_pending(pending, 1);
+        }
+        result
+    }
+}
+
+async fn handle_worker_message(
+    shared: &Arc<FragmentState>,
+    message: KvMessage,
+) -> Result<(), ActorProcessingErr> {
+    match message {
+        KvMessage::ApplyOp {
+            op,
+            priority: _,
+            is_replication: _,
+            reply,
+        } => {
+            // Cache merge and durable enqueue are one ordered operation.
+            // A DB error fails the actor loudly rather than diverging
+            // silently.
+            match shared.apply(&op).await {
+                Ok(outcome) => {
+                    if let Some(reply) = reply {
+                        let _ = reply.send(Ok(outcome));
+                    }
+                    Ok(())
+                }
+                Err(error) => {
+                    let fatal = match &error {
+                        ApplyError::Storage(message) => {
+                            Some(ActorProcessingErr::from(message.clone()))
+                        }
+                        ApplyError::Backpressure | ApplyError::InvalidInput(_) => None,
+                    };
+                    if let Some(reply) = reply {
+                        let _ = reply.send(Err(error));
+                    }
+                    match fatal {
+                        Some(error) => Err(error),
+                        None => Ok(()),
+                    }
+                }
+            }
+        }
+        KvMessage::Get {
+            key,
+            reply,
+            priority: _,
+        } => {
+            // The receiver may be gone (e.g. timed-out caller); that's fine.
+            let _ = reply.send(Ok(shared.get(&key).await));
+            Ok(())
+        }
+        // Flush fences are handled by the dispatcher against the shared
+        // state. They are never routed through a worker pool.
+        KvMessage::Flush { reply } | KvMessage::FlushStable { reply } => {
+            let _ = reply.send(Err(ApplyError::Storage(
+                "flush fence was routed to a worker".to_string(),
+            )));
+            Ok(())
+        }
+        // Snapshot queries are served by the dispatcher straight from
+        // shared state.
+        KvMessage::GetAll { .. }
+        | KvMessage::GetSnapshot { .. }
+        | KvMessage::GetSummaryPage { .. }
+        | KvMessage::GetVersioned { .. }
+        | KvMessage::GetVersionedPage { .. }
+        | KvMessage::GetRevision { .. } => Ok(()),
+        // Shed counts are a dispatcher-level query; workers don't track them.
+        KvMessage::GetShedCounts { reply } => {
+            let _ = reply.send((0, 0, 0));
+            Ok(())
+        }
+    }
+}
+
+/// Worker used internally by [`WorkerPool`]. The pool-wide count enforces the
+/// configured cap, while the slot-local count lets supervision reclaim only
+/// the work abandoned by one failed worker.
+struct PoolWorker;
+
+struct PoolWorkerArgs {
+    shared: Arc<FragmentState>,
+    pool_pending: Arc<AtomicU64>,
+    slot_pending: Arc<AtomicU64>,
+    #[cfg(test)]
+    startup_gate: Option<WorkerStartupGate>,
+}
+
+#[cfg(test)]
+#[derive(Clone, Default)]
+struct WorkerStartupGate {
+    entered: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+}
+
+#[cfg(test)]
+static WORKER_STARTUP_GATES: std::sync::LazyLock<
+    std::sync::Mutex<HashMap<String, WorkerStartupGate>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+#[cfg(test)]
+fn install_worker_startup_gate(name: String) -> WorkerStartupGate {
+    let gate = WorkerStartupGate::default();
+    let replaced = WORKER_STARTUP_GATES
+        .lock()
+        .expect("worker startup gate registry poisoned")
+        .insert(name, gate.clone());
+    assert!(replaced.is_none(), "worker startup gate already installed");
+    gate
+}
+
+#[cfg(test)]
+fn take_worker_startup_gate(name: &str) -> Option<WorkerStartupGate> {
+    WORKER_STARTUP_GATES
+        .lock()
+        .expect("worker startup gate registry poisoned")
+        .remove(name)
+}
+
+impl Actor for PoolWorker {
+    type Msg = KvMessage;
+    type State = PoolWorkerArgs;
+    type Arguments = PoolWorkerArgs;
+
+    async fn pre_start(
+        &self,
+        _myself: ActorRef<Self::Msg>,
+        args: Self::Arguments,
+    ) -> Result<Self::State, ActorProcessingErr> {
+        #[cfg(test)]
+        if let Some(gate) = &args.startup_gate {
+            gate.entered.notify_one();
+            gate.release.notified().await;
+        }
+        Ok(args)
+    }
+
+    async fn handle(
+        &self,
+        _myself: ActorRef<Self::Msg>,
+        message: Self::Msg,
+        state: &mut Self::State,
+    ) -> Result<(), ActorProcessingErr> {
+        match message {
             KvMessage::ApplyOp {
                 op,
                 priority: _,
                 is_replication: _,
                 reply,
             } => {
-                // Cache merge and durable enqueue are one ordered operation.
-                // A DB error fails the actor loudly rather than diverging
-                // silently.
-                match state.0.apply(&op).await {
+                let result = state.shared.apply(&op).await;
+                release_pool_reservation(state);
+                match result {
                     Ok(outcome) => {
                         if let Some(reply) = reply {
                             let _ = reply.send(Ok(outcome));
@@ -1017,38 +1169,43 @@ impl Actor for KvWorker {
                 reply,
                 priority: _,
             } => {
-                // The receiver may be gone (e.g. timed-out caller); that's fine.
-                let _ = reply.send(Ok(state.0.get(&key).await));
+                let value = state.shared.get(&key).await;
+                release_pool_reservation(state);
+                let _ = reply.send(Ok(value));
                 Ok(())
             }
-            // Flush fences are handled by the dispatcher against the shared
-            // state. They are never routed through a worker pool.
-            KvMessage::Flush { reply } | KvMessage::FlushStable { reply } => {
-                let _ = reply.send(Err(ApplyError::Storage(
-                    "flush fence was routed to a worker".to_string(),
-                )));
-                Ok(())
+            message => {
+                // Dispatcher-only variants are never routed here. Keep the
+                // public KvWorker's defensive behavior if an internal bug
+                // does so, while still balancing the reservation.
+                let result = handle_worker_message(&state.shared, message).await;
+                release_pool_reservation(state);
+                result
             }
-            // Snapshot queries are served by the dispatcher straight from
-            // shared state.
-            KvMessage::GetAll { .. }
-            | KvMessage::GetSnapshot { .. }
-            | KvMessage::GetSummaryPage { .. }
-            | KvMessage::GetVersioned { .. }
-            | KvMessage::GetVersionedPage { .. }
-            | KvMessage::GetRevision { .. } => Ok(()),
-            // Shed counts are a dispatcher-level query; workers don't track them.
-            KvMessage::GetShedCounts { reply } => {
-                let _ = reply.send((0, 0, 0));
-                Ok(())
-            }
-        };
-        // Release the pool's pending slot.
-        if let Some(pending) = &state.1 {
-            pending.fetch_sub(1, Ordering::Relaxed);
         }
-        result
     }
+}
+
+fn release_pool_reservation(state: &PoolWorkerArgs) {
+    // The order is deliberately the inverse of admission (slot, then pool),
+    // preserving the conservative invariant that the pool total never falls
+    // below the sum of its live slot counters. Nothing may await between the
+    // two updates and the result reply is sent only after both complete.
+    release_pending(&state.slot_pending, 1);
+    release_pending(&state.pool_pending, 1);
+}
+
+fn release_pending(pending: &AtomicU64, count: u64) -> bool {
+    let released = pending
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            current.checked_sub(count)
+        })
+        .is_ok();
+    debug_assert!(
+        released,
+        "pending counter underflow while releasing {count} jobs"
+    );
+    released
 }
 
 /// The worker index for `key`: sticky across calls within one pool, so a key's
@@ -1057,13 +1214,11 @@ pub fn worker_idx(key: &str, worker_count: usize) -> usize {
     hash_key(key.as_bytes()) as usize % worker_count
 }
 
-/// Factory and lifecycle owner for a fragment's worker pool.
+/// Internal admission and lifecycle owner for a fragment's worker pool.
 ///
 /// The pool spawns the workers, routes keys to them by sticky hash, and
 /// drains them on shutdown. The dispatcher holds a pool and does nothing
-/// else with worker lifecycle — this is the seam Phase 4's supervision
-/// (health checks, restarts) will build on.
-/// A pool of workers with explicit backpressure: bounded queue,
+/// else with worker lifecycle. It provides explicit backpressure: bounded queue,
 /// token-bucket rate limiting, and counted sheds (never silent).
 #[derive(Default)]
 struct WorkerStartupChildren {
@@ -1097,10 +1252,15 @@ impl Drop for WorkerStartupChildren {
     }
 }
 
-pub struct WorkerPool {
-    workers: Vec<ActorRef<KvMessage>>,
+struct WorkerSlot {
+    worker: ActorRef<KvMessage>,
+    pending: Arc<AtomicU64>,
+}
+
+struct WorkerPool {
+    workers: Vec<WorkerSlot>,
     config: PoolConfig,
-    /// Ops currently pending (sent but not yet processed).
+    /// Jobs currently active or queued across this pool's workers.
     pending: Arc<AtomicU64>,
     /// Ops shed due to queue cap or rate limit (explicit, counted).
     shed_count: Arc<AtomicU64>,
@@ -1111,7 +1271,7 @@ impl WorkerPool {
     /// Spawn workers sharing `shared` state, linked to `supervisor`
     /// so a dead worker raises a supervision event there. Workers are
     /// named `<prefix>-worker-<slot>` for registry lookup.
-    pub async fn spawn_linked(
+    async fn spawn_linked(
         config: PoolConfig,
         shared: Arc<FragmentState>,
         supervisor: ActorCell,
@@ -1124,19 +1284,28 @@ impl WorkerPool {
         let startup = AssertUnwindSafe(async {
             for slot in 0..worker_count {
                 let name = format!("{worker_prefix}-worker-{slot}");
-                let (worker, _handle) = KvWorker::spawn_linked(
+                let slot_pending = Arc::new(AtomicU64::new(0));
+                #[cfg(test)]
+                let startup_gate = take_worker_startup_gate(&name);
+                let (worker, _handle) = PoolWorker::spawn_linked(
                     Some(name),
-                    KvWorker,
-                    KvWorkerArgs {
+                    PoolWorker,
+                    PoolWorkerArgs {
                         shared: shared.clone(),
-                        pending: Some(pending.clone()),
+                        pool_pending: pending.clone(),
+                        slot_pending: slot_pending.clone(),
+                        #[cfg(test)]
+                        startup_gate,
                     },
                     supervisor.clone(),
                 )
                 .await
                 .map_err(|e| ActorProcessingErr::from(e.to_string()))?;
                 startup_children.track(worker.get_cell());
-                workers.push(worker);
+                workers.push(WorkerSlot {
+                    worker,
+                    pending: slot_pending,
+                });
             }
             Ok::<(), ActorProcessingErr>(())
         })
@@ -1165,29 +1334,37 @@ impl WorkerPool {
     }
 
     /// Spawn workers sharing `shared` state, unsupervised.
-    pub async fn spawn(
+    #[cfg(test)]
+    async fn spawn(
         config: PoolConfig,
         shared: Arc<FragmentState>,
     ) -> Result<Self, ActorProcessingErr> {
         // Unsupervised spawn: used only in tests. Production pools go
         // through `spawn_linked` so the dispatcher restarts dead workers.
         let worker_count = config.workers.max(1);
+        let pending = Arc::new(AtomicU64::new(0));
         let mut workers = Vec::with_capacity(worker_count);
         let mut startup_children = WorkerStartupChildren::default();
         let startup = AssertUnwindSafe(async {
             for _ in 0..worker_count {
-                let (worker, _handle) = KvWorker::spawn(
+                let slot_pending = Arc::new(AtomicU64::new(0));
+                let (worker, _handle) = PoolWorker::spawn(
                     None,
-                    KvWorker,
-                    KvWorkerArgs {
+                    PoolWorker,
+                    PoolWorkerArgs {
                         shared: shared.clone(),
-                        pending: None,
+                        pool_pending: pending.clone(),
+                        slot_pending: slot_pending.clone(),
+                        startup_gate: None,
                     },
                 )
                 .await
                 .map_err(|e| ActorProcessingErr::from(e.to_string()))?;
                 startup_children.track(worker.get_cell());
-                workers.push(worker);
+                workers.push(WorkerSlot {
+                    worker,
+                    pending: slot_pending,
+                });
             }
             Ok::<(), ActorProcessingErr>(())
         })
@@ -1206,88 +1383,131 @@ impl WorkerPool {
         }
         Ok(Self {
             workers,
-            config,
-            pending: Arc::new(AtomicU64::new(0)),
+            rate_limiter: config
+                .rate_limit_per_sec
+                .map(|r| Mutex::new(TokenBucket::new(r))),
+            pending,
             shed_count: Arc::new(AtomicU64::new(0)),
-            rate_limiter: None,
+            config,
         })
     }
 
     /// Find the pool slot holding `cell`, if any.
-    pub fn slot_of(&self, cell: &ActorCell) -> Option<usize> {
+    fn slot_of(&self, cell: &ActorCell) -> Option<usize> {
         self.workers
             .iter()
-            .position(|w| w.get_id() == cell.get_id())
+            .position(|slot| slot.worker.get_id() == cell.get_id())
     }
 
     /// Replace the worker at `slot` with `worker` (supervised restart).
-    pub fn replace(&mut self, slot: usize, worker: ActorRef<KvMessage>) {
-        if let Some(w) = self.workers.get_mut(slot) {
-            *w = worker;
+    fn replace(&mut self, slot: usize, worker: ActorRef<KvMessage>, pending: Arc<AtomicU64>) {
+        if let Some(worker_slot) = self.workers.get_mut(slot) {
+            *worker_slot = WorkerSlot { worker, pending };
         }
     }
 
-    /// Try to admit an op: checks rate limit and queue cap.
-    /// Returns `true` if admitted, `false` if shed (counted).
-    pub async fn try_admit(&self) -> bool {
+    /// Try to reserve the exact sticky worker for an op. The reservation rolls
+    /// both counters back unless it is successfully handed to that worker.
+    async fn try_reserve(&self, key: &str) -> Option<WorkerReservation<'_>> {
         // Rate limit first.
         if let Some(limiter) = &self.rate_limiter {
             if !limiter.lock().await.try_acquire() {
                 self.shed_count.fetch_add(1, Ordering::Relaxed);
-                return false;
+                return None;
             }
         }
         // Queue cap.
         let pending = self.pending.fetch_add(1, Ordering::Relaxed);
         if pending >= self.config.queue_cap as u64 {
-            self.pending.fetch_sub(1, Ordering::Relaxed);
+            release_pending(&self.pending, 1);
             self.shed_count.fetch_add(1, Ordering::Relaxed);
-            return false;
+            return None;
         }
-        true
+        Some(self.reserve_slot(key))
     }
 
     /// Number of ops shed by this pool.
-    pub fn shed_count(&self) -> u64 {
+    fn shed_count(&self) -> u64 {
         self.shed_count.load(Ordering::Relaxed)
     }
 
-    /// Admit an op without cap/rate checks, only incrementing the
-    /// pending counter. For replication-path ops that bypass admission
-    /// control: the worker unconditionally releases one pending slot
-    /// per op, so the increment must still happen to keep the
-    /// accounting balanced (otherwise the counter underflows and the
-    /// pool sheds everything).
-    pub fn admit_unchecked(&self) {
+    /// Reserve an op without cap/rate checks. Replication and reconciliation
+    /// cannot be discarded after their sender has accepted responsibility,
+    /// but they still participate in exact lifecycle accounting.
+    fn reserve_unchecked(&self, key: &str) -> WorkerReservation<'_> {
         self.pending.fetch_add(1, Ordering::Relaxed);
+        self.reserve_slot(key)
     }
 
-    /// Sticky route: pick a worker by key hash.
-    pub fn route(&self, key: &str) -> &ActorRef<KvMessage> {
+    fn reserve_slot(&self, key: &str) -> WorkerReservation<'_> {
         let idx = worker_idx(key, self.workers.len());
-        &self.workers[idx]
+        self.workers[idx].pending.fetch_add(1, Ordering::Relaxed);
+        WorkerReservation {
+            pool: self,
+            slot: idx,
+            handed_off: false,
+        }
+    }
+
+    /// Reclaim every active or queued job abandoned by one terminated worker.
+    /// Supervision calls this only after actor termination, so that worker can
+    /// no longer race a normal completion decrement.
+    fn reclaim_slot(&self, slot: usize) -> u64 {
+        let abandoned = self.workers[slot].pending.swap(0, Ordering::AcqRel);
+        release_pending(&self.pending, abandoned);
+        abandoned
     }
 
     /// Close every worker mailbox, drain the work accepted before that fence,
     /// and wait for every worker to exit. Closing all mailboxes before waiting
     /// prevents one slow shard from leaving its siblings open to new work.
     fn begin_shutdown(&self) {
-        for worker in &self.workers {
-            if worker.get_status() < ActorStatus::Draining {
-                let _ = worker.drain();
+        for slot in &self.workers {
+            if slot.worker.get_status() < ActorStatus::Draining {
+                let _ = slot.worker.drain();
             }
         }
     }
 
     async fn join(&self) {
-        for worker in &self.workers {
-            let _ = worker.wait(None).await;
+        for slot in &self.workers {
+            let _ = slot.worker.wait(None).await;
         }
     }
 
-    pub async fn shutdown(&self) {
+    async fn shutdown(&self) {
         self.begin_shutdown();
         self.join().await;
+    }
+}
+
+struct WorkerReservation<'a> {
+    pool: &'a WorkerPool,
+    slot: usize,
+    handed_off: bool,
+}
+
+impl WorkerReservation<'_> {
+    /// Hand the reservation and message to the selected worker. An immediate
+    /// send failure drops the reply port and rolls the reservation back, so
+    /// callers observe actor unavailability rather than false backpressure.
+    fn send(mut self, message: KvMessage) {
+        if self.pool.workers[self.slot]
+            .worker
+            .send_message(message)
+            .is_ok()
+        {
+            self.handed_off = true;
+        }
+    }
+}
+
+impl Drop for WorkerReservation<'_> {
+    fn drop(&mut self) {
+        if !self.handed_off {
+            release_pending(&self.pool.workers[self.slot].pending, 1);
+            release_pending(&self.pool.pending, 1);
+        }
     }
 }
 
@@ -1298,9 +1518,9 @@ impl Drop for WorkerPool {
 }
 
 /// The per-fragment dispatcher. One runs per fragment this node serves:
-/// it owns the [`FragmentState`] and a [`WorkerPool`], and routes every
-/// operation to a worker by sticky key hash. `GetAll` is served directly
-/// from shared state.
+/// it owns the [`FragmentState`] and an internal managed worker pool, and
+/// routes every operation to a worker by sticky key hash. `GetAll` is served
+/// directly from shared state.
 pub struct KvActor;
 
 /// The dispatcher's state: the worker pool and the state they share.
@@ -1430,27 +1650,28 @@ impl Actor for KvActor {
                 // is a replicated op: the replication sender is already
                 // bounded, and shedding here while the sender acks would
                 // silently lose acknowledged writes (adversarial #2).
-                // Bypassed ops still take a pending slot (via
-                // admit_unchecked) to keep the worker's release accounting
-                // balanced.
-                if is_replication {
-                    pool.admit_unchecked();
-                } else if !pool.try_admit().await {
+                // Bypassed ops still reserve their exact sticky worker so
+                // completion, immediate send failure, or worker death can
+                // release the same accounting exactly once.
+                let reservation = if is_replication {
+                    Some(pool.reserve_unchecked(&op.key))
+                } else {
+                    pool.try_reserve(&op.key).await
+                };
+                let Some(reservation) = reservation else {
                     // Shed: counted in pool.shed_count and returned to callers
                     // that requested an exact apply outcome.
                     if let Some(reply) = reply {
                         let _ = reply.send(Err(ApplyError::Backpressure));
                     }
                     return Ok(());
-                }
-                pool.route(&op.key)
-                    .send_message(KvMessage::ApplyOp {
-                        op,
-                        priority,
-                        is_replication,
-                        reply,
-                    })
-                    .map_err(|e| ActorProcessingErr::from(e.to_string()))?;
+                };
+                reservation.send(KvMessage::ApplyOp {
+                    op,
+                    priority,
+                    is_replication,
+                    reply,
+                });
                 Ok(())
             }
             KvMessage::Get {
@@ -1469,26 +1690,20 @@ impl Actor for KvActor {
                     OpPriority::Default => &state.default_pool,
                     OpPriority::Background => &state.background_pool,
                 };
-                if !pool.try_admit().await {
+                let Some(reservation) = pool.try_reserve(&key).await else {
                     // Shed: explicit error, not "not found". The caller
                     // sees NodeError::Backpressure, distinct from Ok(None).
                     let _ = reply.send(Err("shed: pool at queue cap or rate limit".to_string()));
                     return Ok(());
-                }
-                let worker = pool.route(&key);
-                if let Ok(CallResult::Success(value)) = worker
-                    .call(
-                        |r| KvMessage::Get {
-                            key,
-                            reply: r,
-                            priority,
-                        },
-                        None,
-                    )
-                    .await
-                {
-                    let _ = reply.send(value);
-                }
+                };
+                // Hand the caller's reply port directly to the worker. The
+                // dispatcher remains free to serve other pools, health, and
+                // supervision while this read waits behind sticky-key work.
+                reservation.send(KvMessage::Get {
+                    key,
+                    reply,
+                    priority,
+                });
                 Ok(())
             }
             KvMessage::Flush { reply } => {
@@ -1586,12 +1801,6 @@ impl Actor for KvActor {
         message: SupervisionEvent,
         state: &mut Self::State,
     ) -> Result<(), ActorProcessingErr> {
-        // Planned worker drains emit the same termination events as failures.
-        // Ractor refuses to link a replacement to a draining parent, and an
-        // attempted restart would turn an orderly drain into actor failure.
-        if myself.get_status() >= ActorStatus::Draining {
-            return Ok(());
-        }
         // A dead worker is replaced in-place: the pool slot keeps its
         // index, so sticky routing is unaffected and no keys move.
         let dead = match &message {
@@ -1613,19 +1822,41 @@ impl Actor for KvActor {
                 }
             }
             if let Some((pool, slot, suffix)) = found {
+                pool.reclaim_slot(slot);
+                // Planned worker drains emit the same termination events as
+                // failures. Retire any remaining accounting above, but do not
+                // link a replacement to a draining parent.
+                if myself.get_status() >= ActorStatus::Draining {
+                    return Ok(());
+                }
                 let name = format!("{}-{suffix}-worker-{slot}", state.worker_prefix);
-                let (worker, _handle) = KvWorker::spawn_linked(
+                let slot_pending = Arc::new(AtomicU64::new(0));
+                #[cfg(test)]
+                let startup_gate = take_worker_startup_gate(&name);
+                let replacement = PoolWorker::spawn_linked(
                     Some(name),
-                    KvWorker,
-                    KvWorkerArgs {
+                    PoolWorker,
+                    PoolWorkerArgs {
                         shared: state.shared.clone(),
-                        pending: Some(pool.pending.clone()),
+                        pool_pending: pool.pending.clone(),
+                        slot_pending: slot_pending.clone(),
+                        #[cfg(test)]
+                        startup_gate,
                     },
                     myself.get_cell(),
                 )
-                .await
-                .map_err(|e| ActorProcessingErr::from(e.to_string()))?;
-                pool.replace(slot, worker);
+                .await;
+                match replacement {
+                    Ok((worker, _handle)) => pool.replace(slot, worker, slot_pending),
+                    // `drain()` changes the parent status immediately. It can
+                    // race the await above, causing ractor to reject the new
+                    // link after the earlier status check. That is an orderly
+                    // retirement, not a dispatcher failure: returning an
+                    // error would skip `post_stop` and kill sibling workers
+                    // before their accepted mailboxes drain.
+                    Err(_) if myself.get_status() >= ActorStatus::Draining => return Ok(()),
+                    Err(error) => return Err(ActorProcessingErr::from(error.to_string())),
+                }
             }
         }
         Ok(())
@@ -2172,6 +2403,637 @@ mod tests {
 
         worker.stop(None);
         handle.await.unwrap();
+    }
+}
+
+#[cfg(test)]
+mod worker_pool_tests {
+    use super::*;
+    use crate::store::StoreError;
+    use ractor::registry::where_is;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::{Condvar, Mutex as StdMutex};
+
+    static NEXT_PREFIX: AtomicU64 = AtomicU64::new(0);
+
+    struct SupervisionProbe;
+
+    impl Actor for SupervisionProbe {
+        type Msg = ();
+        type State = tokio::sync::mpsc::UnboundedSender<SupervisionEvent>;
+        type Arguments = tokio::sync::mpsc::UnboundedSender<SupervisionEvent>;
+
+        async fn pre_start(
+            &self,
+            _myself: ActorRef<Self::Msg>,
+            events: Self::Arguments,
+        ) -> Result<Self::State, ActorProcessingErr> {
+            Ok(events)
+        }
+
+        async fn handle(
+            &self,
+            _myself: ActorRef<Self::Msg>,
+            _message: Self::Msg,
+            _state: &mut Self::State,
+        ) -> Result<(), ActorProcessingErr> {
+            Ok(())
+        }
+
+        async fn handle_supervisor_evt(
+            &self,
+            _myself: ActorRef<Self::Msg>,
+            message: SupervisionEvent,
+            events: &mut Self::State,
+        ) -> Result<(), ActorProcessingErr> {
+            let _ = events.send(message);
+            Ok(())
+        }
+    }
+
+    fn unique_prefix(label: &str) -> String {
+        format!("{label}-{}", NEXT_PREFIX.fetch_add(1, Ordering::Relaxed))
+    }
+
+    fn pool_config(queue_cap: usize, rate_limit_per_sec: Option<u32>) -> PoolConfig {
+        PoolConfig {
+            workers: 1,
+            queue_cap,
+            rate_limit_per_sec,
+        }
+    }
+
+    fn op(key: &str, timestamp_ms: u64) -> ReplicatedOp {
+        ReplicatedOp {
+            key: key.to_string(),
+            value: VersionedValue::new(
+                timestamp_ms.to_be_bytes().to_vec(),
+                timestamp_ms,
+                "test-node".to_string(),
+            ),
+            seq: timestamp_ms,
+            boot_id: 1,
+        }
+    }
+
+    async fn wait_for(condition: impl Fn() -> bool) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !condition() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("condition did not become true");
+    }
+
+    #[derive(Default)]
+    struct BlockingStore {
+        entered: AtomicBool,
+        release: (StdMutex<bool>, Condvar),
+    }
+
+    impl BlockingStore {
+        fn release(&self) {
+            *self.release.0.lock().unwrap() = true;
+            self.release.1.notify_all();
+        }
+    }
+
+    impl KvStore for BlockingStore {
+        fn load(&self) -> Result<Vec<(Vec<u8>, VersionedValue)>, StoreError> {
+            Ok(Vec::new())
+        }
+
+        fn write_batch(&self, _writes: &[(Vec<u8>, VersionedValue)]) -> Result<(), StoreError> {
+            self.entered.store(true, Ordering::SeqCst);
+            let mut released = self.release.0.lock().unwrap();
+            while !*released {
+                released = self.release.1.wait(released).unwrap();
+            }
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn standalone_worker_pool_releases_capacity_and_honors_rate_limit() {
+        let shared = Arc::new(FragmentState::new(
+            HashMap::new(),
+            None,
+            100,
+            Duration::from_secs(3600),
+        ));
+        let pool = WorkerPool::spawn(pool_config(1, None), shared.clone())
+            .await
+            .unwrap();
+
+        pool.try_reserve("first")
+            .await
+            .expect("first job should be admitted")
+            .send(KvMessage::ApplyOp {
+                op: op("first", 1),
+                priority: OpPriority::Default,
+                is_replication: false,
+                reply: None,
+            });
+        wait_for(|| pool.pending.load(Ordering::Relaxed) == 0).await;
+        assert!(shared.get("first").await.is_some());
+
+        let second = pool
+            .try_reserve("second")
+            .await
+            .expect("completed work did not release capacity");
+        drop(second);
+        assert_eq!(pool.pending.load(Ordering::Relaxed), 0);
+        assert_eq!(pool.workers[0].pending.load(Ordering::Relaxed), 0);
+        pool.shutdown().await;
+
+        let rate_limited = WorkerPool::spawn(pool_config(1, Some(1)), shared)
+            .await
+            .unwrap();
+        drop(
+            rate_limited
+                .try_reserve("token")
+                .await
+                .expect("initial rate-limit token should be available"),
+        );
+        assert!(
+            rate_limited.try_reserve("limited").await.is_none(),
+            "standalone pool ignored its configured rate limit"
+        );
+        assert_eq!(rate_limited.shed_count(), 1);
+        rate_limited.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn immediate_worker_send_failure_rolls_back_both_counters() {
+        let shared = Arc::new(FragmentState::new(
+            HashMap::new(),
+            None,
+            100,
+            Duration::from_secs(3600),
+        ));
+        let pool = WorkerPool::spawn(pool_config(1, None), shared)
+            .await
+            .unwrap();
+        let reservation = pool
+            .try_reserve("dead")
+            .await
+            .expect("job should reserve the empty pool");
+        let slot = reservation.slot;
+        let worker = pool.workers[slot].worker.clone();
+        worker.stop(None);
+        worker.wait(None).await.unwrap();
+
+        let (reply, response) = tokio::sync::oneshot::channel();
+        reservation.send(KvMessage::Get {
+            key: "dead".to_string(),
+            reply: reply.into(),
+            priority: OpPriority::Default,
+        });
+
+        assert!(response.await.is_err(), "failed send fabricated a reply");
+        assert_eq!(pool.pending.load(Ordering::Relaxed), 0);
+        assert_eq!(pool.workers[slot].pending.load(Ordering::Relaxed), 0);
+        assert_eq!(pool.shed_count(), 0, "unavailability was counted as shed");
+        pool.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn cancelled_get_holds_admission_until_worker_terminal() {
+        let shared = Arc::new(FragmentState::new(
+            HashMap::new(),
+            None,
+            100,
+            Duration::from_secs(3600),
+        ));
+        let pool = WorkerPool::spawn(pool_config(1, None), shared.clone())
+            .await
+            .unwrap();
+        let cache_guard = shared.cache.write().await;
+        let (reply, response) = tokio::sync::oneshot::channel();
+        pool.try_reserve("cancelled")
+            .await
+            .expect("first read should be admitted")
+            .send(KvMessage::Get {
+                key: "cancelled".to_string(),
+                reply: reply.into(),
+                priority: OpPriority::Default,
+            });
+        drop(response);
+
+        assert_eq!(pool.pending.load(Ordering::Relaxed), 1);
+        assert!(
+            pool.try_reserve("next").await.is_none(),
+            "caller cancellation released capacity before worker completion"
+        );
+
+        drop(cache_guard);
+        wait_for(|| pool.pending.load(Ordering::Relaxed) == 0).await;
+        drop(
+            pool.try_reserve("next")
+                .await
+                .expect("worker completion did not release cancelled read"),
+        );
+        assert_eq!(pool.pending.load(Ordering::Relaxed), 0);
+        pool.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn worker_kill_reclaims_active_and_queued_admissions() {
+        let shared = Arc::new(FragmentState::new(
+            HashMap::new(),
+            None,
+            100,
+            Duration::from_secs(3600),
+        ));
+        let prefix = unique_prefix("reclaim-worker");
+        let pool = pool_config(2, None);
+        let (dispatcher, _handle) = KvActor::spawn(
+            None,
+            KvActor,
+            KvArgs {
+                shared: shared.clone(),
+                fragment: FragmentId(0),
+                worker_prefix: prefix.clone(),
+                default_pool: pool.clone(),
+                high_pool: pool.clone(),
+                background_pool: pool,
+            },
+        )
+        .await
+        .unwrap();
+
+        // Hold the cache so one read is active and the next remains queued in
+        // the same sticky worker. A third read proves both capacity slots are
+        // reserved before the kill.
+        let cache_guard = shared.cache.write().await;
+        let (first_reply, first_response) = tokio::sync::oneshot::channel();
+        let (second_reply, second_response) = tokio::sync::oneshot::channel();
+        dispatcher
+            .send_message(KvMessage::Get {
+                key: "same-slot".to_string(),
+                reply: first_reply.into(),
+                priority: OpPriority::Default,
+            })
+            .unwrap();
+        dispatcher
+            .send_message(KvMessage::Get {
+                key: "same-slot".to_string(),
+                reply: second_reply.into(),
+                priority: OpPriority::Default,
+            })
+            .unwrap();
+        let shed = tokio::time::timeout(
+            Duration::from_secs(1),
+            dispatcher.call(
+                |reply| KvMessage::Get {
+                    key: "same-slot".to_string(),
+                    reply,
+                    priority: OpPriority::Default,
+                },
+                None,
+            ),
+        )
+        .await
+        .expect("dispatcher blocked behind a worker read")
+        .unwrap();
+        assert!(matches!(shed, CallResult::Success(Err(_))));
+
+        let worker_name = format!("{prefix}-default-worker-0");
+        let old_worker = where_is(worker_name.clone()).expect("worker should be registered");
+        let old_id = old_worker.get_id();
+        old_worker.kill();
+        wait_for(|| where_is(worker_name.clone()).is_some_and(|worker| worker.get_id() != old_id))
+            .await;
+        assert!(first_response.await.is_err());
+        assert!(second_response.await.is_err());
+
+        // Keep the replacement blocked and fill the whole pool again. Both
+        // replies must succeed after release; one leaked slot would shed one.
+        let (fresh_one_reply, fresh_one_response) = tokio::sync::oneshot::channel();
+        let (fresh_two_reply, fresh_two_response) = tokio::sync::oneshot::channel();
+        dispatcher
+            .send_message(KvMessage::Get {
+                key: "same-slot".to_string(),
+                reply: fresh_one_reply.into(),
+                priority: OpPriority::Default,
+            })
+            .unwrap();
+        dispatcher
+            .send_message(KvMessage::Get {
+                key: "same-slot".to_string(),
+                reply: fresh_two_reply.into(),
+                priority: OpPriority::Default,
+            })
+            .unwrap();
+        dispatcher
+            .call(|reply| KvMessage::GetShedCounts { reply }, None)
+            .await
+            .unwrap();
+        drop(cache_guard);
+        assert!(fresh_one_response.await.unwrap().is_ok());
+        assert!(fresh_two_response.await.unwrap().is_ok());
+
+        dispatcher.drain().unwrap();
+        dispatcher.wait(None).await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn worker_kill_reclaims_only_the_dead_slots_admissions() {
+        let shared = Arc::new(FragmentState::new(
+            HashMap::new(),
+            None,
+            100,
+            Duration::from_secs(3600),
+        ));
+        let prefix = unique_prefix("reclaim-one-slot");
+        let pool = PoolConfig {
+            workers: 2,
+            queue_cap: 2,
+            rate_limit_per_sec: None,
+        };
+        let (dispatcher, _handle) = KvActor::spawn(
+            None,
+            KvActor,
+            KvArgs {
+                shared: shared.clone(),
+                fragment: FragmentId(0),
+                worker_prefix: prefix.clone(),
+                default_pool: pool.clone(),
+                high_pool: pool.clone(),
+                background_pool: pool,
+            },
+        )
+        .await
+        .unwrap();
+        let key_for_slot = |wanted| {
+            (0..1_000)
+                .map(|candidate| format!("slot-key-{candidate}"))
+                .find(|key| worker_idx(key, 2) == wanted)
+                .expect("test keys should cover both worker slots")
+        };
+        let dead_key = key_for_slot(0);
+        let healthy_key = key_for_slot(1);
+
+        // Block one admitted read in each worker. The dispatcher health call
+        // is a mailbox fence proving both reservations were handed off.
+        let cache_guard = shared.cache.write().await;
+        let (dead_reply, dead_response) = tokio::sync::oneshot::channel();
+        let (healthy_reply, healthy_response) = tokio::sync::oneshot::channel();
+        dispatcher
+            .send_message(KvMessage::Get {
+                key: dead_key.clone(),
+                reply: dead_reply.into(),
+                priority: OpPriority::Default,
+            })
+            .unwrap();
+        dispatcher
+            .send_message(KvMessage::Get {
+                key: healthy_key,
+                reply: healthy_reply.into(),
+                priority: OpPriority::Default,
+            })
+            .unwrap();
+        dispatcher
+            .call(|reply| KvMessage::GetShedCounts { reply }, None)
+            .await
+            .unwrap();
+
+        let worker_name = format!("{prefix}-default-worker-0");
+        let old_worker = where_is(worker_name.clone()).expect("worker should be registered");
+        let old_id = old_worker.get_id();
+        old_worker.kill();
+        wait_for(|| where_is(worker_name.clone()).is_some_and(|worker| worker.get_id() != old_id))
+            .await;
+        assert!(dead_response.await.is_err());
+
+        // Exactly one slot is now available. A fresh read for the replacement
+        // consumes it; another read must shed while the healthy sibling still
+        // owns its original reservation.
+        let (fresh_reply, fresh_response) = tokio::sync::oneshot::channel();
+        dispatcher
+            .send_message(KvMessage::Get {
+                key: dead_key.clone(),
+                reply: fresh_reply.into(),
+                priority: OpPriority::Default,
+            })
+            .unwrap();
+        let overflow = tokio::time::timeout(
+            Duration::from_secs(2),
+            dispatcher.call(
+                |reply| KvMessage::Get {
+                    key: dead_key,
+                    reply,
+                    priority: OpPriority::Default,
+                },
+                None,
+            ),
+        )
+        .await;
+
+        drop(cache_guard);
+        assert!(healthy_response.await.unwrap().is_ok());
+        assert!(fresh_response.await.unwrap().is_ok());
+        assert!(matches!(
+            overflow
+                .expect("healthy sibling reservation was reclaimed")
+                .unwrap(),
+            CallResult::Success(Err(_))
+        ));
+
+        dispatcher.drain().unwrap();
+        dispatcher.wait(None).await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn drain_racing_worker_restart_still_drains_accepted_sibling_work() {
+        let store = Arc::new(BlockingStore::default());
+        let shared = Arc::new(FragmentState::new(
+            HashMap::new(),
+            Some(store.clone()),
+            1,
+            Duration::from_secs(3600),
+        ));
+        let prefix = unique_prefix("restart-drain-race");
+        let pool = pool_config(8, None);
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (probe, probe_handle) = SupervisionProbe::spawn(None, SupervisionProbe, event_tx)
+            .await
+            .unwrap();
+        let (dispatcher, _handle) = KvActor::spawn_linked(
+            None,
+            KvActor,
+            KvArgs {
+                shared: shared.clone(),
+                fragment: FragmentId(0),
+                worker_prefix: prefix.clone(),
+                default_pool: pool.clone(),
+                high_pool: pool.clone(),
+                background_pool: pool,
+            },
+            probe.get_cell(),
+        )
+        .await
+        .unwrap();
+        let dispatcher_id = dispatcher.get_id();
+
+        // Keep accepted work active in a sibling pool. If the replacement
+        // race turns into a dispatcher handler failure, ractor skips
+        // `post_stop` and this worker is killed before it can reply.
+        let (apply_reply, apply_response) = tokio::sync::oneshot::channel();
+        dispatcher
+            .send_message(KvMessage::ApplyOp {
+                op: op("accepted-before-drain", 1),
+                priority: OpPriority::High,
+                is_replication: false,
+                reply: Some(apply_reply.into()),
+            })
+            .unwrap();
+        wait_for(|| store.entered.load(Ordering::SeqCst)).await;
+
+        // Pause a default-worker replacement in pre_start. Draining the
+        // dispatcher before releasing it makes ractor reject the new link,
+        // deterministically exercising the status-check/spawn race.
+        let worker_name = format!("{prefix}-default-worker-0");
+        let startup_gate = install_worker_startup_gate(worker_name.clone());
+        where_is(worker_name)
+            .expect("default worker should be registered")
+            .kill();
+        tokio::time::timeout(Duration::from_secs(2), startup_gate.entered.notified())
+            .await
+            .expect("replacement did not enter pre_start");
+
+        dispatcher.drain().unwrap();
+        assert!(dispatcher.get_status() >= ActorStatus::Draining);
+        startup_gate.release.notify_one();
+        store.release();
+
+        assert!(tokio::time::timeout(Duration::from_secs(2), apply_response)
+            .await
+            .expect("accepted sibling work did not finish during drain")
+            .unwrap()
+            .is_ok());
+        tokio::time::timeout(Duration::from_secs(2), dispatcher.wait(None))
+            .await
+            .expect("dispatcher did not complete its orderly drain")
+            .unwrap();
+        let terminated_cleanly = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                match event_rx.recv().await {
+                    Some(SupervisionEvent::ActorTerminated(cell, _, _))
+                        if cell.get_id() == dispatcher_id =>
+                    {
+                        break true;
+                    }
+                    Some(SupervisionEvent::ActorFailed(cell, _))
+                        if cell.get_id() == dispatcher_id =>
+                    {
+                        break false;
+                    }
+                    Some(_) => {}
+                    None => panic!("supervision probe stopped before dispatcher exit"),
+                }
+            }
+        })
+        .await
+        .expect("supervisor did not observe dispatcher exit");
+        assert!(
+            terminated_cleanly,
+            "replacement/drain race failed the dispatcher instead of terminating cleanly"
+        );
+        assert!(shared.get("accepted-before-drain").await.is_some());
+        probe.stop(None);
+        tokio::time::timeout(Duration::from_secs(2), probe_handle)
+            .await
+            .expect("supervision probe did not stop")
+            .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn blocked_background_get_does_not_stall_high_priority_or_health() {
+        let store = Arc::new(BlockingStore::default());
+        let shared = Arc::new(FragmentState::new(
+            HashMap::from([(
+                "hot".to_string(),
+                VersionedValue::new(b"value".to_vec(), 1, "test-node".to_string()),
+            )]),
+            Some(store.clone()),
+            1,
+            Duration::from_secs(3600),
+        ));
+        let prefix = unique_prefix("get-hol");
+        let pool = pool_config(8, None);
+        let (dispatcher, _handle) = KvActor::spawn(
+            None,
+            KvActor,
+            KvArgs {
+                shared,
+                fragment: FragmentId(0),
+                worker_prefix: prefix,
+                default_pool: pool.clone(),
+                high_pool: pool.clone(),
+                background_pool: pool,
+            },
+        )
+        .await
+        .unwrap();
+
+        let (apply_reply, apply_response) = tokio::sync::oneshot::channel();
+        dispatcher
+            .send_message(KvMessage::ApplyOp {
+                op: op("blocked-write", 2),
+                priority: OpPriority::Background,
+                is_replication: false,
+                reply: Some(apply_reply.into()),
+            })
+            .unwrap();
+        wait_for(|| store.entered.load(Ordering::SeqCst)).await;
+
+        let (background_reply, background_response) = tokio::sync::oneshot::channel();
+        dispatcher
+            .send_message(KvMessage::Get {
+                key: "hot".to_string(),
+                reply: background_reply.into(),
+                priority: OpPriority::Background,
+            })
+            .unwrap();
+
+        let health = tokio::time::timeout(
+            Duration::from_secs(2),
+            dispatcher.call(|reply| KvMessage::GetShedCounts { reply }, None),
+        )
+        .await;
+        let high = tokio::time::timeout(
+            Duration::from_secs(2),
+            dispatcher.call(
+                |reply| KvMessage::Get {
+                    key: "hot".to_string(),
+                    reply,
+                    priority: OpPriority::High,
+                },
+                None,
+            ),
+        )
+        .await;
+
+        // Always release the synchronous store call before asserting, so a
+        // regression cannot strand a Tokio worker thread after test failure.
+        store.release();
+        assert!(apply_response.await.unwrap().is_ok());
+        assert!(background_response.await.unwrap().is_ok());
+        assert!(matches!(
+            health
+                .expect("health query stalled behind a background worker")
+                .unwrap(),
+            CallResult::Success(_)
+        ));
+        assert!(matches!(
+            high.expect("high-priority read stalled").unwrap(),
+            CallResult::Success(Ok(Some(_)))
+        ));
+
+        dispatcher.drain().unwrap();
+        dispatcher.wait(None).await.unwrap();
     }
 }
 

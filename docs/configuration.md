@@ -157,7 +157,7 @@ mutation/control split is the `Node` integration's lifecycle-aware path.
 | Field | Meaning |
 |---|---|
 | `workers` | Worker actors in the pool. Keys sticky-route (`seahash(key) % workers`), so more workers = more parallelism, not more ordering. |
-| `queue_cap` | Max admitted-but-unprocessed ops. On overflow the op is shed and counted. |
+| `queue_cap` | Max active-plus-queued jobs accepted from the dispatcher into this priority's workers. It does not bound the shared dispatcher mailbox or replicated ingress. On overflow a client op is shed and counted. |
 | `rate_limit_per_sec` | Token-bucket rate limit (`None` = unlimited). Checked before the queue cap. |
 
 ## Hardcoded internals (not configurable)

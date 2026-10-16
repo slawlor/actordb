@@ -2,8 +2,11 @@
 
 Every fragment runs **three isolated worker pools** instead of one shared pool.
 Operations are classified by `OpPriority` and each pool has its own workers,
-queue, rate limiter, and shed counter — so bulk traffic can't starve
-latency-sensitive traffic.
+worker backlog, rate limiter, and shed counter. Bulk work cannot consume the
+workers or queue capacity reserved for latency-sensitive traffic. The
+dispatcher mailbox and each peer connection reader remain shared serialization
+points, so this is worker isolation rather than a strict end-to-end priority
+scheduler.
 
 ## Priorities
 
@@ -47,10 +50,18 @@ capacity exists elsewhere.
 
 ## Admission and shedding
 
-`WorkerPool::try_admit` checks the token bucket first, then the queue cap.
-The queue depth is a pool-level `Arc<AtomicU64>` — incremented on admit,
-decremented by the worker after each op. When either check fails, the op is
-**shed**: dropped, **counted** in the pool's shed counter, never silent.
+The dispatcher's internal pool reservation checks the token bucket first, then
+the queue cap. `queue_cap` counts jobs handed from the dispatcher to one
+priority pool, including active and worker-mailbox jobs; it does not bound the
+shared dispatcher mailbox. Admission increments a pool total and the exact
+sticky worker's generation counter. Completion or immediate send failure
+releases both, while supervision reclaims the exact terminated generation's
+remaining reservations before publishing its replacement. When rate or
+capacity admission fails, the op is **shed**: dropped, **counted** in the
+pool's shed counter, never silent. Worker unavailability instead drops the
+reply port for reply-bearing calls and is surfaced as an actor/network
+failure, not backpressure. Fire-and-forget actor messages have no result
+channel to report that failure.
 
 Shed behavior by operation:
 
@@ -93,12 +104,13 @@ allocating. Receiver actor mailboxes still count messages rather than payload
 bytes.
 
 The current custom pool does **not** provide lossless worker restart. Accepted
-jobs already queued in a dead worker's actor mailbox are dropped, and their
-shared pending count is never decremented; the leak can consume pool capacity,
-not merely one active slot. Shutdown also stops workers rather than proving
-that every accepted mailbox job completed. Replacing this lifecycle with
-ractor `Factory` admission, discard replies, worker replacement, and explicit
-drain is required before treating the queue bound as a production guarantee.
+jobs active or queued in a dead worker are dropped, their reply ports close,
+and they are not replayed; supervision does reclaim their reservations, so a
+replacement starts with its full configured capacity. Orderly shutdown is
+different: it closes every worker mailbox, drains the work accepted before
+that fence, and joins every worker before the final fragment flush. Replacing
+the remaining custom lifecycle with ractor `Factory` admission and an explicit
+discard/requeue policy is still required for lossless restart.
 
 ## Observability
 
@@ -108,12 +120,14 @@ background counter under bulk loads and the default/high counters for
 capacity planning; any sustained shedding on `High` means the pool is
 undersized.
 
-## The isolation guarantee
+## Isolation boundary
 
-The property the design is built around: **background saturation must not move
-high-priority p99.** The `background_saturation_leaves_high_priority_p99_unaffected`
-integration test asserts exactly this, and
-`queue_cap_shed_is_explicit_and_counted` asserts that hitting the cap is
-explicit and counted. Worker execution remains isolated by priority, while a
-completed local mutation is visible through the shared fragment cache to all
-three pools.
+Worker execution and admitted backlogs are isolated by priority. A worker-bound
+`Get` carries the caller's reply port directly, so waiting behind background
+work no longer blocks the dispatcher from admitting a high-priority request or
+serving health/supervision messages. The shared dispatcher ingress, cache
+locks, snapshot/flush handlers, and peer connection reader are not isolated.
+`background_saturation_leaves_high_priority_p99_unaffected` covers ordinary
+load, `blocked_background_get_does_not_stall_high_priority_or_health` covers
+the dispatcher handoff, and `queue_cap_shed_is_explicit_and_counted` covers
+explicit capacity shedding.

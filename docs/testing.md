@@ -137,7 +137,12 @@ process — the bulk of behavioral coverage:
 - **Backpressure**: `background_saturation_leaves_high_priority_p99_unaffected`,
   `queue_cap_shed_is_explicit_and_counted`,
   `forwarded_priority_preserved_end_to_end`,
-  `forwarded_single_put_returns_remote_backpressure`.
+  `forwarded_single_put_returns_remote_backpressure`. Actor unit tests add
+  deterministic coverage for standalone rate/cap accounting, immediate worker
+  send rollback, cancellation retaining its slot until worker completion,
+  reclaiming only a dead worker generation's active and queued reservations,
+  clean drain when worker replacement races shutdown, and proving a blocked
+  background `Get` does not stall high-priority reads or health queries.
 - **Remote mutation failures**:
   `forwarded_put_returns_remote_storage_failure`; node unit tests reject
   unspecified statuses and malformed result order/cardinality.
