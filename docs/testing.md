@@ -41,6 +41,21 @@ separate instrumented cache. A new test-cache key starts cold; native RocksDB
 compilation can take many minutes. Compatible warm dependency artifacts reduce
 that work, but every build/check still runs and workspace crates still compile.
 
+The Rust installation action is pinned to a reviewed commit, with explicit
+`toolchain: 1.88.0` for MSRV and `stable` for the remaining jobs. Dependabot can
+update the action without silently changing the advertised minimum compiler.
+Cargo updates are grouped into one PR and GitHub Actions updates into another;
+no package is ignored. Breaking upgrades can still require source migrations
+and compatibility review (notably keeping the HMAC/SHA digest versions aligned).
+Independent handshake proof/transcript vectors and constant-time verification
+regressions protect wire compatibility when those crypto crates change.
+
+The internal xtask owns its Clap 4 command parser instead of enabling
+xtaskops' old Clap 3 facade (which pulled in the obsolete `atty` crate).
+Its seven commands, `coverage -d`/`--dev`, and bloat `-p`/`--package` flags
+still dispatch to the same xtaskops task helpers. Parser and process-level
+help/error/`vars` tests run without executing cleanup or coverage tasks.
+
 Docker CI uses `docker/build-push-action` to build and load one
 `actordb-docker-test:latest` image for all three Compose services. Its explicit
 `type=gha,scope=actordb-docker-test` import/export uses `mode=max` to retain

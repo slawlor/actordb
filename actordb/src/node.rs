@@ -9869,7 +9869,7 @@ fn jitter(backoff: Duration) -> Duration {
 /// path fans out from the coordinator instead.
 fn fresh_hello(node_id: &str) -> Result<Hello, getrandom::Error> {
     let mut challenge = vec![0u8; HANDSHAKE_CHALLENGE_BYTES];
-    getrandom::getrandom(&mut challenge)?;
+    getrandom::fill(&mut challenge)?;
     Ok(Hello {
         node_id: node_id.to_string(),
         auth_tag: Vec::new(),
@@ -9933,7 +9933,7 @@ fn handshake_auth_tag(
     dialer: &Hello,
     listener: &Hello,
 ) -> Vec<u8> {
-    use hmac::{Hmac, Mac};
+    use hmac::{Hmac, KeyInit, Mac};
     use sha2::Sha256;
 
     let mut mac = Hmac::<Sha256>::new_from_slice(secret).expect("HMAC accepts any key length");
@@ -9954,7 +9954,7 @@ fn verify_handshake_auth(
     listener: &Hello,
     tag: &[u8],
 ) -> bool {
-    use hmac::{Hmac, Mac};
+    use hmac::{Hmac, KeyInit, Mac};
     use sha2::Sha256;
 
     match secret {
@@ -12474,6 +12474,26 @@ mod tests {
             challenge: vec![2; HANDSHAKE_CHALLENGE_BYTES],
         };
         let authenticated = handshake_auth_tag(b"secret", true, &dialer, &listener);
+        // Independently computed SHA-256/HMAC vectors pin the existing wire
+        // transcript across crypto dependency upgrades (including proof roles).
+        let hex = |bytes: &[u8]| {
+            bytes
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        };
+        assert_eq!(
+            hex(&authenticated),
+            "bf1f1d4d7d3f00cdb1779c3b07e6d2423e277edf4299f97d76b12a009e30a789"
+        );
+        assert_eq!(
+            hex(&handshake_auth_tag(b"secret", false, &dialer, &listener)),
+            "2c559f59039bfd7b1fcff6a3a2485436ceafe30e54dda01976f0ae1064624388"
+        );
+        assert_eq!(
+            hex(&connection_rank(&dialer, &listener).transcript_id),
+            "9727cd8af4115a169d5a56bde17a0903425baae9bca3664ca830f3b4cc06728b"
+        );
         assert!(verify_handshake_auth(
             Some(b"secret"),
             true,
@@ -12481,6 +12501,22 @@ mod tests {
             &listener,
             &authenticated,
         ));
+        assert!(!verify_handshake_auth(
+            Some(b"different secret"),
+            true,
+            &dialer,
+            &listener,
+            &authenticated,
+        ));
+        for malformed in [&authenticated[..31], &[0; 33][..]] {
+            assert!(!verify_handshake_auth(
+                Some(b"secret"),
+                true,
+                &dialer,
+                &listener,
+                malformed,
+            ));
+        }
         assert!(!verify_handshake_auth(
             Some(b"secret"),
             false,

@@ -7,5 +7,6 @@ rust-version = "1.88"
 publish = false
 
 [dependencies]
-xtaskops = "0.4"
+xtaskops = { version = "0.4.2", default-features = false }
+clap = "4.6.7"
 anyhow = "1"

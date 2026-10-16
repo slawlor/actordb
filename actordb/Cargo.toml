@@ -32,14 +32,14 @@ rocksdb = ["dep:rocksdb"]
 bon = { version = "3.10.2" }
 bytes = { version = "1" }
 futures = { version = "0.3" }
-getrandom = { version = "0.2" }
-hmac = { version = "0.12" }
+getrandom = { version = "0.4.3" }
+hmac = { version = "0.13.0" }
 prost = { version = "0.14" }
 prost-types = { version = "0.14" }
 ractor = { version = "0.16" }
 rocksdb = { version = "0.25", optional = true }
 seahash = { version = "4" }
-sha2 = { version = "0.10" }
+sha2 = { version = "0.11.1" }
 tokio = { version = "1", features = ["sync", "time", "net", "io-util"] }
 tracing = "0.1"
 # Optional dependencies
@@ -48,7 +48,7 @@ tracing = "0.1"
 criterion = { version = "0.8.2", features = ["async_tokio"] }
 tempfile = "3"
 tokio = { version = "1", features = ["rt", "time", "sync", "macros", "rt-multi-thread", "signal", "test-util"] }
-tracing-glog = "0.3"
+tracing-glog = "0.4.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"]}
 tracing-test = "0.2"
 
