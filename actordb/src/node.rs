@@ -85,6 +85,11 @@ use read_service::{
     ReadJob, ReadRequest, ReadRoute, ReadService, READ_KEY_BYTE_CAPACITY, READ_QUEUE_CAPACITY,
     READ_WORKERS_PER_PRIORITY,
 };
+mod mutation_service;
+use mutation_service::{
+    MutationJob, MutationRequest, MutationService, FORWARDED_MUTATION_BYTE_CAPACITY,
+    FORWARDED_MUTATION_CAPACITY,
+};
 
 /// Current peer wire protocol version. Hello ranges must include this value.
 /// Version 3 replaces monolithic full-state sync with byte-bounded,
@@ -962,6 +967,7 @@ struct ConnContext {
     runtime_options: NodeRuntimeOptions,
     receive_byte_budget: Arc<Semaphore>,
     relay_admission: Arc<RelayAdmission>,
+    mutation_service: Arc<MutationService>,
     sender_reports: SenderReportMap,
     /// Notify the placement driver on peer join/leave. `None` in
     /// static mode.
@@ -2016,6 +2022,7 @@ pub struct Node {
     inbound_connections: Arc<Semaphore>,
     receive_byte_budget: Arc<Semaphore>,
     relay_admission: Arc<RelayAdmission>,
+    mutation_service: Arc<MutationService>,
     dial_intents: Arc<StdMutex<HashMap<SocketAddr, DialIntentState>>>,
     dial_intent_changes: watch::Sender<u64>,
     peer_changes: watch::Sender<u64>,
@@ -2050,6 +2057,7 @@ impl Drop for Node {
         // Async cleanup still belongs to `shutdown`, but never leave task
         // admission open merely because a caller dropped the handle.
         self.operation_gate.begin_shutdown();
+        self.mutation_service.request_shutdown();
         self.placement_tasks.request_shutdown();
         self.tasks.request_shutdown();
         if let Ok(senders) = self.senders.try_lock() {
@@ -2759,6 +2767,8 @@ pub struct NodeRuntimeOptions {
     relay_key_byte_capacity: usize,
     serving_read_queue_capacity: usize,
     serving_read_key_byte_capacity: usize,
+    forwarded_mutation_capacity: usize,
+    forwarded_mutation_byte_capacity: usize,
     queue_admission_timeout: Duration,
     reconcile_data_admission_timeout: Duration,
     forwarded_attempt_timeout: Duration,
@@ -2782,6 +2792,8 @@ impl Default for NodeRuntimeOptions {
             relay_key_byte_capacity: RELAY_KEY_BYTE_CAPACITY,
             serving_read_queue_capacity: READ_QUEUE_CAPACITY,
             serving_read_key_byte_capacity: READ_KEY_BYTE_CAPACITY,
+            forwarded_mutation_capacity: FORWARDED_MUTATION_CAPACITY,
+            forwarded_mutation_byte_capacity: FORWARDED_MUTATION_BYTE_CAPACITY,
             queue_admission_timeout: REMOTE_RPC_TIMEOUT,
             reconcile_data_admission_timeout: RECONCILE_DATA_ADMISSION_TIMEOUT,
             forwarded_attempt_timeout: REMOTE_RPC_TIMEOUT,
@@ -2873,6 +2885,28 @@ impl NodeRuntimeOptions {
     /// per-connection encoded writer queues. The minimum is 16 MiB.
     pub fn with_serving_read_key_byte_capacity(mut self, capacity: usize) -> Self {
         self.serving_read_key_byte_capacity = capacity;
+        self
+    }
+
+    /// Set the node-wide serving forwarded-mutation completion count, including
+    /// queued/active single puts and batches and completed results awaiting
+    /// their reader. Default 128. Admission never waits and rejects explicitly
+    /// as `Unavailable` before apply. Execution has eight workers per priority,
+    /// but the aggregate admission budget is shared across all priorities.
+    pub fn with_forwarded_mutation_capacity(mut self, capacity: usize) -> Self {
+        self.forwarded_mutation_capacity = capacity;
+        self
+    }
+
+    /// Set retained serving forwarded-mutation request/RPC payload storage.
+    /// Default 64 MiB. Charges allocated request String/Vec storage and buffers,
+    /// plus the largest single ApplyOp clone and its correlation key. Does not
+    /// charge raw frames, response-builder overhead, caches, sender copies,
+    /// allocator overhead, or total heap. Nonzero smaller budgets may reject
+    /// otherwise legal requests. Accepted work retains admission through apply,
+    /// exact outcomes, fanout and reader encoding, even if its waiter disappears.
+    pub fn with_forwarded_mutation_byte_capacity(mut self, capacity: usize) -> Self {
+        self.forwarded_mutation_byte_capacity = capacity;
         self
     }
 
@@ -2986,6 +3020,16 @@ impl NodeRuntimeOptions {
         self.serving_read_key_byte_capacity
     }
 
+    /// Current node-wide serving forwarded-mutation completion count limit.
+    pub fn forwarded_mutation_capacity(&self) -> usize {
+        self.forwarded_mutation_capacity
+    }
+
+    /// Current serving forwarded-mutation request/RPC payload storage budget.
+    pub fn forwarded_mutation_byte_capacity(&self) -> usize {
+        self.forwarded_mutation_byte_capacity
+    }
+
     /// Current peer-queue admission timeout.
     pub fn queue_admission_timeout(&self) -> Duration {
         self.queue_admission_timeout
@@ -3042,6 +3086,14 @@ impl NodeRuntimeOptions {
         for (name, capacity) in [
             ("relay capacity", self.relay_capacity),
             ("relay key byte capacity", self.relay_key_byte_capacity),
+            (
+                "forwarded mutation capacity",
+                self.forwarded_mutation_capacity,
+            ),
+            (
+                "forwarded mutation byte capacity",
+                self.forwarded_mutation_byte_capacity,
+            ),
         ] {
             if capacity == 0 || capacity > Semaphore::MAX_PERMITS {
                 return Err(NodeError::Actor(format!(
@@ -3689,6 +3741,10 @@ impl Node {
                 runtime_options.relay_capacity,
                 runtime_options.relay_key_byte_capacity,
             ),
+            mutation_service: MutationService::new(
+                runtime_options.forwarded_mutation_capacity,
+                runtime_options.forwarded_mutation_byte_capacity,
+            ),
             dial_intents: Arc::new(StdMutex::new(HashMap::new())),
             dial_intent_changes,
             peer_changes,
@@ -3956,6 +4012,7 @@ impl Node {
             runtime_options: self.runtime_options.clone(),
             receive_byte_budget: self.receive_byte_budget.clone(),
             relay_admission: self.relay_admission.clone(),
+            mutation_service: self.mutation_service.clone(),
             sender_reports: self.sender_reports.clone(),
             membership_tx: self.membership_tx.clone(),
             cluster_secret: self.cluster_secret.clone(),
@@ -5156,11 +5213,16 @@ impl Node {
         progress: &mut ShutdownProgress,
     ) -> Result<(), NodeError> {
         if matches!(progress, ShutdownProgress::StoppingTransport) {
+            self.mutation_service.request_shutdown();
             // Placement owns fragment and sender topology. Join it before the
             // general task set so no cancelled transition can publish work
             // after the transport/sender snapshot below.
             self.placement_tasks.shutdown().await;
             self.tasks.shutdown().await;
+            // Transport cancellation closes RPC waiters, not accepted apply
+            // ownership. Drain complete outcomes/fanout while every sender and
+            // fragment actor is still alive. A canceled caller may resume this.
+            self.mutation_service.shutdown().await;
 
             // Release every request/relay waiter retained by a cancelled
             // handler. Admitted remote operations then leave the public gate
@@ -7441,6 +7503,7 @@ async fn handle_connection(
         runtime_options,
         receive_byte_budget,
         relay_admission,
+        mutation_service,
         sender_reports,
         membership_tx,
         cluster_secret,
@@ -8682,50 +8745,33 @@ async fn handle_connection(
                 };
                 let is_serving = serving.read().unwrap().contains(&frag);
                 if is_serving {
-                    let result = match router.route_for_fragment(frag) {
-                        Some(actor) => {
-                            let replicated = ReplicatedOp {
-                                key: p.key.clone(),
-                                value: {
-                                    let mut v = VersionedValue::new(
-                                        p.value.clone(),
-                                        p.timestamp_ms,
-                                        p.node_id.clone(),
-                                    );
-                                    v.expires_at_ms =
-                                        (p.expires_at_ms != 0).then_some(p.expires_at_ms);
-                                    v.is_tombstone = p.is_tombstone;
-                                    v
-                                },
-                                seq: p.seq,
-                                boot_id: p.boot_id,
-                            };
-                            apply_forwarded_mutation(
-                                &actor,
-                                &senders,
-                                frag,
-                                replicated,
-                                priority_from_proto(p.priority),
-                                0,
-                            )
-                            .await
+                    let Some(actor) = router.route_for_fragment(frag) else {
+                        drop(mutation_lease);
+                        if !send_unavailable_mutation(
+                            &tx,
+                            p.req_id,
+                            vec![p.key],
+                            &format!("serving fragment {frag} has no actor"),
+                        ) {
+                            break;
                         }
-                        None => mutation_result(
-                            p.key.clone(),
-                            0,
-                            Err(NodeError::Network(format!(
-                                "serving fragment {frag} has no actor"
-                            ))),
-                        ),
+                        continue;
                     };
-                    drop(mutation_lease);
-                    if !send_mutation_response(
-                        &tx,
-                        MutationResponse {
-                            req_id: p.req_id,
-                            results: vec![result],
-                        },
-                    ) {
+                    let (job, completion) = MutationJob::new(
+                        MutationRequest::Single(p),
+                        actor,
+                        senders.clone(),
+                        frag,
+                        operation,
+                        mutation_lease,
+                    );
+                    mutation_service.submit(job);
+                    // Preserve connection frame order. Cancellation of this
+                    // waiter never cancels the owned apply/outcome/fanout job.
+                    let Ok(completion) = completion.await else {
+                        break;
+                    };
+                    if !completion.send(&tx) {
                         break;
                     }
                 } else if p.hops < MAX_FORWARD_HOPS {
@@ -8993,7 +9039,6 @@ async fn handle_connection(
                     tracing::warn!(%error, "rejecting irreducible item in batch put");
                     break;
                 }
-                let batch_priority = priority_from_proto(bp.priority);
                 if let Some(timestamp_ms) = bp.puts.iter().map(|p| p.timestamp_ms).max() {
                     if !observe_remote_timestamp(&hlc, timestamp_ms, "BatchPut").await {
                         break;
@@ -9067,34 +9112,19 @@ async fn handle_connection(
                     }
                     continue;
                 };
-                let req_id = bp.req_id;
-                let mut results = Vec::with_capacity(bp.puts.len());
-                for (request_index, p) in bp.puts.into_iter().enumerate() {
-                    let replicated = ReplicatedOp {
-                        key: p.key,
-                        value: {
-                            let mut v = VersionedValue::new(p.value, p.timestamp_ms, p.node_id);
-                            v.expires_at_ms = (p.expires_at_ms != 0).then_some(p.expires_at_ms);
-                            v.is_tombstone = p.is_tombstone;
-                            v
-                        },
-                        seq: p.seq,
-                        boot_id: p.boot_id,
-                    };
-                    results.push(
-                        apply_forwarded_mutation(
-                            &actor,
-                            &senders,
-                            frag,
-                            replicated,
-                            batch_priority,
-                            request_index,
-                        )
-                        .await,
-                    );
-                }
-                drop(mutation_lease);
-                if !send_mutation_response(&tx, MutationResponse { req_id, results }) {
+                let (job, completion) = MutationJob::new(
+                    MutationRequest::Batch(bp),
+                    actor,
+                    senders.clone(),
+                    frag,
+                    operation,
+                    mutation_lease,
+                );
+                mutation_service.submit(job);
+                let Ok(completion) = completion.await else {
+                    break;
+                };
+                if !completion.send(&tx) {
                     break;
                 }
             }
@@ -11022,7 +11052,7 @@ mod tests {
         }
     }
 
-    async fn test_connection_context(
+    pub(super) async fn test_connection_context(
         router: FragmentRouter,
         serving: Arc<RwLock<HashSet<FragmentId>>>,
         placement: Arc<RwLock<HashMap<FragmentId, Vec<String>>>>,
@@ -11064,6 +11094,10 @@ mod tests {
                 runtime_options: NodeRuntimeOptions::default(),
                 receive_byte_budget: Arc::new(Semaphore::new(RECEIVE_BYTE_CAPACITY)),
                 relay_admission: RelayAdmission::new(RELAY_CAPACITY, RELAY_KEY_BYTE_CAPACITY),
+                mutation_service: MutationService::new(
+                    FORWARDED_MUTATION_CAPACITY,
+                    FORWARDED_MUTATION_BYTE_CAPACITY,
+                ),
                 sender_reports,
                 membership_tx: None,
                 cluster_secret: None,
@@ -11073,7 +11107,10 @@ mod tests {
         )
     }
 
-    async fn complete_test_handshake(stream: &mut tokio::io::DuplexStream, peer_id: &str) {
+    pub(super) async fn complete_test_handshake(
+        stream: &mut tokio::io::DuplexStream,
+        peer_id: &str,
+    ) {
         assert!(matches!(
             read_test_envelope(stream).await.msg,
             Some(EnvelopeMsg::Hello(_))
@@ -11119,13 +11156,16 @@ mod tests {
         }
     }
 
-    async fn write_test_envelope(stream: &mut tokio::io::DuplexStream, envelope: Envelope) {
+    pub(super) async fn write_test_envelope(
+        stream: &mut tokio::io::DuplexStream,
+        envelope: Envelope,
+    ) {
         let frame = envelope.encode_to_vec();
         stream.write_u32(frame.len() as u32).await.unwrap();
         stream.write_all(&frame).await.unwrap();
     }
 
-    async fn read_test_envelope(stream: &mut tokio::io::DuplexStream) -> Envelope {
+    pub(super) async fn read_test_envelope(stream: &mut tokio::io::DuplexStream) -> Envelope {
         tokio::time::timeout(Duration::from_secs(1), async {
             let len = stream.read_u32().await.unwrap() as usize;
             let mut frame = vec![0; len];
@@ -11676,6 +11716,8 @@ mod tests {
         assert_eq!(options.relay_key_byte_capacity(), 64 * 1024 * 1024);
         assert_eq!(options.serving_read_queue_capacity(), 64);
         assert_eq!(options.serving_read_key_byte_capacity(), 64 * 1024 * 1024);
+        assert_eq!(options.forwarded_mutation_capacity(), 128);
+        assert_eq!(options.forwarded_mutation_byte_capacity(), 64 * 1024 * 1024);
         assert_eq!(options.queue_admission_timeout(), Duration::from_secs(5));
         assert_eq!(
             options.reconcile_data_admission_timeout(),
@@ -11701,6 +11743,14 @@ mod tests {
                 .with_relay_key_byte_capacity(capacity)
                 .validate()
                 .is_err());
+            assert!(NodeRuntimeOptions::default()
+                .with_forwarded_mutation_capacity(capacity)
+                .validate()
+                .is_err());
+            assert!(NodeRuntimeOptions::default()
+                .with_forwarded_mutation_byte_capacity(capacity)
+                .validate()
+                .is_err());
         }
         assert!(NodeRuntimeOptions::default()
             .with_relay_capacity(1)
@@ -11715,6 +11765,11 @@ mod tests {
         ] {
             assert!(options.validate().is_err());
         }
+        assert!(NodeRuntimeOptions::default()
+            .with_forwarded_mutation_capacity(1)
+            .with_forwarded_mutation_byte_capacity(1)
+            .validate()
+            .is_ok());
         assert!(NodeRuntimeOptions::default()
             .with_socket_write_timeout(Duration::MAX)
             .validate()

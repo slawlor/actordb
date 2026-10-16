@@ -92,6 +92,20 @@ Shed behavior by operation:
   mutation result. A shed single put or batch entry reaches the origin as
   `NodeError::Backpressure`; it is never reported as success.
 
+Serving forwarded single puts and whole batches additionally use a node-owned
+completion queue: 128 aggregate jobs and 64 MiB retained request/RPC payload by
+default, configurable through `NodeRuntimeOptions`. Admission never waits and
+returns ordered `Unavailable` before any apply when either budget is full.
+Eight workers per priority reserve execution capacity, but count/byte admission
+is shared: Background overload can reject High, so this is not strict
+end-to-end priority isolation. Payload accounting includes request headers,
+allocated String/Vec backing storage, and the largest single actor RPC clone
+plus its correlation key; it excludes response metadata, caches, sender copies,
+raw frames and allocator overhead. Accepted work retains its operation and
+placement leases through exact outcome handling and fanout even after reader
+cancellation. The reader still awaits completion before reading the next frame;
+replicated/reconciled applies remain inline and are not covered by this owner.
+
 Wire-size admission is a separate safety boundary from queue depth. Before a
 mutation is applied locally, actordb verifies that the record can fit every
 required single-record protocol envelope. Summary, fetch, data, repair, and

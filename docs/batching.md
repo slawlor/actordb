@@ -161,6 +161,16 @@ Per-key result mapping in a `BatchGetResponse`:
 
 ## Error semantics
 
+A serving `BatchPut` is admitted as one bounded completion job and its entries
+remain sequential, including duplicate keys and exact original indices. Count
+or request/RPC payload exhaustion returns per-position `Unavailable` before
+apply. Once accepted, cancellation of the origin reader does not discard a
+partially applied batch's suffix or sender fanout. The reader nevertheless waits
+for the entire result before handling subsequent frames, so this ownership
+change does not reorder a single put, batch, or replication/session frame on
+that connection. Normal node shutdown drains these jobs before stopping actors
+or senders; last-Node drop remains best effort.
+
 `NodeError::Actor` = misconfiguration (no usable replica listed) or a local
 actor-framework failure.
 `NodeError::Network` = connectivity (no replica reachable).

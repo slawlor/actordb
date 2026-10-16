@@ -98,6 +98,8 @@ does not break exhaustive `NodeConfig` literals. `Node::start` uses
 | `with_relay_key_byte_capacity` / `relay_key_byte_capacity` | `64 MiB` | Node-wide retained relay request-key storage: String headers and buffer capacities, plus batch Vec header and allocated String slots, including unused capacity. Not mutation payloads, writer buffers, decoded frames, caches, allocator overhead, or total heap. Fixed relay/timer overhead is separately count-bounded. No minimum other than nonzero; smaller budgets may reject otherwise legal key sets. |
 | `with_serving_read_queue_capacity` / `serving_read_queue_capacity` | `64` jobs/class | Node-wide serving single/batch-read queue per priority, backed by eight fixed workers/class. Count admission also includes active and actor-retained jobs (queue capacity + eight). Nonzero. |
 | `with_serving_read_key_byte_capacity` / `serving_read_key_byte_capacity` | `64 MiB`/class | Node-wide retained decoded read-key storage per priority, charging String buffer capacities and Vec/String headers through actor ownership after waiter cancellation. Separate from raw receive bodies, values, cache, and writer queues; at least 16 MiB. |
+| `with_forwarded_mutation_capacity` / `forwarded_mutation_capacity` | `128` jobs | Aggregate serving forwarded single puts/batches, queued or active, plus completed results awaiting their reader. Nonwaiting admission rejects with ordered `Unavailable` before apply. Eight execution workers per priority share this count and byte admission. |
+| `with_forwarded_mutation_byte_capacity` / `forwarded_mutation_byte_capacity` | `64 MiB` | Allocated request headers, String/Vec backing capacities and buffers, plus the largest one-at-a-time `ApplyOp` clone and correlation key. Retained through apply, outcomes, sender handoff and response encoding; not a total-heap bound. Any nonzero representable budget is valid, but small budgets reject otherwise legal requests. |
 | `with_queue_admission_timeout` / `queue_admission_timeout` | `5 s` | One absolute maximum wait to reserve a peer-queue frame slot and its exact encoded-byte permits. Expiry cancels that connection; an outbound peer is then redialed. |
 | `with_reconcile_data_admission_timeout` / `reconcile_data_admission_timeout` | `30 s` | Admission wait for each streamed reconciliation-data page. This longer, explicit budget lets a legal near-16 MiB value wait behind another frame while the socket writer is still healthy. Tune with `SenderConfig::reconcile_timeout` and `socket_write_timeout`. |
 | `with_forwarded_attempt_timeout` / `forwarded_attempt_timeout` | `5 s` | Total budget for one forwarded owner attempt, including queue admission and response. Serving read jobs use a separate absolute deadline from receipt through service queue/actor wait. Batch holder attempts and remote fragment groups remain sequential. |
@@ -114,6 +116,14 @@ runtime timeout nonzero; startup rejects invalid or unrepresentable values.
 The receive budget counts encoded bodies, excluding four-byte length prefixes,
 socket/kernel buffers, protobuf object overhead, and decoded or actor/cache/
 relay/caller copies. There is no wire compression. It is not a total heap bound.
+The separate forwarded mutation payload budget excludes raw receive bodies,
+response-result metadata/error/winner allocations, caches, replication sender
+copies, allocator overhead and socket buffers. A batch is one admitted job;
+its entries apply sequentially with unchanged per-position outcomes. The reader
+still awaits that whole job, preserving same-connection mutation/replication
+frame order. Accepted work is not aborted when that reader disappears. Reserved
+execution workers do not reserve aggregate admission for High: overload from
+other priorities can explicitly reject High too.
 Error, EOF, body timeout, connection cancellation, and task abort release raw
 receive reservations through RAII. Operation priority selects the local or remote actor pool, but it does
 not schedule the ordinary peer data lane or socket writer. The peer writer

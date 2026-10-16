@@ -114,7 +114,9 @@ async fn main() -> Result<(), actordb::node::NodeError> {
 - `node.shutdown().await` is a fallible, one-way lifecycle fence. It rejects
   later public data operations with `NodeError::ShuttingDown`, aborts and joins
   listener, connection, writer, dial, timer, and placement tasks, wakes
-  admitted remote requests, waits for admitted API work, then stops replication
+  admitted remote requests, non-abortively drains accepted serving forwarded
+  single/batch mutation completion while actors/senders remain live, waits for
+  admitted API work, then stops replication
   senders. Every fragment closes cleaner/snapshotter admission, drains its
   dispatcher and worker mailboxes, materializes expired values, and reports its
   final local-store flush before any supervisor state is destroyed.

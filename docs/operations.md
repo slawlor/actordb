@@ -181,7 +181,9 @@ keys against the captured transcript and HMAC.
 Call `node.shutdown().await` and handle its `Result`. The first call atomically
 closes public-operation admission; later data calls receive
 `NodeError::ShuttingDown`. Shutdown aborts and joins listener, connection,
-writer, dial, relay-timer, and placement work, releases pending network
+writer, dial, relay-timer, and placement work. It closes and non-abortively
+drains the separate serving forwarded single/batch mutation completion owner
+while actors and replication senders remain live, then releases pending network
 waiters, waits for calls admitted before the fence, and stops replication
 senders. It then closes periodic fragment producers, drains dispatchers and
 worker mailboxes, materializes TTL expirations, and flushes every local store
@@ -195,6 +197,11 @@ durability fence, not a replication-convergence fence: current shutdown stops
 senders without waiting for peer ACKs. Transport cancellation can also drop an
 inbound mutation response after that mutation applied locally, so peers and
 clients must retry stamped/idempotent requests after disconnect. Dropping
+the response waiter does not cancel accepted forwarded apply, exact outcome
+handling, or sender handoff. The completion owner retains its operation fence,
+placement authority and request/RPC payload permits through that work; a
+cancelled normal-shutdown caller can resume the same drain. It adds no apply
+deadline that could orphan an already-queued actor mutation. Merely dropping
 `Node` remains best effort and cannot await or report flush, join, or RocksDB
 lock-release outcomes. It therefore leaves the same live RocksDB object
 fail-closed to reattachment; call and await `shutdown` for reusable ownership.
