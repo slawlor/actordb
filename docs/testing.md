@@ -2,6 +2,12 @@
 
 Three layers, each catching what the others can't.
 
+The separate `Verify release package` workflow check additionally verifies
+unpacked crates.io packages with default and no-default features and runs
+stdlib release-guard regressions. PR and `main` runs have no registry token and
+do not publish to crates.io. See the [release procedure](releases.md) for tag/main provenance,
+release-event tests, credentials, and publication behavior.
+
 ## CI feature coverage and caches
 
 CI tests the default workspace once, including the offered RocksDB backend,

@@ -6,6 +6,7 @@ description = "Dockerized multi-node integration test scenarios for actordb"
 license = "MIT"
 edition = "2021"
 rust-version = "1.88"
+publish = false
 
 [[bin]]
 name = "actordb-docker-test"

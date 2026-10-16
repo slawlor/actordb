@@ -1,32 +1,92 @@
 name: Publish
 
 on:
+  pull_request:
+    types: [opened, reopened, synchronize]
+  push:
+    branches: [main]
   release:
     types: [published]
 
+permissions:
+  contents: read
+
+# Serialize crates.io uploads; never cancel an in-flight publication. PR and
+# main validation have independent groups and cannot trigger an upload.
+concurrency:
+  group: actordb-release-${{ github.event_name == 'release' && 'crates-io' || github.ref }}
+  cancel-in-progress: false
+
 jobs:
   publish:
-    runs-on: ${{ matrix.os }}
-    strategy:
-      matrix:
-        os: [ubuntu-latest]
-        rust: [stable]
-
+    name: Verify release package
+    if: github.event_name != 'release' || (!github.event.release.draft && !github.event.release.prerelease)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
-    - uses: hecrj/setup-rust-action@v2
-      with:
-        rust-version: ${{ matrix.rust }}
-    
-    - uses: actions/checkout@main
-    
-    - name: Login to crates.io
-      run: cargo login $CRATES_IO_TOKEN
-      env:
-        CRATES_IO_TOKEN: ${{ secrets.crates_io_token }}
-    
-    - name: Dry run publish ractor_actors
-      run: cargo publish --dry-run --manifest-path Cargo.toml -p actordb
-    - name: Publish crate ractor_actors
-      run: cargo publish --manifest-path Cargo.toml -p actordb
-      env:
-        CARGO_REGISTRY_TOKEN: ${{ secrets.crates_io_token }}
+      - name: Checkout the event commit
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          # The release guard needs main's history, not just the tagged commit.
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: stable-debug-tests
+
+      - name: Test release guards
+        env:
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: python3 -m unittest discover -s .github/scripts -p 'test_verify_release.py' -v
+
+      - name: Check the bundled license matches the workspace license
+        run: cmp LICENSE actordb/LICENSE
+
+      - name: Verify crate version and release provenance
+        id: release
+        env:
+          RELEASE_EVENT: ${{ github.event_name }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          if [ "$RELEASE_EVENT" = release ]; then
+            python3 .github/scripts/verify_release.py --tag "$RELEASE_TAG"
+          else
+            python3 .github/scripts/verify_release.py
+          fi
+
+      - name: Verify the default package, including RocksDB
+        run: cargo publish --dry-run --locked --package actordb --registry crates-io
+
+      - name: Verify the package without RocksDB
+        run: cargo publish --dry-run --locked --package actordb --registry crates-io --no-default-features
+
+      # PR/main already have the full CI suite. Repeat crate tests on a release
+      # event so publication does not rely solely on an earlier branch check.
+      - name: Test the release with and without RocksDB
+        if: github.event_name == 'release'
+        run: |
+          cargo test --locked --package actordb
+          cargo test --locked --package actordb --no-default-features
+
+      - name: Upload the verified crate for inspection
+        uses: actions/upload-artifact@v7
+        with:
+          name: actordb-${{ steps.release.outputs.version }}
+          path: target/package/actordb-${{ steps.release.outputs.version }}.crate
+          if-no-files-found: error
+
+      - name: Publish actordb to crates.io
+        if: github.event_name == 'release'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          if [ -z "$CARGO_REGISTRY_TOKEN" ]; then
+            echo 'Set the repository CARGO_REGISTRY_TOKEN secret to a crates.io token authorized to publish actordb.' >&2
+            exit 1
+          fi
+          cargo publish --locked --package actordb --registry crates-io

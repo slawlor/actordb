@@ -10,6 +10,24 @@ A rust actor-based distributed database based on *RocksDb*
 
 * `actordb`: ![actordb Downloads](https://img.shields.io/crates/d/actordb.svg)
 
+## Crate installation
+
+The next release is `0.2.0` (Rust 1.88+). After it is published:
+
+```toml
+[dependencies]
+actordb = "0.2"
+```
+
+RocksDB support is enabled by default; configure a store to enable persistence
+for a node. Use `actordb = { version = "0.2", default-features = false }` for
+a build without the RocksDB backend. Both configurations build protobuf from
+source; the default additionally requires libclang for RocksDB's bindings.
+
+This remains pre-1.0 software, and `0.2` includes breaking API, wire-protocol,
+and legacy-store compatibility changes. Read the [release notes](CHANGELOG.md)
+and [release procedure](docs/releases.md) before upgrading or publishing.
+
 ## Working prototype
 
 A working, tested prototype of the actor-first sharded database vision:
@@ -92,6 +110,7 @@ Comprehensive guides live in [`docs/`](docs/):
 - [Operations](docs/operations.md) — crash/restart, rolling restart,
   partitions, overload, what to monitor
 - [Test strategy](docs/testing.md) — unit vs integration vs Docker scenarios
+- [Releases](docs/releases.md) — package checks, version tags, and crates.io publication
 
 ## Docker integration tests
 

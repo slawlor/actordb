@@ -1,6 +1,6 @@
 [package]
 name = "actordb"
-version = "0.1.0"
+version = "0.2.0"
 authors = ["Sean Lawlor"]
 description = "An actor-first distributed database"
 documentation = "https://docs.rs/actordb"
@@ -10,7 +10,7 @@ keywords = ["actor", "ractor", "db", "database"]
 repository = "https://github.com/slawlor/actordb"
 readme = "../README.md"
 homepage = "https://github.com/slawlor/actordb"
-categories = ["actor", "erlang"]
+categories = ["asynchronous", "concurrency", "database-implementations"]
 build = "src/build.rs"
 rust-version = "1.88"
 
