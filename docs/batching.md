@@ -112,6 +112,14 @@ responses are pinned to the authenticated expected peer and validated before
 they affect the clock or caller. Because `GetResponse` cannot encode
 unavailable, actor or routing failure produces no false `found = false`
 response; the bounded attempt expires and the origin tries its next holder.
+Relayed reads and mutations additionally pin the exact expected-owner and
+origin physical channels. Their shared node-wide count and request-key storage
+budgets reject immediately, and disconnect/replacement reclaims only those
+exact channels' work. Batch mutation key accounting includes Vec/String storage
+and buffer capacities, not mutation values; the outbound writer has its own
+encoded-byte budget. Relay timers retain admission until they exit. A rejected
+mutation relay returns explicit `Unavailable` for every original position,
+preserving key order, duplicates, and operation stamps.
 
 The responder targets 1 MiB. One aggregate `KvMessage::GetBatch` continuation
 lazily admits and sticky-routes exactly one ordered key at a time. Its worker

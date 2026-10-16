@@ -180,6 +180,18 @@ process — the bulk of behavioral coverage:
   non-serving fragment cannot tear down unrelated multiplexed traffic, actor
   unavailability cannot become a false single-read miss, and direct or relayed
   single-read responses are pinned to the expected authenticated peer.
+- **Relay admission/lifetime**: `silent_owner_ingress_is_bounded_by_shared_relay_count_and_key_bytes`
+  exercises the production peer reader with a silent owner: both aggregate
+  count and key-storage saturation reject immediately, return typed mutation
+  unavailability, never fabricate read misses, and preserve the same connection
+  for a later frame. Key-accounting tests charge empty keys and unused String/Vec
+  capacity and verify rollback when the byte budget fails. Deterministic tests
+  cancel registration before timer acknowledgment and cancel blocked outbound
+  admission, checking registry, operation-fence, and timer-permit reclamation.
+  Exact owner/origin replacement and reused relay ids cannot clear newer work;
+  a raw-peer test ignores both read and mutation responses from the same peer
+  id on the wrong physical channel. Timeout and completed-response tests verify
+  unavailable semantics and cancellation of the owned timer.
 - **Backpressure**: `background_saturation_leaves_high_priority_p99_unaffected`,
   `queue_cap_shed_is_explicit_and_counted`,
   `forwarded_priority_preserved_end_to_end`,

@@ -87,6 +87,8 @@ does not break exhaustive `NodeConfig` literals. `Node::start` uses
 | `with_replication_control_message_capacity` / `replication_control_message_capacity` | `64` messages | Capacity of the separate ACK/NACK/reconciliation-response lane per fragment/peer sender. Full admission fails the contributing connection so session replay/reconciliation recovers it. A reconcile reply targeting a sender already retired by placement is ignored without dropping the shared peer connection. Peer lifecycle and on-demand reconcile signals are coalesced out of band. |
 | `with_inbound_connection_capacity` / `inbound_connection_capacity` | `1024` connections | Maximum accepted sockets concurrently handshaking or serving as inbound peers. Excess accepted sockets are closed immediately. |
 | `with_receive_byte_capacity` / `receive_byte_capacity` | `64 MiB` | Node-wide raw encoded receive bodies across accepted and outbound-dialed connections, including handshakes. Must fit at least one `16 MiB` maximum frame. Bytes are reserved before body allocation and retained through decoding and the inline handler turn. Saturation rejects only the contributing connection without waiting for capacity. |
+| `with_relay_capacity` / `relay_capacity` | `1024` relays | Node-wide aggregate admission for relayed single reads and single/batched mutations. Includes pending timer registration/enqueue and live timers until they exit. Admission never waits; saturation leaves legacy reads unavailable and returns explicit mutation `Unavailable`. |
+| `with_relay_key_byte_capacity` / `relay_key_byte_capacity` | `64 MiB` | Node-wide retained relay request-key storage: String headers and buffer capacities, plus batch Vec header and allocated String slots, including unused capacity. Not mutation payloads, writer buffers, decoded frames, caches, allocator overhead, or total heap. Fixed relay/timer overhead is separately count-bounded. No minimum other than nonzero; smaller budgets may reject otherwise legal key sets. |
 | `with_queue_admission_timeout` / `queue_admission_timeout` | `5 s` | One absolute maximum wait to reserve a peer-queue frame slot and its exact encoded-byte permits. Expiry cancels that connection; an outbound peer is then redialed. |
 | `with_reconcile_data_admission_timeout` / `reconcile_data_admission_timeout` | `30 s` | Admission wait for each streamed reconciliation-data page. This longer, explicit budget lets a legal near-16 MiB value wait behind another frame while the socket writer is still healthy. Tune with `SenderConfig::reconcile_timeout` and `socket_write_timeout`. |
 | `with_forwarded_attempt_timeout` / `forwarded_attempt_timeout` | `5 s` | Total budget for one forwarded owner attempt, including queue admission and response. Batch holder attempts and remote fragment groups remain sequential. |
@@ -107,6 +109,14 @@ receive reservations through RAII. Operation priority selects the local or remot
 not schedule the ordinary peer data lane or socket writer. The peer writer
 applies both the configured frame-count and encoded-byte bounds; sender actor
 lanes are still bounded by operation/message count.
+
+Relay capacity is reserved without waiting before registration and retained
+through the downstream attempt and its timer's exit. Registration/enqueue
+failure or cancellation rolls back synchronously. Each relay is pinned to its
+exact origin and expected-owner physical channels; disconnect or replacement
+reclaims only work belonging to those channels, not new work with the same
+authenticated peer id. Relay timeout uses `forwarded_attempt_timeout` and does
+not invent a legacy single-read miss or change mutation stamps/durability.
 
 ## `SenderConfig` (replication)
 

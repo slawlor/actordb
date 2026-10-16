@@ -181,6 +181,8 @@ let runtime = NodeRuntimeOptions::default()
     .with_replication_control_message_capacity(128)
     .with_inbound_connection_capacity(512)
     .with_receive_byte_capacity(128 * 1024 * 1024)
+    .with_relay_capacity(1024)
+    .with_relay_key_byte_capacity(64 * 1024 * 1024)
     .with_queue_admission_timeout(Duration::from_secs(2))
     .with_reconcile_data_admission_timeout(Duration::from_secs(20))
     .with_forwarded_attempt_timeout(Duration::from_secs(8))
@@ -494,6 +496,12 @@ as issues in the [issue tracker](https://github.com/slawlor/actordb/issues):
   by the sole connection reader use nonblocking admission and cancel on
   saturation, so the reader never waits behind its own writer. After at most
   16 consecutive responses, a ready data frame is written to prevent starvation.
+  Non-serving read/mutation relays separately share node-wide limits of 1024
+  live attempts/timers and 64 MiB of retained request-key storage (String/Vec
+  storage and buffer capacities, not mutation values or total heap). Admission
+  never waits; rejected mutations return `Unavailable`, and legacy reads stay
+  unavailable without false misses. Exact physical origin/owner identities
+  prevent stale disconnect cleanup from removing replacement work.
   Each Node sender
   has a bounded mutation lane and a separate bounded protocol-control lane;
   mutation overflow advances a persistent reset generation, while control

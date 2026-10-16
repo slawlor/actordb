@@ -173,8 +173,8 @@ receives an op for a fragment it no longer serves **re-forwards** it
 hop-limited (`MAX_FORWARD_HOPS = 4`, never bounced back to the sender, never
 to self) instead of dropping it. Mutation relays mint a collision-free local
 request id, validate the downstream peer, restore the upstream id, and return
-`Unavailable` on no route, hop exhaustion, send failure, or the 5-second relay
-deadline. The Phase 5 reconciler owns anti-entropy in both dynamic and static
+`Unavailable` on no route, hop exhaustion, admission exhaustion, send failure,
+or the 5-second relay deadline. The Phase 5 reconciler owns anti-entropy in both dynamic and static
 mode. The retired `SyncResponse` compatibility counter,
 `sync_entries_applied()`, remains zero.
 
