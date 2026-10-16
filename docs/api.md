@@ -286,16 +286,26 @@ Protocol v3 uses the same correlated reconciliation engine for static and
 dynamic placement. Summary, fetch, data, repair, and ordinary replication
 frames are split using their exact protobuf-encoded size, with a 1 MiB soft
 page target and 16 MiB hard limit. The public actor surface includes
-`SnapshotSummary`, `SummaryPage`, `VersionedPage`,
-`KvMessage::{GetSummaryPage, GetVersioned, GetVersionedPage, GetRevision}`, and
-`KvMessage::FlushStable` for embedders that need ordered, revision-guarded,
-pinned-TTL and memory-bounded exact-value primitives or an explicit backend
-fence. `FlushStable` returns `ApplyDurability::StableCommitted` only after that
-fence succeeds. `GetAll` and `GetSnapshot` remain source-compatible, but the
-network responder no longer uses them to clone an entire fragment. Because
-`KvMessage` is public, embedders with exhaustive matches must add the new
-variants. Direct `ApplyOp` calls return `ApplyError::InvalidInput` for a record
-that cannot traverse the wire; this is nonfatal and does not restart a worker.
+`SnapshotSummary`, `SummaryPage`, `VersionedPage`, `BatchReadEntry`,
+`BatchReadPage`, `KvMessage::{GetBatch, GetSummaryPage, GetVersioned,
+GetVersionedPage, GetRevision}`, and `KvMessage::FlushStable` for embedders that
+need priority-aware ordered batch reads, revision-guarded pinned-TTL reads,
+memory-bounded exact-value primitives, or an explicit backend fence.
+`GetBatch` returns one encoded-byte-bounded ordered prefix while retaining
+per-key pool admission and sticky routing. An orderly dispatcher drain returns
+the prefix after its admitted key completes; callers resume the untouched
+suffix explicitly. `FlushStable` returns
+`ApplyDurability::StableCommitted` only after that fence succeeds. `GetAll` and
+`GetSnapshot` remain source-compatible, but the network responder no longer
+uses them to clone an entire fragment.
+
+`KvMessage` is now `#[non_exhaustive]`: downstream matches must include a
+wildcard arm. This is a one-time source migration for exhaustive 0.1-era
+matches and prevents future internal routing/query additions from repeatedly
+breaking embedders. The opaque `ContinueBatchRead` variant is dispatcher/
+worker plumbing and cannot be constructed directly. Direct `ApplyOp` calls
+return `ApplyError::InvalidInput` for a record that cannot traverse the wire;
+this is nonfatal and does not restart a worker.
 The managed `WorkerPool` is now private: its former public split
 `try_admit`/`route` API could not bind one reservation atomically to one sticky
 worker or roll back failed delivery. Direct actor embedders should send the

@@ -582,6 +582,32 @@ pub(crate) fn message_field_len(field: u32, payload_len: usize) -> usize {
         .saturating_add(payload_len)
 }
 
+/// Exact encoded length of one `BatchGetResponse.KeyValue` payload without
+/// cloning its value. The actor-side batch reader uses this to stop after one
+/// ordered soft-byte-bounded prefix; the network layer still performs the
+/// authoritative whole-envelope preflight before sending.
+pub(crate) fn batch_get_result_encoded_len(
+    key: &str,
+    value: Option<&VersionedValue>,
+    shed: bool,
+) -> usize {
+    let mut encoded_len = bytes_field_len(1, key.len());
+    if shed {
+        return encoded_len.saturating_add(varint_field_len(8, 1));
+    }
+    let Some(value) = value else {
+        return encoded_len;
+    };
+    encoded_len = encoded_len
+        .saturating_add(varint_field_len(2, 1))
+        .saturating_add(bytes_field_len(3, value.value.len()))
+        .saturating_add(varint_field_len(4, value.timestamp_ms))
+        .saturating_add(bytes_field_len(5, value.node_id.len()))
+        .saturating_add(varint_field_len(6, value.expires_at_ms.unwrap_or(0)))
+        .saturating_add(varint_field_len(7, u64::from(value.is_tombstone)));
+    encoded_len
+}
+
 /// Exact size of one envelope message whose payload contains a repeated
 /// length-delimited field. The fixed payload is measured once; each string,
 /// bytes, or nested-message item then contributes only its own field length.
@@ -1021,6 +1047,46 @@ mod tests {
                     ..MutationResponse::default()
                 })),
             },
+        );
+    }
+
+    #[test]
+    fn batch_get_result_sizer_matches_prost() {
+        let missing = BatchKeyValue {
+            key: "missing".to_string(),
+            ..BatchKeyValue::default()
+        };
+        assert_eq!(
+            batch_get_result_encoded_len(&missing.key, None, false),
+            missing.encoded_len()
+        );
+
+        let shed = BatchKeyValue {
+            key: String::new(),
+            shed: true,
+            ..BatchKeyValue::default()
+        };
+        assert_eq!(
+            batch_get_result_encoded_len(&shed.key, None, true),
+            shed.encoded_len()
+        );
+
+        let mut value = VersionedValue::new(vec![7; 128], u64::MAX, "writer".to_string());
+        value.expires_at_ms = Some(u64::MAX);
+        value.is_tombstone = true;
+        let found = BatchKeyValue {
+            key: "found".to_string(),
+            found: true,
+            value: value.value.clone(),
+            timestamp_ms: value.timestamp_ms,
+            node_id: value.node_id.clone(),
+            expires_at_ms: value.expires_at_ms.unwrap_or(0),
+            is_tombstone: value.is_tombstone,
+            shed: false,
+        };
+        assert_eq!(
+            batch_get_result_encoded_len(&found.key, Some(&value), false),
+            found.encoded_len()
         );
     }
 

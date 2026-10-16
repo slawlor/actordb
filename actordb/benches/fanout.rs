@@ -27,10 +27,10 @@
 //! * A `put_multi` regression with flat single-`put` (see put_get bench)
 //!   points at fan-out overhead: fragment grouping, per-fragment
 //!   message encode, or the failover `replica_order` scan.
-//! * A `get_multi` regression points at the remote batch path: note that
-//!   `BatchGet` currently serves keys with sequential actor round-trips
-//!   (adversarial finding #24) — batching that path should show up here
-//!   as a large win, especially at n = 1000.
+//! * A `get_multi` regression points at the remote batch path. `BatchGet`
+//!   now uses one aggregate actor RPC whose ordered continuation lazily visits
+//!   sticky workers; this benchmark measures actor/channel overhead, especially
+//!   at n = 1000. Large-value byte-page tests separately cover clone bounds.
 //! * Sub-linear scaling with `n` is expected (per-batch fixed costs);
 //!   per-op latency *increasing* with `n` points at O(n²) behavior such
 //!   as an accidental repeated whole-batch encode or routing scan.

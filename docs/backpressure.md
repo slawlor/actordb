@@ -63,6 +63,17 @@ reply port for reply-bearing calls and is surfaced as an actor/network
 failure, not backpressure. Fire-and-forget actor messages have no result
 channel to report that failure.
 
+Local `put_multi` / `get_multi` fan-out is issued in windows of at most 1024
+calls. This is a pre-admission bound: it prevents an arbitrary caller vector
+from queueing without limit in the shared dispatcher mailbox, while every item
+still consumes its normal pool token and exact worker-generation reservation.
+Remote `BatchGet` uses one aggregate continuation but admits only its next
+ordered key. A worker releases the completed reservation before the
+continuation can reserve another, and exact encoded-byte sizing stops before
+any omitted suffix is admitted. Orderly dispatcher drain returns the completed
+admitted prefix; caller cancellation retains its current reservation until
+worker completion and prevents further suffix admission.
+
 Shed behavior by operation:
 
 - **Shed read** → the caller gets `Err(NodeError::Backpressure(..))`. A shed
@@ -129,8 +140,12 @@ undersized.
 Worker execution and admitted backlogs are isolated by priority. A worker-bound
 `Get` carries the caller's reply port directly, so waiting behind background
 work no longer blocks the dispatcher from admitting a high-priority request or
-serving health/supervision messages. The shared dispatcher ingress, cache
-locks, snapshot/flush handlers, and peer connection reader are not isolated.
+serving health/supervision messages. An actor-routed batch read follows the
+same rule: only the current key occupies a worker, and the dispatcher never
+awaits it. The shared dispatcher ingress, cache locks, snapshot/flush handlers,
+and peer connection reader are not isolated. The peer reader applies a bounded
+actor-attempt timeout to a batch read, but it still performs the successful
+prefix inline; structured request workers remain a separate improvement.
 Replication sender lookup also uses a node-global registry, but its critical
 section is limited to map lookup/filtering and cloning cheap exact-task
 handles. Potentially large mutation payload clones, bounded sender-mailbox
@@ -139,6 +154,7 @@ releasing that registry; stale snapshots are identity-checked before they may
 close a multiplexed peer connection or certify teardown. Lookup still scans
 the global map; per-fragment indexing remains a separate scaling follow-up.
 `background_saturation_leaves_high_priority_p99_unaffected` covers ordinary
-load, `blocked_background_get_does_not_stall_high_priority_or_health` covers
+load, `blocked_background_get_does_not_stall_high_priority_or_health` and
+`blocked_background_batch_read_does_not_stall_high_priority_or_health` cover
 the dispatcher handoff, and `queue_cap_shed_is_explicit_and_counted` covers
 explicit capacity shedding.

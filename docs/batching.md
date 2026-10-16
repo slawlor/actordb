@@ -9,8 +9,10 @@ and results come back in input order.
 
 1. Each key is hashed to its fragment (`seahash(key) % fragment_count`).
 2. Local keys (this node serves the fragment) run through the normal single-key
-   path — including the exact per-op apply outcome — concurrently via
-   `join_all`, then are stamped back into their input positions.
+   path — including the exact per-op apply outcome — in input-indexed windows
+   of at most 1024 concurrent calls, then are stamped back into their input
+   positions. The window prevents an unbounded caller vector from filling the
+   shared dispatcher mailbox before worker-pool admission can shed it.
 3. Remote puts are split when either the exact request or a conservative
    worst-case response would cross the 1 MiB soft target, or at 4096 items.
    One individually valid item may exceed the soft target but never the
@@ -107,13 +109,25 @@ they affect the clock or caller. Because `GetResponse` cannot encode
 unavailable, actor or routing failure produces no false `found = false`
 response; the bounded attempt expires and the origin tries its next holder.
 
-The responder targets 1 MiB. Because it learns a value's encoded size only
-after the actor read, it includes the single result that crosses that target
-when the aggregate still fits the 16 MiB hard limit, then stops. This avoids
-charging actor admission twice for the boundary key. If that result cannot
-join the current frame, the existing prefix is returned and the item is pulled
-again alone. That hard-boundary retry consumes actor admission again and can
-therefore return explicit backpressure rather than a false miss. One response
+The responder targets 1 MiB. One aggregate `KvMessage::GetBatch` continuation
+lazily admits and sticky-routes exactly one ordered key at a time. Its worker
+releases that exact pool/worker-generation reservation before returning the
+continuation to the dispatcher, so queue-cap and rate-limit accounting remain
+per key and a completed key cannot make the next one shed spuriously. Exact
+protobuf response sizing—including the request id, nested repeated fields, and
+outer envelope—stops the actor page immediately after the one result that
+crosses the soft target; an omitted suffix is neither cloned nor admitted. The
+network layer repeats the authoritative whole-envelope size check before send.
+
+If the crossing result cannot join the current frame without exceeding the
+16 MiB hard limit, the existing prefix is returned and that item is pulled
+again alone. That hard-boundary retry can consume admission again and can
+therefore return explicit backpressure rather than a false miss. A configured
+actor-attempt deadline turns a stopped worker into an empty unavailable reply
+instead of blocking the multiplexed peer reader indefinitely. Orderly
+dispatcher drain returns the already admitted prefix; the caller can retry the
+untouched suffix. Dropping the reply stops further admission after the current
+worker completes. One response
 frame is emitted per request, so the connection reader never waits on a
 multi-frame response stream.
 
