@@ -56,6 +56,34 @@ integration crate, and an `xtask` for coverage.
 | `actordb::network` | Transport abstraction: `Network`, `TcpNetwork`, `PeerStream`; 4-byte length-prefixed `Envelope` framing |
 | `actordb::proto` | prost-generated `meta` protocol-buffer messages (ids 1–20), priorities, mutation outcomes, challenge handshake, replication and reconcile messages |
 
+### Actor implementation files
+
+Each actor's implementation, arguments, and runtime state live together in a
+dedicated file. `actor.rs` and `supervision.rs` are public facades: existing
+imports such as `actordb::actor::{KvActor, KvArgs}` and
+`actordb::supervision::{Cleaner, CleanerArgs}` still work, including their
+generated Bon builder types and inferred typestate setter chains. Bon's
+anonymous state modules remain private. Internal module boundaries are not
+new public APIs.
+
+- `actor/kv_actor.rs`: fragment dispatcher and its linked worker lifecycle.
+- `actor/kv_worker.rs`: the public direct-operation worker.
+- `actor/pool_worker.rs`: the private admission-accounted pool worker.
+- `actor/pool.rs`: priority-pool configuration, routing, and reservations.
+- `actor/fragment_state.rs`, `actor/protocol.rs`, and `actor/clock.rs`: shared
+  cache/persistence, operation/value contracts, and HLC primitives.
+- `supervision/supervisor.rs`: fragment supervisor, health, restart, and quiesce.
+- `supervision/cleaner.rs` and `supervision/snapshotter.rs`: the individual
+  maintenance actors; `supervision/maintenance.rs` holds their shared ticker
+  and coalesced trigger support.
+
+Tests live beside their owning implementation in separate child files so
+private invariants can be tested without exposing runtime internals. This is
+an organizational refactor: it does not change scheduling, locking, admission,
+durability, or replace the worker pools with ractor's `Factory`. The
+`ReplicationSender` is a Tokio task/state machine, not a ractor actor; the node
+transport and replication modules are separate future decomposition work.
+
 ## The hierarchy
 
 ```
