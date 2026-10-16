@@ -2,6 +2,25 @@
 
 Three layers, each catching what the others can't.
 
+## CI feature coverage and caches
+
+CI tests the default workspace once, including the offered RocksDB backend,
+then tests without default features using
+`cargo test --workspace --exclude docker-tests --no-default-features --locked`.
+The exclusion matters: `docker-tests` enables `actordb`'s default features
+through its dependency, even when the workspace command disables defaults.
+The default workspace run still covers that integration crate. Clippy checks
+all targets in both configurations, alongside the existing Rust 1.88,
+formatting, release-documentation, and benchmark-compilation gates.
+
+Compile jobs restore dependency artifacts with `Swatinem/rust-cache`. Stable
+debug tests and Clippy share a cache; Rust 1.88 and the release docs/benchmark
+jobs use separate caches. The action also keys artifacts by the actual Rust
+compiler, Cargo manifests/lockfile, and compiler environment, and does not cache
+workspace build outputs by default. Coverage keeps its separate instrumented
+cache. Docker already uses cargo-chef layers and the GitHub Actions Buildx
+cache backend. A cold cache still performs every build and check.
+
 ## Unit tests (`cargo test --lib`)
 
 Fast, in-process tests of the building blocks: `FragmentState` apply/LWW
