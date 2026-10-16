@@ -214,7 +214,11 @@ success or `Ok(None)`. Local and forwarded puts wait for the serving worker's
 exact apply outcome; once it returns `Ok`, reads at that owner observe that
 version or a newer winner. The priority travels in the request and selects the
 remote actor pool, but it does not schedule the per-peer socket's ordinary
-data lane.
+data lane. Pool capacity counts active-plus-queued worker jobs. It does not
+bound the shared dispatcher mailbox or replicated ingress. The dispatcher
+hands admitted reads directly to their sticky worker rather than awaiting a
+nested worker RPC; worker execution is priority-isolated, while dispatcher
+ingress, fragment cache locks, and each peer reader remain shared.
 See
 [Consistency](consistency.md) and [Traffic classes & backpressure](backpressure.md).
 
@@ -292,6 +296,11 @@ network responder no longer uses them to clone an entire fragment. Because
 `KvMessage` is public, embedders with exhaustive matches must add the new
 variants. Direct `ApplyOp` calls return `ApplyError::InvalidInput` for a record
 that cannot traverse the wire; this is nonfatal and does not restart a worker.
+The managed `WorkerPool` is now private: its former public split
+`try_admit`/`route` API could not bind one reservation atomically to one sticky
+worker or roll back failed delivery. Direct actor embedders should send the
+same public `KvMessage` variants to `KvActor`, which owns admission, routing,
+supervision, and exact per-worker accounting.
 
 Advanced users of public `actordb::proto` types must upgrade in lockstep with
 the cluster: wire v3 requires the paged-anti-entropy, byte-bounded-batches, and

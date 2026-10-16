@@ -29,7 +29,7 @@ regressions/improvements vs the first.
 
 | Bench file        | Setup                              | Cases                                              |
 |-------------------|------------------------------------|----------------------------------------------------|
-| `put_get.rs`      | 1 node, in-memory, no network      | `put` / `get` latency at 100 B, 10 KB, 1 MB values |
+| `put_get.rs`      | 1 node, in-memory, no network      | Sequential `put` / `get` latency at 100 B, 10 KB, 1 MB; concurrent sticky-vs-spread Gets at depths 1/8/64 |
 | `fanout.rs`       | 3 nodes, 3 fragments (1 each)      | `put_multi` / `get_multi` at 10, 100, 1000 keys    |
 | `replication.rs`  | 2 nodes, 1 shared fragment         | source-apply-completion-to-replica-visible lag for 10, 100, 1000-key batches |
 
@@ -92,8 +92,9 @@ These are the first things to measure when they get fixed:
 - ~~#30 — no TCP_NODELAY~~ **fixed 2026-10-14** (`set_nodelay(true)` on
   accept + connect in `network.rs`): `get_multi` 99.9/105.6/120.8 ms →
   0.22/0.79/8.31 ms.
-- #14 — dispatcher is a serial funnel; the per-put barrier doubles its load
-  → watch `put` in `put_get`.
+- #14 — dispatcher ingress remains a shared serial funnel. Worker-bound Gets
+  no longer make it await a nested RPC; watch sequential `put`/`get` plus
+  `concurrent_get/{sticky,spread}` in `put_get`.
 - #24 — `BatchGet` serves keys with sequential actor round-trips
   → watch `get_multi` at 1000 keys in `fanout`.
 - #23 — per-op `hlc.observe()` acquisitions in the replication receiver loop

@@ -22,11 +22,12 @@ supported toolchain.
   fragments; every node agrees on the mapping.
 * **`actor`**: per fragment, a `KvActor` dispatcher (built on
   [ractor](https://github.com/slawlor/ractor)) routes ops to a
-  `WorkerPool` by `hash(key) % worker_count`. Sticky dispatch preserves
-  per-key ordering within a priority pool while different keys execute
-  concurrently. Workers share the fragment's `FragmentState`: one in-memory
-  cache with a lock-coherent ordered key index, one ordered persistence buffer,
-  and one `KvStore`; cross-pool LWW merges are serialized there.
+  private managed worker pool by `hash(key) % worker_count`. Sticky dispatch
+  preserves per-key ordering within a priority pool while different keys
+  execute concurrently. Workers share the fragment's `FragmentState`: one
+  in-memory cache with a lock-coherent ordered key index, one ordered
+  persistence buffer, and one `KvStore`; cross-pool LWW merges are serialized
+  there.
 * **`supervision`**: every fragment runs under a `FragmentSupervisor`
   owning the dispatcher pool plus background actors — a `Cleaner`
   (durable TTL-expiry markers) and a `Snapshotter`
@@ -277,8 +278,10 @@ and require explicit one-time legacy adoption; see
 
 ### `actordb::actor` — the storage core
 
-- `KvActor` — per-fragment dispatcher; `WorkerPool` — sticky-hash
-  worker pool; `FragmentState` — the shared cache/buffer/store.
+- `KvActor` — public per-fragment dispatcher; its managed sticky-hash worker
+  pools are internal; `FragmentState` — the shared cache/buffer/store. Direct
+  embedders send `KvMessage` to `KvActor` rather than splitting admission from
+  a raw worker route.
 - `VersionedValue { value, timestamp_ms, node_id, expires_at_ms, is_tombstone }`
   — a value plus its LWW version; `wins_over` implements the conflict
   rule, `is_expired` the TTL check.
@@ -314,6 +317,11 @@ Each fragment runs **three isolated worker pools** instead of one:
   shed counter, and the caller gets `NodeError::Backpressure` — a shed
   `Get` never returns `Ok(None)`, so backpressure is never confused
   with "not found".
+- `queue_cap` covers work accepted into that priority's workers (active plus
+  queued), not the shared dispatcher mailbox or replicated ingress. Accepted
+  reads are handed to their worker without making the dispatcher await them,
+  so a blocked background worker does not block high-priority admission,
+  health, or supervision.
 - Priority is preserved end-to-end: forwarded single-key operations and batch
   messages carry the originator's priority on the wire, and the owner
   applies/serves them in the matching pool. Priority selects that remote actor
@@ -549,10 +557,14 @@ as issues in the [issue tracker](https://github.com/slawlor/actordb/issues):
   explicitly opt into lifecycle deletion. RocksDB compaction owns later
   physical space reclamation. The certificate covers LWW winners and their TTL
   metadata; independent expiry cleanup may make later byte snapshots differ.
-- **Custom worker-pool supervision is incomplete** — a worker crash can drop
-  accepted mailbox work and leak admission accounting. A restarted dispatcher
-  is republished through a generation-checked fragment route, but migration to
-  ractor's `Factory` lifecycle is still tracked before production use.
+- **Custom worker-pool supervision is not lossless** — a worker crash drops
+  accepted jobs in that worker's mailbox and closes their reply ports; those
+  jobs are not replayed. Exact per-worker reservations reclaim their capacity,
+  and orderly shutdown drains accepted work. A restarted dispatcher is
+  republished through a generation-checked fragment route, but migration to
+  ractor's `Factory` lifecycle remains tracked for discard policy and lossless
+  restart. The formerly public split `WorkerPool` admission/routing surface was
+  removed in this pre-release API: direct embedders should use `KvActor`.
 
 ## Contributors
 
