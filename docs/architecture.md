@@ -74,6 +74,12 @@ Key design points:
   peer connection reader remain shared. Accepted reads are handed directly to
   their sticky worker, so one blocked background worker does not hold the
   dispatcher behind a nested RPC.
+- **Owned forwarded completion.** A separate private node-owned service admits
+  serving forwarded single puts and whole batches with aggregate count/payload
+  limits and eight workers per priority. It retains operation/placement leases
+  through exact apply outcomes and sender handoff despite reader cancellation;
+  explicit shutdown drains it before stopping actors/senders. Readers still
+  await it, preserving same-connection mutation and replication frame order.
 - **Sticky key routing.** Inside one priority pool, a key's operations land on
   the same worker (`seahash(key) % workers`). Different priorities use
   different workers; `FragmentState` therefore serializes each LWW merge with

@@ -544,7 +544,8 @@ as issues in the [issue tracker](https://github.com/slawlor/actordb/issues):
 - **Shutdown is explicit and fallible** — `Node::shutdown().await` atomically
   closes public-operation admission (`NodeError::ShuttingDown` for later
   calls), joins listener/connection/dial work, waits for already-admitted API
-  work, stops replication senders, drains every fragment mailbox, and reports
+  work, drains the bounded serving forwarded-mutation completion owner without
+  aborting accepted apply/outcome/fanout, stops replication senders, drains every fragment mailbox, and reports
   the final local-store flush. A flush error retains the quiesced fragment and
   its batch; retry `shutdown` until it succeeds. The node does not resume after
   an error. This local fence does not wait for replication ACKs.

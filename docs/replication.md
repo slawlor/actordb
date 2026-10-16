@@ -358,6 +358,13 @@ counter for the retired protocol and remains zero in every mode.
   is capped at 4 KiB. Completed listener, handler, writer, dial, timer, and
   placement tasks are continuously reaped and are abort-and-joined at explicit
   Node shutdown.
+- Serving forwarded client mutations use a separate bounded completion owner,
+  but the socket reader still awaits each single put or entire sequential batch
+  before handling another frame. This preserves existing replica ACK fences,
+  frame order and session transitions; replication and reconciliation applies
+  themselves remain inline. Normal shutdown drains accepted forwarded apply and
+  sender handoff before sender/actor teardown, without adding a cancelable
+  actor-apply timeout or claiming peer ACK convergence.
 - The per-peer outbound writer pipeline defaults to 256 frames and 32 MiB of
   admitted encoded data through `NodeRuntimeOptions`. Producers reserve the
   data-lane ingress and exact byte permits before encoding; the permit remains

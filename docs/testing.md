@@ -54,6 +54,15 @@ fail-closed, while a fully joined failed startup releases it for retry.
 Stable-fence tests distinguish ordinary buffered commits from the explicit
 backend fence and verify that RocksDB can force its WAL under `AsyncWal`.
 
+Forwarded-mutation completion tests use actual `KvWorker` actors, synchronous
+release-on-drop gated stores and Node replication senders. They cancel origin
+waiters during apply and sender handoff, retain queued actor payloads and batch
+suffixes, preserve duplicate-key positions/outcomes, pin count/byte accounting
+and pre-apply saturation, and cancel/resume actual Node shutdown while transport
+tasks abort. Placement authority and operation fences must remain held until
+accepted completion finishes; these tests do not claim a stronger last-Node
+drop or lossless worker-crash guarantee.
+
 Protocol-v3 pagination tests cover lexicographically ordered/exclusive summary
 cursors (including the empty-string key), revision-drift detection, zero-limit
 clamping, metadata-byte bounds, pinned TTL tombstone synthesis shared by
