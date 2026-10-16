@@ -32,7 +32,17 @@ jobs:
         uses: docker/setup-buildx-action@v4
 
       - name: Build the test image
-        run: docker compose build
+        # The action supplies GitHub cache runtime credentials that plain
+        # Compose/Buildx shell steps do not receive automatically. Load one
+        # shared image for all three Compose services; do not push a registry.
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: docker-tests/Dockerfile
+          load: true
+          tags: actordb-docker-test:latest
+          cache-from: type=gha,scope=actordb-docker-test
+          cache-to: type=gha,scope=actordb-docker-test,mode=max
 
       - name: Replication across 3 nodes
         run: bash docker/run-scenario.sh docker/envs/replication.env

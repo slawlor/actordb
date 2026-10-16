@@ -14,12 +14,26 @@ all targets in both configurations, alongside the existing Rust 1.88,
 formatting, release-documentation, and benchmark-compilation gates.
 
 Compile jobs restore dependency artifacts with `Swatinem/rust-cache`. Stable
-debug tests and Clippy share a cache; Rust 1.88 and the release docs/benchmark
-jobs use separate caches. The action also keys artifacts by the actual Rust
-compiler, Cargo manifests/lockfile, and compiler environment, and does not cache
-workspace build outputs by default. Coverage keeps its separate instrumented
-cache. Docker already uses cargo-chef layers and the GitHub Actions Buildx
-cache backend. A cold cache still performs every build and check.
+debug tests use `stable-debug-tests`; Clippy keeps `stable-debug`. Check-only
+and test/link native artifacts can differ, and an exact cache hit is immutable:
+the test job cannot augment an existing Clippy-only entry. Rust 1.88 and the
+release docs/benchmark jobs use separate caches. The action also keys artifacts
+by the actual Rust compiler, Cargo manifests/lockfile, and compiler environment,
+and does not cache workspace build outputs by default. Coverage keeps its
+separate instrumented cache. A new test-cache key starts cold; native RocksDB
+compilation can take many minutes. Compatible warm dependency artifacts reduce
+that work, but every build/check still runs and workspace crates still compile.
+
+Docker CI uses `docker/build-push-action` to build and load one
+`actordb-docker-test:latest` image for all three Compose services. Its explicit
+`type=gha,scope=actordb-docker-test` import/export uses `mode=max` to retain
+intermediate cargo-chef dependency layers. The action supplies GitHub cache
+runtime credentials; plain Compose/Buildx shell steps do not receive those
+automatically. Local Compose builds do not require GitHub credentials. The first
+image build is cold; later compatible runs can reuse layers, subject to base
+image/dependency changes, cache access, and eviction. CI logs should show cache
+import/export and `CACHED` steps on a compatible warm run; no fixed speedup is
+guaranteed.
 
 ## Unit tests (`cargo test --lib`)
 
