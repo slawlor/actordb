@@ -2754,6 +2754,7 @@ pub struct NodeRuntimeOptions {
     socket_read_timeout: Duration,
     socket_write_timeout: Duration,
     replication_ack_timeout: Duration,
+    health_timeout: Duration,
 }
 
 impl Default for NodeRuntimeOptions {
@@ -2776,6 +2777,7 @@ impl Default for NodeRuntimeOptions {
             socket_read_timeout: SOCKET_WRITE_TIMEOUT,
             socket_write_timeout: SOCKET_WRITE_TIMEOUT,
             replication_ack_timeout: Duration::from_secs(30),
+            health_timeout: Duration::from_secs(5),
         }
     }
 }
@@ -2917,6 +2919,15 @@ impl NodeRuntimeOptions {
         self
     }
 
+    /// Set one aggregate deadline for a local health snapshot, including
+    /// supervisor-registry acquisition and every fragment probe. Default 5s.
+    /// This does not measure cluster readiness, worker responsiveness, or
+    /// durability. Unavailable evidence is returned as an error, not zeros.
+    pub fn with_health_timeout(mut self, timeout: Duration) -> Self {
+        self.health_timeout = timeout;
+        self
+    }
+
     /// Current per-peer outbound frame capacity.
     pub fn peer_queue_frame_capacity(&self) -> usize {
         self.peer_queue_frame_capacity
@@ -3000,6 +3011,11 @@ impl NodeRuntimeOptions {
     /// Current ordinary replication ACK timeout.
     pub fn replication_ack_timeout(&self) -> Duration {
         self.replication_ack_timeout
+    }
+
+    /// Current aggregate local-health snapshot deadline.
+    pub fn health_timeout(&self) -> Duration {
+        self.health_timeout
     }
 
     fn sender_options(&self) -> SenderRuntimeOptions {
@@ -3123,6 +3139,13 @@ impl NodeRuntimeOptions {
         {
             return Err(NodeError::Actor(
                 "runtime transport and replication timeouts must be representable".to_string(),
+            ));
+        }
+        if self.health_timeout.is_zero()
+            || Instant::now().checked_add(self.health_timeout).is_none()
+        {
+            return Err(NodeError::Actor(
+                "health timeout must be non-zero and representable".to_string(),
             ));
         }
         Ok(())
@@ -5466,30 +5489,66 @@ impl Node {
         Ok(report)
     }
 
-    /// Health snapshots for every fragment this node serves.
+    /// Local health snapshots from owned fragment supervisors, including any
+    /// bootstrapping/draining fragment still owned by this node. The one
+    /// configurable health deadline includes registry acquisition and every
+    /// sequential probe. Missing serving supervisors, failed dispatchers, and
+    /// timeouts return errors; unavailable counters are never replaced by zero.
+    /// Worker names/counts describe linked actors observed Running, not worker
+    /// responsiveness. This non-atomic snapshot is not a readiness, replication,
+    /// or durability guarantee.
     pub async fn health(&self) -> Result<HashMap<FragmentId, FragmentHealth>, NodeError> {
         let _operation = self.admit_operation()?;
-        let supervisors: Vec<(FragmentId, ActorRef<SupervisorMessage>)> = self
-            .supervisors
-            .lock()
-            .await
-            .iter()
-            .map(|(f, s)| (*f, s.clone()))
-            .collect();
-        let mut out = HashMap::with_capacity(supervisors.len());
-        for (frag, supervisor) in &supervisors {
-            let res = supervisor
-                .call(|reply| SupervisorMessage::GetHealth { reply }, None)
+        let deadline = deadline_after(self.runtime_options.health_timeout);
+        tokio::time::timeout_at(deadline, async {
+            let mut supervisors: Vec<(FragmentId, ActorRef<SupervisorMessage>)> = self
+                .supervisors
+                .lock()
                 .await
-                .map_err(|e| NodeError::Actor(e.to_string()))?;
-            match res {
-                CallResult::Success(h) => {
-                    out.insert(*frag, h);
+                .iter()
+                .map(|(f, s)| (*f, s.clone()))
+                .collect();
+            let owned: HashSet<_> = supervisors.iter().map(|(fragment, _)| *fragment).collect();
+            for fragment in self.serving.read().unwrap().iter() {
+                if !owned.contains(fragment) {
+                    return Err(NodeError::Actor(format!(
+                        "health unavailable for fragment {fragment}: serving supervisor is missing"
+                    )));
                 }
-                _ => return Err(NodeError::Actor("health check failed".to_string())),
             }
-        }
-        Ok(out)
+            supervisors.sort_unstable_by_key(|(fragment, _)| *fragment);
+            let mut out = HashMap::with_capacity(supervisors.len());
+            for (frag, supervisor) in supervisors {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Err(NodeError::Actor(
+                        "health snapshot deadline expired".to_string(),
+                    ));
+                }
+                let res = supervisor
+                    .call(
+                        |reply| SupervisorMessage::GetHealth { reply },
+                        Some(remaining),
+                    )
+                    .await
+                    .map_err(|error| {
+                        NodeError::Actor(format!("health unavailable for fragment {frag}: {error}"))
+                    })?;
+                match res {
+                    CallResult::Success(health) if health.fragment == frag => {
+                        out.insert(frag, health);
+                    }
+                    _ => {
+                        return Err(NodeError::Actor(format!(
+                            "health unavailable for fragment {frag}: probe failed"
+                        )))
+                    }
+                }
+            }
+            Ok(out)
+        })
+        .await
+        .map_err(|_| NodeError::Actor("health snapshot deadline expired".to_string()))?
     }
 
     /// Phase 8 placement report: this node's authoritative placement
@@ -10030,8 +10089,217 @@ mod tests {
     use crate::proto::{ReconcileRequest, SessionStart};
     use crate::replication::spawn_sender_with_options;
     use crate::store::StoreError;
+    use ractor::ActorProcessingErr;
     use std::sync::atomic::AtomicBool;
     use std::sync::Condvar;
+
+    struct DelayedHealthSupervisor;
+
+    struct DelayedHealthArgs {
+        fragment: FragmentId,
+        release: Option<Arc<Notify>>,
+        observed_timeout: Arc<StdMutex<Option<Duration>>>,
+    }
+
+    impl Actor for DelayedHealthSupervisor {
+        type Msg = SupervisorMessage;
+        type State = DelayedHealthArgs;
+        type Arguments = DelayedHealthArgs;
+
+        async fn pre_start(
+            &self,
+            _myself: ActorRef<Self::Msg>,
+            args: Self::Arguments,
+        ) -> Result<Self::State, ActorProcessingErr> {
+            Ok(args)
+        }
+
+        async fn handle(
+            &self,
+            _myself: ActorRef<Self::Msg>,
+            message: Self::Msg,
+            state: &mut Self::State,
+        ) -> Result<(), ActorProcessingErr> {
+            if let SupervisorMessage::GetHealth { reply } = message {
+                *state.observed_timeout.lock().unwrap() = reply.get_timeout();
+                if let Some(release) = &state.release {
+                    release.notified().await;
+                }
+                let _ = reply.send(FragmentHealth {
+                    fragment: state.fragment,
+                    worker_count: 0,
+                    worker_names: Vec::new(),
+                    restarts: HashMap::new(),
+                    last_reaped: 0,
+                    shed_counts: (7, 11, 13),
+                });
+            }
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn health_has_one_aggregate_deadline_and_passes_remaining_probe_budget() {
+        let timeout = Duration::from_secs(1);
+        let node = Node::start_with_options(
+            "health-aggregate".to_string(),
+            "127.0.0.1:0".parse().unwrap(),
+            NodeConfig {
+                fragment_count: 2,
+                ..Default::default()
+            },
+            NodeRuntimeOptions::default().with_health_timeout(timeout),
+        )
+        .await
+        .unwrap();
+        let mut replacements = HashMap::new();
+        let mut observed = Vec::new();
+        let release_second = Arc::new(Notify::new());
+        for fragment in [FragmentId(0), FragmentId(1)] {
+            let observed_timeout = Arc::new(StdMutex::new(None));
+            let (actor, _) = DelayedHealthSupervisor::spawn(
+                None,
+                DelayedHealthSupervisor,
+                DelayedHealthArgs {
+                    fragment,
+                    release: (fragment == FragmentId(1)).then(|| release_second.clone()),
+                    observed_timeout: observed_timeout.clone(),
+                },
+            )
+            .await
+            .unwrap();
+            replacements.insert(fragment, actor);
+            observed.push(observed_timeout);
+        }
+        let originals = std::mem::replace(&mut *node.supervisors.lock().await, replacements);
+        // First probe responds immediately; the second stays held. This avoids
+        // requiring a timed first response to run within a tight CI margin.
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(5), node.health())
+                .await
+                .unwrap(),
+            Err(NodeError::Actor(_))
+        ));
+        let first = observed[0].lock().unwrap().unwrap();
+        let second = observed[1].lock().unwrap().unwrap();
+        assert!(first <= timeout);
+        assert!(second < first, "second fragment received a fresh timeout");
+        let replacements = std::mem::replace(&mut *node.supervisors.lock().await, originals);
+        release_second.notify_one();
+        for actor in replacements.values() {
+            actor.stop(None);
+            actor.wait(None).await.unwrap();
+        }
+        node.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn health_deadline_includes_registry_lock_and_missing_serving_supervisor_fails() {
+        let mut node = Node::start_with_options(
+            "health-registry".to_string(),
+            "127.0.0.1:0".parse().unwrap(),
+            NodeConfig::default(),
+            NodeRuntimeOptions::default().with_health_timeout(Duration::from_millis(20)),
+        )
+        .await
+        .unwrap();
+        let mut registry = node.supervisors.lock().await;
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), node.health()).await.unwrap(),
+            Err(NodeError::Actor(error)) if error.contains("deadline")
+        ));
+        let supervisor = registry.remove(&FragmentId(0)).unwrap();
+        drop(registry);
+        assert!(matches!(
+            node.health().await,
+            Err(NodeError::Actor(error)) if error.contains("supervisor is missing")
+        ));
+        node.supervisors
+            .lock()
+            .await
+            .insert(FragmentId(0), supervisor);
+        node.runtime_options.health_timeout = Duration::from_secs(1);
+        let health = node.health().await.unwrap();
+        let fragment = &health[&FragmentId(0)];
+        assert_eq!(fragment.worker_count, fragment.worker_names.len());
+        assert_eq!(fragment.worker_count, 8);
+        assert_eq!(fragment.shed_counts, (0, 0, 0));
+        node.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn health_stopped_registered_supervisor_reports_fragment_and_recovers() {
+        let node = Node::start_with_options(
+            "health-stopped-supervisor".to_string(),
+            "127.0.0.1:0".parse().unwrap(),
+            NodeConfig {
+                fragment_count: 2,
+                ..Default::default()
+            },
+            NodeRuntimeOptions::default().with_health_timeout(Duration::from_secs(1)),
+        )
+        .await
+        .unwrap();
+        let fragment = FragmentId(1);
+        let observed_timeout = Arc::new(StdMutex::new(None));
+        let (stopped, _) = DelayedHealthSupervisor::spawn(
+            None,
+            DelayedHealthSupervisor,
+            DelayedHealthArgs {
+                fragment,
+                release: None,
+                observed_timeout: observed_timeout.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        stopped.stop(None);
+        tokio::time::timeout(Duration::from_secs(5), stopped.wait(None))
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Keep the exact stopped ref in the owned registry: this must exercise
+        // failed RPC admission, not the missing-supervisor or probe-timeout path.
+        let original = node
+            .supervisors
+            .lock()
+            .await
+            .insert(fragment, stopped.clone())
+            .unwrap();
+        let failed = tokio::time::timeout(Duration::from_secs(5), node.health()).await;
+
+        // Restore ownership before any failure assertion, so cleanup still
+        // reaches the original live supervisor even if the regression fires.
+        let replaced = node
+            .supervisors
+            .lock()
+            .await
+            .insert(fragment, original)
+            .unwrap();
+        let recovered = tokio::time::timeout(Duration::from_secs(5), node.health()).await;
+        let query = tokio::time::timeout(
+            Duration::from_secs(5),
+            node.get("health-recovered-query".to_string()),
+        )
+        .await;
+        let shutdown = tokio::time::timeout(Duration::from_secs(5), node.shutdown()).await;
+
+        assert_eq!(replaced.get_id(), stopped.get_id());
+        assert!(observed_timeout.lock().unwrap().is_none());
+        assert!(matches!(
+            failed.unwrap(),
+            Err(NodeError::Actor(error))
+                if error.starts_with(&format!("health unavailable for fragment {fragment}:"))
+                    && !error.contains("probe failed")
+        ));
+        let recovered = recovered.unwrap().unwrap();
+        assert_eq!(recovered.len(), 2);
+        assert_eq!(recovered[&fragment].worker_count, 8);
+        assert_eq!(recovered[&fragment].shed_counts, (0, 0, 0));
+        assert!(query.unwrap().unwrap().is_none());
+        shutdown.unwrap().unwrap();
+    }
 
     #[derive(Default)]
     struct BlockingLoadStore {
@@ -11040,6 +11308,7 @@ mod tests {
         assert_eq!(options.socket_read_timeout(), Duration::from_secs(30));
         assert_eq!(options.socket_write_timeout(), Duration::from_secs(30));
         assert_eq!(options.replication_ack_timeout(), Duration::from_secs(30));
+        assert_eq!(options.health_timeout(), Duration::from_secs(5));
     }
 
     #[test]
@@ -11126,6 +11395,12 @@ mod tests {
             NodeRuntimeOptions::default().with_reconcile_data_admission_timeout(Duration::ZERO),
         ] {
             assert!(options.validate().is_err());
+        }
+        for timeout in [Duration::ZERO, Duration::MAX] {
+            assert!(NodeRuntimeOptions::default()
+                .with_health_timeout(timeout)
+                .validate()
+                .is_err());
         }
     }
 

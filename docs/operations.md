@@ -268,6 +268,14 @@ states (`Bootstrapping`/`Serving`/`Draining`/`Stopped`) for diagnosis.
 | Replication lag | `batch_interval` + receiver apply/flush + peer RTT | ACKs follow the receiver fence; an unanswered ordinary batch rotates and replays at `replication_ack_timeout`, while barriers use `reconcile_timeout` |
 | Peer churn | `Node::peer_count()` and timeout/session-rotation warning logs | Repeated queue/write cancellation or ACK expiry usually means a non-reading, overloaded, or unhealthy peer |
 
+Health uses a single configurable local snapshot deadline (five seconds by
+default), including registry lookup and all fragment probes. Unavailable
+dispatcher evidence returns an error, never fabricated zero counters. Worker
+counts/names describe exact linked actors observed `Running`; a blocked worker
+can still have that status. This non-atomic view is not cluster readiness,
+replication progress, or a durability fence. Compare it with placement lifecycle
+and application-level probes appropriate to your deployment.
+
 Operational rules of thumb:
 
 - `fragment_count` and `fragment_map` must be identical on every node in

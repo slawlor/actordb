@@ -349,7 +349,7 @@ struct construction and exhaustive matches. Exhaustive matches over public
 ## Health and observability
 
 ```rust
-// One snapshot per fragment this node serves.
+// Local snapshots from this node's owned fragment supervisors.
 let health = node.health().await?;
 for (frag, h) in &health {
     println!("{frag}: workers={} restarts={:?} shed(high,default,bg)={:?}",
@@ -366,6 +366,24 @@ println!("dynamic={} map={:?} states={:?}", report.dynamic, report.placement, re
 field that is always zero), and `shed_counts: (u64, u64, u64)` — operations
 shed by backpressure per pool, ordered **(high, default, background)**, always
 counted, never silent.
+
+`health()` has one aggregate deadline (default five seconds, configurable with
+`NodeRuntimeOptions::with_health_timeout`) covering supervisor-registry lookup
+and every fragment RPC. A missing serving supervisor, stopped/nonresponding
+dispatcher, or deadline expiry returns `NodeError::Actor`; unavailable counters
+are never substituted with zeros. No partial successful map is returned.
+Worker counts/names include only exact dispatcher-linked actors observed
+`Running`, not configured slots or arbitrary actors with matching registry
+names. The result may include owned bootstrapping/draining fragments and is a
+local, non-atomic observation: it does not prove worker responsiveness, serving
+readiness, replication convergence, or durability. Use `placement_report()` for
+the separate placement lifecycle view.
+
+The unchanged low-level `SupervisorMessage::GetHealth` also bounds its nested
+dispatcher RPC using the supplied reply-port timeout, or five seconds when no
+timeout is supplied. Already-closed queued reply ports are skipped. A probe
+already executing may finish its bounded inner wait after its caller cancels;
+this never extends the aggregate `Node::health()` deadline.
 
 `sender_report(fragment, peer)` is a `#[doc(hidden)]` test hook; production
 monitoring should use `health()` and `placement_report()`. There is also

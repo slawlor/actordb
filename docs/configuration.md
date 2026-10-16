@@ -102,6 +102,7 @@ does not break exhaustive `NodeConfig` literals. `Node::start` uses
 | `with_socket_read_timeout` / `socket_read_timeout` | `30 s` | Maximum time to receive a frame body after its length prefix. An idle established connection has no read deadline until a prefix arrives. |
 | `with_socket_write_timeout` / `socket_write_timeout` | `30 s` | Maximum time to write one complete length-prefixed frame. Expiry cancels the connection and allows redial. |
 | `with_replication_ack_timeout` / `replication_ack_timeout` | `30 s` | Maximum wait after queue admission for an acceptable ordinary streaming ACK. Expiry rotates the sender session and replays the exact unacknowledged LWW operations. Reconciliation barriers use `SenderConfig::reconcile_timeout` instead. |
+| `with_health_timeout` / `health_timeout` | `5 s` | One aggregate local-health deadline, including registry acquisition and all fragment probes. Failed evidence/deadline expiry returns an error instead of healthy zeros; not a readiness or worker-responsiveness guarantee. Must be nonzero and representable. |
 
 The outbound frame capacity must be at least two, its byte capacity at least
 32 MiB, receive and read-key capacities at least 16 MiB, and every other capacity and
