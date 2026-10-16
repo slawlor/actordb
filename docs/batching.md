@@ -72,10 +72,14 @@ reconnect; if the total attempt expires while waiting for a response, the
 pending request is removed and failover continues without necessarily dropping
 the connection.
 
-Transport, timeout, malformed-response, and typed all-`Unavailable` failures
-try the next holder; if none succeeds, the key gets `NodeError::Network(..)`.
-Other valid typed responses end failover and return their exact per-key
-outcomes. A fragment with no usable replica is a configuration
+Transport, timeout, and malformed responses retry the current unresolved
+request at the next holder. After a fully validated response, only positions
+with typed `Unavailable` retry; all other per-key outcomes are retained and
+excluded from later attempts. This also handles a successful prefix followed
+by actor loss. Filtering preserves duplicate positions and input order, keeps
+every mutation's original stamp, and restarts response indexes at zero for
+each reduced request. If holders are exhausted, only unresolved positions get
+`NodeError::Network(..)`. A fragment with no usable replica is a configuration
 `NodeError::Actor(..)`.
 
 Single-key `put` uses the same per-owner deadline and exact mutation result. It

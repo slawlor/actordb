@@ -253,8 +253,10 @@ Semantics (full detail in [Multi-key batching](batching.md)):
 - Remote puts and gets have one **configured per-attempt deadline** (5 seconds
   by default) covering outbound queue admission and the response. Both fail over on a closed
   connection or missing reply; put replies additionally
-  require one ordered exact outcome per key, and an all-`Unavailable` put
-  response tries the next holder.
+  require one ordered exact outcome per key. Every `Unavailable` position
+  tries the next holder with its original stamped mutation; terminal positions
+  are excluded from the retry and retain their exact outcome. Duplicate keys
+  retain separate input positions and order throughout filtered retries.
 - Remote fragment groups are awaited sequentially, as are holder attempts
   within a group; these APIs do not issue all fan-out attempts concurrently.
 - Per-key errors use `NodeError`: `Actor` = misconfiguration (no usable

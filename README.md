@@ -232,9 +232,10 @@ Multi-key semantics:
 - Remotely routed single-key and batch operations fail over across replica
   holders in placement order on transport, timeout, or malformed-response
   failures. Every owner attempt has one configured budget (5 seconds by
-  default) covering queue admission and the response. A typed `Unavailable`
-  single mutation or all-`Unavailable` batch response tries the next holder;
-  other valid per-key outcomes are returned directly.
+  default) covering queue admission and the response. Typed `Unavailable`
+  positions try the next holder with their original stamped mutations, even
+  after other positions in the batch finish. Other valid per-key outcomes are
+  returned directly and are excluded from subsequent retries.
 - Errors are per-key and classified: `NodeError::Actor` for
   misconfiguration (no replica listed for a fragment) or local actor-framework
   failure,

@@ -399,6 +399,61 @@ async fn recv_frame(stream: &mut tokio::net::TcpStream) -> Envelope {
     .expect("timed out waiting for protocol frame")
 }
 
+async fn recv_batch_put(stream: &mut tokio::net::TcpStream) -> actordb::proto::BatchPut {
+    loop {
+        if let Some(EnvelopeMsg::BatchPut(batch)) = recv_frame(stream).await.msg {
+            return batch;
+        }
+    }
+}
+
+fn batch_put_response(
+    batch: &actordb::proto::BatchPut,
+    statuses: &[actordb::proto::MutationStatus],
+) -> Envelope {
+    use actordb::proto::{MutationResponse, MutationResult, MutationStatus};
+
+    assert_eq!(batch.puts.len(), statuses.len());
+    let results = batch
+        .puts
+        .iter()
+        .zip(statuses)
+        .enumerate()
+        .map(|(request_index, (put, status))| {
+            let mut result = MutationResult {
+                key: put.key.clone(),
+                status: *status as i32,
+                error: String::new(),
+                winner_timestamp_ms: 0,
+                winner_node_id: String::new(),
+                winner_is_tombstone: false,
+                request_index: request_index as u32,
+            };
+            match status {
+                MutationStatus::Superseded => {
+                    result.winner_timestamp_ms = put.timestamp_ms + 1;
+                    result.winner_node_id = "newer-writer".to_string();
+                    result.winner_is_tombstone = true;
+                }
+                MutationStatus::Backpressure
+                | MutationStatus::StorageError
+                | MutationStatus::ActorError
+                | MutationStatus::Unavailable => {
+                    result.error = format!("injected {status:?}");
+                }
+                _ => {}
+            }
+            result
+        })
+        .collect();
+    Envelope {
+        msg: Some(EnvelopeMsg::MutationResponse(MutationResponse {
+            req_id: batch.req_id,
+            results,
+        })),
+    }
+}
+
 fn complete_reconcile_response(
     request: &actordb::proto::ReconcileRequest,
     summaries: Vec<actordb::proto::KeySummary>,
@@ -6110,6 +6165,245 @@ async fn batch_operations_fail_over_after_a_stale_owner_returns_unavailable() {
     a.shutdown().await.unwrap();
     b.shutdown().await.unwrap();
     c.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn mixed_batch_put_retries_only_unavailable_positions_with_exact_stamps() {
+    use actordb::actor::OpPriority;
+    use actordb::proto::{MutationStatus, Priority};
+    use actordb::shard::FragmentId;
+
+    let config = NodeConfig {
+        fragment_map: HashMap::from([(
+            FragmentId(0),
+            vec![
+                "subset-first".to_string(),
+                "subset-second".to_string(),
+                "subset-third".to_string(),
+            ],
+        )]),
+        ..NodeConfig::default()
+    };
+    let client = Node::start_with_options(
+        "subset-client".to_string(),
+        "127.0.0.1:0".parse().unwrap(),
+        config,
+        NodeRuntimeOptions::default().with_forwarded_attempt_timeout(Duration::from_millis(100)),
+    )
+    .await
+    .unwrap();
+    let mut first = tokio::net::TcpStream::connect(client.addr()).await.unwrap();
+    complete_no_secret_handshake(&mut first, "subset-first").await;
+    let mut second = tokio::net::TcpStream::connect(client.addr()).await.unwrap();
+    complete_no_secret_handshake(&mut second, "subset-second").await;
+    let mut third = tokio::net::TcpStream::connect(client.addr()).await.unwrap();
+    complete_no_secret_handshake(&mut third, "subset-third").await;
+    common::wait_for(
+        || async { client.peer_count().await == 3 },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    let input = vec![
+        ("duplicate".to_string(), b"older".to_vec()),
+        ("retry-a".to_string(), b"a".to_vec()),
+        ("storage".to_string(), b"storage".to_vec()),
+        ("duplicate".to_string(), b"newer".to_vec()),
+        ("backpressure".to_string(), b"backpressure".to_vec()),
+        ("retry-b".to_string(), b"b".to_vec()),
+        ("expired".to_string(), b"expired".to_vec()),
+        ("actor-error".to_string(), b"actor-error".to_vec()),
+    ];
+    let exchange = async {
+        let original = recv_batch_put(&mut first).await;
+        assert_eq!(original.puts.len(), 8);
+        assert_eq!(original.priority, Priority::High as i32);
+        assert!(original.puts.iter().all(|put| {
+            put.priority == Priority::High as i32
+                && put.node_id == "subset-client"
+                && put.seq != 0
+                && put.boot_id != 0
+                && put.req_id == 0
+        }));
+        assert_eq!(original.puts[0].key, original.puts[3].key);
+        assert_ne!(original.puts[0].value, original.puts[3].value);
+        send_frame(
+            &mut first,
+            batch_put_response(
+                &original,
+                &[
+                    MutationStatus::Applied,
+                    MutationStatus::Unavailable,
+                    MutationStatus::StorageError,
+                    MutationStatus::Unavailable,
+                    MutationStatus::Backpressure,
+                    MutationStatus::Unavailable,
+                    MutationStatus::Expired,
+                    MutationStatus::ActorError,
+                ],
+            ),
+        )
+        .await;
+
+        let second_batch = recv_batch_put(&mut second).await;
+        assert_ne!(original.req_id, second_batch.req_id);
+        assert_eq!(second_batch.priority, original.priority);
+        assert_eq!(
+            second_batch.puts,
+            vec![
+                original.puts[1].clone(),
+                original.puts[3].clone(),
+                original.puts[5].clone(),
+            ],
+            "retry must preserve exact mutations and only unavailable positions"
+        );
+        // Response indexes are 0, 1, 2 in this filtered request, rather than
+        // the original indexes 1, 3, 5. The duplicate's other position has
+        // already completed and must never be retransmitted.
+        send_frame(
+            &mut second,
+            batch_put_response(
+                &second_batch,
+                &[
+                    MutationStatus::AlreadyPresent,
+                    MutationStatus::Superseded,
+                    MutationStatus::Unavailable,
+                ],
+            ),
+        )
+        .await;
+
+        let third_batch = recv_batch_put(&mut third).await;
+        assert_ne!(original.req_id, third_batch.req_id);
+        assert_ne!(second_batch.req_id, third_batch.req_id);
+        assert_eq!(third_batch.priority, original.priority);
+        assert_eq!(third_batch.puts, vec![original.puts[5].clone()]);
+        send_frame(
+            &mut third,
+            batch_put_response(&third_batch, &[MutationStatus::Applied]),
+        )
+        .await;
+        original.puts[3].timestamp_ms + 1
+    };
+    let (winner_timestamp_ms, results) = tokio::time::timeout(Duration::from_secs(3), async {
+        tokio::join!(
+            exchange,
+            client.put_multi_with_priority(input, OpPriority::High)
+        )
+    })
+    .await
+    .expect("mixed batch-put subset exchange timed out");
+    assert_eq!(results.len(), 8);
+    assert!(results[0].is_ok());
+    assert!(results[1].is_ok());
+    assert!(matches!(&results[2], Err(NodeError::Storage(_))));
+    assert!(matches!(
+        &results[3],
+        Err(NodeError::Superseded {
+            timestamp_ms,
+            node_id,
+            is_tombstone: true,
+        }) if *timestamp_ms == winner_timestamp_ms && node_id == "newer-writer"
+    ));
+    assert!(matches!(&results[4], Err(NodeError::Backpressure(_))));
+    assert!(results[5].is_ok());
+    assert!(matches!(&results[6], Err(NodeError::Expired)));
+    assert!(matches!(&results[7], Err(NodeError::Actor(_))));
+
+    drop(first);
+    drop(second);
+    drop(third);
+    client.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn mixed_batch_put_malformed_subset_exhaustion_preserves_terminal_results() {
+    use actordb::proto::MutationStatus;
+    use actordb::shard::FragmentId;
+
+    let config = NodeConfig {
+        fragment_map: HashMap::from([(
+            FragmentId(0),
+            vec!["partial-first".to_string(), "partial-second".to_string()],
+        )]),
+        ..NodeConfig::default()
+    };
+    let client = Node::start_with_options(
+        "partial-client".to_string(),
+        "127.0.0.1:0".parse().unwrap(),
+        config,
+        NodeRuntimeOptions::default().with_forwarded_attempt_timeout(Duration::from_millis(100)),
+    )
+    .await
+    .unwrap();
+    let mut first = tokio::net::TcpStream::connect(client.addr()).await.unwrap();
+    complete_no_secret_handshake(&mut first, "partial-first").await;
+    let mut second = tokio::net::TcpStream::connect(client.addr()).await.unwrap();
+    complete_no_secret_handshake(&mut second, "partial-second").await;
+    common::wait_for(
+        || async { client.peer_count().await == 2 },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    let input = vec![
+        ("completed".to_string(), b"done".to_vec()),
+        ("unresolved-a".to_string(), b"a".to_vec()),
+        ("storage".to_string(), b"storage".to_vec()),
+        ("unresolved-b".to_string(), b"b".to_vec()),
+        ("backpressure".to_string(), b"backpressure".to_vec()),
+    ];
+    let exchange = async {
+        let original = recv_batch_put(&mut first).await;
+        send_frame(
+            &mut first,
+            batch_put_response(
+                &original,
+                &[
+                    MutationStatus::Applied,
+                    MutationStatus::Unavailable,
+                    MutationStatus::StorageError,
+                    MutationStatus::Unavailable,
+                    MutationStatus::Backpressure,
+                ],
+            ),
+        )
+        .await;
+        let retry = recv_batch_put(&mut second).await;
+        assert_ne!(original.req_id, retry.req_id);
+        assert_eq!(retry.priority, original.priority);
+        assert_eq!(
+            retry.puts,
+            vec![original.puts[1].clone(), original.puts[3].clone()]
+        );
+
+        let mut malformed =
+            batch_put_response(&retry, &[MutationStatus::Applied, MutationStatus::Applied]);
+        let Some(EnvelopeMsg::MutationResponse(response)) = malformed.msg.as_mut() else {
+            unreachable!();
+        };
+        // The first result looks valid, but the second uses its original
+        // position rather than position 1 of the filtered request. The whole
+        // response must be ignored, without committing its first success.
+        response.results[1].request_index = 3;
+        send_frame(&mut second, malformed).await;
+        // Withhold a valid response so the final holder's attempt expires.
+    };
+    let ((), results) = tokio::time::timeout(Duration::from_secs(3), async {
+        tokio::join!(exchange, client.put_multi(input))
+    })
+    .await
+    .expect("partial batch-put exhaustion exchange timed out");
+    assert_eq!(results.len(), 5);
+    assert!(results[0].is_ok());
+    assert!(matches!(&results[1], Err(NodeError::Network(_))));
+    assert!(matches!(&results[2], Err(NodeError::Storage(_))));
+    assert!(matches!(&results[3], Err(NodeError::Network(_))));
+    assert!(matches!(&results[4], Err(NodeError::Backpressure(_))));
+
+    drop(first);
+    drop(second);
+    client.shutdown().await.unwrap();
 }
 
 #[tokio::test]

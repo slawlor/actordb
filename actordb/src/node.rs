@@ -4032,8 +4032,9 @@ impl Node {
     ///
     /// Each key is hashed to its fragment; keys are grouped by fragment
     /// and each fragment's keys are sent in exact-byte/count-bounded `BatchPut` messages,
-    /// failing over across replica holders (self first) until one
-    /// accepts the batch. Returns per-key results in input order.
+    /// failing over across replica holders (self first) until each position
+    /// has a terminal outcome or holders are exhausted. Returns per-key
+    /// results in input order.
     ///
     /// Local and remote keys await an exact per-key apply outcome. Remote
     /// batches use the configured timeout (5 seconds by default) per replica
@@ -4106,7 +4107,8 @@ impl Node {
         }
 
         // Remote puts: exact-byte- and count-bounded BatchPut chunks per
-        // fragment, each failing over until one replica holder accepts it.
+        // fragment. Unavailable positions fail over independently while
+        // completed positions retain their exact per-key outcomes.
         // The request and a conservative worst-case response are both sized
         // incrementally, avoiding quadratic protobuf rescans.
         let wire_priority = priority_to_proto(priority);
@@ -4178,15 +4180,18 @@ impl Node {
                     continue;
                 }
 
-                let (indices, puts): (Vec<_>, Vec<_>) = chunk.into_iter().unzip();
-                let expected_keys: Vec<String> = puts.iter().map(|put| put.key.clone()).collect();
-                let mut done = false;
+                // Keep original input positions alongside exact stamped puts.
+                // A valid response may finish only part of the batch; retry
+                // its unavailable positions without replaying terminal ones.
+                let mut unresolved = chunk;
                 let mut tried: Vec<String> = Vec::new();
                 for owner in self.replica_order(frag) {
                     tried.push(owner.clone());
                     let Some(tx) = self.peer_sender(&owner).await else {
                         continue;
                     };
+                    let expected_keys: Vec<String> =
+                        unresolved.iter().map(|(_, put)| put.key.clone()).collect();
                     let req_id = self.next_req_id.fetch_add(1, Ordering::Relaxed);
                     let (resp_tx, resp_rx) = oneshot::channel();
                     self.pending_mutations.lock().unwrap().insert(
@@ -4207,7 +4212,7 @@ impl Node {
                         &tx,
                         Envelope {
                             msg: Some(EnvelopeMsg::BatchPut(BatchPut {
-                                puts: puts.clone(),
+                                puts: unresolved.iter().map(|(_, put)| put.clone()).collect(),
                                 priority: wire_priority,
                                 req_id,
                             })),
@@ -4223,20 +4228,24 @@ impl Node {
                         Ok(Ok(wire_results))
                             if validate_mutation_results(&expected_keys, &wire_results).is_ok() =>
                         {
-                            // A stale/non-serving holder or failed relay returns a
-                            // typed routing failure for every key. Retry the exact
-                            // stamped batch at the next configured replica.
-                            if wire_results.iter().all(|result| {
-                                MutationStatus::try_from(result.status)
+                            // Validate the entire response before completing
+                            // any position. A stable filter preserves duplicate
+                            // keys and order; response indexes restart at zero
+                            // for the next holder's reduced request.
+                            let mut unavailable = Vec::new();
+                            for ((index, put), result) in unresolved.into_iter().zip(wire_results) {
+                                if MutationStatus::try_from(result.status)
                                     == Ok(MutationStatus::Unavailable)
-                            }) {
-                                continue;
+                                {
+                                    unavailable.push((index, put));
+                                } else {
+                                    results[index] = Some(decode_mutation_result(result));
+                                }
                             }
-                            for (index, result) in indices.iter().zip(wire_results) {
-                                results[*index] = Some(decode_mutation_result(result));
+                            unresolved = unavailable;
+                            if unresolved.is_empty() {
+                                break;
                             }
-                            done = true;
-                            break;
                         }
                         // A timeout or malformed/dropped response may follow a
                         // successful apply. Retrying the exact stamped versions
@@ -4244,13 +4253,11 @@ impl Node {
                         _ => {}
                     }
                 }
-                if !done {
-                    for index in indices {
-                        results[index] = Some(Err(NodeError::Network(format!(
-                            "no replica acknowledged batch put for fragment {frag} (tried {})",
-                            tried.join(",")
-                        ))));
-                    }
+                for (index, _) in unresolved {
+                    results[index] = Some(Err(NodeError::Network(format!(
+                        "no replica acknowledged batch put for fragment {frag} (tried {})",
+                        tried.join(",")
+                    ))));
                 }
             }
         }
