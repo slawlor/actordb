@@ -363,13 +363,20 @@ counter for the retired protocol and remains zero in every mode.
   data-lane ingress and exact byte permits before encoding; the permit remains
   attached to the queued/current frame and is released by RAII on writes,
   cancellation, or task failure. Reader-generated responses use a separately
-  bounded, writer-priority lane and retain a 1 MiB share of the total byte
+  bounded, writer-priority lane and retain a 16 MiB share of the total byte
   budget. The writer forces one ready data frame after at most 16 responses.
   Both lanes share the socket writer. `OpPriority` selects the
   receiver's actor pool but does not reorder the ordinary data lane. Ordinary
   frames use the 5-second queue admission default; streamed
   reconciliation-data pages have an explicit 30-second default so a near-limit
   value can wait behind another legal frame.
+- All physical connections share the node's 64 MiB raw receive-body budget.
+  Both handshake and established bodies reserve bytes before allocation;
+  saturation rejects only the contributing connection so session replay can
+  recover it. Permits cover the raw buffer through decoding and the handler
+  turn, including EOF/timeout/cancellation cleanup. Decoded protobuf objects,
+  actor/relay/caller copies, caches, and kernel buffers are not charged to this
+  budget. The configurable capacity must fit one maximum 16 MiB frame.
 - A ticketed FIFO gate admits one reconciliation round per physical connection
   while guaranteeing that a fragment starting a follow-up round rejoins behind
   fragments already waiting for bootstrap or repair.

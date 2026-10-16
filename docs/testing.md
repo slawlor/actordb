@@ -131,6 +131,12 @@ process — the bulk of behavioral coverage:
   `mutation_relay_scans_past_the_origin_to_a_connected_owner`,
   `remote_batches_split_at_wire_item_limit_without_dropping_connection`,
   `remote_batches_split_at_encoded_byte_limits_without_false_misses`.
+  Receive-admission unit tests hold simultaneous incomplete maximum frames on
+  accepted and outbound-dialed handlers, reject an additional body before
+  reading it, then verify unrelated peer traffic and replacement handshakes
+  remain usable after capacity returns. Separate tests cover completed-frame
+  retention, empty/oversized bodies, EOF, body timeout, cancellation, task abort,
+  and configuration validation.
   Node and wire unit tests separately verify exact Prost length accounting,
   positional ordered-prefix validation with duplicate keys, the shed-bit hard
   boundary, actor-side `BatchGet` result sizing, UTF-8-safe diagnostic

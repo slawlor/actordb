@@ -86,6 +86,7 @@ does not break exhaustive `NodeConfig` literals. `Node::start` uses
 | `with_peer_queue_byte_capacity` / `peer_queue_byte_capacity` | `32 MiB` | Encoded bytes admitted to one peer writer pipeline, including the frame currently blocked on the socket. Must be at least `32 MiB`: one maximum 16 MiB producer frame plus a full 16 MiB response reserve. Ordinary producers cannot consume that reserve. Permits remain attached through write/drop. |
 | `with_replication_control_message_capacity` / `replication_control_message_capacity` | `64` messages | Capacity of the separate ACK/NACK/reconciliation-response lane per fragment/peer sender. Full admission fails the contributing connection so session replay/reconciliation recovers it. A reconcile reply targeting a sender already retired by placement is ignored without dropping the shared peer connection. Peer lifecycle and on-demand reconcile signals are coalesced out of band. |
 | `with_inbound_connection_capacity` / `inbound_connection_capacity` | `1024` connections | Maximum accepted sockets concurrently handshaking or serving as inbound peers. Excess accepted sockets are closed immediately. |
+| `with_receive_byte_capacity` / `receive_byte_capacity` | `64 MiB` | Node-wide raw encoded receive bodies across accepted and outbound-dialed connections, including handshakes. Must fit at least one `16 MiB` maximum frame. Bytes are reserved before body allocation and retained through decoding and the inline handler turn. Saturation rejects only the contributing connection without waiting for capacity. |
 | `with_queue_admission_timeout` / `queue_admission_timeout` | `5 s` | One absolute maximum wait to reserve a peer-queue frame slot and its exact encoded-byte permits. Expiry cancels that connection; an outbound peer is then redialed. |
 | `with_reconcile_data_admission_timeout` / `reconcile_data_admission_timeout` | `30 s` | Admission wait for each streamed reconciliation-data page. This longer, explicit budget lets a legal near-16 MiB value wait behind another frame while the socket writer is still healthy. Tune with `SenderConfig::reconcile_timeout` and `socket_write_timeout`. |
 | `with_forwarded_attempt_timeout` / `forwarded_attempt_timeout` | `5 s` | Total budget for one forwarded owner attempt, including queue admission and response. Batch holder attempts and remote fragment groups remain sequential. |
@@ -95,9 +96,14 @@ does not break exhaustive `NodeConfig` literals. `Node::start` uses
 | `with_socket_write_timeout` / `socket_write_timeout` | `30 s` | Maximum time to write one complete length-prefixed frame. Expiry cancels the connection and allows redial. |
 | `with_replication_ack_timeout` / `replication_ack_timeout` | `30 s` | Maximum wait after queue admission for an acceptable ordinary streaming ACK. Expiry rotates the sender session and replays the exact unacknowledged LWW operations. Reconciliation barriers use `SenderConfig::reconcile_timeout` instead. |
 
-The frame capacity must be at least two, the byte capacity at least 32 MiB,
-and every other capacity and runtime timeout nonzero; startup rejects invalid
-values. Operation priority selects the local or remote actor pool, but it does
+The outbound frame capacity must be at least two, its byte capacity at least
+32 MiB, the receive byte capacity at least 16 MiB, and every other capacity and
+runtime timeout nonzero; startup rejects invalid or unrepresentable values.
+The receive budget counts encoded bodies, excluding four-byte length prefixes,
+socket/kernel buffers, protobuf object overhead, and decoded or actor/cache/
+relay/caller copies. There is no wire compression. It is not a total heap bound.
+Error, EOF, body timeout, connection cancellation, and task abort release raw
+receive reservations through RAII. Operation priority selects the local or remote actor pool, but it does
 not schedule the ordinary peer data lane or socket writer. The peer writer
 applies both the configured frame-count and encoded-byte bounds; sender actor
 lanes are still bounded by operation/message count.

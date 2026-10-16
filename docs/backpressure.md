@@ -118,6 +118,19 @@ allocation-free protobuf preflight caps repeated decode cardinality before
 allocating. Receiver actor mailboxes still count messages rather than payload
 bytes.
 
+Raw inbound bodies additionally share a node-wide 64 MiB receive budget across
+accepted and outbound-dialed connections, including the handshake. The reader
+checks the 4 KiB handshake or 16 MiB established-frame limit, then reserves all
+announced bytes before allocating the body. A full budget rejects that
+connection immediately, without waiting for capacity on the sole socket
+reader. The reservation remains attached through decoding and the inline
+handler turn, and every completion/error/timeout/cancellation/drop releases it.
+This prevents incomplete bodies from multiplying the socket-count limit into
+gigabytes of receive allocations. It does not bound protobuf object overhead,
+decoded/actor/cache/relay/caller copies, kernel socket buffers, or total heap
+use. `with_receive_byte_capacity` configures this encoded-body budget and must
+fit at least one maximum frame. Request execution remains inline.
+
 The current custom pool does **not** provide lossless worker restart. Accepted
 jobs active or queued in a dead worker are dropped, their reply ports close,
 and they are not replayed; supervision does reclaim their reservations, so a
