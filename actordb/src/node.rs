@@ -1208,6 +1208,19 @@ impl std::fmt::Display for NodeError {
     }
 }
 
+/// TTL deadlines are wall-clock milliseconds, not HLC version timestamps.
+/// Zero is reserved for absent expiry by the wire and durable encodings.
+fn ttl_expiry_deadline_ms(wall_ms: u64, ttl: Duration) -> Result<u64, NodeError> {
+    let ttl_ms = u64::try_from(ttl.as_millis())
+        .map_err(|_| NodeError::Codec("TTL duration exceeds u64 milliseconds".to_string()))?;
+    wall_ms
+        .checked_add(ttl_ms)
+        .filter(|deadline| *deadline != 0)
+        .ok_or_else(|| {
+            NodeError::Codec("TTL expiry must fit a nonzero u64 wall-clock deadline".to_string())
+        })
+}
+
 /// Map an [`OpPriority`] to its stable wire value (see `Priority` in
 /// `meta.proto`).
 fn priority_to_proto(p: OpPriority) -> i32 {
@@ -4005,6 +4018,13 @@ impl Node {
         ttl: Option<Duration>,
         priority: OpPriority,
     ) -> Result<(), NodeError> {
+        // Capture and validate expiry before waiting for sequence/clock state
+        // or constructing an operation. Invalid TTLs cannot consume a stamp,
+        // reach a serving actor, or enqueue a forwarded mutation. None avoids
+        // an extra wall-clock read on the ordinary non-TTL put path.
+        let expires_at_ms = ttl
+            .map(|ttl| ttl_expiry_deadline_ms(crate::actor::now_ms(), ttl))
+            .transpose()?;
         let seq = {
             let mut guard = self.next_seq.lock().await;
             *guard += 1;
@@ -4012,7 +4032,7 @@ impl Node {
         };
         let now = self.hlc.lock().await.tick();
         let mut vv = VersionedValue::new(value, now, self.node_id.clone());
-        vv.expires_at_ms = ttl.map(|d| now + d.as_millis() as u64);
+        vv.expires_at_ms = expires_at_ms;
         let op = ReplicatedOp {
             key,
             value: vv,
@@ -4023,8 +4043,21 @@ impl Node {
     }
 
     /// Write `value` under `key`, with an optional time-to-live. When
-    /// `ttl` is set, the key expires `ttl` after this call (wall-clock):
-    /// reads treat it as absent past expiry, and the fragment's cleaner
+    /// `ttl` is set, expiry is anchored to the originating node's wall clock
+    /// before sequence/clock waits and local or forwarded apply. HLC logical
+    /// advancement does not extend the TTL. Durations have millisecond
+    /// precision: sub-millisecond parts are truncated, and zero or a duration
+    /// below one millisecond sets expiry to the captured origin wall time.
+    /// Each serving/reading node evaluates expiry against its own wall clock;
+    /// a slower clock can delay the expired apply outcome or read invisibility.
+    /// `None` means no expiry.
+    ///
+    /// A duration or absolute expiry that cannot fit the nonzero `u64`
+    /// millisecond wire/store deadline returns [`NodeError::Codec`] before
+    /// consuming a sequence/HLC stamp or admitting a mutation. Normal public
+    /// shutdown admission still takes precedence over input validation.
+    ///
+    /// Reads treat the value as absent after expiry, and the fragment's cleaner
     /// materializes and persists a versioned expiry tombstone on its next
     /// sweep so older replicas cannot resurrect it.
     ///
@@ -10199,6 +10232,352 @@ mod tests {
     #[test]
     fn shutting_down_error_has_an_actionable_message() {
         assert_eq!(NodeError::ShuttingDown.to_string(), "node is shutting down");
+    }
+
+    #[test]
+    fn ttl_expiry_deadline_preserves_millisecond_precision_and_exact_boundaries() {
+        assert_eq!(ttl_expiry_deadline_ms(1000, Duration::ZERO).unwrap(), 1000);
+        assert_eq!(
+            ttl_expiry_deadline_ms(1000, Duration::from_nanos(999_999)).unwrap(),
+            1000
+        );
+        assert_eq!(
+            ttl_expiry_deadline_ms(1000, Duration::from_nanos(1_999_999)).unwrap(),
+            1001
+        );
+        assert_eq!(
+            ttl_expiry_deadline_ms(1000, Duration::from_millis(u64::MAX - 1000)).unwrap(),
+            u64::MAX
+        );
+        assert_eq!(
+            ttl_expiry_deadline_ms(u64::MAX, Duration::ZERO).unwrap(),
+            u64::MAX
+        );
+        assert_eq!(
+            ttl_expiry_deadline_ms(0, Duration::from_millis(1)).unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn ttl_expiry_deadline_rejects_truncation_overflow_and_absent_expiry_sentinel() {
+        // 2^64 + 5000 milliseconds: the old cast silently shortened this to 5s.
+        let wrapping = Duration::new(18_446_744_073_709_556, 616_000_000);
+        assert_eq!(wrapping.as_millis(), u64::MAX as u128 + 5001);
+        for ttl in [wrapping, Duration::MAX, Duration::from_millis(u64::MAX)] {
+            assert!(matches!(
+                ttl_expiry_deadline_ms(1000, ttl),
+                Err(NodeError::Codec(_))
+            ));
+        }
+        assert!(matches!(
+            ttl_expiry_deadline_ms(u64::MAX, Duration::from_millis(1)),
+            Err(NodeError::Codec(_))
+        ));
+        for ttl in [Duration::ZERO, Duration::from_nanos(999_999)] {
+            assert!(matches!(
+                ttl_expiry_deadline_ms(0, ttl),
+                Err(NodeError::Codec(_))
+            ));
+        }
+    }
+
+    #[derive(Default)]
+    struct TtlRecordingStore {
+        values: StdMutex<HashMap<Vec<u8>, VersionedValue>>,
+        writes: AtomicUsize,
+    }
+
+    impl KvStore for TtlRecordingStore {
+        fn load(&self) -> Result<Vec<(Vec<u8>, VersionedValue)>, StoreError> {
+            Ok(self
+                .values
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect())
+        }
+
+        fn write_batch(&self, writes: &[(Vec<u8>, VersionedValue)]) -> Result<(), StoreError> {
+            self.writes.fetch_add(1, Ordering::SeqCst);
+            self.values.lock().unwrap().extend(writes.iter().cloned());
+            Ok(())
+        }
+    }
+
+    fn ttl_store_config(store: &Arc<TtlRecordingStore>) -> NodeConfig {
+        NodeConfig {
+            store: Some(store.clone()),
+            flush_batch_size: 1,
+            flush_interval: Duration::from_secs(3600),
+            clean_interval: Duration::from_secs(3600),
+            snapshot_interval: Duration::from_secs(3600),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_ttl_rejects_before_sequence_clock_or_store_and_node_stays_healthy() {
+        let store = Arc::new(TtlRecordingStore::default());
+        let node = Node::start(
+            "ttl-invalid".into(),
+            "127.0.0.1:0".parse().unwrap(),
+            ttl_store_config(&store),
+        )
+        .await
+        .unwrap();
+        let sequence = node.next_seq.lock().await;
+        let mut clock = node.hlc.lock().await;
+        let future = crate::actor::now_ms() + 120_000;
+        clock.seed_persisted(future).unwrap();
+        let next_request = node.next_req_id.load(Ordering::Relaxed);
+        for ttl in [
+            Duration::MAX,
+            Duration::from_millis(u64::MAX),
+            Duration::new(18_446_744_073_709_556, 616_000_000),
+        ] {
+            // Holding both mutation-state locks proves rejection is before
+            // their acquisition, rather than merely after a stamp is consumed.
+            assert!(matches!(
+                tokio::time::timeout(
+                    Duration::from_secs(2),
+                    node.put_with_ttl("invalid".into(), b"value".to_vec(), Some(ttl))
+                )
+                .await
+                .unwrap(),
+                Err(NodeError::Codec(_))
+            ));
+        }
+        assert_eq!(*sequence, 0);
+        assert_eq!(clock.tick(), future + 1);
+        assert_eq!(node.next_req_id.load(Ordering::Relaxed), next_request);
+        drop(clock);
+        drop(sequence);
+        assert!(node.get_all().await.unwrap().is_empty());
+        assert!(store.load().unwrap().is_empty());
+        assert_eq!(store.writes.load(Ordering::SeqCst), 0);
+        node.put("healthy".into(), b"ok".to_vec()).await.unwrap();
+        assert_eq!(
+            node.get("healthy".into()).await.unwrap().unwrap().value,
+            b"ok"
+        );
+        assert_eq!(store.writes.load(Ordering::SeqCst), 1);
+        node.shutdown().await.unwrap();
+        assert!(matches!(
+            node.put_with_ttl("after-shutdown".into(), Vec::new(), Some(Duration::MAX))
+                .await,
+            Err(NodeError::ShuttingDown)
+        ));
+    }
+
+    #[tokio::test]
+    async fn local_ttl_uses_wall_time_and_retains_future_hlc_expiry_provenance_on_restart() {
+        let store = Arc::new(TtlRecordingStore::default());
+        let config = ttl_store_config(&store);
+        let node = Node::start(
+            "ttl-local".into(),
+            "127.0.0.1:0".parse().unwrap(),
+            config.clone(),
+        )
+        .await
+        .unwrap();
+        let future = crate::actor::now_ms() + 120_000;
+        node.hlc.lock().await.seed_persisted(future).unwrap();
+        node.put_with_ttl("permanent".into(), b"value".to_vec(), None)
+            .await
+            .unwrap();
+        let permanent = node.get("permanent".into()).await.unwrap().unwrap();
+        assert_eq!(permanent.timestamp_ms, future + 1);
+        assert_eq!(permanent.expires_at_ms, None);
+
+        let before = crate::actor::now_ms();
+        node.put_with_ttl(
+            "expiring".into(),
+            b"value".to_vec(),
+            Some(Duration::from_secs(60)),
+        )
+        .await
+        .unwrap();
+        let after = crate::actor::now_ms();
+        let expiring = node.get("expiring".into()).await.unwrap().unwrap();
+        assert_eq!(expiring.timestamp_ms, future + 2);
+        assert!((before + 60_000..=after + 60_000).contains(&expiring.expires_at_ms.unwrap()));
+        assert!(expiring.expires_at_ms.unwrap() < expiring.timestamp_ms);
+
+        let mut markers = Vec::new();
+        for (index, ttl) in [Duration::ZERO, Duration::from_nanos(999_999)]
+            .into_iter()
+            .enumerate()
+        {
+            let key = format!("immediate-{index}");
+            let before = crate::actor::now_ms();
+            assert!(matches!(
+                node.put_with_ttl(key.clone(), b"value".to_vec(), Some(ttl))
+                    .await,
+                Err(NodeError::Expired)
+            ));
+            let after = crate::actor::now_ms();
+            assert!(node.get(key.clone()).await.unwrap().is_none());
+            let marker = node.router.get_all().await.unwrap().remove(&key).unwrap();
+            assert!(marker.is_tombstone);
+            assert_eq!(marker.timestamp_ms, future + 3 + index as u64);
+            assert_eq!(marker.node_id, "ttl-local");
+            assert!((before..=after).contains(&marker.expires_at_ms.unwrap()));
+            markers.push((key, marker));
+        }
+        node.shutdown().await.unwrap();
+        let restarted = Node::start("ttl-local".into(), "127.0.0.1:0".parse().unwrap(), config)
+            .await
+            .unwrap();
+        let values = restarted.router.get_all().await.unwrap();
+        assert_eq!(values["permanent"], permanent);
+        assert_eq!(values["expiring"], expiring);
+        for (key, marker) in markers {
+            assert_eq!(values[&key], marker);
+            assert!(restarted.get(key).await.unwrap().is_none());
+        }
+        restarted.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn forwarded_ttl_preserves_origin_wall_deadline_and_hlc_stamp() {
+        let store = Arc::new(TtlRecordingStore::default());
+        let placement = HashMap::from([(FragmentId(0), vec!["ttl-owner".to_string()])]);
+        let owner = Node::start(
+            "ttl-owner".into(),
+            "127.0.0.1:0".parse().unwrap(),
+            NodeConfig {
+                fragment_map: placement.clone(),
+                ..ttl_store_config(&store)
+            },
+        )
+        .await
+        .unwrap();
+        let caller = Node::start(
+            "ttl-caller".into(),
+            "127.0.0.1:0".parse().unwrap(),
+            NodeConfig {
+                fragment_map: placement,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        caller.connect(owner.addr()).await.unwrap();
+        // connect() registers an owned handler; authentication/peer
+        // publication completes asynchronously before forwarding is usable.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while caller.peer_sender("ttl-owner").await.is_none()
+                || owner.peer_sender("ttl-caller").await.is_none()
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let future = crate::actor::now_ms() + 120_000;
+        let mut clock = caller.hlc.lock().await;
+        clock.seed_persisted(future).unwrap();
+        let next_request = caller.next_req_id.load(Ordering::Relaxed);
+        assert!(matches!(
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                caller.put_with_ttl(
+                    "invalid-remote".into(),
+                    b"value".to_vec(),
+                    Some(Duration::MAX)
+                )
+            )
+            .await
+            .unwrap(),
+            Err(NodeError::Codec(_))
+        ));
+        assert_eq!(*caller.next_seq.lock().await, 0);
+        assert_eq!(caller.next_req_id.load(Ordering::Relaxed), next_request);
+        assert_eq!(store.writes.load(Ordering::SeqCst), 0);
+        drop(clock);
+        assert!(owner.get_all().await.unwrap().is_empty());
+        assert!(store.load().unwrap().is_empty());
+
+        let before = crate::actor::now_ms();
+        caller
+            .put_with_ttl(
+                "forwarded".into(),
+                b"value".to_vec(),
+                Some(Duration::from_secs(60)),
+            )
+            .await
+            .unwrap();
+        let after = crate::actor::now_ms();
+        let value = owner.get("forwarded".into()).await.unwrap().unwrap();
+        assert_eq!(value.timestamp_ms, future + 1);
+        assert_eq!(value.node_id, "ttl-caller");
+        assert!((before + 60_000..=after + 60_000).contains(&value.expires_at_ms.unwrap()));
+        assert!(value.expires_at_ms.unwrap() < value.timestamp_ms);
+
+        let before = crate::actor::now_ms();
+        assert!(matches!(
+            caller
+                .put_with_ttl(
+                    "immediate-remote".into(),
+                    b"value".to_vec(),
+                    Some(Duration::ZERO)
+                )
+                .await,
+            Err(NodeError::Expired)
+        ));
+        let after = crate::actor::now_ms();
+        let marker = owner
+            .router
+            .get_all()
+            .await
+            .unwrap()
+            .remove("immediate-remote")
+            .unwrap();
+        assert!(marker.is_tombstone);
+        assert_eq!(marker.node_id, "ttl-caller");
+        assert_eq!(marker.timestamp_ms, future + 2);
+        assert!((before..=after).contains(&marker.expires_at_ms.unwrap()));
+        caller.shutdown().await.unwrap();
+        owner.shutdown().await.unwrap();
+        let persisted = store.load().unwrap();
+        assert!(persisted.iter().any(|(_, stored)| stored == &value));
+        assert!(persisted.iter().any(|(_, stored)| stored == &marker));
+    }
+
+    #[tokio::test]
+    async fn ttl_deadline_includes_waiting_for_the_origin_clock() {
+        let node = Node::start(
+            "ttl-wait".into(),
+            "127.0.0.1:0".parse().unwrap(),
+            NodeConfig::default(),
+        )
+        .await
+        .unwrap();
+        let clock = node.hlc.lock().await;
+        let mut request = Box::pin(node.put_with_ttl(
+            "waited".into(),
+            b"value".to_vec(),
+            Some(Duration::from_millis(5)),
+        ));
+        assert!(futures::poll!(request.as_mut()).is_pending());
+        // The deadline has been captured, and the request is held at the HLC
+        // mutex. Waiting here must consume TTL rather than restart it later.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        drop(clock);
+        assert!(matches!(request.await, Err(NodeError::Expired)));
+        assert!(node.get("waited".into()).await.unwrap().is_none());
+        let marker = node
+            .router
+            .get_all()
+            .await
+            .unwrap()
+            .remove("waited")
+            .unwrap();
+        assert!(marker.is_tombstone);
+        assert!(marker.expires_at_ms.unwrap() < marker.timestamp_ms);
+        node.shutdown().await.unwrap();
     }
 
     struct BlockingPageActor;
