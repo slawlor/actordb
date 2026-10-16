@@ -86,5 +86,4 @@ pub(super) fn coalesced_ticker<M: ractor::Message>(
 }
 
 #[cfg(test)]
-#[path = "tests/maintenance.rs"]
 mod tests;

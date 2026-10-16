@@ -46,8 +46,9 @@ use tokio::sync::{
 use tokio::time::Instant;
 
 use crate::actor::{
-    ApplyDurability, ApplyError, ApplyOutcome, HlcClock, KvMessage, OpPriority, PoolConfig,
-    ReplicatedOp, VersionedValue,
+    ApplyDurability, ApplyError, ApplyOutcome, FragmentHealth, FragmentShutdownError,
+    FragmentStartupStorageError, FragmentSupervisor, HlcClock, KvMessage, OpPriority, PoolConfig,
+    ReplicatedOp, SupervisorArgs, SupervisorMessage, VersionedValue,
 };
 use crate::network::{BoxStream, Network, TcpNetwork};
 use crate::placement::{
@@ -67,10 +68,6 @@ use crate::runtime_tasks::RuntimeTasks;
 use crate::shard::{fragment_of, FragmentId};
 use crate::store::{
     KvStore, PrefixDeleteOutcome, PrefixDeleteSupport, PrefixedStore, StoreBinding, StoreIdentity,
-};
-use crate::supervision::{
-    FragmentHealth, FragmentShutdownError, FragmentStartupStorageError, FragmentSupervisor,
-    SupervisorArgs, SupervisorMessage,
 };
 use crate::wire::{
     bytes_field_len, check_envelope_budget, check_record_budget, encode_envelope,
@@ -3247,7 +3244,7 @@ pub struct NodeConfig {
     pub network: Arc<dyn Network>,
     /// Flush the store write buffer after this many buffered ops.
     /// Ignored when `store` is `None`.
-    #[builder(default = crate::supervision::DEFAULT_FLUSH_BATCH_SIZE)]
+    #[builder(default = crate::actor::DEFAULT_FLUSH_BATCH_SIZE)]
     pub flush_batch_size: usize,
     /// Flush the store write buffer after this long, even if the batch
     /// isn't full (checked on each applied write). Ignored when `store`
@@ -3256,7 +3253,7 @@ pub struct NodeConfig {
     /// Crash window: a `kill -9` can lose the unflushed tail, which is
     /// then recovered via peer sync on reconnect. Clean shutdowns
     /// always flush.
-    #[builder(default = crate::supervision::DEFAULT_FLUSH_INTERVAL)]
+    #[builder(default = crate::actor::DEFAULT_FLUSH_INTERVAL)]
     pub flush_interval: Duration,
     /// Number of fragments the keyspace is partitioned into. Each
     /// fragment gets its own actor (and, with persistence, its own
@@ -3294,12 +3291,12 @@ pub struct NodeConfig {
     pub background_pool: PoolConfig,
     /// How often each fragment's cleaner sweeps for TTL-expired keys.
     /// Default 30 seconds. Must be nonzero and representable by Tokio's clock.
-    #[builder(default = crate::supervision::DEFAULT_CLEAN_INTERVAL)]
+    #[builder(default = crate::actor::DEFAULT_CLEAN_INTERVAL)]
     pub clean_interval: Duration,
     /// How often each fragment's snapshotter flushes the write buffer
     /// to the store. Default 60 seconds. Must be nonzero and representable by
     /// Tokio's clock, including for in-memory nodes.
-    #[builder(default = crate::supervision::DEFAULT_SNAPSHOT_INTERVAL)]
+    #[builder(default = crate::actor::DEFAULT_SNAPSHOT_INTERVAL)]
     pub snapshot_interval: Duration,
     /// Reserved compatibility field for the removed time-based tombstone
     /// collector. Must be `None`; [`Node::start`] rejects every `Some` value

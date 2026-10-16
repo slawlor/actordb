@@ -6,9 +6,9 @@
 //! Paged automatic expiry and explicit snapshot persistence.
 
 use super::*;
+use crate::actor::maintenance_test_support::{GatedStore, ReleaseMaintenanceStore};
 use crate::actor::VersionedValue;
-use crate::supervision::test_support::{GatedStore, ReleaseMaintenanceStore};
-use crate::supervision::{Snapshotter, SnapshotterArgs, SnapshotterMessage};
+use crate::actor::{Snapshotter, SnapshotterArgs, SnapshotterMessage};
 
 #[tokio::test]
 async fn automatic_cleaner_completes_multiple_pages_and_manual_snap_flushes_markers() {

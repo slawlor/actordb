@@ -6,16 +6,16 @@
 //! Supervisor regression groups retain access to their private runtime owner.
 
 use super::*;
+use crate::actor::maintenance_test_support::{GatedStore, ReleaseMaintenanceStore, ReleaseStore};
 use crate::actor::{ApplyOutcome, KvWorker, KvWorkerArgs, ReplicatedOp};
 use crate::store::StoreError;
-use crate::supervision::test_support::{GatedStore, ReleaseMaintenanceStore, ReleaseStore};
 use ractor::registry::where_is;
 use std::sync::atomic::Ordering;
 use std::sync::Mutex as StdMutex;
 
-#[path = "supervisor/builders.rs"]
+#[path = "tests/builders.rs"]
 mod builders;
-#[path = "supervisor/health.rs"]
+#[path = "tests/health.rs"]
 mod health;
-#[path = "supervisor/lifecycle.rs"]
+#[path = "tests/lifecycle.rs"]
 mod lifecycle;

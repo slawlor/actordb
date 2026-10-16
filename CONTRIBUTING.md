@@ -17,6 +17,9 @@ We actively welcome your pull requests!
 4. Ensure the test suite passes.
 
 Release maintainers should follow the [release procedure](docs/releases.md).
+The library workspace does not track `Cargo.lock`. Keep dependency requirements
+as compatible semver ranges; generated local lockfiles remain ignored. Run
+`cargo update` when refreshing local dependencies and rerun the feature matrix.
 PRs validate the crates.io package without credentials or uploads; merging a
 version bump does not itself publish a release.
 

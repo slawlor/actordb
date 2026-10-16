@@ -67,10 +67,10 @@ def verify_backends(package):
 
 def resolve_version(cwd=None):
     result = run_command(
-        ["cargo", "metadata", "--format-version", "1", "--no-deps", "--locked"], cwd
+        ["cargo", "metadata", "--format-version", "1", "--no-deps"], cwd
     )
     if result.returncode != 0:
-        raise ReleaseError("locked Cargo metadata failed")
+        raise ReleaseError("Cargo metadata failed")
     try:
         metadata = json.loads(result.stdout)
     except (ValueError, TypeError) as error:

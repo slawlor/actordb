@@ -44,9 +44,9 @@ integration crate, and an `xtask` for coverage.
 | Module | Role |
 |---|---|
 | `actordb::node` | Public API: `Node`, `NodeConfig`, `NodeError`, peer mesh, routing, forwarding, replication wiring, placement driver |
-| `actordb::actor` | Per-fragment `KvActor` dispatcher, internal managed worker pools, indexed `FragmentState` cache, bounded summary/single-value primitives, `VersionedValue`, `wins_over`, `HlcClock`, priority enum |
+| `actordb::actor` | All ractor actors: dispatcher/workers, `FragmentSupervisor`, `Cleaner`, `Snapshotter`; shared cache, clock, and operation/value contracts |
 | `actordb::replication` | Phase 5 async sender/receiver: `ReplicationSender` state machine, sessions, acks, protocol-v3 paged `ReconcileRequest/Response/Fetch/Data` anti-entropy |
-| `actordb::supervision` | `FragmentSupervisor` + children: dispatcher, `Cleaner` (TTL-expiry markers), `Snapshotter` (periodic flush) |
+| `actordb::supervision` | Compatibility reexports of supervisor and maintenance actor APIs from `actordb::actor` |
 | `actordb::placement` | Phase 8 dynamic placement: `PlacementController` trait, `StaticPlacement`, `ManualPlacement`, migration lifecycle states |
 | `actordb::store` | Shared `KvStore` identity/batch/prefix contract, errors, capabilities, backend options, and compatible implementation reexports |
 | `actordb::store::prefixed` | Always-available fragment-view `PrefixedStore` wrapper |
@@ -59,8 +59,10 @@ integration crate, and an `xtask` for coverage.
 ### Actor implementation files
 
 Each actor's implementation, arguments, and runtime state live together in a
-dedicated file. `actor.rs` and `supervision.rs` are public facades: existing
-imports such as `actordb::actor::{KvActor, KvArgs}` and
+dedicated file under `actor/`, including the supervisor and maintenance actors.
+`actor.rs` is the canonical public facade; `supervision.rs` only preserves the
+legacy supervisor and maintenance imports. Existing imports such as
+`actordb::actor::{KvActor, KvArgs}` and
 `actordb::supervision::{Cleaner, CleanerArgs}` still work, including their
 generated Bon builder types and inferred typestate setter chains. Bon's
 anonymous state modules remain private. Internal module boundaries are not
@@ -72,9 +74,9 @@ new public APIs.
 - `actor/pool.rs`: priority-pool configuration, routing, and reservations.
 - `actor/fragment_state.rs`, `actor/protocol.rs`, and `actor/clock.rs`: shared
   cache/persistence, operation/value contracts, and HLC primitives.
-- `supervision/supervisor.rs`: fragment supervisor, health, restart, and quiesce.
-- `supervision/cleaner.rs` and `supervision/snapshotter.rs`: the individual
-  maintenance actors; `supervision/maintenance.rs` holds their shared ticker
+- `actor/fragment_supervisor.rs`: fragment supervisor, health, restart, and quiesce.
+- `actor/cleaner.rs` and `actor/snapshotter.rs`: the individual
+  maintenance actors; `actor/maintenance.rs` holds their shared ticker
   and coalesced trigger support.
 
 Tests live beside their owning implementation in separate child files so

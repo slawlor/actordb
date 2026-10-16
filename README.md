@@ -44,6 +44,11 @@ A working, tested prototype of the actor-first sharded database vision:
 The workspace requires Rust 1.88 or newer; CI pins 1.88 as the minimum
 supported toolchain.
 
+This library workspace does not commit `Cargo.lock`; fresh checkouts resolve
+compatible dependency versions, preferring the declared Rust minimum. Cargo
+can generate an ignored local lockfile. Run `cargo update` to refresh it and
+rerun tests; dependency resolution is not frozen across fresh builds.
+
 * **`shard`**: deterministic key → fragment mapping (`fragment_of`
   via seahash). The keyspace is partitioned into `fragment_count`
   fragments; every node agrees on the mapping.
@@ -55,12 +60,13 @@ supported toolchain.
   in-memory cache with a lock-coherent ordered key index, one ordered
   persistence buffer, and one `KvStore`; cross-pool LWW merges are serialized
   there.
-* **`supervision`**: every fragment runs under a `FragmentSupervisor`
+* **Supervisor actors (in `actor`)**: every fragment runs under a `FragmentSupervisor`
   owning the dispatcher pool plus background actors — a `Cleaner`
   (durable TTL-expiry markers) and a `Snapshotter`
   (periodic durable flush). Dead workers restart in place; dead children restart without
   touching sibling fragments. `Node::health()` reports per-fragment
-  health.
+  health. The `supervision` module preserves older imports as compatibility
+  reexports; implementations live alongside the other actors.
 * **`node`**: a `Node` pairs the per-fragment supervisors with a Tokio
   TCP mesh. Static placement (`fragment_map`) with caller-side one-hop
   routing: a node either applies a write locally and enqueues it for
@@ -326,7 +332,7 @@ and require explicit one-time legacy adoption; see
 - Failures surface as typed `NodeError` variants, including `Backpressure`,
   `Storage`, `Superseded`, and `Expired` rather than false success.
 
-### `actordb::actor` — the storage core
+### `actordb::actor` — actors and the storage core
 
 - `KvActor` — public per-fragment dispatcher; its managed sticky-hash worker
   pools are internal; `FragmentState` — the shared cache/buffer/store. Direct
@@ -388,12 +394,17 @@ The configured remote deadline (5 seconds by default) covers both bounded
 outbound-queue admission and the reply; cancellation and late replies remove
 or ignore pending state.
 
-### `actordb::supervision` — per-fragment supervision
+### Supervisor and maintenance actors
+
+These types live under `actordb::actor`. `actordb::supervision` reexports the
+same types for compatibility, including their messages, state, and Bon builders.
 
 - `FragmentSupervisor` — owns a fragment's dispatcher, `Cleaner`, and
   `Snapshotter`; restarts dead children in place.
 - `FragmentHealth` — per-fragment health snapshot (worker count/names,
   restart counts, per-pool `shed_counts`).
+- `Cleaner` — materializes expired values as durable TTL markers.
+- `Snapshotter` — periodically flushes the fragment's retained write buffer.
 
 ### `actordb::replication` — async sender/receiver
 

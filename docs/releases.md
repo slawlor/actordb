@@ -7,8 +7,8 @@ does not upload anything. GitHub prereleases are intentionally excluded.
 
 ## Prepare a version PR
 
-1. Bump `actordb/Cargo.toml` and regenerate the matching `actordb` entry in
-   `Cargo.lock`, without unrelated dependency updates. The internal `xtask`
+1. Bump `actordb/Cargo.toml`. Dependency requirements remain compatible semver
+   ranges; this library workspace does not commit `Cargo.lock`. The internal `xtask`
    and `docker-tests` crates are not published and need not share this version.
 2. Update `CHANGELOG.md`, installation examples, and any migration/API docs.
    Pre-1.0 breaking changes use a new minor version; do not promise production
@@ -18,17 +18,17 @@ does not upload anything. GitHub prereleases are intentionally excluded.
    ```bash
    python3 -m unittest discover -s .github/scripts -p 'test_verify_release.py' -v
    python3 .github/scripts/verify_release.py
-   cargo publish --dry-run --locked --package actordb --registry crates-io
-   cargo publish --dry-run --locked --package actordb --registry crates-io --features memory
-   cargo publish --dry-run --locked --package actordb --registry crates-io --features rocksdb
-   cargo package --locked --package actordb
+   cargo publish --dry-run --package actordb --registry crates-io
+   cargo publish --dry-run --package actordb --registry crates-io --features memory
+   cargo publish --dry-run --package actordb --registry crates-io --features rocksdb
+   cargo package --package actordb
    ```
 
    These commands do not publish and need no registry token. Cargo verifies the
    unpacked crate, including the bundled protobuf schema/build script, library
    modules, README, and license. Native protobuf compilation needs a C/C++
    toolchain; opt-in RocksDB support additionally needs working libclang.
-   Inspect `cargo package --list --locked --package actordb` when changing
+   Inspect `cargo package --list --package actordb` when changing
    source layout. Keep the bundled `actordb/LICENSE` in sync with root `LICENSE`.
 4. Wait for all PR checks and reviews, including backend-free, memory-only,
    and full-feature tests, Rust 1.88, Docker, and the `Verify release package`
@@ -39,6 +39,19 @@ verified `.crate` for inspection. An explicit, verified `cargo package` produces
 the artifact in Cargo's normal package directory: recent Cargo versions stage
 publish dry-runs in a temporary registry instead. No internal staging path is
 assumed. The artifact is not a crates.io release.
+
+Fresh checkouts resolve current compatible dependencies instead of a committed
+lockfile. The workspace resolver prefers versions compatible with the declared
+Rust minimum; undeclared or inaccurate dependency MSRVs can still break a build.
+Cargo may create a local, ignored `Cargo.lock` and include a generated lockfile
+in the `.crate` archive; neither is a repository dependency pin. Repeated
+commands can reuse that local resolution. Run `cargo update` to refresh it,
+and rerun validation before releasing. CI and release commands do not require
+a preexisting lockfile or enforce a frozen dependency graph.
+
+The workspace resolver configuration is not shipped as a downstream Cargo
+policy. Consumers choose their own resolver and lockfile behavior; the crate's
+declared Rust minimum and semver dependency requirements remain its contract.
 
 Package verification uses a separate `stable-release-package` dependency cache:
 an unpacked crate does not unify the workspace's dev/test features, so its
@@ -77,7 +90,7 @@ For this version, after the version PR is merged and `main` checks are green:
    unmerged branch, missing/moved tag, or version mismatch fails closed.
 4. Backend-free, memory-only, and RocksDB-only package dry-runs and crate tests
    must pass before the workflow publishes **only `actordb`** to the explicit `crates-io`
-   registry with locked dependencies. Uploads are serialized and an in-flight
+   registry using compatible dependency resolution. Uploads are serialized and an in-flight
    publication is never cancelled by a newer validation run.
 5. Check the Actions result and verify `0.2.0` on
    [crates.io](https://crates.io/crates/actordb) and its build on

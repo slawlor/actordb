@@ -605,5 +605,4 @@ impl Actor for FragmentSupervisor {
 }
 
 #[cfg(test)]
-#[path = "tests/supervisor.rs"]
 mod tests;

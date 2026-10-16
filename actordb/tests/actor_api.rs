@@ -25,6 +25,9 @@ fn builder_types_keep_their_public_paths() {
     let _: supervision::SupervisorArgsBuilder = SupervisorArgs::builder();
     let _: supervision::CleanerArgsBuilder = CleanerArgs::builder();
     let _: supervision::SnapshotterArgsBuilder = SnapshotterArgs::builder();
+    let _: actor::SupervisorArgsBuilder = actor::SupervisorArgs::builder();
+    let _: actor::CleanerArgsBuilder = actor::CleanerArgs::builder();
+    let _: actor::SnapshotterArgsBuilder = actor::SnapshotterArgs::builder();
 }
 
 #[test]
@@ -76,4 +79,28 @@ fn actor_associated_state_types_keep_their_public_paths() {
     state_is::<supervision::FragmentSupervisor, supervision::SupervisorState>();
     state_is::<supervision::Cleaner, supervision::CleanerState>();
     state_is::<supervision::Snapshotter, supervision::SnapshotterState>();
+    // Cross-facade associated states prove these are aliases, not wrapper actors.
+    state_is::<actor::FragmentSupervisor, supervision::SupervisorState>();
+    state_is::<actor::Cleaner, supervision::CleanerState>();
+    state_is::<actor::Snapshotter, supervision::SnapshotterState>();
+    state_is::<supervision::FragmentSupervisor, actor::SupervisorState>();
+    state_is::<supervision::Cleaner, actor::CleanerState>();
+    state_is::<supervision::Snapshotter, actor::SnapshotterState>();
+}
+
+#[test]
+fn canonical_and_compatibility_facades_export_identical_types() {
+    fn same_type<A: 'static, B: 'static>() {
+        assert_eq!(std::any::TypeId::of::<A>(), std::any::TypeId::of::<B>());
+    }
+
+    same_type::<actor::SupervisorArgs, supervision::SupervisorArgs>();
+    same_type::<actor::CleanerArgs, supervision::CleanerArgs>();
+    same_type::<actor::SnapshotterArgs, supervision::SnapshotterArgs>();
+    same_type::<actor::SupervisorMessage, supervision::SupervisorMessage>();
+    same_type::<actor::CleanerMessage, supervision::CleanerMessage>();
+    same_type::<actor::SnapshotterMessage, supervision::SnapshotterMessage>();
+    same_type::<actor::FragmentHealth, supervision::FragmentHealth>();
+    same_type::<actor::FragmentShutdownError, supervision::FragmentShutdownError>();
+    same_type::<actor::MaintenanceTrigger, supervision::MaintenanceTrigger>();
 }

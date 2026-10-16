@@ -57,18 +57,39 @@ class MetadataTests(unittest.TestCase):
         ):
             return guard.resolve_version()
 
-    def test_reads_only_the_named_workspace_package_with_locked_metadata(self):
+    def test_reads_only_the_named_workspace_package_with_metadata(self):
         with mock.patch.object(
             guard.subprocess, "run", return_value=command_result(json.dumps(metadata()))
         ) as run:
             self.assertEqual(guard.resolve_version(), "0.2.0")
         run.assert_called_once_with(
-            ["cargo", "metadata", "--format-version", "1", "--no-deps", "--locked"],
+            ["cargo", "metadata", "--format-version", "1", "--no-deps"],
             cwd=None,
             capture_output=True,
             text=True,
             check=False,
         )
+
+    def test_metadata_does_not_require_an_existing_workspace_lockfile(self):
+        with tempfile.TemporaryDirectory() as directory:
+            lockfile = Path(directory) / "Cargo.lock"
+            self.assertFalse(lockfile.exists())
+
+            def cargo_metadata(command, **options):
+                self.assertEqual(options["cwd"], directory)
+                self.assertFalse(lockfile.exists())
+                self.assertEqual(
+                    command,
+                    ["cargo", "metadata", "--format-version", "1", "--no-deps"],
+                )
+                return command_result(json.dumps(metadata()))
+
+            with mock.patch.object(
+                guard.subprocess, "run", side_effect=cargo_metadata
+            ) as run:
+                self.assertEqual(guard.resolve_version(directory), "0.2.0")
+            run.assert_called_once()
+            self.assertFalse(lockfile.exists())
 
     def test_preserves_prerelease_and_build_version(self):
         self.assertEqual(

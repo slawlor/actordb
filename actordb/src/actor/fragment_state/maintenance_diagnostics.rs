@@ -8,9 +8,10 @@
 //! actual Cleaner. Both contend with actual dispatcher/worker foreground RPCs.
 
 use super::*;
-use crate::actor::{KvActor, KvArgs, KvMessage, OpPriority, PoolConfig, ReplicatedOp};
+use crate::actor::{
+    Cleaner, CleanerArgs, KvActor, KvArgs, KvMessage, OpPriority, PoolConfig, ReplicatedOp,
+};
 use crate::shard::FragmentId;
-use crate::supervision::{Cleaner, CleanerArgs};
 use ractor::rpc::CallResult;
 use ractor::Actor;
 use tokio::sync::Barrier;

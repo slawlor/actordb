@@ -23,27 +23,50 @@
 //! transport layer forwards to the fragment's replica holders, and
 //! inbound ops merge here with last-writer-wins. Because the merge is
 //! idempotent and commutative, replicas converge without coordination.
+//!
+//! This is also the canonical facade for the fragment supervisor, cleaner,
+//! and snapshotter. Their previous [`crate::supervision`] imports remain
+//! available as compatibility reexports of the same types.
 
+mod cleaner;
 mod clock;
 mod fragment_state;
+mod fragment_supervisor;
 mod kv_actor;
 mod kv_worker;
+mod maintenance;
 mod pool;
 mod pool_worker;
 mod protocol;
+mod snapshotter;
 
+pub use cleaner::{Cleaner, CleanerArgs, CleanerArgsBuilder, CleanerMessage, CleanerState};
 pub use clock::{now_ms, ClockSkewError, HlcClock};
 pub use fragment_state::FragmentState;
+pub use fragment_supervisor::{
+    FragmentHealth, FragmentShutdownError, FragmentSupervisor, SupervisorArgs,
+    SupervisorArgsBuilder, SupervisorMessage, SupervisorState,
+};
 pub use kv_actor::{KvActor, KvArgs, KvArgsBuilder, KvState};
 pub use kv_worker::{KvWorker, KvWorkerArgs, KvWorkerArgsBuilder};
+pub use maintenance::MaintenanceTrigger;
 pub use pool::{worker_idx, PoolConfig, PoolConfigBuilder, TokenBucket};
 pub use protocol::{
     ApplyDurability, ApplyError, ApplyOutcome, BatchReadContinuation, BatchReadEntry,
     BatchReadPage, KvMessage, OpPriority, ReplicatedOp, RetainedBatchRead, SnapshotSummary,
     SummaryPage, VersionedPage, VersionedValue,
 };
+pub use snapshotter::{
+    Snapshotter, SnapshotterArgs, SnapshotterArgsBuilder, SnapshotterMessage, SnapshotterState,
+};
 
 pub(crate) use fragment_state::ExpiryPass;
+pub(crate) use fragment_supervisor::{
+    FragmentStartupStorageError, DEFAULT_CLEAN_INTERVAL, DEFAULT_FLUSH_BATCH_SIZE,
+    DEFAULT_FLUSH_INTERVAL, DEFAULT_SNAPSHOT_INTERVAL,
+};
 
+#[cfg(test)]
+mod maintenance_test_support;
 #[cfg(test)]
 mod test_support;

@@ -132,5 +132,4 @@ impl Actor for Cleaner {
 }
 
 #[cfg(test)]
-#[path = "tests/cleaner.rs"]
 mod tests;

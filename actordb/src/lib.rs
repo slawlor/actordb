@@ -11,7 +11,7 @@
 // #![cfg_attr(docsrs, feature(doc_cfg))]
 
 /// The actor-first heart of the database: per-fragment dispatchers
-/// routing to worker pools over shared fragment state, with
+/// routing to worker pools, supervisors, and maintenance actors over shared fragment state, with
 /// last-writer-wins merge, TTLs, and tombstones.
 pub mod actor;
 
@@ -37,7 +37,7 @@ pub mod store;
 /// Sharding: deterministic key → fragment mapping.
 pub mod shard;
 
-/// Per-fragment supervision: dispatcher pool, TTL cleaner, snapshotter.
+/// Compatibility reexports of the supervisor and maintenance actors in [`actor`].
 pub mod supervision;
 
 /// Phase 5: async sender/receiver replication (per-fragment, per-peer

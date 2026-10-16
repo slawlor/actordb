@@ -29,15 +29,19 @@ actor-first, sharded database implementation. This is a breaking upgrade from
   `KvStore` implementations and storeless nodes need neither feature.
 - Rust 1.88 minimum support, backend-free/memory/full-feature CI, package
   verification, and version/tag-checked crates.io release automation.
-- Actor-per-file runtime organization with compatible public imports and Bon
+- Actor-per-file runtime organization under `actor`, with `supervision`
+  compatibility reexports preserving public imports and Bon
   builder paths; shared cache, clock, protocol, pool, and maintenance helpers
   have separate modules.
 - Consolidated `getrandom` 0.4, `hmac` 0.13, `sha2` 0.11, and `tracing-glog` 0.4
-  upgrades, current compatible lockfile patches, and grouped future Dependabot
+  upgrades, current compatible dependency patches, and grouped future Dependabot
   updates. OS challenge generation and constant-time handshake verification
   retain the existing protocol, pinned by independent crypto test vectors.
   The internal xtask uses Clap 4 without the obsolete `atty` dependency, while
   preserving its existing commands and coverage flags.
+- No committed dependency lockfile or frozen-resolution CI/release commands.
+  Fresh resolution prefers dependencies compatible with each crate's declared
+  Rust minimum; Cargo-generated local and packaged lockfiles remain normal.
 
 See the [API guide](docs/api.md), [persistence guide](docs/persistence.md),
 [replication guide](docs/replication.md), and

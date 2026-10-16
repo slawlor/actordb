@@ -91,5 +91,4 @@ impl Actor for Snapshotter {
 }
 
 #[cfg(test)]
-#[path = "tests/snapshotter.rs"]
 mod tests;
