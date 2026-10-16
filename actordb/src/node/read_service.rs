@@ -640,7 +640,9 @@ mod tests {
     #[tokio::test]
     async fn full_queue_sheds_single_read_without_waiting() {
         let (actor, _, _) = actor().await;
-        let (service, _receivers) = queued_service(1, 100);
+        // Both requests fit the byte gate: the second must fail on the queue,
+        // not prematurely on byte exhaustion.
+        let (service, _receivers) = queued_service(1, 2 * KEY_BYTES);
         let (tx, _data, mut responses) = test_peer_channel(8);
         assert!(service.try_submit(job(
             &actor,
@@ -664,10 +666,7 @@ mod tests {
             service.lanes[1].count.available_permits(),
             READ_WORKERS_PER_PRIORITY
         );
-        assert_eq!(
-            service.lanes[1].key_bytes.available_permits(),
-            100 - KEY_BYTES
-        );
+        assert_eq!(service.lanes[1].key_bytes.available_permits(), KEY_BYTES);
         actor.stop_and_wait(None, None).await.unwrap();
     }
 
@@ -829,6 +828,213 @@ mod tests {
                 .is_err()
         );
         actor.stop_and_wait(None, None).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn count_exhaustion_includes_cancelled_actor_keys_with_spare_byte_budget() {
+        let (actor, started, _) = actor().await;
+        let tasks = RuntimeTasks::new(8);
+        let capacity = READ_WORKERS_PER_PRIORITY + 1;
+        let bytes = (capacity + 1) * KEY_BYTES;
+        let service = ReadService::start(&tasks, 1, bytes).await.unwrap();
+        let (old_tx, _old_data, _old_responses) = test_peer_channel(8);
+        assert!(service.try_submit(job(
+            &actor,
+            &old_tx,
+            1,
+            OpPriority::Default,
+            Duration::from_secs(60)
+        )));
+        tokio::time::timeout(Duration::from_secs(2), started.notified())
+            .await
+            .unwrap();
+        old_tx.cancel();
+
+        let (tx, _data, mut responses) = test_peer_channel(8);
+        // The cancelled actor request still owns one admission. All eight
+        // workers can now await later requests behind that same held actor.
+        for req_id in 2..=capacity as u64 {
+            assert!(service.try_submit(job(
+                &actor,
+                &tx,
+                req_id,
+                OpPriority::Default,
+                Duration::from_secs(60)
+            )));
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while service.lanes[1].jobs.capacity() != 1 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+        }
+        assert_eq!(service.lanes[1].count.available_permits(), 0);
+        assert_eq!(service.lanes[1].key_bytes.available_permits(), KEY_BYTES);
+        assert_eq!(service.lanes[1].jobs.capacity(), 1);
+        assert!(service.try_submit(job(
+            &actor,
+            &tx,
+            99,
+            OpPriority::Default,
+            Duration::from_secs(60)
+        )));
+        assert!(
+            matches!(response(&mut responses).await.msg, Some(EnvelopeMsg::BatchGetResponse(r))
+            if r.req_id == 99 && r.results.len() == 1 && r.results[0].key == "key" && r.results[0].shed)
+        );
+        assert_eq!(service.lanes[1].key_bytes.available_permits(), KEY_BYTES);
+        tx.cancel();
+        tasks.shutdown().await;
+        assert_eq!(service.lanes[1].count.available_permits(), 0);
+        actor.kill();
+        actor.wait(None).await.unwrap();
+        assert_eq!(service.lanes[1].count.available_permits(), capacity);
+        assert_eq!(service.lanes[1].key_bytes.available_permits(), bytes);
+    }
+
+    #[tokio::test]
+    async fn preexpired_single_admission_is_silent_and_does_not_consume_capacity() {
+        let (actor, started, _) = actor().await;
+        let (service, _receivers) = queued_service(1, KEY_BYTES);
+        let (tx, _data, mut responses) = test_peer_channel(8);
+        let mut request = job(&actor, &tx, 1, OpPriority::Default, Duration::ZERO);
+        request.request = ReadRequest::Single(ForwardedGet {
+            req_id: 1,
+            key: "key".into(),
+            ..ForwardedGet::default()
+        });
+        assert!(service.try_submit(request));
+        assert!(
+            responses.try_recv().is_err(),
+            "unavailable single read fabricated a miss or shed reply"
+        );
+        assert!(!*tx.cancel.borrow());
+        assert_eq!(
+            service.lanes[1].count.available_permits(),
+            READ_WORKERS_PER_PRIORITY + 1
+        );
+        assert_eq!(service.lanes[1].key_bytes.available_permits(), KEY_BYTES);
+        assert_eq!(service.lanes[1].jobs.capacity(), 1);
+        tx.cancel();
+        assert!(!service.try_submit(job(&actor, &tx, 2, OpPriority::Default, Duration::ZERO)));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), started.notified())
+                .await
+                .is_err()
+        );
+        actor.stop_and_wait(None, None).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stopped_actor_single_is_silent_and_releases_admission() {
+        let (actor, _, _) = actor().await;
+        actor.stop_and_wait(None, None).await.unwrap();
+        let (service, mut receivers) = queued_service(1, KEY_BYTES);
+        let (tx, _data, mut responses) = test_peer_channel(8);
+        let mut request = job(&actor, &tx, 1, OpPriority::Default, Duration::from_secs(5));
+        request.request = ReadRequest::Single(ForwardedGet {
+            req_id: 1,
+            key: "key".into(),
+            ..ForwardedGet::default()
+        });
+        assert!(service.try_submit(request));
+        let request = receivers[1].recv().await.unwrap();
+        let (_stop, mut shutdown) = watch::channel(false);
+        serve_read(request, &mut shutdown).await;
+        assert!(
+            responses.try_recv().is_err(),
+            "stopped actor fabricated a not-found single reply"
+        );
+        assert!(!*tx.cancel.borrow());
+        assert_eq!(
+            service.lanes[1].count.available_permits(),
+            READ_WORKERS_PER_PRIORITY + 1
+        );
+        assert_eq!(service.lanes[1].key_bytes.available_permits(), KEY_BYTES);
+    }
+
+    #[tokio::test]
+    async fn successful_read_response_lane_failure_closes_only_origin_and_releases_keys() {
+        for batch in [false, true] {
+            let (actor, _, release) = actor().await;
+            let (service, mut receivers) = queued_service(1, KEY_BYTES);
+            let (tx, _data, mut responses) = test_peer_channel(1);
+            assert!(send_envelope(
+                &tx,
+                Envelope {
+                    msg: Some(EnvelopeMsg::GetResponse(GetResponse {
+                        req_id: 99,
+                        ..GetResponse::default()
+                    }))
+                }
+            ));
+            let (replacement, _replacement_data, mut replacement_responses) = test_peer_channel(1);
+            let mut request = job(&actor, &tx, 1, OpPriority::Default, Duration::from_secs(5));
+            if !batch {
+                request.request = ReadRequest::Single(ForwardedGet {
+                    req_id: 1,
+                    key: "key".into(),
+                    ..ForwardedGet::default()
+                });
+            }
+            assert!(service.try_submit(request));
+            let request = receivers[1].recv().await.unwrap();
+            release.notify_one();
+            let (_stop, mut shutdown) = watch::channel(false);
+            serve_read(request, &mut shutdown).await;
+            assert!(
+                *tx.cancel.borrow(),
+                "response rejection did not cancel its origin channel"
+            );
+            assert!(!*replacement.cancel.borrow());
+            assert!(replacement_responses.try_recv().is_err());
+            assert!(
+                matches!(response(&mut responses).await.msg, Some(EnvelopeMsg::GetResponse(r)) if r.req_id == 99)
+            );
+            assert!(
+                responses.try_recv().is_err(),
+                "failed read response leaked into saturated queue"
+            );
+            assert_eq!(
+                service.lanes[1].count.available_permits(),
+                READ_WORKERS_PER_PRIORITY + 1
+            );
+            assert_eq!(service.lanes[1].key_bytes.available_permits(), KEY_BYTES);
+            actor.stop_and_wait(None, None).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn expired_rejection_response_failure_closes_channel_without_actor_admission() {
+        let (actor, _, _) = actor().await;
+        let (service, _receivers) = queued_service(1, KEY_BYTES);
+        let (tx, _data, _responses) = test_peer_channel(1);
+        assert!(send_envelope(
+            &tx,
+            Envelope {
+                msg: Some(EnvelopeMsg::GetResponse(GetResponse {
+                    req_id: 99,
+                    ..GetResponse::default()
+                }))
+            }
+        ));
+        assert!(!service.try_submit(job(&actor, &tx, 1, OpPriority::Default, Duration::ZERO)));
+        assert!(*tx.cancel.borrow());
+        assert_eq!(
+            service.lanes[1].count.available_permits(),
+            READ_WORKERS_PER_PRIORITY + 1
+        );
+        assert_eq!(service.lanes[1].key_bytes.available_permits(), KEY_BYTES);
+        assert_eq!(service.lanes[1].jobs.capacity(), 1);
+        actor.stop_and_wait(None, None).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn closed_runtime_refuses_read_worker_registration() {
+        let tasks = RuntimeTasks::new(8);
+        tasks.shutdown().await;
+        assert!(ReadService::start(&tasks, 1, KEY_BYTES).await.is_none());
     }
 
     #[tokio::test]
