@@ -131,6 +131,10 @@ const WIRE_BATCH_PAGE_BYTES: usize = ANTI_ENTROPY_PAGE_BYTES;
 /// Bound pull-request suffixes so a value-heavy batch cannot resend thousands
 /// of key bytes quadratically while responses advance one item at a time.
 const MAX_BATCH_GET_REQUEST_KEYS: usize = 256;
+/// Bound local multi-key fan-out before requests reach fragment dispatcher
+/// admission. Pool queue caps apply after dequeue, so issuing an unbounded
+/// `join_all` would otherwise let one caller monopolize dispatcher ingress.
+const MAX_LOCAL_BATCH_IN_FLIGHT: usize = 1024;
 /// Protocol-control messages retained per fragment/peer sender. Mutation
 /// ingress has its own lane sized by `SenderConfig::buffer_capacity`.
 const REPLICATION_CONTROL_CHANNEL_DEPTH: usize = 64;
@@ -4078,19 +4082,27 @@ impl Node {
             }
         }
 
-        // Local puts run concurrently, each awaiting its exact apply outcome
-        // at the requested priority.
-        let local_futs = local.into_iter().map(|(i, key, value)| {
-            let this = self;
-            async move {
-                let r = this
-                    .put_with_ttl_and_priority(key, value, None, priority)
-                    .await;
-                (i, r)
+        // Bound calls before dispatcher admission: a pool queue cap covers
+        // active/worker-queued work, not an arbitrary backlog already sitting
+        // in the shared dispatcher mailbox.
+        let mut local = local.into_iter();
+        loop {
+            let chunk: Vec<_> = local.by_ref().take(MAX_LOCAL_BATCH_IN_FLIGHT).collect();
+            if chunk.is_empty() {
+                break;
             }
-        });
-        for (i, r) in futures::future::join_all(local_futs).await {
-            results[i] = Some(r);
+            let local_futs = chunk.into_iter().map(|(i, key, value)| {
+                let this = self;
+                async move {
+                    let r = this
+                        .put_with_ttl_and_priority(key, value, None, priority)
+                        .await;
+                    (i, r)
+                }
+            });
+            for (i, r) in futures::future::join_all(local_futs).await {
+                results[i] = Some(r);
+            }
         }
 
         // Remote puts: exact-byte- and count-bounded BatchPut chunks per
@@ -4330,16 +4342,23 @@ impl Node {
             }
         }
 
-        // Local gets: concurrent, at the requested priority.
-        let local_futs = local.into_iter().map(|(i, key)| {
-            let this = self;
-            async move {
-                let r = this.get_with_priority_admitted(key, priority).await;
-                (i, r)
+        // As with local puts, bound the pre-admission dispatcher backlog.
+        let mut local = local.into_iter();
+        loop {
+            let chunk: Vec<_> = local.by_ref().take(MAX_LOCAL_BATCH_IN_FLIGHT).collect();
+            if chunk.is_empty() {
+                break;
             }
-        });
-        for (i, r) in futures::future::join_all(local_futs).await {
-            results[i] = Some(r);
+            let local_futs = chunk.into_iter().map(|(i, key)| {
+                let this = self;
+                async move {
+                    let r = this.get_with_priority_admitted(key, priority).await;
+                    (i, r)
+                }
+            });
+            for (i, r) in futures::future::join_all(local_futs).await {
+                results[i] = Some(r);
+            }
         }
 
         // Remote gets: byte- and count-bounded requests. A response is an
@@ -8637,27 +8656,39 @@ async fn handle_connection(
                 // at most one response frame and never blocks on a stream of
                 // pages in both directions.
                 let batch_priority = priority_from_proto(bg.priority);
-                let mut results = Vec::new();
-                let mut response_payload_len = batch_get_response_base_encoded_len(req_id);
-                for key in bg.keys {
-                    let (value, shed) = match actor
-                        .call(
-                            |reply| KvMessage::Get {
-                                key: key.clone(),
-                                reply,
-                                priority: batch_priority,
-                            },
-                            None,
-                        )
-                        .await
-                    {
-                        Ok(CallResult::Success(Ok(value))) => (value, false),
-                        Ok(CallResult::Success(Err(_))) => (None, true),
-                        Ok(CallResult::Timeout | CallResult::SenderError) | Err(_) => {
-                            // An empty first prefix asks the caller to fail over;
-                            // after progress, it will resume this exact key.
+                let page = match tokio::time::timeout(
+                    runtime_options.forwarded_attempt_timeout,
+                    actor.call(
+                        |reply| KvMessage::GetBatch {
+                            keys: bg.keys,
+                            response_base_payload_len: batch_get_response_base_encoded_len(req_id),
+                            response_soft_limit: WIRE_BATCH_PAGE_BYTES,
+                            reply,
+                            priority: batch_priority,
+                        },
+                        None,
+                    ),
+                )
+                .await
+                {
+                    Ok(Ok(CallResult::Success(page))) => page,
+                    Ok(Ok(CallResult::Timeout | CallResult::SenderError)) | Ok(Err(_)) | Err(_) => {
+                        // An empty response is explicit unavailability. The
+                        // origin retries this untouched suffix at its next
+                        // configured holder.
+                        if !send_batch_get_response(&tx, req_id, Vec::new()) {
                             break;
                         }
+                        continue;
+                    }
+                };
+                let mut results = Vec::new();
+                let mut response_payload_len = batch_get_response_base_encoded_len(req_id);
+                for entry in page.entries {
+                    let key = entry.key;
+                    let (value, shed) = match entry.result {
+                        Ok(value) => (value, false),
+                        Err(_) => (None, true),
                     };
                     let (found, bytes, timestamp_ms, node_id, expires_at_ms, is_tombstone) =
                         match value {
@@ -9757,6 +9788,10 @@ mod tests {
             state: &mut Self::State,
         ) -> Result<(), ractor::ActorProcessingErr> {
             if let KvMessage::GetVersionedPage { reply, .. } = message {
+                state.started.notify_one();
+                state.release.notified().await;
+                drop(reply);
+            } else if let KvMessage::GetBatch { reply, .. } = message {
                 state.started.notify_one();
                 state.release.notified().await;
                 drop(reply);
@@ -11454,6 +11489,107 @@ mod tests {
                 .unwrap();
             runtime_tasks.shutdown().await;
         }
+    }
+
+    #[tokio::test]
+    async fn batch_actor_timeout_returns_unavailable_without_stalling_shared_connection() {
+        let fragment = FragmentId(0);
+        let router = FragmentRouter::new(2, 0);
+        let started = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let (actor, _actor_handle) = ractor::Actor::spawn(
+            None,
+            BlockingPageActor,
+            BlockingPageState {
+                started: started.clone(),
+                release: release.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        router.insert(fragment, actor.clone());
+        let peers: PeerMap = Arc::new(Mutex::new(HashMap::new()));
+        let (mut ctx, runtime_tasks) = test_connection_context(
+            router,
+            Arc::new(RwLock::new(HashSet::from([fragment]))),
+            Arc::new(RwLock::new(HashMap::new())),
+            true,
+            Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(Mutex::new(HashMap::new())),
+            peers.clone(),
+        );
+        ctx.runtime_options =
+            NodeRuntimeOptions::default().with_forwarded_attempt_timeout(Duration::from_millis(50));
+        let (mut client, server) = tokio::io::duplex(4096);
+        let connection = tokio::spawn(handle_connection(ctx, Box::pin(server), false, None, None));
+        complete_test_handshake(&mut client, "peer").await;
+
+        let key_for_fragment = |fragment| {
+            (0..1000)
+                .map(|i| format!("batch-timeout-{i}"))
+                .find(|key| fragment_of(key, 2) == fragment)
+                .unwrap()
+        };
+        write_test_envelope(
+            &mut client,
+            Envelope {
+                msg: Some(EnvelopeMsg::BatchGet(BatchGet {
+                    req_id: 41,
+                    keys: vec![key_for_fragment(fragment)],
+                    priority: ProtoPriority::Default as i32,
+                })),
+            },
+        )
+        .await;
+        tokio::time::timeout(Duration::from_secs(1), started.notified())
+            .await
+            .expect("batch read did not reach the blocked actor");
+        let response =
+            tokio::time::timeout(Duration::from_secs(1), read_test_envelope(&mut client))
+                .await
+                .expect("batch actor deadline did not release the connection reader");
+        assert!(matches!(
+            response.msg,
+            Some(EnvelopeMsg::BatchGetResponse(BatchGetResponse {
+                req_id: 41,
+                results,
+            })) if results.is_empty()
+        ));
+
+        // Keep the original actor blocked. A request for an independently
+        // non-serving fragment must still traverse both halves of this same
+        // multiplexed connection after the timed-out batch.
+        write_test_envelope(
+            &mut client,
+            Envelope {
+                msg: Some(EnvelopeMsg::BatchGet(BatchGet {
+                    req_id: 42,
+                    keys: vec![key_for_fragment(FragmentId(1))],
+                    priority: ProtoPriority::High as i32,
+                })),
+            },
+        )
+        .await;
+        let probe = tokio::time::timeout(Duration::from_secs(1), read_test_envelope(&mut client))
+            .await
+            .expect("shared connection stalled after the batch actor timeout");
+        assert!(matches!(
+            probe.msg,
+            Some(EnvelopeMsg::BatchGetResponse(BatchGetResponse {
+                req_id: 42,
+                results,
+            })) if results.is_empty()
+        ));
+        assert!(peers.lock().await.contains_key("peer"));
+
+        release.notify_one();
+        actor.stop_and_wait(None, None).await.unwrap();
+        drop(client);
+        tokio::time::timeout(Duration::from_secs(1), connection)
+            .await
+            .expect("connection did not stop after its stream closed")
+            .unwrap();
+        runtime_tasks.shutdown().await;
     }
 
     #[tokio::test]

@@ -10,6 +10,9 @@
 //! dispatch preserves per-key ordering within a priority pool, while the
 //! shared fragment state serializes conflicting writes across pools and
 //! different keys execute concurrently across workers.
+//! `GetBatch` keeps one aggregate reply while lazily routing each ordered key
+//! through that same admission and sticky-worker path; it never clones or
+//! reserves an omitted byte-page suffix.
 //!
 //! Workers share the fragment's state ([`FragmentState`](crate::actor::FragmentState)): one in-memory
 //! cache, one ordered persistence buffer, one [`KvStore`](crate::store::KvStore).
@@ -109,7 +112,7 @@ impl TokenBucket {
 
 use crate::shard::{hash_key, FragmentId};
 use crate::store::{KvStore, StoreCommitDurability};
-use crate::wire::check_versioned_value_budget;
+use crate::wire::{batch_get_result_encoded_len, check_versioned_value_budget, RepeatedFieldSizer};
 
 /// A value stamped with its last-writer-wins version.
 ///
@@ -249,6 +252,44 @@ pub struct VersionedPage {
     pub missing: bool,
 }
 
+/// One position in an actor-routed batch read.
+///
+/// Entries remain in request order, including duplicate keys. `Err` is an
+/// explicit per-key admission shed and is never confused with a missing key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BatchReadEntry {
+    /// Requested key at this position.
+    pub key: String,
+    /// Visible value, explicit miss, or admission-shed error.
+    pub result: Result<Option<VersionedValue>, String>,
+}
+
+/// One ordered, byte-bounded prefix returned by [`KvMessage::GetBatch`].
+///
+/// A non-empty request normally produces a non-empty prefix. Callers resume
+/// any omitted suffix explicitly, just as the peer `BatchGet` protocol does.
+/// Orderly dispatcher drain may end the page after its admitted key completes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BatchReadPage {
+    /// Contiguous request prefix in input order.
+    pub entries: Vec<BatchReadEntry>,
+}
+
+/// Opaque continuation passed between a fragment dispatcher and its exact
+/// sticky worker. It is public only because [`KvMessage`] is public; direct
+/// callers cannot construct it and should use [`KvMessage::GetBatch`].
+#[doc(hidden)]
+pub struct BatchReadContinuation {
+    keys: Vec<String>,
+    next_index: usize,
+    results: Vec<Result<Option<VersionedValue>, String>>,
+    response_sizing: RepeatedFieldSizer,
+    response_soft_limit: usize,
+    priority: OpPriority,
+    reply: RpcReplyPort<BatchReadPage>,
+    dispatcher: ActorRef<KvMessage>,
+}
+
 // Keep actor-owned summary clones bounded before the network layer adds
 // protobuf metadata. A single individually valid summary may exceed the soft
 // target, but admission control guarantees it still fits the hard wire limit.
@@ -316,6 +357,7 @@ impl std::fmt::Display for ApplyError {
 impl std::error::Error for ApplyError {}
 
 /// Messages handled by the [KvActor].
+#[non_exhaustive]
 pub enum KvMessage {
     /// Apply a write — local or replicated. Merged with last-writer-wins,
     /// so applying the same op twice is harmless (idempotent).
@@ -356,6 +398,25 @@ pub enum KvMessage {
         reply: RpcReplyPort<Result<Option<VersionedValue>, String>>,
         priority: OpPriority,
     },
+    /// Read an ordered prefix of keys through their normal sticky workers.
+    /// Admission, rate limiting, and shed accounting remain per key. The
+    /// dispatcher routes only the next key after the prior worker releases its
+    /// reservation, so retained result memory stays byte-bounded.
+    GetBatch {
+        keys: Vec<String>,
+        /// Encoded `BatchGetResponse` payload length before repeated results.
+        /// The node supplies its request-id field here.
+        response_base_payload_len: usize,
+        /// Soft target for the complete encoded response envelope. One
+        /// individually valid result may cross it and is returned alone or as
+        /// the terminal entry in the prefix.
+        response_soft_limit: usize,
+        reply: RpcReplyPort<BatchReadPage>,
+        priority: OpPriority,
+    },
+    /// Internal worker-to-dispatcher continuation for [`KvMessage::GetBatch`].
+    #[doc(hidden)]
+    ContinueBatchRead(BatchReadContinuation),
     /// Read the full local copy for compatibility and diagnostics. The wire
     /// reconciler uses bounded summary pages and exact-key reads instead.
     GetAll {
@@ -400,6 +461,82 @@ pub enum KvMessage {
     GetShedCounts {
         reply: RpcReplyPort<(u64, u64, u64)>,
     },
+}
+
+impl BatchReadContinuation {
+    fn new(
+        keys: Vec<String>,
+        response_base_payload_len: usize,
+        response_soft_limit: usize,
+        priority: OpPriority,
+        reply: RpcReplyPort<BatchReadPage>,
+        dispatcher: ActorRef<KvMessage>,
+    ) -> Self {
+        let result_capacity = keys.len().min(256);
+        Self {
+            keys,
+            next_index: 0,
+            results: Vec::with_capacity(result_capacity),
+            response_sizing: RepeatedFieldSizer::new(17, 2, response_base_payload_len),
+            response_soft_limit,
+            priority,
+            reply,
+            dispatcher,
+        }
+    }
+
+    fn current_key(&self) -> Option<&str> {
+        self.keys.get(self.next_index).map(String::as_str)
+    }
+
+    fn push(&mut self, result: Result<Option<VersionedValue>, String>) {
+        let key = self
+            .current_key()
+            .expect("batch continuation must point at an input key");
+        let result_payload_len = match &result {
+            Ok(value) => batch_get_result_encoded_len(key, value.as_ref(), false),
+            Err(_) => batch_get_result_encoded_len(key, None, true),
+        };
+        self.response_sizing.push(result_payload_len);
+        self.results.push(result);
+        self.next_index += 1;
+    }
+
+    fn is_complete(&self) -> bool {
+        self.next_index == self.keys.len()
+            || (!self.results.is_empty()
+                && self.response_sizing.encoded_len() > self.response_soft_limit)
+    }
+
+    fn finish(mut self) {
+        self.keys.truncate(self.results.len());
+        let entries = self
+            .keys
+            .into_iter()
+            .zip(self.results)
+            .map(|(key, result)| BatchReadEntry { key, result })
+            .collect();
+        let _ = self.reply.send(BatchReadPage { entries });
+    }
+
+    fn return_to_dispatcher(self) {
+        if self.reply.is_closed() {
+            return;
+        }
+        if self.is_complete() {
+            self.finish();
+            return;
+        }
+        let dispatcher = self.dispatcher.clone();
+        if let Err(ractor::MessagingErr::SendErr(KvMessage::ContinueBatchRead(work))) =
+            dispatcher.send_message(KvMessage::ContinueBatchRead(self))
+        {
+            // A drain can close admission between worker completion and this
+            // send. Recover the owned message and return the completed prefix;
+            // its untouched suffix was never reserved and remains retryable.
+            work.finish();
+        }
+    }
 }
 
 /// The fragment's shared state: one in-memory cache, one persistence
@@ -1039,6 +1176,44 @@ async fn handle_worker_message(
             let _ = reply.send(Ok(shared.get(&key).await));
             Ok(())
         }
+        KvMessage::GetBatch {
+            keys,
+            response_base_payload_len,
+            response_soft_limit,
+            reply,
+            priority: _,
+        } => {
+            // `KvWorker` remains a public low-level actor. It has no managed
+            // pool admission, so serve the same ordered byte-bounded shape
+            // directly. Production `KvActor` routes one admitted key at a
+            // time through `ContinueBatchRead` below.
+            let mut entries = Vec::with_capacity(keys.len().min(256));
+            let mut response_sizing = RepeatedFieldSizer::new(17, 2, response_base_payload_len);
+            for key in keys {
+                let value = shared.get(&key).await;
+                let result_payload_len = batch_get_result_encoded_len(&key, value.as_ref(), false);
+                response_sizing.push(result_payload_len);
+                entries.push(BatchReadEntry {
+                    key,
+                    result: Ok(value),
+                });
+                if response_sizing.encoded_len() > response_soft_limit {
+                    break;
+                }
+            }
+            let _ = reply.send(BatchReadPage { entries });
+            Ok(())
+        }
+        KvMessage::ContinueBatchRead(mut work) => {
+            let Some(key) = work.current_key() else {
+                work.finish();
+                return Ok(());
+            };
+            let value = shared.get(key).await;
+            work.push(Ok(value));
+            work.return_to_dispatcher();
+            Ok(())
+        }
         // Flush fences are handled by the dispatcher against the shared
         // state. They are never routed through a worker pool.
         KvMessage::Flush { reply } | KvMessage::FlushStable { reply } => {
@@ -1200,6 +1375,26 @@ impl Actor for PoolWorker {
                 let value = state.shared.get(&key).await;
                 release_pool_reservation(state);
                 let _ = reply.send(Ok(value));
+                Ok(())
+            }
+            KvMessage::ContinueBatchRead(mut work) => {
+                let Some(key) = work.current_key() else {
+                    release_pool_reservation(state);
+                    work.finish();
+                    return Ok(());
+                };
+                #[cfg(test)]
+                if let Some(gate) = take_worker_get_gate(key) {
+                    gate.entered.notify_one();
+                    gate.release.notified().await;
+                }
+                let value = state.shared.get(key).await;
+                // Release before the dispatcher admits the next key. At a
+                // queue-cap boundary, forwarding first would make completed
+                // work look pending and spuriously shed the continuation.
+                release_pool_reservation(state);
+                work.push(Ok(value));
+                work.return_to_dispatcher();
                 Ok(())
             }
             message => {
@@ -1569,6 +1764,43 @@ pub struct KvState {
     worker_prefix: String,
 }
 
+impl KvState {
+    fn pool(&self, priority: OpPriority) -> &WorkerPool {
+        match priority {
+            OpPriority::High => &self.high_pool,
+            OpPriority::Default => &self.default_pool,
+            OpPriority::Background => &self.background_pool,
+        }
+    }
+}
+
+async fn route_batch_read(mut work: BatchReadContinuation, state: &KvState) {
+    loop {
+        if work.reply.is_closed() {
+            return;
+        }
+        if work.is_complete()
+            || (!work.results.is_empty() && work.dispatcher.get_status() >= ActorStatus::Draining)
+        {
+            work.finish();
+            return;
+        }
+        let pool = state.pool(work.priority);
+        let reservation = {
+            let key = work
+                .current_key()
+                .expect("incomplete batch continuation must have a key");
+            pool.try_reserve(key).await
+        };
+        let Some(reservation) = reservation else {
+            work.push(Err("shed: pool at queue cap or rate limit".to_string()));
+            continue;
+        };
+        reservation.send(KvMessage::ContinueBatchRead(work));
+        return;
+    }
+}
+
 impl Actor for KvActor {
     type Msg = KvMessage;
     type State = KvState;
@@ -1666,7 +1898,7 @@ impl Actor for KvActor {
 
     async fn handle(
         &self,
-        _myself: ActorRef<Self::Msg>,
+        myself: ActorRef<Self::Msg>,
         message: Self::Msg,
         state: &mut Self::State,
     ) -> Result<(), ActorProcessingErr> {
@@ -1741,6 +1973,31 @@ impl Actor for KvActor {
                     reply,
                     priority,
                 });
+                Ok(())
+            }
+            KvMessage::GetBatch {
+                keys,
+                response_base_payload_len,
+                response_soft_limit,
+                reply,
+                priority,
+            } => {
+                route_batch_read(
+                    BatchReadContinuation::new(
+                        keys,
+                        response_base_payload_len,
+                        response_soft_limit,
+                        priority,
+                        reply,
+                        myself,
+                    ),
+                    state,
+                )
+                .await;
+                Ok(())
+            }
+            KvMessage::ContinueBatchRead(work) => {
+                route_batch_read(work, state).await;
                 Ok(())
             }
             KvMessage::Flush { reply } => {
@@ -2568,6 +2825,457 @@ mod worker_pool_tests {
         );
         assert_eq!(rate_limited.shed_count(), 1);
         rate_limited.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn batch_read_releases_each_reservation_before_routing_the_next_key() {
+        let shared = Arc::new(FragmentState::new(
+            HashMap::new(),
+            None,
+            100,
+            Duration::from_secs(3600),
+        ));
+        let pool = pool_config(1, None);
+        let (dispatcher, _handle) = KvActor::spawn(
+            None,
+            KvActor,
+            KvArgs {
+                shared,
+                fragment: FragmentId(0),
+                worker_prefix: unique_prefix("batch-cap-one"),
+                default_pool: pool.clone(),
+                high_pool: pool.clone(),
+                background_pool: pool,
+            },
+        )
+        .await
+        .unwrap();
+
+        let page = dispatcher
+            .call(
+                |reply| KvMessage::GetBatch {
+                    keys: vec!["first".to_string(), "second".to_string()],
+                    response_base_payload_len: 0,
+                    response_soft_limit: usize::MAX,
+                    reply,
+                    priority: OpPriority::Default,
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        let CallResult::Success(page) = page else {
+            panic!("batch read did not complete");
+        };
+        assert_eq!(page.entries.len(), 2);
+        assert!(page.entries.iter().all(|entry| entry.result == Ok(None)));
+        let counts = dispatcher
+            .call(|reply| KvMessage::GetShedCounts { reply }, None)
+            .await
+            .unwrap();
+        assert_eq!(counts, CallResult::Success((0, 0, 0)));
+
+        dispatcher.drain().unwrap();
+        dispatcher.wait(None).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn batch_read_stops_before_admitting_an_omitted_suffix() {
+        let shared = Arc::new(FragmentState::new(
+            HashMap::new(),
+            None,
+            100,
+            Duration::from_secs(3600),
+        ));
+        shared.apply(&op("first", 1)).await.unwrap();
+        shared.apply(&op("second", 2)).await.unwrap();
+        let pool = pool_config(8, Some(1));
+        let (dispatcher, _handle) = KvActor::spawn(
+            None,
+            KvActor,
+            KvArgs {
+                shared,
+                fragment: FragmentId(0),
+                worker_prefix: unique_prefix("batch-lazy-admission"),
+                default_pool: pool.clone(),
+                high_pool: pool.clone(),
+                background_pool: pool,
+            },
+        )
+        .await
+        .unwrap();
+
+        let page = dispatcher
+            .call(
+                |reply| KvMessage::GetBatch {
+                    keys: vec!["first".to_string(), "second".to_string()],
+                    response_base_payload_len: 0,
+                    response_soft_limit: 0,
+                    reply,
+                    priority: OpPriority::Default,
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        let CallResult::Success(page) = page else {
+            panic!("batch read did not complete");
+        };
+        assert_eq!(page.entries.len(), 1);
+        assert_eq!(page.entries[0].key, "first");
+        assert!(matches!(page.entries[0].result, Ok(Some(_))));
+        let counts = dispatcher
+            .call(|reply| KvMessage::GetShedCounts { reply }, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            counts,
+            CallResult::Success((0, 0, 0)),
+            "omitted suffix consumed a rate-limit token"
+        );
+
+        dispatcher.drain().unwrap();
+        dispatcher.wait(None).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn batch_read_rate_limit_is_charged_and_reported_per_key() {
+        let shared = Arc::new(FragmentState::new(
+            HashMap::new(),
+            None,
+            100,
+            Duration::from_secs(3600),
+        ));
+        let pool = pool_config(8, Some(1));
+        let (dispatcher, _handle) = KvActor::spawn(
+            None,
+            KvActor,
+            KvArgs {
+                shared,
+                fragment: FragmentId(0),
+                worker_prefix: unique_prefix("batch-rate-limit"),
+                default_pool: pool.clone(),
+                high_pool: pool.clone(),
+                background_pool: pool,
+            },
+        )
+        .await
+        .unwrap();
+
+        let page = dispatcher
+            .call(
+                |reply| KvMessage::GetBatch {
+                    keys: vec!["first".to_string(), "second".to_string()],
+                    response_base_payload_len: 0,
+                    response_soft_limit: usize::MAX,
+                    reply,
+                    priority: OpPriority::Default,
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        let CallResult::Success(page) = page else {
+            panic!("batch read did not complete");
+        };
+        assert_eq!(page.entries[0].result, Ok(None));
+        assert!(page.entries[1].result.is_err());
+        let counts = dispatcher
+            .call(|reply| KvMessage::GetShedCounts { reply }, None)
+            .await
+            .unwrap();
+        assert_eq!(counts, CallResult::Success((0, 1, 0)));
+
+        dispatcher.drain().unwrap();
+        dispatcher.wait(None).await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn blocked_background_batch_read_does_not_stall_high_priority_or_health() {
+        let shared = Arc::new(FragmentState::new(
+            HashMap::new(),
+            None,
+            100,
+            Duration::from_secs(3600),
+        ));
+        let pool = pool_config(8, None);
+        let (dispatcher, _handle) = KvActor::spawn(
+            None,
+            KvActor,
+            KvArgs {
+                shared,
+                fragment: FragmentId(0),
+                worker_prefix: unique_prefix("batch-priority-isolation"),
+                default_pool: pool.clone(),
+                high_pool: pool.clone(),
+                background_pool: pool,
+            },
+        )
+        .await
+        .unwrap();
+        let gate = install_worker_get_gate("blocked-batch".to_string());
+        let batch_dispatcher = dispatcher.clone();
+        let batch = tokio::spawn(async move {
+            batch_dispatcher
+                .call(
+                    |reply| KvMessage::GetBatch {
+                        keys: vec!["blocked-batch".to_string(), "later".to_string()],
+                        response_base_payload_len: 0,
+                        response_soft_limit: usize::MAX,
+                        reply,
+                        priority: OpPriority::Background,
+                    },
+                    None,
+                )
+                .await
+                .unwrap()
+        });
+        tokio::time::timeout(Duration::from_secs(2), gate.entered.notified())
+            .await
+            .expect("background batch did not reach its worker");
+
+        let high = tokio::time::timeout(
+            Duration::from_secs(2),
+            dispatcher.call(
+                |reply| KvMessage::Get {
+                    key: "high".to_string(),
+                    reply,
+                    priority: OpPriority::High,
+                },
+                None,
+            ),
+        )
+        .await
+        .expect("background batch blocked high-priority dispatch")
+        .unwrap();
+        assert_eq!(high, CallResult::Success(Ok(None)));
+        let counts = dispatcher
+            .call(|reply| KvMessage::GetShedCounts { reply }, None)
+            .await
+            .unwrap();
+        assert_eq!(counts, CallResult::Success((0, 0, 0)));
+
+        gate.release.notify_one();
+        let CallResult::Success(page) = batch.await.unwrap() else {
+            panic!("background batch did not complete");
+        };
+        assert_eq!(page.entries.len(), 2);
+
+        dispatcher.drain().unwrap();
+        dispatcher.wait(None).await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn batch_read_worker_loss_closes_reply_and_reclaims_its_reservation() {
+        let shared = Arc::new(FragmentState::new(
+            HashMap::new(),
+            None,
+            100,
+            Duration::from_secs(3600),
+        ));
+        let pool = pool_config(1, None);
+        let prefix = unique_prefix("batch-worker-loss");
+        let (dispatcher, _handle) = KvActor::spawn(
+            None,
+            KvActor,
+            KvArgs {
+                shared,
+                fragment: FragmentId(0),
+                worker_prefix: prefix.clone(),
+                default_pool: pool.clone(),
+                high_pool: pool.clone(),
+                background_pool: pool,
+            },
+        )
+        .await
+        .unwrap();
+        let gate = install_worker_get_gate("blocked-batch-loss".to_string());
+        let batch_dispatcher = dispatcher.clone();
+        let batch = tokio::spawn(async move {
+            batch_dispatcher
+                .call(
+                    |reply| KvMessage::GetBatch {
+                        keys: vec!["blocked-batch-loss".to_string(), "later".to_string()],
+                        response_base_payload_len: 0,
+                        response_soft_limit: usize::MAX,
+                        reply,
+                        priority: OpPriority::Default,
+                    },
+                    None,
+                )
+                .await
+                .unwrap()
+        });
+        tokio::time::timeout(Duration::from_secs(2), gate.entered.notified())
+            .await
+            .expect("batch did not reach the worker");
+
+        let worker_name = format!("{prefix}-default-worker-0");
+        let old_worker = where_is(worker_name.clone()).expect("worker should be registered");
+        let old_id = old_worker.get_id();
+        old_worker.kill();
+        wait_for(|| where_is(worker_name.clone()).is_some_and(|worker| worker.get_id() != old_id))
+            .await;
+        assert!(matches!(batch.await.unwrap(), CallResult::SenderError));
+
+        let recovered = dispatcher
+            .call(
+                |reply| KvMessage::GetBatch {
+                    keys: vec!["recovered".to_string()],
+                    response_base_payload_len: 0,
+                    response_soft_limit: usize::MAX,
+                    reply,
+                    priority: OpPriority::Default,
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(recovered, CallResult::Success(_)));
+        let counts = dispatcher
+            .call(|reply| KvMessage::GetShedCounts { reply }, None)
+            .await
+            .unwrap();
+        assert_eq!(counts, CallResult::Success((0, 0, 0)));
+
+        dispatcher.drain().unwrap();
+        dispatcher.wait(None).await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn batch_read_orderly_drain_returns_the_admitted_prefix() {
+        for key_count in [1, 2] {
+            let shared = Arc::new(FragmentState::new(
+                HashMap::new(),
+                None,
+                100,
+                Duration::from_secs(3600),
+            ));
+            let pool = pool_config(1, None);
+            let prefix = unique_prefix("batch-orderly-drain");
+            let first = format!("{prefix}-first");
+            let keys = vec![first.clone(), format!("{prefix}-suffix")];
+            let (dispatcher, _handle) = KvActor::spawn(
+                None,
+                KvActor,
+                KvArgs {
+                    shared,
+                    fragment: FragmentId(0),
+                    worker_prefix: prefix,
+                    default_pool: pool.clone(),
+                    high_pool: pool.clone(),
+                    background_pool: pool,
+                },
+            )
+            .await
+            .unwrap();
+            let gate = install_worker_get_gate(first.clone());
+            let (reply, response) = tokio::sync::oneshot::channel();
+            dispatcher
+                .send_message(KvMessage::GetBatch {
+                    keys: keys.into_iter().take(key_count).collect(),
+                    response_base_payload_len: 0,
+                    response_soft_limit: usize::MAX,
+                    reply: reply.into(),
+                    priority: OpPriority::Default,
+                })
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(2), gate.entered.notified())
+                .await
+                .expect("batch did not enter its worker");
+
+            dispatcher.drain().unwrap();
+            gate.release.notify_one();
+            let page = tokio::time::timeout(Duration::from_secs(2), response)
+                .await
+                .expect("admitted read did not finish during drain")
+                .expect("orderly drain dropped the completed prefix");
+            assert_eq!(
+                page.entries,
+                vec![BatchReadEntry {
+                    key: first,
+                    result: Ok(None),
+                }]
+            );
+            tokio::time::timeout(Duration::from_secs(2), dispatcher.wait(None))
+                .await
+                .expect("batch prevented orderly worker drain")
+                .unwrap();
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn batch_read_cancellation_retains_admission_until_worker_completion() {
+        let shared = Arc::new(FragmentState::new(
+            HashMap::new(),
+            None,
+            100,
+            Duration::from_secs(3600),
+        ));
+        let pool = pool_config(1, None);
+        let prefix = unique_prefix("batch-cancelled");
+        let first = format!("{prefix}-first");
+        let suffix = format!("{prefix}-suffix");
+        let (dispatcher, _handle) = KvActor::spawn(
+            None,
+            KvActor,
+            KvArgs {
+                shared,
+                fragment: FragmentId(0),
+                worker_prefix: prefix,
+                default_pool: pool.clone(),
+                high_pool: pool.clone(),
+                background_pool: pool,
+            },
+        )
+        .await
+        .unwrap();
+        let gate = install_worker_get_gate(first.clone());
+        let suffix_gate = install_worker_get_gate(suffix.clone());
+        let (reply, response) = tokio::sync::oneshot::channel();
+        dispatcher
+            .send_message(KvMessage::GetBatch {
+                keys: vec![first, suffix.clone()],
+                response_base_payload_len: 0,
+                response_soft_limit: usize::MAX,
+                reply: reply.into(),
+                priority: OpPriority::Default,
+            })
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), gate.entered.notified())
+            .await
+            .expect("batch did not enter its worker");
+        drop(response);
+
+        let read = || {
+            dispatcher.call(
+                |reply| KvMessage::Get {
+                    key: "probe".to_string(),
+                    reply,
+                    priority: OpPriority::Default,
+                },
+                None,
+            )
+        };
+        assert!(matches!(read().await.unwrap(), CallResult::Success(Err(_))));
+        gate.release.notify_one();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if matches!(read().await.unwrap(), CallResult::Success(Ok(None))) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancelled batch did not release its completed reservation");
+        assert!(
+            take_worker_get_gate(&suffix).is_some(),
+            "cancelled batch admitted its untouched suffix"
+        );
+        drop(suffix_gate);
+        dispatcher.drain().unwrap();
+        dispatcher.wait(None).await.unwrap();
     }
 
     #[tokio::test]

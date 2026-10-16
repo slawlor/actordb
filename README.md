@@ -221,6 +221,10 @@ Multi-key semantics:
   fragment and owner attempt, rather than one message per key. Large get
   responses advance as connection-correlated ordered prefixes; omitted suffixes are
   requested under fresh ids without losing duplicate positions.
+- Local fan-out is capped at 1024 concurrent calls before dispatcher
+  admission. A remote `BatchGet` uses one aggregate actor continuation but
+  admits and sticky-routes only its next ordered key, stopping by exact encoded
+  result bytes before an omitted suffix is reserved or cloned.
 - Local and remote puts await the serving fragment's exact per-key apply
   outcome. Remote batches preserve request order/cardinality and use the
   configured per-attempt deadline (5 seconds by default), including outbound
@@ -291,14 +295,16 @@ and require explicit one-time legacy adoption; see
 - `ApplyError::{Backpressure, InvalidInput, Storage}` distinguishes a nonfatal
   unencodable direct actor request from persistence failure; invalid input does
   not restart the fragment worker.
-- `SnapshotSummary`, `SummaryPage`, `VersionedPage`, and
-  `KvMessage::{GetSummaryPage, GetVersioned, GetVersionedPage}` provide
-  pinned-time, revision-aware anti-entropy reads without cloning whole
-  fragments or arbitrary fetch chunks; existing `GetAll` and `GetSnapshot`
-  remain available for compatibility and debugging.
-- `KvMessage::{ApplyOp, Flush, FlushStable, Get, GetAll, GetSnapshot,
+- `BatchReadEntry`, `BatchReadPage`, `SnapshotSummary`, `SummaryPage`, and
+  `VersionedPage` support priority-aware ordered batch reads plus pinned-time,
+  revision-aware anti-entropy reads without cloning whole fragments or
+  arbitrary fetch chunks; existing `GetAll` and `GetSnapshot` remain
+  available for compatibility and debugging.
+- `KvMessage::{ApplyOp, Flush, FlushStable, Get, GetBatch, GetAll, GetSnapshot,
   GetSummaryPage, GetVersioned, GetVersionedPage, GetRevision, GetShedCounts}`
   — for embedders driving the dispatcher directly instead of through `Node`.
+  `KvMessage` is non-exhaustive; downstream matches must retain a wildcard arm
+  as internal routing/query variants evolve.
   `FlushStable` requests the backend's explicit stable fence and reports
   `ApplyDurability::StableCommitted` only when that fence succeeds.
 

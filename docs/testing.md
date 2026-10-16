@@ -133,8 +133,15 @@ process — the bulk of behavioral coverage:
   `remote_batches_split_at_encoded_byte_limits_without_false_misses`.
   Node and wire unit tests separately verify exact Prost length accounting,
   positional ordered-prefix validation with duplicate keys, the shed-bit hard
-  boundary, UTF-8-safe diagnostic truncation, valid provenance bounds, and the
-  reserved full-frame response lane under complete producer saturation. The
+  boundary, actor-side `BatchGet` result sizing, UTF-8-safe diagnostic
+  truncation, valid provenance bounds, and the reserved full-frame response
+  lane under complete producer saturation. Actor tests prove a queue-cap-one
+  continuation releases before admitting its next key and a byte-page suffix
+  consumes no rate-limit tokens. They also cover orderly drain returning an
+  admitted prefix and cancellation retaining capacity until worker completion
+  without admitting the suffix. A raw-peer test blocks the batch actor through
+  its deadline, verifies an empty unavailable response, and then exchanges
+  another request on the same connection while that actor remains blocked. The
   connection tests also prove that a reconcile request/fetch racing a
   non-serving fragment cannot tear down unrelated multiplexed traffic, actor
   unavailability cannot become a false single-read miss, and direct or relayed
@@ -147,7 +154,8 @@ process — the bulk of behavioral coverage:
   send rollback, cancellation retaining its slot until worker completion,
   reclaiming only a dead worker generation's active and queued reservations,
   clean drain when worker replacement races shutdown, and proving a blocked
-  background `Get` does not stall high-priority reads or health queries.
+  background `Get` or actor-routed batch read does not stall high-priority
+  reads or health queries.
 - **Remote mutation failures**:
   `forwarded_put_returns_remote_storage_failure`; node unit tests reject
   unspecified statuses and malformed result order/cardinality.

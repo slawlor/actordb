@@ -57,12 +57,13 @@ matters is the trend on the *same* machine.
 
 | case      | 10 keys | 100 keys | 1000 keys |
 |-----------|---------|----------|-----------|
-| put_multi | 175 µs  | 1.41 ms  | 12.87 ms  |
-| get_multi | 225 µs  | 790 µs   | 8.31 ms   |
+| put_multi | 190 µs  | 371 µs   | 2.05 ms   |
+| get_multi | 186 µs  | 308 µs   | 1.69 ms   |
 
-(Re-baselined 2026-10-14: `TCP_NODELAY` fixed the old ~100 ms floor —
-finding #30 closed. `get_multi` went from 99.9/105.6/120.8 ms to
-0.22/0.79/8.31 ms, a 93–99% reduction.)
+(Re-baselined on `main` on 2026-10-16 after the sender-registry and incremental
+protobuf-sizing work. The actor-routed `BatchGet` continuation remained near
+1.7 ms at 1000 keys in a focused run; its benefit is bounded admission and
+result memory, not speculative parallel reads.)
 
 ### replication (mean source-apply-completion-to-replica-visible lag)
 
@@ -109,8 +110,12 @@ These are the first things to measure when they get fixed:
 - #14 — dispatcher ingress remains a shared serial funnel. Worker-bound Gets
   no longer make it await a nested RPC; watch sequential `put`/`get` plus
   `concurrent_get/{sticky,spread}` in `put_get`.
-- #24 — `BatchGet` serves keys with sequential actor round-trips
-  → watch `get_multi` at 1000 keys in `fanout`.
+- ~~#24 — one actor RPC channel per `BatchGet` key~~ **replaced 2026-10-16**
+  with one ordered aggregate continuation. It deliberately keeps one value
+  clone and one per-key admission in flight, so this is a boundedness/fairness
+  fix rather than eager parallel read fan-out. Keep watching `get_multi` at
+  1000 keys in `fanout`; a same-machine focused run remained around
+  1.7 ms (within noise of the pre-change result).
 - #23 — per-op `hlc.observe()` acquisitions in the replication receiver loop
   → watch `replication_lag` scaling with batch size.
 - Sender-registry critical sections → watch `sender_registry` scale across
