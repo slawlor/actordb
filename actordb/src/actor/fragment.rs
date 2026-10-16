@@ -3,7 +3,7 @@
 // This source code is licensed under both the MIT license found in the
 // LICENSE-MIT file in the root directory of this source tree.
 
-//! Fragment child ownership, startup rollback, health and quiescence.
+//! Per-fragment lifecycle, child ownership, startup rollback, and health.
 
 use futures::FutureExt;
 use std::collections::{HashMap, HashSet};

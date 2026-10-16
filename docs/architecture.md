@@ -74,7 +74,7 @@ new public APIs.
 - `actor/pool.rs`: priority-pool configuration, routing, and reservations.
 - `actor/fragment_state.rs`, `actor/protocol.rs`, and `actor/clock.rs`: shared
   cache/persistence, operation/value contracts, and HLC primitives.
-- `actor/fragment_supervisor.rs`: fragment supervisor, health, restart, and quiesce.
+- `actor/fragment.rs`: per-fragment lifecycle, child supervision, health, restart, and quiesce.
 - `actor/cleaner.rs` and `actor/snapshotter.rs`: the individual
   maintenance actors; `actor/maintenance.rs` holds their shared ticker
   and coalesced trigger support.

@@ -30,8 +30,8 @@
 
 mod cleaner;
 mod clock;
+mod fragment;
 mod fragment_state;
-mod fragment_supervisor;
 mod kv_actor;
 mod kv_worker;
 mod maintenance;
@@ -42,11 +42,11 @@ mod snapshotter;
 
 pub use cleaner::{Cleaner, CleanerArgs, CleanerArgsBuilder, CleanerMessage, CleanerState};
 pub use clock::{now_ms, ClockSkewError, HlcClock};
-pub use fragment_state::FragmentState;
-pub use fragment_supervisor::{
+pub use fragment::{
     FragmentHealth, FragmentShutdownError, FragmentSupervisor, SupervisorArgs,
     SupervisorArgsBuilder, SupervisorMessage, SupervisorState,
 };
+pub use fragment_state::FragmentState;
 pub use kv_actor::{KvActor, KvArgs, KvArgsBuilder, KvState};
 pub use kv_worker::{KvWorker, KvWorkerArgs, KvWorkerArgsBuilder};
 pub use maintenance::MaintenanceTrigger;
@@ -60,11 +60,11 @@ pub use snapshotter::{
     Snapshotter, SnapshotterArgs, SnapshotterArgsBuilder, SnapshotterMessage, SnapshotterState,
 };
 
-pub(crate) use fragment_state::ExpiryPass;
-pub(crate) use fragment_supervisor::{
+pub(crate) use fragment::{
     FragmentStartupStorageError, DEFAULT_CLEAN_INTERVAL, DEFAULT_FLUSH_BATCH_SIZE,
     DEFAULT_FLUSH_INTERVAL, DEFAULT_SNAPSHOT_INTERVAL,
 };
+pub(crate) use fragment_state::ExpiryPass;
 
 #[cfg(test)]
 mod maintenance_test_support {
