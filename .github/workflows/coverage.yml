@@ -17,12 +17,20 @@ jobs:
     steps:
       - name: Checkout sources
         uses: actions/checkout@v7
+        with:
+          # Codecov labels PR reports with the head commit, not the synthetic
+          # merge commit. Measure that same source; push reports use github.sha.
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      - name: Verify coverage source identity
+        env:
+          COVERAGE_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: test "$(git rev-parse HEAD)" = "$COVERAGE_COMMIT_SHA"
 
       - name: Install stable toolchain
-        uses: actions-rs/toolchain@v1
+        uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: ${{ matrix.rust }}
-          override: true
           components: llvm-tools-preview
 
       - uses: Swatinem/rust-cache@v2
@@ -33,12 +41,7 @@ jobs:
           curl -sL https://github.com/mozilla/grcov/releases/download/v0.8.10/grcov-x86_64-unknown-linux-gnu.tar.bz2 | tar jxf - -C "${HOME}/.local/bin"
           echo "$HOME/.local/bin" >> $GITHUB_PATH
       - name: Run xtask coverage
-        uses: actions-rs/cargo@v1
-        with:
-          command: run
-          args: --bin xtask coverage
-
-
+        run: cargo run --locked --bin xtask -- coverage
       - name: Upload to codecov.io
         uses: codecov/codecov-action@v7
         with:
