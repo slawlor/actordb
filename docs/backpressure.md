@@ -131,6 +131,21 @@ decoded/actor/cache/relay/caller copies, kernel socket buffers, or total heap
 use. `with_receive_byte_capacity` configures this encoded-body budget and must
 fit at least one maximum frame. Request execution remains inline.
 
+Non-serving nodes also have aggregate, node-wide relay admission: 1024 live
+read/mutation relays and 64 MiB of retained request-key storage by default,
+configured with `with_relay_capacity` and `with_relay_key_byte_capacity`.
+Key charges include String headers/buffer capacities and the batch Vec header
+and allocated String slots, including unused capacity. Mutation values, decoded
+frames, writer buffers, caches, and allocator overhead are outside this key
+budget; fixed relay/timer overhead is separately count-bounded. Admission never
+waits. Saturation or a lost owner yields explicit mutation `Unavailable`; legacy
+single reads stay unavailable and expire at the origin instead of falsely
+reporting a miss. Registration/enqueue cancellation rolls back the exact relay
+generation, and a timer retains admission until its future exits. Disconnect
+and replacement cleanup is pinned to exact physical origin/owner channels, so
+an old socket cannot remove replacement work under the same peer id. Serving
+mutation apply and post-apply replication ownership are unchanged.
+
 The current custom pool does **not** provide lossless worker restart. Accepted
 jobs active or queued in a dead worker are dropped, their reply ports close,
 and they are not replayed; supervision does reclaim their reservations, so a

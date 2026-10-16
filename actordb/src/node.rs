@@ -144,6 +144,8 @@ const INBOUND_CONNECTION_CAPACITY: usize = 1024;
 /// connections. Four maximum frames fit without allowing the socket count to
 /// multiply incomplete-body allocations into gigabytes.
 const RECEIVE_BYTE_CAPACITY: usize = 64 * 1024 * 1024;
+const RELAY_CAPACITY: usize = 1024;
+const RELAY_KEY_BYTE_CAPACITY: usize = 64 * 1024 * 1024;
 /// Total budget for both flights of the peer handshake.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Internal task-registration queue. Registration applies backpressure and is
@@ -199,7 +201,9 @@ impl PeerChannel {
         // Wake producers blocked on the encoded-byte gate immediately; this
         // budget belongs only to this physical connection and is never reused.
         self.outbound.close();
-        let _ = self.cancel.send(true);
+        // Cancellation is terminal, including for relays which subscribe after
+        // the reader exited and the last previous receiver was dropped.
+        self.cancel.send_replace(true);
     }
 }
 
@@ -429,9 +433,9 @@ impl RetiringSender {
 }
 
 /// Relayed forwarded-gets keyed by their locally allocated request id.
-type RelayMap = Arc<Mutex<HashMap<u64, GetRelay>>>;
+type RelayMap = Arc<StdMutex<HashMap<u64, GetRelay>>>;
 /// Relayed forwarded mutations: relay req_id -> (origin peer_tx, origin req_id).
-type MutationRelayMap = Arc<Mutex<HashMap<u64, MutationRelay>>>;
+type MutationRelayMap = Arc<StdMutex<HashMap<u64, MutationRelay>>>;
 
 struct SenderEntryDeps<'a> {
     config: &'a SenderConfig,
@@ -525,6 +529,7 @@ async fn ensure_sender_entry(fragment: FragmentId, peer: &str, deps: SenderEntry
 
 struct MutationRelay {
     expected_peer: String,
+    expected_tx: PeerChannel,
     expected_keys: Vec<String>,
     origin_tx: PeerChannel,
     origin_req_id: u64,
@@ -533,10 +538,12 @@ struct MutationRelay {
     /// response, timeout, or send failure. Response bytes may still be lost
     /// after enqueue; the fence covers mutation completion, not socket flush.
     _operation: OperationPermit,
+    _admission: Arc<RelayLease>,
 }
 
 struct MutationRelayRegistration {
     expected_peer: String,
+    expected_tx: PeerChannel,
     expected_keys: Vec<String>,
     origin_tx: PeerChannel,
     origin_req_id: u64,
@@ -546,18 +553,195 @@ struct MutationRelayRegistration {
 
 struct GetRelay {
     expected_peer: String,
+    expected_tx: PeerChannel,
     expected_key: String,
     origin_tx: PeerChannel,
     origin_req_id: u64,
     timeout_cancel: oneshot::Sender<()>,
+    _admission: Arc<RelayLease>,
 }
 
 struct GetRelayRegistration {
     expected_peer: String,
+    expected_tx: PeerChannel,
     expected_key: String,
     origin_tx: PeerChannel,
     origin_req_id: u64,
     deadline: Instant,
+}
+
+struct RelayAdmission {
+    slots: Arc<Semaphore>,
+    key_bytes: Arc<Semaphore>,
+}
+
+struct RelayLease {
+    _slot: OwnedSemaphorePermit,
+    _keys: OwnedSemaphorePermit,
+}
+
+impl RelayAdmission {
+    fn new(capacity: usize, key_byte_capacity: usize) -> Arc<Self> {
+        Arc::new(Self {
+            slots: Arc::new(Semaphore::new(capacity)),
+            key_bytes: Arc::new(Semaphore::new(key_byte_capacity)),
+        })
+    }
+
+    fn try_reserve(&self, key_bytes: usize) -> Option<Arc<RelayLease>> {
+        let key_bytes = u32::try_from(key_bytes).ok()?;
+        let slot = self.slots.clone().try_acquire_owned().ok()?;
+        let keys = self
+            .key_bytes
+            .clone()
+            .try_acquire_many_owned(key_bytes)
+            .ok()?;
+        Some(Arc::new(RelayLease {
+            _slot: slot,
+            _keys: keys,
+        }))
+    }
+}
+
+fn relay_key_storage_bytes(capacity: usize) -> usize {
+    std::mem::size_of::<String>().saturating_add(capacity)
+}
+
+fn relay_keys_storage_bytes(keys: &[String], capacity: usize) -> usize {
+    keys.iter().fold(
+        std::mem::size_of::<Vec<String>>()
+            .saturating_add(capacity.saturating_mul(std::mem::size_of::<String>())),
+        |bytes, key| bytes.saturating_add(key.capacity()),
+    )
+}
+
+enum RelayRegistry {
+    Get(RelayMap),
+    Mutation(MutationRelayMap),
+}
+
+/// Synchronous rollback covers timer registration and outbound admission.
+/// The timer also owns this lease, so its lifetime cannot outlive admission.
+struct RelayRegistrationGuard {
+    registry: RelayRegistry,
+    relay_id: u64,
+    admission: Arc<RelayLease>,
+    origin_tx: PeerChannel,
+    armed: bool,
+}
+
+impl RelayRegistrationGuard {
+    fn disarm(mut self) {
+        self.armed = false;
+    }
+
+    async fn enqueue(&self, owner_tx: &PeerChannel, envelope: Envelope, deadline: Instant) -> bool {
+        let mut owner_cancel = owner_tx.cancel.subscribe();
+        let mut origin_cancel = self.origin_tx.cancel.subscribe();
+        if *owner_cancel.borrow() || *origin_cancel.borrow() {
+            return false;
+        }
+        tokio::select! {
+            _ = owner_cancel.changed() => false,
+            _ = origin_cancel.changed() => false,
+            sent = try_send_envelope_until(owner_tx, envelope, deadline) => sent,
+        }
+    }
+}
+
+impl Drop for RelayRegistrationGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        match &self.registry {
+            RelayRegistry::Get(relays) => {
+                drop(remove_get_relay(relays, self.relay_id, &self.admission));
+            }
+            RelayRegistry::Mutation(relays) => {
+                if let Some(relay) = remove_mutation_relay(relays, self.relay_id, &self.admission) {
+                    fail_mutation_relay(relay, "mutation relay canceled before enqueue");
+                }
+            }
+        }
+    }
+}
+
+fn remove_get_relay(relays: &RelayMap, id: u64, admission: &Arc<RelayLease>) -> Option<GetRelay> {
+    let mut relays = relays.lock().unwrap();
+    if relays
+        .get(&id)
+        .is_some_and(|relay| Arc::ptr_eq(&relay._admission, admission))
+    {
+        relays.remove(&id)
+    } else {
+        None
+    }
+}
+
+fn remove_mutation_relay(
+    relays: &MutationRelayMap,
+    id: u64,
+    admission: &Arc<RelayLease>,
+) -> Option<MutationRelay> {
+    let mut relays = relays.lock().unwrap();
+    if relays
+        .get(&id)
+        .is_some_and(|relay| Arc::ptr_eq(&relay._admission, admission))
+    {
+        relays.remove(&id)
+    } else {
+        None
+    }
+}
+
+fn fail_mutation_relay(relay: MutationRelay, reason: &str) {
+    let MutationRelay {
+        origin_tx,
+        origin_req_id,
+        expected_keys,
+        timeout_cancel,
+        _operation,
+        _admission,
+        ..
+    } = relay;
+    let _ = timeout_cancel.send(());
+    if !*origin_tx.cancel.borrow() {
+        let _ = send_unavailable_mutation(&origin_tx, origin_req_id, expected_keys, reason);
+    }
+}
+
+fn cancel_connection_relays(channel: &PeerChannel, reads: &RelayMap, mutations: &MutationRelayMap) {
+    let reads = {
+        let mut reads = reads.lock().unwrap();
+        let ids: Vec<_> = reads
+            .iter()
+            .filter_map(|(id, relay)| {
+                (relay.origin_tx.same_channel(channel) || relay.expected_tx.same_channel(channel))
+                    .then_some(*id)
+            })
+            .collect();
+        ids.into_iter()
+            .filter_map(|id| reads.remove(&id))
+            .collect::<Vec<_>>()
+    };
+    drop(reads);
+    let mutations = {
+        let mut mutations = mutations.lock().unwrap();
+        let ids: Vec<_> = mutations
+            .iter()
+            .filter_map(|(id, relay)| {
+                (relay.origin_tx.same_channel(channel) || relay.expected_tx.same_channel(channel))
+                    .then_some(*id)
+            })
+            .collect();
+        ids.into_iter()
+            .filter_map(|id| mutations.remove(&id))
+            .collect::<Vec<_>>()
+    };
+    for relay in mutations {
+        fail_mutation_relay(relay, "mutation relay connection closed");
+    }
 }
 
 /// Pending single-key forwarded reads. The authenticated response source and
@@ -762,6 +946,7 @@ struct ConnContext {
     sender_runtime: SenderRuntimeOptions,
     runtime_options: NodeRuntimeOptions,
     receive_byte_budget: Arc<Semaphore>,
+    relay_admission: Arc<RelayAdmission>,
     sender_reports: SenderReportMap,
     /// Notify the placement driver on peer join/leave. `None` in
     /// static mode.
@@ -1801,6 +1986,7 @@ pub struct Node {
     tasks: Arc<RuntimeTasks>,
     inbound_connections: Arc<Semaphore>,
     receive_byte_budget: Arc<Semaphore>,
+    relay_admission: Arc<RelayAdmission>,
     dial_intents: Arc<StdMutex<HashMap<SocketAddr, DialIntentState>>>,
     dial_intent_changes: watch::Sender<u64>,
     peer_changes: watch::Sender<u64>,
@@ -2540,6 +2726,8 @@ pub struct NodeRuntimeOptions {
     replication_control_message_capacity: usize,
     inbound_connection_capacity: usize,
     receive_byte_capacity: usize,
+    relay_capacity: usize,
+    relay_key_byte_capacity: usize,
     queue_admission_timeout: Duration,
     reconcile_data_admission_timeout: Duration,
     forwarded_attempt_timeout: Duration,
@@ -2558,6 +2746,8 @@ impl Default for NodeRuntimeOptions {
             replication_control_message_capacity: REPLICATION_CONTROL_CHANNEL_DEPTH,
             inbound_connection_capacity: INBOUND_CONNECTION_CAPACITY,
             receive_byte_capacity: RECEIVE_BYTE_CAPACITY,
+            relay_capacity: RELAY_CAPACITY,
+            relay_key_byte_capacity: RELAY_KEY_BYTE_CAPACITY,
             queue_admission_timeout: REMOTE_RPC_TIMEOUT,
             reconcile_data_admission_timeout: RECONCILE_DATA_ADMISSION_TIMEOUT,
             forwarded_attempt_timeout: REMOTE_RPC_TIMEOUT,
@@ -2612,6 +2802,25 @@ impl NodeRuntimeOptions {
     /// actor/cache values, relay state, and caller results allocate separately.
     pub fn with_receive_byte_capacity(mut self, capacity: usize) -> Self {
         self.receive_byte_capacity = capacity;
+        self
+    }
+
+    /// Set the node-wide limit on read and mutation relays, including pending
+    /// timer registration/enqueue and timers which are still exiting. Default
+    /// 1024. Admission does not wait: reads remain unavailable and mutations
+    /// return explicit `Unavailable` when either relay budget is exhausted.
+    pub fn with_relay_capacity(mut self, capacity: usize) -> Self {
+        self.relay_capacity = capacity;
+        self
+    }
+
+    /// Set the node-wide retained request-key storage budget for all relays.
+    /// Default 64 MiB. Charges String buffer capacity and String/Vec storage,
+    /// including unused vector capacity; it does not charge mutation payloads,
+    /// writer buffers, caches, or fixed relay/timer/allocator overhead. The
+    /// relay-count limit separately bounds that fixed overhead.
+    pub fn with_relay_key_byte_capacity(mut self, capacity: usize) -> Self {
+        self.relay_key_byte_capacity = capacity;
         self
     }
 
@@ -2696,6 +2905,16 @@ impl NodeRuntimeOptions {
         self.receive_byte_capacity
     }
 
+    /// Current node-wide relay count limit.
+    pub fn relay_capacity(&self) -> usize {
+        self.relay_capacity
+    }
+
+    /// Current node-wide retained relay request-key storage budget.
+    pub fn relay_key_byte_capacity(&self) -> usize {
+        self.relay_key_byte_capacity
+    }
+
     /// Current peer-queue admission timeout.
     pub fn queue_admission_timeout(&self) -> Duration {
         self.queue_admission_timeout
@@ -2744,6 +2963,17 @@ impl NodeRuntimeOptions {
     }
 
     fn validate(&self) -> Result<(), NodeError> {
+        for (name, capacity) in [
+            ("relay capacity", self.relay_capacity),
+            ("relay key byte capacity", self.relay_key_byte_capacity),
+        ] {
+            if capacity == 0 || capacity > Semaphore::MAX_PERMITS {
+                return Err(NodeError::Actor(format!(
+                    "{name} must be non-zero and at most {}",
+                    Semaphore::MAX_PERMITS
+                )));
+            }
+        }
         if self.peer_queue_frame_capacity < 2 {
             return Err(NodeError::Actor(
                 "peer queue frame capacity must be at least 2".to_string(),
@@ -3316,8 +3546,8 @@ impl Node {
             pending_gets: Arc::new(StdMutex::new(HashMap::new())),
             pending_batch_gets: Arc::new(StdMutex::new(HashMap::new())),
             pending_mutations: Arc::new(StdMutex::new(HashMap::new())),
-            pending_relays: Arc::new(Mutex::new(HashMap::new())),
-            pending_mutation_relays: Arc::new(Mutex::new(HashMap::new())),
+            pending_relays: Arc::new(StdMutex::new(HashMap::new())),
+            pending_mutation_relays: Arc::new(StdMutex::new(HashMap::new())),
             next_req_id: Arc::new(AtomicU64::new(1)),
             peers: Arc::new(Mutex::new(HashMap::new())),
             peer_failures: PeerFailureSignals::default(),
@@ -3338,6 +3568,10 @@ impl Node {
                 runtime_options.inbound_connection_capacity,
             )),
             receive_byte_budget: Arc::new(Semaphore::new(runtime_options.receive_byte_capacity)),
+            relay_admission: RelayAdmission::new(
+                runtime_options.relay_capacity,
+                runtime_options.relay_key_byte_capacity,
+            ),
             dial_intents: Arc::new(StdMutex::new(HashMap::new())),
             dial_intent_changes,
             peer_changes,
@@ -3603,6 +3837,7 @@ impl Node {
             sender_runtime: self.runtime_options.sender_options(),
             runtime_options: self.runtime_options.clone(),
             receive_byte_budget: self.receive_byte_budget.clone(),
+            relay_admission: self.relay_admission.clone(),
             sender_reports: self.sender_reports.clone(),
             membership_tx: self.membership_tx.clone(),
             cluster_secret: self.cluster_secret.clone(),
@@ -4795,8 +5030,8 @@ impl Node {
             self.pending_gets.lock().unwrap().clear();
             self.pending_batch_gets.lock().unwrap().clear();
             self.pending_mutations.lock().unwrap().clear();
-            self.pending_relays.lock().await.clear();
-            self.pending_mutation_relays.lock().await.clear();
+            self.pending_relays.lock().unwrap().clear();
+            self.pending_mutation_relays.lock().unwrap().clear();
 
             // A hard transport shutdown can cancel a handler before its normal
             // exact-channel cleanup tail. Clear every remaining peer entry
@@ -7030,6 +7265,7 @@ async fn handle_connection(
         sender_runtime,
         runtime_options,
         receive_byte_budget,
+        relay_admission,
         sender_reports,
         membership_tx,
         cluster_secret,
@@ -7189,6 +7425,7 @@ async fn handle_connection(
         pending_mutation_relays: pending_mutation_relays.clone(),
         next_req_id: next_req_id.clone(),
         forwarded_attempt_timeout: runtime_options.forwarded_attempt_timeout,
+        relay_admission,
     };
 
     let mut handshake = HandshakeState::AwaitingHello;
@@ -7305,6 +7542,7 @@ async fn handle_connection(
                 }
                 if let Some(previous) = previous {
                     previous.cancel();
+                    cancel_connection_relays(&previous, &pending_relays, &pending_mutation_relays);
                 }
                 peer_changes.send_modify(|generation| {
                     *generation = generation.wrapping_add(1);
@@ -8404,10 +8642,17 @@ async fn handle_connection(
                 };
                 // Correlate the authenticated response source before it may
                 // remove a waiter or advance the local clock.
-                let relay_expected_key = {
-                    let relays = pending_relays.lock().await;
+                let relay_validation = {
+                    let relays = pending_relays.lock().unwrap();
                     relays.get(&r.req_id).and_then(|relay| {
-                        (relay.expected_peer == peer).then(|| relay.expected_key.clone())
+                        (relay.expected_peer == peer && relay.expected_tx.same_channel(&tx)).then(
+                            || {
+                                (
+                                    relay._admission.clone(),
+                                    validate_legacy_get_response(&relay.expected_key, &r),
+                                )
+                            },
+                        )
                     })
                 };
                 let pending_expected_key = {
@@ -8416,21 +8661,26 @@ async fn handle_connection(
                         (request.expected_peer == peer).then(|| request.expected_key.clone())
                     })
                 };
-                let Some(expected_key) = relay_expected_key
-                    .as_deref()
-                    .or(pending_expected_key.as_deref())
-                else {
+                let relay_admission = relay_validation
+                    .as_ref()
+                    .map(|(admission, _)| admission.clone());
+                let Some(validation) = relay_validation.map(|(_, result)| result).or_else(|| {
+                    pending_expected_key
+                        .as_deref()
+                        .map(|key| validate_legacy_get_response(key, &r))
+                }) else {
                     continue;
                 };
-                if let Err(error) = validate_legacy_get_response(expected_key, &r) {
+                if let Err(error) = validation {
                     tracing::warn!(
                         peer = %peer,
                         req_id = r.req_id,
                         %error,
                         "rejecting malformed forwarded-get response"
                     );
-                    if relay_expected_key.is_some() {
-                        if let Some(relay) = pending_relays.lock().await.remove(&r.req_id) {
+                    if let Some(admission) = &relay_admission {
+                        if let Some(relay) = remove_get_relay(&pending_relays, r.req_id, admission)
+                        {
                             let _ = relay.timeout_cancel.send(());
                         }
                     } else if let Some(pending) = pending_gets.lock().unwrap().remove(&r.req_id) {
@@ -8443,8 +8693,8 @@ async fn handle_connection(
                 }
                 // A relayed read completing: forward the response to the
                 // origin peer with its original req_id.
-                let relay = if relay_expected_key.is_some() {
-                    pending_relays.lock().await.remove(&r.req_id)
+                let relay = if let Some(admission) = &relay_admission {
+                    remove_get_relay(&pending_relays, r.req_id, admission)
                 } else {
                     None
                 };
@@ -8491,22 +8741,37 @@ async fn handle_connection(
                 let Some(peer) = peer_node_id.clone() else {
                     continue;
                 };
-                let expected_keys = {
-                    let relays = pending_mutation_relays.lock().await;
+                let relay_validation = {
+                    let relays = pending_mutation_relays.lock().unwrap();
                     relays.get(&response.req_id).and_then(|relay| {
-                        (relay.expected_peer == peer).then(|| relay.expected_keys.clone())
+                        (relay.expected_peer == peer && relay.expected_tx.same_channel(&tx)).then(
+                            || {
+                                (
+                                    relay._admission.clone(),
+                                    validate_mutation_results(
+                                        &relay.expected_keys,
+                                        &response.results,
+                                    ),
+                                )
+                            },
+                        )
                     })
-                }
-                .or_else(|| {
+                };
+                let relay_admission = relay_validation
+                    .as_ref()
+                    .map(|(admission, _)| admission.clone());
+                let validation = relay_validation.map(|(_, result)| result).or_else(|| {
                     let pending = pending_mutations.lock().unwrap();
                     pending.get(&response.req_id).and_then(|request| {
-                        (request.expected_peer == peer).then(|| request.expected_keys.clone())
+                        (request.expected_peer == peer).then(|| {
+                            validate_mutation_results(&request.expected_keys, &response.results)
+                        })
                     })
                 });
-                let Some(expected_keys) = expected_keys else {
+                let Some(validation) = validation else {
                     continue;
                 };
-                if let Err(error) = validate_mutation_results(&expected_keys, &response.results) {
+                if let Err(error) = validation {
                     tracing::warn!(
                         peer = %peer,
                         req_id = response.req_id,
@@ -8529,16 +8794,10 @@ async fn handle_connection(
                     }
                 }
 
-                let relay = {
-                    let mut relays = pending_mutation_relays.lock().await;
-                    if matches!(
-                        relays.get(&response.req_id),
-                        Some(relay) if relay.expected_peer == peer
-                    ) {
-                        relays.remove(&response.req_id)
-                    } else {
-                        None
-                    }
+                let relay = if let Some(admission) = &relay_admission {
+                    remove_mutation_relay(&pending_mutation_relays, response.req_id, admission)
+                } else {
+                    None
                 };
                 if let Some(relay) = relay {
                     let _ = relay.timeout_cancel.send(());
@@ -8598,7 +8857,6 @@ async fn handle_connection(
                         break;
                     }
                 }
-                let keys: Vec<String> = bp.puts.iter().map(|p| p.key.clone()).collect();
                 let Some(frag) = bp
                     .puts
                     .first()
@@ -8623,7 +8881,7 @@ async fn handle_connection(
                     if !send_unavailable_mutation(
                         &tx,
                         bp.req_id,
-                        keys,
+                        bp.puts.into_iter().map(|put| put.key).collect(),
                         "batch contains keys from multiple fragments",
                     ) {
                         break;
@@ -8646,7 +8904,7 @@ async fn handle_connection(
                         if !send_unavailable_mutation(
                             &tx,
                             bp.req_id,
-                            keys,
+                            bp.puts.into_iter().map(|put| put.key).collect(),
                             "forward hop limit reached",
                         ) {
                             break;
@@ -8660,7 +8918,7 @@ async fn handle_connection(
                     if !send_unavailable_mutation(
                         &tx,
                         bp.req_id,
-                        keys,
+                        bp.puts.into_iter().map(|put| put.key).collect(),
                         "serving fragment has no actor",
                     ) {
                         break;
@@ -8905,6 +9163,10 @@ async fn handle_connection(
     // covers writes made while that peer is absent. Explicit placement maps
     // retain sender buffers because their peer cardinality is configured and
     // bounded.
+    // End relay ownership before asynchronous peer/sender cleanup can wait on
+    // another task. This physical channel's replacement is never affected.
+    tx.cancel();
+    cancel_connection_relays(&tx, &pending_relays, &pending_mutation_relays);
     let mut disconnected_senders = Vec::new();
     if let Some(peer) = handshake.established_peer_id().map(str::to_owned) {
         let mut guard = peers.lock().await;
@@ -8961,7 +9223,6 @@ async fn handle_connection(
         }
     }
     drop(reconcile_response_tx);
-    tx.cancel();
     for sender in disconnected_senders {
         sender.join().await;
     }
@@ -8983,6 +9244,7 @@ struct ReforwardCtx {
     pending_mutation_relays: MutationRelayMap,
     next_req_id: Arc<AtomicU64>,
     forwarded_attempt_timeout: Duration,
+    relay_admission: Arc<RelayAdmission>,
 }
 
 /// The current owner for a re-forward: not us, and not the peer the op
@@ -9057,11 +9319,33 @@ fn send_batch_get_response(tx: &PeerChannel, req_id: u64, results: Vec<BatchKeyV
 async fn register_mutation_relay(
     tasks: &Weak<RuntimeTasks>,
     relays: MutationRelayMap,
+    admission: &Arc<RelayAdmission>,
     relay_id: u64,
     registration: MutationRelayRegistration,
-) {
+) -> Option<RelayRegistrationGuard> {
+    let lease = admission.try_reserve(relay_keys_storage_bytes(
+        &registration.expected_keys,
+        registration.expected_keys.capacity(),
+    ));
+    let Some(lease) = lease else {
+        let MutationRelayRegistration {
+            origin_tx,
+            origin_req_id,
+            expected_keys,
+            operation: _operation,
+            ..
+        } = registration;
+        let _ = send_unavailable_mutation(
+            &origin_tx,
+            origin_req_id,
+            expected_keys,
+            "mutation relay admission exhausted",
+        );
+        return None;
+    };
     let MutationRelayRegistration {
         expected_peer,
+        expected_tx,
         expected_keys,
         origin_tx,
         origin_req_id,
@@ -9069,87 +9353,149 @@ async fn register_mutation_relay(
         operation,
     } = registration;
     let (timeout_cancel, cancelled) = oneshot::channel();
-    let timeout_keys = expected_keys.clone();
-    relays.lock().await.insert(
+    let mut owner_cancel = expected_tx.cancel.subscribe();
+    let mut origin_cancel = origin_tx.cancel.subscribe();
+    let guard = RelayRegistrationGuard {
+        registry: RelayRegistry::Mutation(relays.clone()),
         relay_id,
-        MutationRelay {
-            expected_peer,
-            expected_keys,
-            origin_tx,
-            origin_req_id,
-            timeout_cancel,
-            _operation: operation,
-        },
-    );
+        admission: lease.clone(),
+        origin_tx: origin_tx.clone(),
+        armed: true,
+    };
+    let relay = MutationRelay {
+        expected_peer,
+        expected_tx,
+        expected_keys,
+        origin_tx,
+        origin_req_id,
+        timeout_cancel,
+        _operation: operation,
+        _admission: lease.clone(),
+    };
+    if *owner_cancel.borrow() || *origin_cancel.borrow() || Instant::now() >= deadline {
+        fail_mutation_relay(
+            relay,
+            "mutation relay connection closed before registration",
+        );
+        return None;
+    }
+    {
+        let mut entries = relays.lock().unwrap();
+        if entries.contains_key(&relay_id) {
+            drop(entries);
+            fail_mutation_relay(relay, "mutation relay request id collision");
+            return None;
+        }
+        entries.insert(relay_id, relay);
+    }
 
     // Register before spawning the timer. The cancellation sender is already
     // in the map, so every registered relay has exactly one live deadline.
     let timeout_relays = relays.clone();
     let timeout_task = async move {
+        // Admission is retained until the timer future itself exits, not just
+        // until its map entry is removed. Completed/canceled timers are bounded.
+        let _timer_admission = lease;
         tokio::select! {
             _ = tokio::time::sleep_until(deadline) => {
-                let relay = { timeout_relays.lock().await.remove(&relay_id) };
-                if let Some(relay) = relay {
-                    let _ = send_unavailable_mutation(
-                        &relay.origin_tx,
-                        relay.origin_req_id,
-                        timeout_keys,
-                        "forwarded mutation relay timed out",
-                    );
+                if let Some(relay) = remove_mutation_relay(&timeout_relays, relay_id, &_timer_admission) {
+                    fail_mutation_relay(relay, "forwarded mutation relay timed out");
+                }
+            }
+            _ = owner_cancel.changed() => {
+                if let Some(relay) = remove_mutation_relay(&timeout_relays, relay_id, &_timer_admission) {
+                    fail_mutation_relay(relay, "mutation relay owner connection closed");
+                }
+            }
+            _ = origin_cancel.changed() => {
+                if let Some(relay) = remove_mutation_relay(&timeout_relays, relay_id, &_timer_admission) {
+                    fail_mutation_relay(relay, "mutation relay origin connection closed");
                 }
             }
             _ = cancelled => {}
         }
     };
     let registered = match tasks.upgrade() {
-        Some(tasks) => tasks.spawn(timeout_task).await,
+        Some(tasks) => tokio::time::timeout_at(deadline, tasks.spawn(timeout_task))
+            .await
+            .unwrap_or(false),
         None => false,
     };
-    if !registered {
-        relays.lock().await.remove(&relay_id);
-    }
+    registered.then_some(guard)
 }
 
 async fn register_get_relay(
     tasks: &Weak<RuntimeTasks>,
     relays: RelayMap,
+    admission: &Arc<RelayAdmission>,
     relay_id: u64,
     registration: GetRelayRegistration,
-) {
+) -> Option<RelayRegistrationGuard> {
+    let lease = admission.try_reserve(relay_key_storage_bytes(
+        registration.expected_key.capacity(),
+    ))?;
     let GetRelayRegistration {
         expected_peer,
+        expected_tx,
         expected_key,
         origin_tx,
         origin_req_id,
         deadline,
     } = registration;
     let (timeout_cancel, cancelled) = oneshot::channel();
-    relays.lock().await.insert(
+    let mut owner_cancel = expected_tx.cancel.subscribe();
+    let mut origin_cancel = origin_tx.cancel.subscribe();
+    if *owner_cancel.borrow() || *origin_cancel.borrow() || Instant::now() >= deadline {
+        return None;
+    }
+    let guard = RelayRegistrationGuard {
+        registry: RelayRegistry::Get(relays.clone()),
         relay_id,
-        GetRelay {
-            expected_peer,
-            expected_key,
-            origin_tx,
-            origin_req_id,
-            timeout_cancel,
-        },
-    );
+        admission: lease.clone(),
+        origin_tx: origin_tx.clone(),
+        armed: true,
+    };
+    {
+        let mut entries = relays.lock().unwrap();
+        if entries.contains_key(&relay_id) {
+            return None;
+        }
+        entries.insert(
+            relay_id,
+            GetRelay {
+                expected_peer,
+                expected_tx,
+                expected_key,
+                origin_tx,
+                origin_req_id,
+                timeout_cancel,
+                _admission: lease.clone(),
+            },
+        );
+    }
     let timeout_relays = relays.clone();
     let timeout_task = async move {
+        let _timer_admission = lease;
         tokio::select! {
             _ = tokio::time::sleep_until(deadline) => {
-                timeout_relays.lock().await.remove(&relay_id);
+                drop(remove_get_relay(&timeout_relays, relay_id, &_timer_admission));
+            }
+            _ = owner_cancel.changed() => {
+                drop(remove_get_relay(&timeout_relays, relay_id, &_timer_admission));
+            }
+            _ = origin_cancel.changed() => {
+                drop(remove_get_relay(&timeout_relays, relay_id, &_timer_admission));
             }
             _ = cancelled => {}
         }
     };
     let registered = match tasks.upgrade() {
-        Some(tasks) => tasks.spawn(timeout_task).await,
+        Some(tasks) => tokio::time::timeout_at(deadline, tasks.spawn(timeout_task))
+            .await
+            .unwrap_or(false),
         None => false,
     };
-    if !registered {
-        relays.lock().await.remove(&relay_id);
-    }
+    registered.then_some(guard)
 }
 
 /// Relay a write to the fragment's current owner and preserve the exact
@@ -9164,53 +9510,52 @@ async fn relay_put(
     operation: OperationPermit,
 ) {
     let original_req_id = p.req_id;
-    let keys = vec![p.key.clone()];
     let Some((owner, owner_tx)) = reforward_target(ctx, peer_node_id, frag).await else {
         let _ = send_unavailable_mutation(
             origin_tx,
             original_req_id,
-            keys,
+            vec![p.key],
             "no connected owner available for mutation relay",
         );
         return;
     };
     let relay_id = ctx.next_req_id.fetch_add(1, Ordering::Relaxed);
     let attempt_deadline = deadline_after(ctx.forwarded_attempt_timeout);
-    register_mutation_relay(
+    let keys = vec![p.key.clone()];
+    let Some(registration) = register_mutation_relay(
         &ctx.tasks,
         ctx.pending_mutation_relays.clone(),
+        &ctx.relay_admission,
         relay_id,
         MutationRelayRegistration {
             expected_peer: owner,
-            expected_keys: keys.clone(),
+            expected_tx: owner_tx.clone(),
+            expected_keys: keys,
             origin_tx: origin_tx.clone(),
             origin_req_id: original_req_id,
             deadline: attempt_deadline,
             operation,
         },
     )
-    .await;
+    .await
+    else {
+        return;
+    };
     p.req_id = relay_id;
     p.hops += 1;
-    let sent = try_send_envelope_until(
-        &owner_tx,
-        Envelope {
-            msg: Some(EnvelopeMsg::ForwardedPut(p)),
-        },
-        attempt_deadline,
-    )
-    .await;
+    let sent = registration
+        .enqueue(
+            &owner_tx,
+            Envelope {
+                msg: Some(EnvelopeMsg::ForwardedPut(p)),
+            },
+            attempt_deadline,
+        )
+        .await;
     if !sent {
-        let relay = { ctx.pending_mutation_relays.lock().await.remove(&relay_id) };
-        if let Some(relay) = relay {
-            let _ = relay.timeout_cancel.send(());
-            let _ = send_unavailable_mutation(
-                &relay.origin_tx,
-                relay.origin_req_id,
-                keys,
-                "mutation relay connection closed while sending",
-            );
-        }
+        drop(registration);
+    } else {
+        registration.disarm();
     }
 }
 
@@ -9224,55 +9569,54 @@ async fn relay_batch(
     operation: OperationPermit,
 ) {
     let original_req_id = bp.req_id;
-    let keys: Vec<String> = bp.puts.iter().map(|put| put.key.clone()).collect();
     let Some((owner, owner_tx)) = reforward_target(ctx, peer_node_id, frag).await else {
         let _ = send_unavailable_mutation(
             origin_tx,
             original_req_id,
-            keys,
+            bp.puts.into_iter().map(|put| put.key).collect(),
             "no connected owner available for batch relay",
         );
         return;
     };
     let relay_id = ctx.next_req_id.fetch_add(1, Ordering::Relaxed);
     let attempt_deadline = deadline_after(ctx.forwarded_attempt_timeout);
-    register_mutation_relay(
+    let keys: Vec<String> = bp.puts.iter().map(|put| put.key.clone()).collect();
+    let Some(registration) = register_mutation_relay(
         &ctx.tasks,
         ctx.pending_mutation_relays.clone(),
+        &ctx.relay_admission,
         relay_id,
         MutationRelayRegistration {
             expected_peer: owner,
-            expected_keys: keys.clone(),
+            expected_tx: owner_tx.clone(),
+            expected_keys: keys,
             origin_tx: origin_tx.clone(),
             origin_req_id: original_req_id,
             deadline: attempt_deadline,
             operation,
         },
     )
-    .await;
+    .await
+    else {
+        return;
+    };
     bp.req_id = relay_id;
     for p in bp.puts.iter_mut() {
         p.hops += 1;
     }
-    let sent = try_send_envelope_until(
-        &owner_tx,
-        Envelope {
-            msg: Some(EnvelopeMsg::BatchPut(bp)),
-        },
-        attempt_deadline,
-    )
-    .await;
+    let sent = registration
+        .enqueue(
+            &owner_tx,
+            Envelope {
+                msg: Some(EnvelopeMsg::BatchPut(bp)),
+            },
+            attempt_deadline,
+        )
+        .await;
     if !sent {
-        let relay = { ctx.pending_mutation_relays.lock().await.remove(&relay_id) };
-        if let Some(relay) = relay {
-            let _ = relay.timeout_cancel.send(());
-            let _ = send_unavailable_mutation(
-                &relay.origin_tx,
-                relay.origin_req_id,
-                keys,
-                "batch relay connection closed while sending",
-            );
-        }
+        drop(registration);
+    } else {
+        registration.disarm();
     }
 }
 
@@ -9291,37 +9635,43 @@ async fn relay_get(
     };
     let relay_id = ctx.next_req_id.fetch_add(1, Ordering::Relaxed);
     let attempt_deadline = deadline_after(ctx.forwarded_attempt_timeout);
-    register_get_relay(
+    let Some(registration) = register_get_relay(
         &ctx.tasks,
         ctx.pending_relays.clone(),
+        &ctx.relay_admission,
         relay_id,
         GetRelayRegistration {
             expected_peer: owner,
+            expected_tx: owner_tx.clone(),
             expected_key: g.key.clone(),
             origin_tx: origin_tx.clone(),
             origin_req_id: g.req_id,
             deadline: attempt_deadline,
         },
     )
-    .await;
-    let sent = try_send_envelope_until(
-        &owner_tx,
-        Envelope {
-            msg: Some(EnvelopeMsg::ForwardedGet(ForwardedGet {
-                key: g.key.clone(),
-                req_id: relay_id,
-                // Preserve the originator's priority across the relay.
-                priority: g.priority,
-                hops: g.hops + 1,
-            })),
-        },
-        attempt_deadline,
-    )
-    .await;
+    .await
+    else {
+        return;
+    };
+    let sent = registration
+        .enqueue(
+            &owner_tx,
+            Envelope {
+                msg: Some(EnvelopeMsg::ForwardedGet(ForwardedGet {
+                    key: g.key.clone(),
+                    req_id: relay_id,
+                    // Preserve the originator's priority across the relay.
+                    priority: g.priority,
+                    hops: g.hops + 1,
+                })),
+            },
+            attempt_deadline,
+        )
+        .await;
     if !sent {
-        if let Some(relay) = ctx.pending_relays.lock().await.remove(&relay_id) {
-            let _ = relay.timeout_cancel.send(());
-        }
+        drop(registration);
+    } else {
+        registration.disarm();
     }
 }
 
@@ -10062,8 +10412,8 @@ mod tests {
                 pending_gets: Arc::new(StdMutex::new(HashMap::new())),
                 pending_batch_gets: Arc::new(StdMutex::new(HashMap::new())),
                 pending_mutations: Arc::new(StdMutex::new(HashMap::new())),
-                pending_relays: Arc::new(Mutex::new(HashMap::new())),
-                pending_mutation_relays: Arc::new(Mutex::new(HashMap::new())),
+                pending_relays: Arc::new(StdMutex::new(HashMap::new())),
+                pending_mutation_relays: Arc::new(StdMutex::new(HashMap::new())),
                 next_req_id: Arc::new(AtomicU64::new(1)),
                 peers,
                 peer_failures: PeerFailureSignals::default(),
@@ -10078,6 +10428,7 @@ mod tests {
                 sender_runtime: SenderRuntimeOptions::default(),
                 runtime_options: NodeRuntimeOptions::default(),
                 receive_byte_budget: Arc::new(Semaphore::new(RECEIVE_BYTE_CAPACITY)),
+                relay_admission: RelayAdmission::new(RELAY_CAPACITY, RELAY_KEY_BYTE_CAPACITY),
                 sender_reports,
                 membership_tx: None,
                 cluster_secret: None,
@@ -10686,6 +11037,8 @@ mod tests {
         assert_eq!(options.replication_control_message_capacity(), 64);
         assert_eq!(options.inbound_connection_capacity(), 1024);
         assert_eq!(options.receive_byte_capacity(), 64 * 1024 * 1024);
+        assert_eq!(options.relay_capacity(), 1024);
+        assert_eq!(options.relay_key_byte_capacity(), 64 * 1024 * 1024);
         assert_eq!(options.queue_admission_timeout(), Duration::from_secs(5));
         assert_eq!(
             options.reconcile_data_admission_timeout(),
@@ -10701,6 +11054,21 @@ mod tests {
 
     #[test]
     fn runtime_options_reject_unrepresentable_limits() {
+        for capacity in [0, Semaphore::MAX_PERMITS.saturating_add(1)] {
+            assert!(NodeRuntimeOptions::default()
+                .with_relay_capacity(capacity)
+                .validate()
+                .is_err());
+            assert!(NodeRuntimeOptions::default()
+                .with_relay_key_byte_capacity(capacity)
+                .validate()
+                .is_err());
+        }
+        assert!(NodeRuntimeOptions::default()
+            .with_relay_capacity(1)
+            .with_relay_key_byte_capacity(1)
+            .validate()
+            .is_ok());
         assert!(NodeRuntimeOptions::default()
             .with_socket_write_timeout(Duration::MAX)
             .validate()
@@ -13091,7 +13459,7 @@ mod tests {
     #[tokio::test]
     async fn direct_and_relayed_get_responses_are_pinned_to_the_expected_peer() {
         let pending_gets: PendingGets = Arc::new(StdMutex::new(HashMap::new()));
-        let relays: RelayMap = Arc::new(Mutex::new(HashMap::new()));
+        let relays: RelayMap = Arc::new(StdMutex::new(HashMap::new()));
         let peers: PeerMap = Arc::new(Mutex::new(HashMap::new()));
         let (mut ctx, runtime_tasks) = test_connection_context(
             FragmentRouter::new(1, 0),
@@ -13104,6 +13472,25 @@ mod tests {
         );
         ctx.pending_gets = pending_gets.clone();
         ctx.pending_relays = relays.clone();
+        let (mut owner, owner_server) = tokio::io::duplex(4096);
+        let owner_connection = tokio::spawn(handle_connection(
+            ctx.clone(),
+            Box::pin(owner_server),
+            false,
+            None,
+            None,
+        ));
+        complete_test_handshake(&mut owner, "owner").await;
+        let expected_tx = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let Some(tx) = ctx.peers.lock().await.get("owner").cloned() {
+                    break tx;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
 
         let (pending_reply, pending_response) = oneshot::channel();
         pending_gets.lock().unwrap().insert(
@@ -13116,14 +13503,19 @@ mod tests {
         );
         let (origin_tx, _origin_rx, mut origin_response_rx) = test_peer_channel(1);
         let (timeout_cancel, _timeout_cancelled) = oneshot::channel();
-        relays.lock().await.insert(
+        relays.lock().unwrap().insert(
             32,
             GetRelay {
                 expected_peer: "owner".to_string(),
+                expected_tx,
                 expected_key: "key".to_string(),
                 origin_tx,
                 origin_req_id: 9,
                 timeout_cancel,
+                _admission: ctx
+                    .relay_admission
+                    .try_reserve(relay_key_storage_bytes(3))
+                    .unwrap(),
             },
         );
 
@@ -13170,18 +13562,9 @@ mod tests {
             })) if results.is_empty()
         ));
         assert!(pending_gets.lock().unwrap().contains_key(&31));
-        assert!(relays.lock().await.contains_key(&32));
+        assert!(relays.lock().unwrap().contains_key(&32));
         assert!(origin_response_rx.try_recv().is_err());
 
-        let (mut owner, owner_server) = tokio::io::duplex(4096);
-        let owner_connection = tokio::spawn(handle_connection(
-            ctx,
-            Box::pin(owner_server),
-            false,
-            None,
-            None,
-        ));
-        complete_test_handshake(&mut owner, "owner").await;
         for req_id in [31, 32] {
             write_test_envelope(&mut owner, not_found_response(req_id)).await;
         }
@@ -13223,7 +13606,7 @@ mod tests {
             }))
         ));
         assert!(pending_gets.lock().unwrap().is_empty());
-        assert!(relays.lock().await.is_empty());
+        assert!(relays.lock().unwrap().is_empty());
 
         drop(attacker);
         drop(owner);
@@ -13831,8 +14214,10 @@ mod tests {
 
     #[tokio::test]
     async fn mutation_relay_timeout_removes_entry_and_replies_unavailable() {
-        let relays: MutationRelayMap = Arc::new(Mutex::new(HashMap::new()));
+        let relays: MutationRelayMap = Arc::new(StdMutex::new(HashMap::new()));
         let (origin_tx, _origin_rx, mut origin_response_rx) = test_peer_channel(1);
+        let (expected_tx, _owner_rx, _owner_response_rx) = test_peer_channel(1);
+        let admission = RelayAdmission::new(1, 1024);
         let tasks = RuntimeTasks::new(4);
         let task_ref = Arc::downgrade(&tasks);
         let operation_gate = OperationGate::new();
@@ -13840,9 +14225,11 @@ mod tests {
         register_mutation_relay(
             &task_ref,
             relays.clone(),
+            &admission,
             17,
             MutationRelayRegistration {
                 expected_peer: "owner".to_string(),
+                expected_tx,
                 expected_keys: vec!["key".to_string()],
                 origin_tx,
                 origin_req_id: 9,
@@ -13850,8 +14237,10 @@ mod tests {
                 operation,
             },
         )
-        .await;
-        assert!(relays.lock().await.contains_key(&17));
+        .await
+        .unwrap()
+        .disarm();
+        assert!(relays.lock().unwrap().contains_key(&17));
         operation_gate.begin_shutdown();
         assert!(
             tokio::time::timeout(Duration::from_millis(10), operation_gate.wait_for_drain())
@@ -13875,7 +14264,7 @@ mod tests {
             MutationStatus::try_from(response.results[0].status),
             Ok(MutationStatus::Unavailable)
         );
-        assert!(relays.lock().await.is_empty());
+        assert!(relays.lock().unwrap().is_empty());
         tokio::time::timeout(Duration::from_secs(1), operation_gate.wait_for_drain())
             .await
             .expect("relay timeout did not release mutation admission");
@@ -13884,8 +14273,10 @@ mod tests {
 
     #[tokio::test]
     async fn completed_mutation_relay_cancels_timeout() {
-        let relays: MutationRelayMap = Arc::new(Mutex::new(HashMap::new()));
+        let relays: MutationRelayMap = Arc::new(StdMutex::new(HashMap::new()));
         let (origin_tx, _origin_rx, mut origin_response_rx) = test_peer_channel(1);
+        let (expected_tx, _owner_rx, _owner_response_rx) = test_peer_channel(1);
+        let admission = RelayAdmission::new(1, 1024);
         let tasks = RuntimeTasks::new(4);
         let task_ref = Arc::downgrade(&tasks);
         let operation_gate = OperationGate::new();
@@ -13893,9 +14284,11 @@ mod tests {
         register_mutation_relay(
             &task_ref,
             relays.clone(),
+            &admission,
             17,
             MutationRelayRegistration {
                 expected_peer: "owner".to_string(),
+                expected_tx,
                 expected_keys: vec!["key".to_string()],
                 origin_tx,
                 origin_req_id: 9,
@@ -13903,8 +14296,10 @@ mod tests {
                 operation,
             },
         )
-        .await;
-        let relay = relays.lock().await.remove(&17).expect("relay missing");
+        .await
+        .unwrap()
+        .disarm();
+        let relay = relays.lock().unwrap().remove(&17).expect("relay missing");
         let MutationRelay {
             timeout_cancel,
             _operation: operation,
@@ -13925,33 +14320,39 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(30)).await;
         assert!(origin_response_rx.try_recv().is_err());
-        assert!(relays.lock().await.is_empty());
+        assert!(relays.lock().unwrap().is_empty());
         tasks.shutdown().await;
     }
 
     #[tokio::test]
     async fn read_relay_timeout_removes_registry_entry() {
-        let relays: RelayMap = Arc::new(Mutex::new(HashMap::new()));
+        let relays: RelayMap = Arc::new(StdMutex::new(HashMap::new()));
         let (origin_tx, _origin_rx, _origin_response_rx) = test_peer_channel(1);
+        let (expected_tx, _owner_rx, _owner_response_rx) = test_peer_channel(1);
+        let admission = RelayAdmission::new(1, 1024);
         let tasks = RuntimeTasks::new(4);
         let task_ref = Arc::downgrade(&tasks);
         register_get_relay(
             &task_ref,
             relays.clone(),
+            &admission,
             23,
             GetRelayRegistration {
                 expected_peer: "owner".to_string(),
+                expected_tx,
                 expected_key: "key".to_string(),
                 origin_tx,
                 origin_req_id: 11,
                 deadline: Instant::now() + Duration::from_millis(10),
             },
         )
-        .await;
-        assert!(relays.lock().await.contains_key(&23));
+        .await
+        .unwrap()
+        .disarm();
+        assert!(relays.lock().unwrap().contains_key(&23));
         tokio::time::timeout(Duration::from_secs(1), async {
             loop {
-                if relays.lock().await.is_empty() {
+                if relays.lock().unwrap().is_empty() {
                     break;
                 }
                 tokio::task::yield_now().await;
@@ -13960,6 +14361,890 @@ mod tests {
         .await
         .expect("relay deadline did not remove the entry");
         tasks.shutdown().await;
+    }
+
+    async fn wait_for_relay_admission(admission: &RelayAdmission, slots: usize, bytes: usize) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while admission.slots.available_permits() != slots
+                || admission.key_bytes.available_permits() != bytes
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("relay admission was not reclaimed after timer exit");
+    }
+
+    #[tokio::test]
+    async fn origin_cancellation_reclaims_relays_without_connection_cleanup() {
+        let tasks = RuntimeTasks::new(4);
+        let task_ref = Arc::downgrade(&tasks);
+        let admission = RelayAdmission::new(2, 1024);
+        let reads: RelayMap = Arc::new(StdMutex::new(HashMap::new()));
+        let mutations: MutationRelayMap = Arc::new(StdMutex::new(HashMap::new()));
+        let (owner, _owner_rx, _owner_responses) = test_peer_channel(1);
+        let (origin, _origin_rx, mut origin_responses) = test_peer_channel(1);
+        let gate = OperationGate::new();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        register_get_relay(
+            &task_ref,
+            reads.clone(),
+            &admission,
+            1,
+            GetRelayRegistration {
+                expected_peer: "owner".into(),
+                expected_tx: owner.clone(),
+                expected_key: "key".into(),
+                origin_tx: origin.clone(),
+                origin_req_id: 11,
+                deadline,
+            },
+        )
+        .await
+        .unwrap()
+        .disarm();
+        register_mutation_relay(
+            &task_ref,
+            mutations.clone(),
+            &admission,
+            2,
+            MutationRelayRegistration {
+                expected_peer: "owner".into(),
+                expected_tx: owner.clone(),
+                expected_keys: vec!["key".into(), "key".into()],
+                origin_tx: origin.clone(),
+                origin_req_id: 12,
+                deadline,
+                operation: gate.try_enter().unwrap(),
+            },
+        )
+        .await
+        .unwrap()
+        .disarm();
+        assert_eq!(admission.slots.available_permits(), 0);
+        gate.begin_shutdown();
+        let mut drain = Box::pin(gate.wait_for_drain());
+        assert!(futures::poll!(drain.as_mut()).is_pending());
+
+        // The reader can be aborted before reaching its cleanup tail. Only
+        // the registered timers observe this origin's terminal cancellation.
+        origin.cancel();
+        wait_for_relay_admission(&admission, 2, 1024).await;
+        tokio::time::timeout(Duration::from_secs(1), drain)
+            .await
+            .expect("origin cancellation retained the mutation operation fence");
+        assert!(reads.lock().unwrap().is_empty());
+        assert!(mutations.lock().unwrap().is_empty());
+        assert!(origin_responses.try_recv().is_err());
+        assert!(
+            !*owner.cancel.borrow(),
+            "origin loss canceled a healthy owner"
+        );
+        tasks.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn relay_cleanup_is_pinned_to_exact_owner_origin_and_registration_generation() {
+        let tasks = RuntimeTasks::new(8);
+        let task_ref = Arc::downgrade(&tasks);
+        let admission = RelayAdmission::new(8, 4096);
+        let reads: RelayMap = Arc::new(StdMutex::new(HashMap::new()));
+        let mutations: MutationRelayMap = Arc::new(StdMutex::new(HashMap::new()));
+        let (old_owner, _old_owner_rx, _old_owner_responses) = test_peer_channel(1);
+        let (new_owner, _new_owner_rx, _new_owner_responses) = test_peer_channel(1);
+        let (old_origin, _old_origin_rx, mut old_origin_responses) = test_peer_channel(4);
+        let (new_origin, _new_origin_rx, mut new_origin_responses) = test_peer_channel(4);
+        let gate = OperationGate::new();
+        for (id, owner, origin) in [
+            (1, &old_owner, &new_origin),
+            (2, &new_owner, &new_origin),
+            (3, &new_owner, &old_origin),
+        ] {
+            register_get_relay(
+                &task_ref,
+                reads.clone(),
+                &admission,
+                id,
+                GetRelayRegistration {
+                    expected_peer: "same-owner-id".to_string(),
+                    expected_tx: owner.clone(),
+                    expected_key: "key".to_string(),
+                    origin_tx: origin.clone(),
+                    origin_req_id: id + 100,
+                    deadline: Instant::now() + Duration::from_secs(10),
+                },
+            )
+            .await
+            .unwrap()
+            .disarm();
+            register_mutation_relay(
+                &task_ref,
+                mutations.clone(),
+                &admission,
+                id,
+                MutationRelayRegistration {
+                    expected_peer: "same-owner-id".to_string(),
+                    expected_tx: owner.clone(),
+                    expected_keys: vec!["key".to_string()],
+                    origin_tx: origin.clone(),
+                    origin_req_id: id + 200,
+                    deadline: Instant::now() + Duration::from_secs(10),
+                    operation: gate.try_enter().unwrap(),
+                },
+            )
+            .await
+            .unwrap()
+            .disarm();
+        }
+        // Old physical owner cleanup must not clear replacement work which
+        // carries the exact same authenticated peer id.
+        old_owner.cancel();
+        cancel_connection_relays(&old_owner, &reads, &mutations);
+        assert!(!reads.lock().unwrap().contains_key(&1));
+        assert!(!mutations.lock().unwrap().contains_key(&1));
+        assert_eq!(reads.lock().unwrap().len(), 2);
+        assert_eq!(mutations.lock().unwrap().len(), 2);
+        let unavailable = new_origin_responses.try_recv().unwrap();
+        assert!(matches!(Envelope::decode(unavailable.bytes()).unwrap().msg,
+            Some(EnvelopeMsg::MutationResponse(response)) if response.req_id == 201 && response.results[0].status == MutationStatus::Unavailable as i32));
+        old_origin.cancel();
+        cancel_connection_relays(&old_origin, &reads, &mutations);
+        assert_eq!(reads.lock().unwrap().len(), 1);
+        assert_eq!(mutations.lock().unwrap().len(), 1);
+        assert!(reads.lock().unwrap().contains_key(&2));
+        assert!(mutations.lock().unwrap().contains_key(&2));
+        assert!(old_origin_responses.try_recv().is_err());
+        cancel_connection_relays(&old_owner, &reads, &mutations);
+        assert!(reads.lock().unwrap().contains_key(&2));
+        assert!(mutations.lock().unwrap().contains_key(&2));
+
+        // A dropped registration guard/timer may race request-id reuse. It
+        // must compare its lease generation rather than delete a new entry.
+        let stale_guard = register_get_relay(
+            &task_ref,
+            reads.clone(),
+            &admission,
+            4,
+            GetRelayRegistration {
+                expected_peer: "same-owner-id".to_string(),
+                expected_tx: new_owner.clone(),
+                expected_key: "old".to_string(),
+                origin_tx: new_origin.clone(),
+                origin_req_id: 104,
+                deadline: Instant::now() + Duration::from_secs(10),
+            },
+        )
+        .await
+        .unwrap();
+        let removed = reads.lock().unwrap().remove(&4).unwrap();
+        drop(removed);
+        register_get_relay(
+            &task_ref,
+            reads.clone(),
+            &admission,
+            4,
+            GetRelayRegistration {
+                expected_peer: "same-owner-id".to_string(),
+                expected_tx: new_owner.clone(),
+                expected_key: "new".to_string(),
+                origin_tx: new_origin,
+                origin_req_id: 105,
+                deadline: Instant::now() + Duration::from_secs(10),
+            },
+        )
+        .await
+        .unwrap()
+        .disarm();
+        drop(stale_guard);
+        assert_eq!(reads.lock().unwrap().get(&4).unwrap().origin_req_id, 105);
+        new_owner.cancel();
+        // Exercise timer-owned disconnect cleanup, even if the reader cannot
+        // reach its own tail. No explicit map cleanup for this final channel.
+        wait_for_relay_admission(&admission, 8, 4096).await;
+        assert!(reads.lock().unwrap().is_empty());
+        assert!(mutations.lock().unwrap().is_empty());
+        gate.begin_shutdown();
+        gate.wait_for_drain().await;
+        tasks.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn relay_responses_ignore_same_peer_on_a_different_physical_channel() {
+        let (ctx, tasks) = test_connection_context(
+            FragmentRouter::new(1, 0),
+            Arc::new(RwLock::new(HashSet::new())),
+            Arc::new(RwLock::new(HashMap::new())),
+            true,
+            Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(Mutex::new(HashMap::new())),
+        );
+        let (mut owner, server) = tokio::io::duplex(4096);
+        let connection = tokio::spawn(handle_connection(
+            ctx.clone(),
+            Box::pin(server),
+            false,
+            None,
+            None,
+        ));
+        complete_test_handshake(&mut owner, "owner").await;
+        let physical_owner = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let Some(tx) = ctx.peers.lock().await.get("owner").cloned() {
+                    break tx;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let (different_physical_owner, _other_rx, _other_responses) = test_peer_channel(1);
+        let (origin, _origin_rx, mut origin_responses) = test_peer_channel(4);
+        register_get_relay(
+            &ctx.tasks,
+            ctx.pending_relays.clone(),
+            &ctx.relay_admission,
+            11,
+            GetRelayRegistration {
+                expected_peer: "owner".to_string(),
+                expected_tx: different_physical_owner.clone(),
+                expected_key: "key".to_string(),
+                origin_tx: origin.clone(),
+                origin_req_id: 101,
+                deadline: Instant::now() + Duration::from_secs(10),
+            },
+        )
+        .await
+        .unwrap()
+        .disarm();
+        register_mutation_relay(
+            &ctx.tasks,
+            ctx.pending_mutation_relays.clone(),
+            &ctx.relay_admission,
+            12,
+            MutationRelayRegistration {
+                expected_peer: "owner".to_string(),
+                expected_tx: different_physical_owner.clone(),
+                expected_keys: vec!["key".to_string()],
+                origin_tx: origin,
+                origin_req_id: 102,
+                deadline: Instant::now() + Duration::from_secs(10),
+                operation: ctx.operation_gate.try_enter().unwrap(),
+            },
+        )
+        .await
+        .unwrap()
+        .disarm();
+        let read_response = Envelope {
+            msg: Some(EnvelopeMsg::GetResponse(GetResponse {
+                req_id: 11,
+                found: false,
+                value: vec![],
+                timestamp_ms: 0,
+                node_id: String::new(),
+                expires_at_ms: 0,
+                is_tombstone: false,
+                shed: false,
+            })),
+        };
+        let mutation_response = Envelope {
+            msg: Some(EnvelopeMsg::MutationResponse(MutationResponse {
+                req_id: 12,
+                results: vec![result("key", 0)],
+            })),
+        };
+        for barrier in [201, 202] {
+            write_test_envelope(&mut owner, read_response.clone()).await;
+            write_test_envelope(&mut owner, mutation_response.clone()).await;
+            write_test_envelope(
+                &mut owner,
+                Envelope {
+                    msg: Some(EnvelopeMsg::BatchGet(BatchGet {
+                        req_id: barrier,
+                        keys: vec![],
+                        priority: 0,
+                    })),
+                },
+            )
+            .await;
+            assert!(matches!(read_test_envelope(&mut owner).await.msg,
+                Some(EnvelopeMsg::BatchGetResponse(response)) if response.req_id == barrier));
+            if barrier == 201 {
+                assert!(ctx.pending_relays.lock().unwrap().contains_key(&11));
+                assert!(ctx
+                    .pending_mutation_relays
+                    .lock()
+                    .unwrap()
+                    .contains_key(&12));
+                assert!(origin_responses.try_recv().is_err());
+                ctx.pending_relays
+                    .lock()
+                    .unwrap()
+                    .get_mut(&11)
+                    .unwrap()
+                    .expected_tx = physical_owner.clone();
+                ctx.pending_mutation_relays
+                    .lock()
+                    .unwrap()
+                    .get_mut(&12)
+                    .unwrap()
+                    .expected_tx = physical_owner.clone();
+            }
+        }
+        assert!(
+            matches!(Envelope::decode(origin_responses.try_recv().unwrap().bytes()).unwrap().msg,
+            Some(EnvelopeMsg::GetResponse(response)) if response.req_id == 101)
+        );
+        assert!(
+            matches!(Envelope::decode(origin_responses.try_recv().unwrap().bytes()).unwrap().msg,
+            Some(EnvelopeMsg::MutationResponse(response)) if response.req_id == 102)
+        );
+        wait_for_relay_admission(
+            &ctx.relay_admission,
+            RELAY_CAPACITY,
+            RELAY_KEY_BYTE_CAPACITY,
+        )
+        .await;
+        drop(owner);
+        tokio::time::timeout(Duration::from_secs(1), connection)
+            .await
+            .unwrap()
+            .unwrap();
+        tasks.shutdown().await;
+    }
+
+    #[test]
+    fn relay_key_admission_charges_empty_keys_and_unused_storage_and_rolls_back() {
+        let mut keys = Vec::with_capacity(8);
+        keys.push(String::with_capacity(64));
+        keys.push(String::new());
+        let bytes = relay_keys_storage_bytes(&keys, keys.capacity());
+        assert_eq!(
+            bytes,
+            std::mem::size_of::<Vec<String>>()
+                + keys.capacity() * std::mem::size_of::<String>()
+                + 64
+        );
+        assert_eq!(
+            relay_key_storage_bytes(64),
+            std::mem::size_of::<String>() + 64
+        );
+        let admission = RelayAdmission::new(2, bytes);
+        assert!(admission.try_reserve(bytes + 1).is_none());
+        assert_eq!(
+            admission.slots.available_permits(),
+            2,
+            "failed byte admission leaked a count slot"
+        );
+        let lease = admission.try_reserve(bytes).unwrap();
+        assert!(admission.try_reserve(1).is_none());
+        assert_eq!(admission.slots.available_permits(), 1);
+        let timer_lease = lease.clone();
+        drop(lease);
+        assert_eq!(
+            admission.key_bytes.available_permits(),
+            0,
+            "timer lifetime must retain admission"
+        );
+        drop(timer_lease);
+        assert_eq!(admission.slots.available_permits(), 2);
+        assert_eq!(admission.key_bytes.available_permits(), bytes);
+    }
+
+    #[tokio::test]
+    async fn pre_canceled_owner_rejects_relay_registration_without_waiting() {
+        let admission = RelayAdmission::new(2, 1024);
+        let reads: RelayMap = Arc::new(StdMutex::new(HashMap::new()));
+        let mutations: MutationRelayMap = Arc::new(StdMutex::new(HashMap::new()));
+        let tasks = RuntimeTasks::new(4);
+        let task_ref = Arc::downgrade(&tasks);
+        let (owner, _owner_rx, _owner_responses) = test_peer_channel(1);
+        let (origin, _origin_rx, mut origin_responses) = test_peer_channel(1);
+        let gate = OperationGate::new();
+        // No cancellation receivers exist yet: terminal cancellation must be
+        // sticky for a relay which starts after the old reader has exited.
+        owner.cancel();
+        assert!(*owner.cancel.subscribe().borrow());
+        assert!(register_get_relay(
+            &task_ref,
+            reads.clone(),
+            &admission,
+            1,
+            GetRelayRegistration {
+                expected_peer: "owner".to_string(),
+                expected_tx: owner.clone(),
+                expected_key: "key".to_string(),
+                origin_tx: origin.clone(),
+                origin_req_id: 11,
+                deadline: Instant::now() + Duration::from_secs(10),
+            }
+        )
+        .await
+        .is_none());
+        assert!(register_mutation_relay(
+            &task_ref,
+            mutations.clone(),
+            &admission,
+            2,
+            MutationRelayRegistration {
+                expected_peer: "owner".to_string(),
+                expected_tx: owner,
+                expected_keys: vec!["key".to_string()],
+                origin_tx: origin,
+                origin_req_id: 12,
+                deadline: Instant::now() + Duration::from_secs(10),
+                operation: gate.try_enter().unwrap(),
+            }
+        )
+        .await
+        .is_none());
+        assert!(reads.lock().unwrap().is_empty());
+        assert!(mutations.lock().unwrap().is_empty());
+        let response = origin_responses.try_recv().unwrap();
+        assert!(matches!(Envelope::decode(response.bytes()).unwrap().msg,
+            Some(EnvelopeMsg::MutationResponse(response)) if response.req_id == 12 && response.results[0].status == MutationStatus::Unavailable as i32));
+        assert_eq!(admission.slots.available_permits(), 2);
+        assert_eq!(admission.key_bytes.available_permits(), 1024);
+        gate.begin_shutdown();
+        gate.wait_for_drain().await;
+        tasks.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn dropping_relay_registration_before_timer_ack_reclaims_both_types() {
+        let tasks = RuntimeTasks::new(4);
+        let task_ref = Arc::downgrade(&tasks);
+        let admission = RelayAdmission::new(2, 1024);
+        let reads: RelayMap = Arc::new(StdMutex::new(HashMap::new()));
+        let mutations: MutationRelayMap = Arc::new(StdMutex::new(HashMap::new()));
+        let (owner, _owner_rx, _owner_response_rx) = test_peer_channel(1);
+        let (origin, _origin_rx, mut origin_response_rx) = test_peer_channel(1);
+        let gate = OperationGate::new();
+        // Current-thread Tokio cannot run its manager between this one poll
+        // and Drop: both registry insertion and queued timer registration have
+        // happened, but the timer acknowledgment has not.
+        let mut read = Box::pin(register_get_relay(
+            &task_ref,
+            reads.clone(),
+            &admission,
+            1,
+            GetRelayRegistration {
+                expected_peer: "owner".to_string(),
+                expected_tx: owner.clone(),
+                expected_key: "key".to_string(),
+                origin_tx: origin.clone(),
+                origin_req_id: 11,
+                deadline: Instant::now() + Duration::from_secs(10),
+            },
+        ));
+        assert!(futures::poll!(read.as_mut()).is_pending());
+        assert_eq!(reads.lock().unwrap().len(), 1);
+        drop(read);
+        assert!(reads.lock().unwrap().is_empty());
+        assert_eq!(
+            admission.slots.available_permits(),
+            1,
+            "queued timer lost its admission lease"
+        );
+        let mut mutation = Box::pin(register_mutation_relay(
+            &task_ref,
+            mutations.clone(),
+            &admission,
+            2,
+            MutationRelayRegistration {
+                expected_peer: "owner".to_string(),
+                expected_tx: owner,
+                expected_keys: vec!["key".to_string()],
+                origin_tx: origin,
+                origin_req_id: 12,
+                deadline: Instant::now() + Duration::from_secs(10),
+                operation: gate.try_enter().unwrap(),
+            },
+        ));
+        assert!(futures::poll!(mutation.as_mut()).is_pending());
+        assert_eq!(mutations.lock().unwrap().len(), 1);
+        drop(mutation);
+        assert!(mutations.lock().unwrap().is_empty());
+        let response = origin_response_rx
+            .try_recv()
+            .expect("canceled mutation registration must reply unavailable");
+        assert!(matches!(Envelope::decode(response.bytes()).unwrap().msg,
+            Some(EnvelopeMsg::MutationResponse(response)) if response.req_id == 12 && response.results[0].status == MutationStatus::Unavailable as i32));
+        gate.begin_shutdown();
+        gate.wait_for_drain().await;
+        wait_for_relay_admission(&admission, 2, 1024).await;
+        tasks.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn relay_enqueue_cancellation_and_registration_failure_release_admission() {
+        let tasks = RuntimeTasks::new(4);
+        let task_ref = Arc::downgrade(&tasks);
+        let admission = RelayAdmission::new(1, 1024);
+        let mutations: MutationRelayMap = Arc::new(StdMutex::new(HashMap::new()));
+        let (owner, _owner_rx, _owner_response_rx) = test_peer_channel(1);
+        let (origin, _origin_rx, mut origin_response_rx) = test_peer_channel(4);
+        let gate = OperationGate::new();
+        let envelope = Envelope {
+            msg: Some(EnvelopeMsg::BatchGet(BatchGet {
+                req_id: 1,
+                keys: vec![],
+                priority: 0,
+            })),
+        };
+        assert!(
+            try_send_envelope_until(
+                &owner,
+                envelope.clone(),
+                Instant::now() + Duration::from_secs(1)
+            )
+            .await
+        );
+        let registration = register_mutation_relay(
+            &task_ref,
+            mutations.clone(),
+            &admission,
+            1,
+            MutationRelayRegistration {
+                expected_peer: "owner".to_string(),
+                expected_tx: owner.clone(),
+                expected_keys: vec!["key".to_string()],
+                origin_tx: origin.clone(),
+                origin_req_id: 11,
+                deadline: Instant::now() + Duration::from_secs(10),
+                operation: gate.try_enter().unwrap(),
+            },
+        )
+        .await
+        .unwrap();
+        let mut enqueue = Box::pin(async move {
+            assert!(
+                registration
+                    .enqueue(&owner, envelope, Instant::now() + Duration::from_secs(10))
+                    .await
+            );
+            registration.disarm();
+        });
+        assert!(futures::poll!(enqueue.as_mut()).is_pending());
+        drop(enqueue);
+        assert!(mutations.lock().unwrap().is_empty());
+        let response = origin_response_rx.try_recv().unwrap();
+        assert!(matches!(Envelope::decode(response.bytes()).unwrap().msg,
+            Some(EnvelopeMsg::MutationResponse(response)) if response.req_id == 11 && response.results[0].status == MutationStatus::Unavailable as i32));
+        wait_for_relay_admission(&admission, 1, 1024).await;
+        // A stopped task owner rejects registration; no map/timer/operation
+        // may remain and the downstream frame must never be enqueued.
+        tasks.shutdown().await;
+        let (owner, _owner_rx, _owner_response_rx) = test_peer_channel(1);
+        assert!(register_mutation_relay(
+            &task_ref,
+            mutations.clone(),
+            &admission,
+            2,
+            MutationRelayRegistration {
+                expected_peer: "owner".to_string(),
+                expected_tx: owner,
+                expected_keys: vec!["key".to_string()],
+                origin_tx: origin,
+                origin_req_id: 12,
+                deadline: Instant::now() + Duration::from_secs(10),
+                operation: gate.try_enter().unwrap(),
+            }
+        )
+        .await
+        .is_none());
+        assert!(mutations.lock().unwrap().is_empty());
+        assert!(origin_response_rx.try_recv().is_ok());
+        wait_for_relay_admission(&admission, 1, 1024).await;
+        gate.begin_shutdown();
+        gate.wait_for_drain().await;
+    }
+
+    #[tokio::test]
+    async fn batch_relay_preserves_duplicate_positions_stamps_and_terminal_capacity() {
+        let (mut ctx, tasks) = test_connection_context(
+            FragmentRouter::new(1, 0),
+            Arc::new(RwLock::new(HashSet::new())),
+            Arc::new(RwLock::new(HashMap::from([(
+                FragmentId(0),
+                vec!["owner".to_string()],
+            )]))),
+            true,
+            Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(Mutex::new(HashMap::new())),
+        );
+        ctx.relay_admission = RelayAdmission::new(1, 1024);
+        ctx.runtime_options = ctx
+            .runtime_options
+            .with_forwarded_attempt_timeout(Duration::from_secs(10));
+        let (mut owner, owner_server) = tokio::io::duplex(4096);
+        let owner_connection = tokio::spawn(handle_connection(
+            ctx.clone(),
+            Box::pin(owner_server),
+            false,
+            None,
+            None,
+        ));
+        complete_test_handshake(&mut owner, "owner").await;
+        // This response proves the owner handshake published its exact channel
+        // before the origin requests a relay through it.
+        write_test_envelope(
+            &mut owner,
+            Envelope {
+                msg: Some(EnvelopeMsg::BatchGet(BatchGet {
+                    req_id: 300,
+                    ..Default::default()
+                })),
+            },
+        )
+        .await;
+        assert!(matches!(read_test_envelope(&mut owner).await.msg,
+            Some(EnvelopeMsg::BatchGetResponse(response)) if response.req_id == 300));
+        let (mut origin, origin_server) = tokio::io::duplex(4096);
+        let origin_connection = tokio::spawn(handle_connection(
+            ctx.clone(),
+            Box::pin(origin_server),
+            false,
+            None,
+            None,
+        ));
+        complete_test_handshake(&mut origin, "origin").await;
+        let request = BatchPut {
+            req_id: 400,
+            priority: ProtoPriority::High as i32,
+            puts: ["duplicate", "duplicate", "other"]
+                .into_iter()
+                .enumerate()
+                .map(|(index, key)| ForwardedPut {
+                    key: key.into(),
+                    value: if index == 2 {
+                        Vec::new()
+                    } else {
+                        vec![index as u8]
+                    },
+                    timestamp_ms: index as u64 + 1,
+                    node_id: format!("origin-{index}"),
+                    seq: index as u64 + 11,
+                    boot_id: index as u64 + 21,
+                    expires_at_ms: index as u64 * 10,
+                    is_tombstone: index == 2,
+                    priority: ProtoPriority::Background as i32,
+                    hops: index as u32,
+                    req_id: index as u64 + 500,
+                })
+                .collect(),
+        };
+        write_test_envelope(
+            &mut origin,
+            Envelope {
+                msg: Some(EnvelopeMsg::BatchPut(request.clone())),
+            },
+        )
+        .await;
+        let Some(EnvelopeMsg::BatchPut(forwarded)) = read_test_envelope(&mut owner).await.msg
+        else {
+            panic!("owner did not receive the forwarded batch");
+        };
+        assert_ne!(forwarded.req_id, request.req_id);
+        let mut expected = request.clone();
+        expected.req_id = forwarded.req_id;
+        for put in &mut expected.puts {
+            put.hops += 1;
+        }
+        assert_eq!(
+            forwarded, expected,
+            "relay changed operation stamps or positions"
+        );
+        assert_eq!(ctx.pending_mutation_relays.lock().unwrap().len(), 1);
+        assert_eq!(ctx.relay_admission.slots.available_permits(), 0);
+        assert!(ctx.relay_admission.key_bytes.available_permits() < 1024);
+        ctx.operation_gate.begin_shutdown();
+        let mut drain = Box::pin(ctx.operation_gate.wait_for_drain());
+        assert!(futures::poll!(drain.as_mut()).is_pending());
+
+        let mut superseded = result("duplicate", 1);
+        superseded.status = MutationStatus::Superseded as i32;
+        superseded.winner_timestamp_ms = 4;
+        superseded.winner_node_id = "winner".into();
+        superseded.winner_is_tombstone = true;
+        let mut unavailable = result("other", 2);
+        unavailable.status = MutationStatus::Unavailable as i32;
+        unavailable.error = "downstream unavailable".into();
+        let results = vec![result("duplicate", 0), superseded, unavailable];
+        write_test_envelope(
+            &mut owner,
+            Envelope {
+                msg: Some(EnvelopeMsg::MutationResponse(MutationResponse {
+                    req_id: forwarded.req_id,
+                    results: results.clone(),
+                })),
+            },
+        )
+        .await;
+        assert_eq!(
+            read_test_envelope(&mut origin).await.msg,
+            Some(EnvelopeMsg::MutationResponse(MutationResponse {
+                req_id: request.req_id,
+                results,
+            })),
+            "relay changed duplicate positions or downstream statuses",
+        );
+        wait_for_relay_admission(&ctx.relay_admission, 1, 1024).await;
+        assert!(ctx.pending_mutation_relays.lock().unwrap().is_empty());
+        tokio::time::timeout(Duration::from_secs(1), drain)
+            .await
+            .expect("terminal batch response retained the operation fence");
+        drop(origin);
+        drop(owner);
+        for connection in [origin_connection, owner_connection] {
+            tokio::time::timeout(Duration::from_secs(1), connection)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        tasks.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn silent_owner_ingress_is_bounded_by_shared_relay_count_and_key_bytes() {
+        for bound_by_bytes in [false, true] {
+            let peers: PeerMap = Arc::new(Mutex::new(HashMap::new()));
+            let (owner, mut owner_rx, _owner_response_rx) = test_peer_channel(8);
+            peers.lock().await.insert("owner".to_string(), owner);
+            let (mut ctx, tasks) = test_connection_context(
+                FragmentRouter::new(1, 0),
+                Arc::new(RwLock::new(HashSet::new())),
+                Arc::new(RwLock::new(HashMap::from([(
+                    FragmentId(0),
+                    vec!["owner".to_string()],
+                )]))),
+                true,
+                Arc::new(Mutex::new(HashMap::new())),
+                Arc::new(Mutex::new(HashMap::new())),
+                peers,
+            );
+            let slots = if bound_by_bytes { 8 } else { 2 };
+            let bytes = if bound_by_bytes {
+                relay_key_storage_bytes(3) + relay_keys_storage_bytes(&["key".to_string()], 1)
+            } else {
+                1024
+            };
+            ctx.relay_admission = RelayAdmission::new(slots, bytes);
+            ctx.runtime_options = ctx
+                .runtime_options
+                .with_forwarded_attempt_timeout(Duration::from_millis(500));
+            let admission = ctx.relay_admission.clone();
+            let reads = ctx.pending_relays.clone();
+            let mutations = ctx.pending_mutation_relays.clone();
+            let (mut client, server) = tokio::io::duplex(4096);
+            let connection =
+                tokio::spawn(handle_connection(ctx, Box::pin(server), false, None, None));
+            complete_test_handshake(&mut client, "origin").await;
+            let read = |req_id| Envelope {
+                msg: Some(EnvelopeMsg::ForwardedGet(ForwardedGet {
+                    key: "key".to_string(),
+                    req_id,
+                    priority: ProtoPriority::High as i32,
+                    hops: 0,
+                })),
+            };
+            let put = |req_id| Envelope {
+                msg: Some(EnvelopeMsg::ForwardedPut(ForwardedPut {
+                    key: "key".to_string(),
+                    value: b"value".to_vec(),
+                    timestamp_ms: 1,
+                    node_id: "origin".to_string(),
+                    seq: req_id,
+                    boot_id: 1,
+                    expires_at_ms: 0,
+                    is_tombstone: false,
+                    priority: ProtoPriority::Default as i32,
+                    hops: 0,
+                    req_id,
+                })),
+            };
+            write_test_envelope(&mut client, read(10)).await;
+            write_test_envelope(&mut client, put(11)).await;
+            let forwarded_read = tokio::time::timeout(Duration::from_secs(1), owner_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                matches!(Envelope::decode(forwarded_read.bytes()).unwrap().msg,
+                Some(EnvelopeMsg::ForwardedGet(g)) if g.req_id != 10 && g.priority == ProtoPriority::High as i32 && g.hops == 1)
+            );
+            let forwarded_put = tokio::time::timeout(Duration::from_secs(1), owner_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                matches!(Envelope::decode(forwarded_put.bytes()).unwrap().msg,
+                Some(EnvelopeMsg::ForwardedPut(p)) if p.req_id != 11 && p.timestamp_ms == 1 && p.seq == 11 && p.hops == 1)
+            );
+            for req_id in 20..40 {
+                write_test_envelope(&mut client, read(req_id)).await;
+                write_test_envelope(&mut client, put(req_id + 100)).await;
+                assert!(matches!(read_test_envelope(&mut client).await.msg,
+                    Some(EnvelopeMsg::MutationResponse(response)) if response.req_id == req_id + 100 && response.results[0].status == MutationStatus::Unavailable as i32));
+                assert_eq!(reads.lock().unwrap().len(), 1);
+                assert_eq!(mutations.lock().unwrap().len(), 1);
+            }
+            assert!(
+                owner_rx.try_recv().is_err(),
+                "rejected relays reached the owner"
+            );
+            let batch_put = ForwardedPut {
+                key: "key".to_string(),
+                value: b"value".to_vec(),
+                timestamp_ms: 2,
+                node_id: "origin".to_string(),
+                seq: 400,
+                boot_id: 1,
+                req_id: 400,
+                ..Default::default()
+            };
+            write_test_envelope(
+                &mut client,
+                Envelope {
+                    msg: Some(EnvelopeMsg::BatchPut(BatchPut {
+                        req_id: 400,
+                        puts: vec![batch_put.clone(), batch_put],
+                        priority: ProtoPriority::High as i32,
+                    })),
+                },
+            )
+            .await;
+            assert!(matches!(read_test_envelope(&mut client).await.msg,
+                Some(EnvelopeMsg::MutationResponse(response)) if response.req_id == 400 && response.results.len() == 2
+                    && response.results.iter().enumerate().all(|(index, result)| result.key == "key" && result.request_index as usize == index && result.status == MutationStatus::Unavailable as i32)));
+            // Barrier proves the saturated peer reader remains usable and no
+            // unavailable legacy read was converted into a false miss.
+            write_test_envelope(
+                &mut client,
+                Envelope {
+                    msg: Some(EnvelopeMsg::BatchGet(BatchGet {
+                        req_id: 300,
+                        keys: vec![],
+                        priority: 0,
+                    })),
+                },
+            )
+            .await;
+            assert!(matches!(read_test_envelope(&mut client).await.msg,
+                Some(EnvelopeMsg::BatchGetResponse(response)) if response.req_id == 300 && response.results.is_empty()));
+            assert!(matches!(read_test_envelope(&mut client).await.msg,
+                Some(EnvelopeMsg::MutationResponse(response)) if response.req_id == 11 && response.results[0].status == MutationStatus::Unavailable as i32));
+            wait_for_relay_admission(&admission, slots, bytes).await;
+            assert!(reads.lock().unwrap().is_empty());
+            assert!(mutations.lock().unwrap().is_empty());
+            drop(client);
+            tokio::time::timeout(Duration::from_secs(1), connection)
+                .await
+                .unwrap()
+                .unwrap();
+            tasks.shutdown().await;
+        }
     }
 
     #[tokio::test]

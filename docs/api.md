@@ -42,6 +42,8 @@ async fn main() -> Result<(), actordb::node::NodeError> {
       .with_replication_control_message_capacity(128)
       .with_inbound_connection_capacity(512)
       .with_receive_byte_capacity(128 * 1024 * 1024)
+      .with_relay_capacity(1024)
+      .with_relay_key_byte_capacity(64 * 1024 * 1024)
       .with_queue_admission_timeout(Duration::from_secs(2))
       .with_reconcile_data_admission_timeout(Duration::from_secs(20))
       .with_forwarded_attempt_timeout(Duration::from_secs(8))

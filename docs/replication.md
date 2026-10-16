@@ -380,6 +380,16 @@ counter for the retired protocol and remains zero in every mode.
 - A ticketed FIFO gate admits one reconciliation round per physical connection
   while guaranteeing that a fragment starting a follow-up round rejoins behind
   fragments already waiting for bootstrap or repair.
+- Non-serving forwarding shares a node-wide admission pool across single-read
+  and single/batched-mutation relays: 1024 live attempts/timers and 64 MiB of
+  retained request-key storage by default. String/Vec headers, allocated String
+  slots, and String buffer capacities are charged; mutation payloads, writer
+  buffers, and total heap are not. Admission is nonwaiting, timers retain their
+  permits until exit, and canceled registration/enqueue rolls back synchronously.
+  Exact physical origin/owner identities prevent stale disconnect or response
+  cleanup from consuming replacement work. Lost/rejected mutation relays return
+  `Unavailable`; legacy reads remain unavailable without false misses. This
+  changes neither serving apply/fanout ownership nor durability guarantees.
 - Each fragment/peer Node sender separately retains at most
   `buffer_capacity` queued mutation commands, `buffer_capacity` owned deltas,
   `max_in_flight * batch_size` ordinary in-flight operations, and 64 queued
