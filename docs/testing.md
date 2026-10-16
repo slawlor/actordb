@@ -160,7 +160,9 @@ process — the bulk of behavioral coverage:
   reading it, then verify unrelated peer traffic and replacement handshakes
   remain usable after capacity returns. Separate tests cover completed-frame
   retention, empty/oversized bodies, EOF, body timeout, cancellation, task abort,
-  and configuration validation.
+  and configuration validation. Maintenance interval regressions reject zero
+  and unrepresentable cleaner, snapshotter, and enabled placement timers before
+  transport bind, while preserving ignored placement settings in static mode.
   Node and wire unit tests separately verify exact Prost length accounting,
   positional ordered-prefix validation with duplicate keys, the shed-bit hard
   boundary, actor-side `BatchGet` result sizing, UTF-8-safe diagnostic

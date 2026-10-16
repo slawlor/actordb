@@ -2888,10 +2888,11 @@ pub struct NodeConfig {
     pub high_pool: PoolConfig,
     pub background_pool: PoolConfig,
     /// How often each fragment's cleaner sweeps for TTL-expired keys.
-    /// Default 30 seconds.
+    /// Default 30 seconds. Must be nonzero and representable by Tokio's clock.
     pub clean_interval: Duration,
     /// How often each fragment's snapshotter flushes the write buffer
-    /// to the store. Default 60 seconds.
+    /// to the store. Default 60 seconds. Must be nonzero and representable by
+    /// Tokio's clock, including for in-memory nodes.
     pub snapshot_interval: Duration,
     /// Reserved compatibility field for the removed time-based tombstone
     /// collector. Must be `None`; [`Node::start`] rejects every `Some` value
@@ -3078,13 +3079,34 @@ impl Node {
             .replication
             .validate_node_ingress()
             .map_err(|error| NodeError::Actor(error.to_string()))?;
-        if dynamic
-            && (config.placement_poll_interval.is_zero()
-                || config.placement_drain_warn_interval.is_zero())
-        {
-            return Err(NodeError::Actor(
-                "dynamic placement intervals must be non-zero".to_string(),
-            ));
+        // Validate before binding storage or transport. Maintenance actors
+        // construct interval timers during startup and placement can construct
+        // warning deadlines much later; neither may panic on user input.
+        let timer_now = Instant::now();
+        let warning_now = std::time::Instant::now();
+        for (name, interval, enabled) in [
+            ("clean_interval", config.clean_interval, true),
+            ("snapshot_interval", config.snapshot_interval, true),
+            (
+                "placement_poll_interval",
+                config.placement_poll_interval,
+                dynamic,
+            ),
+            (
+                "placement_drain_warn_interval",
+                config.placement_drain_warn_interval,
+                dynamic,
+            ),
+        ] {
+            if enabled
+                && (interval.is_zero()
+                    || timer_now.checked_add(interval).is_none()
+                    || warning_now.checked_add(interval).is_none())
+            {
+                return Err(NodeError::Actor(format!(
+                    "{name} must be non-zero and representable by the runtime clock"
+                )));
+            }
         }
         if config.tombstone_gc_age.is_some() {
             return Err(NodeError::Actor(
