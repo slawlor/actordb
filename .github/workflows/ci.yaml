@@ -11,113 +11,94 @@ jobs:
     name: Rust 1.88 minimum version
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@main
+      - uses: actions/checkout@v7
       - name: Install Rust 1.88
         uses: dtolnay/rust-toolchain@1.88.0
+      - uses: Swatinem/rust-cache@v2
       - name: Check the locked workspace
         run: cargo check --workspace --all-targets --locked
 
   test:
-    name: ${{matrix.name}}
+    name: Run the default tests
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: Run the default tests
-            package: actordb
-            # flags:
-
     steps:
-      - uses: actions/checkout@main
+      - uses: actions/checkout@v7
 
       - name: Install rust
-        uses: actions-rs/toolchain@v1
-        with:
-          toolchain: stable
-          override: true
+        uses: dtolnay/rust-toolchain@stable
 
-      - name: ${{matrix.name}}
-        uses: actions-rs/cargo@v1
+      - uses: Swatinem/rust-cache@v2
         with:
-          command: test
-          args: --package ${{matrix.package}} ${{matrix.flags}}
+          # Test and Clippy use the same stable debug dependency artifacts.
+          shared-key: stable-debug
 
       - name: Test everything
-        uses: actions-rs/cargo@v1
-        with:
-          command: test
+        run: cargo test --workspace --locked
+
+      - name: Test without default features
+        # docker-tests opts into actordb's defaults through its dependency;
+        # excluding it is necessary to exercise a genuinely RocksDB-free build.
+        run: cargo test --workspace --exclude docker-tests --no-default-features --locked
 
   clippy:
     name: Clippy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@main
+      - uses: actions/checkout@v7
       - name: Install minimal stable with clippy
-        uses: actions-rs/toolchain@v1
+        uses: dtolnay/rust-toolchain@stable
         with:
-          profile: minimal
-          toolchain: stable
           components: clippy
-          override: true
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: stable-debug
 
       - name: Run Clippy
-        uses: actions-rs/cargo@v1
-        with:
-          command: clippy
-          args: --all -- -D clippy::all -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D clippy::all -D warnings
+
+      - name: Run Clippy without default features
+        run: cargo clippy --workspace --exclude docker-tests --all-targets --no-default-features --locked -- -D clippy::all -D warnings
 
   rustfmt:
     name: rustfmt
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@main
+      - uses: actions/checkout@v7
       - name: Install minimal stable with rustfmt
-        uses: actions-rs/toolchain@v1
+        uses: dtolnay/rust-toolchain@stable
         with:
-          profile: minimal
-          toolchain: stable
           components: rustfmt
-          override: true
 
       - name: Run rustfmt
-        uses: actions-rs/cargo@v1
-        with:
-          command: fmt
-          args: --all -- --check
+        run: cargo fmt --all -- --check
 
   docs:
     name: docs
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@main
-      - name: Install minimal stable with rustfmt
-        uses: actions-rs/toolchain@v1
+      - uses: actions/checkout@v7
+      - name: Install minimal stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
         with:
-          profile: minimal
-          toolchain: stable
-          components: rustfmt
-          override: true
+          key: release-docs
 
       - name: Run cargo doc on release profile
-        uses: actions-rs/cargo@v1
-        with:
-          command: doc
-          args: --lib -r
+        run: cargo doc --lib --release --locked
 
   benches:
     name: benches
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@main
+      - uses: actions/checkout@v7
       - name: Install rust
-        uses: actions-rs/toolchain@v1
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
         with:
-          toolchain: stable
-          override: true
+          key: release-benches
 
       - name: Compile benchmarks
-        uses: actions-rs/cargo@v1
-        with:
-          command: bench
-          args: --no-run
+        run: cargo bench --workspace --no-run --locked
