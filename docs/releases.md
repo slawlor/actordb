@@ -31,8 +31,8 @@ does not upload anything. GitHub prereleases are intentionally excluded.
    Inspect `cargo package --list --locked --package actordb` when changing
    source layout. Keep the bundled `actordb/LICENSE` in sync with root `LICENSE`.
 4. Wait for all PR checks and reviews, including backend-free, memory-only,
-   and full-feature tests, Rust 1.88,
-   Docker, and the `Verify release package` check. Merge into `main`.
+   and full-feature tests, Rust 1.88, Docker, and the `Verify release package`
+   check. Merge into `main`.
 
 The package workflow uploads an `actordb-VERSION` build artifact containing the
 verified `.crate` for inspection. An explicit, verified `cargo package` produces
@@ -76,8 +76,7 @@ For this version, after the version PR is merged and `main` checks are green:
    be contained in `origin/main`. An older tested ancestor is allowed; an
    unmerged branch, missing/moved tag, or version mismatch fails closed.
 4. Backend-free, memory-only, and RocksDB-only package dry-runs and crate tests
-   must pass before
-   the workflow publishes **only `actordb`** to the explicit `crates-io`
+   must pass before the workflow publishes **only `actordb`** to the explicit `crates-io`
    registry with locked dependencies. Uploads are serialized and an in-flight
    publication is never cancelled by a newer validation run.
 5. Check the Actions result and verify `0.2.0` on

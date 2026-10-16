@@ -142,6 +142,13 @@ class MetadataTests(unittest.TestCase):
             with self.subTest(entries=entries), self.assertRaises(guard.ReleaseError):
                 self.resolve(value)
 
+    def test_rocksdb_opt_in_cannot_enable_memory_or_another_feature(self):
+        for entries in [["dep:rocksdb", "memory"], ["dep:rocksdb", "another"]]:
+            value = metadata()
+            value["packages"][0]["features"]["rocksdb"] = entries
+            with self.subTest(entries=entries), self.assertRaises(guard.ReleaseError):
+                self.resolve(value)
+
     def test_rejects_malformed_backend_metadata(self):
         for field, setting in [
             ("features", None),

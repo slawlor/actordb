@@ -40,8 +40,8 @@ def verify_backends(package):
         raise ReleaseError("actordb default features must remain empty")
     if features.get("memory") != []:
         raise ReleaseError("actordb must provide a dependency-free memory opt-in")
-    if "dep:rocksdb" not in features.get("rocksdb", []):
-        raise ReleaseError("actordb rocksdb opt-in must explicitly enable dep:rocksdb")
+    if features.get("rocksdb") != ["dep:rocksdb"]:
+        raise ReleaseError("actordb rocksdb opt-in must enable only dep:rocksdb")
 
     dependencies = package.get("dependencies")
     if not isinstance(dependencies, list) or not all(
