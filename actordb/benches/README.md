@@ -38,6 +38,19 @@ regressions/improvements vs the first.
 Each file has a doc comment explaining what it measures and how to read a
 regression — start there before tuning.
 
+Automatic expiry maintenance also has an ignored internal release diagnostic,
+separate from Criterion. It compares the full-sweep primitive with the actual
+Cleaner under concurrent actor-routed High/default reads and overwrites, with
+dense/sparse keysets and several TTL fractions. It reports bounded foreground
+samples separately from materialization/drain times; no release baseline or
+p99 improvement has been recorded. See [test strategy](../../docs/testing.md)
+for the witness, sampling and storeless-scope caveats.
+
+```bash
+cargo test -p actordb --release --no-default-features --locked \
+  maintenance_foreground_latency_distribution -- --ignored --nocapture
+```
+
 ## Baselines
 
 Recorded 2026-10-14 on a shared dev VM (multi-thread tokio, in-memory store,

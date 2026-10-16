@@ -200,7 +200,8 @@ The buffer is pushed to the store when:
   `StoreCommitted` or `StableCommitted` ACK.
 
 `flush_interval` is write-triggered, not an independent timer. For an idle
-fragment, `snapshot_interval` is the upper bound before a periodic flush.
+fragment, `snapshot_interval` schedules a periodic flush opportunity; a stalled
+actor or store can delay completion, so it is not a hard durability deadline.
 The cleaner enqueues TTL-expiry tombstones through the same ordered buffer.
 Expired values found during startup are rewritten as tombstones before that
 fragment starts serving, so a crash/restart cannot erase the version floor.
@@ -218,6 +219,51 @@ ordinary policy. `STABLE_COMMITTED` additionally means `stable_fence` reported
 Despite the name, the `Snapshotter` is **not** a RocksDB checkpoint — it is a
 periodic durable-flush actor (`SnapshotterMessage::Snap` → `shared.flush()`).
 There are no checkpoints or point-in-time snapshots in the current design.
+
+## Bounded automatic maintenance
+
+Cleaner and Snapshotter each admit at most one automatic job, queued or active.
+Ticks while that job is outstanding are coalesced, not accumulated in the
+mailbox. A cleaner job retains its admission lease across immediate page
+continuations; snapshot flushes retain theirs until completion. Rejection,
+cancellation, actor teardown, and completed jobs release the lease. Explicit
+low-level `CleanerMessage::Sweep` and `SnapshotterMessage::Snap` remain manual
+full operations; callers can still queue those themselves, outside this bound.
+
+Each automatic cleaner page visits at most **256 current ordered keys**, even
+when no key has a TTL or the cache HashMap has large unused capacity. Its
+**1 MiB soft work target** charges inspected metadata, cursor/pass key clones,
+expiry-marker and persistence clones, and the capacity of removed expired
+payload buffers. Processing stops after the first record that reaches the
+target: a prefix can exceed it by at most that one terminal record's charge.
+The first visited record's charge also includes the pass high-water key clone,
+even when that metadata describes a different key.
+An oversized first record is processed alone; an oversized later record may
+terminate a smaller prefix. This is not a hard memory or latency bound:
+arbitrary individual buffer capacity, allocation/deallocation costs, ordered
+index traversal, lock waits, store calls, flush-batch copies and the existing
+dirty/in-flight write buffer are not bounded by the page's soft target.
+
+A pass pins its expiry time; its first page captures an ordered high-water key
+and an initial-cardinality visit quota under the cache write lock. Subsequent
+pages use an exclusive cursor (`None` is distinct from the empty-string key)
+and consume quota only for actually visited records. Concurrent inserts can
+consume visits, and inserts/replacements behind the cursor or after the
+high-water key may wait for a later pass. This is weakly consistent
+materialization, not an atomic initial snapshot. Each visit checks the current
+winning value under the write lock. Reads and reconciliation continue to hide
+or synthesize expired values immediately, independently of maintenance.
+
+Every page publishes its tombstone replacements, ordered persistence enqueue,
+and mutation revision together under the normal flush-buffer → cache lock
+order. Flush errors/cancellation retain pending or in-flight data for retry;
+a restarted pass may safely rescan. Draining stops automatic continuations.
+Between nonterminal pages the cleaner yields with no cache/flush lock held,
+retaining its admission lease. This offers other tasks a scheduling opportunity,
+not a hard foreground-latency or priority guarantee.
+The public `FragmentState::expire_values(now)` full sweep and the authoritative
+post-quiescence shutdown sweep/flush are unchanged and catch the remaining
+expiry version floors before successful shutdown.
 
 Crash semantics: explicit `shutdown().await` closes public-operation admission,
 waits for admitted calls, drains fragment mailboxes, and returns only after each
