@@ -13,6 +13,6 @@ name = "actordb-docker-test"
 path = "src/main.rs"
 
 [dependencies]
-actordb = { path = "../actordb", features = ["rocksdb"] }
+actordb = { path = "../actordb", default-features = false, features = ["rocksdb"] }
 clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "net"] }

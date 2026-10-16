@@ -24,8 +24,11 @@ actor-first, sharded database implementation. This is a breaking upgrade from
   builders for public configuration and actor arguments. Required identities
   and shared dependencies remain required; runtime validation remains at
   startup.
-- Rust 1.88 minimum support, default RocksDB and genuine no-default-feature CI,
-  package verification, and version/tag-checked crates.io release automation.
+- Backend-free default crate with independent opt-in `rocksdb` and `memory`
+  features. `MemoryStore` is a no-op test double, not a database; custom
+  `KvStore` implementations and storeless nodes need neither feature.
+- Rust 1.88 minimum support, backend-free/memory/full-feature CI, package
+  verification, and version/tag-checked crates.io release automation.
 
 See the [API guide](docs/api.md), [persistence guide](docs/persistence.md),
 [replication guide](docs/replication.md), and

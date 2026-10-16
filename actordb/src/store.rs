@@ -8,28 +8,93 @@
 //! A [`KvStore`](crate::store::KvStore) persists the batches the [`KvActor`](crate::actor::KvActor)
 //! flushes and reloads them on boot. Persistence itself is optional:
 //! `NodeConfig.store` is `None` by default (a pure in-memory node).
-//! Enable the `rocksdb` cargo feature for `RocksDbStore`, the
-//! preferred implementation, or bring your own. [`MemoryStore`](crate::store::MemoryStore) is a
-//! test double for exercising the persistence plumbing without a
-//! database.
+//! The default crate includes no bundled storage backend. Enable the `rocksdb`
+//! cargo feature for `RocksDbStore`, the preferred durable implementation, or
+//! bring your own. The independent `memory` feature enables `MemoryStore`, a
+//! no-op test double for exercising the persistence plumbing without a database.
+//! Neither feature enables the other; the Node's volatile actor cache does not
+//! depend on either backend.
 //!
 //! Shared contracts, identities, capability types, and backend options live in
 //! this parent module. Each implementation has its own child module:
-//! [`memory`](crate::store::memory) contains the test double,
+//! the `memory` feature enables the test double in `store::memory`,
 //! [`prefixed`](crate::store::prefixed) contains the fragment namespace adapter,
 //! and the `rocksdb` feature enables the offered RocksDB
 //! backend in `store::rocksdb`. Existing `store::*` type imports remain available
-//! through reexports.
+//! through reexports when the corresponding feature is enabled. `KvStore` and
+//! the `PrefixedStore` namespace wrapper remain available without a backend.
+//!
+//! A caller-supplied store works with the backend-free default crate:
+//!
+//! ```
+//! use actordb::{actor::VersionedValue, shard::FragmentId};
+//! use actordb::store::{KvStore, PrefixedStore, StoreError};
+//! use std::sync::Arc;
+//!
+//! struct CallerStore;
+//! impl KvStore for CallerStore {
+//!     fn load(&self) -> Result<Vec<(Vec<u8>, VersionedValue)>, StoreError> {
+//!         Ok(Vec::new())
+//!     }
+//!     fn write_batch(&self, _: &[(Vec<u8>, VersionedValue)]) -> Result<(), StoreError> {
+//!         Ok(())
+//!     }
+//! }
+//! let root: Arc<dyn KvStore> = Arc::new(CallerStore);
+//! let fragment = PrefixedStore::new(root, FragmentId(0));
+//! assert!(fragment.load().unwrap().is_empty());
+//! ```
+
+#![cfg_attr(
+    not(feature = "memory"),
+    doc = r#"
+Without `memory`, neither the root reexport nor the backend module is public:
+
+```compile_fail
+use actordb::store::MemoryStore;
+```
+
+```compile_fail
+use actordb::store::memory::MemoryStore;
+```
+"#
+)]
+#![cfg_attr(
+    not(feature = "rocksdb"),
+    doc = r#"
+Without `rocksdb`, neither the root reexport nor the backend module is public:
+
+```compile_fail
+use actordb::store::RocksDbStore;
+```
+
+```compile_fail
+use actordb::store::rocksdb::RocksDbStore;
+```
+
+RocksDB open options and Node's convenience constructor are also opt-in:
+
+```compile_fail
+use actordb::store::RocksDbOptions;
+```
+
+```compile_fail
+let config = actordb::node::NodeConfig::with_rocksdb("./data/node-a");
+```
+"#
+)]
 
 use std::fmt;
 
 use crate::actor::VersionedValue;
 
+#[cfg(feature = "memory")]
 pub mod memory;
 pub mod prefixed;
 #[cfg(feature = "rocksdb")]
 pub mod rocksdb;
 
+#[cfg(feature = "memory")]
 pub use memory::MemoryStore;
 pub use prefixed::PrefixedStore;
 #[cfg(feature = "rocksdb")]

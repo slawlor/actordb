@@ -3,21 +3,32 @@
 Three layers, each catching what the others can't.
 
 The separate `Verify release package` workflow check additionally verifies
-unpacked crates.io packages with default and no-default features and runs
-stdlib release-guard regressions. PR and `main` runs have no registry token and
-do not publish to crates.io. See the [release procedure](releases.md) for tag/main provenance,
-release-event tests, credentials, and publication behavior.
+unpacked crates.io packages for backend-free defaults and opted-in storage
+features, and runs stdlib release-guard regressions. PR and `main` runs have no
+registry token and do not publish to crates.io. See the [release procedure](releases.md) for
+tag/main provenance, release-event tests, credentials, and publication behavior.
 
 ## CI feature coverage and caches
 
-CI tests the default workspace once, including the offered RocksDB backend,
-then tests without default features using
-`cargo test --workspace --exclude docker-tests --no-default-features --locked`.
-The exclusion matters: `docker-tests` enables `actordb`'s default features
-through its dependency, even when the workspace command disables defaults.
-The default workspace run still covers that integration crate. Clippy checks
-all targets in both configurations, alongside the existing Rust 1.88,
-formatting, release-documentation, and benchmark-compilation gates.
+The crate has an empty default feature set. CI distinguishes the storeless core
+from the independent no-op `memory` test double and the offered `rocksdb`
+backend:
+
+| Configuration | Test command |
+|---|---|
+| Backend-free default | `cargo test --workspace --exclude docker-tests --locked` |
+| Memory test double only | `cargo test --workspace --exclude docker-tests --features actordb/memory --locked` |
+| All features, including RocksDB and Docker role compilation | `cargo test --workspace --all-features --locked` |
+
+The Docker exclusion matters: `docker-tests` explicitly enables RocksDB through
+its dependency, so including it unifies that feature into a workspace build.
+The all-feature run covers that integration crate and both bundled store
+modules. Clippy checks all targets in all three configurations. Rust 1.88 is
+checked with all features and with the backend-free core, alongside formatting,
+release-documentation, and benchmark-compilation gates. `--no-default-features`
+is redundant for the core today; it does not counteract another workspace
+member's explicit backend feature selection. Test names below describe the
+combined suite; backend-specific cases are gated by their corresponding feature.
 
 Compile jobs restore dependency artifacts with `Swatinem/rust-cache`. Stable
 debug tests use `stable-debug-tests`; Clippy keeps `stable-debug`. Check-only
@@ -48,10 +59,14 @@ Testing a synthetic merge but labeling its report with the PR
 head shifts line attribution when main changes, so a moved line can appear
 uncovered even though a different source revision was measured. Coverage is a
 head-source report, not evidence that the PR integrates cleanly with main:
-the default workspace, Clippy and Docker workflows retain their merge-based
+the test matrix, Clippy and Docker workflows retain their merge-based
 integration checks. The coverage job installs stable Rust with
 `llvm-tools-preview` and invokes `cargo run --locked --bin xtask -- coverage`;
 the existing xtask instrumentation, tests and LCOV generation are unchanged.
+That helper runs workspace tests, so the Docker crate's explicit dependency
+feature enables RocksDB in the coverage build. It does not select the `memory`
+test double: that module is exercised by the separate memory-only and
+all-feature test configurations, not this LCOV report.
 
 ## Unit tests (`cargo test --lib`)
 
@@ -100,7 +115,7 @@ thresholds, and setup/worker startup are excluded. The diagnostic is storeless;
 durable flush-buffer and disk-latency comparisons need a separate benchmark.
 
 ```bash
-cargo test -p actordb --release --no-default-features --locked \
+cargo test -p actordb --release --locked \
   maintenance_foreground_latency_distribution -- --ignored --nocapture
 ```
 
@@ -180,7 +195,10 @@ ordinary reads on the same Node before clean shutdown.
 ## Integration tests (`actordb/tests/cluster.rs`)
 
 The cluster suite runs over real TCP on localhost with multiple `Node`s in one
-process — the bulk of behavioral coverage:
+process — the bulk of behavioral coverage. Storeless and custom-store tests
+run in the backend-free configuration. Offered RocksDB tests require `rocksdb`;
+`memory_store_exercises_persistence_plumbing` requires `memory` and tests only
+no-op store plumbing, not durable storage:
 
 - **Basics**: `single_node_put_get`, `two_nodes_replicate`,
   `three_node_mesh_converges`, `lww_last_write_wins_everywhere`.
@@ -390,8 +408,15 @@ Runtime validation regressions remain separate: successful `build()` does not
 prove that startup/spawn will accept a configuration.
 
 ```bash
-cargo test -p actordb            # unit + integration
-cargo run --bin xtask -- coverage # coverage report (CI enforces it)
+cargo test --workspace --exclude docker-tests --locked
+cargo test --workspace --exclude docker-tests --features actordb/memory --locked
+cargo test --workspace --all-features --locked
+
+cargo clippy --workspace --exclude docker-tests --all-targets --locked -- -D clippy::all -D warnings
+cargo clippy --workspace --exclude docker-tests --features actordb/memory --all-targets --locked -- -D clippy::all -D warnings
+cargo clippy --workspace --all-features --all-targets --locked -- -D clippy::all -D warnings
+
+cargo run --locked --bin xtask -- coverage # workspace/RocksDB coverage, not memory
 # Docker scenarios run in CI; see docker/run-scenario.sh to run locally.
 ```
 

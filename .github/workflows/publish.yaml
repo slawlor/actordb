@@ -61,11 +61,14 @@ jobs:
             python3 .github/scripts/verify_release.py
           fi
 
-      - name: Verify the default package, including RocksDB
+      - name: Verify the backend-free default package
         run: cargo publish --dry-run --locked --package actordb --registry crates-io
 
-      - name: Verify the package without RocksDB
-        run: cargo publish --dry-run --locked --package actordb --registry crates-io --no-default-features
+      - name: Verify the opt-in memory test double
+        run: cargo publish --dry-run --locked --package actordb --registry crates-io --features memory
+
+      - name: Verify opt-in RocksDB support
+        run: cargo publish --dry-run --locked --package actordb --registry crates-io --features rocksdb
 
       - name: Create the verified release artifact
         # Modern Cargo stages publish dry-runs in a temporary registry rather
@@ -74,11 +77,12 @@ jobs:
 
       # PR/main already have the full CI suite. Repeat crate tests on a release
       # event so publication does not rely solely on an earlier branch check.
-      - name: Test the release with and without RocksDB
+      - name: Test the backend-free release and independent backend opt-ins
         if: github.event_name == 'release'
         run: |
           cargo test --locked --package actordb
-          cargo test --locked --package actordb --no-default-features
+          cargo test --locked --package actordb --features memory
+          cargo test --locked --package actordb --features rocksdb
 
       - name: Upload the verified crate for inspection
         uses: actions/upload-artifact@v7

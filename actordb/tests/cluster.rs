@@ -3871,6 +3871,7 @@ async fn shutdown_materializes_expiry_before_the_final_flush() {
     assert!(persisted.value.is_empty());
 }
 
+#[cfg(feature = "memory")]
 #[tokio::test]
 async fn memory_store_exercises_persistence_plumbing() {
     // The MemoryStore test double runs the full store path (load,

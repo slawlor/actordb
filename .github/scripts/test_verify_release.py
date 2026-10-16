@@ -1,4 +1,4 @@
-"""Stdlib tests for metadata identity, release ancestry, and safe CI output."""
+"""Stdlib tests for backend opt-ins, release provenance, and safe CI output."""
 
 import contextlib
 import importlib.util
@@ -22,7 +22,24 @@ SPEC.loader.exec_module(guard)
 def metadata(version="0.2.0"):
     return {
         "packages": [
-            {"name": "actordb", "id": "actordb-id", "version": version},
+            {
+                "name": "actordb",
+                "id": "actordb-id",
+                "version": version,
+                "features": {
+                    "default": [],
+                    "memory": [],
+                    "rocksdb": ["dep:rocksdb"],
+                },
+                "dependencies": [
+                    {
+                        "name": "rocksdb",
+                        "kind": None,
+                        "optional": True,
+                        "source": "registry+https://github.com/rust-lang/crates.io-index",
+                    }
+                ],
+            },
             {"name": "xtask", "id": "xtask-id", "version": "0.1.0"},
         ],
         "workspace_members": ["actordb-id", "xtask-id"],
@@ -57,6 +74,89 @@ class MetadataTests(unittest.TestCase):
         self.assertEqual(
             self.resolve(metadata("1.2.3-rc.1+build.4")), "1.2.3-rc.1+build.4"
         )
+
+    def test_backend_features_remain_independent_and_opt_in(self):
+        value = metadata()
+        # Extra, unselected features do not require a generic feature-graph audit.
+        value["packages"][0]["features"]["other"] = []
+        self.assertEqual(self.resolve(value), "0.2.0")
+
+    def test_rejects_nonempty_or_missing_default_features(self):
+        for defaults in [["memory"], ["rocksdb"], ["other"]]:
+            value = metadata()
+            value["packages"][0]["features"]["default"] = defaults
+            with self.subTest(defaults=defaults), self.assertRaises(guard.ReleaseError):
+                self.resolve(value)
+        value = metadata()
+        del value["packages"][0]["features"]["default"]
+        with self.assertRaises(guard.ReleaseError):
+            self.resolve(value)
+
+    def test_requires_both_named_backend_opt_in_features(self):
+        for feature in ["memory", "rocksdb"]:
+            value = metadata()
+            del value["packages"][0]["features"][feature]
+            with self.subTest(feature=feature), self.assertRaises(guard.ReleaseError):
+                self.resolve(value)
+
+    def test_rejects_memory_feature_dependencies(self):
+        for entries in [["rocksdb"], ["dep:rocksdb"], ["other"]]:
+            value = metadata()
+            value["packages"][0]["features"]["memory"] = entries
+            with self.subTest(entries=entries), self.assertRaises(guard.ReleaseError):
+                self.resolve(value)
+
+    def test_rejects_missing_or_nonruntime_rocksdb_dependency(self):
+        for kind in ["dev", "build"]:
+            value = metadata()
+            value["packages"][0]["dependencies"][0]["kind"] = kind
+            with self.subTest(kind=kind), self.assertRaises(guard.ReleaseError):
+                self.resolve(value)
+        for dependencies in [[], metadata()["packages"][0]["dependencies"] * 2]:
+            value = metadata()
+            value["packages"][0]["dependencies"] = dependencies
+            with self.subTest(dependencies=dependencies), self.assertRaises(
+                guard.ReleaseError
+            ):
+                self.resolve(value)
+
+    def test_rejects_mandatory_or_nonregistry_rocksdb_dependency(self):
+        for field, setting in [
+            ("optional", False),
+            ("optional", None),
+            ("optional", 1),
+            ("source", None),
+            ("source", "git+https://example.invalid/rocksdb"),
+        ]:
+            value = metadata()
+            value["packages"][0]["dependencies"][0][field] = setting
+            with self.subTest(field=field, setting=setting), self.assertRaises(
+                guard.ReleaseError
+            ):
+                self.resolve(value)
+
+    def test_requires_explicit_rocksdb_dependency_feature(self):
+        for entries in [[], ["memory"], ["rocksdb"], ["rocksdb/default"]]:
+            value = metadata()
+            value["packages"][0]["features"]["rocksdb"] = entries
+            with self.subTest(entries=entries), self.assertRaises(guard.ReleaseError):
+                self.resolve(value)
+
+    def test_rejects_malformed_backend_metadata(self):
+        for field, setting in [
+            ("features", None),
+            ("features", []),
+            ("features", {"default": [], "memory": [], "rocksdb": "dep:rocksdb"}),
+            ("dependencies", None),
+            ("dependencies", {}),
+            ("dependencies", [None]),
+        ]:
+            value = metadata()
+            value["packages"][0][field] = setting
+            with self.subTest(field=field, setting=setting), self.assertRaises(
+                guard.ReleaseError
+            ):
+                self.resolve(value)
 
     def test_rejects_missing_wrong_duplicate_and_nonworkspace_package(self):
         cases = [
@@ -134,6 +234,24 @@ class OutputAndCliTests(unittest.TestCase):
                     (0, "version=0.2.0\n", ""),
                 )
         verify.assert_not_called()
+
+    def test_failed_backend_policy_emits_no_success_or_private_metadata(self):
+        value = metadata()
+        value["packages"][0]["features"]["default"] = ["private-token"]
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "outputs"
+            with mock.patch.object(
+                guard.subprocess, "run", return_value=command_result(json.dumps(value))
+            ), mock.patch.object(guard, "verify_tag") as verify:
+                result, stdout, stderr = self.invoke(
+                    ["--tag", "v0.2.0"], {"GITHUB_OUTPUT": str(output)}
+                )
+            self.assertEqual(result, 1)
+            self.assertEqual(stdout, "")
+            self.assertNotIn("private-token", stderr)
+            self.assertIn("default features must remain empty", stderr)
+            self.assertFalse(output.exists())
+            verify.assert_not_called()
 
     def test_appends_github_output_and_emits_stdout_after_verification(self):
         with tempfile.TemporaryDirectory() as directory:

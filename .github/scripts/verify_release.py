@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Resolve the workspace crate version and fail closed on unsafe release tags."""
+"""Verify backend opt-ins, resolve the crate version, and validate release tags."""
 
 import argparse
 import json
@@ -27,6 +27,42 @@ def run_command(command, cwd=None):
         )
     except (OSError, UnicodeError) as error:
         raise ReleaseError("could not run the required verification command") from error
+
+
+def verify_backends(package):
+    features = package.get("features")
+    if not isinstance(features, dict) or not all(
+        isinstance(entries, list) and all(isinstance(entry, str) for entry in entries)
+        for entries in features.values()
+    ):
+        raise ReleaseError("actordb had an invalid feature list")
+    if features.get("default") != []:
+        raise ReleaseError("actordb default features must remain empty")
+    if features.get("memory") != []:
+        raise ReleaseError("actordb must provide a dependency-free memory opt-in")
+    if "dep:rocksdb" not in features.get("rocksdb", []):
+        raise ReleaseError("actordb rocksdb opt-in must explicitly enable dep:rocksdb")
+
+    dependencies = package.get("dependencies")
+    if not isinstance(dependencies, list) or not all(
+        isinstance(dependency, dict) for dependency in dependencies
+    ):
+        raise ReleaseError("actordb had an invalid dependency list")
+    rocksdb = [
+        dependency
+        for dependency in dependencies
+        if dependency.get("name") == "rocksdb" and dependency.get("kind") is None
+    ]
+    if len(rocksdb) != 1:
+        raise ReleaseError("actordb must have one optional RocksDB runtime dependency")
+    dependency = rocksdb[0]
+    source = dependency.get("source")
+    if dependency.get("optional") is not True or not (
+        isinstance(source, str) and source.startswith("registry+")
+    ):
+        raise ReleaseError(
+            "actordb RocksDB runtime dependency must be optional and registry-based"
+        )
 
 
 def resolve_version(cwd=None):
@@ -63,6 +99,7 @@ def resolve_version(cwd=None):
         for part in prerelease.split(".")
     ):
         raise ReleaseError("actordb had an invalid package version")
+    verify_backends(matches[0])
     return version
 
 

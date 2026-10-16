@@ -7,6 +7,12 @@ persistence, traffic isolation, and an optional fresh challenge-bound
 pre-shared-secret handshake, but without built-in TLS, individual peer
 credentials, multi-datacenter support, or transactional semantics.
 
+The default crate has no bundled storage backend. Its actors still keep their
+working data in the fragment cache: a storeless node needs neither `memory`
+nor `rocksdb`. The independent `memory` feature exposes a no-op test double;
+`rocksdb` exposes the offered durable backend. Custom `KvStore` implementations
+and the `PrefixedStore` wrapper are available without either feature.
+
 ## What it is
 
 - **Distributed KV store**: keys are strings, values are byte vectors, each
@@ -43,7 +49,9 @@ integration crate, and an `xtask` for coverage.
 | `actordb::supervision` | `FragmentSupervisor` + children: dispatcher, `Cleaner` (TTL-expiry markers), `Snapshotter` (periodic flush) |
 | `actordb::placement` | Phase 8 dynamic placement: `PlacementController` trait, `StaticPlacement`, `ManualPlacement`, migration lifecycle states |
 | `actordb::store` | Shared `KvStore` identity/batch/prefix contract, errors, capabilities, backend options, and compatible implementation reexports |
-| `actordb::store::{memory, prefixed, rocksdb}` | Isolated implementations and unit tests: no-op `MemoryStore`, fragment-view `PrefixedStore`, fail-closed `RocksDbStore` (`rocksdb` feature-gated) |
+| `actordb::store::prefixed` | Always-available fragment-view `PrefixedStore` wrapper |
+| `actordb::store::memory` | No-op `MemoryStore` test double; opt-in `memory` feature |
+| `actordb::store::rocksdb` | Fail-closed `RocksDbStore` durable backend; opt-in `rocksdb` feature |
 | `actordb::shard` | `FragmentId`, `hash_key` (seahash), `fragment_of` |
 | `actordb::network` | Transport abstraction: `Network`, `TcpNetwork`, `PeerStream`; 4-byte length-prefixed `Envelope` framing |
 | `actordb::proto` | prost-generated `meta` protocol-buffer messages (ids 1–20), priorities, mutation outcomes, challenge handshake, replication and reconcile messages |

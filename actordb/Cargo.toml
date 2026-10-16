@@ -14,24 +14,17 @@ categories = ["asynchronous", "concurrency", "database-implementations"]
 build = "src/build.rs"
 rust-version = "1.88"
 
-# [features]
-# filewatcher = ["notify"]
-# net = ["tokio/net", "tokio/io-util", "tokio/macros", "tokio-rustls"]
-# time = ["chrono", "cron"]
-# streams = ["tokio-stream"]
-# sync = []
-
-# default = ["filewatcher", "net", "time", "streams", "sync"]
-
 [build-dependencies]
 protobuf-src = "2"
 prost-build = { version = "0.14" }
 
 [features]
-default = ["rocksdb"]
-# RocksDB-backed durable storage. Disable with --no-default-features for
-# a lean build (the in-memory store remains); note librocksdb-sys runs
-# bindgen at build time and needs libclang with working header paths.
+default = []
+# Optional no-op store test double; not a durable database or the Node cache.
+memory = []
+# Opt-in RocksDB-backed durable storage. Independent of the memory feature.
+# librocksdb-sys runs bindgen at build time and needs libclang with working
+# header paths. The default crate includes no bundled store implementation.
 rocksdb = ["dep:rocksdb"]
 
 [dependencies]

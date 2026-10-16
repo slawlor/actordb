@@ -2,7 +2,22 @@
 
 Persistence is **opt-in**. `NodeConfig.store` defaults to `None`, which means
 a purely in-memory node: the fragment cache holds everything and nothing
-touches disk. Set a store to get durability.
+touches disk. This default needs no storage-backend feature; it does not use
+`MemoryStore`. Set a durable store to get durability.
+
+The crate's default feature set is empty. Enable the independent `rocksdb`
+feature to use the offered durable backend:
+
+```toml
+[dependencies]
+actordb = { version = "0.2", features = ["rocksdb"] }
+```
+
+The independent `memory` feature exposes only the no-op `MemoryStore` test
+double. It does not retain writes or recover data on restart, and enabling it
+does not enable RocksDB. Neither feature is required to implement a custom
+`KvStore` or use the always-available `PrefixedStore` wrapper. Enabling a
+backend only makes its API available; a Node still needs a configured store.
 
 ## The `KvStore` trait
 
@@ -61,19 +76,22 @@ The contract is deliberately narrow:
 
 ## Implementations
 
-| Store | Implementation module | Role |
-|---|---|---|
-| `MemoryStore` | `actordb::store::memory` | Test double. `load` returns empty, `write_batch` is a no-op. Never for production. |
-| `RocksDbStore` | `actordb::store::rocksdb` | Production backend, behind the `rocksdb` cargo feature. |
-| `PrefixedStore` | `actordb::store::prefixed` | Namespace wrapper: prepends a 4-byte big-endian fragment id to every key so N fragment actors can share one store without collisions. |
+| Store | Implementation module | Cargo feature | Role |
+|---|---|---|---|
+| `MemoryStore` | `actordb::store::memory` | `memory` (opt-in) | Test double. `load` returns empty, `write_batch` is a no-op. Never for production. |
+| `RocksDbStore` | `actordb::store::rocksdb` | `rocksdb` (opt-in) | Offered durable backend; not a declaration of production readiness. |
+| `PrefixedStore` | `actordb::store::prefixed` | None | Namespace wrapper: prepends a 4-byte big-endian fragment id to every key so N fragment actors can share one store without collisions. |
 
 The `store` parent module owns the shared `KvStore` contract, errors, identity
 and capability types, and backend options. Backend code and its unit tests live
 in dedicated child modules. Existing imports such as
 `actordb::store::{KvStore, RocksDbStore, RocksDbOptions, PrefixedStore}` remain
-available through parent reexports; RocksDB types and its child module retain
-the same `rocksdb` feature gate. Add future supported backends in their own
-`store` child modules and reexport their public entry points from the parent.
+available through parent reexports when their features are enabled. Shared
+types and `PrefixedStore` are unconditional; `MemoryStore` and its child module
+require `memory`, while RocksDB types and its child module require `rocksdb`.
+Both backend features are disabled by default and can be enabled independently.
+Add future supported backends in their own opt-in `store` child modules and
+reexport their public entry points from the parent.
 
 `RocksDbStore::open(path)` creates the directory and opens the default CF for
 fragment-prefixed data. Existing initialized stores also open their
