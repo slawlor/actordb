@@ -35,6 +35,18 @@ image/dependency changes, cache access, and eviction. CI logs should show cache
 import/export and `CACHED` steps on a compatible warm run; no fixed speedup is
 guaranteed.
 
+Coverage checks out a pull request's exact head SHA, matching the commit
+identity used by Codecov's default PR upload. Push reports instead measure
+`github.sha`; an early guard verifies the actual checkout matches that identity.
+Testing a synthetic merge but labeling its report with the PR
+head shifts line attribution when main changes, so a moved line can appear
+uncovered even though a different source revision was measured. Coverage is a
+head-source report, not evidence that the PR integrates cleanly with main:
+the default workspace, Clippy and Docker workflows retain their merge-based
+integration checks. The coverage job installs stable Rust with
+`llvm-tools-preview` and invokes `cargo run --locked --bin xtask -- coverage`;
+the existing xtask instrumentation, tests and LCOV generation are unchanged.
+
 ## Unit tests (`cargo test --lib`)
 
 TTL tests cover millisecond truncation, exact `u64` boundaries, overflow and
