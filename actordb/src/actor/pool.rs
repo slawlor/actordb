@@ -6,7 +6,7 @@
 //! Priority configuration, token buckets, and managed worker admission.
 
 use std::panic::AssertUnwindSafe;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -171,6 +171,9 @@ pub(super) struct WorkerPool {
     /// Ops shed due to queue cap or rate limit (explicit, counted).
     shed_count: Arc<AtomicU64>,
     rate_limiter: Option<Mutex<TokenBucket>>,
+    /// Round-robin cursor for keyless ops (scan). Sticky routing does not
+    /// apply to scans, so concurrent scans spread across workers.
+    round_robin: AtomicUsize,
 }
 
 impl WorkerPool {
@@ -234,6 +237,7 @@ impl WorkerPool {
                 .rate_limit_per_sec
                 .map(|r| Mutex::new(TokenBucket::new(r))),
             shed_count: Arc::new(AtomicU64::new(0)),
+            round_robin: AtomicUsize::new(0),
             pending,
             config,
         })
@@ -294,6 +298,7 @@ impl WorkerPool {
                 .map(|r| Mutex::new(TokenBucket::new(r))),
             pending,
             shed_count: Arc::new(AtomicU64::new(0)),
+            round_robin: AtomicUsize::new(0),
             config,
         })
     }
@@ -337,6 +342,28 @@ impl WorkerPool {
         Some(self.reserve_slot(key))
     }
 
+    /// Try to reserve a worker for a keyless op (scan), spreading load
+    /// round-robin across the pool's workers. Same admission control as
+    /// [`Self::try_reserve`] (rate limit, then queue cap); `None` means the
+    /// op was shed and counted.
+    pub(super) async fn try_reserve_round_robin(&self) -> Option<WorkerReservation<'_>> {
+        // Rate limit first.
+        if let Some(limiter) = &self.rate_limiter {
+            if !limiter.lock().await.try_acquire() {
+                self.shed_count.fetch_add(1, Ordering::Relaxed);
+                return None;
+            }
+        }
+        // Queue cap.
+        let pending = self.pending.fetch_add(1, Ordering::Relaxed);
+        if pending >= self.config.queue_cap as u64 {
+            release_pending(&self.pending, 1);
+            self.shed_count.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+        Some(self.reserve_slot_round_robin())
+    }
+
     /// Number of ops shed by this pool.
     pub(super) fn shed_count(&self) -> u64 {
         self.shed_count.load(Ordering::Relaxed)
@@ -352,6 +379,18 @@ impl WorkerPool {
 
     fn reserve_slot(&self, key: &str) -> WorkerReservation<'_> {
         let idx = worker_idx(key, self.workers.len());
+        self.workers[idx].pending.fetch_add(1, Ordering::Relaxed);
+        WorkerReservation {
+            pool: self,
+            slot: idx,
+            handed_off: false,
+        }
+    }
+
+    /// Non-sticky slot reservation for keyless ops. Round-robin across the
+    /// pool's workers so concurrent scans do not pile onto one worker.
+    fn reserve_slot_round_robin(&self) -> WorkerReservation<'_> {
+        let idx = self.round_robin.fetch_add(1, Ordering::Relaxed) % self.workers.len();
         self.workers[idx].pending.fetch_add(1, Ordering::Relaxed);
         WorkerReservation {
             pool: self,

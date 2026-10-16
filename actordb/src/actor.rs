@@ -38,6 +38,7 @@ mod maintenance;
 mod pool;
 mod pool_worker;
 mod protocol;
+mod scan;
 mod snapshotter;
 
 pub use cleaner::{Cleaner, CleanerArgs, CleanerArgsBuilder, CleanerMessage, CleanerState};
@@ -56,6 +57,7 @@ pub use protocol::{
     BatchReadPage, KvMessage, OpPriority, ReplicatedOp, RetainedBatchRead, SnapshotSummary,
     SummaryPage, VersionedPage, VersionedValue,
 };
+pub use scan::{KeyMatcher, ScanMatch, ScanSpec, ValueTransform, DEFAULT_SCAN_LIMIT};
 pub use snapshotter::{
     Snapshotter, SnapshotterArgs, SnapshotterArgsBuilder, SnapshotterMessage, SnapshotterState,
 };
