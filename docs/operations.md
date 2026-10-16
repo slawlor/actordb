@@ -89,7 +89,7 @@ nodes certify one another.
 ### Slow or non-reading peer
 
 - Each connection has one shared outbound pipeline, bounded by 256 frames and
-  32 MiB of admitted encoded data by default. Half the frame slots and 1 MiB
+  32 MiB of admitted encoded data by default. Half the frame slots and 16 MiB
   of bytes are reserved from ordinary producers for writer-priority protocol
   responses. Queue admission is capped at 5 seconds and each complete socket
   frame write at 30 seconds. Either expiry cancels that exact connection; its

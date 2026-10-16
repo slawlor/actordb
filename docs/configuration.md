@@ -35,8 +35,11 @@ simulator, not a tuning knob.
 
 `fragment_count`, `replication.batch_size`, `replication.max_in_flight`, and
 `replication.buffer_capacity` must be nonzero. Replication and
-dynamic-placement intervals/timeouts must also be nonzero; replication timer
-values must fit Tokio's clock, and bounded-channel capacities may not exceed
+dynamic-placement intervals/timeouts must also be nonzero. `clean_interval`
+and `snapshot_interval` must be nonzero even without a store, because both
+maintenance actors run on in-memory nodes too. Maintenance, replication, and
+enabled dynamic-placement timer values must fit the runtime clock;
+placement intervals remain ignored in static mode. Bounded-channel capacities may not exceed
 Tokio's semaphore maximum. `Node::start` rejects invalid values instead of
 allowing channel or timer panics. The local node id, every `members` key, and
 every placement replica id must contain 1 to 255 UTF-8 bytes. Placement replica

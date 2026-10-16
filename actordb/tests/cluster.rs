@@ -943,6 +943,63 @@ async fn invalid_zero_sized_replication_and_placement_config_is_rejected() {
 }
 
 #[tokio::test]
+async fn invalid_maintenance_intervals_are_rejected_before_binding() {
+    use actordb::placement::ManualPlacement;
+    use actordb::shard::FragmentId;
+
+    let occupied = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = occupied.local_addr().unwrap();
+    for invalid in [Duration::ZERO, Duration::MAX] {
+        for field in [
+            "clean_interval",
+            "snapshot_interval",
+            "placement_poll_interval",
+            "placement_drain_warn_interval",
+        ] {
+            let mut config = NodeConfig::default();
+            match field {
+                "clean_interval" => config.clean_interval = invalid,
+                "snapshot_interval" => config.snapshot_interval = invalid,
+                "placement_poll_interval" => config.placement_poll_interval = invalid,
+                "placement_drain_warn_interval" => config.placement_drain_warn_interval = invalid,
+                _ => unreachable!(),
+            }
+            if field.starts_with("placement_") {
+                config.placement_controller = Some(Arc::new(ManualPlacement::new(HashMap::from(
+                    [(FragmentId(0), vec!["invalid-maintenance".to_string()])],
+                ))));
+            }
+            let result = Node::start("invalid-maintenance".to_string(), addr, config).await;
+            assert!(
+                matches!(result, Err(NodeError::Actor(ref message)) if message.contains(field)),
+                "{field}={invalid:?} was not rejected before transport bind"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn static_placement_ignores_unused_placement_intervals() {
+    let node = Node::start(
+        "static-unused-intervals".to_string(),
+        "127.0.0.1:0".parse().unwrap(),
+        NodeConfig {
+            placement_poll_interval: Duration::ZERO,
+            placement_drain_warn_interval: Duration::MAX,
+            ..NodeConfig::default()
+        },
+    )
+    .await
+    .unwrap();
+    node.put("valid".into(), vec![1]).await.unwrap();
+    assert_eq!(
+        node.get("valid".into()).await.unwrap().unwrap().value,
+        vec![1]
+    );
+    node.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn time_based_tombstone_gc_is_rejected_before_binding() {
     use actordb::node::NodeError;
 
