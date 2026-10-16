@@ -2728,6 +2728,7 @@ pub struct NodeRuntimeOptions {
     receive_byte_capacity: usize,
     relay_capacity: usize,
     relay_key_byte_capacity: usize,
+    health_timeout: Duration,
     queue_admission_timeout: Duration,
     reconcile_data_admission_timeout: Duration,
     forwarded_attempt_timeout: Duration,
@@ -2748,6 +2749,7 @@ impl Default for NodeRuntimeOptions {
             receive_byte_capacity: RECEIVE_BYTE_CAPACITY,
             relay_capacity: RELAY_CAPACITY,
             relay_key_byte_capacity: RELAY_KEY_BYTE_CAPACITY,
+            health_timeout: Duration::from_secs(5),
             queue_admission_timeout: REMOTE_RPC_TIMEOUT,
             reconcile_data_admission_timeout: RECONCILE_DATA_ADMISSION_TIMEOUT,
             forwarded_attempt_timeout: REMOTE_RPC_TIMEOUT,
@@ -2821,6 +2823,15 @@ impl NodeRuntimeOptions {
     /// relay-count limit separately bounds that fixed overhead.
     pub fn with_relay_key_byte_capacity(mut self, capacity: usize) -> Self {
         self.relay_key_byte_capacity = capacity;
+        self
+    }
+
+    /// Set one aggregate deadline for a local health snapshot, including
+    /// supervisor-registry acquisition and every fragment probe. Default 5s.
+    /// This does not measure cluster readiness, worker responsiveness, or
+    /// durability. Unavailable evidence is returned as an error, not zeros.
+    pub fn with_health_timeout(mut self, timeout: Duration) -> Self {
+        self.health_timeout = timeout;
         self
     }
 
@@ -2915,6 +2926,11 @@ impl NodeRuntimeOptions {
         self.relay_key_byte_capacity
     }
 
+    /// Current aggregate local-health snapshot deadline.
+    pub fn health_timeout(&self) -> Duration {
+        self.health_timeout
+    }
+
     /// Current peer-queue admission timeout.
     pub fn queue_admission_timeout(&self) -> Duration {
         self.queue_admission_timeout
@@ -2973,6 +2989,13 @@ impl NodeRuntimeOptions {
                     Semaphore::MAX_PERMITS
                 )));
             }
+        }
+        if self.health_timeout.is_zero()
+            || Instant::now().checked_add(self.health_timeout).is_none()
+        {
+            return Err(NodeError::Actor(
+                "health timeout must be non-zero and representable".to_string(),
+            ));
         }
         if self.peer_queue_frame_capacity < 2 {
             return Err(NodeError::Actor(
@@ -5384,30 +5407,66 @@ impl Node {
         Ok(report)
     }
 
-    /// Health snapshots for every fragment this node serves.
+    /// Local health snapshots from owned fragment supervisors, including any
+    /// bootstrapping/draining fragment still owned by this node. The one
+    /// configurable health deadline includes registry acquisition and every
+    /// sequential probe. Missing serving supervisors, failed dispatchers, and
+    /// timeouts return errors; unavailable counters are never replaced by zero.
+    /// Worker names/counts describe linked actors observed Running, not worker
+    /// responsiveness. This non-atomic snapshot is not a readiness, replication,
+    /// or durability guarantee.
     pub async fn health(&self) -> Result<HashMap<FragmentId, FragmentHealth>, NodeError> {
         let _operation = self.admit_operation()?;
-        let supervisors: Vec<(FragmentId, ActorRef<SupervisorMessage>)> = self
-            .supervisors
-            .lock()
-            .await
-            .iter()
-            .map(|(f, s)| (*f, s.clone()))
-            .collect();
-        let mut out = HashMap::with_capacity(supervisors.len());
-        for (frag, supervisor) in &supervisors {
-            let res = supervisor
-                .call(|reply| SupervisorMessage::GetHealth { reply }, None)
+        let deadline = deadline_after(self.runtime_options.health_timeout);
+        tokio::time::timeout_at(deadline, async {
+            let mut supervisors: Vec<(FragmentId, ActorRef<SupervisorMessage>)> = self
+                .supervisors
+                .lock()
                 .await
-                .map_err(|e| NodeError::Actor(e.to_string()))?;
-            match res {
-                CallResult::Success(h) => {
-                    out.insert(*frag, h);
+                .iter()
+                .map(|(f, s)| (*f, s.clone()))
+                .collect();
+            let owned: HashSet<_> = supervisors.iter().map(|(fragment, _)| *fragment).collect();
+            for fragment in self.serving.read().unwrap().iter() {
+                if !owned.contains(fragment) {
+                    return Err(NodeError::Actor(format!(
+                        "health unavailable for fragment {fragment}: serving supervisor is missing"
+                    )));
                 }
-                _ => return Err(NodeError::Actor("health check failed".to_string())),
             }
-        }
-        Ok(out)
+            supervisors.sort_unstable_by_key(|(fragment, _)| *fragment);
+            let mut out = HashMap::with_capacity(supervisors.len());
+            for (frag, supervisor) in supervisors {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Err(NodeError::Actor(
+                        "health snapshot deadline expired".to_string(),
+                    ));
+                }
+                let res = supervisor
+                    .call(
+                        |reply| SupervisorMessage::GetHealth { reply },
+                        Some(remaining),
+                    )
+                    .await
+                    .map_err(|error| {
+                        NodeError::Actor(format!("health unavailable for fragment {frag}: {error}"))
+                    })?;
+                match res {
+                    CallResult::Success(health) if health.fragment == frag => {
+                        out.insert(frag, health);
+                    }
+                    _ => {
+                        return Err(NodeError::Actor(format!(
+                            "health unavailable for fragment {frag}: probe failed"
+                        )))
+                    }
+                }
+            }
+            Ok(out)
+        })
+        .await
+        .map_err(|_| NodeError::Actor("health snapshot deadline expired".to_string()))?
     }
 
     /// Phase 8 placement report: this node's authoritative placement
@@ -10050,8 +10109,143 @@ mod tests {
     use crate::proto::{ReconcileRequest, SessionStart};
     use crate::replication::spawn_sender_with_options;
     use crate::store::StoreError;
+    use ractor::ActorProcessingErr;
     use std::sync::atomic::AtomicBool;
     use std::sync::Condvar;
+
+    struct DelayedHealthSupervisor;
+
+    struct DelayedHealthArgs {
+        fragment: FragmentId,
+        release: Option<Arc<Notify>>,
+        observed_timeout: Arc<StdMutex<Option<Duration>>>,
+    }
+
+    impl Actor for DelayedHealthSupervisor {
+        type Msg = SupervisorMessage;
+        type State = DelayedHealthArgs;
+        type Arguments = DelayedHealthArgs;
+
+        async fn pre_start(
+            &self,
+            _myself: ActorRef<Self::Msg>,
+            args: Self::Arguments,
+        ) -> Result<Self::State, ActorProcessingErr> {
+            Ok(args)
+        }
+
+        async fn handle(
+            &self,
+            _myself: ActorRef<Self::Msg>,
+            message: Self::Msg,
+            state: &mut Self::State,
+        ) -> Result<(), ActorProcessingErr> {
+            if let SupervisorMessage::GetHealth { reply } = message {
+                *state.observed_timeout.lock().unwrap() = reply.get_timeout();
+                if let Some(release) = &state.release {
+                    release.notified().await;
+                }
+                let _ = reply.send(FragmentHealth {
+                    fragment: state.fragment,
+                    worker_count: 0,
+                    worker_names: Vec::new(),
+                    restarts: HashMap::new(),
+                    last_reaped: 0,
+                    shed_counts: (7, 11, 13),
+                });
+            }
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn health_has_one_aggregate_deadline_and_passes_remaining_probe_budget() {
+        let timeout = Duration::from_secs(1);
+        let node = Node::start_with_options(
+            "health-aggregate".to_string(),
+            "127.0.0.1:0".parse().unwrap(),
+            NodeConfig {
+                fragment_count: 2,
+                ..Default::default()
+            },
+            NodeRuntimeOptions::default().with_health_timeout(timeout),
+        )
+        .await
+        .unwrap();
+        let mut replacements = HashMap::new();
+        let mut observed = Vec::new();
+        let release_second = Arc::new(Notify::new());
+        for fragment in [FragmentId(0), FragmentId(1)] {
+            let observed_timeout = Arc::new(StdMutex::new(None));
+            let (actor, _) = DelayedHealthSupervisor::spawn(
+                None,
+                DelayedHealthSupervisor,
+                DelayedHealthArgs {
+                    fragment,
+                    release: (fragment == FragmentId(1)).then(|| release_second.clone()),
+                    observed_timeout: observed_timeout.clone(),
+                },
+            )
+            .await
+            .unwrap();
+            replacements.insert(fragment, actor);
+            observed.push(observed_timeout);
+        }
+        let originals = std::mem::replace(&mut *node.supervisors.lock().await, replacements);
+        // First probe responds immediately; the second stays held. This avoids
+        // requiring a timed first response to run within a tight CI margin.
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(5), node.health())
+                .await
+                .unwrap(),
+            Err(NodeError::Actor(_))
+        ));
+        let first = observed[0].lock().unwrap().unwrap();
+        let second = observed[1].lock().unwrap().unwrap();
+        assert!(first <= timeout);
+        assert!(second < first, "second fragment received a fresh timeout");
+        let replacements = std::mem::replace(&mut *node.supervisors.lock().await, originals);
+        release_second.notify_one();
+        for actor in replacements.values() {
+            actor.stop(None);
+            actor.wait(None).await.unwrap();
+        }
+        node.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn health_deadline_includes_registry_lock_and_missing_serving_supervisor_fails() {
+        let mut node = Node::start_with_options(
+            "health-registry".to_string(),
+            "127.0.0.1:0".parse().unwrap(),
+            NodeConfig::default(),
+            NodeRuntimeOptions::default().with_health_timeout(Duration::from_millis(20)),
+        )
+        .await
+        .unwrap();
+        let mut registry = node.supervisors.lock().await;
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), node.health()).await.unwrap(),
+            Err(NodeError::Actor(error)) if error.contains("deadline")
+        ));
+        let supervisor = registry.remove(&FragmentId(0)).unwrap();
+        drop(registry);
+        assert!(matches!(
+            node.health().await,
+            Err(NodeError::Actor(error)) if error.contains("supervisor is missing")
+        ));
+        node.supervisors
+            .lock()
+            .await
+            .insert(FragmentId(0), supervisor);
+        node.runtime_options.health_timeout = Duration::from_secs(1);
+        let health = node.health().await.unwrap();
+        let fragment = &health[&FragmentId(0)];
+        assert_eq!(fragment.worker_count, fragment.worker_names.len());
+        assert_eq!(fragment.worker_count, 8);
+        assert_eq!(fragment.shed_counts, (0, 0, 0));
+        node.shutdown().await.unwrap();
+    }
 
     #[derive(Default)]
     struct BlockingLoadStore {
@@ -11039,6 +11233,7 @@ mod tests {
         assert_eq!(options.receive_byte_capacity(), 64 * 1024 * 1024);
         assert_eq!(options.relay_capacity(), 1024);
         assert_eq!(options.relay_key_byte_capacity(), 64 * 1024 * 1024);
+        assert_eq!(options.health_timeout(), Duration::from_secs(5));
         assert_eq!(options.queue_admission_timeout(), Duration::from_secs(5));
         assert_eq!(
             options.reconcile_data_admission_timeout(),
@@ -11069,6 +11264,12 @@ mod tests {
             .with_relay_key_byte_capacity(1)
             .validate()
             .is_ok());
+        for timeout in [Duration::ZERO, Duration::MAX] {
+            assert!(NodeRuntimeOptions::default()
+                .with_health_timeout(timeout)
+                .validate()
+                .is_err());
+        }
         assert!(NodeRuntimeOptions::default()
             .with_socket_write_timeout(Duration::MAX)
             .validate()
