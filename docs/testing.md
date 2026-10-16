@@ -141,7 +141,11 @@ process — the bulk of behavioral coverage:
   admitted prefix and cancellation retaining capacity until worker completion
   without admitting the suffix. A raw-peer test blocks the batch actor through
   its deadline, verifies an empty unavailable response, and then exchanges
-  another request on the same connection while that actor remains blocked. The
+  another request on the same connection while that actor remains blocked.
+  Direct worker coverage checks exact Prost response boundaries, duplicate
+  positions, misses, suffix resumption, and empty input. A production TCP test
+  verifies per-key background shedding and a later high-priority batch over the
+  same connection. The
   connection tests also prove that a reconcile request/fetch racing a
   non-serving fragment cannot tear down unrelated multiplexed traffic, actor
   unavailability cannot become a false single-read miss, and direct or relayed

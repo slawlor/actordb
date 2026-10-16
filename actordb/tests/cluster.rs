@@ -6621,6 +6621,75 @@ async fn forwarded_priority_preserved_end_to_end() {
 }
 
 #[tokio::test]
+async fn remote_batch_read_reports_per_key_shed_and_preserves_high_priority_pool() {
+    use actordb::actor::{OpPriority, PoolConfig};
+    use actordb::shard::FragmentId;
+
+    let config = NodeConfig {
+        fragment_map: HashMap::from([(FragmentId(0), vec!["batch-read-owner".to_string()])]),
+        background_pool: PoolConfig {
+            workers: 1,
+            queue_cap: 1,
+            rate_limit_per_sec: Some(1),
+        },
+        ..NodeConfig::default()
+    };
+    let origin = Node::start(
+        "batch-read-origin".to_string(),
+        "127.0.0.1:0".parse().unwrap(),
+        config.clone(),
+    )
+    .await
+    .unwrap();
+    let owner = Node::start(
+        "batch-read-owner".to_string(),
+        "127.0.0.1:0".parse().unwrap(),
+        config,
+    )
+    .await
+    .unwrap();
+    let key = "remote-batch-duplicate".to_string();
+    owner
+        .put_with_priority(key.clone(), b"value".to_vec(), OpPriority::Default)
+        .await
+        .unwrap();
+    owner.connect(origin.addr()).await.unwrap();
+    wait_for_peers(&origin, &owner).await;
+
+    // The origin owns no fragments, so both duplicate positions traverse the
+    // real BatchGet responder. Only the first may consume the owner's one
+    // background token; the second must be explicit shed, never a false miss.
+    let background = origin.get_multi(vec![key.clone(), key.clone()]).await;
+    assert_eq!(background.len(), 2);
+    assert_eq!(
+        background[0].as_ref().unwrap().as_ref().unwrap().value,
+        b"value".to_vec()
+    );
+    assert!(
+        matches!(&background[1], Err(NodeError::Backpressure(_))),
+        "second duplicate should return remote shed, got {:?}",
+        background[1]
+    );
+
+    // The same connection must still serve a High-priority aggregate read
+    // through the separate high pool while the background token is exhausted.
+    let high = origin
+        .get_multi_with_priority(vec![key.clone(), key], OpPriority::High)
+        .await;
+    assert_eq!(high.len(), 2);
+    for result in high {
+        assert_eq!(result.unwrap().unwrap().value, b"value".to_vec());
+    }
+    let health = owner.health().await.unwrap();
+    assert_eq!(health[&FragmentId(0)].shed_counts, (0, 0, 1));
+    assert_eq!(origin.peer_count().await, 1);
+    assert_eq!(owner.peer_count().await, 1);
+
+    origin.shutdown().await.unwrap();
+    owner.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn forwarded_single_put_returns_remote_backpressure() {
     use actordb::actor::PoolConfig;
     use actordb::node::NodeError;

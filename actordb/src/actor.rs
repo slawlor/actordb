@@ -2614,6 +2614,107 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn direct_worker_batch_read_preserves_positions_and_exact_response_boundary() {
+        use crate::proto::{BatchGetResponse, BatchKeyValue, Envelope, EnvelopeMsg};
+        use prost::Message;
+
+        let value = VersionedValue::new(vec![7; 128], 128, "n".to_string());
+        let shared = Arc::new(test_state(HashMap::from([(
+            "present".to_string(),
+            value.clone(),
+        )])));
+        let (worker, handle) = KvWorker::spawn(
+            None,
+            KvWorker,
+            KvWorkerArgs {
+                shared,
+                pending: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        // Measure with Prost, including the nonzero request id and nested
+        // envelope, rather than the actor's incremental sizing helper.
+        let response = BatchGetResponse {
+            req_id: u64::MAX,
+            results: Vec::new(),
+        };
+        let response_base_payload_len = response.encoded_len();
+        let mut singleton = response;
+        singleton.results.push(BatchKeyValue {
+            key: "present".to_string(),
+            found: true,
+            value: value.value.clone(),
+            timestamp_ms: value.timestamp_ms,
+            node_id: value.node_id.clone(),
+            ..BatchKeyValue::default()
+        });
+        let singleton_response_len = Envelope {
+            msg: Some(EnvelopeMsg::BatchGetResponse(singleton)),
+        }
+        .encoded_len();
+        let keys = vec![
+            "present".to_string(),
+            "m".to_string(),
+            "present".to_string(),
+            "m".to_string(),
+        ];
+        let read = |keys: Vec<String>, response_soft_limit| {
+            worker.call(
+                move |reply| KvMessage::GetBatch {
+                    keys,
+                    response_base_payload_len,
+                    response_soft_limit,
+                    reply,
+                    priority: OpPriority::Background,
+                },
+                Some(Duration::from_secs(2)),
+            )
+        };
+
+        let present = BatchReadEntry {
+            key: "present".to_string(),
+            result: Ok(Some(value)),
+        };
+        let missing = BatchReadEntry {
+            key: "m".to_string(),
+            result: Ok(None),
+        };
+        let CallResult::Success(below_boundary) = read(keys.clone(), singleton_response_len - 1)
+            .await
+            .unwrap()
+        else {
+            panic!("direct worker did not return the crossing singleton");
+        };
+        assert_eq!(below_boundary.entries, vec![present.clone()]);
+
+        // Equality does not end the page: the next miss crosses the target
+        // and is included once. The duplicate positions remain in the suffix.
+        let CallResult::Success(first) = read(keys.clone(), singleton_response_len).await.unwrap()
+        else {
+            panic!("direct worker did not return the first prefix");
+        };
+        assert_eq!(first.entries, vec![present.clone(), missing.clone()]);
+        let suffix = keys.into_iter().skip(first.entries.len()).collect();
+        let CallResult::Success(second) = read(suffix, singleton_response_len).await.unwrap()
+        else {
+            panic!("direct worker did not return the resumed suffix");
+        };
+        assert_eq!(second.entries, vec![present, missing]);
+
+        let empty = read(Vec::new(), 0).await.unwrap();
+        assert_eq!(
+            empty,
+            CallResult::Success(BatchReadPage {
+                entries: Vec::new()
+            })
+        );
+        worker.stop(None);
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn invalid_wire_record_apply_is_nonfatal_to_worker() {
         let shared = Arc::new(test_state(HashMap::new()));
         let (worker, handle) = KvWorker::spawn(
