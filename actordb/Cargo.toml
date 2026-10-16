@@ -69,3 +69,7 @@ harness = false
 [[bench]]
 name = "replication"
 harness = false
+
+[[bench]]
+name = "sender_registry"
+harness = false

@@ -866,7 +866,7 @@ mod tests {
 
         assert!(result.is_err());
         assert!(
-            where_is("failed-supervisor-high-worker-0".to_string()).is_none(),
+            where_is("failed-supervisor-high-worker-0").is_none(),
             "failed dispatcher startup left an earlier worker running"
         );
         assert_eq!(

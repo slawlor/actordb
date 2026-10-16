@@ -44,6 +44,11 @@ lane fails fast at its cap, and that peer/reconcile signals remain available.
 `retiring_reconcile_consumer_does_not_close_shared_connection` forces both
 reconcile reply variants to race sender retirement after control-lane admission
 and proves the multiplexed peer connection remains usable.
+Sender-registry tests additionally hold an individual report lock while proving
+the node-global sender/report registries and placement publication remain
+available, reject a same-key replacement by exact task/report identity, and
+prove the per-fragment finalization seal blocks recreation only until its
+cancellable handoff attempt ends.
 The placement lease test proves revocation waits for an already-admitted
 mutation before changing the serving decision.
 `dispatcher_restart_is_republished_to_the_fragment_router` exercises the full
@@ -161,6 +166,14 @@ process — the bulk of behavioral coverage:
 
 Shared helpers (`wait_for` poll-until-timeout) live in
 `actordb/tests/common/mod.rs`.
+
+Manual Criterion coverage in `actordb/benches/sender_registry.rs` compares one
+and 64 fully replicated fragments at write concurrency 1/32/64 with 100-byte
+and 1-MiB values. It times source apply plus fan-out while awaiting replica
+visibility outside the measurement, exposing value-size, registry-cardinality,
+and cross-fragment contention regressions without turning sender overflow
+recovery into the measured workload. Fixed key sets keep retained cache memory
+bounded across Criterion's calibrated iterations.
 
 ## Docker multi-node scenarios (`docker-tests/`)
 

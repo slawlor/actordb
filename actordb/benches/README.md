@@ -19,6 +19,7 @@ cargo bench -p actordb -- --quick
 cargo bench -p actordb --bench put_get
 cargo bench -p actordb --bench fanout
 cargo bench -p actordb --bench replication
+cargo bench -p actordb --bench sender_registry
 ```
 
 Criterion saves results under `target/criterion/` and compares against the
@@ -32,6 +33,7 @@ regressions/improvements vs the first.
 | `put_get.rs`      | 1 node, in-memory, no network      | Sequential `put` / `get` latency at 100 B, 10 KB, 1 MB; concurrent sticky-vs-spread Gets at depths 1/8/64 |
 | `fanout.rs`       | 3 nodes, 3 fragments (1 each)      | `put_multi` / `get_multi` at 10, 100, 1000 keys    |
 | `replication.rs`  | 2 nodes, 1 shared fragment         | source-apply-completion-to-replica-visible lag for 10, 100, 1000-key batches |
+| `sender_registry.rs` | 2 nodes, 1 or 64 shared fragments | source apply/fan-out at concurrency 1/32/64 with 100 B or 1 MiB values; replica catch-up excluded from timing |
 
 Each file has a doc comment explaining what it measures and how to read a
 regression — start there before tuning.
@@ -99,6 +101,10 @@ These are the first things to measure when they get fixed:
   → watch `get_multi` at 1000 keys in `fanout`.
 - #23 — per-op `hlc.observe()` acquisitions in the replication receiver loop
   → watch `replication_lag` scaling with batch size.
+- Sender-registry critical sections → watch `sender_registry` scale across
+  value size, registry cardinality, and cross-fragment concurrency. Payload
+  cloning and per-sender mailbox admission belong outside the global registry
+  lock.
 - #25 — sender `batch_interval` timer-gates full batches; `max_in_flight=4`
   → watch the `replication_lag` floor independent of batch size.
 - #18 — anti-entropy clones full values to build summaries

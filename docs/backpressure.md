@@ -127,6 +127,13 @@ Worker execution and admitted backlogs are isolated by priority. A worker-bound
 work no longer blocks the dispatcher from admitting a high-priority request or
 serving health/supervision messages. The shared dispatcher ingress, cache
 locks, snapshot/flush handlers, and peer connection reader are not isolated.
+Replication sender lookup also uses a node-global registry, but its critical
+section is limited to map lookup/filtering and cloning cheap exact-task
+handles. Potentially large mutation payload clones, bounded sender-mailbox
+admission, per-sender report waits, and placement-handoff joins run after
+releasing that registry; stale snapshots are identity-checked before they may
+close a multiplexed peer connection or certify teardown. Lookup still scans
+the global map; per-fragment indexing remains a separate scaling follow-up.
 `background_saturation_leaves_high_priority_p99_unaffected` covers ordinary
 load, `blocked_background_get_does_not_stall_high_priority_or_health` covers
 the dispatcher handoff, and `queue_cap_shed_is_explicit_and_counted` covers

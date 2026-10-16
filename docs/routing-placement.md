@@ -144,9 +144,13 @@ one another's empty state.
    sender replacement restarts the complete set. Queue emptiness alone never
    authorizes deletion.
 4. Under the placement commit lock and exclusive mutation lease, revalidate the
-   exact vector, generation, sender tasks, and registered supervisor. Stop/join
-   those senders and re-read the actor revision before detaching its router. An
-   ABA/target change retries; a pre-detach re-add replaces the sealed senders,
+   exact vector, generation, sender tasks, and registered supervisor. Install a
+   per-fragment finalization seal and atomically detach the exact sender/report
+   set, then release the node-global placement and sender registries before
+   joining those tasks or re-reading the actor revision. Reacquire the commit
+   lock and revalidate the placement generation plus the still-empty sealed set
+   before detaching the router. An ABA/target change or revision timeout
+   retries; a pre-detach re-add drops the seal, installs fresh senders,
    reconciles, and restores `Serving`.
 5. After detach, quiesce periodic actors, drain dispatcher/worker mailboxes,
    and require the final local flush before touching storage. Revalidate the
