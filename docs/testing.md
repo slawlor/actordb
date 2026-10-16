@@ -192,6 +192,10 @@ process — the bulk of behavioral coverage:
   a raw-peer test ignores both read and mutation responses from the same peer
   id on the wrong physical channel. Timeout and completed-response tests verify
   unavailable semantics and cancellation of the owned timer.
+  A successful raw-peer batch relay preserves duplicate positions, all operation
+  stamps, per-item hop increments, and distinct downstream statuses; terminal
+  responses reclaim both relay capacity and the operation fence. Origin-loss
+  tests also verify timer-only cleanup when the connection tail cannot run.
 - **Backpressure**: `background_saturation_leaves_high_priority_p99_unaffected`,
   `queue_cap_shed_is_explicit_and_counted`,
   `forwarded_priority_preserved_end_to_end`,

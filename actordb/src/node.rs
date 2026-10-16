@@ -14354,6 +14354,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn origin_cancellation_reclaims_relays_without_connection_cleanup() {
+        let tasks = RuntimeTasks::new(4);
+        let task_ref = Arc::downgrade(&tasks);
+        let admission = RelayAdmission::new(2, 1024);
+        let reads: RelayMap = Arc::new(StdMutex::new(HashMap::new()));
+        let mutations: MutationRelayMap = Arc::new(StdMutex::new(HashMap::new()));
+        let (owner, _owner_rx, _owner_responses) = test_peer_channel(1);
+        let (origin, _origin_rx, mut origin_responses) = test_peer_channel(1);
+        let gate = OperationGate::new();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        register_get_relay(
+            &task_ref,
+            reads.clone(),
+            &admission,
+            1,
+            GetRelayRegistration {
+                expected_peer: "owner".into(),
+                expected_tx: owner.clone(),
+                expected_key: "key".into(),
+                origin_tx: origin.clone(),
+                origin_req_id: 11,
+                deadline,
+            },
+        )
+        .await
+        .unwrap()
+        .disarm();
+        register_mutation_relay(
+            &task_ref,
+            mutations.clone(),
+            &admission,
+            2,
+            MutationRelayRegistration {
+                expected_peer: "owner".into(),
+                expected_tx: owner.clone(),
+                expected_keys: vec!["key".into(), "key".into()],
+                origin_tx: origin.clone(),
+                origin_req_id: 12,
+                deadline,
+                operation: gate.try_enter().unwrap(),
+            },
+        )
+        .await
+        .unwrap()
+        .disarm();
+        assert_eq!(admission.slots.available_permits(), 0);
+        gate.begin_shutdown();
+        let mut drain = Box::pin(gate.wait_for_drain());
+        assert!(futures::poll!(drain.as_mut()).is_pending());
+
+        // The reader can be aborted before reaching its cleanup tail. Only
+        // the registered timers observe this origin's terminal cancellation.
+        origin.cancel();
+        wait_for_relay_admission(&admission, 2, 1024).await;
+        tokio::time::timeout(Duration::from_secs(1), drain)
+            .await
+            .expect("origin cancellation retained the mutation operation fence");
+        assert!(reads.lock().unwrap().is_empty());
+        assert!(mutations.lock().unwrap().is_empty());
+        assert!(origin_responses.try_recv().is_err());
+        assert!(
+            !*owner.cancel.borrow(),
+            "origin loss canceled a healthy owner"
+        );
+        tasks.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn relay_cleanup_is_pinned_to_exact_owner_origin_and_registration_generation() {
         let tasks = RuntimeTasks::new(8);
         let task_ref = Arc::downgrade(&tasks);
@@ -14868,6 +14936,152 @@ mod tests {
         wait_for_relay_admission(&admission, 1, 1024).await;
         gate.begin_shutdown();
         gate.wait_for_drain().await;
+    }
+
+    #[tokio::test]
+    async fn batch_relay_preserves_duplicate_positions_stamps_and_terminal_capacity() {
+        let (mut ctx, tasks) = test_connection_context(
+            FragmentRouter::new(1, 0),
+            Arc::new(RwLock::new(HashSet::new())),
+            Arc::new(RwLock::new(HashMap::from([(
+                FragmentId(0),
+                vec!["owner".to_string()],
+            )]))),
+            true,
+            Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(Mutex::new(HashMap::new())),
+        );
+        ctx.relay_admission = RelayAdmission::new(1, 1024);
+        ctx.runtime_options = ctx
+            .runtime_options
+            .with_forwarded_attempt_timeout(Duration::from_secs(10));
+        let (mut owner, owner_server) = tokio::io::duplex(4096);
+        let owner_connection = tokio::spawn(handle_connection(
+            ctx.clone(),
+            Box::pin(owner_server),
+            false,
+            None,
+            None,
+        ));
+        complete_test_handshake(&mut owner, "owner").await;
+        // This response proves the owner handshake published its exact channel
+        // before the origin requests a relay through it.
+        write_test_envelope(
+            &mut owner,
+            Envelope {
+                msg: Some(EnvelopeMsg::BatchGet(BatchGet {
+                    req_id: 300,
+                    ..Default::default()
+                })),
+            },
+        )
+        .await;
+        assert!(matches!(read_test_envelope(&mut owner).await.msg,
+            Some(EnvelopeMsg::BatchGetResponse(response)) if response.req_id == 300));
+        let (mut origin, origin_server) = tokio::io::duplex(4096);
+        let origin_connection = tokio::spawn(handle_connection(
+            ctx.clone(),
+            Box::pin(origin_server),
+            false,
+            None,
+            None,
+        ));
+        complete_test_handshake(&mut origin, "origin").await;
+        let request = BatchPut {
+            req_id: 400,
+            priority: ProtoPriority::High as i32,
+            puts: ["duplicate", "duplicate", "other"]
+                .into_iter()
+                .enumerate()
+                .map(|(index, key)| ForwardedPut {
+                    key: key.into(),
+                    value: if index == 2 {
+                        Vec::new()
+                    } else {
+                        vec![index as u8]
+                    },
+                    timestamp_ms: index as u64 + 1,
+                    node_id: format!("origin-{index}"),
+                    seq: index as u64 + 11,
+                    boot_id: index as u64 + 21,
+                    expires_at_ms: index as u64 * 10,
+                    is_tombstone: index == 2,
+                    priority: ProtoPriority::Background as i32,
+                    hops: index as u32,
+                    req_id: index as u64 + 500,
+                })
+                .collect(),
+        };
+        write_test_envelope(
+            &mut origin,
+            Envelope {
+                msg: Some(EnvelopeMsg::BatchPut(request.clone())),
+            },
+        )
+        .await;
+        let Some(EnvelopeMsg::BatchPut(forwarded)) = read_test_envelope(&mut owner).await.msg
+        else {
+            panic!("owner did not receive the forwarded batch");
+        };
+        assert_ne!(forwarded.req_id, request.req_id);
+        let mut expected = request.clone();
+        expected.req_id = forwarded.req_id;
+        for put in &mut expected.puts {
+            put.hops += 1;
+        }
+        assert_eq!(
+            forwarded, expected,
+            "relay changed operation stamps or positions"
+        );
+        assert_eq!(ctx.pending_mutation_relays.lock().unwrap().len(), 1);
+        assert_eq!(ctx.relay_admission.slots.available_permits(), 0);
+        assert!(ctx.relay_admission.key_bytes.available_permits() < 1024);
+        ctx.operation_gate.begin_shutdown();
+        let mut drain = Box::pin(ctx.operation_gate.wait_for_drain());
+        assert!(futures::poll!(drain.as_mut()).is_pending());
+
+        let mut superseded = result("duplicate", 1);
+        superseded.status = MutationStatus::Superseded as i32;
+        superseded.winner_timestamp_ms = 4;
+        superseded.winner_node_id = "winner".into();
+        superseded.winner_is_tombstone = true;
+        let mut unavailable = result("other", 2);
+        unavailable.status = MutationStatus::Unavailable as i32;
+        unavailable.error = "downstream unavailable".into();
+        let results = vec![result("duplicate", 0), superseded, unavailable];
+        write_test_envelope(
+            &mut owner,
+            Envelope {
+                msg: Some(EnvelopeMsg::MutationResponse(MutationResponse {
+                    req_id: forwarded.req_id,
+                    results: results.clone(),
+                })),
+            },
+        )
+        .await;
+        assert_eq!(
+            read_test_envelope(&mut origin).await.msg,
+            Some(EnvelopeMsg::MutationResponse(MutationResponse {
+                req_id: request.req_id,
+                results,
+            })),
+            "relay changed duplicate positions or downstream statuses",
+        );
+        wait_for_relay_admission(&ctx.relay_admission, 1, 1024).await;
+        assert!(ctx.pending_mutation_relays.lock().unwrap().is_empty());
+        tokio::time::timeout(Duration::from_secs(1), drain)
+            .await
+            .expect("terminal batch response retained the operation fence");
+        drop(origin);
+        drop(owner);
+        for connection in [origin_connection, owner_connection] {
+            tokio::time::timeout(Duration::from_secs(1), connection)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        tasks.shutdown().await;
     }
 
     #[tokio::test]
