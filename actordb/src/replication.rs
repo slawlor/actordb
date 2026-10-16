@@ -55,9 +55,10 @@ use crate::proto::{
 };
 use crate::shard::FragmentId;
 use crate::wire::{
-    check_envelope_budget, check_replicated_op_budget, encode_envelope, message_field_len,
-    BudgetedFrame, BudgetedPeerTx, ReconcilePermit, ReconcileTicket, ANTI_ENTROPY_PAGE_BYTES,
-    MAX_FRAME_BYTES, MAX_RECONCILE_FETCH_KEYS, MAX_RECONCILE_PAGE_ITEMS, MAX_WIRE_BATCH_ITEMS,
+    bytes_field_len, check_envelope_budget, check_replicated_op_budget, encode_envelope,
+    varint_field_len, BudgetedFrame, BudgetedPeerTx, ReconcilePermit, ReconcileTicket,
+    RepeatedFieldSizer, ANTI_ENTROPY_PAGE_BYTES, MAX_FRAME_BYTES, MAX_RECONCILE_FETCH_KEYS,
+    MAX_RECONCILE_PAGE_ITEMS, MAX_WIRE_BATCH_ITEMS,
 };
 
 /// Prevent a permanently failing receiver store from becoming a tight
@@ -1231,6 +1232,18 @@ fn proto_op(op: &crate::actor::ReplicatedOp) -> ProtoReplicateOp {
     }
 }
 
+/// Exact Prost length of [`proto_op`] without cloning its owned payload.
+fn proto_op_encoded_len(op: &crate::actor::ReplicatedOp) -> usize {
+    bytes_field_len(1, op.key.len())
+        .saturating_add(bytes_field_len(2, op.value.value.len()))
+        .saturating_add(varint_field_len(3, op.value.timestamp_ms))
+        .saturating_add(bytes_field_len(4, op.value.node_id.len()))
+        .saturating_add(varint_field_len(5, op.seq))
+        .saturating_add(varint_field_len(6, op.boot_id))
+        .saturating_add(varint_field_len(7, op.value.expires_at_ms.unwrap_or(0)))
+        .saturating_add(varint_field_len(8, u64::from(op.value.is_tombstone)))
+}
+
 fn take_streaming_batch(
     buffer: &mut VecDeque<crate::actor::ReplicatedOp>,
     max_items: usize,
@@ -1247,12 +1260,12 @@ fn take_streaming_batch(
         ops: Vec::new(),
         required_ack_level,
     };
+    let mut sizing = RepeatedFieldSizer::new(9, 4, batch.encoded_len());
     while ops.len() < max_items.min(MAX_WIRE_BATCH_ITEMS) {
         let Some(op) = buffer.pop_front() else { break };
-        batch.ops.push(proto_op(&op));
-        let encoded_len = message_field_len(9, batch.encoded_len());
+        let item_len = proto_op_encoded_len(&op);
+        let encoded_len = sizing.encoded_len_with(item_len);
         if encoded_len > MAX_FRAME_BYTES {
-            batch.ops.pop();
             buffer.push_front(op);
             if ops.is_empty() {
                 return Err(());
@@ -1260,10 +1273,13 @@ fn take_streaming_batch(
             break;
         }
         if encoded_len > ANTI_ENTROPY_PAGE_BYTES && !ops.is_empty() {
-            batch.ops.pop();
             buffer.push_front(op);
             break;
         }
+        let encoded = proto_op(&op);
+        debug_assert_eq!(encoded.encoded_len(), item_len);
+        sizing.push(item_len);
+        batch.ops.push(encoded);
         ops.push(op);
         if encoded_len > ANTI_ENTROPY_PAGE_BYTES {
             break;
@@ -3092,18 +3108,21 @@ async fn send_repair_ops(
             // barrier requests and reports the actual fence.
             required_ack_level: ReplicationAckLevel::Applied as i32,
         };
+        let mut sizing = RepeatedFieldSizer::new(9, 4, batch.encoded_len());
         let mut consumed = 0;
         for op in ops[offset..].iter().take(100) {
-            batch.ops.push(proto_op(op));
-            let encoded_len = message_field_len(9, batch.encoded_len());
+            let item_len = proto_op_encoded_len(op);
+            let encoded_len = sizing.encoded_len_with(item_len);
             if encoded_len > MAX_FRAME_BYTES {
-                batch.ops.pop();
                 break;
             }
-            if encoded_len > ANTI_ENTROPY_PAGE_BYTES && batch.ops.len() > 1 {
-                batch.ops.pop();
+            if encoded_len > ANTI_ENTROPY_PAGE_BYTES && !batch.ops.is_empty() {
                 break;
             }
+            let encoded = proto_op(op);
+            debug_assert_eq!(encoded.encoded_len(), item_len);
+            sizing.push(item_len);
+            batch.ops.push(encoded);
             consumed += 1;
             if encoded_len > ANTI_ENTROPY_PAGE_BYTES {
                 break;
@@ -3277,13 +3296,15 @@ async fn send_repair_keys(
     let keys = Arc::new(keys);
     let mut next_key_index = 0usize;
     let mut page = Vec::new();
-    let mut sizing_batch = ReplicateBatch {
+    let sizing_batch = ReplicateBatch {
         session_id: connection.session_id,
         batch_seq: u64::MAX,
         fragment: fragment.0,
         ops: Vec::new(),
         required_ack_level: ReplicationAckLevel::Applied as i32,
     };
+    let base_payload_len = sizing_batch.encoded_len();
+    let mut sizing = RepeatedFieldSizer::new(9, 4, base_payload_len);
     while next_key_index < keys.len() {
         let request_keys = keys.clone();
         let value_page = match actor
@@ -3315,34 +3336,35 @@ async fn send_repair_keys(
                 seq: 0,
                 boot_id: 0,
             };
-            sizing_batch.ops.push(proto_op(&op));
-            page.push(op);
-            let encoded_len = message_field_len(9, sizing_batch.encoded_len());
+            let item_len = proto_op_encoded_len(&op);
+            let encoded_len = sizing.encoded_len_with(item_len);
             if encoded_len > MAX_FRAME_BYTES {
-                let oversized = page.pop().expect("just pushed");
-                let oversized_proto = sizing_batch.ops.pop().expect("just pushed");
                 if page.is_empty() {
                     tracing::warn!(
                         fragment = fragment.0,
-                        key = %oversized.key,
+                        key = %op.key,
                         "one reconciliation repair exceeds the hard frame limit"
                     );
                     return Err(ReconcileError::Local);
                 }
                 send_repair_ops(fragment, connection, &page).await?;
                 page.clear();
-                sizing_batch.ops.clear();
-                page.push(oversized);
-                sizing_batch.ops.push(oversized_proto);
-            } else if encoded_len > ANTI_ENTROPY_PAGE_BYTES && page.len() > 1 {
-                let next = page.pop().expect("just pushed");
-                let next_proto = sizing_batch.ops.pop().expect("just pushed");
+                sizing.reset(base_payload_len);
+                if sizing.encoded_len_with(item_len) > MAX_FRAME_BYTES {
+                    tracing::warn!(
+                        fragment = fragment.0,
+                        key = %op.key,
+                        "one reconciliation repair exceeds the hard frame limit"
+                    );
+                    return Err(ReconcileError::Local);
+                }
+            } else if encoded_len > ANTI_ENTROPY_PAGE_BYTES && !page.is_empty() {
                 send_repair_ops(fragment, connection, &page).await?;
                 page.clear();
-                sizing_batch.ops.clear();
-                page.push(next);
-                sizing_batch.ops.push(next_proto);
+                sizing.reset(base_payload_len);
             }
+            sizing.push(item_len);
+            page.push(op);
         }
     }
     if !page.is_empty() {
@@ -3358,34 +3380,37 @@ fn reconcile_fetch_chunks(
     keys: Vec<String>,
 ) -> Result<VecDeque<Vec<String>>, ReconcileError> {
     let mut chunks = VecDeque::new();
-    let mut request = ReconcileFetch {
+    let request = ReconcileFetch {
         fragment: fragment.0,
         keys: Vec::new(),
         session_id,
         round_id,
         chunk_seq: u64::MAX,
     };
+    let base_payload_len = request.encoded_len();
+    let mut sizing = RepeatedFieldSizer::new(13, 2, base_payload_len);
+    let mut request_keys = Vec::new();
     for key in keys {
-        request.keys.push(key);
-        let encoded_len = message_field_len(13, request.encoded_len());
+        let encoded_len = sizing.encoded_len_with(key.len());
+        let next_count = request_keys.len() + 1;
         if encoded_len > MAX_FRAME_BYTES
-            || ((encoded_len > ANTI_ENTROPY_PAGE_BYTES
-                || request.keys.len() > MAX_RECONCILE_FETCH_KEYS)
-                && request.keys.len() > 1)
+            || ((encoded_len > ANTI_ENTROPY_PAGE_BYTES || next_count > MAX_RECONCILE_FETCH_KEYS)
+                && !request_keys.is_empty())
         {
-            let next = request.keys.pop().expect("just pushed");
-            if request.keys.is_empty() {
+            if request_keys.is_empty() {
                 return Err(ReconcileError::Local);
             }
-            chunks.push_back(std::mem::take(&mut request.keys));
-            request.keys.push(next);
-            if message_field_len(13, request.encoded_len()) > MAX_FRAME_BYTES {
+            chunks.push_back(std::mem::take(&mut request_keys));
+            sizing.reset(base_payload_len);
+            if sizing.encoded_len_with(key.len()) > MAX_FRAME_BYTES {
                 return Err(ReconcileError::Local);
             }
         }
+        sizing.push(key.len());
+        request_keys.push(key);
     }
-    if !request.keys.is_empty() {
-        chunks.push_back(request.keys);
+    if !request_keys.is_empty() {
+        chunks.push_back(request_keys);
     }
     Ok(chunks)
 }
@@ -3677,6 +3702,7 @@ fn rand_session_id() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::wire::message_field_len;
     use std::sync::atomic::{AtomicBool, Ordering};
 
     fn op(key: &str) -> crate::actor::ReplicatedOp {
@@ -3698,6 +3724,30 @@ mod tests {
             ack_durability_mismatch: false,
             reconcile_rounds: 0,
         }))
+    }
+
+    #[test]
+    fn borrowed_replicate_op_length_matches_prost() {
+        for (index, value_len) in [0, 1, 127, 128, 16_383, 16_384].into_iter().enumerate() {
+            let value = VersionedValue {
+                value: vec![7; value_len],
+                timestamp_ms: if index % 2 == 0 { 0 } else { u64::MAX },
+                node_id: if index == 0 {
+                    String::new()
+                } else {
+                    "node".repeat(index)
+                },
+                expires_at_ms: (index % 3 == 0).then_some(u64::MAX),
+                is_tombstone: index % 2 != 0,
+            };
+            let op = crate::actor::ReplicatedOp {
+                key: "k".repeat(value_len.min(128)),
+                value,
+                seq: if index % 2 == 0 { 0 } else { u64::MAX },
+                boot_id: if index % 3 == 0 { 0 } else { u64::MAX },
+            };
+            assert_eq!(proto_op_encoded_len(&op), proto_op(&op).encoded_len());
+        }
     }
 
     #[test]
@@ -3728,6 +3778,41 @@ mod tests {
             buffer.into_iter().map(|op| op.key).collect::<Vec<_>>(),
             vec![second.key, third.key]
         );
+    }
+
+    #[test]
+    fn streaming_batch_preserves_the_wire_item_count_ceiling() {
+        let mut buffer = (0..=MAX_WIRE_BATCH_ITEMS)
+            .map(|index| op(&format!("key-{index}")))
+            .collect::<VecDeque<_>>();
+
+        let (taken, encoded) = take_streaming_batch(
+            &mut buffer,
+            usize::MAX,
+            u64::MAX,
+            u64::MAX,
+            FragmentId(u32::MAX),
+            ReplicationAckLevel::StableCommitted as i32,
+        )
+        .unwrap();
+
+        assert_eq!(taken.len(), MAX_WIRE_BATCH_ITEMS);
+        assert_eq!(encoded.len(), MAX_WIRE_BATCH_ITEMS);
+        assert_eq!(buffer.len(), 1);
+        assert_eq!(
+            buffer.front().unwrap().key,
+            format!("key-{MAX_WIRE_BATCH_ITEMS}")
+        );
+        let envelope = Envelope {
+            msg: Some(EnvelopeMsg::ReplicateBatch(ReplicateBatch {
+                session_id: u64::MAX,
+                batch_seq: u64::MAX,
+                fragment: u32::MAX,
+                ops: encoded,
+                required_ack_level: ReplicationAckLevel::StableCommitted as i32,
+            })),
+        };
+        assert!(envelope.encoded_len() <= ANTI_ENTROPY_PAGE_BYTES);
     }
 
     #[test]
@@ -3786,6 +3871,33 @@ mod tests {
                 .encoded_len(),
             ) > ANTI_ENTROPY_PAGE_BYTES
         );
+
+        let empty_keys = reconcile_fetch_chunks(
+            FragmentId(0),
+            1,
+            2,
+            (0..=MAX_RECONCILE_FETCH_KEYS)
+                .map(|_| String::new())
+                .collect(),
+        )
+        .unwrap();
+        assert_eq!(
+            empty_keys.iter().map(Vec::len).collect::<Vec<_>>(),
+            vec![MAX_RECONCILE_FETCH_KEYS, 1]
+        );
+        assert!(empty_keys.iter().all(|keys| {
+            message_field_len(
+                13,
+                ReconcileFetch {
+                    fragment: 0,
+                    keys: keys.clone(),
+                    session_id: 1,
+                    round_id: 2,
+                    chunk_seq: u64::MAX,
+                }
+                .encoded_len(),
+            ) <= MAX_FRAME_BYTES
+        }));
     }
 
     #[test]

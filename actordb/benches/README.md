@@ -32,17 +32,13 @@ regressions/improvements vs the first.
 |-------------------|------------------------------------|----------------------------------------------------|
 | `put_get.rs`      | 1 node, in-memory, no network      | Sequential `put` / `get` latency at 100 B, 10 KB, 1 MB; concurrent sticky-vs-spread Gets at depths 1/8/64 |
 | `fanout.rs`       | 3 nodes, 3 fragments (1 each)      | `put_multi` / `get_multi` at 10, 100, 1000 keys    |
-| `replication.rs`  | 2 nodes, 1 shared fragment         | source-apply-completion-to-replica-visible lag for 10, 100, 1000-key batches |
+| `replication.rs`  | 2 nodes, 1 shared fragment         | timer-dominated visibility lag for 10/100/1000 keys; 1 ms-tick disconnected catch-up for 64/256/1024/4096 compact records |
 | `sender_registry.rs` | 2 nodes, 1 or 64 shared fragments | source apply/fan-out at concurrency 1/32/64 with 100 B or 1 MiB values; replica catch-up excluded from timing |
 
 Each file has a doc comment explaining what it measures and how to read a
 regression — start there before tuning.
 
 ## Baselines
-
-Recorded 2026-10-14 on the maintainer's dev VM (multi-thread tokio, in-memory
-store, `--no-default-features`). Your numbers will differ; what matters is the
-trend on the *same* machine.
 
 Recorded 2026-10-14 on a shared dev VM (multi-thread tokio, in-memory store,
 `--no-default-features`, release profile). Your numbers will differ; what
@@ -78,6 +74,22 @@ Note: lag is dominated by the sender `batch_interval` (100 ms): 10 keys and
 100 keys both take one batch (~100 ms); 1000 keys take 10 batches (~1 s).
 This is finding #25 — shipping full batches immediately would cut this ~10x.
 
+### replication buffered catch-up (mean connect-to-ACK latency)
+
+Recorded 2026-10-16 on the maintainer's dev VM with fresh in-memory node pairs,
+`batch_size = 4096`, a 1 ms interval, and `--quick`. Preload, verification, and
+shutdown are excluded from the reported duration; connection establishment,
+encoding, receiver apply, and ACK remain included.
+
+| batch size | 64 | 256 | 1024 | 4096 |
+|------------|----|-----|------|------|
+| catch-up   | 2.84 ms | 3.43 ms | 5.99 ms | 15.93 ms |
+
+The 4,096-record case was 45.71 ms before incremental protobuf sizing and
+15.93 ms after it on the same machine (65% lower). Unlike `replication_lag`,
+this group reduces the sender tick to 1 ms instead of hiding batch construction
+behind the default 100 ms timer.
+
 ## Convention for perf-relevant changes
 
 1. Run the affected bench **before** your change; note the numbers.
@@ -107,5 +119,8 @@ These are the first things to measure when they get fixed:
   lock.
 - #25 — sender `batch_interval` timer-gates full batches; `max_in_flight=4`
   → watch the `replication_lag` floor independent of batch size.
+- Incremental ordinary replication batch sizing is protected by
+  `replication_catchup/buffered_catchup`; watch 4,096-record scaling for a
+  return of repeated whole-batch scans.
 - #18 — anti-entropy clones full values to build summaries
   → not covered by these benches yet; needs a reconcile bench.

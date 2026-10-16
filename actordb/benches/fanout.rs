@@ -33,7 +33,7 @@
 //!   as a large win, especially at n = 1000.
 //! * Sub-linear scaling with `n` is expected (per-batch fixed costs);
 //!   per-op latency *increasing* with `n` points at O(n²) behavior such
-//!   as the per-key senders-map scan (finding #22).
+//!   as an accidental repeated whole-batch encode or routing scan.
 //!
 //! Both remote paths now await responses, and peer sockets use `TCP_NODELAY`.
 //! A new fixed latency floor therefore points at request correlation,
