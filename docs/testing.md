@@ -4,8 +4,9 @@ Three layers, each catching what the others can't.
 
 Unit tests use inline `#[cfg(test)]` modules in their owning source files,
 including grouped private-state regressions and small shared actor fixtures.
-Integration tests stay in `actordb/tests` to exercise public imports/builders
-and real-node behavior from outside the library.
+Integration tests stay in `actordb/tests` to exercise real-node behavior and
+public APIs from outside the library. Test project behavior and failure modes,
+not generated builder plumbing or repetitive default/override assertions.
 
 The separate `Verify release package` workflow check additionally verifies
 unpacked crates.io packages for backend-free defaults and opted-in storage
@@ -432,14 +433,13 @@ re-establishment.
 
 ## Running them
 
-Configuration-builder regressions exercise omitted-default parity, explicit
-overrides, optional setters, and independently allocated legacy reset maps.
-Compile-fail rustdoc examples cover missing required dependencies and the
-absence of public setters for private sender hooks. Examples, benchmarks, and
-the Docker role executable use the same generated builders; their normal
-all-target compilation checks setter names and feature-gated RocksDB usage.
-Runtime validation regressions remain separate: successful `build()` does not
-prove that startup/spawn will accept a configuration.
+Examples, benchmarks, and the Docker role executable use the generated
+builders; normal all-target compilation exercises their use without duplicating
+Bon's setter/default tests. Runtime regressions verify startup, serving,
+shutdown, child restart, and rejection of invalid settings before transport
+bind. Successful `build()` does not prove startup/spawn will accept a
+configuration. Backend-feature compile-fail examples retain coverage of the
+crate's actual opt-in API contract.
 
 ```bash
 cargo test --workspace --exclude docker-tests

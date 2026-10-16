@@ -447,41 +447,7 @@ mod tests {
     use ractor::{registry::where_is, rpc::CallResult, ActorStatus, SupervisionEvent};
     use std::collections::HashMap;
     use std::time::Duration;
-    #[test]
-    fn pool_builder_preserves_defaults_and_optional_overrides() {
-        let built = PoolConfig::builder().build();
-        let default = PoolConfig::default();
-        assert_eq!(
-            (built.workers, built.queue_cap, built.rate_limit_per_sec),
-            (
-                default.workers,
-                default.queue_cap,
-                default.rate_limit_per_sec
-            )
-        );
-        assert_eq!((built.workers, built.queue_cap), (4, 10_000));
-        assert_eq!(built.rate_limit_per_sec, None);
-        let limited = PoolConfig::builder()
-            .workers(3)
-            .queue_cap(17)
-            .rate_limit_per_sec(9)
-            .build();
-        assert_eq!(
-            (
-                limited.workers,
-                limited.queue_cap,
-                limited.rate_limit_per_sec
-            ),
-            (3, 17, Some(9))
-        );
-        assert_eq!(
-            PoolConfig::builder()
-                .maybe_rate_limit_per_sec(None)
-                .build()
-                .rate_limit_per_sec,
-            None
-        );
-    }
+
     static NEXT_PREFIX: AtomicU64 = AtomicU64::new(0);
 
     struct SupervisionProbe;

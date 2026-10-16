@@ -19,6 +19,9 @@ We actively welcome your pull requests!
 Keep unit tests in an inline `#[cfg(test)] mod tests` in the owning source file.
 Use separate files under `tests/` for integration tests exercising the crate's
 public API; do not expose production internals just to test them.
+Focus tests on behavior, validation, and failure modes. Do not duplicate Bon's
+generated builder tests or add repetitive field/default assertions to increase
+coverage percentages.
 
 Release maintainers should follow the [release procedure](docs/releases.md).
 The library workspace does not track `Cargo.lock`. Keep dependency requirements

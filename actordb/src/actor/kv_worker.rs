@@ -214,7 +214,7 @@ mod tests {
     use std::collections::HashMap;
     use std::time::Duration;
     #[tokio::test]
-    async fn worker_builder_with_omitted_pending_serves_real_actor_operations() {
+    async fn worker_without_pending_counter_serves_operations() {
         let shared = Arc::new(test_state(HashMap::new()));
         let (worker, handle) = KvWorker::spawn(
             None,

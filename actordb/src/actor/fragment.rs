@@ -618,160 +618,13 @@ mod tests {
     use std::sync::atomic::Ordering;
     use std::sync::Mutex as StdMutex;
 
-    mod builders {
-        //! Builder defaults, explicit settings and real child recovery.
+    mod lifecycle_configuration {
+        //! Configured child startup, quiescence and real maintenance recovery.
 
         use super::*;
 
         #[tokio::test]
-        async fn supervision_builders_omit_settings_without_inventing_shared_dependencies() {
-            let hlc = Arc::new(Mutex::new(HlcClock::new()));
-            let make = || {
-                SupervisorArgs::builder()
-                    .fragment(FragmentId(7))
-                    .worker_prefix("builder-supervisor")
-                    .hlc(hlc.clone())
-                    .build()
-            };
-            let args = make();
-            let other = make();
-            let defaults = crate::node::NodeConfig::default();
-            assert!(Arc::ptr_eq(&args.hlc, &hlc));
-            assert_eq!(args.fragment, FragmentId(7));
-            assert_eq!(args.worker_prefix, "builder-supervisor");
-            assert!(args.store.is_none());
-            assert!(args.tombstone_gc_age.is_none());
-            assert_eq!(args.flush_batch_size, defaults.flush_batch_size);
-            assert_eq!(args.flush_interval, defaults.flush_interval);
-            assert_eq!(args.clean_interval, defaults.clean_interval);
-            assert_eq!(args.snapshot_interval, defaults.snapshot_interval);
-            for (actual, expected) in [
-                (&args.high_pool, &defaults.high_pool),
-                (&args.default_pool, &defaults.default_pool),
-                (&args.background_pool, &defaults.background_pool),
-            ] {
-                assert_eq!(
-                    (actual.workers, actual.queue_cap, actual.rate_limit_per_sec),
-                    (
-                        expected.workers,
-                        expected.queue_cap,
-                        expected.rate_limit_per_sec
-                    )
-                );
-            }
-            assert!(!Arc::ptr_eq(&args.reset_senders, &other.reset_senders));
-            args.reset_senders
-                .lock()
-                .await
-                .insert((FragmentId(7), "peer".into()), 1);
-            assert!(other.reset_senders.lock().await.is_empty());
-
-            let shared = Arc::new(FragmentState::new(
-                HashMap::new(),
-                None,
-                1000,
-                Duration::from_millis(100),
-            ));
-            let make_cleaner = || {
-                CleanerArgs::builder()
-                    .fragment(FragmentId(7))
-                    .shared(shared.clone())
-                    .build()
-            };
-            let cleaner = make_cleaner();
-            assert!(Arc::ptr_eq(&cleaner.shared, &shared));
-            assert_eq!(cleaner.fragment, FragmentId(7));
-            assert_eq!(cleaner.interval, defaults.clean_interval);
-            assert!(cleaner.tombstone_gc_age.is_none());
-            assert!(!Arc::ptr_eq(
-                &cleaner.reset_senders,
-                &make_cleaner().reset_senders
-            ));
-            assert!(!Arc::ptr_eq(&cleaner.reset_senders, &args.reset_senders));
-            let snapshotter = SnapshotterArgs::builder().shared(shared.clone()).build();
-            assert!(Arc::ptr_eq(&snapshotter.shared, &shared));
-            assert_eq!(snapshotter.interval, defaults.snapshot_interval);
-        }
-
-        #[tokio::test]
-        async fn supervision_builders_preserve_explicit_settings_and_legacy_overrides() {
-            let hlc = Arc::new(Mutex::new(HlcClock::new()));
-            let store: Arc<dyn KvStore> = Arc::new(GatedStore::default());
-            let resets = Arc::new(Mutex::new(HashMap::from([(
-                (FragmentId(8), "peer".into()),
-                9,
-            )])));
-            let custom_pool = || {
-                PoolConfig::builder()
-                    .workers(1)
-                    .queue_cap(3)
-                    .rate_limit_per_sec(5)
-                    .build()
-            };
-            let legacy_age = Duration::from_secs(6);
-            let args = SupervisorArgs::builder()
-                .fragment(FragmentId(8))
-                .worker_prefix(String::from("builder-overrides"))
-                .hlc(hlc.clone())
-                .store(store.clone())
-                .high_pool(custom_pool())
-                .default_pool(custom_pool())
-                .background_pool(custom_pool())
-                .flush_batch_size(7)
-                .flush_interval(Duration::from_millis(8))
-                .clean_interval(Duration::from_secs(9))
-                .snapshot_interval(Duration::from_secs(10))
-                .tombstone_gc_age(legacy_age)
-                .reset_senders(resets.clone())
-                .build();
-            assert!(Arc::ptr_eq(args.store.as_ref().unwrap(), &store));
-            assert!(Arc::ptr_eq(&args.hlc, &hlc));
-            assert!(Arc::ptr_eq(&args.reset_senders, &resets));
-            assert_eq!(args.tombstone_gc_age, Some(legacy_age));
-            assert_eq!(args.flush_batch_size, 7);
-            assert_eq!(args.flush_interval, Duration::from_millis(8));
-            assert_eq!(args.clean_interval, Duration::from_secs(9));
-            assert_eq!(args.snapshot_interval, Duration::from_secs(10));
-            for pool in [args.high_pool, args.default_pool, args.background_pool] {
-                assert_eq!(
-                    (pool.workers, pool.queue_cap, pool.rate_limit_per_sec),
-                    (1, 3, Some(5))
-                );
-            }
-            let no_store = SupervisorArgs::builder()
-                .fragment(FragmentId(8))
-                .worker_prefix("no-store")
-                .hlc(hlc)
-                .maybe_store(None)
-                .maybe_tombstone_gc_age(None)
-                .build();
-            assert!(no_store.store.is_none());
-            assert!(no_store.tombstone_gc_age.is_none());
-            let shared = Arc::new(FragmentState::new(
-                HashMap::new(),
-                None,
-                1000,
-                Duration::from_millis(100),
-            ));
-            let cleaner = CleanerArgs::builder()
-                .fragment(FragmentId(8))
-                .shared(shared.clone())
-                .interval(Duration::from_secs(11))
-                .maybe_tombstone_gc_age(Some(legacy_age))
-                .reset_senders(resets.clone())
-                .build();
-            assert_eq!(cleaner.interval, Duration::from_secs(11));
-            assert_eq!(cleaner.tombstone_gc_age, Some(legacy_age));
-            assert!(Arc::ptr_eq(&cleaner.reset_senders, &resets));
-            let snapshotter = SnapshotterArgs::builder()
-                .shared(shared)
-                .interval(Duration::from_secs(12))
-                .build();
-            assert_eq!(snapshotter.interval, Duration::from_secs(12));
-        }
-
-        #[tokio::test]
-        async fn supervisor_builder_defaults_start_and_quiesce_real_owned_workers() {
+        async fn supervisor_starts_and_quiesces_owned_workers() {
             let (supervisor, handle) = FragmentSupervisor::spawn(
                 None,
                 FragmentSupervisor,
@@ -883,7 +736,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn maintenance_child_builder_restarts_preserve_shared_state_and_periodic_policy() {
+        async fn maintenance_restarts_preserve_shared_state_and_periodic_policy() {
             let store = Arc::new(RestartRecordingStore::default());
             let pool = |workers, queue_cap| {
                 PoolConfig::builder()
