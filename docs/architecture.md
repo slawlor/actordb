@@ -42,7 +42,8 @@ integration crate, and an `xtask` for coverage.
 | `actordb::replication` | Phase 5 async sender/receiver: `ReplicationSender` state machine, sessions, acks, protocol-v3 paged `ReconcileRequest/Response/Fetch/Data` anti-entropy |
 | `actordb::supervision` | `FragmentSupervisor` + children: dispatcher, `Cleaner` (TTL-expiry markers), `Snapshotter` (periodic flush) |
 | `actordb::placement` | Phase 8 dynamic placement: `PlacementController` trait, `StaticPlacement`, `ManualPlacement`, migration lifecycle states |
-| `actordb::store` | `KvStore` identity/batch/prefix contract, `MemoryStore`, fragment-view `PrefixedStore`, fail-closed `RocksDbStore` (feature-gated) |
+| `actordb::store` | Shared `KvStore` identity/batch/prefix contract, errors, capabilities, backend options, and compatible implementation reexports |
+| `actordb::store::{memory, prefixed, rocksdb}` | Isolated implementations and unit tests: no-op `MemoryStore`, fragment-view `PrefixedStore`, fail-closed `RocksDbStore` (`rocksdb` feature-gated) |
 | `actordb::shard` | `FragmentId`, `hash_key` (seahash), `fragment_of` |
 | `actordb::network` | Transport abstraction: `Network`, `TcpNetwork`, `PeerStream`; 4-byte length-prefixed `Envelope` framing |
 | `actordb::proto` | prost-generated `meta` protocol-buffer messages (ids 1–20), priorities, mutation outcomes, challenge handshake, replication and reconcile messages |
