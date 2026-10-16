@@ -43,6 +43,15 @@ and byte/count chunk at a time, and each chunk's replica holders are attempted
 one at a time in placement order. A slow attempt therefore delays later
 holders, chunks, and remote fragments.
 
+Serving single/batch reads use bounded Node-wide priority-separated job queues,
+not inline socket-reader actor waits. Concurrent requests may complete out of
+order across request ids; each batch prefix still preserves its own input order.
+There are eight fixed serving workers and 64 queue slots per priority by default,
+plus a separate 64 MiB retained decoded-key budget per priority. Cancellation
+keeps admission charged until actors actually release the keys. See
+[backpressure](backpressure.md#node-owned-serving-reads) for the exact bounds
+and the mutation/reconciliation handlers that remain inline.
+
 ## Remote puts: exact outcomes and bounded failover
 
 For each remote fragment, the node iterates `replica_order(frag)` — itself

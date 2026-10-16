@@ -208,6 +208,14 @@ process — the bulk of behavioral coverage:
   clean drain when worker replacement races shutdown, and proving a blocked
   background `Get` or actor-routed batch read does not stall high-priority
   reads or health queries.
+  Node read-service tests additionally prove nonwaiting queue/byte shedding,
+  independent priority admission/execution, expired queued jobs skipping actors,
+  stale route publication rejection, sticky physical cancellation without watch
+  subscribers, and shutdown dropping queued leases while actor-held keys remain
+  charged. The real sticky-worker lease regression covers cancellation and
+  worker death without suffix admission. A production connection-handler test
+  holds both single and batch reads while an unrelated pending response completes
+  on the same physical socket, before actor release or the read deadline.
 - **Remote mutation failures**:
   `forwarded_put_returns_remote_storage_failure`; node unit tests reject
   unspecified statuses and malformed result order/cardinality.

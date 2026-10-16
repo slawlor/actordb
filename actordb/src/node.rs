@@ -80,6 +80,12 @@ use crate::wire::{
     MAX_WIRE_NODE_ID_BYTES,
 };
 
+mod read_service;
+use read_service::{
+    ReadJob, ReadRequest, ReadRoute, ReadService, READ_KEY_BYTE_CAPACITY, READ_QUEUE_CAPACITY,
+    READ_WORKERS_PER_PRIORITY,
+};
+
 /// Current peer wire protocol version. Hello ranges must include this value.
 /// Version 3 replaces monolithic full-state sync with byte-bounded,
 /// cursor-correlated reconciliation pages. Required capabilities additionally
@@ -178,6 +184,14 @@ struct PeerChannel {
     cancel: watch::Sender<bool>,
     queue_admission_timeout: Duration,
     rank: Option<ConnectionRank>,
+}
+
+struct ConnectionCancelGuard(PeerChannel);
+
+impl Drop for ConnectionCancelGuard {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
 }
 
 impl PeerChannel {
@@ -934,6 +948,7 @@ struct ConnContext {
     peers: PeerMap,
     peer_failures: PeerFailureSignals,
     tasks: Weak<RuntimeTasks>,
+    read_service: Arc<ReadService>,
     operation_gate: Arc<OperationGate>,
     /// Monotonic wake-up signal for dial supervisors waiting behind another
     /// physical connection to the same authenticated peer.
@@ -1984,6 +1999,7 @@ pub struct Node {
     /// shutdown can freeze sender topology without aborting peer transports.
     placement_tasks: Arc<RuntimeTasks>,
     tasks: Arc<RuntimeTasks>,
+    read_service: Arc<ReadService>,
     inbound_connections: Arc<Semaphore>,
     receive_byte_budget: Arc<Semaphore>,
     relay_admission: Arc<RelayAdmission>,
@@ -2728,6 +2744,8 @@ pub struct NodeRuntimeOptions {
     receive_byte_capacity: usize,
     relay_capacity: usize,
     relay_key_byte_capacity: usize,
+    serving_read_queue_capacity: usize,
+    serving_read_key_byte_capacity: usize,
     queue_admission_timeout: Duration,
     reconcile_data_admission_timeout: Duration,
     forwarded_attempt_timeout: Duration,
@@ -2748,6 +2766,8 @@ impl Default for NodeRuntimeOptions {
             receive_byte_capacity: RECEIVE_BYTE_CAPACITY,
             relay_capacity: RELAY_CAPACITY,
             relay_key_byte_capacity: RELAY_KEY_BYTE_CAPACITY,
+            serving_read_queue_capacity: READ_QUEUE_CAPACITY,
+            serving_read_key_byte_capacity: READ_KEY_BYTE_CAPACITY,
             queue_admission_timeout: REMOTE_RPC_TIMEOUT,
             reconcile_data_admission_timeout: RECONCILE_DATA_ADMISSION_TIMEOUT,
             forwarded_attempt_timeout: REMOTE_RPC_TIMEOUT,
@@ -2821,6 +2841,23 @@ impl NodeRuntimeOptions {
     /// relay-count limit separately bounds that fixed overhead.
     pub fn with_relay_key_byte_capacity(mut self, capacity: usize) -> Self {
         self.relay_key_byte_capacity = capacity;
+        self
+    }
+
+    /// Set queued serving reads per priority across this Node. Eight fixed
+    /// workers per priority serve single/batch reads outside socket readers.
+    /// Admission also counts actor-owned requests after RPC cancellation.
+    pub fn with_serving_read_queue_capacity(mut self, capacity: usize) -> Self {
+        self.serving_read_queue_capacity = capacity;
+        self
+    }
+
+    /// Set retained decoded read-key bytes per priority across this Node.
+    /// Charges String buffer capacities and Vec/String allocation headers.
+    /// This budget is separate from raw receive bodies, returned values, and
+    /// per-connection encoded writer queues. The minimum is 16 MiB.
+    pub fn with_serving_read_key_byte_capacity(mut self, capacity: usize) -> Self {
+        self.serving_read_key_byte_capacity = capacity;
         self
     }
 
@@ -2915,6 +2952,16 @@ impl NodeRuntimeOptions {
         self.relay_key_byte_capacity
     }
 
+    /// Current Node-wide queued serving-read capacity per priority.
+    pub fn serving_read_queue_capacity(&self) -> usize {
+        self.serving_read_queue_capacity
+    }
+
+    /// Current Node-wide retained decoded read-key byte capacity per priority.
+    pub fn serving_read_key_byte_capacity(&self) -> usize {
+        self.serving_read_key_byte_capacity
+    }
+
     /// Current peer-queue admission timeout.
     pub fn queue_admission_timeout(&self) -> Duration {
         self.queue_admission_timeout
@@ -2973,6 +3020,24 @@ impl NodeRuntimeOptions {
                     Semaphore::MAX_PERMITS
                 )));
             }
+        }
+        if self.serving_read_queue_capacity == 0
+            || self
+                .serving_read_queue_capacity
+                .checked_add(READ_WORKERS_PER_PRIORITY)
+                .is_none_or(|capacity| capacity > Semaphore::MAX_PERMITS)
+        {
+            return Err(NodeError::Actor(
+                "serving read queue capacity is invalid".to_string(),
+            ));
+        }
+        if self.serving_read_key_byte_capacity < MAX_FRAME_BYTES
+            || self.serving_read_key_byte_capacity > Semaphore::MAX_PERMITS
+        {
+            return Err(NodeError::Actor(format!(
+                "serving read key byte capacity must be between {MAX_FRAME_BYTES} and {}",
+                Semaphore::MAX_PERMITS,
+            )));
         }
         if self.peer_queue_frame_capacity < 2 {
             return Err(NodeError::Actor(
@@ -3530,6 +3595,21 @@ impl Node {
         };
         let (peer_changes, _) = watch::channel(0u64);
         let (dial_intent_changes, _) = watch::channel(0u64);
+        let Some(read_service) = ReadService::start(
+            &tasks,
+            runtime_options.serving_read_queue_capacity,
+            runtime_options.serving_read_key_byte_capacity,
+        )
+        .await
+        else {
+            tasks.shutdown().await;
+            supervisor_stops.stop_and_join_all().await;
+            startup_supervisors.disarm();
+            store_binding.allow_release_after_join();
+            return Err(NodeError::Actor(
+                "node runtime stopped during serving read startup".to_string(),
+            ));
+        };
         let node = Self {
             node_id: node_id.clone(),
             boot_id: fresh_boot_id(),
@@ -3564,6 +3644,7 @@ impl Node {
             cluster_secret: config.cluster_secret.clone(),
             placement_tasks,
             tasks,
+            read_service,
             inbound_connections: Arc::new(Semaphore::new(
                 runtime_options.inbound_connection_capacity,
             )),
@@ -3827,6 +3908,7 @@ impl Node {
             peers: self.peers.clone(),
             peer_failures: self.peer_failures.clone(),
             tasks: Arc::downgrade(&self.tasks),
+            read_service: self.read_service.clone(),
             operation_gate: self.operation_gate.clone(),
             peer_changes: self.peer_changes.clone(),
             hlc: self.hlc.clone(),
@@ -7255,6 +7337,7 @@ async fn handle_connection(
         peers,
         peer_failures,
         tasks,
+        read_service,
         operation_gate,
         peer_changes,
         hlc,
@@ -7330,6 +7413,8 @@ async fn handle_connection(
         rank: None,
     };
     let writer_cancel = cancel.subscribe();
+    // Abort/early-return must cancel jobs bound to this exact physical socket.
+    let _connection_cancel = ConnectionCancelGuard(tx.clone());
     // Subscribe before the writer or handshake can signal cancellation;
     // subscribing after an early failure would mark that value as already
     // observed and leave the read side waiting forever.
@@ -8567,6 +8652,7 @@ async fn handle_connection(
                 }
             }
             Some(EnvelopeMsg::ForwardedGet(g)) => {
+                let deadline = deadline_after(runtime_options.forwarded_attempt_timeout);
                 // We serve this fragment: read it and reply on this
                 // connection. (A bootstrapping node is not yet
                 // authoritative, so it relays instead of serving
@@ -8579,60 +8665,24 @@ async fn handle_connection(
                     }
                     continue;
                 }
-                // Serve at the originator's priority (Phase 7).
-                let get_priority = priority_from_proto(g.priority);
-                let Some(actor) = router.route(&g.key) else {
-                    // Legacy GetResponse has no unavailable outcome. Silence
-                    // is safer than fabricating an authoritative miss; the
-                    // origin times out and may retry another holder.
+                let Some((generation, actor)) = router.route_with_generation(frag) else {
+                    // The legacy response cannot express unavailability.
                     continue;
                 };
-                let (value, shed) = match actor
-                    .call(
-                        |reply| KvMessage::Get {
-                            key: g.key.clone(),
-                            reply,
-                            priority: get_priority,
-                        },
-                        None,
-                    )
-                    .await
-                {
-                    Ok(CallResult::Success(Ok(v))) => (v, false),
-                    Ok(CallResult::Success(Err(_))) => (None, true),
-                    Ok(CallResult::Timeout | CallResult::SenderError) | Err(_) => {
-                        // As above, actor unavailability is not a genuine
-                        // not-found result.
-                        continue;
-                    }
-                };
-                let (found, bytes, timestamp_ms, origin, expires_at_ms, is_tombstone) = match value
-                {
-                    Some(v) => (
-                        true,
-                        v.value,
-                        v.timestamp_ms,
-                        v.node_id,
-                        v.expires_at_ms.unwrap_or(0),
-                        v.is_tombstone,
-                    ),
-                    None => (false, Vec::new(), 0, String::new(), 0, false),
-                };
-                if !send_envelope(
-                    &tx,
-                    Envelope {
-                        msg: Some(EnvelopeMsg::GetResponse(GetResponse {
-                            req_id: g.req_id,
-                            found,
-                            value: bytes,
-                            timestamp_ms,
-                            node_id: origin,
-                            expires_at_ms,
-                            is_tombstone,
-                            shed,
-                        })),
+                let priority = priority_from_proto(g.priority);
+                if !read_service.try_submit(ReadJob::new(
+                    ReadRequest::Single(g),
+                    priority,
+                    ReadRoute {
+                        fragment: frag,
+                        generation,
+                        actor,
+                        router: router.clone(),
+                        serving: serving.clone(),
                     },
-                ) {
+                    tx.clone(),
+                    deadline,
+                )) {
                     break;
                 }
             }
@@ -8957,6 +9007,7 @@ async fn handle_connection(
                 }
             }
             Some(EnvelopeMsg::BatchGet(bg)) => {
+                let deadline = deadline_after(runtime_options.forwarded_attempt_timeout);
                 if bg.keys.len() > MAX_WIRE_BATCH_ITEMS {
                     tracing::warn!(
                         item_count = bg.keys.len(),
@@ -8992,98 +9043,26 @@ async fn handle_connection(
                     }
                     continue;
                 }
-                let Some(actor) = router.route_for_fragment(frag) else {
+                let Some((generation, actor)) = router.route_with_generation(frag) else {
                     if !send_batch_get_response(&tx, req_id, Vec::new()) {
                         break;
                     }
                     continue;
                 };
-
-                // Return one exact-byte-bounded ordered prefix. The origin
-                // explicitly requests any suffix, so the socket reader emits
-                // at most one response frame and never blocks on a stream of
-                // pages in both directions.
-                let batch_priority = priority_from_proto(bg.priority);
-                let page = match tokio::time::timeout(
-                    runtime_options.forwarded_attempt_timeout,
-                    actor.call(
-                        |reply| KvMessage::GetBatch {
-                            keys: bg.keys,
-                            response_base_payload_len: batch_get_response_base_encoded_len(req_id),
-                            response_soft_limit: WIRE_BATCH_PAGE_BYTES,
-                            reply,
-                            priority: batch_priority,
-                        },
-                        None,
-                    ),
-                )
-                .await
-                {
-                    Ok(Ok(CallResult::Success(page))) => page,
-                    Ok(Ok(CallResult::Timeout | CallResult::SenderError)) | Ok(Err(_)) | Err(_) => {
-                        // An empty response is explicit unavailability. The
-                        // origin retries this untouched suffix at its next
-                        // configured holder.
-                        if !send_batch_get_response(&tx, req_id, Vec::new()) {
-                            break;
-                        }
-                        continue;
-                    }
-                };
-                let mut results = Vec::new();
-                let mut response_payload_len = batch_get_response_base_encoded_len(req_id);
-                for entry in page.entries {
-                    let key = entry.key;
-                    let (value, shed) = match entry.result {
-                        Ok(value) => (value, false),
-                        Err(_) => (None, true),
-                    };
-                    let (found, bytes, timestamp_ms, node_id, expires_at_ms, is_tombstone) =
-                        match value {
-                            Some(v) => (
-                                true,
-                                v.value,
-                                v.timestamp_ms,
-                                v.node_id,
-                                v.expires_at_ms.unwrap_or(0),
-                                v.is_tombstone,
-                            ),
-                            None => (false, Vec::new(), 0, String::new(), 0, false),
-                        };
-                    let result = BatchKeyValue {
-                        key,
-                        found,
-                        value: bytes,
-                        timestamp_ms,
-                        node_id,
-                        expires_at_ms,
-                        is_tombstone,
-                        shed,
-                    };
-                    let next_payload_len =
-                        response_payload_len + message_field_len(2, result.encoded_len());
-                    let response_len = batch_get_response_envelope_encoded_len(next_payload_len);
-                    if response_len > MAX_FRAME_BYTES {
-                        if !results.is_empty() {
-                            // The current item remains individually retryable.
-                            // Return the prefix instead of sacrificing a healthy
-                            // connection because this aggregate cannot fit.
-                            break;
-                        }
-                        tracing::warn!(
-                            req_id,
-                            response_len,
-                            "single batch-get result exceeds the hard frame limit"
-                        );
-                        break 'connection;
-                    }
-                    response_payload_len = next_payload_len;
-                    results.push(result);
-                    if response_len > WIRE_BATCH_PAGE_BYTES {
-                        break;
-                    }
-                }
-                if !send_batch_get_response(&tx, req_id, results) {
+                let priority = priority_from_proto(bg.priority);
+                if !read_service.try_submit(ReadJob::new(
+                    ReadRequest::Batch(bg),
+                    priority,
+                    ReadRoute {
+                        fragment: frag,
+                        generation,
+                        actor,
+                        router: router.clone(),
+                        serving: serving.clone(),
+                    },
+                    tx.clone(),
+                    deadline,
+                )) {
                     break;
                 }
             }
@@ -9155,6 +9134,7 @@ async fn handle_connection(
         }
     }
 
+    tx.cancel();
     // Connection dropped: forget the peer only if this exact physical channel
     // is still current. Legacy full-replication peers are discovered at
     // runtime, so reap their per-fragment senders on disconnect rather than
@@ -10235,6 +10215,10 @@ mod tests {
                 state.started.notify_one();
                 state.release.notified().await;
                 drop(reply);
+            } else if let KvMessage::GetBatchRetained(request) = message {
+                state.started.notify_one();
+                state.release.notified().await;
+                drop(request);
             }
             Ok(())
         }
@@ -10291,7 +10275,7 @@ mod tests {
         }
     }
 
-    fn test_peer_channel(
+    pub(super) fn test_peer_channel(
         capacity: usize,
     ) -> (
         PeerChannel,
@@ -10391,7 +10375,7 @@ mod tests {
         }
     }
 
-    fn test_connection_context(
+    async fn test_connection_context(
         router: FragmentRouter,
         serving: Arc<RwLock<HashSet<FragmentId>>>,
         placement: Arc<RwLock<HashMap<FragmentId, Vec<String>>>>,
@@ -10401,6 +10385,9 @@ mod tests {
         peers: PeerMap,
     ) -> (ConnContext, Arc<RuntimeTasks>) {
         let tasks = RuntimeTasks::new(8);
+        let read_service = ReadService::start(&tasks, READ_QUEUE_CAPACITY, READ_KEY_BYTE_CAPACITY)
+            .await
+            .expect("test read service started");
         let (peer_changes, _) = watch::channel(0u64);
         (
             ConnContext {
@@ -10418,6 +10405,7 @@ mod tests {
                 peers,
                 peer_failures: PeerFailureSignals::default(),
                 tasks: Arc::downgrade(&tasks),
+                read_service,
                 operation_gate: OperationGate::new(),
                 peer_changes,
                 hlc: Arc::new(Mutex::new(HlcClock::new())),
@@ -11039,6 +11027,8 @@ mod tests {
         assert_eq!(options.receive_byte_capacity(), 64 * 1024 * 1024);
         assert_eq!(options.relay_capacity(), 1024);
         assert_eq!(options.relay_key_byte_capacity(), 64 * 1024 * 1024);
+        assert_eq!(options.serving_read_queue_capacity(), 64);
+        assert_eq!(options.serving_read_key_byte_capacity(), 64 * 1024 * 1024);
         assert_eq!(options.queue_admission_timeout(), Duration::from_secs(5));
         assert_eq!(
             options.reconcile_data_admission_timeout(),
@@ -11069,6 +11059,14 @@ mod tests {
             .with_relay_key_byte_capacity(1)
             .validate()
             .is_ok());
+        for options in [
+            NodeRuntimeOptions::default().with_serving_read_queue_capacity(0),
+            NodeRuntimeOptions::default().with_serving_read_queue_capacity(usize::MAX),
+            NodeRuntimeOptions::default().with_serving_read_key_byte_capacity(MAX_FRAME_BYTES - 1),
+            NodeRuntimeOptions::default().with_serving_read_key_byte_capacity(usize::MAX),
+        ] {
+            assert!(options.validate().is_err());
+        }
         assert!(NodeRuntimeOptions::default()
             .with_socket_write_timeout(Duration::MAX)
             .validate()
@@ -11265,7 +11263,8 @@ mod tests {
             Arc::new(Mutex::new(HashMap::new())),
             Arc::new(Mutex::new(HashMap::new())),
             peers.clone(),
-        );
+        )
+        .await;
         ctx.receive_byte_budget = budget.clone();
         ctx.runtime_options = NodeRuntimeOptions::default()
             .with_receive_byte_capacity(capacity)
@@ -11700,7 +11699,8 @@ mod tests {
                 senders,
                 sender_reports,
                 peers.clone(),
-            );
+            )
+            .await;
             let (mut client, server) = tokio::io::duplex(4096);
             let connection =
                 tokio::spawn(handle_connection(ctx, Box::pin(server), false, None, None));
@@ -11784,7 +11784,8 @@ mod tests {
                 senders.clone(),
                 sender_reports,
                 peers.clone(),
-            );
+            )
+            .await;
             let (mut client, server) = tokio::io::duplex(4096);
             let connection =
                 tokio::spawn(handle_connection(ctx, Box::pin(server), false, None, None));
@@ -11937,7 +11938,8 @@ mod tests {
                 senders.clone(),
                 sender_reports.clone(),
                 peers.clone(),
-            );
+            )
+            .await;
             let captured = Arc::new(Notify::new());
             let resume = Arc::new(Notify::new());
             ctx.sender_snapshot_hook = Some(SenderSnapshotHook {
@@ -12073,7 +12075,8 @@ mod tests {
                 senders,
                 sender_reports,
                 peers.clone(),
-            );
+            )
+            .await;
             let (mut client, server) = tokio::io::duplex(4096);
             let connection =
                 tokio::spawn(handle_connection(ctx, Box::pin(server), false, None, None));
@@ -12148,7 +12151,8 @@ mod tests {
                 Arc::new(Mutex::new(HashMap::new())),
                 Arc::new(Mutex::new(HashMap::new())),
                 peers.clone(),
-            );
+            )
+            .await;
             let (mut client, server) = tokio::io::duplex(4096);
             let connection =
                 tokio::spawn(handle_connection(ctx, Box::pin(server), false, None, None));
@@ -12223,6 +12227,101 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn blocked_serving_reads_do_not_stall_pending_replies_on_same_connection() {
+        for batch in [false, true] {
+            let fragment = FragmentId(0);
+            let router = FragmentRouter::new(1, 0);
+            let started = Arc::new(Notify::new());
+            let release = Arc::new(Notify::new());
+            let (actor, _) = ractor::Actor::spawn(
+                None,
+                BlockingPageActor,
+                BlockingPageState {
+                    started: started.clone(),
+                    release: release.clone(),
+                },
+            )
+            .await
+            .unwrap();
+            router.insert(fragment, actor.clone());
+            let (mut ctx, runtime_tasks) = test_connection_context(
+                router,
+                Arc::new(RwLock::new(HashSet::from([fragment]))),
+                Arc::new(RwLock::new(HashMap::new())),
+                true,
+                Arc::new(Mutex::new(HashMap::new())),
+                Arc::new(Mutex::new(HashMap::new())),
+                Arc::new(Mutex::new(HashMap::new())),
+            )
+            .await;
+            ctx.runtime_options = NodeRuntimeOptions::default()
+                .with_forwarded_attempt_timeout(Duration::from_secs(10));
+            let receive_byte_budget = ctx.receive_byte_budget.clone();
+            let (reply, completed) = oneshot::channel();
+            ctx.pending_gets.lock().unwrap().insert(
+                99,
+                PendingGet {
+                    expected_peer: "peer".into(),
+                    expected_key: "reply-key".into(),
+                    reply,
+                },
+            );
+            let (mut client, server) = tokio::io::duplex(4096);
+            let connection =
+                tokio::spawn(handle_connection(ctx, Box::pin(server), false, None, None));
+            complete_test_handshake(&mut client, "peer").await;
+            let request = if batch {
+                EnvelopeMsg::BatchGet(BatchGet {
+                    req_id: 1,
+                    keys: vec!["held".into()],
+                    priority: ProtoPriority::Background as i32,
+                })
+            } else {
+                EnvelopeMsg::ForwardedGet(ForwardedGet {
+                    req_id: 1,
+                    key: "held".into(),
+                    priority: ProtoPriority::Background as i32,
+                    hops: 0,
+                })
+            };
+            write_test_envelope(&mut client, Envelope { msg: Some(request) }).await;
+            tokio::time::timeout(Duration::from_secs(1), started.notified())
+                .await
+                .unwrap();
+            write_test_envelope(
+                &mut client,
+                Envelope {
+                    msg: Some(EnvelopeMsg::GetResponse(GetResponse {
+                        req_id: 99,
+                        ..GetResponse::default()
+                    })),
+                },
+            )
+            .await;
+            assert!(tokio::time::timeout(Duration::from_secs(1), completed)
+                .await
+                .expect("serving read blocked a pending reply on its physical connection")
+                .unwrap()
+                .unwrap()
+                .is_none());
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while receive_byte_budget.available_permits() != RECEIVE_BYTE_CAPACITY {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("decoded read job retained the raw receive body permit");
+            // Cancel while the actor still owns the request, rather than
+            // relying on its ten-second deadline to release the socket reader.
+            connection.abort();
+            assert!(connection.await.unwrap_err().is_cancelled());
+            release.notify_one();
+            actor.stop_and_wait(None, None).await.unwrap();
+            runtime_tasks.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
     async fn batch_actor_timeout_returns_unavailable_without_stalling_shared_connection() {
         let fragment = FragmentId(0);
         let router = FragmentRouter::new(2, 0);
@@ -12248,7 +12347,8 @@ mod tests {
             Arc::new(Mutex::new(HashMap::new())),
             Arc::new(Mutex::new(HashMap::new())),
             peers.clone(),
-        );
+        )
+        .await;
         ctx.runtime_options =
             NodeRuntimeOptions::default().with_forwarded_attempt_timeout(Duration::from_millis(50));
         let (mut client, server) = tokio::io::duplex(4096);
@@ -12337,7 +12437,8 @@ mod tests {
             Arc::new(Mutex::new(HashMap::new())),
             Arc::new(Mutex::new(HashMap::new())),
             peers.clone(),
-        );
+        )
+        .await;
         let (mut client, server) = tokio::io::duplex(4096);
         let connection = tokio::spawn(handle_connection(ctx, Box::pin(server), false, None, None));
         complete_test_handshake(&mut client, "peer").await;
@@ -12506,7 +12607,8 @@ mod tests {
             senders.clone(),
             reports.clone(),
             peers.clone(),
-        );
+        )
+        .await;
         ctx.node_id = "local".to_string();
 
         let (mut client, server) = tokio::io::duplex(4096);
@@ -12560,7 +12662,8 @@ mod tests {
             senders.clone(),
             reports.clone(),
             peers.clone(),
-        );
+        )
+        .await;
 
         for index in 0..3 {
             let peer = format!("ephemeral-peer-{index}");
@@ -13469,7 +13572,8 @@ mod tests {
             Arc::new(Mutex::new(HashMap::new())),
             Arc::new(Mutex::new(HashMap::new())),
             peers,
-        );
+        )
+        .await;
         ctx.pending_gets = pending_gets.clone();
         ctx.pending_relays = relays.clone();
         let (mut owner, owner_server) = tokio::io::duplex(4096);

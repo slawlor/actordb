@@ -4,9 +4,8 @@ Every fragment runs **three isolated worker pools** instead of one shared pool.
 Operations are classified by `OpPriority` and each pool has its own workers,
 worker backlog, rate limiter, and shed counter. Bulk work cannot consume the
 workers or queue capacity reserved for latency-sensitive traffic. The
-dispatcher mailbox and each peer connection reader remain shared serialization
-points, so this is worker isolation rather than a strict end-to-end priority
-scheduler.
+dispatcher mailbox and peer framing/writer lanes remain shared, so this is
+worker isolation rather than a strict end-to-end priority scheduler.
 
 ## Priorities
 
@@ -155,6 +154,32 @@ that fence, and joins every worker before the final fragment flush. Replacing
 the remaining custom lifecycle with ractor `Factory` admission and an explicit
 discard/requeue policy is still required for lossless restart.
 
+## Node-owned serving reads
+
+Serving `ForwardedGet` and `BatchGet` jobs leave the socket reader through
+three independent Node-wide priority queues. Each class defaults to 64 queued
+jobs, eight fixed workers, and a separate 64 MiB decoded-key-byte budget.
+Admission is nonwaiting: capacity exhaustion returns explicit shed (one ordered
+position for a batch); unavailable actors/routes return an empty batch prefix
+or silence for the legacy single-read protocol. The configured forwarded
+attempt deadline includes queue wait and actor wait, without resetting on
+dequeue. Responses use the request's exact physical channel, and stale route
+incarnations cannot publish authoritative reads.
+
+Count admission includes queued, executing, and actor-retained requests. An
+opaque lease follows keys into the actor continuation, so timeout or socket
+cancellation cannot admit new keys while the old actor still owns them. Raw
+receive bodies and their permits drop with the nonwaiting reader turn, rather
+than following the decoded job; the separate key-storage lease follows it. Raw
+frame bodies, returned values, cache storage, and encoded writer queues are
+separate allocations, not covered by this decoded-key budget. The storage charge
+includes String buffer capacities, Vec capacity times String header size, and
+the Vec header, including spare capacity; fixed job metadata and allocator
+overhead are excluded and count-limited. At most 24 read
+workers build responses concurrently; existing per-connection frame/byte
+queues bound encoded output separately. This is not a Node-wide total response
+or heap guarantee. Service admission sheds are not fragment-pool shed counts.
+
 ## Observability
 
 `FragmentHealth.shed_counts` is `(u64, u64, u64)` ordered
@@ -171,9 +196,11 @@ work no longer blocks the dispatcher from admitting a high-priority request or
 serving health/supervision messages. An actor-routed batch read follows the
 same rule: only the current key occupies a worker, and the dispatcher never
 awaits it. The shared dispatcher ingress, cache locks, snapshot/flush handlers,
-and peer connection reader are not isolated. The peer reader applies a bounded
-actor-attempt timeout to a batch read, but it still performs the successful
-prefix inline; structured request workers remain a separate improvement.
+and peer framing/writer lanes are not isolated. Serving single/batch read
+execution is isolated by the Node-wide service above, keeping ACK and response
+traffic moving while those actors are slow. Mutation, replication, and
+reconciliation handlers still await work inline and can stall their connection
+reader; this slice does not make every protocol handler independently scheduled.
 Replication sender lookup also uses a node-global registry, but its critical
 section is limited to map lookup/filtering and cloning cheap exact-task
 handles. Potentially large mutation payload clones, bounded sender-mailbox

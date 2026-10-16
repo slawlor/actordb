@@ -275,6 +275,39 @@ pub struct BatchReadPage {
     pub entries: Vec<BatchReadEntry>,
 }
 
+/// Internal read request which retains admission ownership while actors hold
+/// its keys. Public only because [`KvMessage`] is public; it has no public
+/// constructor and does not change direct [`KvMessage::GetBatch`] calls.
+#[doc(hidden)]
+pub struct RetainedBatchRead {
+    pub(crate) keys: Vec<String>,
+    pub(crate) response_base_payload_len: usize,
+    pub(crate) response_soft_limit: usize,
+    pub(crate) reply: RpcReplyPort<BatchReadPage>,
+    pub(crate) priority: OpPriority,
+    pub(crate) retention: Arc<dyn Send + Sync>,
+}
+
+impl RetainedBatchRead {
+    pub(crate) fn new(
+        keys: Vec<String>,
+        response_base_payload_len: usize,
+        response_soft_limit: usize,
+        reply: RpcReplyPort<BatchReadPage>,
+        priority: OpPriority,
+        retention: Arc<dyn Send + Sync>,
+    ) -> Self {
+        Self {
+            keys,
+            response_base_payload_len,
+            response_soft_limit,
+            reply,
+            priority,
+            retention,
+        }
+    }
+}
+
 /// Opaque continuation passed between a fragment dispatcher and its exact
 /// sticky worker. It is public only because [`KvMessage`] is public; direct
 /// callers cannot construct it and should use [`KvMessage::GetBatch`].
@@ -288,6 +321,7 @@ pub struct BatchReadContinuation {
     priority: OpPriority,
     reply: RpcReplyPort<BatchReadPage>,
     dispatcher: ActorRef<KvMessage>,
+    _retention: Option<Arc<dyn Send + Sync>>,
 }
 
 // Keep actor-owned summary clones bounded before the network layer adds
@@ -417,6 +451,9 @@ pub enum KvMessage {
     /// Internal worker-to-dispatcher continuation for [`KvMessage::GetBatch`].
     #[doc(hidden)]
     ContinueBatchRead(BatchReadContinuation),
+    /// Internal Node read admission ownership, retained through actor work.
+    #[doc(hidden)]
+    GetBatchRetained(RetainedBatchRead),
     /// Read the full local copy for compatibility and diagnostics. The wire
     /// reconciler uses bounded summary pages and exact-key reads instead.
     GetAll {
@@ -482,7 +519,13 @@ impl BatchReadContinuation {
             priority,
             reply,
             dispatcher,
+            _retention: None,
         }
+    }
+
+    fn with_retention(mut self, retention: Arc<dyn Send + Sync>) -> Self {
+        self._retention = Some(retention);
+        self
     }
 
     fn current_key(&self) -> Option<&str> {
@@ -1129,6 +1172,29 @@ impl Actor for KvWorker {
     }
 }
 
+async fn serve_worker_batch(
+    shared: &FragmentState,
+    keys: Vec<String>,
+    response_base_payload_len: usize,
+    response_soft_limit: usize,
+    reply: RpcReplyPort<BatchReadPage>,
+) {
+    let mut entries = Vec::with_capacity(keys.len().min(256));
+    let mut response_sizing = RepeatedFieldSizer::new(17, 2, response_base_payload_len);
+    for key in keys {
+        let value = shared.get(&key).await;
+        response_sizing.push(batch_get_result_encoded_len(&key, value.as_ref(), false));
+        entries.push(BatchReadEntry {
+            key,
+            result: Ok(value),
+        });
+        if response_sizing.encoded_len() > response_soft_limit {
+            break;
+        }
+    }
+    let _ = reply.send(BatchReadPage { entries });
+}
+
 async fn handle_worker_message(
     shared: &Arc<FragmentState>,
     message: KvMessage,
@@ -1187,21 +1253,26 @@ async fn handle_worker_message(
             // pool admission, so serve the same ordered byte-bounded shape
             // directly. Production `KvActor` routes one admitted key at a
             // time through `ContinueBatchRead` below.
-            let mut entries = Vec::with_capacity(keys.len().min(256));
-            let mut response_sizing = RepeatedFieldSizer::new(17, 2, response_base_payload_len);
-            for key in keys {
-                let value = shared.get(&key).await;
-                let result_payload_len = batch_get_result_encoded_len(&key, value.as_ref(), false);
-                response_sizing.push(result_payload_len);
-                entries.push(BatchReadEntry {
-                    key,
-                    result: Ok(value),
-                });
-                if response_sizing.encoded_len() > response_soft_limit {
-                    break;
-                }
-            }
-            let _ = reply.send(BatchReadPage { entries });
+            serve_worker_batch(
+                shared,
+                keys,
+                response_base_payload_len,
+                response_soft_limit,
+                reply,
+            )
+            .await;
+            Ok(())
+        }
+        KvMessage::GetBatchRetained(request) => {
+            let _retention = request.retention;
+            serve_worker_batch(
+                shared,
+                request.keys,
+                request.response_base_payload_len,
+                request.response_soft_limit,
+                request.reply,
+            )
+            .await;
             Ok(())
         }
         KvMessage::ContinueBatchRead(mut work) => {
@@ -2000,6 +2071,22 @@ impl Actor for KvActor {
                 route_batch_read(work, state).await;
                 Ok(())
             }
+            KvMessage::GetBatchRetained(request) => {
+                route_batch_read(
+                    BatchReadContinuation::new(
+                        request.keys,
+                        request.response_base_payload_len,
+                        request.response_soft_limit,
+                        request.priority,
+                        request.reply,
+                        myself,
+                    )
+                    .with_retention(request.retention),
+                    state,
+                )
+                .await;
+                Ok(())
+            }
             KvMessage::Flush { reply } => {
                 let result = state
                     .shared
@@ -2701,7 +2788,32 @@ mod tests {
         else {
             panic!("direct worker did not return the resumed suffix");
         };
-        assert_eq!(second.entries, vec![present, missing]);
+        assert_eq!(second.entries, vec![present.clone(), missing]);
+
+        let retention = Arc::new(());
+        let released = Arc::downgrade(&retention);
+        let retained = worker
+            .call(
+                move |reply| {
+                    KvMessage::GetBatchRetained(RetainedBatchRead::new(
+                        vec!["present".to_string(), "m".to_string()],
+                        response_base_payload_len,
+                        singleton_response_len - 1,
+                        reply,
+                        OpPriority::Background,
+                        retention,
+                    ))
+                },
+                Some(Duration::from_secs(2)),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            retained,
+            CallResult::Success(BatchReadPage {
+                entries: vec![present]
+            })
+        );
 
         let empty = read(Vec::new(), 0).await.unwrap();
         assert_eq!(
@@ -2709,6 +2821,10 @@ mod tests {
             CallResult::Success(BatchReadPage {
                 entries: Vec::new()
             })
+        );
+        assert!(
+            released.upgrade().is_none(),
+            "low-level worker retained a completed request lease"
         );
         worker.stop(None);
         handle.await.unwrap();
@@ -3164,6 +3280,84 @@ mod worker_pool_tests {
 
         dispatcher.drain().unwrap();
         dispatcher.wait(None).await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn retained_batch_lease_survives_cancellation_until_sticky_worker_drops_keys() {
+        for kill in [false, true] {
+            let shared = Arc::new(FragmentState::new(
+                HashMap::new(),
+                None,
+                100,
+                Duration::from_secs(3600),
+            ));
+            let pool = pool_config(1, None);
+            let prefix = unique_prefix("retained-batch");
+            let key = format!("{prefix}-blocked");
+            let suffix = format!("{prefix}-suffix");
+            let gate = install_worker_get_gate(key.clone());
+            let suffix_gate = install_worker_get_gate(suffix.clone());
+            let (dispatcher, _) = KvActor::spawn(
+                None,
+                KvActor,
+                KvArgs {
+                    shared,
+                    fragment: FragmentId(0),
+                    worker_prefix: prefix.clone(),
+                    default_pool: pool.clone(),
+                    high_pool: pool.clone(),
+                    background_pool: pool,
+                },
+            )
+            .await
+            .unwrap();
+            let retention = Arc::new(());
+            let retained = Arc::downgrade(&retention);
+            let batch_dispatcher = dispatcher.clone();
+            let batch = tokio::spawn(async move {
+                batch_dispatcher
+                    .call(
+                        move |reply| {
+                            KvMessage::GetBatchRetained(RetainedBatchRead::new(
+                                vec![key, suffix],
+                                0,
+                                usize::MAX,
+                                reply,
+                                OpPriority::Default,
+                                retention,
+                            ))
+                        },
+                        None,
+                    )
+                    .await
+            });
+            tokio::time::timeout(Duration::from_secs(2), gate.entered.notified())
+                .await
+                .unwrap();
+            batch.abort();
+            assert!(batch.await.unwrap_err().is_cancelled());
+            assert!(
+                retained.upgrade().is_some(),
+                "cancellation freed actor-owned admission"
+            );
+            if kill {
+                where_is(format!("{prefix}-default-worker-0"))
+                    .unwrap()
+                    .kill();
+            } else {
+                gate.release.notify_one();
+            }
+            wait_for(|| retained.upgrade().is_none()).await;
+            assert!(
+                tokio::time::timeout(Duration::from_millis(10), suffix_gate.entered.notified())
+                    .await
+                    .is_err(),
+                "cancelled request admitted its untouched suffix"
+            );
+            take_worker_get_gate(&format!("{prefix}-suffix"));
+            dispatcher.drain().unwrap();
+            dispatcher.wait(None).await.unwrap();
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -44,6 +44,8 @@ async fn main() -> Result<(), actordb::node::NodeError> {
       .with_receive_byte_capacity(128 * 1024 * 1024)
       .with_relay_capacity(1024)
       .with_relay_key_byte_capacity(64 * 1024 * 1024)
+      .with_serving_read_queue_capacity(64)
+      .with_serving_read_key_byte_capacity(64 * 1024 * 1024)
       .with_queue_admission_timeout(Duration::from_secs(2))
       .with_reconcile_data_admission_timeout(Duration::from_secs(20))
       .with_forwarded_attempt_timeout(Duration::from_secs(8))
@@ -68,8 +70,14 @@ async fn main() -> Result<(), actordb::node::NodeError> {
   handshakes. It reserves bytes before allocation and retains them through
   decoding and the handler turn; saturation closes only that connection.
   Protobuf decoding and actor/cache/relay/caller copies allocate separately,
-  so this is not a total-memory limit. Queue
-  admission, a forwarded owner attempt, a dial, and the complete two-flight
+  so this is not a total-memory limit.
+  Serving single/batch reads have three Node-wide queues
+  (64 jobs and eight fixed workers per priority) and a separate 64 MiB key-storage
+  budget per priority, held through actor ownership after waiter cancellation.
+  String buffer capacities and Vec/String headers are charged; fixed job and
+  allocator overhead, values, raw receive bodies, and encoded writer queues are
+  excluded. Its configured minimum is 16 MiB. Queue admission, a forwarded
+  owner attempt, a dial, and the complete two-flight
   handshake each default to 5 seconds. Frame-body reads after a prefix, complete
   frame writes, and acceptable ordinary replication ACKs each default to 30
   seconds. Idle established connections have no read deadline until a prefix
