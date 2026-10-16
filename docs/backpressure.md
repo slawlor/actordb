@@ -85,9 +85,13 @@ Shed behavior by operation:
 Wire-size admission is a separate safety boundary from queue depth. Before a
 mutation is applied locally, actordb verifies that the record can fit every
 required single-record protocol envelope. Summary, fetch, data, repair, and
-ordinary replication builders then measure exact encoded size, target 1 MiB
-pages, and enforce a 16 MiB hard frame limit. This prevents an irreducible
-record from wedging replication. The 256-frame peer queue is complemented by
+ordinary replication builders maintain incremental protobuf size accounting
+from exact repeated-field deltas instead of rescanning each growing page.
+Fetch chunks conservatively reserve the largest sequence id, and data pages
+reserve the terminal `done` field before admitting entries. Every completed
+envelope is still preflighted with Prost before admission and encoding; pages
+target 1 MiB and the 16 MiB hard frame limit remains authoritative. This
+prevents an irreducible record from wedging replication. The 256-frame peer queue is complemented by
 an independent 32 MiB default encoded-byte budget (configurable through
 `NodeRuntimeOptions`). Its frame slots are split evenly between ordinary data
 and a writer-priority response lane. Ordinary producers also leave one full

@@ -36,7 +36,8 @@
 //!   Shipping full batches immediately should lower this floor.
 //! * This bench polls `b` every 10 ms, so measurements have ~10 ms of
 //!   quantization noise — compare runs, not absolute values, below ~50 ms.
-//! * `buffered_catchup` uses fresh nodes per sample and a 1 ms batch interval.
+//! * `buffered_catchup` uses fresh nodes per measured iteration and a 1 ms
+//!   batch interval.
 //!   Setup, preload, verification, and shutdown are outside its reported
 //!   duration; connection establishment and the receiver apply remain inside.
 

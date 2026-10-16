@@ -228,9 +228,15 @@ before the barrier can certify it.
 Valid entries are merged locally at `OpPriority::Default`. Stale responses are
 ignored, and LWW makes a retried exchange idempotent.
 
-Summary, fetch, data, repair, and ordinary replication builders measure the
-exact encoded protobuf envelope. They target 1 MiB pages; a single valid record
-may exceed that soft target, but no frame may exceed the 16 MiB hard limit.
+Summary, fetch, data, repair, and ordinary replication builders maintain an
+encoded protobuf bound incrementally from exact or conservative fixed metadata
+plus exact repeated-field deltas. A completed envelope still receives an
+authoritative Prost preflight before queue admission and encoding. Data-page
+accounting reserves the terminal `done=true` field on every candidate, so
+setting it cannot push a final page across the target. Builders target 1 MiB
+pages; a single valid
+record may exceed that soft target, but no frame may exceed the 16 MiB hard
+limit.
 One credit shared by all fragment senders on a physical connection admits one
 complete reconciliation round at a time. Credit release wakes queued retries;
 this bounds responder work without a fragment-count-dependent queue cliff.

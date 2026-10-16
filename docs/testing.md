@@ -175,6 +175,14 @@ and cross-fragment contention regressions without turning sender overflow
 recovery into the measured workload. Fixed key sets keep retained cache memory
 bounded across Criterion's calibrated iterations.
 
+`actordb/benches/replication.rs` also has a low-timer `buffered_catchup`
+group. Each measured iteration preloads 64/256/1024/4096 compact records into a
+disconnected sender, then measures connect through its observed ACK on fresh
+storeless nodes with a 1 ms sender tick. Preload, verification, and shutdown
+are outside the reported duration. This exercises production batch
+construction without the default 100 ms floor and catches a return of
+quadratic whole-message protobuf sizing.
+
 ## Docker multi-node scenarios (`docker-tests/`)
 
 The `docker-tests` crate builds real container images and runs scripted

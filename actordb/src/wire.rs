@@ -562,7 +562,7 @@ pub(crate) fn varint_field_len(field: u32, value: u64) -> usize {
     if value == 0 {
         0
     } else {
-        tag_len(field, 0) + varint_len(value)
+        tag_len(field, 0).saturating_add(varint_len(value))
     }
 }
 
@@ -570,12 +570,59 @@ pub(crate) fn bytes_field_len(field: u32, payload_len: usize) -> usize {
     if payload_len == 0 {
         0
     } else {
-        tag_len(field, 2) + varint_len(payload_len as u64) + payload_len
+        tag_len(field, 2)
+            .saturating_add(varint_len(payload_len as u64))
+            .saturating_add(payload_len)
     }
 }
 
 pub(crate) fn message_field_len(field: u32, payload_len: usize) -> usize {
-    tag_len(field, 2) + varint_len(payload_len as u64) + payload_len
+    tag_len(field, 2)
+        .saturating_add(varint_len(payload_len as u64))
+        .saturating_add(payload_len)
+}
+
+/// Exact size of one envelope message whose payload contains a repeated
+/// length-delimited field. The fixed payload is measured once; each string,
+/// bytes, or nested-message item then contributes only its own field length.
+/// This keeps page construction linear without changing Prost's wire size.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RepeatedFieldSizer {
+    envelope_field: u32,
+    item_field: u32,
+    payload_len: usize,
+}
+
+impl RepeatedFieldSizer {
+    pub(crate) fn new(envelope_field: u32, item_field: u32, base_payload_len: usize) -> Self {
+        Self {
+            envelope_field,
+            item_field,
+            payload_len: base_payload_len,
+        }
+    }
+
+    pub(crate) fn encoded_len(&self) -> usize {
+        message_field_len(self.envelope_field, self.payload_len)
+    }
+
+    pub(crate) fn encoded_len_with(&self, item_payload_len: usize) -> usize {
+        let payload_len = self
+            .payload_len
+            .saturating_add(message_field_len(self.item_field, item_payload_len));
+        message_field_len(self.envelope_field, payload_len)
+    }
+
+    pub(crate) fn push(&mut self, item_payload_len: usize) -> usize {
+        self.payload_len = self
+            .payload_len
+            .saturating_add(message_field_len(self.item_field, item_payload_len));
+        self.encoded_len()
+    }
+
+    pub(crate) fn reset(&mut self, base_payload_len: usize) {
+        self.payload_len = base_payload_len;
+    }
 }
 
 fn max_u64_field_len(field: u32) -> usize {
@@ -753,9 +800,10 @@ mod tests {
     use super::*;
     use crate::actor::VersionedValue;
     use crate::proto::{
-        BatchGetResponse, BatchKeyValue, BatchPut, EnvelopeMsg, ForwardedPut, KeySummary,
-        MutationResponse, MutationResult, MutationStatus, ReconcileData, ReconcileResponse,
-        ReplicateBatch, ReplicateOp as ProtoReplicateOp, ReplicationAckLevel, SyncEntry,
+        BatchGet, BatchGetResponse, BatchKeyValue, BatchPut, EnvelopeMsg, ForwardedPut, KeySummary,
+        MutationResponse, MutationResult, MutationStatus, ReconcileData, ReconcileFetch,
+        ReconcileResponse, ReplicateBatch, ReplicateOp as ProtoReplicateOp, ReplicationAckLevel,
+        SyncEntry,
     };
 
     fn data_envelope(value_len: usize) -> Envelope {
@@ -841,6 +889,176 @@ mod tests {
 
         assert_eq!(encode_envelope(&envelope).unwrap(), direct);
         assert!(preflight_envelope_decode(&direct).is_ok());
+    }
+
+    fn assert_single_repeated_item_size(
+        envelope_field: u32,
+        item_field: u32,
+        base_payload_len: usize,
+        item_payload_len: usize,
+        envelope: Envelope,
+    ) {
+        let mut sizing = RepeatedFieldSizer::new(envelope_field, item_field, base_payload_len);
+        assert_eq!(
+            sizing.encoded_len_with(item_payload_len),
+            envelope.encoded_len()
+        );
+        assert_eq!(sizing.push(item_payload_len), envelope.encoded_len());
+        sizing.reset(base_payload_len);
+        assert_eq!(
+            sizing.encoded_len_with(item_payload_len),
+            envelope.encoded_len()
+        );
+    }
+
+    #[test]
+    fn repeated_field_sizer_matches_every_batched_envelope_tag() {
+        let op = ProtoReplicateOp::default();
+        assert_single_repeated_item_size(
+            9,
+            4,
+            ReplicateBatch::default().encoded_len(),
+            op.encoded_len(),
+            Envelope {
+                msg: Some(EnvelopeMsg::ReplicateBatch(ReplicateBatch {
+                    ops: vec![op],
+                    ..ReplicateBatch::default()
+                })),
+            },
+        );
+
+        let summary = KeySummary::default();
+        assert_single_repeated_item_size(
+            12,
+            2,
+            ReconcileResponse::default().encoded_len(),
+            summary.encoded_len(),
+            Envelope {
+                msg: Some(EnvelopeMsg::ReconcileResponse(ReconcileResponse {
+                    summaries: vec![summary],
+                    ..ReconcileResponse::default()
+                })),
+            },
+        );
+
+        assert_single_repeated_item_size(
+            13,
+            2,
+            ReconcileFetch::default().encoded_len(),
+            0,
+            Envelope {
+                msg: Some(EnvelopeMsg::ReconcileFetch(ReconcileFetch {
+                    keys: vec![String::new()],
+                    ..ReconcileFetch::default()
+                })),
+            },
+        );
+
+        let entry = SyncEntry::default();
+        assert_single_repeated_item_size(
+            14,
+            2,
+            ReconcileData::default().encoded_len(),
+            entry.encoded_len(),
+            Envelope {
+                msg: Some(EnvelopeMsg::ReconcileData(ReconcileData {
+                    entries: vec![entry],
+                    ..ReconcileData::default()
+                })),
+            },
+        );
+
+        let put = ForwardedPut::default();
+        assert_single_repeated_item_size(
+            15,
+            1,
+            BatchPut::default().encoded_len(),
+            put.encoded_len(),
+            Envelope {
+                msg: Some(EnvelopeMsg::BatchPut(BatchPut {
+                    puts: vec![put],
+                    ..BatchPut::default()
+                })),
+            },
+        );
+
+        assert_single_repeated_item_size(
+            16,
+            2,
+            BatchGet::default().encoded_len(),
+            0,
+            Envelope {
+                msg: Some(EnvelopeMsg::BatchGet(BatchGet {
+                    keys: vec![String::new()],
+                    ..BatchGet::default()
+                })),
+            },
+        );
+
+        let value = BatchKeyValue::default();
+        assert_single_repeated_item_size(
+            17,
+            2,
+            BatchGetResponse::default().encoded_len(),
+            value.encoded_len(),
+            Envelope {
+                msg: Some(EnvelopeMsg::BatchGetResponse(BatchGetResponse {
+                    results: vec![value],
+                    ..BatchGetResponse::default()
+                })),
+            },
+        );
+
+        let result = MutationResult::default();
+        assert_single_repeated_item_size(
+            18,
+            2,
+            MutationResponse::default().encoded_len(),
+            result.encoded_len(),
+            Envelope {
+                msg: Some(EnvelopeMsg::MutationResponse(MutationResponse {
+                    results: vec![result],
+                    ..MutationResponse::default()
+                })),
+            },
+        );
+    }
+
+    #[test]
+    fn repeated_string_sizer_matches_prost_at_varint_boundaries() {
+        let mut request = ReconcileFetch {
+            fragment: u32::MAX,
+            keys: Vec::new(),
+            session_id: u64::MAX,
+            round_id: u64::MAX,
+            chunk_seq: u64::MAX,
+        };
+        let base_payload_len = request.encoded_len();
+        let mut sizing = RepeatedFieldSizer::new(13, 2, base_payload_len);
+        assert_eq!(
+            sizing.encoded_len(),
+            Envelope {
+                msg: Some(EnvelopeMsg::ReconcileFetch(request.clone()))
+            }
+            .encoded_len()
+        );
+
+        for item_len in [0, 1, 127, 128, 16_383, 16_384, 2_097_151, 2_097_152] {
+            let key = "k".repeat(item_len);
+            let predicted = sizing.encoded_len_with(item_len);
+            request.keys.push(key);
+            let actual = Envelope {
+                msg: Some(EnvelopeMsg::ReconcileFetch(request.clone())),
+            }
+            .encoded_len();
+            assert_eq!(predicted, actual, "item length {item_len}");
+            assert_eq!(sizing.push(item_len), actual, "item length {item_len}");
+        }
+
+        sizing.reset(usize::MAX);
+        assert_eq!(sizing.encoded_len(), usize::MAX);
+        assert_eq!(sizing.encoded_len_with(1), usize::MAX);
+        assert_eq!(sizing.push(1), usize::MAX);
     }
 
     #[test]
