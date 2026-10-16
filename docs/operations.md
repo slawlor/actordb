@@ -140,6 +140,13 @@ Ordinary queue admission defaults to 5 seconds; streamed reconciliation-data
 pages use the separate 30-second `reconcile_data_admission_timeout` so large
 legal frames do not churn an otherwise healthy slow connection. Configured
 frame capacity must be at least two and byte capacity at least 32 MiB.
+Incoming raw bodies share a separate node-wide 64 MiB receive budget, including
+handshake and outbound-dialed connections. Admission reserves the announced
+body before allocation; saturation closes only the contributing connection.
+Tune `with_receive_byte_capacity` for concurrent large frames (minimum 16 MiB).
+Reservations release after the handler turn or on error/cancellation. This
+counts encoded bodies only; decoded values, actor/relay queues, caches, kernel
+buffers, and caller results remain separate memory consumers.
 
 ### Peer startup, identity, and duplicate connections
 

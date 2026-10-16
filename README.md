@@ -178,6 +178,7 @@ let runtime = NodeRuntimeOptions::default()
     .with_peer_queue_byte_capacity(64 * 1024 * 1024)
     .with_replication_control_message_capacity(128)
     .with_inbound_connection_capacity(512)
+    .with_receive_byte_capacity(128 * 1024 * 1024)
     .with_queue_admission_timeout(Duration::from_secs(2))
     .with_reconcile_data_admission_timeout(Duration::from_secs(20))
     .with_forwarded_attempt_timeout(Duration::from_secs(8))
@@ -197,8 +198,13 @@ let node = Node::start_with_options(
 ```
 
 The defaults are a 256-frame queue per peer, 64 protocol-control messages per
-fragment/peer sender, and at most 1024 concurrent inbound handshakes or
-connections. Queue admission, a complete forwarded owner attempt, one dial,
+fragment/peer sender, at most 1024 concurrent inbound handshakes or
+connections, and a node-wide 64 MiB raw receive-body budget. Accepted and
+outbound-dialed connections reserve body bytes before allocation, including
+handshake frames; saturation closes only the contributing connection. Permits
+remain attached through decoding and the handler turn. This counts encoded
+bodies, not protobuf/actor/cache copies or total process memory. Queue
+admission, a complete forwarded owner attempt, one dial,
 and the absolute two-flight handshake each have 5-second deadlines. Reading a
 frame body after its length prefix and writing a complete frame each have a
 30-second deadline; an idle established connection has no read deadline until

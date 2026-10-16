@@ -140,6 +140,10 @@ const MAX_LOCAL_BATCH_IN_FLIGHT: usize = 1024;
 const REPLICATION_CONTROL_CHANNEL_DEPTH: usize = 64;
 /// Concurrent inbound sockets admitted to handshake/connection processing.
 const INBOUND_CONNECTION_CAPACITY: usize = 1024;
+/// Node-wide raw receive bodies, including handshakes and outbound-dialed
+/// connections. Four maximum frames fit without allowing the socket count to
+/// multiply incomplete-body allocations into gigabytes.
+const RECEIVE_BYTE_CAPACITY: usize = 64 * 1024 * 1024;
 /// Total budget for both flights of the peer handshake.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Internal task-registration queue. Registration applies backpressure and is
@@ -757,6 +761,7 @@ struct ConnContext {
     sender_config: SenderConfig,
     sender_runtime: SenderRuntimeOptions,
     runtime_options: NodeRuntimeOptions,
+    receive_byte_budget: Arc<Semaphore>,
     sender_reports: SenderReportMap,
     /// Notify the placement driver on peer join/leave. `None` in
     /// static mode.
@@ -1795,6 +1800,7 @@ pub struct Node {
     placement_tasks: Arc<RuntimeTasks>,
     tasks: Arc<RuntimeTasks>,
     inbound_connections: Arc<Semaphore>,
+    receive_byte_budget: Arc<Semaphore>,
     dial_intents: Arc<StdMutex<HashMap<SocketAddr, DialIntentState>>>,
     dial_intent_changes: watch::Sender<u64>,
     peer_changes: watch::Sender<u64>,
@@ -2533,6 +2539,7 @@ pub struct NodeRuntimeOptions {
     peer_queue_byte_capacity: usize,
     replication_control_message_capacity: usize,
     inbound_connection_capacity: usize,
+    receive_byte_capacity: usize,
     queue_admission_timeout: Duration,
     reconcile_data_admission_timeout: Duration,
     forwarded_attempt_timeout: Duration,
@@ -2550,6 +2557,7 @@ impl Default for NodeRuntimeOptions {
             peer_queue_byte_capacity: PEER_CHANNEL_BYTE_CAPACITY,
             replication_control_message_capacity: REPLICATION_CONTROL_CHANNEL_DEPTH,
             inbound_connection_capacity: INBOUND_CONNECTION_CAPACITY,
+            receive_byte_capacity: RECEIVE_BYTE_CAPACITY,
             queue_admission_timeout: REMOTE_RPC_TIMEOUT,
             reconcile_data_admission_timeout: RECONCILE_DATA_ADMISSION_TIMEOUT,
             forwarded_attempt_timeout: REMOTE_RPC_TIMEOUT,
@@ -2591,6 +2599,19 @@ impl NodeRuntimeOptions {
     /// closed immediately after accept.
     pub fn with_inbound_connection_capacity(mut self, capacity: usize) -> Self {
         self.inbound_connection_capacity = capacity;
+        self
+    }
+
+    /// Set the node-wide encoded-body receive budget across all physical
+    /// connections, including handshakes and outbound-dialed peers. At least
+    /// one maximum 16 MiB frame must fit. Bodies reserve space before allocation
+    /// and retain it through their connection-handler turn. Exhaustion closes
+    /// only the contributing connection without waiting for admission.
+    ///
+    /// This bounds raw frame bodies, not total heap use: protobuf decoding,
+    /// actor/cache values, relay state, and caller results allocate separately.
+    pub fn with_receive_byte_capacity(mut self, capacity: usize) -> Self {
+        self.receive_byte_capacity = capacity;
         self
     }
 
@@ -2670,6 +2691,11 @@ impl NodeRuntimeOptions {
         self.inbound_connection_capacity
     }
 
+    /// Current node-wide encoded-body receive budget.
+    pub fn receive_byte_capacity(&self) -> usize {
+        self.receive_byte_capacity
+    }
+
     /// Current peer-queue admission timeout.
     pub fn queue_admission_timeout(&self) -> Duration {
         self.queue_admission_timeout
@@ -2737,6 +2763,17 @@ impl NodeRuntimeOptions {
             return Err(NodeError::Actor(
                 "inbound connection capacity must be non-zero".to_string(),
             ));
+        }
+        if self.receive_byte_capacity < MAX_FRAME_BYTES {
+            return Err(NodeError::Actor(format!(
+                "receive byte capacity must be at least {MAX_FRAME_BYTES}"
+            )));
+        }
+        if self.receive_byte_capacity > tokio::sync::Semaphore::MAX_PERMITS {
+            return Err(NodeError::Actor(format!(
+                "receive byte capacity exceeds maximum {}",
+                tokio::sync::Semaphore::MAX_PERMITS
+            )));
         }
         if self.peer_queue_frame_capacity > tokio::sync::Semaphore::MAX_PERMITS {
             return Err(NodeError::Actor(format!(
@@ -3278,6 +3315,7 @@ impl Node {
             inbound_connections: Arc::new(Semaphore::new(
                 runtime_options.inbound_connection_capacity,
             )),
+            receive_byte_budget: Arc::new(Semaphore::new(runtime_options.receive_byte_capacity)),
             dial_intents: Arc::new(StdMutex::new(HashMap::new())),
             dial_intent_changes,
             peer_changes,
@@ -3542,6 +3580,7 @@ impl Node {
             sender_config: self.sender_config.clone(),
             sender_runtime: self.runtime_options.sender_options(),
             runtime_options: self.runtime_options.clone(),
+            receive_byte_budget: self.receive_byte_budget.clone(),
             sender_reports: self.sender_reports.clone(),
             membership_tx: self.membership_tx.clone(),
             cluster_secret: self.cluster_secret.clone(),
@@ -6821,13 +6860,21 @@ async fn run_reconcile_responder(
     }
 }
 
+/// The byte permit follows the raw allocation through decoding and the full
+/// inline handler turn. Decoded or forwarded copies are separate allocations.
+struct ReceivedFrame {
+    bytes: Vec<u8>,
+    _byte_permit: OwnedSemaphorePermit,
+}
+
 async fn read_connection_frame<R>(
     reader: &mut R,
     cancel: &mut watch::Receiver<bool>,
+    receive_byte_budget: &Arc<Semaphore>,
     established: bool,
     handshake_deadline: Instant,
     frame_body_timeout: Duration,
-) -> Option<Vec<u8>>
+) -> Option<ReceivedFrame>
 where
     R: tokio::io::AsyncRead + Unpin,
 {
@@ -6859,6 +6906,15 @@ where
         return None;
     }
 
+    let byte_permit = match receive_byte_budget.clone().try_acquire_many_owned(prefix) {
+        Ok(permit) => permit,
+        Err(_) => {
+            // Waiting here could stop the only reader which can drain the
+            // opposite direction. No frame is decoded or applied on failure.
+            tracing::warn!(len, "closing connection at node receive byte capacity");
+            return None;
+        }
+    };
     let mut frame = vec![0u8; len];
     let body_deadline = if established {
         deadline_after(frame_body_timeout)
@@ -6871,7 +6927,10 @@ where
             None
         }
         _ = tokio::time::sleep_until(body_deadline) => None,
-        result = reader.read_exact(&mut frame) => result.ok().map(|_| frame),
+        result = reader.read_exact(&mut frame) => result.ok().map(|_| ReceivedFrame {
+            bytes: frame,
+            _byte_permit: byte_permit,
+        }),
     }
 }
 
@@ -6941,6 +7000,7 @@ async fn handle_connection(
         sender_config,
         sender_runtime,
         runtime_options,
+        receive_byte_budget,
         sender_reports,
         membership_tx,
         cluster_secret,
@@ -7110,6 +7170,7 @@ async fn handle_connection(
         let Some(buf) = read_connection_frame(
             &mut reader,
             &mut read_cancel,
+            &receive_byte_budget,
             handshake.is_established(),
             handshake_deadline,
             runtime_options.socket_read_timeout,
@@ -7118,11 +7179,11 @@ async fn handle_connection(
         else {
             break;
         };
-        if let Err(error) = preflight_envelope_decode(&buf) {
+        if let Err(error) = preflight_envelope_decode(&buf.bytes) {
             tracing::warn!(%error, "rejecting inbound peer frame before protobuf allocation");
             break;
         }
-        let envelope = match Envelope::decode(&buf[..]) {
+        let envelope = match Envelope::decode(&buf.bytes[..]) {
             Ok(e) => e,
             Err(_) => break,
         };
@@ -9987,6 +10048,7 @@ mod tests {
                 sender_config: SenderConfig::default(),
                 sender_runtime: SenderRuntimeOptions::default(),
                 runtime_options: NodeRuntimeOptions::default(),
+                receive_byte_budget: Arc::new(Semaphore::new(RECEIVE_BYTE_CAPACITY)),
                 sender_reports,
                 membership_tx: None,
                 cluster_secret: None,
@@ -10594,6 +10656,7 @@ mod tests {
         assert_eq!(options.peer_queue_byte_capacity(), 32 * 1024 * 1024);
         assert_eq!(options.replication_control_message_capacity(), 64);
         assert_eq!(options.inbound_connection_capacity(), 1024);
+        assert_eq!(options.receive_byte_capacity(), 64 * 1024 * 1024);
         assert_eq!(options.queue_admission_timeout(), Duration::from_secs(5));
         assert_eq!(
             options.reconcile_data_admission_timeout(),
@@ -10637,6 +10700,16 @@ mod tests {
             .with_inbound_connection_capacity(0)
             .validate()
             .is_err());
+        for capacity in [0, MAX_FRAME_BYTES - 1, Semaphore::MAX_PERMITS + 1] {
+            assert!(NodeRuntimeOptions::default()
+                .with_receive_byte_capacity(capacity)
+                .validate()
+                .is_err());
+        }
+        assert!(NodeRuntimeOptions::default()
+            .with_receive_byte_capacity(MAX_FRAME_BYTES)
+            .validate()
+            .is_ok());
         assert!(NodeRuntimeOptions::default()
             .with_replication_control_message_capacity(
                 tokio::sync::Semaphore::MAX_PERMITS.saturating_add(1),
@@ -10659,6 +10732,267 @@ mod tests {
         ] {
             assert!(options.validate().is_err());
         }
+    }
+
+    #[tokio::test]
+    async fn receive_byte_permit_follows_completed_frame_and_releases_on_eof() {
+        let budget = Arc::new(Semaphore::new(8));
+        let (_cancel, mut cancelled) = watch::channel(false);
+        let (mut client, mut reader) = tokio::io::duplex(64);
+        client.write_u32(4).await.unwrap();
+        client.write_all(&[1, 2, 3, 4]).await.unwrap();
+        let frame = read_connection_frame(
+            &mut reader,
+            &mut cancelled,
+            &budget,
+            true,
+            Instant::now(),
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        assert_eq!(frame.bytes, [1, 2, 3, 4]);
+        assert_eq!(budget.available_permits(), 4);
+        drop(frame);
+        assert_eq!(budget.available_permits(), 8);
+
+        // Empty bodies consume no bytes, but still follow normal framing.
+        client.write_u32(0).await.unwrap();
+        let empty = read_connection_frame(
+            &mut reader,
+            &mut cancelled,
+            &budget,
+            true,
+            Instant::now(),
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        assert!(empty.bytes.is_empty());
+        drop(empty);
+        assert_eq!(budget.available_permits(), 8);
+
+        client.write_u32(8).await.unwrap();
+        client.write_all(&[1, 2]).await.unwrap();
+        drop(client);
+        assert!(read_connection_frame(
+            &mut reader,
+            &mut cancelled,
+            &budget,
+            true,
+            Instant::now(),
+            Duration::from_secs(1),
+        )
+        .await
+        .is_none());
+        assert_eq!(budget.available_permits(), 8);
+    }
+
+    #[tokio::test]
+    async fn receive_byte_permit_releases_on_timeout_cancel_and_task_abort() {
+        for failure in 0..3 {
+            let budget = Arc::new(Semaphore::new(8));
+            let (cancel, mut cancelled) = watch::channel(false);
+            let (mut client, mut reader) = tokio::io::duplex(64);
+            client.write_u32(8).await.unwrap();
+            client.write_all(&[1]).await.unwrap();
+            let read_budget = budget.clone();
+            let read = tokio::spawn(async move {
+                read_connection_frame(
+                    &mut reader,
+                    &mut cancelled,
+                    &read_budget,
+                    true,
+                    Instant::now(),
+                    if failure == 0 {
+                        Duration::from_millis(50)
+                    } else {
+                        Duration::from_secs(10)
+                    },
+                )
+                .await
+            });
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while budget.available_permits() != 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("incomplete body did not reserve its bytes");
+            match failure {
+                0 => assert!(read.await.unwrap().is_none()),
+                1 => {
+                    cancel.send(true).unwrap();
+                    assert!(read.await.unwrap().is_none());
+                }
+                _ => {
+                    read.abort();
+                    assert!(matches!(read.await, Err(error) if error.is_cancelled()));
+                }
+            }
+            assert_eq!(budget.available_permits(), 8);
+        }
+    }
+
+    #[tokio::test]
+    async fn receive_byte_admission_checks_handshake_and_hard_limits_first() {
+        for (established, len) in [(false, 4097), (true, MAX_FRAME_BYTES + 1)] {
+            let budget = Arc::new(Semaphore::new(8));
+            let (_cancel, mut cancelled) = watch::channel(false);
+            let (mut client, mut reader) = tokio::io::duplex(64);
+            client.write_u32(len as u32).await.unwrap();
+            assert!(read_connection_frame(
+                &mut reader,
+                &mut cancelled,
+                &budget,
+                established,
+                Instant::now() + Duration::from_secs(1),
+                Duration::from_secs(1),
+            )
+            .await
+            .is_none());
+            assert_eq!(budget.available_permits(), 8);
+        }
+    }
+
+    #[tokio::test]
+    async fn receive_byte_admission_is_shared_and_saturation_is_connection_local() {
+        let capacity = 2 * MAX_FRAME_BYTES;
+        let budget = Arc::new(Semaphore::new(capacity));
+        let peers: PeerMap = Arc::new(Mutex::new(HashMap::new()));
+        let (mut ctx, runtime_tasks) = test_connection_context(
+            FragmentRouter::new(1, 0),
+            Arc::new(RwLock::new(HashSet::new())),
+            Arc::new(RwLock::new(HashMap::new())),
+            true,
+            Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(Mutex::new(HashMap::new())),
+            peers.clone(),
+        );
+        ctx.receive_byte_budget = budget.clone();
+        ctx.runtime_options = NodeRuntimeOptions::default()
+            .with_receive_byte_capacity(capacity)
+            .with_socket_read_timeout(Duration::from_secs(10));
+        let mut connections = Vec::new();
+        for (peer, we_dialed) in [
+            ("held-accepted", false),
+            ("held-dialed", true),
+            ("healthy", false),
+            ("shed", false),
+        ] {
+            let (mut client, server) = tokio::io::duplex(4096);
+            let handler = tokio::spawn(handle_connection(
+                ctx.clone(),
+                Box::pin(server),
+                we_dialed,
+                we_dialed.then(|| peer.to_string()),
+                None,
+            ));
+            complete_test_handshake(&mut client, peer).await;
+            connections.push((client, handler));
+        }
+        let [
+            (mut accepted, accepted_handler),
+            (mut dialed, dialed_handler),
+            (mut healthy, healthy_handler),
+            (mut shed, shed_handler),
+        ]: [_; 4] = connections.try_into().ok().unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while peers.lock().await.len() != 4 || budget.available_permits() != capacity {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("handshake frames retained receive permits");
+
+        // Accepted and outbound-dialed handlers each announce an incomplete
+        // maximum frame. Their reservations must share the one node budget.
+        accepted.write_u32(MAX_FRAME_BYTES as u32).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while budget.available_permits() != MAX_FRAME_BYTES {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        dialed.write_u32(MAX_FRAME_BYTES as u32).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while budget.available_permits() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        // No body follows: rejection must happen at admission, before
+        // allocation/read/decode, without waiting for the held frames.
+        shed.write_u32(1).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), shed_handler)
+            .await
+            .expect("receive saturation waited for body bytes")
+            .unwrap();
+        let mut byte = [0];
+        assert_eq!(shed.read(&mut byte).await.unwrap(), 0);
+        assert_eq!(budget.available_permits(), 0);
+        assert!(peers.lock().await.contains_key("healthy"));
+        assert!(!peers.lock().await.contains_key("shed"));
+
+        drop(accepted);
+        tokio::time::timeout(Duration::from_secs(1), accepted_handler)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(budget.available_permits(), MAX_FRAME_BYTES);
+        write_test_envelope(
+            &mut healthy,
+            Envelope {
+                msg: Some(EnvelopeMsg::BatchGet(BatchGet {
+                    req_id: 71,
+                    keys: vec!["probe".to_string()],
+                    priority: ProtoPriority::Default as i32,
+                })),
+            },
+        )
+        .await;
+        assert!(matches!(
+            read_test_envelope(&mut healthy).await.msg,
+            Some(EnvelopeMsg::BatchGetResponse(BatchGetResponse { req_id: 71, results }))
+                if results.is_empty()
+        ));
+
+        let (mut replacement, server) = tokio::io::duplex(4096);
+        let replacement_handler =
+            tokio::spawn(handle_connection(ctx, Box::pin(server), false, None, None));
+        complete_test_handshake(&mut replacement, "held-accepted").await;
+        write_test_envelope(
+            &mut replacement,
+            Envelope {
+                msg: Some(EnvelopeMsg::BatchGet(BatchGet {
+                    req_id: 72,
+                    keys: vec!["replacement-probe".to_string()],
+                    priority: ProtoPriority::High as i32,
+                })),
+            },
+        )
+        .await;
+        assert!(matches!(
+            read_test_envelope(&mut replacement).await.msg,
+            Some(EnvelopeMsg::BatchGetResponse(BatchGetResponse { req_id: 72, results }))
+                if results.is_empty()
+        ));
+
+        drop(dialed);
+        drop(healthy);
+        drop(replacement);
+        for handler in [dialed_handler, healthy_handler, replacement_handler] {
+            tokio::time::timeout(Duration::from_secs(1), handler)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        assert_eq!(budget.available_permits(), capacity);
+        assert!(peers.lock().await.is_empty());
+        runtime_tasks.shutdown().await;
     }
 
     #[tokio::test]

@@ -41,6 +41,7 @@ async fn main() -> Result<(), actordb::node::NodeError> {
       .with_peer_queue_byte_capacity(64 * 1024 * 1024)
       .with_replication_control_message_capacity(128)
       .with_inbound_connection_capacity(512)
+      .with_receive_byte_capacity(128 * 1024 * 1024)
       .with_queue_admission_timeout(Duration::from_secs(2))
       .with_reconcile_data_admission_timeout(Duration::from_secs(20))
       .with_forwarded_attempt_timeout(Duration::from_secs(8))
@@ -60,7 +61,12 @@ async fn main() -> Result<(), actordb::node::NodeError> {
 
   Defaults are 256 queued frames and 32 MiB of admitted encoded bytes per peer,
   64 protocol-control messages per fragment/peer sender, and 1024 concurrent
-  inbound connections. Queue
+  inbound connections. A separate node-wide 64 MiB receive budget covers raw
+  encoded bodies on accepted and outbound-dialed connections, including
+  handshakes. It reserves bytes before allocation and retains them through
+  decoding and the handler turn; saturation closes only that connection.
+  Protobuf decoding and actor/cache/relay/caller copies allocate separately,
+  so this is not a total-memory limit. Queue
   admission, a forwarded owner attempt, a dial, and the complete two-flight
   handshake each default to 5 seconds. Frame-body reads after a prefix, complete
   frame writes, and acceptable ordinary replication ACKs each default to 30
@@ -69,7 +75,8 @@ async fn main() -> Result<(), actordb::node::NodeError> {
   `SenderConfig::buffer_capacity`. The peer frame budget must be at least two
   and is split between data and priority responses; the byte budget must be at
   least 32 MiB so ordinary producers leave a full 16 MiB response reserve
-  beside one maximum-size frame. Other capacities/timeouts must be nonzero. Actor
+  beside one maximum-size frame. The receive budget must fit at least one
+  16 MiB maximum body. Other capacities/timeouts must be nonzero. Actor
   lanes remain item-count bounded. Every encoded frame is separately limited
   to 16 MiB, with 1 MiB soft pages for anti-entropy and ordinary replication.
 - `node.connect(peer_addr)` tries the first transport dial once and returns an
