@@ -62,6 +62,11 @@ and pre-apply saturation, and cancel/resume actual Node shutdown while transport
 tasks abort. Placement authority and operation fences must remain held until
 accepted completion finishes; these tests do not claim a stronger last-Node
 drop or lossless worker-crash guarantee.
+Raw-peer admission regressions additionally saturate aggregate count and payload
+budgets with an actual blocked store apply, reject duplicate-key batches with
+exact unavailable positions before any partial apply, and verify independent
+frames remain usable on the same connection. Closed-owner rollback and moved
+mixed-fragment/hop-limit error paths retain key order and release authority.
 
 Protocol-v3 pagination tests cover lexicographically ordered/exclusive summary
 cursors (including the empty-string key), revision-drift detection, zero-limit

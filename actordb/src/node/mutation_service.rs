@@ -388,6 +388,7 @@ mod tests {
         SenderStateReport,
     };
     use crate::store::{KvStore, StoreError};
+    use prost::Message;
     use ractor::Actor;
     use std::collections::HashMap;
     use std::sync::Condvar;
@@ -537,6 +538,340 @@ mod tests {
             Duration::from_secs(2),
         )
         .await;
+    }
+
+    async fn mutation_response(stream: &mut tokio::io::DuplexStream) -> MutationResponse {
+        loop {
+            if let Some(EnvelopeMsg::MutationResponse(response)) =
+                read_test_envelope(stream).await.msg
+            {
+                return response;
+            }
+        }
+    }
+
+    fn assert_unavailable(response: &MutationResponse, req_id: u64, keys: &[&str], reason: &str) {
+        assert_eq!(response.req_id, req_id);
+        assert_eq!(response.results.len(), keys.len());
+        for (index, (result, key)) in response.results.iter().zip(keys).enumerate() {
+            assert_eq!(result.request_index, index as u32);
+            assert_eq!(result.key.as_str(), *key);
+            assert_eq!(result.status, MutationStatus::Unavailable as i32);
+            assert!(result.error.contains(reason), "{}", result.error);
+            assert_eq!(result.winner_timestamp_ms, 0);
+            assert!(result.winner_node_id.is_empty());
+            assert!(!result.winner_is_tombstone);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn production_batch_admission_rejection_preserves_duplicates_and_connection_health() {
+        for count in [1, 4] {
+            let store = Arc::new(GatedStore::default());
+            let _release = ReleaseStore(store.clone());
+            let (actor, state) = worker(Some(store.clone())).await;
+            let router = FragmentRouter::new(1, 1);
+            router.insert(FragmentId(0), actor.clone());
+            let (mut context, tasks) = test_connection_context(
+                router,
+                Arc::new(std::sync::RwLock::new(std::collections::HashSet::from([
+                    FragmentId(0),
+                ]))),
+                Arc::new(std::sync::RwLock::new(HashMap::new())),
+                false,
+                Arc::new(Mutex::new(HashMap::new())),
+                Arc::new(Mutex::new(HashMap::new())),
+                Arc::new(Mutex::new(HashMap::new())),
+            )
+            .await;
+            let first = put(401, Priority::Background);
+            let encoded = Envelope {
+                msg: Some(EnvelopeMsg::ForwardedPut(first.clone())),
+            }
+            .encode_to_vec();
+            let Some(EnvelopeMsg::ForwardedPut(decoded)) =
+                Envelope::decode(encoded.as_slice()).unwrap().msg
+            else {
+                panic!("expected forwarded put")
+            };
+            // Match Prost's actual String/Vec capacities, rather than assuming
+            // decoded buffers have the same capacity as the producer's input.
+            let bytes = MutationRequest::Single(decoded).payload_bytes();
+            let service = MutationService::new(count, bytes);
+            context.mutation_service = service.clone();
+            let gate = context.operation_gate.clone();
+            let (mut active, active_socket) = tokio::io::duplex(4096);
+            let active_reader = tokio::spawn(handle_connection(
+                context.clone(),
+                Box::pin(active_socket),
+                false,
+                None,
+                None,
+            ));
+            complete_test_handshake(&mut active, "active-origin").await;
+            write_test_envelope(
+                &mut active,
+                Envelope {
+                    msg: Some(EnvelopeMsg::ForwardedPut(first)),
+                },
+            )
+            .await;
+            tokio::time::timeout(Duration::from_secs(2), store.entered.notified())
+                .await
+                .unwrap();
+
+            let (mut rejected, rejected_socket) = tokio::io::duplex(4096);
+            let rejected_reader = tokio::spawn(handle_connection(
+                context,
+                Box::pin(rejected_socket),
+                false,
+                None,
+                None,
+            ));
+            complete_test_handshake(&mut rejected, "rejected-origin").await;
+            let keys = ["rejected", "rejected", "other"];
+            let puts = keys
+                .iter()
+                .enumerate()
+                .map(|(index, key)| {
+                    let mut put = put(410 + index as u64, Priority::Background);
+                    put.key = (*key).to_string();
+                    put.timestamp_ms = 10 + index as u64;
+                    put.is_tombstone = index == 1;
+                    if put.is_tombstone {
+                        put.value.clear();
+                    }
+                    put.expires_at_ms = if index == 2 { u64::MAX } else { 0 };
+                    put
+                })
+                .collect();
+            write_test_envelope(
+                &mut rejected,
+                Envelope {
+                    msg: Some(EnvelopeMsg::BatchPut(BatchPut {
+                        req_id: 420,
+                        priority: Priority::High as i32,
+                        puts,
+                    })),
+                },
+            )
+            .await;
+            let response = mutation_response(&mut rejected).await;
+            let reason = if count == 1 {
+                "capacity exhausted"
+            } else {
+                "payload budget exhausted"
+            };
+            assert_unavailable(&response, 420, &keys, reason);
+            assert_eq!(service.count.available_permits(), count - 1);
+            assert_eq!(service.payload.available_permits(), 0);
+            for key in keys {
+                assert!(state.get(key).await.is_none());
+            }
+            // Rejection must not kill or wedge the same physical reader. This
+            // independent empty batch does not consume the saturated owner.
+            write_test_envelope(
+                &mut rejected,
+                Envelope {
+                    msg: Some(EnvelopeMsg::BatchPut(BatchPut {
+                        req_id: 421,
+                        priority: Priority::Default as i32,
+                        puts: Vec::new(),
+                    })),
+                },
+            )
+            .await;
+            let empty = mutation_response(&mut rejected).await;
+            assert_eq!(empty.req_id, 421);
+            assert!(empty.results.is_empty());
+
+            store.release();
+            let applied = mutation_response(&mut active).await;
+            assert_eq!(applied.req_id, 401);
+            assert_eq!(applied.results[0].status, MutationStatus::Applied as i32);
+            capacity_restored(&service, count, bytes).await;
+            gate.wait_for_drain().await;
+            assert_eq!(store.entries.lock().unwrap().len(), 1);
+            drop(active);
+            drop(rejected);
+            tokio::time::timeout(Duration::from_secs(2), active_reader)
+                .await
+                .unwrap()
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(2), rejected_reader)
+                .await
+                .unwrap()
+                .unwrap();
+            service.shutdown().await;
+            tasks.shutdown().await;
+            actor.stop(None);
+        }
+    }
+
+    #[tokio::test]
+    async fn closed_owner_rejects_whole_duplicate_batch_and_releases_authority() {
+        let (actor, state) = worker(None).await;
+        let service = MutationService::new(1, 1);
+        service.shutdown().await;
+        let gate = OperationGate::new();
+        let authority = Arc::new(RwLock::new(()));
+        let keys = ["key", "key", "suffix"];
+        let request = MutationRequest::Batch(BatchPut {
+            req_id: 430,
+            priority: Priority::High as i32,
+            puts: keys
+                .iter()
+                .enumerate()
+                .map(|(index, key)| {
+                    let mut put = put(index as u64 + 1, Priority::Default);
+                    put.key = (*key).to_string();
+                    put
+                })
+                .collect(),
+        });
+        let (job, response) = MutationJob::new(
+            request,
+            actor.clone(),
+            Arc::new(Mutex::new(HashMap::new())),
+            FragmentId(0),
+            gate.try_enter().unwrap(),
+            Some(authority.clone().read_owned().await),
+        );
+        service.submit(job);
+        let completion = response.await.unwrap();
+        assert_unavailable(&completion.response, 430, &keys, "shutting down");
+        gate.wait_for_drain().await;
+        drop(authority.write_owned().await);
+        assert!(state.get_all().await.is_empty());
+        capacity_restored(&service, 1, 1).await;
+        actor.stop(None);
+    }
+
+    #[tokio::test]
+    async fn production_mixed_fragment_and_hop_rejections_preserve_keys_and_reader() {
+        let (actor, state) = worker(None).await;
+        let router = FragmentRouter::new(2, 1);
+        router.insert(FragmentId(0), actor.clone());
+        let (context, tasks) = test_connection_context(
+            router,
+            Arc::new(std::sync::RwLock::new(std::collections::HashSet::from([
+                FragmentId(0),
+            ]))),
+            Arc::new(std::sync::RwLock::new(HashMap::new())),
+            false,
+            Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(Mutex::new(HashMap::new())),
+        )
+        .await;
+        let service = context.mutation_service.clone();
+        let gate = context.operation_gate.clone();
+        let serving_key = (0..100)
+            .map(|index| format!("serving-{index}"))
+            .find(|key| super::super::fragment_of(key, 2) == FragmentId(0))
+            .unwrap();
+        let remote_key = (0..100)
+            .map(|index| format!("remote-{index}"))
+            .find(|key| super::super::fragment_of(key, 2) == FragmentId(1))
+            .unwrap();
+        let (mut origin, socket) = tokio::io::duplex(4096);
+        let reader = tokio::spawn(handle_connection(
+            context,
+            Box::pin(socket),
+            false,
+            None,
+            None,
+        ));
+        complete_test_handshake(&mut origin, "validation-origin").await;
+        let mixed_keys = [&serving_key[..], &remote_key[..], &serving_key[..]];
+        let puts = mixed_keys
+            .iter()
+            .enumerate()
+            .map(|(index, key)| {
+                let mut put = put(440 + index as u64, Priority::Default);
+                put.key = (*key).to_string();
+                put
+            })
+            .collect();
+        write_test_envelope(
+            &mut origin,
+            Envelope {
+                msg: Some(EnvelopeMsg::BatchPut(BatchPut {
+                    req_id: 450,
+                    priority: Priority::Default as i32,
+                    puts,
+                })),
+            },
+        )
+        .await;
+        assert_unavailable(
+            &mutation_response(&mut origin).await,
+            450,
+            &mixed_keys,
+            "multiple fragments",
+        );
+        let hop_keys = [&remote_key[..], &remote_key[..]];
+        let puts = hop_keys
+            .iter()
+            .enumerate()
+            .map(|(index, key)| {
+                let mut put = put(460 + index as u64, Priority::Default);
+                put.key = (*key).to_string();
+                put.hops = if index == 0 {
+                    0
+                } else {
+                    super::super::MAX_FORWARD_HOPS
+                };
+                put
+            })
+            .collect();
+        write_test_envelope(
+            &mut origin,
+            Envelope {
+                msg: Some(EnvelopeMsg::BatchPut(BatchPut {
+                    req_id: 470,
+                    priority: Priority::Default as i32,
+                    puts,
+                })),
+            },
+        )
+        .await;
+        assert_unavailable(
+            &mutation_response(&mut origin).await,
+            470,
+            &hop_keys,
+            "hop limit",
+        );
+        assert!(state.get_all().await.is_empty());
+        let mut valid = put(480, Priority::High);
+        valid.key = serving_key.clone();
+        write_test_envelope(
+            &mut origin,
+            Envelope {
+                msg: Some(EnvelopeMsg::ForwardedPut(valid)),
+            },
+        )
+        .await;
+        let valid = mutation_response(&mut origin).await;
+        assert_eq!(valid.req_id, 480);
+        assert_eq!(valid.results[0].status, MutationStatus::Applied as i32);
+        assert_eq!(state.get_all().await.len(), 1);
+        assert!(state.get(&remote_key).await.is_none());
+        gate.wait_for_drain().await;
+        capacity_restored(
+            &service,
+            FORWARDED_MUTATION_CAPACITY,
+            FORWARDED_MUTATION_BYTE_CAPACITY,
+        )
+        .await;
+        drop(origin);
+        tokio::time::timeout(Duration::from_secs(2), reader)
+            .await
+            .unwrap()
+            .unwrap();
+        service.shutdown().await;
+        tasks.shutdown().await;
+        actor.stop(None);
     }
 
     #[test]
