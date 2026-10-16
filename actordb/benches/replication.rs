@@ -19,6 +19,12 @@
 //! batching (`batch_interval`, `batch_size`), network encode, receiver apply,
 //! and `b`'s read are all in the measured path.
 //!
+//! `buffered_catchup/<n>`: a fresh source buffers `n` compact writes while its
+//! replica is disconnected. Timing starts immediately before connect and ends
+//! when the source observes the replication ACK. A 4,096-op batch therefore
+//! exercises the production batch builder without the default 100 ms timer or
+//! the visibility polling in `replication_lag` dominating the result.
+//!
 //! How to read regressions
 //! -----------------------
 //! * Lag growing with `n` faster than linearly points at per-op receiver
@@ -30,6 +36,9 @@
 //!   Shipping full batches immediately should lower this floor.
 //! * This bench polls `b` every 10 ms, so measurements have ~10 ms of
 //!   quantization noise — compare runs, not absolute values, below ~50 ms.
+//! * `buffered_catchup` uses fresh nodes per sample and a 1 ms batch interval.
+//!   Setup, preload, verification, and shutdown are outside its reported
+//!   duration; connection establishment and the receiver apply remain inside.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -38,6 +47,7 @@ use std::time::{Duration, Instant};
 
 use actordb::actor::PoolConfig;
 use actordb::node::{Node, NodeConfig};
+use actordb::replication::SenderConfig;
 use actordb::shard::FragmentId;
 use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion};
 
@@ -48,6 +58,122 @@ fn runtime() -> tokio::runtime::Runtime {
         .expect("tokio runtime")
 }
 
+fn large_pool() -> PoolConfig {
+    PoolConfig {
+        workers: 4,
+        queue_cap: 1_000_000,
+        rate_limit_per_sec: None,
+    }
+}
+
+fn catchup_config(replicas: Vec<String>) -> NodeConfig {
+    let mut fragment_map = HashMap::new();
+    fragment_map.insert(FragmentId(0), replicas);
+    NodeConfig {
+        default_pool: large_pool(),
+        high_pool: large_pool(),
+        background_pool: large_pool(),
+        fragment_count: 1,
+        fragment_map,
+        replication: SenderConfig {
+            batch_size: 4096,
+            batch_interval: Duration::from_millis(1),
+            max_in_flight: 8,
+            buffer_capacity: 8192,
+            consistency_interval: Duration::from_secs(3600),
+            ..SenderConfig::default()
+        },
+        ..NodeConfig::default()
+    }
+}
+
+async fn buffered_catchup_sample(n: usize) -> Duration {
+    let source = Node::start(
+        "catchup-a".to_string(),
+        "127.0.0.1:0".parse().unwrap(),
+        catchup_config(vec!["catchup-a".to_string(), "catchup-b".to_string()]),
+    )
+    .await
+    .expect("catch-up source");
+    let expected = (0..n)
+        .map(|index| {
+            (
+                format!("catchup-{index:04}"),
+                (index as u64).to_le_bytes().to_vec(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let results = source.put_multi(expected.clone()).await;
+    assert!(results.iter().all(Result::is_ok));
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        if source
+            .sender_report(FragmentId(0), "catchup-b")
+            .await
+            .is_some_and(|report| {
+                report.state == "disconnected" && report.buffered == n && report.in_flight == 0
+            })
+        {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "source did not buffer {n} disconnected writes"
+        );
+        tokio::task::yield_now().await;
+    }
+
+    // The target-only placement prevents a reverse sender/reconcile workload
+    // from contaminating this one-direction catch-up measurement.
+    let target = Node::start(
+        "catchup-b".to_string(),
+        "127.0.0.1:0".parse().unwrap(),
+        catchup_config(vec!["catchup-b".to_string()]),
+    )
+    .await
+    .expect("catch-up target");
+
+    let started = Instant::now();
+    source.connect(target.addr()).await.expect("connect target");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        if source
+            .sender_report(FragmentId(0), "catchup-b")
+            .await
+            .is_some_and(|report| {
+                report.session_id != 0
+                    && report.buffered == 0
+                    && report.in_flight == 0
+                    && report.last_ack_durability.is_some()
+            })
+        {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "source did not receive the catch-up ACK for {n} writes"
+        );
+        tokio::task::yield_now().await;
+    }
+    let elapsed = started.elapsed();
+
+    let keys = expected
+        .iter()
+        .map(|(key, _)| key.clone())
+        .collect::<Vec<_>>();
+    let values = target.get_multi(keys).await;
+    assert_eq!(values.len(), expected.len());
+    for (result, (_, expected_value)) in values.into_iter().zip(&expected) {
+        let actual = result.unwrap().expect("replicated value");
+        assert_eq!(actual.value.as_slice(), expected_value.as_slice());
+    }
+
+    source.shutdown().await.expect("source shutdown");
+    target.shutdown().await.expect("target shutdown");
+    elapsed
+}
+
 fn bench_replication(c: &mut Criterion) {
     let rt = runtime();
     let (node_a, node_b) = rt.block_on(async {
@@ -55,15 +181,10 @@ fn bench_replication(c: &mut Criterion) {
         fragment_map.insert(FragmentId(0), vec!["a".to_string(), "b".to_string()]);
         // High queue caps: criterion hammers iterations back-to-back; we want
         // to measure the op path, not the backpressure shed path.
-        let big_pool = || PoolConfig {
-            workers: 4,
-            queue_cap: 1_000_000,
-            rate_limit_per_sec: None,
-        };
         let mk = || NodeConfig {
-            default_pool: big_pool(),
-            high_pool: big_pool(),
-            background_pool: big_pool(),
+            default_pool: large_pool(),
+            high_pool: large_pool(),
+            background_pool: large_pool(),
             fragment_count: 1,
             fragment_map: fragment_map.clone(),
             ..NodeConfig::default()
@@ -144,6 +265,21 @@ fn bench_replication(c: &mut Criterion) {
 
     rt.block_on(node_a.shutdown()).unwrap();
     rt.block_on(node_b.shutdown()).unwrap();
+
+    let mut catchup = c.benchmark_group("replication_catchup");
+    catchup.sample_size(10);
+    for &n in &[64usize, 256, 1024, 4096] {
+        catchup.bench_with_input(BenchmarkId::new("buffered_catchup", n), &n, |b, &n| {
+            b.to_async(&rt).iter_custom(|iterations| async move {
+                let mut measured = Duration::ZERO;
+                for _ in 0..iterations {
+                    measured += buffered_catchup_sample(n).await;
+                }
+                measured
+            });
+        });
+    }
+    catchup.finish();
 }
 
 criterion_group!(benches, bench_replication);
