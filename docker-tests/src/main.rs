@@ -19,9 +19,11 @@
 use std::future::Future;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use actordb::node::{Node, NodeConfig};
+use actordb::store::{KvStore, RocksDbStore};
 use clap::{Parser, Subcommand};
 
 /// generous per-step timeouts: CI runners and cold docker builds are slow
@@ -126,10 +128,11 @@ struct Ctx {
 
 impl Ctx {
     async fn start(node_id: String, port: u16, db_path: Option<PathBuf>) -> Result<Self, String> {
-        let config = match db_path {
-            Some(path) => NodeConfig::with_rocksdb(path).map_err(|e| format!("open db: {e}"))?,
-            None => NodeConfig::default(),
-        };
+        let store = db_path
+            .map(|path| RocksDbStore::open(path).map(|store| Arc::new(store) as Arc<dyn KvStore>))
+            .transpose()
+            .map_err(|e| format!("open db: {e}"))?;
+        let config = NodeConfig::builder().maybe_store(store).build();
         let node = Node::start(node_id.clone(), bind(port), config)
             .await
             .map_err(|e| format!("start failed: {e}"))?;

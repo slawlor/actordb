@@ -36,6 +36,7 @@ rocksdb = ["dep:rocksdb"]
 
 [dependencies]
 # Required dependencies
+bon = { version = "3.10.2" }
 bytes = { version = "1" }
 futures = { version = "0.3" }
 getrandom = { version = "0.2" }

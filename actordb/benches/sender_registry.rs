@@ -55,28 +55,32 @@ async fn replicated_pair(fragment_count: usize) -> (Node, Node) {
         .map(|fragment| (FragmentId(fragment as u32), replicas.clone()))
         .collect::<HashMap<_, _>>();
     let workers = if fragment_count == 1 { 64 } else { 1 };
-    let pool = || PoolConfig {
-        workers,
-        queue_cap: 100_000,
-        rate_limit_per_sec: None,
+    let pool = || {
+        PoolConfig::builder()
+            .workers(workers)
+            .queue_cap(100_000)
+            .build()
     };
-    let config = || NodeConfig {
-        default_pool: pool(),
-        high_pool: pool(),
-        background_pool: pool(),
-        fragment_count,
-        fragment_map: fragment_map.clone(),
-        replication: SenderConfig {
-            batch_interval: Duration::from_millis(1),
-            max_in_flight: 64,
-            buffer_capacity: 100_000,
-            ..SenderConfig::default()
-        },
-        ..NodeConfig::default()
+    let config = || {
+        NodeConfig::builder()
+            .default_pool(pool())
+            .high_pool(pool())
+            .background_pool(pool())
+            .fragment_count(fragment_count)
+            .fragment_map(fragment_map.clone())
+            .replication(
+                SenderConfig::builder()
+                    .batch_interval(Duration::from_millis(1))
+                    .max_in_flight(64)
+                    .buffer_capacity(100_000)
+                    .build(),
+            )
+            .build()
     };
-    let runtime_options = NodeRuntimeOptions::default()
-        .with_peer_queue_frame_capacity(4096)
-        .with_peer_queue_byte_capacity(256 * 1024 * 1024);
+    let runtime_options = NodeRuntimeOptions::builder()
+        .peer_queue_frame_capacity(4096)
+        .peer_queue_byte_capacity(256 * 1024 * 1024)
+        .build();
     let a = Node::start_with_options(
         "a".to_string(),
         "127.0.0.1:0".parse().unwrap(),

@@ -3,6 +3,12 @@
 Criterion benchmarks for operation performance. These are **manual/local only**
 — deliberately not in CI (too heavy, too noisy for shared runners).
 
+Configurations use Bon builders without changing benchmark tuning. The
+replication/fan-out fixtures deliberately replace all priority profiles with
+large unlimited pools; a standalone `PoolConfig` builder defaults to four
+workers and no rate limit, unlike the Node's rate-limited Background profile.
+The single-node fixture omits overrides and keeps the Node defaults.
+
 ## Running them
 
 ```bash

@@ -78,11 +78,27 @@ type QueueFailureHandler = Arc<dyn Fn(mpsc::Sender<Vec<u8>>) + Send + Sync>;
 /// These settings live outside [`SenderConfig`] so existing exhaustive
 /// `SenderConfig` literals remain source-compatible. Use
 /// [`spawn_sender_with_options`] to override the defaults.
-#[derive(Clone)]
+/// The builder exposes only the existing public timeout policies, not the
+/// Node's internal ingress capacity or transport-failure callback.
+///
+/// ```compile_fail
+/// let _ = actordb::replication::SenderRuntimeOptions::builder()
+///     .control_channel_capacity(1);
+/// ```
+///
+/// ```compile_fail
+/// let _ = actordb::replication::SenderRuntimeOptions::builder()
+///     .maybe_queue_failure_handler(None);
+/// ```
+#[derive(Clone, bon::Builder)]
 pub struct SenderRuntimeOptions {
+    #[builder(default = Duration::from_secs(30))]
     ack_timeout: Duration,
+    #[builder(default = Duration::from_secs(5))]
     queue_admission_timeout: Duration,
+    #[builder(skip = 64)]
     control_channel_capacity: usize,
+    #[builder(skip = None)]
     queue_failure_handler: Option<QueueFailureHandler>,
 }
 
@@ -98,12 +114,7 @@ impl std::fmt::Debug for SenderRuntimeOptions {
 
 impl Default for SenderRuntimeOptions {
     fn default() -> Self {
-        Self {
-            ack_timeout: Duration::from_secs(30),
-            queue_admission_timeout: Duration::from_secs(5),
-            control_channel_capacity: 64,
-            queue_failure_handler: None,
-        }
+        Self::builder().build()
     }
 }
 
@@ -257,45 +268,44 @@ impl SenderRuntimeOptions {
 
 /// Tuning knobs for the replication sender. All fields are public so
 /// embedders can tune; `Default` is sane for tests and small clusters.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, bon::Builder)]
 pub struct SenderConfig {
     /// Max ops per batch.
+    #[builder(default = 100)]
     pub batch_size: usize,
     /// Ship a batch at least this often when the buffer is non-empty.
+    #[builder(default = Duration::from_millis(100))]
     pub batch_interval: Duration,
     /// Max batches in flight awaiting acks.
+    #[builder(default = 4)]
     pub max_in_flight: usize,
     /// Max buffered (unshipped) ops per sender. A [`crate::node::Node`] also
     /// uses this as the capacity of the preceding local-mutation ingress lane.
     /// Either overflow sheds queued history and enters `BufferReset`; recovery
     /// reads the authoritative fragment snapshot.
+    #[builder(default = 10_000)]
     pub buffer_capacity: usize,
     /// How often a connected sender runs anti-entropy reconciliation
     /// to repair divergence.
+    #[builder(default = Duration::from_secs(300))]
     pub consistency_interval: Duration,
     /// Maximum time to wait for one network reconciliation phase
     /// (summary response, fetched-data chunk, or durability barrier ACK).
     /// A timeout rotates the session and retries the round, so a connected
     /// but silent peer cannot strand bootstrap or overflow recovery forever.
+    #[builder(default = Duration::from_secs(30))]
     pub reconcile_timeout: Duration,
     /// Minimum receiver fence that may retire an in-flight batch.
     /// `MemoryApplied` accepts any stronger acknowledgement level;
     /// `StoreCommitted` requires a receiver with a configured store, and
     /// `StableCommitted` additionally requires its explicit stable fence.
+    #[builder(default = ReplicationAckDurability::MemoryApplied)]
     pub required_ack_durability: ReplicationAckDurability,
 }
 
 impl Default for SenderConfig {
     fn default() -> Self {
-        Self {
-            batch_size: 100,
-            batch_interval: Duration::from_millis(100),
-            max_in_flight: 4,
-            buffer_capacity: 10_000,
-            consistency_interval: Duration::from_secs(300),
-            reconcile_timeout: Duration::from_secs(30),
-            required_ack_durability: ReplicationAckDurability::MemoryApplied,
-        }
+        Self::builder().build()
     }
 }
 
@@ -1098,6 +1108,14 @@ pub struct SenderStateReport {
 }
 
 /// Shared dependencies for a sender task.
+///
+/// The builder requires the real router, node HLC, and state report. Only the
+/// ignored legacy reset registry defaults to a fresh empty registry.
+///
+/// ```compile_fail
+/// let _ = actordb::replication::SenderDeps::builder().build();
+/// ```
+#[derive(bon::Builder)]
 pub struct SenderDeps {
     pub router: FragmentRouter,
     /// Node-wide HLC. Reconcile frames are observed here only after the sender
@@ -1105,6 +1123,7 @@ pub struct SenderDeps {
     pub hlc: Arc<Mutex<HlcClock>>,
     /// Legacy compatibility field. Ignored because tombstone collection no
     /// longer depends on transient sender reset state.
+    #[builder(default = Arc::new(Mutex::new(HashMap::new())))]
     pub reset_senders: Arc<Mutex<HashMap<(FragmentId, String), u64>>>,
     /// Where the sender publishes its state.
     pub state_report: Arc<Mutex<SenderStateReport>>,
@@ -3724,6 +3743,140 @@ mod tests {
             ack_durability_mismatch: false,
             reconcile_rounds: 0,
         }))
+    }
+
+    #[test]
+    fn sender_config_builder_omission_and_overrides_preserve_literal_defaults() {
+        let defaults = SenderConfig::builder().build();
+        assert_eq!(
+            (
+                defaults.batch_size,
+                defaults.batch_interval,
+                defaults.max_in_flight,
+                defaults.buffer_capacity,
+                defaults.consistency_interval,
+                defaults.reconcile_timeout,
+                defaults.required_ack_durability,
+            ),
+            (
+                100,
+                Duration::from_millis(100),
+                4,
+                10_000,
+                Duration::from_secs(300),
+                Duration::from_secs(30),
+                ReplicationAckDurability::MemoryApplied,
+            )
+        );
+        assert_eq!(
+            format!("{defaults:?}"),
+            format!("{:?}", SenderConfig::default())
+        );
+        let partial = SenderConfig::builder().batch_size(7).build();
+        let literal = SenderConfig {
+            batch_size: 7,
+            ..defaults.clone()
+        };
+        assert_eq!(format!("{partial:?}"), format!("{literal:?}"));
+        let overrides = SenderConfig::builder()
+            .batch_size(7)
+            .batch_interval(Duration::from_millis(3))
+            .max_in_flight(2)
+            .buffer_capacity(16)
+            .consistency_interval(Duration::from_secs(12))
+            .reconcile_timeout(Duration::from_secs(4))
+            .required_ack_durability(ReplicationAckDurability::StableCommitted)
+            .build();
+        let literal = SenderConfig {
+            batch_size: 7,
+            batch_interval: Duration::from_millis(3),
+            max_in_flight: 2,
+            buffer_capacity: 16,
+            consistency_interval: Duration::from_secs(12),
+            reconcile_timeout: Duration::from_secs(4),
+            required_ack_durability: ReplicationAckDurability::StableCommitted,
+        };
+        assert_eq!(format!("{overrides:?}"), format!("{literal:?}"));
+        assert!(overrides.validate().is_ok());
+        // Builders construct options; the existing spawn/start boundary still
+        // validates invalid values rather than shifting or skipping validation.
+        assert_eq!(
+            SenderConfig::builder().batch_size(0).build().validate(),
+            Err(SenderOptionsError::ZeroBatchSize)
+        );
+    }
+
+    #[test]
+    fn sender_runtime_builder_preserves_private_hooks_and_public_timeout_policy() {
+        let defaults = SenderRuntimeOptions::builder().build();
+        assert_eq!(defaults.ack_timeout(), Duration::from_secs(30));
+        assert_eq!(defaults.queue_admission_timeout(), Duration::from_secs(5));
+        assert_eq!(defaults.control_channel_capacity, 64);
+        assert!(defaults.queue_failure_handler.is_none());
+        assert_eq!(
+            format!("{defaults:?}"),
+            format!("{:?}", SenderRuntimeOptions::default())
+        );
+        let overrides = SenderRuntimeOptions::builder()
+            .ack_timeout(Duration::from_secs(9))
+            .queue_admission_timeout(Duration::from_secs(2))
+            .build();
+        let legacy = SenderRuntimeOptions::default()
+            .with_ack_timeout(Duration::from_secs(9))
+            .with_queue_admission_timeout(Duration::from_secs(2));
+        assert_eq!(format!("{overrides:?}"), format!("{legacy:?}"));
+        assert!(overrides.queue_failure_handler.is_none());
+        let handler: QueueFailureHandler = Arc::new(|_| {});
+        let internal = overrides
+            .with_control_channel_capacity(8)
+            .with_queue_failure_handler(handler.clone());
+        assert_eq!(internal.control_channel_capacity, 8);
+        assert!(Arc::ptr_eq(
+            internal.queue_failure_handler.as_ref().unwrap(),
+            &handler
+        ));
+        assert_eq!(
+            SenderRuntimeOptions::builder()
+                .ack_timeout(Duration::ZERO)
+                .build()
+                .validate(),
+            Err(SenderOptionsError::ZeroAckTimeout)
+        );
+    }
+
+    #[tokio::test]
+    async fn sender_deps_builder_keeps_required_dependencies_and_fresh_legacy_registry() {
+        let router = FragmentRouter::new(1, 0);
+        let hlc = Arc::new(Mutex::new(HlcClock::new()));
+        let report = state_report();
+        let first = SenderDeps::builder()
+            .router(router.clone())
+            .hlc(hlc.clone())
+            .state_report(report.clone())
+            .build();
+        let second = SenderDeps::builder()
+            .router(router.clone())
+            .hlc(hlc.clone())
+            .state_report(report.clone())
+            .build();
+        assert!(Arc::ptr_eq(&first.hlc, &hlc));
+        assert!(Arc::ptr_eq(&first.state_report, &report));
+        assert!(!Arc::ptr_eq(&first.reset_senders, &second.reset_senders));
+        first
+            .reset_senders
+            .lock()
+            .await
+            .insert((FragmentId(0), "peer".to_string()), 17);
+        assert!(second.reset_senders.lock().await.is_empty());
+        let legacy = first.reset_senders.clone();
+        let explicit = SenderDeps::builder()
+            .router(router)
+            .hlc(hlc)
+            .state_report(report)
+            .reset_senders(legacy.clone())
+            .build();
+        assert!(Arc::ptr_eq(&explicit.reset_senders, &legacy));
+        assert_eq!(explicit.reset_senders.lock().await.len(), 1);
     }
 
     #[test]

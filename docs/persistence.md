@@ -100,8 +100,9 @@ the operating-system buffer cache. To choose the faster, weaker policy:
 use actordb::node::NodeConfig;
 use actordb::store::{RocksDbDurability, RocksDbOptions};
 
-let options = RocksDbOptions::default()
-    .with_durability(RocksDbDurability::AsyncWal);
+let options = RocksDbOptions::builder()
+    .durability(RocksDbDurability::AsyncWal)
+    .build();
 let config = NodeConfig::with_rocksdb_options("./data/node-a", options)?;
 ```
 
@@ -142,8 +143,9 @@ After verifying the path, fragment layout, and a backup, perform the one-time
 explicit adoption:
 
 ```rust
-let options = RocksDbOptions::default()
-    .with_legacy_manifest_adoption(true);
+let options = RocksDbOptions::builder()
+    .legacy_manifest_adoption(true)
+    .build();
 let config = NodeConfig::with_rocksdb_options("./data/legacy-node-a", options)?;
 // The first successful storage bind during Node::start writes the manifest.
 ```

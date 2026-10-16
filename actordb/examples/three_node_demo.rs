@@ -12,21 +12,21 @@ async fn main() {
     let a = Node::start(
         "node-a".to_string(),
         "127.0.0.1:0".parse().unwrap(),
-        NodeConfig::default(),
+        NodeConfig::builder().build(),
     )
     .await
     .unwrap();
     let b = Node::start(
         "node-b".to_string(),
         "127.0.0.1:0".parse().unwrap(),
-        NodeConfig::default(),
+        NodeConfig::builder().build(),
     )
     .await
     .unwrap();
     let c = Node::start(
         "node-c".to_string(),
         "127.0.0.1:0".parse().unwrap(),
-        NodeConfig::default(),
+        NodeConfig::builder().build(),
     )
     .await
     .unwrap();

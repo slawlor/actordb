@@ -64,18 +64,16 @@ async fn mesh() -> (Node, Node, Node) {
     fragment_map.insert(FragmentId(2), vec!["c".to_string()]);
     // High queue caps: criterion hammers iterations back-to-back; we want
     // to measure the op path, not the backpressure shed path.
-    let big_pool = || PoolConfig {
-        workers: 4,
-        queue_cap: 1_000_000,
-        rate_limit_per_sec: None,
-    };
-    let mk = || NodeConfig {
-        default_pool: big_pool(),
-        high_pool: big_pool(),
-        background_pool: big_pool(),
-        fragment_count: 3,
-        fragment_map: fragment_map.clone(),
-        ..NodeConfig::default()
+    // The standalone pool builder defaults to four workers and no rate limit.
+    let big_pool = || PoolConfig::builder().queue_cap(1_000_000).build();
+    let mk = || {
+        NodeConfig::builder()
+            .default_pool(big_pool())
+            .high_pool(big_pool())
+            .background_pool(big_pool())
+            .fragment_count(3)
+            .fragment_map(fragment_map.clone())
+            .build()
     };
     let a = Node::start("a".to_string(), "127.0.0.1:0".parse().unwrap(), mk())
         .await

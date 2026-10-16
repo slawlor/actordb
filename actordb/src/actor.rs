@@ -54,13 +54,16 @@ pub enum OpPriority {
 }
 
 /// Configuration for a worker pool.
-#[derive(Debug, Clone)]
+/// Omitted builder settings use the normal-priority pool defaults.
+#[derive(Debug, Clone, bon::Builder)]
 pub struct PoolConfig {
     /// Number of worker actors.
+    #[builder(default = 4)]
     pub workers: usize,
     /// Max active-plus-queued jobs accepted into this priority's workers
     /// before shedding. This does not bound the shared dispatcher mailbox.
     /// Shed ops are dropped and counted (explicit, not silent).
+    #[builder(default = 10_000)]
     pub queue_cap: usize,
     /// Token-bucket rate limit (ops/sec). `None` = unlimited.
     pub rate_limit_per_sec: Option<u32>,
@@ -68,11 +71,21 @@ pub struct PoolConfig {
 
 impl Default for PoolConfig {
     fn default() -> Self {
-        Self {
-            workers: 4,
-            queue_cap: 10_000,
-            rate_limit_per_sec: None,
-        }
+        Self::builder().build()
+    }
+}
+
+impl PoolConfig {
+    pub(crate) fn high_priority_defaults() -> Self {
+        Self::builder().workers(2).queue_cap(5_000).build()
+    }
+
+    pub(crate) fn background_defaults() -> Self {
+        Self::builder()
+            .workers(2)
+            .queue_cap(5_000)
+            .rate_limit_per_sec(1000)
+            .build()
     }
 }
 
@@ -1267,7 +1280,19 @@ impl FlushBuffer {
 }
 
 /// Arguments to spawn a [KvActor].
-#[derive(Clone)]
+/// State, fragment identity and the unique worker prefix remain required;
+/// omitted pool settings match [`crate::node::NodeConfig`] defaults.
+///
+/// ```compile_fail
+/// use actordb::{actor::{FragmentState, KvArgs}, shard::FragmentId};
+/// use std::{collections::HashMap, sync::Arc, time::Duration};
+/// let shared = Arc::new(FragmentState::new(
+///     HashMap::new(), None, 1000, Duration::from_millis(100),
+/// ));
+/// // A builder cannot invent the dispatcher's unique worker names.
+/// let args = KvArgs::builder().shared(shared).fragment(FragmentId(0)).build();
+/// ```
+#[derive(Clone, bon::Builder)]
 pub struct KvArgs {
     /// The fragment's shared state, created by the supervisor (which
     /// also hands it to the cleaner and snapshotter).
@@ -1277,11 +1302,15 @@ pub struct KvArgs {
     pub fragment: FragmentId,
     /// Prefix for worker actor names (must be unique per dispatcher
     /// in the process; the supervisor generates it).
+    #[builder(into)]
     pub worker_prefix: String,
     /// Worker pool configs by priority. Keys are sticky-routed by
     /// `hash(key) % pool.workers` within the selected pool.
+    #[builder(default = PoolConfig::high_priority_defaults())]
     pub high_pool: PoolConfig,
+    #[builder(default = PoolConfig::default())]
     pub default_pool: PoolConfig,
+    #[builder(default = PoolConfig::background_defaults())]
     pub background_pool: PoolConfig,
 }
 
@@ -1293,7 +1322,7 @@ pub struct KvArgs {
 pub struct KvWorker;
 
 /// Arguments to spawn a [KvWorker].
-#[derive(Clone)]
+#[derive(Clone, bon::Builder)]
 pub struct KvWorkerArgs {
     /// The fragment state this worker shares with its siblings.
     pub shared: Arc<FragmentState>,
@@ -2540,6 +2569,135 @@ mod tests {
     use super::*;
     use crate::store::StoreError;
     use std::sync::Mutex as StdMutex;
+
+    #[test]
+    fn pool_builder_preserves_defaults_and_optional_overrides() {
+        let built = PoolConfig::builder().build();
+        let default = PoolConfig::default();
+        assert_eq!(
+            (built.workers, built.queue_cap, built.rate_limit_per_sec),
+            (
+                default.workers,
+                default.queue_cap,
+                default.rate_limit_per_sec
+            )
+        );
+        assert_eq!((built.workers, built.queue_cap), (4, 10_000));
+        assert_eq!(built.rate_limit_per_sec, None);
+        let limited = PoolConfig::builder()
+            .workers(3)
+            .queue_cap(17)
+            .rate_limit_per_sec(9)
+            .build();
+        assert_eq!(
+            (
+                limited.workers,
+                limited.queue_cap,
+                limited.rate_limit_per_sec
+            ),
+            (3, 17, Some(9))
+        );
+        assert_eq!(
+            PoolConfig::builder()
+                .maybe_rate_limit_per_sec(None)
+                .build()
+                .rate_limit_per_sec,
+            None
+        );
+    }
+
+    #[test]
+    fn actor_args_builders_retain_dependencies_and_priority_defaults() {
+        let shared = Arc::new(test_state(HashMap::new()));
+        let args = KvArgs::builder()
+            .shared(shared.clone())
+            .fragment(FragmentId(7))
+            .worker_prefix("builder-defaults")
+            .build();
+        assert!(Arc::ptr_eq(&args.shared, &shared));
+        assert_eq!(args.fragment, FragmentId(7));
+        assert_eq!(args.worker_prefix, "builder-defaults");
+        for (pool, expected) in [
+            (&args.default_pool, (4, 10_000, None)),
+            (&args.high_pool, (2, 5_000, None)),
+            (&args.background_pool, (2, 5_000, Some(1000))),
+        ] {
+            assert_eq!(
+                (pool.workers, pool.queue_cap, pool.rate_limit_per_sec),
+                expected
+            );
+        }
+        let custom = || PoolConfig::builder().workers(1).queue_cap(2).build();
+        let overridden = KvArgs::builder()
+            .shared(shared.clone())
+            .fragment(FragmentId(8))
+            .worker_prefix(String::from("builder-overrides"))
+            .high_pool(custom())
+            .default_pool(custom())
+            .background_pool(custom())
+            .build();
+        for pool in [
+            overridden.high_pool,
+            overridden.default_pool,
+            overridden.background_pool,
+        ] {
+            assert_eq!(
+                (pool.workers, pool.queue_cap, pool.rate_limit_per_sec),
+                (1, 2, None)
+            );
+        }
+        let worker = KvWorkerArgs::builder().shared(shared.clone()).build();
+        assert!(Arc::ptr_eq(&worker.shared, &shared));
+        assert!(worker.pending.is_none());
+        let pending = Arc::new(AtomicU64::new(0));
+        let worker = KvWorkerArgs::builder()
+            .shared(shared.clone())
+            .pending(pending.clone())
+            .build();
+        assert!(Arc::ptr_eq(worker.pending.as_ref().unwrap(), &pending));
+        assert!(KvWorkerArgs::builder()
+            .shared(shared)
+            .maybe_pending(None)
+            .build()
+            .pending
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn worker_builder_with_omitted_pending_serves_real_actor_operations() {
+        let shared = Arc::new(test_state(HashMap::new()));
+        let (worker, handle) = KvWorker::spawn(
+            None,
+            KvWorker,
+            KvWorkerArgs::builder().shared(shared.clone()).build(),
+        )
+        .await
+        .unwrap();
+        let value = VersionedValue::new(b"built".to_vec(), 10, "writer".into());
+        assert_eq!(
+            worker
+                .call(
+                    |reply| KvMessage::ApplyOp {
+                        op: ReplicatedOp {
+                            key: "built".into(),
+                            value: value.clone(),
+                            seq: 1,
+                            boot_id: 1
+                        },
+                        priority: OpPriority::Default,
+                        is_replication: false,
+                        reply: Some(reply),
+                    },
+                    Some(Duration::from_secs(2))
+                )
+                .await
+                .unwrap(),
+            CallResult::Success(Ok(ApplyOutcome::Applied))
+        );
+        assert_eq!(shared.get("built").await, Some(value));
+        worker.drain().unwrap();
+        handle.await.unwrap();
+    }
 
     struct StableFenceStore {
         reported: StoreCommitDurability,

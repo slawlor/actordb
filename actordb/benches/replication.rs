@@ -60,32 +60,27 @@ fn runtime() -> tokio::runtime::Runtime {
 }
 
 fn large_pool() -> PoolConfig {
-    PoolConfig {
-        workers: 4,
-        queue_cap: 1_000_000,
-        rate_limit_per_sec: None,
-    }
+    PoolConfig::builder().queue_cap(1_000_000).build()
 }
 
 fn catchup_config(replicas: Vec<String>) -> NodeConfig {
     let mut fragment_map = HashMap::new();
     fragment_map.insert(FragmentId(0), replicas);
-    NodeConfig {
-        default_pool: large_pool(),
-        high_pool: large_pool(),
-        background_pool: large_pool(),
-        fragment_count: 1,
-        fragment_map,
-        replication: SenderConfig {
-            batch_size: 4096,
-            batch_interval: Duration::from_millis(1),
-            max_in_flight: 8,
-            buffer_capacity: 8192,
-            consistency_interval: Duration::from_secs(3600),
-            ..SenderConfig::default()
-        },
-        ..NodeConfig::default()
-    }
+    NodeConfig::builder()
+        .default_pool(large_pool())
+        .high_pool(large_pool())
+        .background_pool(large_pool())
+        .fragment_map(fragment_map)
+        .replication(
+            SenderConfig::builder()
+                .batch_size(4096)
+                .batch_interval(Duration::from_millis(1))
+                .max_in_flight(8)
+                .buffer_capacity(8192)
+                .consistency_interval(Duration::from_secs(3600))
+                .build(),
+        )
+        .build()
 }
 
 async fn buffered_catchup_sample(n: usize) -> Duration {
@@ -182,13 +177,13 @@ fn bench_replication(c: &mut Criterion) {
         fragment_map.insert(FragmentId(0), vec!["a".to_string(), "b".to_string()]);
         // High queue caps: criterion hammers iterations back-to-back; we want
         // to measure the op path, not the backpressure shed path.
-        let mk = || NodeConfig {
-            default_pool: large_pool(),
-            high_pool: large_pool(),
-            background_pool: large_pool(),
-            fragment_count: 1,
-            fragment_map: fragment_map.clone(),
-            ..NodeConfig::default()
+        let mk = || {
+            NodeConfig::builder()
+                .default_pool(large_pool())
+                .high_pool(large_pool())
+                .background_pool(large_pool())
+                .fragment_map(fragment_map.clone())
+                .build()
         };
         let a = Node::start("a".to_string(), "127.0.0.1:0".parse().unwrap(), mk())
             .await

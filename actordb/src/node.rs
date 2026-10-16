@@ -523,12 +523,11 @@ async fn ensure_sender_entry(fragment: FragmentId, peer: &str, deps: SenderEntry
         fragment,
         peer.to_string(),
         deps.config.clone(),
-        SenderDeps {
-            router: deps.router.clone(),
-            hlc: deps.hlc.clone(),
-            reset_senders: Arc::new(Mutex::new(HashMap::new())),
-            state_report: report.clone(),
-        },
+        SenderDeps::builder()
+            .router(deps.router.clone())
+            .hlc(deps.hlc.clone())
+            .state_report(report.clone())
+            .build(),
         runtime,
     )
     .expect("node runtime options were validated before sender spawn");
@@ -1807,16 +1806,15 @@ impl ReplicationDrainReport {
 /// admitted mutations, reconnecting peers, reconciliation, and durability
 /// barriers. Per-attempt ACK/reconciliation timeouts still govern retries
 /// inside that total budget.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, bon::Builder)]
 pub struct ReplicationDrainOptions {
+    #[builder(default = Duration::from_secs(30))]
     timeout: Duration,
 }
 
 impl Default for ReplicationDrainOptions {
     fn default() -> Self {
-        Self {
-            timeout: Duration::from_secs(30),
-        }
+        Self::builder().build()
     }
 }
 
@@ -2275,21 +2273,20 @@ async fn spawn_fragment_subtree_registered(
     let (supervisor, startup_handle) = ActorRuntime::<FragmentSupervisor>::spawn_instant(
         None,
         FragmentSupervisor,
-        SupervisorArgs {
-            fragment,
-            worker_prefix,
-            store,
-            hlc: hlc.clone(),
-            default_pool: config.default_pool.clone(),
-            high_pool: config.high_pool.clone(),
-            background_pool: config.background_pool.clone(),
-            flush_batch_size: config.flush_batch_size,
-            flush_interval: config.flush_interval,
-            clean_interval: config.clean_interval,
-            snapshot_interval: config.snapshot_interval,
-            tombstone_gc_age: config.tombstone_gc_age,
-            reset_senders: Arc::new(Mutex::new(HashMap::new())),
-        },
+        SupervisorArgs::builder()
+            .fragment(fragment)
+            .worker_prefix(worker_prefix)
+            .maybe_store(store)
+            .hlc(hlc.clone())
+            .default_pool(config.default_pool.clone())
+            .high_pool(config.high_pool.clone())
+            .background_pool(config.background_pool.clone())
+            .flush_batch_size(config.flush_batch_size)
+            .flush_interval(config.flush_interval)
+            .clean_interval(config.clean_interval)
+            .snapshot_interval(config.snapshot_interval)
+            .maybe_tombstone_gc_age(config.tombstone_gc_age)
+            .build(),
     )
     .map_err(|e| NodeError::Actor(e.to_string()))?;
 
@@ -2756,54 +2753,53 @@ impl Drop for StoreBindingStartupGuard {
 /// This is separate from [`NodeConfig`] so adding transport policy does not
 /// break existing exhaustive `NodeConfig` literals. [`Node::start`] uses the
 /// defaults; pass an override to [`Node::start_with_options`].
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, bon::Builder)]
 pub struct NodeRuntimeOptions {
+    #[builder(default = PEER_CHANNEL_DEPTH)]
     peer_queue_frame_capacity: usize,
+    #[builder(default = PEER_CHANNEL_BYTE_CAPACITY)]
     peer_queue_byte_capacity: usize,
+    #[builder(default = REPLICATION_CONTROL_CHANNEL_DEPTH)]
     replication_control_message_capacity: usize,
+    #[builder(default = INBOUND_CONNECTION_CAPACITY)]
     inbound_connection_capacity: usize,
+    #[builder(default = RECEIVE_BYTE_CAPACITY)]
     receive_byte_capacity: usize,
+    #[builder(default = RELAY_CAPACITY)]
     relay_capacity: usize,
+    #[builder(default = RELAY_KEY_BYTE_CAPACITY)]
     relay_key_byte_capacity: usize,
+    #[builder(default = READ_QUEUE_CAPACITY)]
     serving_read_queue_capacity: usize,
+    #[builder(default = READ_KEY_BYTE_CAPACITY)]
     serving_read_key_byte_capacity: usize,
+    #[builder(default = FORWARDED_MUTATION_CAPACITY)]
     forwarded_mutation_capacity: usize,
+    #[builder(default = FORWARDED_MUTATION_BYTE_CAPACITY)]
     forwarded_mutation_byte_capacity: usize,
+    #[builder(default = REMOTE_RPC_TIMEOUT)]
     queue_admission_timeout: Duration,
+    #[builder(default = RECONCILE_DATA_ADMISSION_TIMEOUT)]
     reconcile_data_admission_timeout: Duration,
+    #[builder(default = REMOTE_RPC_TIMEOUT)]
     forwarded_attempt_timeout: Duration,
+    #[builder(default = REMOTE_RPC_TIMEOUT)]
     connect_timeout: Duration,
+    #[builder(default = HANDSHAKE_TIMEOUT)]
     handshake_timeout: Duration,
+    #[builder(default = SOCKET_WRITE_TIMEOUT)]
     socket_read_timeout: Duration,
+    #[builder(default = SOCKET_WRITE_TIMEOUT)]
     socket_write_timeout: Duration,
+    #[builder(default = Duration::from_secs(30))]
     replication_ack_timeout: Duration,
+    #[builder(default = Duration::from_secs(5))]
     health_timeout: Duration,
 }
 
 impl Default for NodeRuntimeOptions {
     fn default() -> Self {
-        Self {
-            peer_queue_frame_capacity: PEER_CHANNEL_DEPTH,
-            peer_queue_byte_capacity: PEER_CHANNEL_BYTE_CAPACITY,
-            replication_control_message_capacity: REPLICATION_CONTROL_CHANNEL_DEPTH,
-            inbound_connection_capacity: INBOUND_CONNECTION_CAPACITY,
-            receive_byte_capacity: RECEIVE_BYTE_CAPACITY,
-            relay_capacity: RELAY_CAPACITY,
-            relay_key_byte_capacity: RELAY_KEY_BYTE_CAPACITY,
-            serving_read_queue_capacity: READ_QUEUE_CAPACITY,
-            serving_read_key_byte_capacity: READ_KEY_BYTE_CAPACITY,
-            forwarded_mutation_capacity: FORWARDED_MUTATION_CAPACITY,
-            forwarded_mutation_byte_capacity: FORWARDED_MUTATION_BYTE_CAPACITY,
-            queue_admission_timeout: REMOTE_RPC_TIMEOUT,
-            reconcile_data_admission_timeout: RECONCILE_DATA_ADMISSION_TIMEOUT,
-            forwarded_attempt_timeout: REMOTE_RPC_TIMEOUT,
-            connect_timeout: REMOTE_RPC_TIMEOUT,
-            handshake_timeout: HANDSHAKE_TIMEOUT,
-            socket_read_timeout: SOCKET_WRITE_TIMEOUT,
-            socket_write_timeout: SOCKET_WRITE_TIMEOUT,
-            replication_ack_timeout: Duration::from_secs(30),
-            health_timeout: Duration::from_secs(5),
-        }
+        Self::builder().build()
     }
 }
 
@@ -3217,10 +3213,27 @@ impl NodeRuntimeOptions {
     }
 }
 
-/// Configuration for a [Node]. Start with `NodeConfig::default()` and
-/// set the fields you need. This is the seed of the operator-facing
+/// Configuration for a [Node]. Use [`NodeConfig::builder`] to override only
+/// the settings you need; omitted fields retain the documented defaults.
+/// Existing public struct literals and [`Default`] remain supported.
+/// This is the seed of the operator-facing
 /// configuration surface (see the `NodeConfig` productionization issue).
-#[derive(Clone)]
+///
+/// ```
+/// use actordb::actor::PoolConfig;
+/// use actordb::node::{NodeConfig, NodeRuntimeOptions};
+/// let config = NodeConfig::builder()
+///     .high_pool(PoolConfig::builder().workers(4).queue_cap(5_000).build())
+///     .maybe_store(None)
+///     .build();
+/// let runtime = NodeRuntimeOptions::builder()
+///     .forwarded_mutation_capacity(256)
+///     .forwarded_mutation_byte_capacity(128 * 1024 * 1024)
+///     .build();
+/// assert_eq!(config.background_pool.rate_limit_per_sec, Some(1000));
+/// assert_eq!(runtime.forwarded_mutation_capacity(), 256);
+/// ```
+#[derive(Clone, bon::Builder)]
 pub struct NodeConfig {
     /// Optional durable storage behind the node's in-memory cache.
     /// `None` (default) = no persistence; the node is purely in-memory.
@@ -3230,9 +3243,11 @@ pub struct NodeConfig {
     pub store: Option<Arc<dyn KvStore>>,
     /// Network transport for the peer mesh. Defaults to plain TCP;
     /// see [`Network`].
+    #[builder(default = Arc::new(TcpNetwork))]
     pub network: Arc<dyn Network>,
     /// Flush the store write buffer after this many buffered ops.
     /// Ignored when `store` is `None`.
+    #[builder(default = crate::supervision::DEFAULT_FLUSH_BATCH_SIZE)]
     pub flush_batch_size: usize,
     /// Flush the store write buffer after this long, even if the batch
     /// isn't full (checked on each applied write). Ignored when `store`
@@ -3241,6 +3256,7 @@ pub struct NodeConfig {
     /// Crash window: a `kill -9` can lose the unflushed tail, which is
     /// then recovered via peer sync on reconnect. Clean shutdowns
     /// always flush.
+    #[builder(default = crate::supervision::DEFAULT_FLUSH_INTERVAL)]
     pub flush_interval: Duration,
     /// Number of fragments the keyspace is partitioned into. Each
     /// fragment gets its own actor (and, with persistence, its own
@@ -3250,6 +3266,7 @@ pub struct NodeConfig {
     /// `fragment_of(key)`, or keys become unreachable.
     /// Must not exceed `u32::MAX`; the offered RocksDB backend binds this value
     /// into its persistent identity manifest.
+    #[builder(default = 1)]
     pub fragment_count: usize,
     /// Static placement: fragment -> replica node_ids. Must be identical
     /// on every node. A non-empty map must cover exactly
@@ -3257,25 +3274,32 @@ pub struct NodeConfig {
     /// duplicate-free, and every replica id must contain 1 to 255 bytes.
     /// Empty (default) = this node serves all fragments (single-node / legacy
     /// full replication).
+    #[builder(default)]
     pub fragment_map: HashMap<FragmentId, Vec<String>>,
     /// Static membership: node_id -> address, for dialing fragment owners.
     /// Every id must contain 1 to 255 bytes and addresses must be unique.
     /// [`Node::start`] registers a persistent dial supervisor for every
     /// non-local entry, so its expected id is enforced on the first
     /// authentication attempt and every retry.
+    #[builder(default)]
     pub members: HashMap<String, SocketAddr>,
     /// Worker pool configs by priority. The default pool handles normal
     /// ops; high-priority is for latency-sensitive traffic; background
     /// is for bulk/scan (rate-limited).
+    #[builder(default)]
     pub default_pool: PoolConfig,
+    #[builder(default = PoolConfig::high_priority_defaults())]
     pub high_pool: PoolConfig,
+    #[builder(default = PoolConfig::background_defaults())]
     pub background_pool: PoolConfig,
     /// How often each fragment's cleaner sweeps for TTL-expired keys.
     /// Default 30 seconds. Must be nonzero and representable by Tokio's clock.
+    #[builder(default = crate::supervision::DEFAULT_CLEAN_INTERVAL)]
     pub clean_interval: Duration,
     /// How often each fragment's snapshotter flushes the write buffer
     /// to the store. Default 60 seconds. Must be nonzero and representable by
     /// Tokio's clock, including for in-memory nodes.
+    #[builder(default = crate::supervision::DEFAULT_SNAPSHOT_INTERVAL)]
     pub snapshot_interval: Duration,
     /// Reserved compatibility field for the removed time-based tombstone
     /// collector. Must be `None`; [`Node::start`] rejects every `Some` value
@@ -3286,12 +3310,14 @@ pub struct NodeConfig {
     /// production; tests use it to simulate clock skew. Hidden from
     /// docs: not a tuning knob.
     #[doc(hidden)]
+    #[builder(default)]
     pub clock_skew_ms: i64,
     /// Maximum a remote or persisted timestamp may exceed this node's wall
     /// clock before the connection or durable startup is rejected. The raw
     /// out-of-policy value is never stored. Without this bound, one bad
     /// timestamp permanently poisons last-writer-wins cluster-wide. Default
     /// 5 minutes.
+    #[builder(default = Duration::from_secs(300))]
     pub max_clock_skew: Duration,
     /// Pre-shared secret for mutual HMAC proofs over both peers' fresh
     /// challenges, identities, protocol ranges, capabilities, and connection
@@ -3306,6 +3332,7 @@ pub struct NodeConfig {
     /// (default) sends no proof.
     pub cluster_secret: Option<Vec<u8>>,
     /// Phase 5 async replication tuning (batching, acks, buffers).
+    #[builder(default)]
     pub replication: SenderConfig,
     /// Phase 8: dynamic placement controller. `None` (default) =
     /// static placement: the node's fragments are fixed at startup
@@ -3321,50 +3348,19 @@ pub struct NodeConfig {
     pub placement_controller: Option<Arc<dyn PlacementController>>,
     /// How often the Phase 8 placement driver re-evaluates desired
     /// placement. Ignored in static mode. Default 1 second.
+    #[builder(default = Duration::from_secs(1))]
     pub placement_poll_interval: Duration,
     /// How often to warn while a revoked fragment cannot safely finish
     /// draining. This is an observability interval, not a destructive
     /// timeout: the old owner retains its recovery state until every sender
     /// has drained. Ignored in static mode. Default 10 seconds.
+    #[builder(default = Duration::from_secs(10))]
     pub placement_drain_warn_interval: Duration,
 }
 
 impl Default for NodeConfig {
     fn default() -> Self {
-        Self {
-            store: None,
-            network: Arc::new(TcpNetwork),
-            flush_batch_size: 1000,
-            flush_interval: Duration::from_millis(100),
-            fragment_count: 1,
-            fragment_map: HashMap::new(),
-            members: HashMap::new(),
-            default_pool: PoolConfig {
-                workers: 4,
-                queue_cap: 10_000,
-                rate_limit_per_sec: None,
-            },
-            high_pool: PoolConfig {
-                workers: 2,
-                queue_cap: 5_000,
-                rate_limit_per_sec: None,
-            },
-            background_pool: PoolConfig {
-                workers: 2,
-                queue_cap: 5_000,
-                rate_limit_per_sec: Some(1000),
-            },
-            clean_interval: Duration::from_secs(30),
-            snapshot_interval: Duration::from_secs(60),
-            tombstone_gc_age: None,
-            clock_skew_ms: 0,
-            max_clock_skew: Duration::from_secs(300),
-            cluster_secret: None,
-            replication: SenderConfig::default(),
-            placement_controller: None,
-            placement_poll_interval: Duration::from_secs(1),
-            placement_drain_warn_interval: Duration::from_secs(10),
-        }
+        Self::builder().build()
     }
 }
 
@@ -3384,12 +3380,11 @@ impl NodeConfig {
         path: impl AsRef<std::path::Path>,
         options: crate::store::RocksDbOptions,
     ) -> Result<Self, crate::store::StoreError> {
-        Ok(Self {
-            store: Some(Arc::new(crate::store::RocksDbStore::open_with_options(
+        Ok(Self::builder()
+            .store(Arc::new(crate::store::RocksDbStore::open_with_options(
                 path, options,
-            )?)),
-            ..Self::default()
-        })
+            )?))
+            .build())
     }
 }
 
@@ -10155,6 +10150,205 @@ mod tests {
     use ractor::ActorProcessingErr;
     use std::sync::atomic::AtomicBool;
     use std::sync::Condvar;
+
+    #[test]
+    fn runtime_builder_defaults_and_every_override_match_legacy_options() {
+        let expected = NodeRuntimeOptions {
+            peer_queue_frame_capacity: PEER_CHANNEL_DEPTH,
+            peer_queue_byte_capacity: PEER_CHANNEL_BYTE_CAPACITY,
+            replication_control_message_capacity: REPLICATION_CONTROL_CHANNEL_DEPTH,
+            inbound_connection_capacity: INBOUND_CONNECTION_CAPACITY,
+            receive_byte_capacity: RECEIVE_BYTE_CAPACITY,
+            relay_capacity: RELAY_CAPACITY,
+            relay_key_byte_capacity: RELAY_KEY_BYTE_CAPACITY,
+            serving_read_queue_capacity: READ_QUEUE_CAPACITY,
+            serving_read_key_byte_capacity: READ_KEY_BYTE_CAPACITY,
+            forwarded_mutation_capacity: FORWARDED_MUTATION_CAPACITY,
+            forwarded_mutation_byte_capacity: FORWARDED_MUTATION_BYTE_CAPACITY,
+            queue_admission_timeout: REMOTE_RPC_TIMEOUT,
+            reconcile_data_admission_timeout: RECONCILE_DATA_ADMISSION_TIMEOUT,
+            forwarded_attempt_timeout: REMOTE_RPC_TIMEOUT,
+            connect_timeout: REMOTE_RPC_TIMEOUT,
+            handshake_timeout: HANDSHAKE_TIMEOUT,
+            socket_read_timeout: SOCKET_WRITE_TIMEOUT,
+            socket_write_timeout: SOCKET_WRITE_TIMEOUT,
+            replication_ack_timeout: Duration::from_secs(30),
+            health_timeout: Duration::from_secs(5),
+        };
+        let defaults = NodeRuntimeOptions::builder().build();
+        assert_eq!(format!("{defaults:?}"), format!("{expected:?}"));
+        assert_eq!(
+            format!("{defaults:?}"),
+            format!("{:?}", NodeRuntimeOptions::default())
+        );
+        defaults.validate().unwrap();
+
+        let timeout = Duration::from_secs(17);
+        let built = NodeRuntimeOptions::builder()
+            .peer_queue_frame_capacity(20)
+            .peer_queue_byte_capacity(64 * 1024 * 1024)
+            .replication_control_message_capacity(29)
+            .inbound_connection_capacity(31)
+            .receive_byte_capacity(32 * 1024 * 1024)
+            .relay_capacity(37)
+            .relay_key_byte_capacity(41)
+            .serving_read_queue_capacity(43)
+            .serving_read_key_byte_capacity(32 * 1024 * 1024)
+            .forwarded_mutation_capacity(47)
+            .forwarded_mutation_byte_capacity(32 * 1024 * 1024)
+            .queue_admission_timeout(timeout)
+            .reconcile_data_admission_timeout(timeout)
+            .forwarded_attempt_timeout(timeout)
+            .connect_timeout(timeout)
+            .handshake_timeout(timeout)
+            .socket_read_timeout(timeout)
+            .socket_write_timeout(timeout)
+            .replication_ack_timeout(timeout)
+            .health_timeout(timeout)
+            .build();
+        let legacy = NodeRuntimeOptions::default()
+            .with_peer_queue_frame_capacity(20)
+            .with_peer_queue_byte_capacity(64 * 1024 * 1024)
+            .with_replication_control_message_capacity(29)
+            .with_inbound_connection_capacity(31)
+            .with_receive_byte_capacity(32 * 1024 * 1024)
+            .with_relay_capacity(37)
+            .with_relay_key_byte_capacity(41)
+            .with_serving_read_queue_capacity(43)
+            .with_serving_read_key_byte_capacity(32 * 1024 * 1024)
+            .with_forwarded_mutation_capacity(47)
+            .with_forwarded_mutation_byte_capacity(32 * 1024 * 1024)
+            .with_queue_admission_timeout(timeout)
+            .with_reconcile_data_admission_timeout(timeout)
+            .with_forwarded_attempt_timeout(timeout)
+            .with_connect_timeout(timeout)
+            .with_handshake_timeout(timeout)
+            .with_socket_read_timeout(timeout)
+            .with_socket_write_timeout(timeout)
+            .with_replication_ack_timeout(timeout)
+            .with_health_timeout(timeout);
+        assert_eq!(format!("{built:?}"), format!("{legacy:?}"));
+        built.validate().unwrap();
+
+        let drain = ReplicationDrainOptions::builder().build();
+        assert_eq!(drain.timeout(), Duration::from_secs(30));
+        assert_eq!(
+            drain.timeout(),
+            ReplicationDrainOptions::default().timeout()
+        );
+        assert_eq!(
+            ReplicationDrainOptions::builder()
+                .timeout(timeout)
+                .build()
+                .timeout(),
+            ReplicationDrainOptions::default()
+                .with_timeout(timeout)
+                .timeout()
+        );
+    }
+
+    #[test]
+    fn node_config_builder_omits_settings_without_changing_priority_or_security_defaults() {
+        let config = NodeConfig::builder().build();
+        assert!(config.store.is_none());
+        assert_eq!(config.flush_batch_size, 1000);
+        assert_eq!(config.flush_interval, Duration::from_millis(100));
+        assert_eq!(config.fragment_count, 1);
+        assert!(config.fragment_map.is_empty());
+        assert!(config.members.is_empty());
+        assert_eq!(
+            (config.default_pool.workers, config.default_pool.queue_cap),
+            (4, 10_000)
+        );
+        assert_eq!(
+            (config.high_pool.workers, config.high_pool.queue_cap),
+            (2, 5_000)
+        );
+        assert_eq!(
+            (
+                config.background_pool.workers,
+                config.background_pool.queue_cap
+            ),
+            (2, 5_000)
+        );
+        assert_eq!(config.default_pool.rate_limit_per_sec, None);
+        assert_eq!(config.high_pool.rate_limit_per_sec, None);
+        assert_eq!(config.background_pool.rate_limit_per_sec, Some(1000));
+        assert_eq!(config.clean_interval, Duration::from_secs(30));
+        assert_eq!(config.snapshot_interval, Duration::from_secs(60));
+        assert_eq!(config.tombstone_gc_age, None);
+        assert_eq!(config.clock_skew_ms, 0);
+        assert_eq!(config.max_clock_skew, Duration::from_secs(300));
+        assert!(config.cluster_secret.is_none());
+        assert_eq!(config.replication.batch_size, 100);
+        assert!(config.placement_controller.is_none());
+        assert_eq!(config.placement_poll_interval, Duration::from_secs(1));
+        assert_eq!(
+            config.placement_drain_warn_interval,
+            Duration::from_secs(10)
+        );
+
+        let config = NodeConfig::builder()
+            .fragment_count(3)
+            .high_pool(PoolConfig::builder().workers(7).build())
+            .cluster_secret(vec![42; 32])
+            .maybe_store(None)
+            .maybe_placement_controller(None)
+            .maybe_tombstone_gc_age(None)
+            .build();
+        assert_eq!(config.fragment_count, 3);
+        assert_eq!(config.high_pool.workers, 7);
+        assert_eq!(config.high_pool.queue_cap, 10_000);
+        assert_eq!(config.cluster_secret.as_deref(), Some(&[42; 32][..]));
+        assert!(config.store.is_none());
+        assert!(config.placement_controller.is_none());
+        assert_eq!(config.tombstone_gc_age, None);
+    }
+
+    #[tokio::test]
+    async fn builder_constructed_nodes_serve_and_invalid_settings_still_fail_before_bind() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let error = match Node::start_with_options(
+            "invalid-builder".to_string(),
+            address,
+            NodeConfig::builder().build(),
+            NodeRuntimeOptions::builder()
+                .health_timeout(Duration::ZERO)
+                .build(),
+        )
+        .await
+        {
+            Err(error) => error,
+            Ok(node) => {
+                node.shutdown().await.unwrap();
+                panic!("invalid health timeout accepted");
+            }
+        };
+        assert!(matches!(error, NodeError::Actor(message) if message.contains("health timeout")));
+        drop(listener);
+
+        let node = Node::start_with_options(
+            "bon-builder".to_string(),
+            "127.0.0.1:0".parse().unwrap(),
+            NodeConfig::builder().fragment_count(2).build(),
+            NodeRuntimeOptions::builder().build(),
+        )
+        .await
+        .unwrap();
+        node.put("builder-key".to_string(), b"value".to_vec())
+            .await
+            .unwrap();
+        assert_eq!(
+            node.get("builder-key".to_string())
+                .await
+                .unwrap()
+                .unwrap()
+                .value,
+            b"value".to_vec()
+        );
+        node.shutdown().await.unwrap();
+    }
 
     struct DelayedHealthSupervisor;
 
