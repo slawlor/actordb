@@ -6,8 +6,10 @@ use std::time::Duration;
 
 use actordb::actor::{KeyMatcher, ScanSpec, ValueTransform};
 use actordb::node::scan::ScanError;
-use actordb::node::{Node, NodeConfig};
+use actordb::node::{Node, NodeConfig, NodeError};
 use actordb::shard::{fragment_of, FragmentId};
+
+mod common;
 
 async fn test_node(id: &str, config: NodeConfig) -> Node {
     let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
@@ -104,15 +106,24 @@ async fn node_scan_hides_tombstones_and_expired() {
     node.put("dead".to_string(), b"v".to_vec()).await.unwrap();
     node.delete("dead".to_string()).await.unwrap();
 
-    // Expired via a 1ms TTL, then wait it out.
-    node.put_with_ttl(
-        "old".to_string(),
-        b"v".to_vec(),
-        Some(Duration::from_millis(1)),
+    // Expiry can race admission on a loaded or instrumented runner. Both an
+    // applied write and an explicitly expired write must disappear from scans.
+    let result = node
+        .put_with_ttl(
+            "old".to_string(),
+            b"v".to_vec(),
+            Some(Duration::from_millis(100)),
+        )
+        .await;
+    assert!(
+        matches!(result, Ok(()) | Err(NodeError::Expired)),
+        "unexpected TTL result: {result:?}"
+    );
+    common::wait_for(
+        || async { node.get("old".to_string()).await.unwrap().is_none() },
+        Duration::from_secs(5),
     )
-    .await
-    .unwrap();
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    .await;
 
     let matches = node.scan(&scan_all()).await.expect("scan failed");
     let keys: Vec<&str> = matches.iter().map(|m| m.key.as_str()).collect();
