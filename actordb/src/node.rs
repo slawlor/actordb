@@ -14639,9 +14639,7 @@ mod tests {
         };
         assert!(try_send_envelope_immediate(&peer, envelope()));
         let mut cancelled = peer.cancel.subscribe();
-        let started = Instant::now();
         assert!(!try_send_envelope_immediate(&peer, envelope()));
-        assert!(started.elapsed() < Duration::from_millis(50));
         tokio::time::timeout(Duration::from_secs(1), cancelled.changed())
             .await
             .expect("saturated reader response did not cancel the connection")
@@ -15141,7 +15139,7 @@ mod tests {
         assert_eq!(producer_byte_budget.available_permits(), encoded_len);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn mutation_relay_timeout_removes_entry_and_replies_unavailable() {
         let relays: MutationRelayMap = Arc::new(StdMutex::new(HashMap::new()));
         let (origin_tx, _origin_rx, mut origin_response_rx) = test_peer_channel(1);
@@ -15178,6 +15176,7 @@ mod tests {
             "relay released mutation admission before response or timeout"
         );
 
+        tokio::time::advance(Duration::from_millis(50)).await;
         let bytes = tokio::time::timeout(Duration::from_secs(1), origin_response_rx.recv())
             .await
             .expect("relay timeout did not reply")
@@ -15200,7 +15199,7 @@ mod tests {
         tasks.shutdown().await;
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn completed_mutation_relay_cancels_timeout() {
         let relays: MutationRelayMap = Arc::new(StdMutex::new(HashMap::new()));
         let (origin_tx, _origin_rx, mut origin_response_rx) = test_peer_channel(1);
@@ -15232,6 +15231,7 @@ mod tests {
         let MutationRelay {
             timeout_cancel,
             _operation: operation,
+            _admission: relay_admission,
             ..
         } = relay;
         let _ = timeout_cancel.send(());
@@ -15243,17 +15243,24 @@ mod tests {
             "removed relay released mutation admission before response handling finished"
         );
         drop(operation);
+        drop(relay_admission);
         tokio::time::timeout(Duration::from_secs(1), operation_gate.wait_for_drain())
             .await
             .expect("completed relay did not release mutation admission");
 
-        tokio::time::sleep(Duration::from_millis(30)).await;
+        tokio::time::advance(Duration::from_millis(30)).await;
+        // A removed entry alone does not prove that its canceled timer exited.
+        // The timer retains the sole admission slot until its future drops.
+        let _timer_exited = tokio::time::timeout(Duration::from_secs(1), admission.slots.acquire())
+            .await
+            .expect("completed relay timer did not release admission")
+            .expect("relay admission closed");
         assert!(origin_response_rx.try_recv().is_err());
         assert!(relays.lock().unwrap().is_empty());
         tasks.shutdown().await;
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn read_relay_timeout_removes_registry_entry() {
         let relays: RelayMap = Arc::new(StdMutex::new(HashMap::new()));
         let (origin_tx, _origin_rx, _origin_response_rx) = test_peer_channel(1);
@@ -15279,16 +15286,12 @@ mod tests {
         .unwrap()
         .disarm();
         assert!(relays.lock().unwrap().contains_key(&23));
-        tokio::time::timeout(Duration::from_secs(1), async {
-            loop {
-                if relays.lock().unwrap().is_empty() {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("relay deadline did not remove the entry");
+        tokio::time::advance(Duration::from_millis(10)).await;
+        let _timer_exited = tokio::time::timeout(Duration::from_secs(1), admission.slots.acquire())
+            .await
+            .expect("relay deadline timer did not release admission")
+            .expect("relay admission closed");
+        assert!(relays.lock().unwrap().is_empty());
         tasks.shutdown().await;
     }
 
@@ -16918,6 +16921,9 @@ mod tests {
             Some(EnvelopeMsg::SessionStart(session)) => session.session_id,
             other => panic!("expected SessionStart, got {other:?}"),
         };
+        // Measure from before admission, not a possibly delayed receipt of
+        // SessionStart after the sender has already begun its retry floor.
+        let reconcile_started_at = Instant::now();
         sender.send(SenderMsg::ReconcileNow).unwrap();
         let initial_round = match Envelope::decode(timed_out_rx.recv().await.unwrap().as_slice())
             .unwrap()
@@ -16939,7 +16945,6 @@ mod tests {
             other => panic!("expected rotated SessionStart, got {other:?}"),
         };
         assert_ne!(rotated_session, initial_session);
-        let retry_floor_observed_at = Instant::now();
 
         sender
             .send(SenderMsg::PeerDisconnected {
@@ -16960,7 +16965,7 @@ mod tests {
         };
         assert_ne!(new_session, rotated_session);
 
-        let early_deadline = retry_floor_observed_at + Duration::from_millis(800);
+        let early_deadline = reconcile_started_at + Duration::from_millis(800);
         if Instant::now() < early_deadline {
             assert!(
                 tokio::time::timeout_at(early_deadline, new_rx.recv())
@@ -16973,7 +16978,7 @@ mod tests {
             .await
             .expect("reconciliation was not retried after the retry floor")
             .expect("replacement peer channel closed");
-        assert!(retry_floor_observed_at.elapsed() >= Duration::from_millis(900));
+        assert!(reconcile_started_at.elapsed() >= Duration::from_millis(900));
         match Envelope::decode(retry.as_slice()).unwrap().msg {
             Some(EnvelopeMsg::ReconcileRequest(request)) => {
                 assert_eq!(request.session_id, new_session);

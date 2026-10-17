@@ -1,7 +1,7 @@
 // Shared helpers for actordb integration tests.
 
 use std::future::Future;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use tokio::time::sleep;
 
@@ -11,12 +11,17 @@ where
     F: Fn() -> Fut,
     Fut: Future<Output = bool>,
 {
-    let start = Instant::now();
-    while start.elapsed() < timeout {
-        if check().await {
-            return;
-        }
-        sleep(Duration::from_millis(50)).await;
-    }
-    assert!(check().await, "condition not met within {timeout:?}");
+    assert!(
+        tokio::time::timeout(timeout, async {
+            loop {
+                if check().await {
+                    return;
+                }
+                sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .is_ok(),
+        "condition not met within {timeout:?}"
+    );
 }

@@ -1,5 +1,28 @@
 # Release notes
 
+## 0.3.1
+
+- Stabilize tests around asynchronous worker health, relay/ACK deadlines, and TTL expiry;
+  expiry during admission remains an explicit supported outcome, not a failure
+  of scan visibility.
+- Fence supervised restarts by actor identity, bound the complete integration
+  polling operation, and replace a shared-runner latency threshold with a
+  correctness check that completes both bulk-write and high-priority workloads.
+- Remove duplicate native RocksDB package builds and tests from publishing.
+  Normal CI retains backend-free, memory-only, and all-feature validation; release
+  validation retains backend-free and memory-only package checks and tests.
+- Update installation examples and release instructions for the 0.3 series.
+
+## 0.3.0
+
+- Add `Node::scan` for distributed key filtering and value projections, with
+  background-pool admission, per-fragment bounds, replica failover, and explicit
+  failure rather than silent partial results. Scans use per-fragment views,
+  not a globally isolated snapshot; see the [scan guide](docs/scanning.md).
+- Add scan request/response messages to the peer protocol and deterministic
+  local scan ordering. Upgrade peers together when adopting the scan API.
+- Use the protobuf-src 1.1 release series for protobuf generation.
+
 ## 0.2.0
 
 The next pre-1.0 release replaces the original prototype with the current

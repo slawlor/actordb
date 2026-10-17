@@ -618,6 +618,54 @@ mod tests {
     use std::sync::atomic::Ordering;
     use std::sync::Mutex as StdMutex;
 
+    async fn wait_until_running(actors: &[ActorCell]) {
+        // ractor spawn completes pre_start and linking, not the background
+        // post_start transition. Fence exact physical actors before treating
+        // their non-atomic health snapshot as a fully started test fixture.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let mut ready = true;
+                for actor in actors {
+                    let status = actor.get_status();
+                    assert!(
+                        status < ActorStatus::Draining,
+                        "actor {:?} stopped before becoming ready: {status:?}",
+                        actor.get_name()
+                    );
+                    ready &= status == ActorStatus::Running;
+                }
+                if ready {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("actor fixture did not finish startup");
+    }
+
+    async fn running_dispatcher(
+        supervisor: &ActorRef<SupervisorMessage>,
+        expected_workers: usize,
+    ) -> ActorRef<KvMessage> {
+        let dispatcher = match supervisor
+            .call(
+                |reply| SupervisorMessage::GetDispatcher { reply },
+                Some(Duration::from_secs(2)),
+            )
+            .await
+            .unwrap()
+        {
+            CallResult::Success(dispatcher) => dispatcher,
+            other => panic!("dispatcher lookup failed: {other:?}"),
+        };
+        let mut actors = dispatcher.get_children();
+        assert_eq!(actors.len(), expected_workers);
+        actors.push(dispatcher.get_cell());
+        wait_until_running(&actors).await;
+        dispatcher
+    }
+
     mod lifecycle_configuration {
         //! Configured child startup, quiescence and real maintenance recovery.
 
@@ -636,6 +684,7 @@ mod tests {
             )
             .await
             .unwrap();
+            let _dispatcher = running_dispatcher(&supervisor, 8).await;
             let CallResult::Success(health) = supervisor
                 .call(
                     |reply| SupervisorMessage::GetHealth { reply },
@@ -770,16 +819,7 @@ mod tests {
             .await
             .unwrap();
             let _stop = StopRestartSupervisor(supervisor.get_cell());
-            let CallResult::Success(dispatcher) = supervisor
-                .call(
-                    |reply| SupervisorMessage::GetDispatcher { reply },
-                    Some(Duration::from_secs(2)),
-                )
-                .await
-                .unwrap()
-            else {
-                panic!("dispatcher lookup failed")
-            };
+            let dispatcher = running_dispatcher(&supervisor, 8).await;
             let ordinary = VersionedValue::new(b"retained".to_vec(), 10, "writer".into());
             let apply = |key: &str, value: VersionedValue| ReplicatedOp {
                 key: key.into(),
@@ -1029,6 +1069,9 @@ mod tests {
                 };
                 children.push(child);
             }
+            let mut actors: Vec<_> = children.iter().map(|child| child.get_cell()).collect();
+            actors.push(dispatcher.get_cell());
+            wait_until_running(&actors).await;
             children[2].stop(None);
             children[2].wait(None).await.unwrap();
             let restarts = HashMap::from([("dispatcher".to_string(), 3)]);
@@ -1058,6 +1101,7 @@ mod tests {
                 HealthDispatcher::spawn(None, HealthDispatcher, HealthDispatcherMode::DropReply)
                     .await
                     .unwrap();
+            wait_until_running(&[missing_reply.get_cell()]).await;
             assert!(
                 probe_health(&missing_reply, &args, &restarts, Duration::from_secs(1))
                     .await
@@ -1079,6 +1123,7 @@ mod tests {
             )
             .await
             .unwrap();
+            wait_until_running(&[blocked.get_cell()]).await;
             assert!(tokio::time::timeout(
                 Duration::from_secs(1),
                 probe_health(&blocked, &args, &restarts, Duration::from_millis(20)),
@@ -1101,14 +1146,7 @@ mod tests {
             let (supervisor, _) = FragmentSupervisor::spawn(None, FragmentSupervisor, args)
                 .await
                 .unwrap();
-            let dispatcher = match supervisor
-                .call(|reply| SupervisorMessage::GetDispatcher { reply }, None)
-                .await
-                .unwrap()
-            {
-                CallResult::Success(dispatcher) => dispatcher,
-                other => panic!("dispatcher lookup failed: {other:?}"),
-            };
+            let dispatcher = running_dispatcher(&supervisor, 3).await;
             let (applied, mut apply_result) = tokio::sync::oneshot::channel();
             dispatcher
                 .send_message(KvMessage::ApplyOp {
@@ -1478,14 +1516,7 @@ mod tests {
             )
             .await
             .unwrap();
-            let dispatcher = match supervisor
-                .call(|reply| SupervisorMessage::GetDispatcher { reply }, None)
-                .await
-                .unwrap()
-            {
-                CallResult::Success(dispatcher) => dispatcher,
-                other => panic!("dispatcher lookup failed: {other:?}"),
-            };
+            let dispatcher = running_dispatcher(&supervisor, 3).await;
             let health = match supervisor
                 .call(|reply| SupervisorMessage::GetHealth { reply }, None)
                 .await
@@ -1540,7 +1571,14 @@ mod tests {
                     .call(|reply| SupervisorMessage::Quiesce { reply }, None)
                     .await
             });
-            tokio::time::sleep(Duration::from_millis(20)).await;
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while dispatcher.get_status() < ActorStatus::Draining {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("quiesce did not reach the dispatcher drain fence");
+            assert_eq!(dispatcher.get_status(), ActorStatus::Draining);
             assert!(
                 !quiesce.is_finished(),
                 "quiesce skipped blocked worker work"
