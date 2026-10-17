@@ -1571,14 +1571,17 @@ mod tests {
                     .call(|reply| SupervisorMessage::Quiesce { reply }, None)
                     .await
             });
+            // Draining is transient once the dispatcher empties its mailbox.
+            // Stopping is stable here: post_stop must join the store-blocked
+            // worker before the dispatcher can finish and become Stopped.
             tokio::time::timeout(Duration::from_secs(5), async {
-                while dispatcher.get_status() < ActorStatus::Draining {
+                while dispatcher.get_status() < ActorStatus::Stopping {
                     tokio::task::yield_now().await;
                 }
             })
             .await
-            .expect("quiesce did not reach the dispatcher drain fence");
-            assert_eq!(dispatcher.get_status(), ActorStatus::Draining);
+            .expect("quiesce did not reach the dispatcher worker-join fence");
+            assert_eq!(dispatcher.get_status(), ActorStatus::Stopping);
             assert!(
                 !quiesce.is_finished(),
                 "quiesce skipped blocked worker work"
