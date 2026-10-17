@@ -17,6 +17,6 @@ pub use meta::{
     BatchAck, BatchGet, BatchGetResponse, BatchNack, BatchPut, Envelope, ForwardedGet,
     ForwardedPut, GetResponse, Hello, HelloAuth, KeySummary, MutationResponse, MutationResult,
     MutationStatus, Priority, ReconcileData, ReconcileFetch, ReconcileRequest, ReconcileResponse,
-    ReplicateBatch, ReplicateOp, ReplicationAckLevel, SessionStart, SyncEntry, SyncRequest,
-    SyncResponse,
+    ReplicateBatch, ReplicateOp, ReplicationAckLevel, ScanMatch as ScanMatchProto, ScanRequest,
+    ScanResponse, SessionStart, SyncEntry, SyncRequest, SyncResponse,
 };

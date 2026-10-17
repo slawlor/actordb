@@ -34,6 +34,10 @@ pub(crate) const MAX_RECONCILE_FETCH_KEYS: usize = 256;
 /// frame containing millions of zero-length protobuf elements from amplifying
 /// into unbounded decode allocations.
 pub(crate) const MAX_WIRE_BATCH_ITEMS: usize = 4096;
+/// Sanity ceiling on ScanResponse.matches repeated-field count. The
+/// per-fragment scan limit and the 16 MiB frame cap are the real bounds;
+/// this only rejects absurd counts during preflight decode.
+pub(crate) const MAX_SCAN_RESPONSE_MATCHES: usize = 1_000_000;
 /// Provenance ids are carried in result metadata and must match the handshake
 /// and placement identity bound.
 pub(crate) const MAX_WIRE_NODE_ID_BYTES: usize = 255;
@@ -440,7 +444,7 @@ pub(crate) fn preflight_envelope_decode(frame: &[u8]) -> Result<(), WireDecodeEr
             return Err(WireDecodeError::Malformed("field number is zero"));
         }
         let wire_type = (key & 7) as u8;
-        if (1..=20).contains(&field) {
+        if (1..=22).contains(&field) {
             messages += 1;
             if messages > 1 {
                 return Err(WireDecodeError::MultipleMessages);
@@ -491,6 +495,16 @@ pub(crate) fn preflight_envelope_decode(frame: &[u8]) -> Result<(), WireDecodeEr
                     2,
                     MAX_WIRE_BATCH_ITEMS,
                     "MutationResponse.results",
+                )?,
+                // ScanResponse.matches: bounded by the per-fragment scan
+                // limit; the 16 MiB frame cap is the hard bound. This
+                // preflight count is a sanity ceiling against absurd
+                // repeated-field counts.
+                22 => preflight_repeated_field(
+                    payload,
+                    2,
+                    MAX_SCAN_RESPONSE_MATCHES,
+                    "ScanResponse.matches",
                 )?,
                 _ => {}
             }

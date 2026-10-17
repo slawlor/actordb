@@ -343,5 +343,49 @@ message Envelope {
     MutationResponse mutation_response = 18;
     BatchNack batch_nack = 19;
     HelloAuth hello_auth = 20;
+    ScanRequest scan_request = 21;
+    ScanResponse scan_response = 22;
   }
+}
+
+// Distributed scan: coordinator -> fragment holder. Mirrors ForwardedGet:
+// one holder per fragment, failover across replica_order, hop-bounded
+// re-forwarding during placement migration. The spec is data, never code.
+message ScanRequest {
+  uint64 req_id = 1;
+  uint32 fragment = 2;
+  // Matcher descriptor: 0=all, 1=key prefix.
+  uint32 matcher_kind = 3;
+  // Matcher argument: prefix bytes when matcher_kind=1.
+  bytes matcher_arg = 4;
+  // Transform descriptor: 0=identity, 1=key_only, 2=prefix_bytes.
+  uint32 transform_kind = 5;
+  // Transform argument: N when transform_kind=2.
+  uint32 transform_arg = 6;
+  // Per-fragment match bound. 0 = server default. This bound is also the
+  // wire-size safety: the response is a single envelope, so limit *
+  // avg value size must stay comfortably under the 16 MiB frame cap.
+  uint32 limit = 7;
+  // Skip-first-N pagination cursor (deterministic key order).
+  uint64 offset = 8;
+  // Always PRIORITY_BACKGROUND for scans.
+  Priority priority = 9;
+  // Re-forward bound, as with ForwardedGet.
+  uint32 hops = 10;
+}
+
+// Holder -> coordinator. A single response per request; the per-fragment
+// limit keeps it under the frame cap.
+message ScanResponse {
+  uint64 req_id = 1;
+  repeated ScanMatch matches = 2;
+  // Non-empty = this holder could not serve the scan (not serving, bad
+  // spec, shed). The coordinator fails over to the next replica holder.
+  string error = 3;
+}
+
+message ScanMatch {
+  string key = 1;
+  // Transformed value. Empty when the transform is key_only.
+  bytes value = 2;
 }

@@ -87,6 +87,8 @@ use mutation_service::{
     MutationJob, MutationRequest, MutationService, FORWARDED_MUTATION_BYTE_CAPACITY,
     FORWARDED_MUTATION_CAPACITY,
 };
+pub mod scan;
+pub use scan::{ScanError, MAX_SCAN_TOTAL_MATCHES};
 
 /// Current peer wire protocol version. Hello ranges must include this value.
 /// Version 3 replaces monolithic full-state sync with byte-bounded,
@@ -771,6 +773,10 @@ type PendingBatchGets = Arc<StdMutex<HashMap<u64, PendingBatchGet>>>;
 /// Pending single or batched forwarded mutations. Results preserve request
 /// order and cardinality.
 type PendingMutations = Arc<StdMutex<HashMap<u64, PendingMutation>>>;
+/// Pending distributed scan requests: req_id -> reply channel. The expected
+/// responder is retained so a colliding reply cannot complete another
+/// peer's scan.
+type PendingScans = Arc<StdMutex<HashMap<u64, PendingScan>>>;
 
 struct PendingMutation {
     expected_peer: String,
@@ -788,6 +794,24 @@ struct PendingBatchGet {
     expected_peer: String,
     expected_keys: Vec<String>,
     reply: oneshot::Sender<Result<Vec<BatchKeyValue>, NodeError>>,
+}
+
+struct PendingScan {
+    expected_peer: String,
+    reply: oneshot::Sender<Result<Vec<crate::proto::ScanMatchProto>, String>>,
+}
+
+/// Removes a pending scan request even if the coordinator future is
+/// cancelled while waiting for the holder's response.
+struct PendingScanGuard {
+    req_id: u64,
+    pending: PendingScans,
+}
+
+impl Drop for PendingScanGuard {
+    fn drop(&mut self) {
+        self.pending.lock().unwrap().remove(&self.req_id);
+    }
 }
 
 /// Removes a pending request even if its future is cancelled while waiting
@@ -941,6 +965,8 @@ struct ConnContext {
     dynamic_placement: bool,
     pending_gets: PendingGets,
     pending_batch_gets: PendingBatchGets,
+    /// In-flight distributed scan requests (coordinator side).
+    pending_scans: PendingScans,
     pending_mutations: PendingMutations,
     /// Relayed forwarded-gets: relay_req_id -> (origin peer_tx, origin req_id).
     pending_relays: RelayMap,
@@ -1075,6 +1101,12 @@ impl FragmentRouter {
 
     fn fragment_ids(&self) -> Vec<u32> {
         self.actors.read().unwrap().keys().map(|f| f.0).collect()
+    }
+
+    /// Total fragments in the keyspace (`0..fragment_count`), whether or
+    /// not this node serves them.
+    pub(crate) fn fragment_count(&self) -> usize {
+        self.fragment_count
     }
 
     /// Add (or replace) the actor for `fragment`.
@@ -1973,6 +2005,8 @@ pub struct Node {
     pending_gets: PendingGets,
     /// In-flight batched forwarded reads: req_id -> reply channel.
     pending_batch_gets: PendingBatchGets,
+    /// In-flight distributed scan requests: req_id -> reply channel.
+    pending_scans: PendingScans,
     /// In-flight single and batched forwarded mutation outcomes.
     pending_mutations: PendingMutations,
     /// Relayed forwarded-gets (Phase 8 re-forwarding).
@@ -3705,6 +3739,7 @@ impl Node {
             members: config.members.clone(),
             pending_gets: Arc::new(StdMutex::new(HashMap::new())),
             pending_batch_gets: Arc::new(StdMutex::new(HashMap::new())),
+            pending_scans: Arc::new(StdMutex::new(HashMap::new())),
             pending_mutations: Arc::new(StdMutex::new(HashMap::new())),
             pending_relays: Arc::new(StdMutex::new(HashMap::new())),
             pending_mutation_relays: Arc::new(StdMutex::new(HashMap::new())),
@@ -3985,6 +4020,7 @@ impl Node {
             dynamic_placement: self.placement_controller.is_some(),
             pending_gets: self.pending_gets.clone(),
             pending_batch_gets: self.pending_batch_gets.clone(),
+            pending_scans: self.pending_scans.clone(),
             pending_mutations: self.pending_mutations.clone(),
             pending_relays: self.pending_relays.clone(),
             pending_mutation_relays: self.pending_mutation_relays.clone(),
@@ -7476,6 +7512,7 @@ async fn handle_connection(
         dynamic_placement,
         pending_gets,
         pending_batch_gets,
+        pending_scans,
         pending_mutations,
         pending_relays,
         pending_mutation_relays,
@@ -9243,6 +9280,39 @@ async fn handle_connection(
                 // fail closed instead of rebuilding an unbounded response.
                 tracing::warn!("closing peer that sent a retired full-state sync frame");
                 break;
+            }
+            Some(EnvelopeMsg::ScanRequest(req)) => {
+                // Serve the scan without blocking the connection read
+                // loop: the spawned task runs the fragment actor call and
+                // replies with a single bounded ScanResponse.
+                let tx = tx.clone();
+                let serving = serving.clone();
+                let router = router.clone();
+                tokio::spawn(async move {
+                    scan::serve_scan_request(tx, serving, router, req).await;
+                });
+            }
+            Some(EnvelopeMsg::ScanResponse(resp)) => {
+                let Some(peer) = peer_node_id.clone() else {
+                    continue;
+                };
+                let pending = {
+                    let mut pending = pending_scans.lock().unwrap();
+                    match pending.get(&resp.req_id) {
+                        Some(request) if request.expected_peer == peer => {
+                            pending.remove(&resp.req_id)
+                        }
+                        _ => None,
+                    }
+                };
+                if let Some(pending) = pending {
+                    let result = if resp.error.is_empty() {
+                        Ok(resp.matches)
+                    } else {
+                        Err(resp.error)
+                    };
+                    let _ = pending.reply.send(result);
+                }
             }
             None => {}
         }
@@ -11112,6 +11182,7 @@ mod tests {
                 dynamic_placement,
                 pending_gets: Arc::new(StdMutex::new(HashMap::new())),
                 pending_batch_gets: Arc::new(StdMutex::new(HashMap::new())),
+                pending_scans: Arc::new(StdMutex::new(HashMap::new())),
                 pending_mutations: Arc::new(StdMutex::new(HashMap::new())),
                 pending_relays: Arc::new(StdMutex::new(HashMap::new())),
                 pending_mutation_relays: Arc::new(StdMutex::new(HashMap::new())),
