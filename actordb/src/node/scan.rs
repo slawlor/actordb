@@ -35,7 +35,7 @@
 //! replica. There is no snapshot isolation across fragments: concurrent
 //! writes may land between two fragments' scans, and a forwarded scan may
 //! read a replica that has not yet converged. This matches the system's
-//! AP/eventual-consistency contract. See [`crate::actor::scan`] for the
+//! AP/eventual-consistency contract. See [`crate::actor`] for the
 //! per-fragment semantics (visibility, ordering, backpressure).
 
 use std::collections::HashSet;

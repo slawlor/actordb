@@ -155,7 +155,7 @@ pub struct ScanMatch {
 }
 
 impl ScanMatch {
-    /// Encode into the wire [`crate::proto::ScanMatch`] record.
+    /// Encode into the wire [`crate::proto::ScanMatchProto`] record.
     pub fn to_proto(&self) -> crate::proto::ScanMatchProto {
         crate::proto::ScanMatchProto {
             key: self.key.clone(),
@@ -163,7 +163,7 @@ impl ScanMatch {
         }
     }
 
-    /// Decode a wire [`crate::proto::ScanMatch`] record.
+    /// Decode a wire [`crate::proto::ScanMatchProto`] record.
     pub fn from_proto(proto: &crate::proto::ScanMatchProto) -> Self {
         ScanMatch {
             key: proto.key.clone(),
