@@ -1,6 +1,6 @@
 [package]
 name = "actordb"
-version = "0.3.1"
+version = "0.3.0"
 authors = ["Sean Lawlor"]
 description = "An actor-first distributed database"
 documentation = "https://docs.rs/actordb"
