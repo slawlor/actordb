@@ -1,6 +1,6 @@
 [package]
 name = "actordb"
-version = "0.2.0"
+version = "0.3.0"
 authors = ["Sean Lawlor"]
 description = "An actor-first distributed database"
 documentation = "https://docs.rs/actordb"
@@ -15,7 +15,7 @@ build = "src/build.rs"
 rust-version = "1.88"
 
 [build-dependencies]
-protobuf-src = "2"
+protobuf-src = "1.1.0"
 prost-build = { version = "0.14" }
 
 [features]
