@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 use ractor::{ActorRef, RpcReplyPort};
 
+use super::scan::{ScanMatch, ScanSpec};
 use crate::wire::{batch_get_result_encoded_len, RepeatedFieldSizer};
 /// Priority for an operation. The dispatcher routes to separate worker
 /// pools by priority, so bulk/background work cannot occupy the workers or
@@ -337,6 +338,17 @@ pub enum KvMessage {
         key: String,
         reply: RpcReplyPort<Result<Option<VersionedValue>, String>>,
         priority: OpPriority,
+    },
+    /// Scan the fragment's local records with a filter + transform spec.
+    /// Routed to the background pool (non-sticky round-robin: scans have no
+    /// key), with the same admission control as every other op — shed
+    /// explicitly under backpressure, never confused with "no matches".
+    /// Visibility matches [`crate::actor::FragmentState::get`]: tombstones
+    /// and TTL-expired values are hidden. Results are in lexicographic key
+    /// order, bounded by the spec's effective limit.
+    Scan {
+        spec: ScanSpec,
+        reply: RpcReplyPort<Result<Vec<ScanMatch>, String>>,
     },
     /// Read an ordered prefix of keys through their normal sticky workers.
     /// Admission, rate limiting, and shed accounting remain per key. The

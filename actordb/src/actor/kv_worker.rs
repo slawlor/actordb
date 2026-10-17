@@ -131,6 +131,13 @@ pub(super) async fn handle_worker_message(
             let _ = reply.send(Ok(shared.get(&key).await));
             Ok(())
         }
+        KvMessage::Scan { spec, reply } => {
+            // Worker-executed (unlike the dispatcher-served GetAll family
+            // below): the scan runs against shared state inside the worker's
+            // message handler. The receiver may be gone; that's fine.
+            let _ = reply.send(Ok(shared.scan(&spec).await));
+            Ok(())
+        }
         KvMessage::GetBatch {
             keys,
             response_base_payload_len,

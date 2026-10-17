@@ -119,6 +119,8 @@ Comprehensive guides live in [`docs/`](docs/):
 - [Consistency model](docs/consistency.md) — LWW via HLC, exact local apply
   outcomes, read-your-write, partitions
 - [Multi-key batching](docs/batching.md) — fan-out, failover, partial failures
+- [Scanning](docs/scanning.md) — single-shard filter + transform scans,
+  spec semantics, scheduling, and cost model
 - [Traffic classes & backpressure](docs/backpressure.md) — `OpPriority`,
   pool config, shed behavior and observability
 - [Configuration reference](docs/configuration.md) — every `NodeConfig`

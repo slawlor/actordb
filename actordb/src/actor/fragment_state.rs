@@ -18,6 +18,7 @@ use super::protocol::{
     ApplyDurability, ApplyError, ApplyOutcome, ReplicatedOp, SnapshotSummary, SummaryPage,
     VersionedPage, VersionedValue,
 };
+use super::scan::{KeyMatcher, ScanMatch, ScanSpec, ValueTransform};
 use crate::store::{KvStore, StoreCommitDurability};
 use crate::wire::check_versioned_value_budget;
 
@@ -333,6 +334,68 @@ impl FragmentState {
             .get(key)
             .filter(|v| !v.is_tombstone && !v.is_expired(now))
             .cloned()
+    }
+
+    /// Scan the fragment's local cache, returning transformed matches.
+    ///
+    /// Single fused pass under one read lock: filter (key matcher, then
+    /// [`get`](Self::get)-style visibility — tombstones and TTL-expired
+    /// values are hidden) and transform happen inline, and only matches are
+    /// materialized. Never clone-then-filter.
+    ///
+    /// Matches are returned in lexicographic key order (the fragment's
+    /// ordered key index), so [`ScanSpec::offset`] pagination is stable as
+    /// long as the key set does not change between pages. At most
+    /// [`ScanSpec::effective_limit`](crate::actor::ScanSpec::effective_limit)
+    /// matches are returned.
+    ///
+    /// The read lock is held for the whole pass: concurrent writes to this
+    /// fragment pause for the scan's duration (reads do not). Keep `limit`
+    /// tight; chunked scans are a future follow-up.
+    pub async fn scan(&self, spec: &ScanSpec) -> Vec<ScanMatch> {
+        let now = now_ms();
+        let limit = spec.effective_limit();
+        let cache = self.cache.read().await;
+        let mut out = Vec::new();
+        let mut skipped: u64 = 0;
+        // Lexicographic order via the ordered key index: deterministic
+        // results, stable offset pagination.
+        for key in cache.ordered_keys.iter() {
+            let Some(value) = cache.values.get(key) else {
+                continue;
+            };
+            // Same visibility as `get`: tombstones and expired values are
+            // not matches.
+            if value.is_tombstone || value.is_expired(now) {
+                continue;
+            }
+            let matched = match &spec.matcher {
+                KeyMatcher::All => true,
+                KeyMatcher::Prefix(prefix) => key.as_bytes().starts_with(prefix),
+            };
+            if !matched {
+                continue;
+            }
+            if skipped < spec.offset {
+                skipped += 1;
+                continue;
+            }
+            let transformed = match spec.transform {
+                ValueTransform::Identity => value.value.clone(),
+                ValueTransform::KeyOnly => Vec::new(),
+                ValueTransform::PrefixBytes(n) => {
+                    value.value[..value.value.len().min(n as usize)].to_vec()
+                }
+            };
+            out.push(ScanMatch {
+                key: key.clone(),
+                value: transformed,
+            });
+            if out.len() as u64 >= limit {
+                break;
+            }
+        }
+        out
     }
 
     /// Read the full cache, including tombstones. Expired live values are

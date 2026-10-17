@@ -270,6 +270,20 @@ impl Actor for KvActor {
                 });
                 Ok(())
             }
+            KvMessage::Scan { spec, reply } => {
+                // Scans ride the background pool ("bulk/scan traffic") so
+                // they can never starve latency-sensitive ops. Non-sticky
+                // routing: a scan has no key, so spread concurrent scans
+                // round-robin across background workers. Shed explicitly
+                // under backpressure — never confused with "no matches".
+                let pool = &state.background_pool;
+                let Some(reservation) = pool.try_reserve_round_robin().await else {
+                    let _ = reply.send(Err("shed: pool at queue cap or rate limit".to_string()));
+                    return Ok(());
+                };
+                reservation.send(KvMessage::Scan { spec, reply });
+                Ok(())
+            }
             KvMessage::GetBatch {
                 keys,
                 response_base_payload_len,
