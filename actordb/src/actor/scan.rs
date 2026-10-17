@@ -93,6 +93,55 @@ impl ScanSpec {
             u64::from(self.limit)
         }
     }
+
+    /// Encode this spec into a wire [`crate::proto::ScanRequest`]. The
+    /// coordinator supplies the request id and target fragment.
+    pub fn to_scan_request(&self, req_id: u64, fragment: u32) -> crate::proto::ScanRequest {
+        let (matcher_kind, matcher_arg) = match &self.matcher {
+            KeyMatcher::All => (0u32, Vec::new()),
+            KeyMatcher::Prefix(prefix) => (1u32, prefix.clone()),
+        };
+        let (transform_kind, transform_arg) = match &self.transform {
+            ValueTransform::Identity => (0u32, 0u32),
+            ValueTransform::KeyOnly => (1u32, 0u32),
+            ValueTransform::PrefixBytes(n) => (2u32, *n),
+        };
+        crate::proto::ScanRequest {
+            req_id,
+            fragment,
+            matcher_kind,
+            matcher_arg,
+            transform_kind,
+            transform_arg,
+            limit: self.limit,
+            offset: self.offset,
+            priority: crate::proto::Priority::Background as i32,
+            hops: 4,
+        }
+    }
+
+    /// Decode a wire [`crate::proto::ScanRequest`] back into a spec.
+    /// Unknown matcher/transform kinds are rejected: the spec is data, and
+    /// a peer speaking a newer dialect must not be silently misread.
+    pub fn from_scan_request(req: &crate::proto::ScanRequest) -> Result<Self, String> {
+        let matcher = match req.matcher_kind {
+            0 => KeyMatcher::All,
+            1 => KeyMatcher::Prefix(req.matcher_arg.clone()),
+            other => return Err(format!("unknown scan matcher_kind {other}")),
+        };
+        let transform = match req.transform_kind {
+            0 => ValueTransform::Identity,
+            1 => ValueTransform::KeyOnly,
+            2 => ValueTransform::PrefixBytes(req.transform_arg),
+            other => return Err(format!("unknown scan transform_kind {other}")),
+        };
+        Ok(ScanSpec {
+            matcher,
+            transform,
+            limit: req.limit,
+            offset: req.offset,
+        })
+    }
 }
 
 /// One transformed match returned by a scan.
@@ -103,6 +152,24 @@ pub struct ScanMatch {
     /// The transformed value. Empty when the spec used
     /// [`ValueTransform::KeyOnly`].
     pub value: Vec<u8>,
+}
+
+impl ScanMatch {
+    /// Encode into the wire [`crate::proto::ScanMatch`] record.
+    pub fn to_proto(&self) -> crate::proto::ScanMatchProto {
+        crate::proto::ScanMatchProto {
+            key: self.key.clone(),
+            value: self.value.clone(),
+        }
+    }
+
+    /// Decode a wire [`crate::proto::ScanMatch`] record.
+    pub fn from_proto(proto: &crate::proto::ScanMatchProto) -> Self {
+        ScanMatch {
+            key: proto.key.clone(),
+            value: proto.value.clone(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -520,5 +587,50 @@ mod tests {
 
         worker.stop(None);
         handle.await.unwrap();
+    }
+
+    #[test]
+    fn scan_spec_proto_round_trip() {
+        for spec in [
+            spec(KeyMatcher::All, ValueTransform::Identity, 0, 0),
+            spec(
+                KeyMatcher::Prefix(b"user/".to_vec()),
+                ValueTransform::KeyOnly,
+                100,
+                5,
+            ),
+            spec(
+                KeyMatcher::Prefix(b"\xff\xfe".to_vec()),
+                ValueTransform::PrefixBytes(16),
+                7,
+                0,
+            ),
+        ] {
+            let req = spec.to_scan_request(42, 3);
+            assert_eq!(req.req_id, 42);
+            assert_eq!(req.fragment, 3);
+            let back = ScanSpec::from_scan_request(&req).unwrap();
+            assert_eq!(back, spec);
+        }
+    }
+
+    #[test]
+    fn scan_spec_rejects_unknown_wire_kinds() {
+        let mut req = spec(KeyMatcher::All, ValueTransform::Identity, 0, 0).to_scan_request(1, 0);
+        req.matcher_kind = 99;
+        assert!(ScanSpec::from_scan_request(&req).is_err());
+        req.matcher_kind = 0;
+        req.transform_kind = 99;
+        assert!(ScanSpec::from_scan_request(&req).is_err());
+    }
+
+    #[test]
+    fn scan_match_proto_round_trip() {
+        let m = ScanMatch {
+            key: "k".to_string(),
+            value: vec![7u8; 100],
+        };
+        let proto = m.to_proto();
+        assert_eq!(ScanMatch::from_proto(&proto), m);
     }
 }

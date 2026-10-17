@@ -1,10 +1,11 @@
 # Scanning
 
-A **scan** applies a filter + transform spec to every record in one
-fragment's local cache and returns the transformed matches. It is the local
-execution primitive for distributed map-reduce style queries: a future
-network layer fans a spec out across fragments and merges the results, but
-each shard's work is exactly what is described here.
+A **scan** applies a filter + transform spec to every record in a
+fragment's local cache and returns the transformed matches. It is the
+execution primitive for distributed map-reduce style queries:
+[`Node::scan`](#nodescan-the-distributed-coordinator-api) fans a spec out
+across fragments — in-process for local fragments, over the wire for
+remote holders — and merges the results.
 
 ## The spec is data, not code
 
@@ -79,9 +80,82 @@ stability across chunks — a v2 design decision, not v1).
 
 The v1 primitive is map-only: filter + transform + collect per shard.
 Client-side reduction over the returned matches covers count/sum/top-K.
-A distributed fan-out (one owner per fragment, result merging) and a
-named-function registry for richer matchers/transformers are the natural
-next PRs; both build directly on this primitive.
+[`Node::scan`] merges across fragments with coordinator failover; a
+named-function registry for richer matchers/transformers is the natural
+next PR and builds directly on this primitive.
+
+## `Node::scan`: the distributed coordinator API
+
+```rust
+use actordb::actor::{KeyMatcher, ScanSpec, ValueTransform};
+use actordb::node::{Node, NodeConfig};
+
+# async fn example() -> Result<(), Box<dyn std::error::Error>> {
+let node = Node::start(
+    "n1".to_string(),
+    "127.0.0.1:0".parse()?,
+    NodeConfig::default(),
+).await?;
+node.put("user:1".to_string(), b"alice".to_vec()).await?;
+
+let matches = node.scan(&ScanSpec {
+    matcher: KeyMatcher::Prefix(b"user:".to_vec()),
+    transform: ValueTransform::Identity,
+    limit: 1000,
+    offset: 0,
+}).await?;
+# Ok(())
+# }
+```
+
+`Node::scan` is a **server-side coordinator**, exactly like `Node::get`:
+the client talks to any one node, and that node coordinates the whole
+scan. For each fragment the coordinator scans in-process when it holds
+the fragment locally (one `KvMessage::Scan` per fragment, background
+pool, fanned out concurrently); otherwise it forwards a `ScanRequest`
+to one replica holder from `replica_order` — the same pattern as
+`ForwardedGet` — retrying across holders on failure. Exactly one holder
+is contacted per fragment, so replicas (which converge via LWW) never
+double-count.
+
+Results merge in fragment order (each fragment's matches in
+lexicographic key order), truncated at `MAX_SCAN_TOTAL_MATCHES`
+(100,000) as a coordinator-side safety net; the per-fragment
+`ScanSpec::limit` applies first.
+
+### Full replication: scans are local
+
+actordb's default is **full replication**: when no `fragment_map` is
+configured, every node serves every fragment. A scan is therefore local
+to the requesting node in the default configuration — no network round
+trips, no cross-node coordination, no distributed failure modes.
+
+### Failure policy: fail, don't go partial
+
+If no holder is reachable for a fragment — not served locally and no
+replica holder answered — the whole scan fails with
+[`ScanError::FragmentsUnavailable`] naming the fragments. **v1 never
+returns silent partial results.** A holder that refuses a scan (not
+serving, bad spec, shed under backpressure) triggers failover to the
+next holder, exactly like `ForwardedGet`.
+
+### Wire size
+
+The scan response is a single envelope per fragment, so the
+per-fragment `limit` is also the wire-size safety: `limit` × average
+value size must stay comfortably under the 16 MiB frame cap. Keep limits
+tight and prefer `KeyOnly`/`PrefixBytes` transforms for wide scans.
+
+## Future work
+
+If a single host holds many fragments, should it serve the entire scan
+itself, or should the coordinator fan out scan work across the fleet to
+distribute fragment load? Currently the coordinator scans all local
+fragments itself and only forwards fragments it doesn't hold. A future
+iteration could distribute per-fragment scan work across replica holders
+for load balancing.
 
 [`KeyMatcher`]: https://docs.rs/actordb/latest/actordb/actor/enum.KeyMatcher.html
 [`ValueTransform`]: https://docs.rs/actordb/latest/actordb/actor/enum.ValueTransform.html
+[`Node::scan`]: https://docs.rs/actordb/latest/actordb/node/struct.Node.html#method.scan
+[`ScanError::FragmentsUnavailable`]: https://docs.rs/actordb/latest/actordb/node/scan/enum.ScanError.html
