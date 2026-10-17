@@ -1,6 +1,6 @@
 # Release notes
 
-## 0.3.1
+## 0.3.0
 
 - Stabilize tests around asynchronous worker health, relay/ACK deadlines, and TTL expiry;
   expiry during admission remains an explicit supported outcome, not a failure
@@ -12,8 +12,6 @@
   Normal CI retains backend-free, memory-only, and all-feature validation; release
   validation retains backend-free and memory-only package checks and tests.
 - Update installation examples and release instructions for the 0.3 series.
-
-## 0.3.0
 
 - Add `Node::scan` for distributed key filtering and value projections, with
   background-pool admission, per-fragment bounds, replica failover, and explicit
