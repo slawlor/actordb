@@ -9244,6 +9244,15 @@ async fn handle_connection(
                 tracing::warn!("closing peer that sent a retired full-state sync frame");
                 break;
             }
+            // Distributed scan frames (ScanRequest/ScanChunk/ScanAck) are
+            // defined on the wire but not yet served: the fan-out PR adds
+            // the serving and coordinator paths. Until then, drop them
+            // loudly rather than mis-acknowledging a scan.
+            Some(EnvelopeMsg::ScanRequest(_))
+            | Some(EnvelopeMsg::ScanChunk(_))
+            | Some(EnvelopeMsg::ScanAck(_)) => {
+                tracing::warn!("received scan frame but distributed scan is not yet implemented");
+            }
             None => {}
         }
     }

@@ -321,6 +321,59 @@ message BatchGetResponse {
   repeated KeyValue results = 2;
 }
 
+// Distributed scan: coordinator -> fragment owner. One per fragment.
+// The scan spec is data, never code: matcher/transform are predefined
+// kinds (see the scan primitive's KeyMatcher/ValueTransform). Pull-based:
+// the owner sends one chunk, then waits for ScanAck before the next.
+message ScanRequest {
+  // Coordinator-assigned; correlates chunks and acks.
+  uint64 scan_id = 1;
+  // Fragment to scan (redundant but useful for routing checks).
+  uint32 fragment = 2;
+  // Matcher descriptor: 0=all, 1=key prefix.
+  uint32 matcher_kind = 3;
+  // Matcher argument: prefix bytes when matcher_kind=1.
+  bytes matcher_arg = 4;
+  // Transform descriptor: 0=identity, 1=key_only, 2=prefix_bytes.
+  uint32 transform_kind = 5;
+  // Transform argument: N when transform_kind=2.
+  uint32 transform_arg = 6;
+  // Per-fragment match bound. 0 = server default.
+  uint32 limit = 7;
+  // Skip-first-N pagination cursor (deterministic key order).
+  uint64 offset = 8;
+  // Coordinator's per-chunk byte bound. The owner keeps every chunk's
+  // encoded size under this; it must leave headroom under the 16 MiB
+  // frame cap.
+  uint32 max_chunk_bytes = 9;
+}
+
+// Owner -> coordinator. Chunked scan results, pull-based.
+message ScanChunk {
+  uint64 scan_id = 1;
+  uint32 fragment = 2;
+  repeated ScanMatch matches = 3;
+  // Terminal chunk for this fragment's scan.
+  bool done = 4;
+  // Non-empty = this fragment's scan failed; matches is empty.
+  // The coordinator fails over to the next replica holder.
+  string error = 5;
+}
+
+message ScanMatch {
+  string key = 1;
+  // Transformed value. Empty when the transform is key_only.
+  bytes value = 2;
+}
+
+// Coordinator -> owner. Pull-based flow control: the owner sends the next
+// chunk only after receiving an ack with want_next=true. want_next=false
+// cancels the scan and releases the owner's buffered state.
+message ScanAck {
+  uint64 scan_id = 1;
+  bool want_next = 2;
+}
+
 message Envelope {
   oneof msg {
     Hello hello = 1;
@@ -343,5 +396,8 @@ message Envelope {
     MutationResponse mutation_response = 18;
     BatchNack batch_nack = 19;
     HelloAuth hello_auth = 20;
+    ScanRequest scan_request = 21;
+    ScanChunk scan_chunk = 22;
+    ScanAck scan_ack = 23;
   }
 }
