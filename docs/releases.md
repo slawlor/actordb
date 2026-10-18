@@ -20,7 +20,7 @@ does not upload anything. GitHub prereleases are intentionally excluded.
 3. Commit the changes, then run the release checks from the repository root:
 
    ```bash
-   python3 -m unittest discover -s .github/scripts -p 'test_verify_release.py' -v
+   python3 -m unittest discover -s .github/scripts -p 'test_*.py' -v
    python3 .github/scripts/verify_release.py
    cargo publish --dry-run --package actordb-protocol --package actordb-query --package actordb --package actordb-client --registry crates-io
    cargo publish --dry-run --package actordb-protocol --package actordb-query --package actordb --package actordb-client --registry crates-io --features actordb/memory
@@ -97,8 +97,10 @@ For this version, after the version PR is merged and `main` checks are green:
 4. Backend-free and memory-only package dry-runs and crate tests
    must pass before the workflow publishes the selected libraries in dependency order to the explicit
    `crates-io` registry using compatible dependency resolution. Cargo stages
-   workspace dependencies together for validation and waits for registry
-   availability during publication. Uploads are serialized and an in-flight
+   workspace dependencies together for validation. Actual uploads publish
+   protocol/query first, wait for their exact non-yanked versions in the Cargo
+   sparse index, publish the database, then wait for every client dependency
+   before publishing the SDK. Uploads are serialized and an in-flight
    publication is never cancelled by a newer validation run.
    RocksDB builds and tests must pass in normal CI before merging; the publish
    workflow deliberately does not repeat them.
@@ -114,3 +116,29 @@ not already uploaded. Crates.io versions are immutable: an already-published
 version must not be overwritten, and a duplicate publish fails rather than
 being treated as success. If upload succeeded but a later status check failed,
 verify the registry before retrying; use a new version for content changes.
+
+
+## Dependency readiness
+
+Release uploads use explicit index-readiness barriers, following ractor's
+publish/wait/dependent-publish sequence:
+
+1. Publish `actordb-protocol` and `actordb-query`.
+2. Wait until both exact release versions appear in the public Cargo index.
+3. Publish `actordb`.
+4. Verify protocol, query, and database versions are indexed, then publish
+   `actordb-client`.
+
+`.github/scripts/wait_for_crate_dependency.py DEPENDENT TARGET` reads Cargo
+metadata and checks the target's full workspace version, such as `0.4.0`.
+It does not mistake a compatible dependency requirement such as `0.4` for
+an exact published version. Only a matching, non-yanked index entry counts.
+The helper checks immediately, then retries every five seconds for up to
+15 minutes per dependency; the release job has a 60-minute overall deadline.
+Transient registry errors are retried; an unavailable version fails the job.
+
+These barriers and uploads run only on a published release. PR/main jobs
+perform package dry-runs and exercise the guards with simulated registry
+responses. No credential is supplied to index polling. The release guard
+requires all four published libraries to share the release version and keeps
+internal workspace tools nonpublishable.

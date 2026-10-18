@@ -15,6 +15,10 @@ VERSION_PATTERN = re.compile(
     r"(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?"
 )
 
+# The workflow publishes these libraries together, in dependency order. Internal
+# workspace utilities must explicitly opt out of registry publication.
+PUBLISHED_PACKAGES = ("actordb-protocol", "actordb-query", "actordb", "actordb-client")
+
 
 class ReleaseError(Exception):
     """A verification failure safe to print without command output or secrets."""
@@ -65,6 +69,31 @@ def verify_backends(package):
         )
 
 
+def verify_publication_packages(packages, members, version):
+    for name in PUBLISHED_PACKAGES:
+        matches = [package for package in packages if package.get("name") == name]
+        if len(matches) != 1 or matches[0].get("id") not in members:
+            raise ReleaseError("expected exactly one of each published library in the workspace")
+        package = matches[0]
+        if package.get("version") != version:
+            raise ReleaseError("published libraries must share the actordb version")
+        publish = package.get("publish")
+        if publish is not None and not (
+            isinstance(publish, list)
+            and all(isinstance(registry, str) for registry in publish)
+            and "crates-io" in publish
+        ):
+            raise ReleaseError("published libraries must permit the crates-io registry")
+
+    for member in members:
+        matches = [package for package in packages if package.get("id") == member]
+        if len(matches) != 1:
+            raise ReleaseError("workspace member metadata must describe one package")
+        package = matches[0]
+        if package.get("name") not in PUBLISHED_PACKAGES and package.get("publish") != []:
+            raise ReleaseError("nonlibrary workspace packages must explicitly disable publication")
+
+
 def resolve_version(cwd=None):
     result = run_command(
         ["cargo", "metadata", "--format-version", "1", "--no-deps"], cwd
@@ -100,6 +129,7 @@ def resolve_version(cwd=None):
     ):
         raise ReleaseError("actordb had an invalid package version")
     verify_backends(matches[0])
+    verify_publication_packages(packages, members, version)
     return version
 
 
