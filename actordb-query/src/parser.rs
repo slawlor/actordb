@@ -123,7 +123,7 @@ fn tokenize(sql: &str) -> Result<Vec<Token>, QueryError> {
                     ));
                 }
                 let mut decoded = Vec::with_capacity(hex.len() / 2);
-                for pair in hex.as_bytes().chunks_exact(2) {
+                for pair in hex.as_bytes().as_chunks::<2>().0 {
                     decoded.push((hex_digit(pair[0]) << 4) | hex_digit(pair[1]));
                 }
                 Kind::Bytes(decoded)
