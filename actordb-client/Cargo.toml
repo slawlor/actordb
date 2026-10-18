@@ -1,18 +1,18 @@
 [package]
 name = "actordb-client"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 rust-version = "1.88"
 license = "MIT"
 description = "Async Rust companion client for ActorDB's application listener"
 
 [dependencies]
-actordb-protocol = { version = "0.3", path = "../actordb-protocol" }
-actordb-query = { version = "0.3", path = "../actordb-query" }
+actordb-protocol = { version = "0.4", path = "../actordb-protocol" }
+actordb-query = { version = "0.4", path = "../actordb-query" }
 prost = "0.14"
 getrandom = "0.4"
 tokio = { version = "1", features = ["sync", "time", "net", "io-util"] }
 
 [dev-dependencies]
-actordb = { version = "0.3", path = "../actordb" }
+actordb = { version = "0.4", path = "../actordb" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

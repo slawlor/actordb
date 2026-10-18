@@ -12,11 +12,11 @@ A Rust actor-based distributed database with pluggable, opt-in storage
 
 ## Crate installation
 
-The `0.3` release series requires Rust 1.88+:
+The `0.4` release series requires Rust 1.88+:
 
 ```toml
 [dependencies]
-actordb = "0.3"
+actordb = "0.4"
 ```
 
 The default crate includes no concrete storage backend. Its actor cache and
@@ -24,7 +24,7 @@ The default crate includes no concrete storage backend. Its actor cache and
 unless you supply a custom store. RocksDB is an independent opt-in:
 
 ```toml
-actordb = { version = "0.3", features = ["rocksdb"] }
+actordb = { version = "0.4", features = ["rocksdb"] }
 ```
 
 The separate `memory` feature exposes the no-op `MemoryStore` test double; it
@@ -34,7 +34,7 @@ compile protobuf tooling. RocksDB requires its native library and libclang
 bindings. `default-features = false` is not
 necessary to avoid RocksDB: the default feature set is empty.
 
-This remains pre-1.0 software. The `0.2` and `0.3` releases include API,
+This remains pre-1.0 software. The `0.2`, `0.3`, and `0.4` releases include API,
 wire-protocol, and legacy-store compatibility changes. Read the [release notes](CHANGELOG.md)
 and [release procedure](docs/releases.md) before upgrading or publishing.
 

@@ -1,6 +1,6 @@
 # Release notes
 
-## Unreleased
+## 0.4.0
 
 - Add a Rust companion SDK and a separate application listener, with point and
   batch operations, TTL, priorities, scans, queries, and read-only inspection.
