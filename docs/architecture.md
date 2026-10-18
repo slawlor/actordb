@@ -40,7 +40,8 @@ and the `PrefixedStore` wrapper are available without either feature.
 
 The workspace contains `actordb`, its lightweight `actordb-protocol`,
 `actordb-query`, and `actordb-client` companions, the `docker-tests` integration
-crate, and an `xtask` for coverage. The client application listener wraps a
+crate, the SDK-only `docker-client-tests` scenario executable, and an `xtask`
+for coverage. The client application listener wraps a
 Node without creating peer membership or replication senders.
 
 | Module | Role |

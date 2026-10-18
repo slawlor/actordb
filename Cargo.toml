@@ -5,6 +5,7 @@ members = [
     "actordb-query",
     "actordb-client",
     "docker-tests",
+    "docker-client-tests",
     "xtask"
 ]
 resolver = "2"

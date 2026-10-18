@@ -426,10 +426,34 @@ multi-node scenarios in CI (`docker-compose.yml`, `docker/`):
 - **SIGKILL + restart reconvergence**: a node is SIGKILLed mid-write and
   restarted; it must reconverge (new session, redial, reconcile) while readers
   on the surviving nodes keep working.
+- **External SDK client**: `docker-compose.client.yml` runs three database
+  containers with six fragments and two replicas per fragment, plus a fourth
+  SDK-only client container. The client has no node/actor/storage dependency,
+  opens only application connections, and verifies point/batch operations,
+  TTL/deletes, priorities, transforms, and distributed SQL through remote
+  holders. Node-A is SIGKILLed; the client explicitly reconnects to B and
+  writes through C, then verifies A recovers the exact new version after
+  restart. Client connections must leave the database peer count unchanged.
 
 These catch what localhost integration tests can't: real process death, DNS
 and container-network behavior, and the full restart path including session
 re-establishment.
+
+Run the external scenario with `bash docker/client-test.sh`. Build its two
+images first with `docker compose -f docker-compose.client.yml build`.
+The driver gates kill/restart on observed client milestones, bounds waits,
+checks every final exit code, and removes its containers and volumes.
+
+Without Docker, run the same SDK executable as a separate process:
+
+```bash
+cargo build --package docker-tests --package docker-client-tests
+python3 docker/run-client-processes.py
+```
+
+This launches three node processes and an SDK-only fourth process with real
+TCP, persistent node directories, SIGKILL/restart, and bounded cleanup. Docker
+CI additionally exercises container DNS/network isolation and the client image.
 
 ## Running them
 

@@ -7,9 +7,12 @@ on:
       - 'actordb/**'
       - 'actordb-protocol/**'
       - 'actordb-query/**'
+      - 'actordb-client/**'
       - 'docker-tests/**'
+      - 'docker-client-tests/**'
       - 'docker/**'
       - 'docker-compose.yml'
+      - 'docker-compose.client.yml'
       - '.dockerignore'
       - '.github/workflows/docker-integration.yaml'
   pull_request:
@@ -18,9 +21,12 @@ on:
       - 'actordb/**'
       - 'actordb-protocol/**'
       - 'actordb-query/**'
+      - 'actordb-client/**'
       - 'docker-tests/**'
+      - 'docker-client-tests/**'
       - 'docker/**'
       - 'docker-compose.yml'
+      - 'docker-compose.client.yml'
       - '.dockerignore'
       - '.github/workflows/docker-integration.yaml'
 
@@ -43,13 +49,30 @@ jobs:
         with:
           context: .
           file: docker-tests/Dockerfile
+          target: runtime
           load: true
           tags: actordb-docker-test:latest
           cache-from: type=gha,scope=actordb-docker-test
           cache-to: type=gha,scope=actordb-docker-test,mode=max
+
+      - name: Build the separate SDK-only client image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: docker-tests/Dockerfile
+          target: client-runtime
+          load: true
+          tags: actordb-docker-client-test:latest
+          cache-from: |
+            type=gha,scope=actordb-docker-test
+            type=gha,scope=actordb-docker-client-test
+          cache-to: type=gha,scope=actordb-docker-client-test,mode=max
 
       - name: Replication across 3 nodes
         run: bash docker/run-scenario.sh docker/envs/replication.env
 
       - name: SIGKILL + restart reconvergence
         run: bash docker/restart-test.sh
+
+      - name: External SDK client across sharded nodes and ingress restart
+        run: bash docker/client-test.sh

@@ -1,6 +1,6 @@
 # Build from the root of the repository with
 #
-#   docker build -f docker-tests/Dockerfile . -t actordb-docker-test:latest
+#   docker build --target runtime -f docker-tests/Dockerfile . -t actordb-docker-test:latest
 #   docker run actordb-docker-test:latest --help
 #
 # Each container runs one scenario role, e.g.
@@ -40,8 +40,9 @@ COPY --from=planner /usr/src/app/recipe.json recipe.json
 RUN cargo chef cook --release --recipe-path recipe.json
 COPY . .
 # Now compile just our workspace crates on top of the cached dependencies.
-RUN cargo build --release --bin actordb-docker-test \
-    && cp target/release/actordb-docker-test /usr/local/bin/actordb-docker-test
+RUN cargo build --release --package docker-tests --package docker-client-tests \
+    && cp target/release/actordb-docker-test /usr/local/bin/actordb-docker-test \
+    && cp target/release/actordb-docker-client-test /usr/local/bin/actordb-docker-client-test
 
 FROM debian:trixie-slim AS runtime
 # NOTE: this must match the Debian release underlying rust:latest
@@ -58,3 +59,16 @@ COPY --from=builder /usr/local/bin/actordb-docker-test /usr/local/bin/actordb-do
 WORKDIR /usr/local/bin
 
 ENTRYPOINT ["actordb-docker-test"]
+
+# The external client image contains only the SDK scenario executable. It has
+# no Node executable, database volume, peer listener, or C++ storage dependency.
+FROM debian:trixie-slim AS client-runtime
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates libgcc-s1 \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=builder /usr/local/bin/actordb-docker-client-test /usr/local/bin/actordb-docker-client-test
+WORKDIR /usr/local/bin
+ENTRYPOINT ["actordb-docker-client-test"]
+
+# Preserve the historical server image when no build target is specified.
+FROM runtime AS default-runtime

@@ -141,8 +141,8 @@ Modeled on
 [ractor's cluster integration tests](https://github.com/slawlor/ractor/tree/main/ractor_cluster_integration_tests):
 three nodes on a private compose network (`test-net`), each container
 running one scripted role from the `actordb-docker-test` binary
-(`docker-tests/` crate). Unlike the in-process tests, these exercise
-real multi-host networking — DNS peer addresses, container death, and
+(`docker-tests/` crate). These exercise process boundaries, container-network
+DNS peer addresses, container death, and
 true `SIGKILL` crashes.
 
 Scenarios live in `docker/envs/`:
@@ -153,14 +153,19 @@ Scenarios live in `docker/envs/`:
   by the driver script), restart it, and require all three nodes to
   reconverge. Exercises the redial supervisor, fresh replication sessions,
   and immediate correlated reconciliation across process death.
+* **external client** — a separate SDK-only fourth container talks to three
+  sharded nodes through the application protocol. It checks remote routing,
+  SQL/transforms, client reconnection after an ingress SIGKILL, and recovery.
 
 ```bash
 docker compose build
 bash docker/run-scenario.sh docker/envs/replication.env
 bash docker/restart-test.sh
+docker compose -f docker-compose.client.yml build
+bash docker/client-test.sh
 ```
 
-CI runs both scenarios on every push/PR touching the relevant paths
+CI runs all scenarios on every push/PR touching the relevant paths
 (`.github/workflows/docker-integration.yaml`).
 
 ## Public API
