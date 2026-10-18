@@ -1,5 +1,18 @@
 # Release notes
 
+## 0.4.0
+
+- Add a Rust companion SDK and a separate application listener, with point and
+  batch operations, TTL, priorities, scans, queries, and read-only inspection.
+- Add bounded SQL queries over the virtual `kv` table: key and fragment filters,
+  global row pagination, byte projections, and exact integer aggregates.
+  Joins, subqueries, multiple statements, and grouping remain unsupported.
+- Share generated protocol bindings through `actordb-protocol`; ordinary library
+  builds no longer compile protobuf tooling. Negotiate peer scan and query
+  capabilities explicitly.
+- Keep mutation retries explicit: a lost application response can have an
+  unknown outcome; the SDK does not replay a mutation with a fresh version.
+
 ## 0.3.0
 
 - Stabilize tests around asynchronous worker health, relay/ACK deadlines, and TTL expiry;

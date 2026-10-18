@@ -1,0 +1,21 @@
+[package]
+name = "actordb-protocol"
+version = "0.4.0"
+edition = "2021"
+rust-version = "1.88"
+license = "MIT"
+description = "Language-neutral peer and application wire contracts for ActorDB"
+
+[features]
+codegen = ["dep:prost-build", "dep:protobuf-src"]
+
+[dependencies]
+prost = "0.14"
+hmac = "0.13"
+sha2 = "0.11"
+prost-build = { version = "0.14", optional = true }
+protobuf-src = { version = "1.1", optional = true }
+
+[[bin]]
+name = "generate"
+required-features = ["codegen"]

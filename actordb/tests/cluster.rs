@@ -725,7 +725,10 @@ async fn complete_no_secret_handshake(stream: &mut tokio::net::TcpStream, peer_i
     };
     assert_eq!(server_hello.min_protocol_version, WIRE_PROTOCOL_VERSION);
     assert_eq!(server_hello.max_protocol_version, WIRE_PROTOCOL_VERSION);
-    assert_eq!(server_hello.capabilities, REQUIRED_WIRE_CAPABILITIES);
+    assert_eq!(
+        server_hello.capabilities & REQUIRED_WIRE_CAPABILITIES,
+        REQUIRED_WIRE_CAPABILITIES
+    );
     assert_eq!(server_hello.challenge.len(), 32);
 
     send_frame(

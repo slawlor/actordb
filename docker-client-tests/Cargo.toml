@@ -1,0 +1,18 @@
+[package]
+name = "docker-client-tests"
+version = "0.4.0"
+edition = "2021"
+rust-version = "1.88"
+publish = false
+license = "MIT"
+description = "External-process SDK scenarios for ActorDB"
+
+[[bin]]
+name = "actordb-docker-client-test"
+path = "src/main.rs"
+
+[dependencies]
+actordb-client = { version = "0.4", path = "../actordb-client" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "net"] }
+clap = { version = "4", features = ["derive"] }
+seahash = "4"

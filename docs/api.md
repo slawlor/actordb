@@ -1,5 +1,10 @@
 # Public API guide
 
+For remote application connections, use the companion
+[`actordb-client`](../actordb-client/README.md) and the separate
+`actordb::client_server::ClientServer` listener. For SQL filtering, fragment
+scopes, projections, and exact aggregates, see the [query guide](query.md).
+
 The main application surface lives in `actordb::node`. Start from
 `NodeConfig::builder()` for database behavior and `NodeRuntimeOptions::builder()`
 for transport/replication liveness policy, overriding only the settings you need

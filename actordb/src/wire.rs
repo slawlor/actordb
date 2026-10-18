@@ -444,7 +444,7 @@ pub(crate) fn preflight_envelope_decode(frame: &[u8]) -> Result<(), WireDecodeEr
             return Err(WireDecodeError::Malformed("field number is zero"));
         }
         let wire_type = (key & 7) as u8;
-        if (1..=22).contains(&field) {
+        if (1..=24).contains(&field) {
             messages += 1;
             if messages > 1 {
                 return Err(WireDecodeError::MultipleMessages);
@@ -506,6 +506,19 @@ pub(crate) fn preflight_envelope_decode(frame: &[u8]) -> Result<(), WireDecodeEr
                     MAX_SCAN_RESPONSE_MATCHES,
                     "ScanResponse.matches",
                 )?,
+                24 => {
+                    preflight_repeated_field(payload, 3, 256, "QueryPageResponse.rows")?;
+                    let mut row_cursor = 0usize;
+                    while row_cursor < payload.len() {
+                        let key = read_varint(payload, &mut row_cursor)?;
+                        if key >> 3 == 3 && key & 7 == 2 {
+                            let row = take_length_delimited(payload, &mut row_cursor)?;
+                            preflight_repeated_field(row, 2, 64, "QueryPageRow.cells")?;
+                        } else {
+                            skip_field(payload, &mut row_cursor, (key & 7) as u8)?;
+                        }
+                    }
+                }
                 _ => {}
             }
         } else {

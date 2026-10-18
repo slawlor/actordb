@@ -350,6 +350,18 @@ pub enum KvMessage {
         spec: ScanSpec,
         reply: RpcReplyPort<Result<Vec<ScanMatch>, String>>,
     },
+    /// Internal scan admission retained through background actor ownership.
+    #[doc(hidden)]
+    ScanRetained {
+        spec: ScanSpec,
+        retention: Arc<crate::query::QueryRetention>,
+        reply: RpcReplyPort<Result<Vec<ScanMatch>, String>>,
+    },
+    /// Execute one bounded, revision-guarded query page on a background worker.
+    QueryPage {
+        work: crate::query::QueryPageWork,
+        reply: RpcReplyPort<crate::proto::QueryPageResponse>,
+    },
     /// Read an ordered prefix of keys through their normal sticky workers.
     /// Admission, rate limiting, and shed accounting remain per key. The
     /// dispatcher routes only the next key after the prior worker releases its

@@ -20,6 +20,12 @@ pub mod actor;
 /// one-hop routing.
 pub mod node;
 
+/// Application listener for remote SDKs, independent of the peer mesh.
+pub mod client_server;
+
+/// Bounded SQL query coordination over fragment views.
+pub mod query;
+
 /// Pluggable network transport for the peer mesh. The default is plain
 /// TCP; implement `Network` for TLS or other transports.
 pub mod network;

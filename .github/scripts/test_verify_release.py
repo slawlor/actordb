@@ -40,9 +40,14 @@ def metadata(version="0.2.0"):
                     }
                 ],
             },
-            {"name": "xtask", "id": "xtask-id", "version": "0.1.0"},
+            {"name": "xtask", "id": "xtask-id", "version": "0.1.0", "publish": []},
+            {"name": "docker-tests", "id": "docker-tests-id", "version": "0.1.0", "publish": []},
+            *[
+                {"name": name, "id": f"{name}-id", "version": version, "publish": None}
+                for name in ["actordb-protocol", "actordb-query", "actordb-client"]
+            ],
         ],
-        "workspace_members": ["actordb-id", "xtask-id"],
+        "workspace_members": ["actordb-id", "xtask-id", "docker-tests-id", "actordb-protocol-id", "actordb-query-id", "actordb-client-id"],
     }
 
 
@@ -95,6 +100,68 @@ class MetadataTests(unittest.TestCase):
         self.assertEqual(
             self.resolve(metadata("1.2.3-rc.1+build.4")), "1.2.3-rc.1+build.4"
         )
+
+    def test_companions_must_match_the_core_version(self):
+        for name in ["actordb-protocol", "actordb-query", "actordb-client"]:
+            for version in ["0.1.0", "0.2.0-rc.1", "0.2.0+build", None, "private-token\n"]:
+                value = metadata()
+                next(package for package in value["packages"] if package["name"] == name)["version"] = version
+                with self.subTest(name=name, version=version), self.assertRaisesRegex(guard.ReleaseError, "share") as caught:
+                    self.resolve(value)
+                self.assertNotIn("private-token", str(caught.exception))
+
+    def test_companions_must_be_present_once_and_in_the_workspace(self):
+        for name in ["actordb-protocol", "actordb-query", "actordb-client"]:
+            for mutation in ["missing", "duplicate", "outside_workspace"]:
+                value = metadata()
+                package = next(package for package in value["packages"] if package["name"] == name)
+                if mutation == "missing":
+                    value["packages"].remove(package)
+                elif mutation == "duplicate":
+                    value["packages"].append(package.copy())
+                else:
+                    value["workspace_members"].remove(package["id"])
+                with self.subTest(name=name, mutation=mutation), self.assertRaises(guard.ReleaseError):
+                    self.resolve(value)
+
+    def test_publish_metadata_uses_cargo_null_or_registry_allowlist(self):
+        for name in guard.PUBLISHED_PACKAGES:
+            for publish in [None, ["crates-io"], ["private", "crates-io"]]:
+                value = metadata()
+                next(package for package in value["packages"] if package["name"] == name)["publish"] = publish
+                with self.subTest(name=name, publish=publish):
+                    self.assertEqual(self.resolve(value), "0.2.0")
+            for publish in [[], False, True, ["private"], "crates-io", [1, "crates-io"]]:
+                value = metadata()
+                next(package for package in value["packages"] if package["name"] == name)["publish"] = publish
+                with self.subTest(name=name, publish=publish), self.assertRaisesRegex(guard.ReleaseError, "crates-io"):
+                    self.resolve(value)
+
+    def test_internal_tools_and_accidental_workspace_packages_cannot_publish(self):
+        for name in ["xtask", "docker-tests"]:
+            for publish in [None, ["crates-io"], False]:
+                value = metadata()
+                next(package for package in value["packages"] if package["name"] == name)["publish"] = publish
+                with self.subTest(name=name, publish=publish), self.assertRaisesRegex(guard.ReleaseError, "disable publication"):
+                    self.resolve(value)
+        value = metadata()
+        value["packages"].append({"name": "extra-library", "id": "extra-id", "version": "0.2.0", "publish": None})
+        value["workspace_members"].append("extra-id")
+        with self.assertRaisesRegex(guard.ReleaseError, "disable publication"):
+            self.resolve(value)
+        value["packages"][-1]["publish"] = []
+        self.assertEqual(self.resolve(value), "0.2.0")
+
+    def test_nonworkspace_dependency_publication_metadata_is_not_a_workspace_policy(self):
+        value = metadata()
+        value["packages"].append({"name": "third-party", "id": "dependency-id", "version": "999.0.0", "publish": None})
+        self.assertEqual(self.resolve(value), "0.2.0")
+
+    def test_workspace_member_without_package_metadata_fails_closed(self):
+        value = metadata()
+        value["workspace_members"].append("unknown-id")
+        with self.assertRaisesRegex(guard.ReleaseError, "one package"):
+            self.resolve(value)
 
     def test_backend_features_remain_independent_and_opt_in(self):
         value = metadata()

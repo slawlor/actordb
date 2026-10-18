@@ -7,6 +7,7 @@
 //!
 //! Roles:
 //! - `replicate-writer` / `replicate-reader`: 3-node convergence.
+//! - `client-node`: a database/application server for external SDK scenarios.
 //! - `restart-crashing` / `restart-survivor`: SIGKILL a node mid-cluster,
 //!   restart it, assert it reconverges (exercises redial + `boot_id`).
 //!
@@ -15,6 +16,8 @@
 //! timeline across containers. The bare marker lines `READY`,
 //! `SCENARIO_OK` and `SCENARIO_FAILED` are intentionally unprefixed —
 //! the driver scripts grep for them.
+
+mod client_node;
 
 use std::future::Future;
 use std::net::SocketAddr;
@@ -43,6 +46,23 @@ struct Args {
 
 #[derive(Subcommand, Debug)]
 enum Command {
+    /// Serve a sharded database node and its separate application listener.
+    ClientNode {
+        #[arg(long, value_parser = ["node-a", "node-b", "node-c"])]
+        node_id: String,
+        #[arg(long, default_value_t = 7447)]
+        peer_port: u16,
+        #[arg(long, default_value_t = 7449)]
+        client_port: u16,
+        /// Repeat for the other two database nodes; DNS names are supported.
+        #[arg(long, required = true)]
+        peer: Vec<String>,
+        #[arg(long)]
+        db_path: Option<PathBuf>,
+        /// Separate application credential as UTF-8 bytes (at least 32 bytes).
+        #[arg(long)]
+        credential: Option<String>,
+    },
     /// Wait for peers, write one key, exit 0.
     ReplicateWriter {
         #[arg(long)]
@@ -479,6 +499,14 @@ async fn wait_for_peer_death(ctx: &Ctx) -> TestResult {
 async fn main() {
     let args = Args::parse();
     let result = match args.command {
+        Command::ClientNode {
+            node_id,
+            peer_port,
+            client_port,
+            peer,
+            db_path,
+            credential,
+        } => client_node::run(node_id, peer_port, client_port, peer, db_path, credential).await,
         Command::ReplicateWriter {
             node_id,
             port,
@@ -534,5 +562,47 @@ async fn main() {
             println!("SCENARIO_FAILED: {e}");
             std::process::exit(1);
         }
+    }
+}
+
+#[cfg(test)]
+mod client_node_cli_tests {
+    use super::*;
+
+    #[test]
+    fn client_node_accepts_repeated_peers_and_separate_port_defaults() {
+        let args = Args::try_parse_from([
+            "actordb-docker-test",
+            "client-node",
+            "--node-id",
+            "node-a",
+            "--peer",
+            "node-b:7447",
+            "--peer",
+            "node-c:7447",
+        ])
+        .unwrap();
+        let Command::ClientNode {
+            node_id,
+            peer_port,
+            client_port,
+            peer,
+            ..
+        } = args.command
+        else {
+            panic!("wrong role");
+        };
+        assert_eq!(node_id, "node-a");
+        assert_eq!((peer_port, client_port), (7447, 7449));
+        assert_eq!(peer, ["node-b:7447", "node-c:7447"]);
+        assert!(Args::try_parse_from([
+            "actordb-docker-test",
+            "client-node",
+            "--node-id",
+            "unplaced",
+            "--peer",
+            "node-b:7447"
+        ])
+        .is_err());
     }
 }

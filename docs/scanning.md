@@ -1,5 +1,10 @@
 # Scanning
 
+For global ordering/pagination and complete aggregates, use the separate
+[SQL query API](query.md). Legacy `Node::scan` retains the per-fragment
+limit/offset and collection semantics described here. The application listener
+bounds scan collection and reports oversized results explicitly.
+
 A **scan** applies a filter + transform spec to every record in a
 fragment's local cache and returns the transformed matches. It is the
 execution primitive for distributed map-reduce style queries:

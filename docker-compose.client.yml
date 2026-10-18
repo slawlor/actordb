@@ -1,0 +1,44 @@
+# Three sharded database servers and a separate SDK-only client container.
+services:
+  node-a:
+    image: actordb-docker-test:latest
+    build:
+      context: .
+      dockerfile: docker-tests/Dockerfile
+      target: runtime
+    command: client-node --node-id node-a --peer-port 7447 --client-port 7449 --peer node-b:7447 --peer node-c:7447 --db-path /data/actordb --credential 0123456789abcdef0123456789abcdef
+    networks: [test-net]
+    volumes: [node-a-data:/data]
+  node-b:
+    image: actordb-docker-test:latest
+    build:
+      context: .
+      dockerfile: docker-tests/Dockerfile
+      target: runtime
+    command: client-node --node-id node-b --peer-port 7447 --client-port 7449 --peer node-a:7447 --peer node-c:7447 --db-path /data/actordb --credential 0123456789abcdef0123456789abcdef
+    networks: [test-net]
+    volumes: [node-b-data:/data]
+  node-c:
+    image: actordb-docker-test:latest
+    build:
+      context: .
+      dockerfile: docker-tests/Dockerfile
+      target: runtime
+    command: client-node --node-id node-c --peer-port 7447 --client-port 7449 --peer node-a:7447 --peer node-b:7447 --db-path /data/actordb --credential 0123456789abcdef0123456789abcdef
+    networks: [test-net]
+    volumes: [node-c-data:/data]
+  external-client:
+    image: actordb-docker-client-test:latest
+    build:
+      context: .
+      dockerfile: docker-tests/Dockerfile
+      target: client-runtime
+    command: --endpoint node-a:7449 --endpoint node-b:7449 --endpoint node-c:7449 --credential 0123456789abcdef0123456789abcdef --timeout-secs 180
+    depends_on: [node-a, node-b, node-c]
+    networks: [test-net]
+networks:
+  test-net:
+volumes:
+  node-a-data:
+  node-b-data:
+  node-c-data:

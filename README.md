@@ -12,11 +12,11 @@ A Rust actor-based distributed database with pluggable, opt-in storage
 
 ## Crate installation
 
-The `0.3` release series requires Rust 1.88+:
+The `0.4` release series requires Rust 1.88+:
 
 ```toml
 [dependencies]
-actordb = "0.3"
+actordb = "0.4"
 ```
 
 The default crate includes no concrete storage backend. Its actor cache and
@@ -24,16 +24,17 @@ The default crate includes no concrete storage backend. Its actor cache and
 unless you supply a custom store. RocksDB is an independent opt-in:
 
 ```toml
-actordb = { version = "0.3", features = ["rocksdb"] }
+actordb = { version = "0.4", features = ["rocksdb"] }
 ```
 
 The separate `memory` feature exposes the no-op `MemoryStore` test double; it
-is not persistent storage. Neither backend feature enables the other. All
-configurations build protobuf from source; only opting into RocksDB requires
-its native library and libclang bindings. `default-features = false` is not
+is not persistent storage. Neither backend feature enables the other. Protocol
+messages ship as generated Rust in `actordb-protocol`; ordinary builds do not
+compile protobuf tooling. RocksDB requires its native library and libclang
+bindings. `default-features = false` is not
 necessary to avoid RocksDB: the default feature set is empty.
 
-This remains pre-1.0 software. The `0.2` and `0.3` releases include API,
+This remains pre-1.0 software. The `0.2`, `0.3`, and `0.4` releases include API,
 wire-protocol, and legacy-store compatibility changes. Read the [release notes](CHANGELOG.md)
 and [release procedure](docs/releases.md) before upgrading or publishing.
 
@@ -121,6 +122,10 @@ Comprehensive guides live in [`docs/`](docs/):
 - [Multi-key batching](docs/batching.md) — fan-out, failover, partial failures
 - [Scanning](docs/scanning.md) — single-shard filter + transform scans,
   spec semantics, scheduling, and cost model
+- [SQL queries](docs/query.md) — fragment filters, global pagination,
+  byte projections, and exact aggregates over the virtual `kv` table
+- [Rust client](actordb-client/README.md) — remote application connections,
+  operation coverage, credentials, and mutation retry semantics
 - [Traffic classes & backpressure](docs/backpressure.md) — `OpPriority`,
   pool config, shed behavior and observability
 - [Configuration reference](docs/configuration.md) — every `NodeConfig`
@@ -136,8 +141,8 @@ Modeled on
 [ractor's cluster integration tests](https://github.com/slawlor/ractor/tree/main/ractor_cluster_integration_tests):
 three nodes on a private compose network (`test-net`), each container
 running one scripted role from the `actordb-docker-test` binary
-(`docker-tests/` crate). Unlike the in-process tests, these exercise
-real multi-host networking — DNS peer addresses, container death, and
+(`docker-tests/` crate). These exercise process boundaries, container-network
+DNS peer addresses, container death, and
 true `SIGKILL` crashes.
 
 Scenarios live in `docker/envs/`:
@@ -148,14 +153,19 @@ Scenarios live in `docker/envs/`:
   by the driver script), restart it, and require all three nodes to
   reconverge. Exercises the redial supervisor, fresh replication sessions,
   and immediate correlated reconciliation across process death.
+* **external client** — a separate SDK-only fourth container talks to three
+  sharded nodes through the application protocol. It checks remote routing,
+  SQL/transforms, client reconnection after an ingress SIGKILL, and recovery.
 
 ```bash
 docker compose build
 bash docker/run-scenario.sh docker/envs/replication.env
 bash docker/restart-test.sh
+docker compose -f docker-compose.client.yml build
+bash docker/client-test.sh
 ```
 
-CI runs both scenarios on every push/PR touching the relevant paths
+CI runs all scenarios on every push/PR touching the relevant paths
 (`.github/workflows/docker-integration.yaml`).
 
 ## Public API

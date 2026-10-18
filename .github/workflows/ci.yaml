@@ -7,6 +7,35 @@ on:
     types: [opened, reopened, synchronize]
 
 jobs:
+  companion:
+    name: Standalone Rust companions
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Check SDK without server or native dependencies
+        run: cargo check --package actordb-client --lib --no-default-features
+      - name: Verify the external client cannot link a database node
+        run: |
+          python3 - <<'PY'
+          import subprocess
+          result = subprocess.run(
+              ['cargo', 'tree', '--package', 'docker-client-tests', '--edges', 'normal,build', '--prefix', 'none'],
+              capture_output=True, text=True, check=True,
+          )
+          forbidden = {'actordb', 'ractor', 'rocksdb', 'librocksdb-sys', 'protobuf-src', 'prost-build'}
+          actual = {line.split()[0] for line in result.stdout.splitlines() if line.strip()}
+          assert not actual & forbidden, f'External client links server dependencies: {actual & forbidden}'
+          print('External client links only SDK dependencies.')
+          PY
+      - name: Test portable query and protocol contracts
+        run: cargo test --package actordb-query --package actordb-protocol
+      - name: Verify generated protocol bindings match the schemas
+        run: cargo run --package actordb-protocol --features codegen --bin generate -- --check
+
   msrv:
     name: Rust 1.88 minimum version
     runs-on: ubuntu-latest

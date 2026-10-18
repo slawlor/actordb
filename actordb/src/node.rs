@@ -87,6 +87,7 @@ use mutation_service::{
     MutationJob, MutationRequest, MutationService, FORWARDED_MUTATION_BYTE_CAPACITY,
     FORWARDED_MUTATION_CAPACITY,
 };
+mod query;
 pub mod scan;
 pub use scan::{ScanError, MAX_SCAN_TOTAL_MATCHES};
 
@@ -112,6 +113,10 @@ pub const CAPABILITY_BYTE_BOUNDED_BATCHES: u64 = 1 << 5;
 /// Replication ACKs can report an explicit stable-storage fence independently
 /// of ordinary store-commit policy.
 pub const CAPABILITY_STABLE_DURABILITY_ACKS: u64 = 1 << 6;
+/// Optional distributed scan support.
+pub const CAPABILITY_SCAN: u64 = 1 << 7;
+/// Optional revision-guarded, bounded SQL query pages.
+pub const CAPABILITY_QUERY_PAGES: u64 = 1 << 8;
 /// Capabilities required by this binary before it installs a peer connection.
 pub const REQUIRED_WIRE_CAPABILITIES: u64 = CAPABILITY_MUTATION_RESULTS
     | CAPABILITY_DURABILITY_ACKS
@@ -188,6 +193,7 @@ struct PeerChannel {
     cancel: watch::Sender<bool>,
     queue_admission_timeout: Duration,
     rank: Option<ConnectionRank>,
+    capabilities: u64,
 }
 
 struct ConnectionCancelGuard(PeerChannel);
@@ -967,6 +973,8 @@ struct ConnContext {
     pending_batch_gets: PendingBatchGets,
     /// In-flight distributed scan requests (coordinator side).
     pending_scans: PendingScans,
+    pending_query_pages: query::PendingQueryPages,
+    query_admission: Arc<crate::query::QueryAdmission>,
     pending_mutations: PendingMutations,
     /// Relayed forwarded-gets: relay_req_id -> (origin peer_tx, origin req_id).
     pending_relays: RelayMap,
@@ -2007,6 +2015,8 @@ pub struct Node {
     pending_batch_gets: PendingBatchGets,
     /// In-flight distributed scan requests: req_id -> reply channel.
     pending_scans: PendingScans,
+    pending_query_pages: query::PendingQueryPages,
+    query_admission: Arc<crate::query::QueryAdmission>,
     /// In-flight single and batched forwarded mutation outcomes.
     pending_mutations: PendingMutations,
     /// Relayed forwarded-gets (Phase 8 re-forwarding).
@@ -3740,6 +3750,8 @@ impl Node {
             pending_gets: Arc::new(StdMutex::new(HashMap::new())),
             pending_batch_gets: Arc::new(StdMutex::new(HashMap::new())),
             pending_scans: Arc::new(StdMutex::new(HashMap::new())),
+            pending_query_pages: Arc::new(StdMutex::new(HashMap::new())),
+            query_admission: crate::query::QueryAdmission::new(),
             pending_mutations: Arc::new(StdMutex::new(HashMap::new())),
             pending_relays: Arc::new(StdMutex::new(HashMap::new())),
             pending_mutation_relays: Arc::new(StdMutex::new(HashMap::new())),
@@ -4021,6 +4033,8 @@ impl Node {
             pending_gets: self.pending_gets.clone(),
             pending_batch_gets: self.pending_batch_gets.clone(),
             pending_scans: self.pending_scans.clone(),
+            pending_query_pages: self.pending_query_pages.clone(),
+            query_admission: self.query_admission.clone(),
             pending_mutations: self.pending_mutations.clone(),
             pending_relays: self.pending_relays.clone(),
             pending_mutation_relays: self.pending_mutation_relays.clone(),
@@ -4197,6 +4211,19 @@ impl Node {
             .await
     }
 
+    /// Write with optional TTL and explicit priority, preserving one exact expiry deadline.
+    pub async fn put_with_options(
+        &self,
+        key: String,
+        value: Vec<u8>,
+        ttl: Option<Duration>,
+        priority: OpPriority,
+    ) -> Result<(), NodeError> {
+        let _operation = self.admit_operation()?;
+        self.put_with_ttl_and_priority(key, value, ttl, priority)
+            .await
+    }
+
     /// Internal: put with TTL and priority. The priority is honored
     /// on both paths: local applies go to the priority's pool, and
     /// forwarded puts carry the priority on the wire so the owner
@@ -4269,6 +4296,15 @@ impl Node {
     /// tombstones so deletes survive node restarts and re-joins. A later
     /// `put` with a higher timestamp resurrects the key.
     pub async fn delete(&self, key: String) -> Result<(), NodeError> {
+        self.delete_with_priority(key, OpPriority::Default).await
+    }
+
+    /// Delete a key through the selected priority pool.
+    pub async fn delete_with_priority(
+        &self,
+        key: String,
+        priority: OpPriority,
+    ) -> Result<(), NodeError> {
         let _operation = self.admit_operation()?;
         let seq = {
             let mut guard = self.next_seq.lock().await;
@@ -4282,14 +4318,7 @@ impl Node {
             seq,
             boot_id: self.boot_id,
         };
-        self.apply_local(op).await
-    }
-
-    /// Apply a locally-originated op, await its exact merge outcome, then
-    /// replicate only an operation that was applied or already present.
-    async fn apply_local(&self, op: ReplicatedOp) -> Result<(), NodeError> {
-        self.apply_local_with_priority(op, OpPriority::Default)
-            .await
+        self.apply_local_with_priority(op, priority).await
     }
 
     async fn apply_local_with_priority(
@@ -7513,6 +7542,8 @@ async fn handle_connection(
         pending_gets,
         pending_batch_gets,
         pending_scans,
+        pending_query_pages,
+        query_admission,
         pending_mutations,
         pending_relays,
         pending_mutation_relays,
@@ -7595,6 +7626,7 @@ async fn handle_connection(
         cancel: cancel.clone(),
         queue_admission_timeout: runtime_options.queue_admission_timeout,
         rank: None,
+        capabilities: REQUIRED_WIRE_CAPABILITIES | CAPABILITY_SCAN | CAPABILITY_QUERY_PAGES,
     };
     let writer_cancel = cancel.subscribe();
     // Abort/early-return must cancel jobs bound to this exact physical socket.
@@ -7793,6 +7825,7 @@ async fn handle_connection(
                 let peer = peer_hello.node_id.clone();
                 authenticated_peer_id = Some(peer.clone());
                 tx.rank = Some(connection_rank(dialer, listener));
+                tx.capabilities = peer_hello.capabilities;
                 let (won_election, previous) = {
                     let mut peer_guard = peers.lock().await;
                     match peer_guard.get(&peer) {
@@ -9281,6 +9314,81 @@ async fn handle_connection(
                 tracing::warn!("closing peer that sent a retired full-state sync frame");
                 break;
             }
+            Some(EnvelopeMsg::QueryPageRequest(req)) => {
+                if tx.capabilities & CAPABILITY_QUERY_PAGES == 0 {
+                    break;
+                }
+                let retention = match query::reserve_inbound(&query_admission, &req) {
+                    Ok(retention) => retention,
+                    Err(error) => {
+                        let page = crate::query::page_error(
+                            &req,
+                            crate::proto::QueryPageStatus::Backpressure,
+                            error.to_string(),
+                        );
+                        let _ = try_send_envelope_until(
+                            &tx,
+                            crate::query::page_envelope(page),
+                            deadline_after(runtime_options.queue_admission_timeout),
+                        )
+                        .await;
+                        continue;
+                    }
+                };
+                let operation = match operation_gate.try_enter() {
+                    Ok(operation) => operation,
+                    Err(_) => {
+                        let page = crate::query::page_error(
+                            &req,
+                            crate::proto::QueryPageStatus::Unavailable,
+                            "node is shutting down",
+                        );
+                        let _ = try_send_envelope_until(
+                            &tx,
+                            crate::query::page_envelope(page),
+                            deadline_after(runtime_options.queue_admission_timeout),
+                        )
+                        .await;
+                        continue;
+                    }
+                };
+                let Some(tasks) = tasks.upgrade() else {
+                    break;
+                };
+                let channel = tx.clone();
+                let router = router.clone();
+                let serving = serving.clone();
+                let deadline = deadline_after(runtime_options.forwarded_attempt_timeout);
+                if !tasks
+                    .spawn(async move {
+                        let _operation = operation;
+                        query::serve_query_page(channel, router, serving, req, retention, deadline)
+                            .await;
+                    })
+                    .await
+                {
+                    break;
+                }
+            }
+            Some(EnvelopeMsg::QueryPageResponse(response)) => {
+                if tx.capabilities & CAPABILITY_QUERY_PAGES == 0 {
+                    break;
+                }
+                let pending = {
+                    let mut pending = pending_query_pages.lock().unwrap();
+                    if pending
+                        .get(&response.req_id)
+                        .is_some_and(|request| request.channel.same_channel(&tx))
+                    {
+                        pending.remove(&response.req_id)
+                    } else {
+                        None
+                    }
+                };
+                if let Some(pending) = pending {
+                    let _ = pending.reply.send(response);
+                }
+            }
             Some(EnvelopeMsg::ScanRequest(req)) => {
                 // Serve the scan without blocking the connection read
                 // loop: the spawned task runs the fragment actor call and
@@ -9288,9 +9396,44 @@ async fn handle_connection(
                 let tx = tx.clone();
                 let serving = serving.clone();
                 let router = router.clone();
-                tokio::spawn(async move {
-                    scan::serve_scan_request(tx, serving, router, req).await;
-                });
+                if tx.capabilities & CAPABILITY_SCAN == 0 {
+                    break;
+                }
+                let retention = match query_admission
+                    .reserve(req.encoded_len().saturating_add(1024))
+                {
+                    Ok(retention) => retention,
+                    Err(error) => {
+                        scan::send_scan_response(&tx, req.req_id, Vec::new(), error.to_string())
+                            .await;
+                        continue;
+                    }
+                };
+                let operation = match operation_gate.try_enter() {
+                    Ok(operation) => operation,
+                    Err(_) => {
+                        scan::send_scan_response(
+                            &tx,
+                            req.req_id,
+                            Vec::new(),
+                            "node is shutting down".into(),
+                        )
+                        .await;
+                        continue;
+                    }
+                };
+                let Some(tasks) = tasks.upgrade() else {
+                    break;
+                };
+                if !tasks
+                    .spawn(async move {
+                        let _operation = operation;
+                        scan::serve_scan_request(tx, serving, router, req, retention).await;
+                    })
+                    .await
+                {
+                    break;
+                }
             }
             Some(EnvelopeMsg::ScanResponse(resp)) => {
                 let Some(peer) = peer_node_id.clone() else {
@@ -9319,6 +9462,10 @@ async fn handle_connection(
     }
 
     tx.cancel();
+    pending_query_pages
+        .lock()
+        .unwrap()
+        .retain(|_, request| !request.channel.same_channel(&tx));
     // Connection dropped: forget the peer only if this exact physical channel
     // is still current. Legacy full-replication peers are discovered at
     // runtime, so reap their per-fragment senders on disconnect rather than
@@ -9942,7 +10089,7 @@ fn fresh_hello(node_id: &str) -> Result<Hello, getrandom::Error> {
         auth_tag: Vec::new(),
         min_protocol_version: WIRE_PROTOCOL_VERSION,
         max_protocol_version: WIRE_PROTOCOL_VERSION,
-        capabilities: REQUIRED_WIRE_CAPABILITIES,
+        capabilities: REQUIRED_WIRE_CAPABILITIES | CAPABILITY_SCAN | CAPABILITY_QUERY_PAGES,
         challenge,
     })
 }
@@ -11085,6 +11232,7 @@ mod tests {
                 cancel,
                 queue_admission_timeout: Duration::from_millis(10),
                 rank: None,
+                capabilities: REQUIRED_WIRE_CAPABILITIES,
             },
             rx,
             response_rx,
@@ -11183,6 +11331,8 @@ mod tests {
                 pending_gets: Arc::new(StdMutex::new(HashMap::new())),
                 pending_batch_gets: Arc::new(StdMutex::new(HashMap::new())),
                 pending_scans: Arc::new(StdMutex::new(HashMap::new())),
+                pending_query_pages: Arc::new(StdMutex::new(HashMap::new())),
+                query_admission: crate::query::QueryAdmission::new(),
                 pending_mutations: Arc::new(StdMutex::new(HashMap::new())),
                 pending_relays: Arc::new(StdMutex::new(HashMap::new())),
                 pending_mutation_relays: Arc::new(StdMutex::new(HashMap::new())),
@@ -15086,6 +15236,7 @@ mod tests {
             cancel: cancel_tx,
             queue_admission_timeout: Duration::from_millis(10),
             rank: None,
+            capabilities: REQUIRED_WIRE_CAPABILITIES,
         };
 
         assert!(try_send_envelope(&peer, envelope.clone()).await);
@@ -15124,6 +15275,7 @@ mod tests {
             cancel: cancel_tx,
             queue_admission_timeout: Duration::from_millis(10),
             rank: None,
+            capabilities: REQUIRED_WIRE_CAPABILITIES,
         };
 
         assert!(try_send_envelope(&peer, envelope.clone()).await);

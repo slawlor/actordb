@@ -38,12 +38,17 @@ and the `PrefixedStore` wrapper are available without either feature.
 
 ## Crate layout
 
-The workspace root holds the library crate `actordb`, the `docker-tests`
-integration crate, and an `xtask` for coverage.
+The workspace contains `actordb`, its lightweight `actordb-protocol`,
+`actordb-query`, and `actordb-client` companions, the `docker-tests` integration
+crate, the SDK-only `docker-client-tests` scenario executable, and an `xtask`
+for coverage. The client application listener wraps a
+Node without creating peer membership or replication senders.
 
 | Module | Role |
 |---|---|
 | `actordb::node` | Public API: `Node`, `NodeConfig`, `NodeError`, peer mesh, routing, forwarding, replication wiring, placement driver |
+| `actordb::client_server` | Separate bounded application TCP listener for SDK connections |
+| `actordb::query` | SQL execution policy, bounded background pages, and revision-checked fragment coordination |
 | `actordb::actor` | All ractor actors: dispatcher/workers, `FragmentSupervisor`, `Cleaner`, `Snapshotter`; shared cache, clock, and operation/value contracts |
 | `actordb::replication` | Phase 5 async sender/receiver: `ReplicationSender` state machine, sessions, acks, protocol-v3 paged `ReconcileRequest/Response/Fetch/Data` anti-entropy |
 | `actordb::supervision` | Compatibility reexports of supervisor and maintenance actor APIs from `actordb::actor` |
@@ -54,7 +59,7 @@ integration crate, and an `xtask` for coverage.
 | `actordb::store::rocksdb` | Fail-closed `RocksDbStore` durable backend; opt-in `rocksdb` feature |
 | `actordb::shard` | `FragmentId`, `hash_key` (seahash), `fragment_of` |
 | `actordb::network` | Transport abstraction: `Network`, `TcpNetwork`, `PeerStream`; 4-byte length-prefixed `Envelope` framing |
-| `actordb::proto` | prost-generated `meta` protocol-buffer messages (ids 1–20), priorities, mutation outcomes, challenge handshake, replication and reconcile messages |
+| `actordb::proto` | Compatibility reexports of shared generated peer messages, priorities, mutation outcomes, handshake, replication, reconciliation, scans, and query pages |
 
 ### Actor implementation files
 

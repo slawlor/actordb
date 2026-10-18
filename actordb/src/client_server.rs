@@ -1,0 +1,702 @@
+//! Opt-in application TCP listener composed around an existing [`crate::node::Node`].
+//!
+//! Application clients never join peer membership. Credentials are separate
+//! from cluster secrets. TCP authentication proves possession but does not
+//! encrypt traffic; deploy this listener on a protected network or TLS proxy.
+//! Listener shutdown closes application sessions and leaves the Node running.
+
+use crate::actor::{OpPriority, VersionedValue};
+use crate::node::{Node, NodeError};
+use actordb_protocol::{
+    client as wire, CLIENT_CAPABILITIES, CLIENT_PROTOCOL_VERSION, MAX_FRAME_BYTES,
+};
+use prost::Message;
+use std::collections::HashSet;
+use std::net::SocketAddr;
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::{watch, Semaphore};
+use tokio::task::{JoinHandle, JoinSet};
+
+/// Resource limits and optional application credential. Never reuse a cluster key.
+#[derive(Clone, Debug)]
+pub struct ClientServerOptions {
+    pub credential: Option<Vec<u8>>,
+    pub max_connections: usize,
+    pub max_in_flight_requests: usize,
+    pub receive_bytes: usize,
+    pub timeout: Duration,
+}
+impl Default for ClientServerOptions {
+    fn default() -> Self {
+        Self {
+            credential: None,
+            max_connections: 64,
+            max_in_flight_requests: 8,
+            receive_bytes: 64 * 1024 * 1024,
+            timeout: Duration::from_secs(30),
+        }
+    }
+}
+/// Owned application listener. Drop requests cancellation; [`Self::shutdown`]
+/// additionally joins the listener and all application connection tasks.
+pub struct ClientServer {
+    addr: SocketAddr,
+    cancel: watch::Sender<bool>,
+    task: Option<JoinHandle<()>>,
+}
+impl ClientServer {
+    pub async fn bind(
+        node: Arc<Node>,
+        addr: SocketAddr,
+        options: ClientServerOptions,
+    ) -> Result<Self, NodeError> {
+        if options.max_connections == 0
+            || options.max_connections > Semaphore::MAX_PERMITS
+            || options.max_in_flight_requests == 0
+            || options.max_in_flight_requests > Semaphore::MAX_PERMITS
+            || options.timeout.is_zero()
+            || options.receive_bytes < MAX_FRAME_BYTES
+            || options.receive_bytes > u32::MAX as usize
+            || options.receive_bytes > Semaphore::MAX_PERMITS
+            || options
+                .credential
+                .as_ref()
+                .is_some_and(|key| key.len() < 32)
+            || tokio::time::Instant::now()
+                .checked_add(options.timeout)
+                .is_none()
+        {
+            return Err(NodeError::Codec(
+                "invalid application listener limits or credential".into(),
+            ));
+        }
+        let listener = TcpListener::bind(addr).await?;
+        let addr = listener.local_addr()?;
+        let (cancel, mut cancellation) = watch::channel(false);
+        let connections = Arc::new(Semaphore::new(options.max_connections));
+        let requests = Arc::new(Semaphore::new(options.max_in_flight_requests));
+        let bytes = Arc::new(Semaphore::new(options.receive_bytes));
+        let task = tokio::spawn(async move {
+            let mut sessions = JoinSet::new();
+            loop {
+                tokio::select! {
+                    _ = cancellation.changed() => break,
+                    Some(_) = sessions.join_next(), if !sessions.is_empty() => {},
+                    accepted = listener.accept() => {
+                        let Ok((stream, _)) = accepted else { break; };
+                        let Ok(permit) = connections.clone().try_acquire_owned() else { continue; };
+                        let node = node.clone(); let options = options.clone();
+                        let bytes = bytes.clone(); let requests = requests.clone();
+                        let mut cancellation = cancellation.clone();
+                        sessions.spawn(async move {
+                            let _connection_permit = permit;
+                            serve_connection(node, stream, options, bytes, requests, &mut cancellation).await;
+                        });
+                    }
+                }
+            }
+            // Idle/read-only work cancels promptly. Accepted mutations own
+            // their apply and fan-out until completion, even after socket loss.
+            while sessions.join_next().await.is_some() {}
+        });
+        Ok(Self {
+            addr,
+            cancel,
+            task: Some(task),
+        })
+    }
+    pub fn addr(&self) -> SocketAddr {
+        self.addr
+    }
+    pub async fn shutdown(&mut self) {
+        let _ = self.cancel.send(true);
+        if let Some(task) = self.task.as_mut() {
+            let _ = task.await;
+        }
+        self.task.take();
+    }
+}
+impl Drop for ClientServer {
+    fn drop(&mut self) {
+        let _ = self.cancel.send(true);
+    }
+}
+
+async fn serve_connection(
+    node: Arc<Node>,
+    mut stream: TcpStream,
+    options: ClientServerOptions,
+    bytes: Arc<Semaphore>,
+    requests: Arc<Semaphore>,
+    cancellation: &mut watch::Receiver<bool>,
+) {
+    let handshake = async {
+        stream.set_nodelay(true).ok()?;
+        let client = match receive(&mut stream, actordb_protocol::MAX_HANDSHAKE_BYTES, &bytes)
+            .await?
+            .0
+            .message
+        {
+            Some(wire::frame::Message::Hello(hello))
+                if actordb_protocol::valid_client_hello(&hello) =>
+            {
+                hello
+            }
+            _ => return None,
+        };
+        let mut challenge = vec![0; 32];
+        getrandom::fill(&mut challenge).ok()?;
+        let server = wire::Hello {
+            identity: node.id().into(),
+            challenge,
+            min_version: CLIENT_PROTOCOL_VERSION,
+            max_version: CLIENT_PROTOCOL_VERSION,
+            capabilities: CLIENT_CAPABILITIES,
+        };
+        send(
+            &mut stream,
+            wire::Frame {
+                message: Some(wire::frame::Message::Hello(server.clone())),
+            },
+        )
+        .await?;
+        let auth = match receive(&mut stream, actordb_protocol::MAX_HANDSHAKE_BYTES, &bytes)
+            .await?
+            .0
+            .message
+        {
+            Some(wire::frame::Message::Auth(auth)) => auth,
+            _ => return None,
+        };
+        if !actordb_protocol::verify_client_auth(
+            options.credential.as_deref(),
+            true,
+            &client,
+            &server,
+            &auth.proof,
+        ) {
+            return None;
+        }
+        let proof = options
+            .credential
+            .as_deref()
+            .map(|key| actordb_protocol::client_auth_proof(key, false, &client, &server))
+            .unwrap_or_default();
+        send(
+            &mut stream,
+            wire::Frame {
+                message: Some(wire::frame::Message::Auth(wire::Auth { proof })),
+            },
+        )
+        .await?;
+        Some(client.capabilities & server.capabilities)
+    };
+    let completed = tokio::select! {
+        _ = cancellation.changed() => None,
+        result = tokio::time::timeout(options.timeout.min(Duration::from_secs(5)), handshake) => result.ok().flatten(),
+    };
+    let Some(capabilities) = completed else {
+        return;
+    };
+    loop {
+        if *cancellation.borrow() {
+            return;
+        }
+        // Idle connections occupy no receive bytes. Body and request work have
+        // deadlines; listener cancellation interrupts the idle prefix read.
+        let first = tokio::select! {
+            _ = cancellation.changed() => return,
+            result = stream.read_u8() => match result { Ok(first) => first, _ => return },
+        };
+        let mut prefix = [first, 0, 0, 0];
+        tokio::select! {
+            _ = cancellation.changed() => return,
+            result = tokio::time::timeout(options.timeout, stream.read_exact(&mut prefix[1..])) => if !matches!(result, Ok(Ok(_))) { return; },
+        }
+        let length = u32::from_be_bytes(prefix);
+        if length == 0 || length as usize > MAX_FRAME_BYTES {
+            return;
+        }
+        let Ok(permit) = bytes.clone().try_acquire_many_owned(length) else {
+            return;
+        };
+        let mut body = vec![0; length as usize];
+        tokio::select! {
+            _ = cancellation.changed() => return,
+            result = tokio::time::timeout(options.timeout, stream.read_exact(&mut body)) => {
+                if !matches!(result, Ok(Ok(_))) { return; }
+            }
+        }
+        if actordb_protocol::preflight_client_frame(&body).is_err() {
+            return;
+        }
+        let request = match wire::Frame::decode(body.as_slice())
+            .ok()
+            .and_then(|frame| frame.message)
+        {
+            Some(wire::frame::Message::Request(request)) if request.id != 0 => request,
+            _ => return,
+        };
+        drop(body);
+        let _request_permit = tokio::select! {
+            _ = cancellation.changed() => return,
+            result = tokio::time::timeout(options.timeout, requests.acquire()) => match result { Ok(Ok(permit)) => permit, _ => return },
+        };
+        if *cancellation.borrow() {
+            return;
+        }
+        let optional_capability = match request.operation {
+            Some(wire::request::Operation::Query(_)) => actordb_protocol::CLIENT_CAPABILITY_QUERY,
+            Some(wire::request::Operation::Scan(_)) => actordb_protocol::CLIENT_CAPABILITY_SCAN,
+            _ => 0,
+        };
+        if optional_capability & capabilities != optional_capability {
+            let response = wire::Response {
+                id: request.id,
+                error: Some(error(
+                    wire::ErrorCode::Unsupported,
+                    "operation capability was not negotiated",
+                )),
+                ..Default::default()
+            };
+            if !matches!(
+                tokio::time::timeout(
+                    options.timeout,
+                    send(
+                        &mut stream,
+                        wire::Frame {
+                            message: Some(wire::frame::Message::Response(response))
+                        }
+                    )
+                )
+                .await,
+                Ok(Some(()))
+            ) {
+                return;
+            }
+            continue;
+        }
+        let mutation = matches!(
+            request.operation,
+            Some(
+                wire::request::Operation::Put(_)
+                    | wire::request::Operation::Delete(_)
+                    | wire::request::Operation::BatchPut(_)
+            )
+        );
+        let mut response = if mutation {
+            // This session is tracked by the listener and never aborted while
+            // it owns an accepted mutation. Client deadlines may expire, but
+            // apply/outcome/fan-out completion remains owned and gets joined.
+            dispatch(&node, request).await
+        } else {
+            tokio::select! {
+                _ = cancellation.changed() => return,
+                result = tokio::time::timeout(options.timeout, dispatch(&node, request)) => match result { Ok(response) => response, Err(_) => return },
+            }
+        };
+        if *cancellation.borrow() {
+            return;
+        }
+        if response.encoded_len() + 16 > MAX_FRAME_BYTES || !response_counts_valid(&response) {
+            response = wire::Response {
+                id: response.id,
+                error: Some(error(
+                    if mutation {
+                        wire::ErrorCode::UnknownOutcome
+                    } else {
+                        wire::ErrorCode::ResourceLimit
+                    },
+                    "complete response exceeds byte or count limit; reduce batch/query/scan size",
+                )),
+                ..Default::default()
+            };
+        }
+        let result = tokio::time::timeout(
+            options.timeout,
+            send(
+                &mut stream,
+                wire::Frame {
+                    message: Some(wire::frame::Message::Response(response)),
+                },
+            ),
+        )
+        .await;
+        drop(permit);
+        if !matches!(result, Ok(Some(()))) {
+            return;
+        }
+    }
+}
+
+fn response_counts_valid(response: &wire::Response) -> bool {
+    response.reads.len() <= actordb_protocol::MAX_BATCH_ITEMS
+        && response.mutations.len() <= actordb_protocol::MAX_BATCH_ITEMS
+        && response.scans.len() <= 100_000
+        && response.query.as_ref().is_none_or(|query| {
+            query.columns.len() <= 32
+                && query.rows.len() <= 100_000
+                && query.rows.iter().all(|row| row.cells.len() <= 32)
+        })
+        && response.inspection.as_ref().is_none_or(|inspection| {
+            inspection.health.len() <= 100_000
+                && inspection.placement.len() <= 100_000
+                && inspection.health.iter().all(|health| {
+                    health.worker_names.len() <= actordb_protocol::MAX_BATCH_ITEMS
+                        && health.restarts.len() <= actordb_protocol::MAX_BATCH_ITEMS
+                })
+                && inspection
+                    .placement
+                    .iter()
+                    .all(|row| row.replica_ids.len() <= actordb_protocol::MAX_BATCH_ITEMS)
+        })
+}
+
+async fn dispatch(node: &Node, request: wire::Request) -> wire::Response {
+    use wire::request::Operation;
+    let mut response = wire::Response {
+        id: request.id,
+        ..Default::default()
+    };
+    let priority_is_valid = match &request.operation {
+        Some(wire::request::Operation::Get(get)) => {
+            actordb_protocol::meta::Priority::try_from(get.priority).is_ok()
+        }
+        Some(wire::request::Operation::Put(put)) => {
+            actordb_protocol::meta::Priority::try_from(put.priority).is_ok()
+        }
+        Some(wire::request::Operation::Delete(delete)) => {
+            actordb_protocol::meta::Priority::try_from(delete.priority).is_ok()
+        }
+        Some(wire::request::Operation::BatchGet(batch)) => {
+            actordb_protocol::meta::Priority::try_from(batch.priority).is_ok()
+        }
+        Some(wire::request::Operation::BatchPut(batch)) => {
+            actordb_protocol::meta::Priority::try_from(batch.priority).is_ok()
+                && batch
+                    .puts
+                    .iter()
+                    .all(|put| actordb_protocol::meta::Priority::try_from(put.priority).is_ok())
+        }
+        _ => true,
+    };
+    if !priority_is_valid {
+        response.error = Some(error(wire::ErrorCode::Invalid, "unknown priority"));
+        return response;
+    }
+    match request.operation {
+        Some(Operation::Get(get)) => {
+            let result = node
+                .get_with_priority(get.key.clone(), priority(get.priority))
+                .await;
+            response.reads.push(read_result(get.key, result));
+        }
+        Some(Operation::Put(put)) => {
+            let result = node
+                .put_with_options(
+                    put.key.clone(),
+                    put.value,
+                    put.ttl_ms.map(Duration::from_millis),
+                    priority(put.priority),
+                )
+                .await;
+            response.mutations.push(mutation_result(put.key, result));
+        }
+        Some(Operation::Delete(delete)) => {
+            let result = node
+                .delete_with_priority(delete.key.clone(), priority(delete.priority))
+                .await;
+            response.mutations.push(mutation_result(delete.key, result));
+        }
+        Some(Operation::BatchGet(batch)) => {
+            if batch.keys.len() > actordb_protocol::MAX_BATCH_ITEMS {
+                response.error = Some(error(wire::ErrorCode::ResourceLimit, "too many batch keys"));
+            } else {
+                for key in batch.keys {
+                    let result = node
+                        .get_with_priority(key.clone(), priority(batch.priority))
+                        .await;
+                    response.reads.push(read_result(key, result));
+                    if response.encoded_len() + 16 > MAX_FRAME_BYTES {
+                        response.reads.clear();
+                        response.error = Some(error(
+                            wire::ErrorCode::ResourceLimit,
+                            "batch result exceeds frame limit",
+                        ));
+                        break;
+                    }
+                }
+            }
+        }
+        Some(Operation::BatchPut(batch)) => {
+            if batch.puts.len() > actordb_protocol::MAX_BATCH_ITEMS {
+                response.error = Some(error(wire::ErrorCode::ResourceLimit, "too many batch puts"));
+            } else {
+                // Apply in input order, retaining duplicate positions. The batch
+                // is not a transaction: results describe each individual write.
+                for put in batch.puts {
+                    let result = node
+                        .put_with_options(
+                            put.key.clone(),
+                            put.value,
+                            put.ttl_ms.map(Duration::from_millis),
+                            priority(batch.priority),
+                        )
+                        .await;
+                    response.mutations.push(mutation_result(put.key, result));
+                }
+            }
+        }
+        Some(Operation::Query(query)) => {
+            let params = query
+                .params
+                .into_iter()
+                .map(decode_cell)
+                .collect::<Result<Vec<_>, _>>();
+            match params {
+                Err(message) => response.error = Some(error(wire::ErrorCode::Invalid, message)),
+                Ok(params) => match node.query_with_params(&query.sql, &params).await {
+                    Ok(result) => {
+                        response.query = Some(wire::QueryResult {
+                            columns: result.columns,
+                            rows: result
+                                .rows
+                                .into_iter()
+                                .map(|cells| actordb_protocol::meta::QueryPageRow {
+                                    key: String::new(),
+                                    cells: cells.into_iter().map(encode_cell).collect(),
+                                })
+                                .collect(),
+                        })
+                    }
+                    Err(failure) => response.error = Some(query_error(failure)),
+                },
+            }
+        }
+        Some(Operation::Inspect(_)) => match node.health().await {
+            Err(failure) => response.error = Some(node_error(failure)),
+            Ok(health) => {
+                let placement = node.placement_report().await;
+                let mut ids: HashSet<_> = placement
+                    .placement
+                    .keys()
+                    .chain(placement.states.keys())
+                    .copied()
+                    .collect();
+                ids.extend(health.keys().copied());
+                let mut placement_rows: Vec<_> = ids
+                    .into_iter()
+                    .map(|fragment| wire::Placement {
+                        fragment: fragment.0,
+                        replica_ids: placement
+                            .placement
+                            .get(&fragment)
+                            .cloned()
+                            .unwrap_or_default(),
+                        state: placement
+                            .states
+                            .get(&fragment)
+                            .map(|state| format!("{state:?}"))
+                            .unwrap_or_else(|| {
+                                if health.contains_key(&fragment) {
+                                    "Serving".into()
+                                } else {
+                                    "NotOwned".into()
+                                }
+                            }),
+                    })
+                    .collect();
+                placement_rows.sort_by_key(|row| row.fragment);
+                let mut health: Vec<_> = health
+                    .into_values()
+                    .map(|item| wire::FragmentHealth {
+                        fragment: item.fragment.0,
+                        worker_count: item.worker_count as u64,
+                        worker_names: item.worker_names,
+                        restarts: item.restarts,
+                        last_reaped: item.last_reaped as u64,
+                        shed_high: item.shed_counts.0,
+                        shed_default: item.shed_counts.1,
+                        shed_background: item.shed_counts.2,
+                    })
+                    .collect();
+                health.sort_by_key(|row| row.fragment);
+                response.inspection = Some(wire::Inspection {
+                    node_id: node.id().into(),
+                    peer_addr: node.addr().to_string(),
+                    peer_count: node.peer_count().await as u64,
+                    health,
+                    placement: placement_rows,
+                    dynamic: placement.dynamic,
+                });
+            }
+        },
+        Some(Operation::Scan(scan)) => {
+            let request = actordb_protocol::meta::ScanRequest {
+                matcher_kind: scan.matcher_kind,
+                matcher_arg: scan.prefix,
+                transform_kind: scan.transform_kind,
+                transform_arg: scan.prefix_bytes,
+                limit: scan.limit,
+                offset: scan.offset,
+                ..Default::default()
+            };
+            match crate::actor::ScanSpec::from_scan_request(&request) {
+                Err(message) => response.error = Some(error(wire::ErrorCode::Invalid, &message)),
+                Ok(spec) => match node.scan_bounded(&spec).await {
+                    Ok(matches) => {
+                        response.scans = matches.into_iter().map(|item| item.to_proto()).collect()
+                    }
+                    Err(failure) => response.error = Some(query_error(failure)),
+                },
+            }
+        }
+        None => {
+            response.error = Some(error(
+                wire::ErrorCode::Unsupported,
+                "missing or unsupported operation",
+            ))
+        }
+    }
+    response
+}
+fn priority(value: i32) -> OpPriority {
+    match actordb_protocol::meta::Priority::try_from(value) {
+        Ok(actordb_protocol::meta::Priority::High) => OpPriority::High,
+        Ok(actordb_protocol::meta::Priority::Background) => OpPriority::Background,
+        _ => OpPriority::Default,
+    }
+}
+fn read_result(key: String, result: Result<Option<VersionedValue>, NodeError>) -> wire::ReadResult {
+    match result {
+        Ok(value) => wire::ReadResult {
+            key,
+            value: value.map(|value| wire::Value {
+                bytes: value.value,
+                timestamp_ms: value.timestamp_ms,
+                node_id: value.node_id,
+                expires_at_ms: value.expires_at_ms,
+            }),
+            error: None,
+        },
+        Err(failure) => wire::ReadResult {
+            key,
+            value: None,
+            error: Some(node_error(failure)),
+        },
+    }
+}
+fn mutation_result(key: String, result: Result<(), NodeError>) -> wire::MutationResult {
+    wire::MutationResult {
+        key,
+        error: result.err().map(|failure| {
+            if matches!(
+                failure,
+                NodeError::Io(_) | NodeError::Network(_) | NodeError::Actor(_)
+            ) {
+                error(wire::ErrorCode::UnknownOutcome, &failure.to_string())
+            } else {
+                node_error(failure)
+            }
+        }),
+    }
+}
+fn error(code: wire::ErrorCode, message: &str) -> wire::Error {
+    wire::Error {
+        code: code as i32,
+        message: message.chars().take(1024).collect(),
+        ..Default::default()
+    }
+}
+fn node_error(failure: NodeError) -> wire::Error {
+    use wire::ErrorCode;
+    let code = match &failure {
+        NodeError::Io(_) | NodeError::Actor(_) | NodeError::Network(_) => ErrorCode::Unavailable,
+        NodeError::Codec(_) => ErrorCode::Invalid,
+        NodeError::Backpressure(_) => ErrorCode::Backpressure,
+        NodeError::Storage(_) => ErrorCode::Storage,
+        NodeError::Superseded { .. } => ErrorCode::Superseded,
+        NodeError::Expired => ErrorCode::Expired,
+        NodeError::ShuttingDown => ErrorCode::ShuttingDown,
+    };
+    let mut result = error(code, &failure.to_string());
+    if let NodeError::Superseded {
+        timestamp_ms,
+        node_id,
+        is_tombstone,
+    } = failure
+    {
+        result.winner_timestamp_ms = timestamp_ms;
+        result.winner_node_id = node_id;
+        result.winner_is_tombstone = is_tombstone;
+    }
+    result
+}
+fn query_error(failure: crate::query::QueryExecutionError) -> wire::Error {
+    use crate::query::QueryExecutionError;
+    let code = match failure {
+        QueryExecutionError::InvalidQuery(_) => wire::ErrorCode::Invalid,
+        QueryExecutionError::BudgetExceeded(_) => wire::ErrorCode::ResourceLimit,
+        QueryExecutionError::Backpressure(_) => wire::ErrorCode::Backpressure,
+        QueryExecutionError::QueryChanged(_) => wire::ErrorCode::QueryChanged,
+        QueryExecutionError::ShuttingDown => wire::ErrorCode::ShuttingDown,
+        _ => wire::ErrorCode::Unavailable,
+    };
+    error(code, &failure.to_string())
+}
+fn encode_cell(value: actordb_query::QueryValue) -> actordb_protocol::meta::QueryCell {
+    use actordb_protocol::meta::query_cell::Value;
+    actordb_protocol::meta::QueryCell {
+        value: Some(match value {
+            actordb_query::QueryValue::Null => Value::Null(true),
+            actordb_query::QueryValue::Text(v) => Value::Text(v),
+            actordb_query::QueryValue::Bytes(v) => Value::Bytes(v),
+            actordb_query::QueryValue::Integer(v) => Value::Integer(v.to_string()),
+        }),
+    }
+}
+fn decode_cell(
+    value: actordb_protocol::meta::QueryCell,
+) -> Result<actordb_query::QueryValue, &'static str> {
+    use actordb_protocol::meta::query_cell::Value;
+    match value.value {
+        Some(Value::Null(true)) => Ok(actordb_query::QueryValue::Null),
+        Some(Value::Text(v)) => Ok(actordb_query::QueryValue::Text(v)),
+        Some(Value::Bytes(v)) => Ok(actordb_query::QueryValue::Bytes(v)),
+        Some(Value::Integer(v)) => {
+            let integer: i128 = v.parse().map_err(|_| "invalid integer parameter")?;
+            if integer.to_string() != v {
+                return Err("noncanonical integer parameter");
+            }
+            Ok(actordb_query::QueryValue::Integer(integer))
+        }
+        _ => Err("invalid parameter"),
+    }
+}
+async fn send(stream: &mut TcpStream, frame: wire::Frame) -> Option<()> {
+    if frame.encoded_len() > MAX_FRAME_BYTES {
+        return None;
+    }
+    let bytes = frame.encode_to_vec();
+    stream.write_u32(bytes.len() as u32).await.ok()?;
+    stream.write_all(&bytes).await.ok()?;
+    Some(())
+}
+async fn receive(
+    stream: &mut TcpStream,
+    max: usize,
+    bytes: &Arc<Semaphore>,
+) -> Option<(wire::Frame, tokio::sync::OwnedSemaphorePermit)> {
+    let length = stream.read_u32().await.ok()?;
+    if length == 0 || length as usize > max {
+        return None;
+    }
+    let permit = bytes.clone().try_acquire_many_owned(length).ok()?;
+    let mut body = vec![0; length as usize];
+    stream.read_exact(&mut body).await.ok()?;
+    actordb_protocol::preflight_client_frame(&body).ok()?;
+    Some((wire::Frame::decode(body.as_slice()).ok()?, permit))
+}

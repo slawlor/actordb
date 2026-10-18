@@ -1,6 +1,6 @@
 [package]
 name = "docker-tests"
-version = "0.1.0"
+version = "0.4.0"
 authors = ["Sean Lawlor"]
 description = "Dockerized multi-node integration test scenarios for actordb"
 license = "MIT"
@@ -15,4 +15,4 @@ path = "src/main.rs"
 [dependencies]
 actordb = { path = "../actordb", default-features = false, features = ["rocksdb"] }
 clap = { version = "4", features = ["derive"] }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "net"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "net", "signal"] }

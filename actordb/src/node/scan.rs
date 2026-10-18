@@ -100,6 +100,85 @@ impl fmt::Display for ScanError {
 impl std::error::Error for ScanError {}
 
 impl Node {
+    /// Scan through bounded query pages while retaining the legacy per-fragment
+    /// offset/limit and fragment-order merge. Intended for external client
+    /// listeners; unlike the compatibility `scan`, wide replies fail at a
+    /// 16 MiB aggregate storage budget instead of materializing full fragments.
+    pub async fn scan_bounded(
+        &self,
+        spec: &ScanSpec,
+    ) -> Result<Vec<ScanMatch>, crate::query::QueryExecutionError> {
+        use crate::actor::{KeyMatcher, ValueTransform};
+        use crate::query::{QueryExecutionError, QueryOptions};
+        use actordb_query::{KeyPredicate, Projection, QueryPlan, QueryValue};
+        let _operation = self
+            .admit_operation()
+            .map_err(|_| QueryExecutionError::ShuttingDown)?;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+        tokio::time::timeout_at(deadline, async {
+            let mut merged = Vec::new();
+            let mut retained = 0usize;
+            for fragment in 0..self.router.fragment_count() {
+                let projections = match spec.transform {
+                    ValueTransform::Identity => vec![Projection::Key, Projection::Value],
+                    ValueTransform::KeyOnly => vec![Projection::Key],
+                    ValueTransform::PrefixBytes(n) => {
+                        vec![Projection::Key, Projection::PrefixBytes(n)]
+                    }
+                };
+                let predicates = match &spec.matcher {
+                    KeyMatcher::All => Vec::new(),
+                    KeyMatcher::Prefix(prefix) => vec![KeyPredicate::Prefix(prefix.clone())],
+                };
+                let plan = QueryPlan {
+                    projections,
+                    predicates,
+                    fragments: Some(vec![fragment as u32]),
+                    limit: Some(spec.effective_limit().min(MAX_SCAN_TOTAL_MATCHES as u64)),
+                    offset: spec.offset,
+                };
+                let remaining = (16 * 1024 * 1024usize).saturating_sub(retained);
+                let options = QueryOptions {
+                    max_result_bytes: remaining,
+                    timeout: deadline.saturating_duration_since(tokio::time::Instant::now()),
+                    ..Default::default()
+                };
+                let result = self.query_plan_with_options(&plan, options).await?;
+                for row in result.rows {
+                    if merged.len() == MAX_SCAN_TOTAL_MATCHES {
+                        break;
+                    }
+                    let mut cells = row.into_iter();
+                    let Some(QueryValue::Text(key)) = cells.next() else {
+                        return Err(QueryExecutionError::Protocol("scan key projection".into()));
+                    };
+                    let value = match cells.next() {
+                        Some(QueryValue::Bytes(bytes)) => bytes,
+                        None => Vec::new(),
+                        _ => {
+                            return Err(QueryExecutionError::Protocol(
+                                "scan value projection".into(),
+                            ))
+                        }
+                    };
+                    retained = retained
+                        .saturating_add(key.capacity())
+                        .saturating_add(value.capacity())
+                        .saturating_add(std::mem::size_of::<ScanMatch>());
+                    if retained > 16 * 1024 * 1024 {
+                        return Err(QueryExecutionError::BudgetExceeded(
+                            "scan result storage".into(),
+                        ));
+                    }
+                    merged.push(ScanMatch { key, value });
+                }
+            }
+            Ok(merged)
+        })
+        .await
+        .map_err(|_| QueryExecutionError::Timeout)?
+    }
+
     /// Distributed scan: apply `spec` to every fragment in the keyspace
     /// and merge the transformed matches.
     ///
@@ -280,6 +359,11 @@ impl Node {
                 "not connected to scan holder {owner}"
             )));
         };
+        if tx.capabilities & super::CAPABILITY_SCAN == 0 {
+            return Err(ScanError::Actor(format!(
+                "holder {owner} does not support scans"
+            )));
+        }
         let req_id = self
             .next_req_id
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -335,6 +419,7 @@ pub(super) async fn serve_scan_request(
     serving: Arc<StdRwLock<HashSet<FragmentId>>>,
     router: super::FragmentRouter,
     req: proto::ScanRequest,
+    retention: Arc<crate::query::QueryRetention>,
 ) {
     let fragment = FragmentId(req.fragment);
     let req_id = req.req_id;
@@ -375,7 +460,11 @@ pub(super) async fn serve_scan_request(
 
     let matches = match actor
         .call(
-            |reply| KvMessage::Scan { spec, reply },
+            |reply| KvMessage::ScanRetained {
+                spec,
+                retention,
+                reply,
+            },
             Some(SCAN_FRAGMENT_TIMEOUT),
         )
         .await
@@ -402,7 +491,7 @@ pub(super) async fn serve_scan_request(
     send_scan_response(&tx, req_id, proto_matches, String::new()).await;
 }
 
-async fn send_scan_response(
+pub(super) async fn send_scan_response(
     tx: &PeerChannel,
     req_id: u64,
     matches: Vec<proto::ScanMatchProto>,

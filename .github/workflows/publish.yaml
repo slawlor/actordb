@@ -22,7 +22,7 @@ jobs:
     name: Verify release package
     if: github.event_name != 'release' || (!github.event.release.draft && !github.event.release.prerelease)
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
     steps:
       - name: Checkout the event commit
         uses: actions/checkout@v7
@@ -46,7 +46,7 @@ jobs:
       - name: Test release guards
         env:
           PYTHONDONTWRITEBYTECODE: '1'
-        run: python3 -m unittest discover -s .github/scripts -p 'test_verify_release.py' -v
+        run: python3 -m unittest discover -s .github/scripts -p 'test_*.py' -v
 
       - name: Check the bundled license matches the workspace license
         run: cmp LICENSE actordb/LICENSE
@@ -64,15 +64,16 @@ jobs:
           fi
 
       - name: Verify the backend-free default package
-        run: cargo publish --dry-run --package actordb --registry crates-io
+        # Stage companion dependencies together before checking dependent crates.
+        run: cargo publish --dry-run --package actordb-protocol --package actordb-query --package actordb --package actordb-client --registry crates-io
 
       - name: Verify the opt-in memory test double
-        run: cargo publish --dry-run --package actordb --registry crates-io --features memory
+        run: cargo publish --dry-run --package actordb-protocol --package actordb-query --package actordb --package actordb-client --registry crates-io --features actordb/memory
 
       - name: Create the verified release artifact
         # Modern Cargo stages publish dry-runs in a temporary registry rather
         # than the normal package directory. Do not depend on internal paths.
-        run: cargo package --package actordb
+        run: cargo package --package actordb-protocol --package actordb-query --package actordb --package actordb-client
 
       # PR/main CI owns RocksDB validation. Publication only repeats the cheap
       # backend-free and memory checks; never build the native backend here.
@@ -82,20 +83,55 @@ jobs:
           cargo test --package actordb
           cargo test --package actordb --features memory
 
-      - name: Upload the verified crate for inspection
+      - name: Upload the verified crates for inspection
         uses: actions/upload-artifact@v7
         with:
-          name: actordb-${{ steps.release.outputs.version }}
-          path: target/package/actordb-${{ steps.release.outputs.version }}.crate
+          name: actordb-workspace-${{ steps.release.outputs.version }}
+          path: |
+            target/package/actordb-protocol-${{ steps.release.outputs.version }}.crate
+            target/package/actordb-query-${{ steps.release.outputs.version }}.crate
+            target/package/actordb-${{ steps.release.outputs.version }}.crate
+            target/package/actordb-client-${{ steps.release.outputs.version }}.crate
           if-no-files-found: error
 
-      - name: Publish actordb to crates.io
+      - name: Publish actordb-protocol
         if: github.event_name == 'release'
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: |
           if [ -z "$CARGO_REGISTRY_TOKEN" ]; then
-            echo 'Set the repository CARGO_REGISTRY_TOKEN secret to a crates.io token authorized to publish actordb.' >&2
+            echo 'Set CARGO_REGISTRY_TOKEN to a token authorized to publish the ActorDB library packages.' >&2
             exit 1
           fi
-          cargo publish --package actordb --registry crates-io
+          cargo publish --package actordb-protocol --registry crates-io
+
+      - name: Publish actordb-query
+        if: github.event_name == 'release'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish --package actordb-query --registry crates-io
+
+      - name: Wait for database dependencies in the registry index
+        if: github.event_name == 'release'
+        run: |
+          python3 .github/scripts/wait_for_crate_dependency.py actordb actordb-protocol
+          python3 .github/scripts/wait_for_crate_dependency.py actordb actordb-query
+
+      - name: Publish actordb
+        if: github.event_name == 'release'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish --package actordb --registry crates-io
+
+      - name: Wait for client dependencies in the registry index
+        if: github.event_name == 'release'
+        run: |
+          python3 .github/scripts/wait_for_crate_dependency.py actordb-client actordb-protocol
+          python3 .github/scripts/wait_for_crate_dependency.py actordb-client actordb-query
+          python3 .github/scripts/wait_for_crate_dependency.py actordb-client actordb
+
+      - name: Publish actordb-client
+        if: github.event_name == 'release'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish --package actordb-client --registry crates-io
