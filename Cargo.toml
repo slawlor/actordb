@@ -1,6 +1,9 @@
 [workspace]
 members = [
     "actordb",
+    "actordb-protocol",
+    "actordb-query",
+    "actordb-client",
     "docker-tests",
     "xtask"
 ]

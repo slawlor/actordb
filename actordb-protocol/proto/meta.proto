@@ -345,6 +345,8 @@ message Envelope {
     HelloAuth hello_auth = 20;
     ScanRequest scan_request = 21;
     ScanResponse scan_response = 22;
+    QueryPageRequest query_page_request = 23;
+    QueryPageResponse query_page_response = 24;
   }
 }
 
@@ -388,4 +390,57 @@ message ScanMatch {
   string key = 1;
   // Transformed value. Empty when the transform is key_only.
   bytes value = 2;
+}
+
+// Bounded declarative query traversal. Continuations pin one holder incarnation,
+// revision, and TTL observation time. SQL is validated as data, never executed code.
+message QueryPageRequest {
+  uint64 req_id = 1;
+  uint32 fragment = 2;
+  string sql = 3;
+  string after_key = 4;
+  bool continuation = 5;
+  uint64 revision = 6;
+  uint64 snapshot_time_ms = 7;
+  uint64 incarnation = 8;
+  uint32 max_rows = 9;
+  uint32 max_bytes = 10;
+  uint32 max_visits = 11;
+  bool verify_only = 12;
+}
+message QueryPageResponse {
+  uint64 req_id = 1;
+  uint32 fragment = 2;
+  repeated QueryPageRow rows = 3;
+  string next_after_key = 4;
+  bool done = 5;
+  uint64 revision = 6;
+  uint64 snapshot_time_ms = 7;
+  uint64 incarnation = 8;
+  uint32 visited = 9;
+  uint64 work_bytes = 10;
+  QueryPageStatus status = 11;
+  string error = 12;
+}
+message QueryPageRow {
+  string key = 1;
+  repeated QueryCell cells = 2;
+}
+message QueryCell {
+  oneof value {
+    bool null = 1;
+    string text = 2;
+    bytes bytes = 3;
+    // Canonical base-ten integer; preserves full i128 precision in every SDK.
+    string integer = 4;
+  }
+}
+enum QueryPageStatus {
+  QUERY_PAGE_STATUS_UNKNOWN = 0;
+  QUERY_PAGE_STATUS_OK = 1;
+  QUERY_PAGE_STATUS_CHANGED = 2;
+  QUERY_PAGE_STATUS_BACKPRESSURE = 3;
+  QUERY_PAGE_STATUS_UNAVAILABLE = 4;
+  QUERY_PAGE_STATUS_INVALID = 5;
+  QUERY_PAGE_STATUS_BUDGET = 6;
 }

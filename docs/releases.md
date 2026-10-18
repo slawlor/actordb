@@ -7,7 +7,11 @@ does not upload anything. GitHub prereleases are intentionally excluded.
 
 ## Prepare a version PR
 
-1. Bump `actordb/Cargo.toml`. Dependency requirements remain compatible semver
+1. Bump all four library manifests (`actordb`, `actordb-protocol`,
+   `actordb-query`, and `actordb-client`) together and update their version
+   requirements. The current workflow publishes all four selected packages;
+   every selected version must be new because crates.io versions are immutable.
+   Dependency requirements remain compatible semver
    ranges; this library workspace does not commit `Cargo.lock`. The internal `xtask`
    and `docker-tests` crates are not published and need not share this version.
 2. Update `CHANGELOG.md`, installation examples, and any migration/API docs.
@@ -18,14 +22,15 @@ does not upload anything. GitHub prereleases are intentionally excluded.
    ```bash
    python3 -m unittest discover -s .github/scripts -p 'test_verify_release.py' -v
    python3 .github/scripts/verify_release.py
-   cargo publish --dry-run --package actordb --registry crates-io
-   cargo publish --dry-run --package actordb --registry crates-io --features memory
-   cargo package --package actordb
+   cargo publish --dry-run --package actordb-protocol --package actordb-query --package actordb --package actordb-client --registry crates-io
+   cargo publish --dry-run --package actordb-protocol --package actordb-query --package actordb --package actordb-client --registry crates-io --features actordb/memory
+   cargo package --package actordb-protocol --package actordb-query --package actordb --package actordb-client
    ```
 
    These commands do not publish and need no registry token. Cargo verifies the
-   unpacked crate, including the bundled protobuf schema/build script, library
-   modules, README, and license. Native protobuf compilation needs a C/C++
+   unpacked libraries, including generated protocol bindings, query modules,
+   SDK, README files, and licenses. Ordinary builds use checked-in protocol
+   bindings. Regeneration with the protocol codegen feature needs a C/C++
    toolchain. RocksDB builds and tests remain in normal CI, not the publish
    workflow; that CI additionally needs working libclang.
    Inspect `cargo package --list --package actordb` when changing
@@ -34,8 +39,8 @@ does not upload anything. GitHub prereleases are intentionally excluded.
    and full-feature tests, Rust 1.88, Docker, and the `Verify release package`
    check. Merge into `main`.
 
-The package workflow uploads an `actordb-VERSION` build artifact containing the
-verified `.crate` for inspection. An explicit, verified `cargo package` produces
+The package workflow uploads an `actordb-workspace-VERSION` artifact containing
+the verified library `.crate` files for inspection. An explicit, verified `cargo package` produces
 the artifact in Cargo's normal package directory: recent Cargo versions stage
 publish dry-runs in a temporary registry instead. No internal staging path is
 assumed. The artifact is not a crates.io release.
@@ -66,7 +71,7 @@ default builds do not enable or link them.
 ## Credentials
 
 Configure the repository Actions secret `CARGO_REGISTRY_TOKEN` with a valid
-crates.io API token authorized to publish `actordb`. This repository already
+crates.io API token authorized to publish the ActorDB library packages. This repository already
 has a secret by that name; its existence does not prove that an old token is
 still valid. Prefer a narrowly scoped, expiring token and rotate it as needed.
 The workflow does not use the unrelated GitHub PAT or the old
@@ -90,8 +95,10 @@ For this version, after the version PR is merged and `main` checks are green:
    be contained in `origin/main`. An older tested ancestor is allowed; an
    unmerged branch, missing/moved tag, or version mismatch fails closed.
 4. Backend-free and memory-only package dry-runs and crate tests
-   must pass before the workflow publishes **only `actordb`** to the explicit `crates-io`
-   registry using compatible dependency resolution. Uploads are serialized and an in-flight
+   must pass before the workflow publishes the selected libraries in dependency order to the explicit
+   `crates-io` registry using compatible dependency resolution. Cargo stages
+   workspace dependencies together for validation and waits for registry
+   availability during publication. Uploads are serialized and an in-flight
    publication is never cancelled by a newer validation run.
    RocksDB builds and tests must pass in normal CI before merging; the publish
    workflow deliberately does not repeat them.

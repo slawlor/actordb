@@ -23,6 +23,8 @@ use crate::store::{KvStore, StoreCommitDurability};
 use crate::wire::check_versioned_value_budget;
 
 // Actor-owned summary clones stay bounded before wire metadata is added.
+static NEXT_QUERY_INCARNATION: AtomicU64 = AtomicU64::new(1);
+
 const SUMMARY_PAGE_TARGET_BYTES: usize = 1024 * 1024;
 const VERSIONED_PAGE_TARGET_BYTES: usize = 1024 * 1024;
 /// The fragment's shared state: one in-memory cache, one persistence
@@ -45,6 +47,7 @@ pub struct FragmentState {
     /// Advances for every winning cache mutation, including replicated
     /// writes and expiry conversion.
     revision: AtomicU64,
+    query_incarnation: u64,
     /// Buffered writes awaiting flush.
     flush: Mutex<FlushBuffer>,
     /// Allows exactly one store write at a time for this fragment. The
@@ -143,6 +146,7 @@ impl FragmentState {
             }),
             kvstore,
             revision: AtomicU64::new(0),
+            query_incarnation: NEXT_QUERY_INCARNATION.fetch_add(1, Ordering::Relaxed),
             flush: Mutex::new(FlushBuffer {
                 pending: Vec::new(),
                 in_flight: None,
@@ -396,6 +400,232 @@ impl FragmentState {
             }
         }
         out
+    }
+
+    /// Read a revision-guarded page through the background worker pool.
+    /// Cursor progression includes filtered and invisible records, so sparse
+    /// predicates cannot turn a page into an unbounded cache-lock pass.
+    pub async fn query_page(
+        &self,
+        work: &crate::query::QueryPageWork,
+    ) -> crate::proto::QueryPageResponse {
+        use crate::proto::{QueryPageRow, QueryPageStatus};
+        use crate::query::{
+            page_encoded_len, page_error, value_to_cell, MAX_QUERY_PAGE_BYTES, QUERY_PAGE_VISITS,
+            QUERY_WORK_BYTES,
+        };
+        use actordb_query::{AggregateInput, Projection, QueryAccumulator};
+        use std::ops::Bound::{Excluded, Unbounded};
+
+        let req = &work.request;
+        let plan = &work.plan;
+        if let Err(error) = plan.validate() {
+            return page_error(req, QueryPageStatus::Invalid, error.to_string());
+        }
+        let max_rows = if req.max_rows == 0 {
+            QUERY_PAGE_VISITS
+        } else {
+            req.max_rows as usize
+        };
+        let max_visits = if req.max_visits == 0 {
+            QUERY_PAGE_VISITS
+        } else {
+            req.max_visits as usize
+        };
+        let max_bytes = if req.max_bytes == 0 {
+            1024 * 1024
+        } else {
+            req.max_bytes as usize
+        };
+        if max_rows > QUERY_PAGE_VISITS
+            || max_visits > QUERY_PAGE_VISITS
+            || !(1024..=MAX_QUERY_PAGE_BYTES).contains(&max_bytes)
+        {
+            return page_error(req, QueryPageStatus::Invalid, "invalid query page limits");
+        }
+        if !req.continuation
+            && (!req.after_key.is_empty()
+                || req.revision != 0
+                || req.snapshot_time_ms != 0
+                || req.incarnation != 0
+                || req.verify_only)
+        {
+            return page_error(
+                req,
+                QueryPageStatus::Invalid,
+                "initial page contains continuation state",
+            );
+        }
+        if req.continuation && (req.snapshot_time_ms == 0 || req.incarnation == 0) {
+            return page_error(
+                req,
+                QueryPageStatus::Invalid,
+                "continuation lacks pinned identity/time",
+            );
+        }
+        let cache = self.cache.read().await;
+        let revision = self.revision.load(Ordering::Acquire);
+        if req.continuation
+            && (req.revision != revision || req.incarnation != self.query_incarnation)
+        {
+            return page_error(
+                req,
+                QueryPageStatus::Changed,
+                "fragment changed between query pages",
+            );
+        }
+        let snapshot_time_ms = if req.continuation {
+            req.snapshot_time_ms
+        } else {
+            now_ms()
+        };
+        let mut page = crate::proto::QueryPageResponse {
+            req_id: req.req_id,
+            fragment: req.fragment,
+            rows: Vec::new(),
+            next_after_key: req.after_key.clone(),
+            done: true,
+            revision,
+            snapshot_time_ms,
+            incarnation: self.query_incarnation,
+            status: QueryPageStatus::Ok as i32,
+            ..Default::default()
+        };
+        if req.verify_only || !plan.matches_fragment(req.fragment) {
+            return page;
+        }
+        let lower = if req.continuation {
+            Excluded(req.after_key.clone())
+        } else {
+            Unbounded
+        };
+        let mut keys = cache.ordered_keys.range((lower, Unbounded)).peekable();
+        let mut accumulator = QueryAccumulator::new(plan);
+        while let Some(key) = keys.peek().copied() {
+            if page.visited as usize == max_visits
+                || (!plan.is_aggregate() && page.rows.len() == max_rows)
+            {
+                page.done = false;
+                break;
+            }
+            let Some(value) = cache.values.get(key) else {
+                keys.next();
+                continue;
+            };
+            let matched =
+                !value.is_tombstone && !value.is_expired(snapshot_time_ms) && plan.matches_key(key);
+            // Charge actual projected/parsed work, not an untouched full value
+            // for COUNT or OCTET_LENGTH. A wide parsed BIGINT/projection still
+            // has a strict per-turn work cap.
+            let value_work = if matched {
+                plan.projections
+                    .iter()
+                    .map(|projection| match projection {
+                        Projection::Value => value.value.len(),
+                        Projection::PrefixBytes(n) => value.value.len().min(*n as usize),
+                        Projection::Aggregate {
+                            input: AggregateInput::BigInt,
+                            ..
+                        } => value.value.len(),
+                        _ => 0,
+                    })
+                    .sum::<usize>()
+            } else {
+                0
+            };
+            let record_work = key
+                .len()
+                .saturating_mul(2)
+                .saturating_add(value_work)
+                .saturating_add(128);
+            if record_work > QUERY_WORK_BYTES {
+                return page_error(
+                    req,
+                    QueryPageStatus::Budget,
+                    "one record exceeds query work/page bytes; use a narrower projection",
+                );
+            }
+            if page.work_bytes.saturating_add(record_work as u64) > QUERY_WORK_BYTES as u64 {
+                page.done = false;
+                break;
+            }
+            if matched && !plan.is_aggregate() {
+                let row_wire_bytes = crate::query::projected_row_wire_bytes(
+                    plan,
+                    key,
+                    value.value.len(),
+                    req.fragment,
+                );
+                let predicted = page_encoded_len(&page)
+                    .saturating_add(crate::wire::message_field_len(3, row_wire_bytes))
+                    .saturating_add(crate::wire::bytes_field_len(4, key.len()))
+                    .saturating_add(32);
+                if predicted > max_bytes {
+                    if page.visited == 0 {
+                        return page_error(
+                            req,
+                            QueryPageStatus::Budget,
+                            "projected row exceeds encoded query page budget",
+                        );
+                    }
+                    page.done = false;
+                    break;
+                }
+                let cells = match plan.project(key, &value.value, req.fragment) {
+                    Ok(values) => values.into_iter().map(value_to_cell).collect(),
+                    Err(error) => {
+                        return page_error(req, QueryPageStatus::Invalid, error.to_string())
+                    }
+                };
+                page.rows.push(QueryPageRow {
+                    key: key.clone(),
+                    cells,
+                });
+                let old_cursor = std::mem::replace(&mut page.next_after_key, key.clone());
+                if page_encoded_len(&page).saturating_add(32) > max_bytes {
+                    page.rows.pop();
+                    page.next_after_key = old_cursor;
+                    if page.visited == 0 {
+                        return page_error(
+                            req,
+                            QueryPageStatus::Budget,
+                            "projected row exceeds encoded query page budget",
+                        );
+                    }
+                    page.done = false;
+                    break;
+                }
+            } else {
+                page.next_after_key = key.clone();
+                if matched {
+                    if let Err(error) = accumulator.push(key, &value.value, req.fragment) {
+                        return page_error(req, QueryPageStatus::Invalid, error.to_string());
+                    }
+                }
+            }
+            page.visited += 1;
+            page.work_bytes += record_work as u64;
+            keys.next();
+        }
+        if plan.is_aggregate() {
+            let result = accumulator.finish();
+            page.rows = result
+                .rows
+                .into_iter()
+                .map(|row| QueryPageRow {
+                    key: String::new(),
+                    cells: row.into_iter().map(value_to_cell).collect(),
+                })
+                .collect();
+        }
+        if page_encoded_len(&page) > max_bytes {
+            return page_error(
+                req,
+                QueryPageStatus::Budget,
+                "query page cursor/result exceeds encoded budget",
+            );
+        }
+        page
     }
 
     /// Read the full cache, including tombstones. Expired live values are
@@ -1959,5 +2189,196 @@ mod tests {
         assert_eq!(second.next_index, keys.len());
         assert_eq!(second.entries.len(), 1);
         assert_eq!(second.entries[0].0, "b");
+    }
+}
+
+#[cfg(test)]
+mod query_page_tests {
+    use super::*;
+    use crate::proto::{QueryPageRequest, QueryPageStatus};
+    use crate::query::QueryPageWork;
+
+    fn query_state(keys: impl IntoIterator<Item = String>) -> FragmentState {
+        FragmentState::new(
+            keys.into_iter()
+                .map(|key| (key, VersionedValue::new(b"123".to_vec(), 1, "n".into())))
+                .collect(),
+            None,
+            1000,
+            Duration::from_secs(60),
+        )
+    }
+    fn work(sql: &str, visits: u32) -> QueryPageWork {
+        QueryPageWork::new(
+            Arc::new(actordb_query::parse(sql).unwrap()),
+            QueryPageRequest {
+                req_id: 7,
+                max_visits: visits,
+                max_rows: 256,
+                max_bytes: 1024 * 1024,
+                ..Default::default()
+            },
+        )
+    }
+    fn resume(work: &mut QueryPageWork, page: &crate::proto::QueryPageResponse) {
+        work.request.continuation = true;
+        work.request.after_key = page.next_after_key.clone();
+        work.request.revision = page.revision;
+        work.request.snapshot_time_ms = page.snapshot_time_ms;
+        work.request.incarnation = page.incarnation;
+    }
+
+    #[tokio::test]
+    async fn cancelled_query_waiter_retains_actor_admission_until_page_finishes() {
+        use crate::actor::{KvMessage, KvWorker, KvWorkerArgs};
+        use ractor::Actor;
+        let state = Arc::new(query_state(["a".into()]));
+        let admission = crate::query::QueryAdmission::new();
+        let retention = admission.reserve(1024).unwrap();
+        let weak = Arc::downgrade(&retention);
+        let (worker, handle) = Actor::spawn(
+            None,
+            KvWorker,
+            KvWorkerArgs {
+                shared: state.clone(),
+                pending: None,
+            },
+        )
+        .await
+        .unwrap();
+        let cache = state.cache.write().await;
+        let (reply, response) = tokio::sync::oneshot::channel();
+        let mut work = work("SELECT key FROM kv", 1);
+        work.retention = Some(retention);
+        worker
+            .cast(KvMessage::QueryPage {
+                work,
+                reply: reply.into(),
+            })
+            .unwrap();
+        // Let the actor enter the read-lock wait, then cancel only its caller.
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        drop(response);
+        assert!(weak.upgrade().is_some());
+        drop(cache);
+        crate::common_test::periodic_check(|| weak.upgrade().is_none(), Duration::from_secs(2))
+            .await;
+        assert!(weak.upgrade().is_none());
+        worker.stop(None);
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn sparse_query_pages_advance_through_nonmatches() {
+        let state = query_state((0..600).map(|n| format!("a{n:04}")).chain(["z-hit".into()]));
+        let mut work = work("SELECT key FROM kv WHERE STARTS_WITH(key, 'z')", 256);
+        let first = state.query_page(&work).await;
+        assert_eq!(first.status, QueryPageStatus::Ok as i32);
+        assert_eq!(first.visited, 256);
+        assert!(!first.done);
+        assert!(first.rows.is_empty());
+        resume(&mut work, &first);
+        let second = state.query_page(&work).await;
+        assert_eq!(second.visited, 256);
+        assert!(second.next_after_key > first.next_after_key);
+        assert!(!second.done);
+        resume(&mut work, &second);
+        let third = state.query_page(&work).await;
+        assert!(third.done);
+        assert_eq!(third.visited, 89);
+        assert_eq!(third.rows.len(), 1);
+        assert_eq!(third.rows[0].key, "z-hit");
+    }
+
+    #[tokio::test]
+    async fn query_continuation_rejects_mutations_and_new_incarnations() {
+        let state = query_state(["a".into(), "b".into()]);
+        let mut work = work("SELECT key FROM kv", 1);
+        let first = state.query_page(&work).await;
+        resume(&mut work, &first);
+        let replacement = query_state(["a".into(), "b".into()]);
+        assert_eq!(
+            replacement.query_page(&work).await.status,
+            QueryPageStatus::Changed as i32
+        );
+        state
+            .apply(&ReplicatedOp {
+                key: "b".into(),
+                value: VersionedValue::new(b"456".to_vec(), 2, "n".into()),
+                seq: 1,
+                boot_id: 1,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            state.query_page(&work).await.status,
+            QueryPageStatus::Changed as i32
+        );
+    }
+
+    #[tokio::test]
+    async fn query_pages_reject_oversized_rows_but_count_wide_values() {
+        let state = FragmentState::new(
+            HashMap::from([(
+                "wide".into(),
+                VersionedValue::new(vec![1; 2 * 1024 * 1024], 1, "n".into()),
+            )]),
+            None,
+            1000,
+            Duration::from_secs(60),
+        );
+        let projected = state
+            .query_page(&work("SELECT key, value FROM kv", 256))
+            .await;
+        assert_eq!(projected.status, QueryPageStatus::Budget as i32);
+        assert!(projected.rows.is_empty());
+        let count = state
+            .query_page(&work(
+                "SELECT COUNT(*), SUM(OCTET_LENGTH(value)) FROM kv",
+                256,
+            ))
+            .await;
+        assert_eq!(count.status, QueryPageStatus::Ok as i32);
+        assert!(count.done);
+        assert_eq!(
+            count.rows[0]
+                .cells
+                .iter()
+                .cloned()
+                .map(crate::query::cell_to_value)
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap(),
+            vec![
+                actordb_query::QueryValue::Integer(1),
+                actordb_query::QueryValue::Integer(2 * 1024 * 1024)
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn query_page_bytes_stop_before_cloning_a_wide_projection() {
+        let state = FragmentState::new(
+            HashMap::from([
+                ("a".into(), VersionedValue::new(vec![1; 32], 1, "n".into())),
+                (
+                    "b".into(),
+                    VersionedValue::new(vec![2; 2048], 1, "n".into()),
+                ),
+            ]),
+            None,
+            1000,
+            Duration::from_secs(60),
+        );
+        let mut work = work("SELECT key, value FROM kv", 256);
+        work.request.max_bytes = 1024;
+        let page = state.query_page(&work).await;
+        assert_eq!(page.status, QueryPageStatus::Ok as i32);
+        assert_eq!(page.visited, 1);
+        assert!(!page.done);
+        assert_eq!(page.rows[0].key, "a");
+        resume(&mut work, &page);
+        let oversized = state.query_page(&work).await;
+        assert_eq!(oversized.status, QueryPageStatus::Budget as i32);
+        assert!(oversized.rows.is_empty());
     }
 }

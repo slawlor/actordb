@@ -138,6 +138,24 @@ pub(super) async fn handle_worker_message(
             let _ = reply.send(Ok(shared.scan(&spec).await));
             Ok(())
         }
+        KvMessage::ScanRetained {
+            spec,
+            retention,
+            reply,
+        } => {
+            let _retention = retention;
+            if !reply.is_closed() {
+                let _ = reply.send(Ok(shared.scan(&spec).await));
+            }
+            Ok(())
+        }
+        KvMessage::QueryPage { work, reply } => {
+            if !reply.is_closed() {
+                let _retention = &work.retention;
+                let _ = reply.send(shared.query_page(&work).await);
+            }
+            Ok(())
+        }
         KvMessage::GetBatch {
             keys,
             response_base_payload_len,

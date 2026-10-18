@@ -11,12 +11,7 @@ repository = "https://github.com/slawlor/actordb"
 readme = "../README.md"
 homepage = "https://github.com/slawlor/actordb"
 categories = ["asynchronous", "concurrency", "database-implementations"]
-build = "src/build.rs"
 rust-version = "1.88"
-
-[build-dependencies]
-protobuf-src = "1.1.0"
-prost-build = { version = "0.14" }
 
 [features]
 default = []
@@ -28,6 +23,8 @@ memory = []
 rocksdb = ["dep:rocksdb"]
 
 [dependencies]
+actordb-protocol = { version = "0.3", path = "../actordb-protocol" }
+actordb-query = { version = "0.3", path = "../actordb-query" }
 # Required dependencies
 bon = { version = "3.10.2" }
 bytes = { version = "1" }

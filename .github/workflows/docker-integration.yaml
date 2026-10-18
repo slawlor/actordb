@@ -5,6 +5,8 @@ on:
       - main
     paths:
       - 'actordb/**'
+      - 'actordb-protocol/**'
+      - 'actordb-query/**'
       - 'docker-tests/**'
       - 'docker/**'
       - 'docker-compose.yml'
@@ -14,6 +16,8 @@ on:
     types: [opened, reopened, synchronize]
     paths:
       - 'actordb/**'
+      - 'actordb-protocol/**'
+      - 'actordb-query/**'
       - 'docker-tests/**'
       - 'docker/**'
       - 'docker-compose.yml'

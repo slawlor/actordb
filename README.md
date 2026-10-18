@@ -28,9 +28,10 @@ actordb = { version = "0.3", features = ["rocksdb"] }
 ```
 
 The separate `memory` feature exposes the no-op `MemoryStore` test double; it
-is not persistent storage. Neither backend feature enables the other. All
-configurations build protobuf from source; only opting into RocksDB requires
-its native library and libclang bindings. `default-features = false` is not
+is not persistent storage. Neither backend feature enables the other. Protocol
+messages ship as generated Rust in `actordb-protocol`; ordinary builds do not
+compile protobuf tooling. RocksDB requires its native library and libclang
+bindings. `default-features = false` is not
 necessary to avoid RocksDB: the default feature set is empty.
 
 This remains pre-1.0 software. The `0.2` and `0.3` releases include API,
@@ -121,6 +122,10 @@ Comprehensive guides live in [`docs/`](docs/):
 - [Multi-key batching](docs/batching.md) — fan-out, failover, partial failures
 - [Scanning](docs/scanning.md) — single-shard filter + transform scans,
   spec semantics, scheduling, and cost model
+- [SQL queries](docs/query.md) — fragment filters, global pagination,
+  byte projections, and exact aggregates over the virtual `kv` table
+- [Rust client](actordb-client/README.md) — remote application connections,
+  operation coverage, credentials, and mutation retry semantics
 - [Traffic classes & backpressure](docs/backpressure.md) — `OpPriority`,
   pool config, shed behavior and observability
 - [Configuration reference](docs/configuration.md) — every `NodeConfig`

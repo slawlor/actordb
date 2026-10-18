@@ -284,6 +284,42 @@ impl Actor for KvActor {
                 reservation.send(KvMessage::Scan { spec, reply });
                 Ok(())
             }
+            KvMessage::ScanRetained {
+                spec,
+                retention,
+                reply,
+            } => {
+                if reply.is_closed() {
+                    return Ok(());
+                }
+                let Some(reservation) = state.background_pool.try_reserve_round_robin().await
+                else {
+                    let _ = reply.send(Err("shed: pool at queue cap or rate limit".into()));
+                    return Ok(());
+                };
+                reservation.send(KvMessage::ScanRetained {
+                    spec,
+                    retention,
+                    reply,
+                });
+                Ok(())
+            }
+            KvMessage::QueryPage { work, reply } => {
+                if reply.is_closed() {
+                    return Ok(());
+                }
+                let Some(reservation) = state.background_pool.try_reserve_round_robin().await
+                else {
+                    let _ = reply.send(crate::query::page_error(
+                        &work.request,
+                        crate::proto::QueryPageStatus::Backpressure,
+                        "background pool at queue cap or rate limit",
+                    ));
+                    return Ok(());
+                };
+                reservation.send(KvMessage::QueryPage { work, reply });
+                Ok(())
+            }
             KvMessage::GetBatch {
                 keys,
                 response_base_payload_len,

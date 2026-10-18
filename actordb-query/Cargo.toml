@@ -1,0 +1,12 @@
+[package]
+name = "actordb-query"
+version = "0.3.0"
+edition = "2021"
+rust-version = "1.88"
+authors = ["Sean Lawlor"]
+description = "Portable bounded query plans and SQL syntax for actordb"
+license = "MIT"
+repository = "https://github.com/slawlor/actordb"
+readme = "README.md"
+
+[dependencies]
