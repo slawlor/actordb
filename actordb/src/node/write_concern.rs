@@ -155,6 +155,7 @@ impl Node {
         }
         let expected_key = op.key.clone();
         let mut tried = Vec::with_capacity(replicas.len());
+        let mut ambiguous_attempt = false;
         for owner in replicas {
             tried.push(owner.clone());
             let Some(tx) = self.peer_sender(&owner).await else {
@@ -211,20 +212,29 @@ impl Node {
             }
             let response = tokio::time::timeout_at(attempt_deadline, resp_rx).await;
             let Ok(Ok(mut results)) = response else {
+                ambiguous_attempt = true;
                 continue;
             };
             if validate_mutation_results(std::slice::from_ref(&expected_key), &results).is_err() {
+                ambiguous_attempt = true;
                 continue;
             }
             let result = results.remove(0);
             if MutationStatus::try_from(result.status) == Ok(MutationStatus::Unavailable) {
+                ambiguous_attempt = true;
                 continue;
             }
             if let Some(options) = options {
                 if let Some(bytes) = result.write_concern.as_deref() {
-                    return decode_forwarded_concern(&result, bytes, options).map(Some);
+                    return resolve_concern_attempt(
+                        decode_forwarded_concern(&result, bytes, options),
+                        ambiguous_attempt,
+                    )
+                    .map(Some);
                 }
-                decode_mutation_result(result)?;
+                if let Err(error) = decode_mutation_result(result) {
+                    return resolve_concern_attempt(Err(error.into()), ambiguous_attempt).map(Some);
+                }
                 return Err(WriteConcernError::UnknownOutcome(
                     "mutation reply omitted write concern acknowledgement".into(),
                 ));
@@ -232,11 +242,37 @@ impl Node {
             decode_mutation_result(result)?;
             return Ok(None);
         }
+        if options.is_some() && ambiguous_attempt {
+            return Err(WriteConcernError::UnknownOutcome(format!(
+                "forwarded mutation may have applied; no conclusive reply for fragment {frag} (tried {})",
+                tried.join(",")
+            )));
+        }
         Err(NodeError::Network(format!(
             "no replica acknowledged mutation for fragment {frag} (tried {})",
             tried.join(",")
         ))
         .into())
+    }
+}
+
+fn resolve_concern_attempt(
+    outcome: Result<WriteConcernReceipt, WriteConcernError>,
+    ambiguous_attempt: bool,
+) -> Result<WriteConcernReceipt, WriteConcernError> {
+    match outcome {
+        Err(error)
+            if ambiguous_attempt
+                && !matches!(
+                    error,
+                    WriteConcernError::TimedOut(_) | WriteConcernError::UnknownOutcome(_)
+                ) =>
+        {
+            Err(WriteConcernError::UnknownOutcome(format!(
+                "an earlier forwarded mutation may have applied; latest attempt returned: {error}"
+            )))
+        }
+        outcome => outcome,
     }
 }
 

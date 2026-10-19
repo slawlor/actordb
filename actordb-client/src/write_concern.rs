@@ -33,7 +33,10 @@ impl fmt::Display for WriteConcernClientError {
 impl std::error::Error for WriteConcernClientError {}
 impl From<ClientError> for WriteConcernClientError {
     fn from(e: ClientError) -> Self {
-        Self::Operation(e)
+        match e {
+            ClientError::UnknownOutcome(message) => Self::UnknownOutcome(message),
+            error => Self::Operation(error),
+        }
     }
 }
 impl From<WriteConcernPolicyError> for WriteConcernClientError {
