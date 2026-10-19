@@ -39,9 +39,15 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          # Unpacked package builds do not unify the workspace's dev features.
-          # Keep their native artifacts separate from immutable test caches.
+          # Cache downloads and ordinary release tests.
           shared-key: stable-release-package
+
+      - name: Allocate a fresh package build directory
+        # Unpublished crates can change while keeping the same version. A fresh
+        # target directory isolates Cargo's staged registry and compiled crates.
+        run: |
+          package_target_dir=$(mktemp -d "$RUNNER_TEMP/actordb-package.XXXXXX")
+          echo "ACTORDB_PACKAGE_TARGET=$package_target_dir" >> "$GITHUB_ENV"
 
       - name: Test release guards
         env:
@@ -65,15 +71,15 @@ jobs:
 
       - name: Verify the backend-free default package
         # Stage companion dependencies together before checking dependent crates.
-        run: cargo publish --dry-run --package actordb-protocol --package actordb-query --package actordb --package actordb-client --registry crates-io
+        run: cargo publish --dry-run --package actordb-protocol --package actordb-query --package actordb --package actordb-client --registry crates-io --target-dir "$ACTORDB_PACKAGE_TARGET"
 
       - name: Verify the opt-in memory test double
-        run: cargo publish --dry-run --package actordb-protocol --package actordb-query --package actordb --package actordb-client --registry crates-io --features actordb/memory
+        run: cargo publish --dry-run --package actordb-protocol --package actordb-query --package actordb --package actordb-client --registry crates-io --features actordb/memory --target-dir "$ACTORDB_PACKAGE_TARGET"
 
       - name: Create the verified release artifact
         # Modern Cargo stages publish dry-runs in a temporary registry rather
         # than the normal package directory. Do not depend on internal paths.
-        run: cargo package --package actordb-protocol --package actordb-query --package actordb --package actordb-client
+        run: cargo package --package actordb-protocol --package actordb-query --package actordb --package actordb --package actordb-client --target-dir "$ACTORDB_PACKAGE_TARGET"
 
       # PR/main CI owns RocksDB validation. Publication only repeats the cheap
       # backend-free and memory checks; never build the native backend here.
@@ -88,10 +94,10 @@ jobs:
         with:
           name: actordb-workspace-${{ steps.release.outputs.version }}
           path: |
-            target/package/actordb-protocol-${{ steps.release.outputs.version }}.crate
-            target/package/actordb-query-${{ steps.release.outputs.version }}.crate
-            target/package/actordb-${{ steps.release.outputs.version }}.crate
-            target/package/actordb-client-${{ steps.release.outputs.version }}.crate
+            ${{ env.ACTORDB_PACKAGE_TARGET }}/package/actordb-protocol-${{ steps.release.outputs.version }}.crate
+            ${{ env.ACTORDB_PACKAGE_TARGET }}/package/actordb-query-${{ steps.release.outputs.version }}.crate
+            ${{ env.ACTORDB_PACKAGE_TARGET }}/package/actordb-${{ steps.release.outputs.version }}.crate
+            ${{ env.ACTORDB_PACKAGE_TARGET }}/package/actordb-client-${{ steps.release.outputs.version }}.crate
           if-no-files-found: error
 
       - name: Publish actordb-protocol

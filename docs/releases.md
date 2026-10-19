@@ -26,9 +26,10 @@ does not upload anything. GitHub prereleases are intentionally excluded.
    ```bash
    python3 -m unittest discover -s .github/scripts -p 'test_*.py' -v
    python3 .github/scripts/verify_release.py
-   cargo publish --dry-run --package actordb-protocol --package actordb-query --package actordb --package actordb-client --registry crates-io
-   cargo publish --dry-run --package actordb-protocol --package actordb-query --package actordb --package actordb-client --registry crates-io --features actordb/memory
-   cargo package --package actordb-protocol --package actordb-query --package actordb --package actordb-client
+   package_target_dir=$(mktemp -d)
+   cargo publish --dry-run --package actordb-protocol --package actordb-query --package actordb --package actordb-client --registry crates-io --target-dir "$package_target_dir"
+   cargo publish --dry-run --package actordb-protocol --package actordb-query --package actordb --package actordb-client --registry crates-io --features actordb/memory --target-dir "$package_target_dir"
+   cargo package --package actordb-protocol --package actordb-query --package actordb --package actordb-client --target-dir "$package_target_dir"
    ```
 
    These commands do not publish and need no registry token. Cargo verifies the
@@ -45,7 +46,7 @@ does not upload anything. GitHub prereleases are intentionally excluded.
 
 The package workflow uploads an `actordb-workspace-VERSION` artifact containing
 the verified library `.crate` files for inspection. An explicit, verified `cargo package` produces
-the artifact in Cargo's normal package directory: recent Cargo versions stage
+the artifact under `$package_target_dir/package`: recent Cargo versions stage
 publish dry-runs in a temporary registry instead. No internal staging path is
 assumed. The artifact is not a crates.io release.
 
@@ -62,15 +63,19 @@ The workspace resolver configuration is not shipped as a downstream Cargo
 policy. Consumers choose their own resolver and lockfile behavior; the crate's
 declared Rust minimum and semver dependency requirements remain its contract.
 
-Package verification uses a separate `stable-release-package` dependency cache:
-an unpacked crate does not unify the workspace's dev/test features, so its
-native dependency artifacts can differ from workspace CI. The first compatible
-package cache is cold; later reuse depends on toolchain, dependency, and cache
-availability. Backend-free and memory-only package configurations run; native
-RocksDB validation is handled by normal CI. No fixed build speed is promised.
-The normal artifact and actual publish use the empty default
-feature set. The archived source contains optional backends, but downstream
-default builds do not enable or link them.
+Package verification uses a fresh target directory for each run. Cargo treats
+registry crate versions as immutable, including dependencies staged by package
+verification. Reusing a staged registry or compiled dependency from an earlier
+PR with the same unpublished version can select stale source or compiled APIs.
+A fresh package target directory avoids that state while allowing all checks
+within one run to share their build artifacts. Keep it until inspecting or
+archiving the verified crates, then remove it.
+
+CI caches dependency downloads and ordinary release tests under
+`stable-release-package`. Package checks compile in the fresh directory;
+backend-free and memory-only verification run without native RocksDB builds.
+Native validation remains in normal CI. The uploaded `.crate` files contain
+optional backends, while downstream default builds enable neither backend.
 
 ## Credentials
 
