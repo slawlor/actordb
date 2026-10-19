@@ -204,7 +204,8 @@ impl Node {
                     write_concern: policy.clone(),
                 })),
             };
-            check_envelope_budget(&envelope, MAX_FRAME_BYTES).map_err(|e| NodeError::Codec(e.to_string()))?;
+            check_envelope_budget(&envelope, MAX_FRAME_BYTES)
+                .map_err(|e| NodeError::Codec(e.to_string()))?;
             if !try_send_envelope_until(&tx, envelope, attempt_deadline).await {
                 continue;
             }
