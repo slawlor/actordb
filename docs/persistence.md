@@ -10,7 +10,7 @@ feature to use the offered durable backend:
 
 ```toml
 [dependencies]
-actordb = { version = "0.5", features = ["rocksdb"] }
+actordb = { version = "0.6", features = ["rocksdb"] }
 ```
 
 The independent `memory` feature exposes only the no-op `MemoryStore` test

@@ -5,6 +5,11 @@ application connections. Plain TCP remains the default. TLS libraries are only
 development dependencies for the example and tests; applications choose their
 own TLS library, certificates, trust roots, and validation policy.
 
+The application extension points are available in `0.6.0`. Update the database,
+protocol, query, and SDK dependency requirements to the `0.6` series together.
+This release preserves the peer/application wire versions and stored record
+format; the version change covers the public Rust crate release.
+
 ## Peer mesh
 
 Implement `actordb::network::Network` and `Acceptor`, then configure

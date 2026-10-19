@@ -12,11 +12,11 @@ A Rust actor-based distributed database with pluggable, opt-in storage
 
 ## Crate installation
 
-The `0.5` release series requires Rust 1.88+:
+The `0.6` release series requires Rust 1.88+:
 
 ```toml
 [dependencies]
-actordb = "0.5.0"
+actordb = "0.6.0"
 ```
 
 [Write concern](docs/write-concern.md) adds per-write acknowledgement counts
@@ -29,7 +29,7 @@ The default crate includes no concrete storage backend. Its actor cache and
 unless you supply a custom store. RocksDB is an independent opt-in:
 
 ```toml
-actordb = { version = "0.5.0", features = ["rocksdb"] }
+actordb = { version = "0.6.0", features = ["rocksdb"] }
 ```
 
 The separate `memory` feature exposes the no-op `MemoryStore` test double; it
