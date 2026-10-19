@@ -222,7 +222,7 @@ impl Node {
             }
             if let Some(options) = options {
                 if let Some(bytes) = result.write_concern.as_deref() {
-                    return decode_outcome(bytes, options).map(Some);
+                    return decode_forwarded_concern(&result, bytes, options).map(Some);
                 }
                 decode_mutation_result(result)?;
                 return Err(WriteConcernError::UnknownOutcome(
@@ -237,5 +237,83 @@ impl Node {
             tried.join(",")
         ))
         .into())
+    }
+}
+
+fn decode_forwarded_concern(
+    result: &MutationResult,
+    bytes: &[u8],
+    options: &WriteConcernOptions,
+) -> Result<WriteConcernReceipt, WriteConcernError> {
+    let outcome = decode_outcome(bytes, options);
+    if (outcome.is_ok() || matches!(outcome, Err(WriteConcernError::TimedOut(_))))
+        && !matches!(
+            MutationStatus::try_from(result.status),
+            Ok(MutationStatus::Applied | MutationStatus::AlreadyPresent)
+        )
+    {
+        return Err(WriteConcernError::UnknownOutcome(
+            "write concern progress conflicts with mutation status".into(),
+        ));
+    }
+    outcome
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::write_concern::WriteConcernOutcome;
+
+    #[test]
+    fn forwarded_receipt_requires_local_application_status() {
+        let options = WriteConcernOptions::builder()
+            .concern(crate::write_concern::WriteConcern::Count(2))
+            .build();
+        let receipt =
+            WriteConcernReceipt::new("owner".into(), 3, 2, 2, vec!["owner".into(), "peer".into()])
+                .unwrap();
+        let partial =
+            WriteConcernReceipt::new("owner".into(), 3, 2, 2, vec!["owner".into()]).unwrap();
+        for concern in [
+            WriteConcernOutcome::Satisfied(receipt),
+            WriteConcernOutcome::TimedOut(partial),
+        ] {
+            let bytes = concern.encode();
+            for status in [
+                MutationStatus::Applied,
+                MutationStatus::AlreadyPresent,
+                MutationStatus::Expired,
+                MutationStatus::Superseded,
+                MutationStatus::StorageError,
+                MutationStatus::ActorError,
+                MutationStatus::Backpressure,
+            ] {
+                let mut result = MutationResult {
+                    key: "key".into(),
+                    status: status as i32,
+                    write_concern: Some(bytes.clone()),
+                    ..Default::default()
+                };
+                if status == MutationStatus::Superseded {
+                    result.winner_node_id = "winner".into();
+                }
+                validate_mutation_results(&["key".into()], std::slice::from_ref(&result)).unwrap();
+                let decoded = decode_forwarded_concern(&result, &bytes, &options);
+                if matches!(
+                    status,
+                    MutationStatus::Applied | MutationStatus::AlreadyPresent
+                ) {
+                    match concern {
+                        WriteConcernOutcome::Satisfied(_) => assert!(decoded.is_ok()),
+                        WriteConcernOutcome::TimedOut(_) => {
+                            assert!(matches!(decoded, Err(WriteConcernError::TimedOut(_))));
+                        }
+                        _ => unreachable!(),
+                    }
+                } else {
+                    assert!(matches!(decoded, Err(WriteConcernError::UnknownOutcome(_))));
+                }
+            }
+        }
     }
 }

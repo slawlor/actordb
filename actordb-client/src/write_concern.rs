@@ -121,42 +121,128 @@ impl Client {
             ));
         }
         let result = response.mutations.remove(0);
-        let Some(bytes) = result.write_concern.as_deref() else {
-            if let Some(error) = result.error {
-                return Err(server_error(error).into());
+        decode_concern_result(result, &options)
+    }
+}
+
+fn decode_concern_result(
+    result: wire::MutationResult,
+    options: &WriteConcernOptions,
+) -> Result<WriteConcernReceipt, WriteConcernClientError> {
+    let Some(bytes) = result.write_concern.as_deref() else {
+        if let Some(error) = result.error {
+            return Err(server_error(error).into());
+        }
+        return Err(WriteConcernClientError::UnknownOutcome(
+            "server omitted write concern receipt".into(),
+        ));
+    };
+    match WriteConcernOutcome::decode(bytes).map_err(|e| {
+        WriteConcernClientError::UnknownOutcome(format!("invalid concern reply: {e}"))
+    })? {
+        WriteConcernOutcome::Satisfied(receipt) => {
+            if result.error.is_some() {
+                return Err(WriteConcernClientError::UnknownOutcome(
+                    "success receipt conflicts with mutation error".into(),
+                ));
             }
-            return Err(WriteConcernClientError::UnknownOutcome(
-                "server omitted write concern receipt".into(),
+            let expected = options
+                .concern()
+                .required_acknowledgements(receipt.replica_count().unwrap_or(0) as usize)?;
+            if receipt.requested_acknowledgements() != expected {
+                return Err(WriteConcernClientError::UnknownOutcome(
+                    "server changed requested acknowledgement count".into(),
+                ));
+            }
+            Ok(receipt)
+        }
+        WriteConcernOutcome::TimedOut(receipt) => {
+            if result
+                .error
+                .as_ref()
+                .is_some_and(|error| error.code != wire::ErrorCode::UnknownOutcome as i32)
+            {
+                return Err(WriteConcernClientError::UnknownOutcome(
+                    "timeout receipt conflicts with mutation error".into(),
+                ));
+            }
+            Err(WriteConcernClientError::TimedOut(receipt))
+        }
+        WriteConcernOutcome::InvalidPolicy(e) => Err(WriteConcernClientError::InvalidPolicy(e)),
+        WriteConcernOutcome::Unsupported(e) => Err(WriteConcernClientError::Unsupported(e)),
+        WriteConcernOutcome::Backpressure => Err(WriteConcernClientError::Backpressure),
+        _ => Err(WriteConcernClientError::UnknownOutcome(
+            "unsupported concern reply".into(),
+        )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn client_progress_receipts_reject_contradictory_mutation_errors() {
+        let options = WriteConcernOptions::builder()
+            .concern(WriteConcern::Count(2))
+            .build();
+        let complete =
+            WriteConcernReceipt::new("owner".into(), 3, 2, 2, vec!["owner".into(), "peer".into()])
+                .unwrap();
+        let partial =
+            WriteConcernReceipt::new("owner".into(), 3, 2, 2, vec!["owner".into()]).unwrap();
+        for (outcome, code) in [
+            (
+                WriteConcernOutcome::Satisfied(complete.clone()),
+                wire::ErrorCode::Storage,
+            ),
+            (
+                WriteConcernOutcome::TimedOut(partial.clone()),
+                wire::ErrorCode::Storage,
+            ),
+            (
+                WriteConcernOutcome::TimedOut(partial.clone()),
+                wire::ErrorCode::Backpressure,
+            ),
+        ] {
+            let result = wire::MutationResult {
+                key: "key".into(),
+                error: Some(wire::Error {
+                    code: code as i32,
+                    message: "rejected".into(),
+                    ..Default::default()
+                }),
+                write_concern: Some(outcome.encode()),
+            };
+            assert!(matches!(
+                decode_concern_result(result, &options),
+                Err(WriteConcernClientError::UnknownOutcome(_))
             ));
-        };
-        match WriteConcernOutcome::decode(bytes).map_err(|e| {
-            WriteConcernClientError::UnknownOutcome(format!("invalid concern reply: {e}"))
-        })? {
-            WriteConcernOutcome::Satisfied(receipt) => {
-                if result.error.is_some() {
-                    return Err(WriteConcernClientError::UnknownOutcome(
-                        "success receipt conflicts with mutation error".into(),
-                    ));
-                }
-                let expected = options
-                    .concern()
-                    .required_acknowledgements(receipt.replica_count().unwrap_or(0) as usize)?;
-                if receipt.requested_acknowledgements() != expected {
-                    return Err(WriteConcernClientError::UnknownOutcome(
-                        "server changed requested acknowledgement count".into(),
-                    ));
-                }
-                Ok(receipt)
+        }
+        for (outcome, error) in [
+            (WriteConcernOutcome::Satisfied(complete), None),
+            (WriteConcernOutcome::TimedOut(partial.clone()), None),
+            (
+                WriteConcernOutcome::TimedOut(partial),
+                Some(wire::Error {
+                    code: wire::ErrorCode::UnknownOutcome as i32,
+                    message: "timed out".into(),
+                    ..Default::default()
+                }),
+            ),
+        ] {
+            let is_success = matches!(outcome, WriteConcernOutcome::Satisfied(_));
+            let result = wire::MutationResult {
+                key: "key".into(),
+                error,
+                write_concern: Some(outcome.encode()),
+            };
+            let decoded = decode_concern_result(result, &options);
+            if is_success {
+                assert!(decoded.is_ok());
+            } else {
+                assert!(matches!(decoded, Err(WriteConcernClientError::TimedOut(_))));
             }
-            WriteConcernOutcome::TimedOut(receipt) => {
-                Err(WriteConcernClientError::TimedOut(receipt))
-            }
-            WriteConcernOutcome::InvalidPolicy(e) => Err(WriteConcernClientError::InvalidPolicy(e)),
-            WriteConcernOutcome::Unsupported(e) => Err(WriteConcernClientError::Unsupported(e)),
-            WriteConcernOutcome::Backpressure => Err(WriteConcernClientError::Backpressure),
-            _ => Err(WriteConcernClientError::UnknownOutcome(
-                "unsupported concern reply".into(),
-            )),
         }
     }
 }
