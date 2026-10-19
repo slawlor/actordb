@@ -14,6 +14,10 @@ does not upload anything. GitHub prereleases are intentionally excluded.
    Dependency requirements remain compatible semver
    ranges; this library workspace does not commit `Cargo.lock`. The internal `xtask`
    and `docker-tests` crates are not published and need not share this version.
+   Feature PRs included in the same unpublished release share that release
+   version. Keep their release notes under one changelog entry; separate PRs
+   do not require separate version bumps. Bump the version again after publishing
+   the preceding release.
 2. Update `CHANGELOG.md`, installation examples, and any migration/API docs.
    Pre-1.0 breaking changes use a new minor version; do not promise production
    readiness or compatibility that the implementation does not enforce.
@@ -22,9 +26,10 @@ does not upload anything. GitHub prereleases are intentionally excluded.
    ```bash
    python3 -m unittest discover -s .github/scripts -p 'test_*.py' -v
    python3 .github/scripts/verify_release.py
-   cargo publish --dry-run --package actordb-protocol --package actordb-query --package actordb --package actordb-client --registry crates-io
-   cargo publish --dry-run --package actordb-protocol --package actordb-query --package actordb --package actordb-client --registry crates-io --features actordb/memory
-   cargo package --package actordb-protocol --package actordb-query --package actordb --package actordb-client
+   package_target_dir=$(mktemp -d)
+   cargo publish --dry-run --package actordb-protocol --package actordb-query --package actordb --package actordb-client --registry crates-io --target-dir "$package_target_dir"
+   cargo publish --dry-run --package actordb-protocol --package actordb-query --package actordb --package actordb-client --registry crates-io --features actordb/memory --target-dir "$package_target_dir"
+   cargo package --package actordb-protocol --package actordb-query --package actordb --package actordb-client --target-dir "$package_target_dir"
    ```
 
    These commands do not publish and need no registry token. Cargo verifies the
@@ -41,7 +46,7 @@ does not upload anything. GitHub prereleases are intentionally excluded.
 
 The package workflow uploads an `actordb-workspace-VERSION` artifact containing
 the verified library `.crate` files for inspection. An explicit, verified `cargo package` produces
-the artifact in Cargo's normal package directory: recent Cargo versions stage
+the artifact under `$package_target_dir/package`: recent Cargo versions stage
 publish dry-runs in a temporary registry instead. No internal staging path is
 assumed. The artifact is not a crates.io release.
 
@@ -58,15 +63,19 @@ The workspace resolver configuration is not shipped as a downstream Cargo
 policy. Consumers choose their own resolver and lockfile behavior; the crate's
 declared Rust minimum and semver dependency requirements remain its contract.
 
-Package verification uses a separate `stable-release-package` dependency cache:
-an unpacked crate does not unify the workspace's dev/test features, so its
-native dependency artifacts can differ from workspace CI. The first compatible
-package cache is cold; later reuse depends on toolchain, dependency, and cache
-availability. Backend-free and memory-only package configurations run; native
-RocksDB validation is handled by normal CI. No fixed build speed is promised.
-The normal artifact and actual publish use the empty default
-feature set. The archived source contains optional backends, but downstream
-default builds do not enable or link them.
+Package verification uses a fresh target directory for each run. Cargo treats
+registry crate versions as immutable, including dependencies staged by package
+verification. Reusing a staged registry or compiled dependency from an earlier
+PR with the same unpublished version can select stale source or compiled APIs.
+A fresh package target directory avoids that state while allowing all checks
+within one run to share their build artifacts. Keep it until inspecting or
+archiving the verified crates, then remove it.
+
+CI caches dependency downloads and ordinary release tests under
+`stable-release-package`. Package checks compile in the fresh directory;
+backend-free and memory-only verification run without native RocksDB builds.
+Native validation remains in normal CI. The uploaded `.crate` files contain
+optional backends, while downstream default builds enable neither backend.
 
 ## Credentials
 
@@ -83,10 +92,10 @@ or artifact uploads. Do not print or commit token values.
 
 For this version, after the version PR is merged and `main` checks are green:
 
-1. Fetch `main`, select the tested release commit, and create the tag `v0.5.2`
+1. Fetch `main`, select the tested release commit, and create the tag `v0.5.0`
    at that commit. Push that tag, or select that exact commit when creating it
    in GitHub's release UI. Do not tag an unmerged PR branch.
-2. Create a GitHub release for `v0.5.2` using `CHANGELOG.md` as the notes. Keep
+2. Create a GitHub release for `v0.5.0` using `CHANGELOG.md` as the notes. Keep
    it a draft until ready; leave **Set as a pre-release** unchecked.
 3. Publish the GitHub release. The workflow checks out the event's exact commit
    with full history. Before building or uploading, the release guard requires
@@ -104,7 +113,7 @@ For this version, after the version PR is merged and `main` checks are green:
    publication is never cancelled by a newer validation run.
    RocksDB builds and tests must pass in normal CI before merging; the publish
    workflow deliberately does not repeat them.
-5. Check the Actions result and verify `0.5.2` on
+5. Check the Actions result and verify `0.5.0` on
    [crates.io](https://crates.io/crates/actordb) and its build on
    [docs.rs](https://docs.rs/actordb). GitHub release publication precedes the
    registry upload, so a failed workflow can leave a GitHub release without a

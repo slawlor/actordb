@@ -131,9 +131,10 @@ fields, so an older implementation cannot silently ignore a new constraint.
 
 ## Release and compatibility
 
-This feature uses **0.5.0** because generated public message structs gain
-optional `write_concern` fields. Downstream struct literals must initialize
-those fields or use `Default`. All four public crates and inter-crate minimum
+The **0.5.0** release includes acknowledgement policies, region requirements,
+and operational caps. It uses a new minor version because generated public
+message structs gain optional `write_concern` fields. Downstream struct literals
+must initialize those fields or use `Default`. All four public crates and inter-crate minimum
 requirements move to compatible `0.5.0` ranges.
 
 Peers require the new write-concern capability before connecting. Upgrade the
