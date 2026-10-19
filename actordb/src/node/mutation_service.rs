@@ -189,7 +189,24 @@ pub(super) struct MutationService {
 }
 
 impl MutationService {
+    #[cfg(test)]
     pub(super) fn new(capacity: usize, byte_capacity: usize) -> Arc<Self> {
+        Self::new_inner(capacity, byte_capacity, None)
+    }
+
+    pub(super) fn new_with_tracker(
+        capacity: usize,
+        byte_capacity: usize,
+        tracker: Arc<crate::write_concern::WriteConcernTracker>,
+    ) -> Arc<Self> {
+        Self::new_inner(capacity, byte_capacity, Some(tracker))
+    }
+
+    fn new_inner(
+        capacity: usize,
+        byte_capacity: usize,
+        tracker: Option<Arc<crate::write_concern::WriteConcernTracker>>,
+    ) -> Arc<Self> {
         let (stop, stop_rx) = watch::channel(false);
         let (done_tx, done) = watch::channel(false);
         let mut senders = Vec::with_capacity(3);
@@ -199,7 +216,7 @@ impl MutationService {
             senders.push(sender);
             receivers.push(receiver);
         }
-        let manager = tokio::spawn(run_manager(receivers, stop_rx, done_tx));
+        let manager = tokio::spawn(run_manager(receivers, stop_rx, done_tx, tracker));
         Arc::new(Self {
             accepting: StdMutex::new(true),
             lanes: senders.try_into().expect("three mutation lanes"),
@@ -294,6 +311,7 @@ async fn run_manager(
     receivers: Vec<mpsc::Receiver<MutationJob>>,
     stop: watch::Receiver<bool>,
     done: watch::Sender<bool>,
+    tracker: Option<Arc<crate::write_concern::WriteConcernTracker>>,
 ) {
     struct PublishDone(watch::Sender<bool>);
     impl Drop for PublishDone {
@@ -306,7 +324,7 @@ async fn run_manager(
     for receiver in receivers {
         let receiver = Arc::new(Mutex::new(receiver));
         for _ in 0..WORKERS_PER_PRIORITY {
-            workers.spawn(run_worker(receiver.clone(), stop.clone()));
+            workers.spawn(run_worker(receiver.clone(), stop.clone(), tracker.clone()));
         }
     }
     while let Some(result) = workers.join_next().await {
@@ -319,6 +337,7 @@ async fn run_manager(
 async fn run_worker(
     jobs: Arc<Mutex<mpsc::Receiver<MutationJob>>>,
     mut stop: watch::Receiver<bool>,
+    tracker: Option<Arc<crate::write_concern::WriteConcernTracker>>,
 ) {
     loop {
         let job = {
@@ -336,29 +355,69 @@ async fn run_worker(
             return;
         };
         // Never race accepted apply/fanout against transport or node shutdown.
-        complete_job(job).await;
+        complete_job(job, tracker.as_ref()).await;
     }
 }
 
-async fn complete_job(job: MutationJob) {
+async fn complete_job(
+    job: MutationJob,
+    tracker: Option<&Arc<crate::write_concern::WriteConcernTracker>>,
+) {
     let MutationJob {
         request,
         actor,
         senders,
         fragment,
         _operation,
-        _authority,
+        mut _authority,
         reply,
         retention,
     } = job;
     let req_id = request.req_id();
     let priority = request.priority();
+    let batch = matches!(&request, MutationRequest::Batch(_));
     let puts = match request {
         MutationRequest::Single(put) => vec![put],
         MutationRequest::Batch(batch) => batch.puts,
     };
     let mut results = Vec::with_capacity(puts.len());
     for (index, put) in puts.into_iter().enumerate() {
+        let policy = put
+            .write_concern
+            .as_deref()
+            .map(crate::write_concern::WriteConcernOptions::decode)
+            .transpose();
+        let policy = match policy {
+            Ok(policy) if !batch || policy.is_none() => policy,
+            Ok(_) => {
+                let mut result = super::mutation_result(
+                    put.key,
+                    index,
+                    Err(super::NodeError::Codec(
+                        "batch write concerns are unsupported".into(),
+                    )),
+                );
+                result.write_concern = Some(
+                    crate::write_concern::WriteConcernOutcome::Unsupported(
+                        "batch write concerns are unsupported".into(),
+                    )
+                    .encode(),
+                );
+                results.push(result);
+                continue;
+            }
+            Err(error) => {
+                let failure = crate::write_concern::WriteConcernError::from(error);
+                let mut result = super::mutation_result(
+                    put.key,
+                    index,
+                    Err(super::NodeError::Codec(failure.to_string())),
+                );
+                result.write_concern = failure.outcome().map(|outcome| outcome.encode());
+                results.push(result);
+                continue;
+            }
+        };
         let mut value = VersionedValue::new(put.value, put.timestamp_ms, put.node_id);
         value.expires_at_ms = (put.expires_at_ms != 0).then_some(put.expires_at_ms);
         value.is_tombstone = put.is_tombstone;
@@ -368,8 +427,54 @@ async fn complete_job(job: MutationJob) {
             seq: put.seq,
             boot_id: put.boot_id,
         };
-        results
-            .push(apply_forwarded_mutation(&actor, &senders, fragment, op, priority, index).await);
+        let pending = if let Some(policy) = policy.as_ref() {
+            let prepared = tracker
+                .ok_or_else(|| {
+                    crate::write_concern::WriteConcernError::Unsupported(
+                        "write concern receiver unavailable".into(),
+                    )
+                })
+                .and_then(|tracker| tracker.prepare(fragment, &op, policy));
+            match prepared {
+                Ok(pending) => Some(pending),
+                Err(failure) => {
+                    let mut result = super::mutation_result(
+                        op.key,
+                        index,
+                        Err(super::NodeError::Codec(failure.to_string())),
+                    );
+                    result.write_concern = failure.outcome().map(|outcome| outcome.encode());
+                    results.push(result);
+                    continue;
+                }
+            }
+        } else {
+            None
+        };
+        let mut result =
+            apply_forwarded_mutation(&actor, &senders, fragment, op, priority, index).await;
+        if let Some(pending) = pending {
+            // Replication fan-out has completed; ownership teardown must not
+            // wait on client acknowledgement policy. Single writes only.
+            drop(_authority.take());
+            if matches!(
+                crate::proto::MutationStatus::try_from(result.status),
+                Ok(crate::proto::MutationStatus::Applied
+                    | crate::proto::MutationStatus::AlreadyPresent)
+            ) {
+                pending.applied_locally();
+                result.write_concern = Some(match pending.wait().await {
+                    Ok(receipt) => {
+                        crate::write_concern::WriteConcernOutcome::Satisfied(receipt).encode()
+                    }
+                    Err(error) => error
+                        .outcome()
+                        .expect("wait returns receipt timeout")
+                        .encode(),
+                });
+            }
+        }
+        results.push(result);
     }
     let _ = reply.send(MutationCompletion {
         response: MutationResponse { req_id, results },

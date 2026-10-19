@@ -90,6 +90,8 @@ pub struct SenderRuntimeOptions {
     control_channel_capacity: usize,
     #[builder(skip = None)]
     queue_failure_handler: Option<QueueFailureHandler>,
+    #[builder(skip = None)]
+    write_concerns: Option<Arc<crate::write_concern::WriteConcernTracker>>,
 }
 
 impl std::fmt::Debug for SenderRuntimeOptions {
@@ -224,6 +226,14 @@ impl SenderRuntimeOptions {
 
     pub(crate) fn with_control_channel_capacity(mut self, capacity: usize) -> Self {
         self.control_channel_capacity = capacity;
+        self
+    }
+
+    pub(crate) fn with_write_concerns(
+        mut self,
+        tracker: Arc<crate::write_concern::WriteConcernTracker>,
+    ) -> Self {
+        self.write_concerns = Some(tracker);
         self
     }
 
@@ -823,11 +833,16 @@ enum InflightKind {
     ReconcileBarrier,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Debug)]
 enum InflightAckResult {
     Missing,
-    BelowRequired { required: ReplicationAckDurability },
-    Accepted { kind: InflightKind },
+    BelowRequired {
+        required: ReplicationAckDurability,
+    },
+    Accepted {
+        kind: InflightKind,
+        ops: Vec<crate::actor::ReplicatedOp>,
+    },
 }
 
 fn acknowledge_in_flight(
@@ -850,7 +865,10 @@ fn acknowledge_in_flight(
         .in_flight
         .remove(position)
         .expect("in-flight batch position was just resolved");
-    InflightAckResult::Accepted { kind: batch.kind }
+    InflightAckResult::Accepted {
+        kind: batch.kind,
+        ops: batch.ops,
+    }
 }
 
 struct ActiveConnection {
@@ -1830,7 +1848,10 @@ async fn sender_task(
                                         "replication ack did not meet the batch durability fence"
                                     );
                                 }
-                                InflightAckResult::Accepted { kind } => {
+                                InflightAckResult::Accepted { kind, ops } => {
+                                    if let Some(tracker) = runtime.write_concerns.as_ref() {
+                                        tracker.acknowledge(&peer_id, fragment, &ops);
+                                    }
                                     last_ack_durability = Some(durability);
                                     ack_durability_mismatch = false;
                                     let is_barrier = kind == InflightKind::ReconcileBarrier
@@ -4158,7 +4179,7 @@ mod tests {
             Ok(ReplicationAckLevel::StableCommitted)
         );
 
-        assert_eq!(
+        assert!(matches!(
             acknowledge_in_flight(
                 &mut connection,
                 batch_seq,
@@ -4167,10 +4188,10 @@ mod tests {
             InflightAckResult::BelowRequired {
                 required: ReplicationAckDurability::StableCommitted,
             }
-        );
+        ));
         assert_eq!(connection.in_flight.len(), 1);
         assert!(!drain.is_complete());
-        assert_eq!(
+        assert!(matches!(
             acknowledge_in_flight(
                 &mut connection,
                 batch_seq,
@@ -4178,8 +4199,9 @@ mod tests {
             ),
             InflightAckResult::Accepted {
                 kind: InflightKind::ReconcileBarrier,
+                ..
             }
-        );
+        ));
         assert!(connection.in_flight.is_empty());
 
         finish_tx.send(()).unwrap();

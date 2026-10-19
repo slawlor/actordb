@@ -25,6 +25,10 @@ pub use actordb_query::{QueryResult, QueryValue};
 pub use wire::Scan as ScanOptions;
 pub use wire::{Inspection, Value};
 
+mod write_concern;
+pub use actordb_protocol::write_concern::{WriteConcern, WriteConcernOptions, WriteConcernReceipt};
+pub use write_concern::WriteConcernClientError;
+
 /// Connection and queue bounds. Credentials are independent of cluster secrets.
 #[derive(Debug, Clone)]
 pub struct ClientOptions {
@@ -199,8 +203,24 @@ impl Client {
         operation: wire::request::Operation,
         mutation: bool,
     ) -> Result<wire::Response, ClientError> {
+        self.request_with_timeout(operation, mutation, Duration::ZERO)
+            .await
+    }
+
+    async fn request_with_timeout(
+        &self,
+        operation: wire::request::Operation,
+        mutation: bool,
+        extra: Duration,
+    ) -> Result<wire::Response, ClientError> {
+        let request_timeout = self
+            .inner
+            .options
+            .timeout
+            .checked_add(extra)
+            .ok_or_else(|| ClientError::Invalid("timeout too large".into()))?;
         let deadline = Instant::now()
-            .checked_add(self.inner.options.timeout)
+            .checked_add(request_timeout)
             .ok_or_else(|| ClientError::Invalid("timeout too large".into()))?;
         // Admission is nonwaiting, so excess callers never retain payloads in
         // an unaccounted semaphore waiter queue.
@@ -331,6 +351,8 @@ impl Client {
             value,
             ttl_ms,
             priority: options.priority as i32,
+
+            write_concern: None,
         }))
         .await
     }
@@ -377,6 +399,8 @@ impl Client {
         self.single_mutation(wire::request::Operation::Delete(wire::Delete {
             key: key.into(),
             priority: priority as i32,
+
+            write_concern: None,
         }))
         .await
     }
@@ -446,6 +470,8 @@ impl Client {
                 value,
                 ttl_ms: None,
                 priority: priority as i32,
+
+                write_concern: None,
             })
             .collect();
         let response = self

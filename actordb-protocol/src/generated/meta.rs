@@ -95,6 +95,9 @@ pub struct ForwardedPut {
     /// Correlates the exact apply outcome back to the originating node.
     #[prost(uint64, tag = "11")]
     pub req_id: u64,
+    /// Optional encoded WriteConcernPolicy. Absence preserves local acknowledgement.
+    #[prost(bytes = "vec", optional, tag = "12")]
+    pub write_concern: ::core::option::Option<::prost::alloc::vec::Vec<u8>>,
 }
 /// A single-key routed read. The origin tries configured holders in order; a
 /// non-serving holder may relay it under a fresh request id while placement
@@ -345,6 +348,37 @@ pub struct MutationResult {
     pub winner_is_tombstone: bool,
     #[prost(uint32, tag = "7")]
     pub request_index: u32,
+    /// Encoded WriteConcernResult, present only when a policy was requested.
+    #[prost(bytes = "vec", optional, tag = "8")]
+    pub write_concern: ::core::option::Option<::prost::alloc::vec::Vec<u8>>,
+}
+#[non_exhaustive]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct WriteConcernPolicy {
+    #[prost(enumeration = "WriteConcernLevel", tag = "1")]
+    pub level: i32,
+    #[prost(uint32, tag = "2")]
+    pub acknowledgements: u32,
+    #[prost(uint64, tag = "3")]
+    pub timeout_ms: u64,
+}
+#[non_exhaustive]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct WriteConcernResult {
+    #[prost(enumeration = "WriteConcernStatus", tag = "1")]
+    pub status: i32,
+    #[prost(string, tag = "2")]
+    pub receiving_node: ::prost::alloc::string::String,
+    #[prost(uint32, tag = "3")]
+    pub replica_count: u32,
+    #[prost(uint32, tag = "4")]
+    pub requested_acknowledgements: u32,
+    #[prost(uint32, tag = "5")]
+    pub required_acknowledgements: u32,
+    #[prost(string, repeated, tag = "6")]
+    pub acknowledged_nodes: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(string, tag = "7")]
+    pub error: ::prost::alloc::string::String,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct MutationResponse {
@@ -707,6 +741,70 @@ impl MutationStatus {
             "MUTATION_STATUS_STORAGE_ERROR" => Some(Self::StorageError),
             "MUTATION_STATUS_ACTOR_ERROR" => Some(Self::ActorError),
             "MUTATION_STATUS_UNAVAILABLE" => Some(Self::Unavailable),
+            _ => None,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum WriteConcernLevel {
+    WriteConcernLocal = 0,
+    WriteConcernCount = 1,
+    WriteConcernMajority = 2,
+}
+impl WriteConcernLevel {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::WriteConcernLocal => "WRITE_CONCERN_LOCAL",
+            Self::WriteConcernCount => "WRITE_CONCERN_COUNT",
+            Self::WriteConcernMajority => "WRITE_CONCERN_MAJORITY",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "WRITE_CONCERN_LOCAL" => Some(Self::WriteConcernLocal),
+            "WRITE_CONCERN_COUNT" => Some(Self::WriteConcernCount),
+            "WRITE_CONCERN_MAJORITY" => Some(Self::WriteConcernMajority),
+            _ => None,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum WriteConcernStatus {
+    WriteConcernSatisfied = 0,
+    WriteConcernTimedOut = 1,
+    WriteConcernInvalid = 2,
+    WriteConcernBackpressure = 3,
+    WriteConcernUnsupported = 4,
+}
+impl WriteConcernStatus {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::WriteConcernSatisfied => "WRITE_CONCERN_SATISFIED",
+            Self::WriteConcernTimedOut => "WRITE_CONCERN_TIMED_OUT",
+            Self::WriteConcernInvalid => "WRITE_CONCERN_INVALID",
+            Self::WriteConcernBackpressure => "WRITE_CONCERN_BACKPRESSURE",
+            Self::WriteConcernUnsupported => "WRITE_CONCERN_UNSUPPORTED",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "WRITE_CONCERN_SATISFIED" => Some(Self::WriteConcernSatisfied),
+            "WRITE_CONCERN_TIMED_OUT" => Some(Self::WriteConcernTimedOut),
+            "WRITE_CONCERN_INVALID" => Some(Self::WriteConcernInvalid),
+            "WRITE_CONCERN_BACKPRESSURE" => Some(Self::WriteConcernBackpressure),
+            "WRITE_CONCERN_UNSUPPORTED" => Some(Self::WriteConcernUnsupported),
             _ => None,
         }
     }

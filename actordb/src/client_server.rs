@@ -249,6 +249,14 @@ async fn serve_connection(
             return;
         }
         let optional_capability = match request.operation {
+            Some(wire::request::Operation::Put(ref put)) if put.write_concern.is_some() => {
+                actordb_protocol::CLIENT_CAPABILITY_WRITE_CONCERNS
+            }
+            Some(wire::request::Operation::Delete(ref delete))
+                if delete.write_concern.is_some() =>
+            {
+                actordb_protocol::CLIENT_CAPABILITY_WRITE_CONCERNS
+            }
             Some(wire::request::Operation::Query(_)) => actordb_protocol::CLIENT_CAPABILITY_QUERY,
             Some(wire::request::Operation::Scan(_)) => actordb_protocol::CLIENT_CAPABILITY_SCAN,
             _ => 0,
@@ -395,6 +403,25 @@ async fn dispatch(node: &Node, request: wire::Request) -> wire::Response {
             response.reads.push(read_result(get.key, result));
         }
         Some(Operation::Put(put)) => {
+            if let Some(encoded) = put.write_concern.as_deref() {
+                let result = match crate::write_concern::WriteConcernOptions::decode(encoded) {
+                    Ok(options) => {
+                        node.put_with_write_concern_options(
+                            put.key.clone(),
+                            put.value,
+                            put.ttl_ms.map(Duration::from_millis),
+                            priority(put.priority),
+                            options,
+                        )
+                        .await
+                    }
+                    Err(error) => Err(error.into()),
+                };
+                response
+                    .mutations
+                    .push(concern_mutation_result(put.key, result));
+                return response;
+            }
             let result = node
                 .put_with_options(
                     put.key.clone(),
@@ -406,6 +433,23 @@ async fn dispatch(node: &Node, request: wire::Request) -> wire::Response {
             response.mutations.push(mutation_result(put.key, result));
         }
         Some(Operation::Delete(delete)) => {
+            if let Some(encoded) = delete.write_concern.as_deref() {
+                let result = match crate::write_concern::WriteConcernOptions::decode(encoded) {
+                    Ok(options) => {
+                        node.delete_with_write_concern_options(
+                            delete.key.clone(),
+                            priority(delete.priority),
+                            options,
+                        )
+                        .await
+                    }
+                    Err(error) => Err(error.into()),
+                };
+                response
+                    .mutations
+                    .push(concern_mutation_result(delete.key, result));
+                return response;
+            }
             let result = node
                 .delete_with_priority(delete.key.clone(), priority(delete.priority))
                 .await;
@@ -432,6 +476,13 @@ async fn dispatch(node: &Node, request: wire::Request) -> wire::Response {
             }
         }
         Some(Operation::BatchPut(batch)) => {
+            if batch.puts.iter().any(|put| put.write_concern.is_some()) {
+                response.error = Some(error(
+                    wire::ErrorCode::Unsupported,
+                    "batch write concerns are not supported",
+                ));
+                return response;
+            }
             if batch.puts.len() > actordb_protocol::MAX_BATCH_ITEMS {
                 response.error = Some(error(wire::ErrorCode::ResourceLimit, "too many batch puts"));
             } else {
@@ -602,6 +653,42 @@ fn mutation_result(key: String, result: Result<(), NodeError>) -> wire::Mutation
                 node_error(failure)
             }
         }),
+
+        write_concern: None,
+    }
+}
+
+fn concern_mutation_result(
+    key: String,
+    result: Result<
+        crate::write_concern::WriteConcernReceipt,
+        crate::write_concern::WriteConcernError,
+    >,
+) -> wire::MutationResult {
+    use crate::write_concern::{WriteConcernError, WriteConcernOutcome};
+    match result {
+        Ok(receipt) => wire::MutationResult {
+            key,
+            error: None,
+            write_concern: Some(WriteConcernOutcome::Satisfied(receipt).encode()),
+        },
+        Err(WriteConcernError::Operation(error)) => mutation_result(key, Err(error)),
+        Err(failure) => {
+            let encoded = failure.outcome().map(|outcome| outcome.encode());
+            let code = match failure {
+                WriteConcernError::TimedOut(_) | WriteConcernError::UnknownOutcome(_) => {
+                    wire::ErrorCode::UnknownOutcome
+                }
+                WriteConcernError::Backpressure => wire::ErrorCode::Backpressure,
+                WriteConcernError::Unsupported(_) => wire::ErrorCode::Unsupported,
+                _ => wire::ErrorCode::Invalid,
+            };
+            wire::MutationResult {
+                key,
+                error: Some(error(code, &failure.to_string())),
+                write_concern: encoded,
+            }
+        }
     }
 }
 fn error(code: wire::ErrorCode, message: &str) -> wire::Error {

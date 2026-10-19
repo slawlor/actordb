@@ -54,6 +54,8 @@ pub struct Put {
     pub ttl_ms: ::core::option::Option<u64>,
     #[prost(enumeration = "super::meta::Priority", tag = "4")]
     pub priority: i32,
+    #[prost(bytes = "vec", optional, tag = "5")]
+    pub write_concern: ::core::option::Option<::prost::alloc::vec::Vec<u8>>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct Delete {
@@ -61,6 +63,8 @@ pub struct Delete {
     pub key: ::prost::alloc::string::String,
     #[prost(enumeration = "super::meta::Priority", tag = "2")]
     pub priority: i32,
+    #[prost(bytes = "vec", optional, tag = "3")]
+    pub write_concern: ::core::option::Option<::prost::alloc::vec::Vec<u8>>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct BatchGet {
@@ -168,6 +172,8 @@ pub struct MutationResult {
     pub key: ::prost::alloc::string::String,
     #[prost(message, optional, tag = "2")]
     pub error: ::core::option::Option<Error>,
+    #[prost(bytes = "vec", optional, tag = "3")]
+    pub write_concern: ::core::option::Option<::prost::alloc::vec::Vec<u8>>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct QueryResult {

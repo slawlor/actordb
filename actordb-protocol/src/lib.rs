@@ -10,10 +10,15 @@ pub mod client {
     include!("generated/client.rs");
 }
 
+/// Per-write acknowledgement policy and progress receipts.
+pub mod write_concern;
+
 pub const CLIENT_PROTOCOL_VERSION: u32 = 1;
 pub const CLIENT_CAPABILITY_QUERY: u64 = 1;
 pub const CLIENT_CAPABILITY_SCAN: u64 = 2;
-pub const CLIENT_CAPABILITIES: u64 = CLIENT_CAPABILITY_QUERY | CLIENT_CAPABILITY_SCAN;
+pub const CLIENT_CAPABILITY_WRITE_CONCERNS: u64 = 4;
+pub const CLIENT_CAPABILITIES: u64 =
+    CLIENT_CAPABILITY_QUERY | CLIENT_CAPABILITY_SCAN | CLIENT_CAPABILITY_WRITE_CONCERNS;
 pub const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_BATCH_ITEMS: usize = 4096;
 pub const MAX_HANDSHAKE_BYTES: usize = 4096;
@@ -96,6 +101,9 @@ pub fn preflight_client_frame(bytes: &[u8]) -> Result<(), &'static str> {
         Health,
         Placement,
         Cell,
+        Put,
+        Delete,
+        MutationResult,
     }
     fn varint(bytes: &[u8], pos: &mut usize) -> Result<u64, &'static str> {
         let mut result = 0;
@@ -169,10 +177,22 @@ pub fn preflight_client_frame(bytes: &[u8]) -> Result<(), &'static str> {
                         usize::try_from(varint(bytes, &mut pos)?).map_err(|_| "overflow")?;
                     let end = pos.checked_add(length).ok_or("overflow")?;
                     let inner = bytes.get(pos..end).ok_or("truncated field")?;
+                    if matches!((context, field), (Put, 5) | (Delete, 3))
+                        && inner.len() > write_concern::MAX_WRITE_CONCERN_POLICY_BYTES
+                    {
+                        return Err("write concern policy exceeds byte limit");
+                    }
+                    if matches!((context, field), (MutationResult, 3)) {
+                        write_concern::preflight_result(inner)
+                            .map_err(|_| "invalid write concern receipt")?;
+                    }
                     let nested = match (context, field) {
                         (Frame, 3) => Some(Request),
                         (Frame, 4) => Some(Response),
                         (Request, 5) => Some(BatchGet),
+                        (Request, 3) | (BatchPut, 1) => Some(Put),
+                        (Request, 4) => Some(Delete),
+                        (Response, 4) => Some(MutationResult),
                         (Request, 6) => Some(BatchPut),
                         (Request, 7) => Some(Query),
                         (Query, 2) | (Row, 2) => Some(Cell),
