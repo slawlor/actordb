@@ -50,6 +50,6 @@ active.
 
 ## Version requirements
 
-This additive API is available in `0.5.0`. All four public crates use compatible
-`0.5.0` dependency minimums so an upgrade resolves the matching database,
-protocol, query, and SDK revisions.
+This additive API was introduced in `0.5.0`. The current release uses compatible
+`0.6.0` dependency minimums across all four public crates so an upgrade resolves
+the matching database, protocol, query, and SDK revisions.

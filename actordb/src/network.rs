@@ -3,10 +3,11 @@
 // This source code is licensed under both the MIT license found in the
 // LICENSE-MIT file in the root directory of this source tree.
 
-//! Pluggable network transport for the peer mesh.
+//! Pluggable byte-stream transport for the peer mesh and application listener.
 //!
-//! A [`Network`](crate::network::Network) binds a listen address and dials peers, producing
-//! byte streams. Everything above — framing, handshake, gossip —
+//! A [`Network`](crate::network::Network) binds a listen address and dials connections,
+//! producing byte streams. The peer mesh and [`ClientServer`](crate::client_server::ClientServer)
+//! can use the same transport interface. Everything above — framing, handshake, gossip —
 //! operates on those streams generically. The default is [`TcpNetwork`](crate::network::TcpNetwork)
 //! (plain TCP); implement [`Network`](crate::network::Network) to run the mesh over TLS, a
 //! Meta-internal transport, or anything else that moves bytes.
@@ -34,7 +35,12 @@ use std::pin::Pin;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
 
-/// A connected peer: any async bidirectional byte stream.
+/// A peer or application connection: any async bidirectional byte stream.
+///
+/// Streams must deliver reliable, ordered bytes, support concurrent reading and
+/// writing, and propagate backpressure and connection errors. ActorDB flushes
+/// after each frame, so buffered streams are supported. Transport adapters must
+/// not replay bytes across connections or transparently retry database operations.
 ///
 /// Blanket-implemented for all suitable types, so a `TcpStream`, a
 /// TLS stream, or any future transport plugs in unchanged. Dropping the stream
@@ -77,7 +83,7 @@ impl From<std::io::Error> for NetworkError {
     }
 }
 
-/// Accepts inbound peer connections. Returned by [`Network::bind`].
+/// Accepts inbound peer or application connections. Returned by [`Network::bind`].
 ///
 /// Dropping the acceptor must release the listening resource. A pending
 /// [`accept`](Acceptor::accept) future may be dropped during Node shutdown and
@@ -90,7 +96,7 @@ pub trait Acceptor: Send + 'static {
     fn accept(&mut self) -> AcceptFuture<'_>;
 }
 
-/// Pluggable network transport for the peer mesh.
+/// Pluggable byte-stream transport for peers and application connections.
 ///
 /// Implementors only move bytes: [`Network::bind`] listens for peers
 /// and [`Network::connect`] dials one. Framing, the handshake, and
@@ -139,14 +145,7 @@ impl Acceptor for TcpAcceptor {
 
 impl Network for TcpNetwork {
     fn bind(&self, addr: SocketAddr) -> BindFuture<'_> {
-        Box::pin(async move {
-            let listener = TcpListener::bind(addr).await?;
-            let bound = listener.local_addr()?;
-            Ok((
-                bound,
-                Box::new(TcpAcceptor { listener }) as Box<dyn Acceptor>,
-            ))
-        })
+        Box::pin(async move { Ok(bind_tcp(addr).await?) })
     }
 
     fn connect(&self, addr: SocketAddr) -> ConnectFuture<'_> {
@@ -160,4 +159,11 @@ impl Network for TcpNetwork {
             Ok(Pin::new(boxed))
         })
     }
+}
+
+// Keep the concrete I/O error for the existing application TCP convenience API.
+pub(crate) async fn bind_tcp(addr: SocketAddr) -> std::io::Result<(SocketAddr, Box<dyn Acceptor>)> {
+    let listener = TcpListener::bind(addr).await?;
+    let bound = listener.local_addr()?;
+    Ok((bound, Box::new(TcpAcceptor { listener })))
 }

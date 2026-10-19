@@ -83,7 +83,7 @@ below before using the default plain-TCP transport in production.
 | Field | Type | Default | Guidance |
 |---|---|---|---|
 | `store` | `Option<Arc<dyn KvStore>>` | `None` | `None` = purely in-memory node using its fragment cache, with no backend feature required. Set to a base `RocksDbStore` (`rocksdb` feature) or custom store; Node applies the per-fragment `PrefixedStore` views itself. The opt-in `MemoryStore` is a no-op test double, not persistence. |
-| `network` | `Arc<dyn Network>` | `TcpNetwork` | Plain TCP. Implement `Network` for TLS or custom transports. |
+| `network` | `Arc<dyn Network>` | `TcpNetwork` | Plain TCP. Implement `Network` for TLS or custom transports; see the [transport guide](transports.md). |
 | `flush_batch_size` | `usize` | `1000` | Ops buffered before a store flush. Ignored when `store` is `None`. Larger = fewer, bigger RocksDB write batches. |
 | `flush_interval` | `Duration` | `100 ms` | A new write triggers a flush when the previous attempt is this old; idle fragments are bounded by `snapshot_interval`. |
 | `fragment_count` | `usize` | `1` | Number of keyspace fragments, from 1 through `u32::MAX`. **Must be identical on every node** or keys become unreachable. RocksDB pins it in the database manifest. |

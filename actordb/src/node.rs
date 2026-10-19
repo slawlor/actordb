@@ -2279,7 +2279,8 @@ async fn run_queued_peer_writer<W>(
         }
         let write = async {
             writer.write_u32(frame.len() as u32).await?;
-            writer.write_all(frame.bytes()).await
+            writer.write_all(frame.bytes()).await?;
+            writer.flush().await
         };
         let result = tokio::select! {
             changed = cancel_rx.changed() => {
