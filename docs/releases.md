@@ -14,6 +14,10 @@ does not upload anything. GitHub prereleases are intentionally excluded.
    Dependency requirements remain compatible semver
    ranges; this library workspace does not commit `Cargo.lock`. The internal `xtask`
    and `docker-tests` crates are not published and need not share this version.
+   Feature PRs included in the same unpublished release share that release
+   version. Keep their release notes under one changelog entry; separate PRs
+   do not require separate version bumps. Bump the version again after publishing
+   the preceding release.
 2. Update `CHANGELOG.md`, installation examples, and any migration/API docs.
    Pre-1.0 breaking changes use a new minor version; do not promise production
    readiness or compatibility that the implementation does not enforce.
@@ -83,10 +87,10 @@ or artifact uploads. Do not print or commit token values.
 
 For this version, after the version PR is merged and `main` checks are green:
 
-1. Fetch `main`, select the tested release commit, and create the tag `v0.5.2`
+1. Fetch `main`, select the tested release commit, and create the tag `v0.5.0`
    at that commit. Push that tag, or select that exact commit when creating it
    in GitHub's release UI. Do not tag an unmerged PR branch.
-2. Create a GitHub release for `v0.5.2` using `CHANGELOG.md` as the notes. Keep
+2. Create a GitHub release for `v0.5.0` using `CHANGELOG.md` as the notes. Keep
    it a draft until ready; leave **Set as a pre-release** unchecked.
 3. Publish the GitHub release. The workflow checks out the event's exact commit
    with full history. Before building or uploading, the release guard requires
@@ -104,7 +108,7 @@ For this version, after the version PR is merged and `main` checks are green:
    publication is never cancelled by a newer validation run.
    RocksDB builds and tests must pass in normal CI before merging; the publish
    workflow deliberately does not repeat them.
-5. Check the Actions result and verify `0.5.2` on
+5. Check the Actions result and verify `0.5.0` on
    [crates.io](https://crates.io/crates/actordb) and its build on
    [docs.rs](https://docs.rs/actordb). GitHub release publication precedes the
    registry upload, so a failed workflow can leave a GitHub release without a

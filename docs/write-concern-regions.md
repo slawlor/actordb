@@ -72,6 +72,8 @@ last-write-wins reconciliation and eventual replication continue to apply.
 
 ## Compatibility
 
+Region requirements are included in the `0.5.0` release.
+
 Region requirements use an additional policy field. Older implementations
 reject unknown policy fields before application; they cannot silently ignore a
 required region condition. Upgrade nodes that process region-constrained writes

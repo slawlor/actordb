@@ -43,7 +43,7 @@ real application listener.
 
 Per-write acknowledgement counts and region requirements are available through
 `put_with_write_concern` and `delete_with_write_concern`. Install
-`actordb-client = "0.5.1"` for region support; the compatible dependency minimums
+`actordb-client = "0.5.0"` for region support; the compatible dependency minimums
 also select the required protocol and query revisions. See the
 [region guide](../docs/write-concern-regions.md) for configuration and receipt
 semantics. Local acknowledgement remains the default.
