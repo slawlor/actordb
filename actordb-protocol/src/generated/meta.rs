@@ -361,6 +361,8 @@ pub struct WriteConcernPolicy {
     pub acknowledgements: u32,
     #[prost(uint64, tag = "3")]
     pub timeout_ms: u64,
+    #[prost(bool, tag = "4")]
+    pub require_other_region: bool,
 }
 #[non_exhaustive]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -379,6 +381,12 @@ pub struct WriteConcernResult {
     pub acknowledged_nodes: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
     #[prost(string, tag = "7")]
     pub error: ::prost::alloc::string::String,
+    #[prost(string, optional, tag = "8")]
+    pub receiving_region: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, repeated, tag = "9")]
+    pub outside_region_acknowledged_nodes: ::prost::alloc::vec::Vec<
+        ::prost::alloc::string::String,
+    >,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct MutationResponse {

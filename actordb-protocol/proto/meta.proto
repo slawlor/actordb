@@ -302,6 +302,7 @@ message WriteConcernPolicy {
   WriteConcernLevel level = 1;
   uint32 acknowledgements = 2;
   uint64 timeout_ms = 3;
+  bool require_other_region = 4;
 }
 enum WriteConcernStatus {
   WRITE_CONCERN_SATISFIED = 0;
@@ -318,6 +319,8 @@ message WriteConcernResult {
   uint32 required_acknowledgements = 5;
   repeated string acknowledged_nodes = 6;
   string error = 7;
+  optional string receiving_region = 8;
+  repeated string outside_region_acknowledged_nodes = 9;
 }
 
 message MutationResponse {
