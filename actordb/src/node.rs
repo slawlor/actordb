@@ -2847,6 +2847,9 @@ pub struct NodeRuntimeOptions {
     replication_ack_timeout: Duration,
     #[builder(default = Duration::from_secs(5))]
     health_timeout: Duration,
+    /// Optional operational ceiling on acknowledgement counts for new writes.
+    /// This weakens requested write concerns and is never applied automatically.
+    write_concern_acknowledgement_cap: Option<u32>,
 }
 
 impl Default for NodeRuntimeOptions {
@@ -3042,6 +3045,27 @@ impl NodeRuntimeOptions {
         self
     }
 
+    /// Lower acknowledgement requirements for writes received by this node to
+    /// at most `cap`. A cap must be positive; startup rejects zero. It never
+    /// raises a requested threshold or removes any additional write requirement.
+    ///
+    /// Use only when intentionally accepting weaker replication assurance.
+    pub fn with_write_concern_acknowledgement_cap(mut self, cap: u32) -> Self {
+        self.write_concern_acknowledgement_cap = Some(cap);
+        self
+    }
+
+    /// Restore requested acknowledgement counts in this startup configuration.
+    pub fn without_write_concern_acknowledgement_cap(mut self) -> Self {
+        self.write_concern_acknowledgement_cap = None;
+        self
+    }
+
+    /// Optional operational ceiling on acknowledgement counts for new writes.
+    pub fn write_concern_acknowledgement_cap(&self) -> Option<u32> {
+        self.write_concern_acknowledgement_cap
+    }
+
     /// Current per-peer outbound frame capacity.
     pub fn peer_queue_frame_capacity(&self) -> usize {
         self.peer_queue_frame_capacity
@@ -3161,6 +3185,11 @@ impl NodeRuntimeOptions {
                     "region label must contain 1 to {MAX_WIRE_NODE_ID_BYTES} bytes"
                 )));
             }
+        }
+        if self.write_concern_acknowledgement_cap == Some(0) {
+            return Err(NodeError::Actor(
+                "write concern acknowledgement cap must be positive".to_string(),
+            ));
         }
         for (name, capacity) in [
             ("relay capacity", self.relay_capacity),
@@ -3782,6 +3811,11 @@ impl Node {
             runtime_options.forwarded_mutation_capacity,
         );
         write_concerns.configure_regions(runtime_options.regions.as_ref().clone());
+        if let Some(cap) = runtime_options.write_concern_acknowledgement_cap {
+            write_concerns
+                .set_acknowledgement_cap(cap)
+                .expect("runtime options validated before startup");
+        }
         let node = Self {
             node_id: node_id.clone(),
             boot_id: fresh_boot_id(),
@@ -12016,6 +12050,19 @@ mod tests {
         )
         .await;
         assert!(matches!(result, Err(NodeError::Actor(error)) if error.contains("region label")));
+    }
+
+    #[test]
+    fn runtime_options_reject_zero_write_concern_acknowledgement_cap() {
+        assert!(NodeRuntimeOptions::default()
+            .with_write_concern_acknowledgement_cap(0)
+            .validate()
+            .is_err());
+        assert!(NodeRuntimeOptions::default()
+            .with_write_concern_acknowledgement_cap(0)
+            .without_write_concern_acknowledgement_cap()
+            .validate()
+            .is_ok());
     }
 
     #[test]
