@@ -2,7 +2,8 @@
 //!
 //! Application clients never join peer membership. Credentials are separate
 //! from cluster secrets. TCP authentication proves possession but does not
-//! encrypt traffic; supply a protected [`Network`] transport when needed.
+//! encrypt traffic; supply a protected [`Network`](crate::network::Network)
+//! transport when needed.
 //! Listener shutdown closes application sessions and leaves the Node running.
 
 use crate::actor::{OpPriority, VersionedValue};
