@@ -12,9 +12,10 @@ cargo run -p actordb-protocol --features codegen --bin generate
 cargo run -p actordb-protocol --features codegen --bin generate -- --check
 ```
 
-The optional `codegen` feature builds bundled protoc for reproducible generation;
-it is unnecessary for consumers. Other language SDKs should generate bindings
-from these packaged schemas. Integers in query cells are canonical signed decimal
+The optional `codegen` feature builds bundled protoc through `protobuf-src` 2.1
+and requires CMake and a C/C++ toolchain. It is unnecessary for consumers.
+Other language SDKs should generate bindings from these packaged schemas.
+Integers in query cells are canonical signed decimal
 strings, preserving i128 precision. Keys are UTF-8 strings; values are arbitrary
 bytes. Framing is a four-byte big-endian body length, capped at 16 MiB.
 

@@ -35,9 +35,9 @@ does not upload anything. GitHub prereleases are intentionally excluded.
    These commands do not publish and need no registry token. Cargo verifies the
    unpacked libraries, including generated protocol bindings, query modules,
    SDK, README files, and licenses. Ordinary builds use checked-in protocol
-   bindings. Regeneration with the protocol codegen feature needs a C/C++
-   toolchain. RocksDB builds and tests remain in normal CI, not the publish
-   workflow; that CI additionally needs working libclang.
+   bindings. Regeneration with the protocol codegen feature uses `protobuf-src`
+   2.1 and needs CMake and a C/C++ toolchain. RocksDB builds and tests remain in
+   normal CI, not the publish workflow; that CI additionally needs working libclang.
    Inspect `cargo package --list --package actordb` when changing
    source layout. Keep the bundled `actordb/LICENSE` in sync with root `LICENSE`.
 4. Wait for all PR checks and reviews, including backend-free, memory-only,
