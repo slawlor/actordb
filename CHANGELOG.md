@@ -1,5 +1,16 @@
 # Release notes
 
+## 0.5.2
+
+- Add explicit per-node acknowledgement caps for new write concern plans,
+  including validated startup configuration and runtime set/clear controls.
+- Report requested and effective thresholds through Node and SDK receipts;
+  existing plans retain their captured thresholds when a cap changes.
+- Preserve region requirements independently of numeric caps and validate
+  requested counts before applying overrides.
+- Update all four public crate versions and inter-crate minimums to compatible
+  0.5.2 ranges. See `docs/write-concern-overrides.md` for support and limits.
+
 ## 0.5.1
 
 - Add per-write requirements for a processed acknowledgement from another

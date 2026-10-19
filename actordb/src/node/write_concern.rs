@@ -5,6 +5,27 @@ use crate::write_concern::{
 };
 
 impl Node {
+    /// Cap acknowledgement counts for subsequently received writes. The cap
+    /// must be positive and never raises a request's threshold or removes other
+    /// write requirements. Existing waiters retain their captured thresholds.
+    ///
+    /// This explicitly accepts weaker replication assurance during an outage;
+    /// peer connectivity never changes the threshold automatically.
+    pub fn set_write_concern_acknowledgement_cap(&self, cap: u32) -> Result<(), WriteConcernError> {
+        self.write_concerns.set_acknowledgement_cap(cap)
+    }
+
+    /// Restore requested acknowledgement counts for subsequently received writes.
+    /// Existing waiters retain the cap captured when they were prepared.
+    pub fn clear_write_concern_acknowledgement_cap(&self) {
+        self.write_concerns.clear_acknowledgement_cap();
+    }
+
+    /// Current operational cap used when this node prepares a new write plan.
+    pub fn write_concern_acknowledgement_cap(&self) -> Option<u32> {
+        self.write_concerns.acknowledgement_cap()
+    }
+
     pub async fn put_with_write_concern(
         &self,
         key: String,
