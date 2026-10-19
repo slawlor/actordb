@@ -283,6 +283,9 @@ pub(crate) struct PendingWrite {
     _permit: Option<OwnedSemaphorePermit>,
 }
 impl PendingWrite {
+    pub(crate) fn requires_wait(&self) -> bool {
+        self.ticket.plan.requires_wait()
+    }
     pub(crate) fn applied_locally(&self) {
         let mut progress = self.ticket.progress.lock().unwrap();
         progress.nodes.insert(self.ticket.plan.receiver.clone());

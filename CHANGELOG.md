@@ -1,5 +1,19 @@
 # Release notes
 
+## 0.5.0
+
+- Add per-write `Local`, `Count(n)`, and `Majority` acknowledgement policies
+  to Node and Rust client single-key put/delete APIs, including TTL/priority.
+- Return explicit acknowledgement receipts and partial progress on timeout;
+  updates continue through the normal asynchronous replication path.
+- Count only validated, distinct processing ACKs for the stamped update and
+  captured replica set. Keep local acknowledgement as the ordinary default.
+- Isolate acknowledgement waits from forwarded apply workers and keep peer
+  readers available for ACKs during forwarded writes.
+- Extend generated public wire structs with optional concern fields, require
+  peer capability support, and move all public crate dependency minimums to
+  compatible 0.5.0 ranges. See `docs/write-concern.md` for semantics and migration.
+
 ## 0.4.0
 
 - Add a Rust companion SDK and a separate application listener, with point and

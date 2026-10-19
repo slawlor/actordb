@@ -31,7 +31,7 @@ pub(super) const FORWARDED_MUTATION_BYTE_CAPACITY: usize = 64 * 1024 * 1024;
 const WORKERS_PER_PRIORITY: usize = 8;
 
 struct MutationRetention {
-    _count: OwnedSemaphorePermit,
+    _count: Option<OwnedSemaphorePermit>,
     _payload: OwnedSemaphorePermit,
 }
 
@@ -95,6 +95,7 @@ fn put_buffer_bytes(put: &ForwardedPut) -> usize {
         .capacity()
         .saturating_add(put.value.capacity())
         .saturating_add(put.node_id.capacity())
+        .saturating_add(put.write_concern.as_ref().map_or(0, Vec::capacity))
 }
 
 fn apply_clone_bytes(put: &ForwardedPut) -> usize {
@@ -216,7 +217,7 @@ impl MutationService {
             senders.push(sender);
             receivers.push(receiver);
         }
-        let manager = tokio::spawn(run_manager(receivers, stop_rx, done_tx, tracker));
+        let manager = tokio::spawn(run_manager(receivers, stop_rx, done_tx, tracker, capacity));
         Arc::new(Self {
             accepting: StdMutex::new(true),
             lanes: senders.try_into().expect("three mutation lanes"),
@@ -254,7 +255,7 @@ impl MutationService {
             return;
         };
         job.retention = Some(Arc::new(MutationRetention {
-            _count: count,
+            _count: Some(count),
             _payload: payload,
         }));
         let lane = match job.request.priority() {
@@ -312,6 +313,7 @@ async fn run_manager(
     stop: watch::Receiver<bool>,
     done: watch::Sender<bool>,
     tracker: Option<Arc<crate::write_concern::WriteConcernTracker>>,
+    capacity: usize,
 ) {
     struct PublishDone(watch::Sender<bool>);
     impl Drop for PublishDone {
@@ -320,16 +322,63 @@ async fn run_manager(
         }
     }
     let _done = PublishDone(done);
+    let (concern_tx, concern_rx) = mpsc::channel(capacity);
+    let mut completion_owner = JoinSet::new();
+    completion_owner.spawn(run_concern_completions(concern_rx));
     let mut workers = JoinSet::new();
     for receiver in receivers {
         let receiver = Arc::new(Mutex::new(receiver));
         for _ in 0..WORKERS_PER_PRIORITY {
-            workers.spawn(run_worker(receiver.clone(), stop.clone(), tracker.clone()));
+            workers.spawn(run_worker(
+                receiver.clone(),
+                stop.clone(),
+                tracker.clone(),
+                concern_tx.clone(),
+            ));
         }
     }
+    drop(concern_tx);
     while let Some(result) = workers.join_next().await {
         if let Err(error) = result {
             tracing::warn!(%error, "mutation completion worker failed");
+        }
+    }
+    while completion_owner.join_next().await.is_some() {}
+}
+
+struct ConcernCompletionJob {
+    pending: crate::write_concern::PendingWrite,
+    reply: oneshot::Sender<MutationCompletion>,
+    completion: MutationCompletion,
+    _operation: OperationPermit,
+}
+
+impl ConcernCompletionJob {
+    async fn complete(mut self) {
+        let outcome = match self.pending.wait().await {
+            Ok(receipt) => crate::write_concern::WriteConcernOutcome::Satisfied(receipt),
+            Err(error) => error
+                .outcome()
+                .expect("acknowledgement wait returns timeout progress"),
+        };
+        self.completion.response.results[0].write_concern = Some(outcome.encode());
+        let _ = self.reply.send(self.completion);
+    }
+}
+
+async fn run_concern_completions(mut jobs: mpsc::Receiver<ConcernCompletionJob>) {
+    let mut owned = JoinSet::new();
+    while let Some(job) = jobs.recv().await {
+        owned.spawn(job.complete());
+        while let Some(result) = owned.try_join_next() {
+            if let Err(error) = result {
+                tracing::warn!(%error, "write concern completion failed");
+            }
+        }
+    }
+    while let Some(result) = owned.join_next().await {
+        if let Err(error) = result {
+            tracing::warn!(%error, "write concern completion failed");
         }
     }
 }
@@ -338,6 +387,7 @@ async fn run_worker(
     jobs: Arc<Mutex<mpsc::Receiver<MutationJob>>>,
     mut stop: watch::Receiver<bool>,
     tracker: Option<Arc<crate::write_concern::WriteConcernTracker>>,
+    concerns: mpsc::Sender<ConcernCompletionJob>,
 ) {
     loop {
         let job = {
@@ -355,14 +405,20 @@ async fn run_worker(
             return;
         };
         // Never race accepted apply/fanout against transport or node shutdown.
-        complete_job(job, tracker.as_ref()).await;
+        if let Some(completion) = complete_job(job, tracker.as_ref()).await {
+            if let Err(error) = concerns.try_send(completion) {
+                // Admission bounds make fullness impossible during normal
+                // operation; retain completion ownership on owner failure.
+                error.into_inner().complete().await;
+            }
+        }
     }
 }
 
 async fn complete_job(
     job: MutationJob,
     tracker: Option<&Arc<crate::write_concern::WriteConcernTracker>>,
-) {
+) -> Option<ConcernCompletionJob> {
     let MutationJob {
         request,
         actor,
@@ -371,7 +427,7 @@ async fn complete_job(
         _operation,
         mut _authority,
         reply,
-        retention,
+        mut retention,
     } = job;
     let req_id = request.req_id();
     let priority = request.priority();
@@ -463,6 +519,26 @@ async fn complete_job(
                     | crate::proto::MutationStatus::AlreadyPresent)
             ) {
                 pending.applied_locally();
+                if pending.requires_wait() {
+                    // ACK waiters have their own tracker admission. Release
+                    // the apply slot so local-only writes can still enter;
+                    // retain the payload lease through response encoding.
+                    if let Some(lease) = retention.as_mut().and_then(Arc::get_mut) {
+                        drop(lease._count.take());
+                    }
+                    return Some(ConcernCompletionJob {
+                        pending,
+                        reply,
+                        completion: MutationCompletion {
+                            response: MutationResponse {
+                                req_id,
+                                results: vec![result],
+                            },
+                            _retention: retention,
+                        },
+                        _operation,
+                    });
+                }
                 result.write_concern = Some(match pending.wait().await {
                     Ok(receipt) => {
                         crate::write_concern::WriteConcernOutcome::Satisfied(receipt).encode()
@@ -480,6 +556,7 @@ async fn complete_job(
         response: MutationResponse { req_id, results },
         _retention: retention,
     });
+    None
 }
 
 #[cfg(test)]
@@ -506,6 +583,91 @@ mod tests {
     use super::super::{
         handle_connection, FragmentRouter, HlcClock, Node, NodeConfig, OperationGate,
     };
+
+    #[tokio::test]
+    async fn concern_waits_do_not_occupy_forwarded_apply_worker_slots() {
+        let (actor, shared) = worker(None).await;
+        let tracker = crate::write_concern::WriteConcernTracker::new(
+            "owner".into(),
+            Arc::new(std::sync::RwLock::new(HashMap::from([(
+                FragmentId(0),
+                vec!["owner".into(), "peer".into()],
+            )]))),
+            16,
+        );
+        let service =
+            MutationService::new_with_tracker(WORKERS_PER_PRIORITY, 128 * 1024, tracker.clone());
+        let gate = OperationGate::new();
+        let senders = Arc::new(Mutex::new(HashMap::new()));
+        let mut responses = Vec::new();
+        let mut operations = Vec::new();
+        for index in 0..WORKERS_PER_PRIORITY {
+            let mut request = put(index as u64 + 1, Priority::Default);
+            request.key = format!("held-{index}");
+            request.timestamp_ms = index as u64 + 1;
+            request.write_concern = Some(
+                crate::write_concern::WriteConcernOptions::builder()
+                    .concern(crate::write_concern::WriteConcern::Count(2))
+                    .timeout(Duration::from_secs(10))
+                    .build()
+                    .encode()
+                    .unwrap(),
+            );
+            operations.push(ReplicatedOp {
+                key: request.key.clone(),
+                value: VersionedValue::new(
+                    request.value.clone(),
+                    request.timestamp_ms,
+                    request.node_id.clone(),
+                ),
+                seq: request.seq,
+                boot_id: request.boot_id,
+            });
+            let (job, response) = MutationJob::new(
+                MutationRequest::Single(request),
+                actor.clone(),
+                senders.clone(),
+                FragmentId(0),
+                gate.try_enter().unwrap(),
+                None,
+            );
+            service.submit(job);
+            responses.push(response);
+        }
+        periodic_async_check(
+            || {
+                let shared = shared.clone();
+                async move { shared.get_all().await.len() == WORKERS_PER_PRIORITY }
+            },
+            Duration::from_secs(2),
+        )
+        .await;
+        let (job, plain) = MutationJob::new(
+            MutationRequest::Single(put(100, Priority::Default)),
+            actor.clone(),
+            senders,
+            FragmentId(0),
+            gate.try_enter().unwrap(),
+            None,
+        );
+        service.submit(job);
+        let completion = tokio::time::timeout(Duration::from_secs(2), plain)
+            .await
+            .expect("plain write was blocked behind acknowledgement waits")
+            .unwrap();
+        assert_eq!(
+            completion.response.results[0].status,
+            MutationStatus::Applied as i32
+        );
+        tracker.acknowledge("peer", FragmentId(0), &operations);
+        for response in responses {
+            assert!(response.await.unwrap().response.results[0]
+                .write_concern
+                .is_some());
+        }
+        service.shutdown().await;
+        actor.stop(None);
+    }
 
     #[derive(Default)]
     struct GatedStore {

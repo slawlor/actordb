@@ -187,29 +187,25 @@ impl Node {
             let attempt_deadline = Instant::now().checked_add(timeout).ok_or_else(|| {
                 WriteConcernError::InvalidPolicy("forwarded concern timeout exceeds range".into())
             })?;
-            if !try_send_envelope_until(
-                &tx,
-                Envelope {
-                    msg: Some(EnvelopeMsg::ForwardedPut(ForwardedPut {
-                        key: op.key.clone(),
-                        value: op.value.value.clone(),
-                        timestamp_ms: op.value.timestamp_ms,
-                        node_id: op.value.node_id.clone(),
-                        seq: op.seq,
-                        boot_id: op.boot_id,
-                        expires_at_ms: op.value.expires_at_ms.unwrap_or(0),
-                        is_tombstone: op.value.is_tombstone,
-                        priority: priority_to_proto(priority),
-                        hops: 0,
-                        req_id,
+            let envelope = Envelope {
+                msg: Some(EnvelopeMsg::ForwardedPut(ForwardedPut {
+                    key: op.key.clone(),
+                    value: op.value.value.clone(),
+                    timestamp_ms: op.value.timestamp_ms,
+                    node_id: op.value.node_id.clone(),
+                    seq: op.seq,
+                    boot_id: op.boot_id,
+                    expires_at_ms: op.value.expires_at_ms.unwrap_or(0),
+                    is_tombstone: op.value.is_tombstone,
+                    priority: priority_to_proto(priority),
+                    hops: 0,
+                    req_id,
 
-                        write_concern: policy.clone(),
-                    })),
-                },
-                attempt_deadline,
-            )
-            .await
-            {
+                    write_concern: policy.clone(),
+                })),
+            };
+            check_envelope_budget(&envelope, MAX_FRAME_BYTES).map_err(|e| NodeError::Codec(e.to_string()))?;
+            if !try_send_envelope_until(&tx, envelope, attempt_deadline).await {
                 continue;
             }
             let response = tokio::time::timeout_at(attempt_deadline, resp_rx).await;

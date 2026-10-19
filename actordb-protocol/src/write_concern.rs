@@ -199,6 +199,9 @@ impl WriteConcernReceipt {
             || (self.replica_count == 0 && self.requested != 1)
             || (self.replica_count > 0 && self.requested > self.replica_count / 2 + 1)
             || self.acknowledged_nodes.len() > MAX_WRITE_CONCERN_REPLICAS
+            || (self.replica_count == 0 && self.acknowledged_nodes.len() != 1)
+            || (self.replica_count > 0
+                && self.acknowledged_nodes.len() > self.replica_count as usize)
             || self.acknowledged_nodes.iter().any(|id| !valid_id(id))
             || self.acknowledged_nodes.iter().collect::<HashSet<_>>().len()
                 != self.acknowledged_nodes.len()

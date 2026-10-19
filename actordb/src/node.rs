@@ -9770,7 +9770,45 @@ async fn relay_put(
         return;
     };
     let relay_id = ctx.next_req_id.fetch_add(1, Ordering::Relaxed);
-    let attempt_deadline = deadline_after(ctx.forwarded_attempt_timeout);
+    let extra = match p
+        .write_concern
+        .as_deref()
+        .map(crate::write_concern::WriteConcernOptions::decode)
+        .transpose()
+    {
+        Ok(options) => options.map_or(Duration::ZERO, |options| options.timeout()),
+        Err(error) => {
+            let failure = crate::write_concern::WriteConcernError::from(error);
+            let mut result = mutation_result(p.key, 0, Err(NodeError::Codec(failure.to_string())));
+            result.write_concern = failure.outcome().map(|outcome| outcome.encode());
+            let _ = send_mutation_response(
+                origin_tx,
+                MutationResponse {
+                    req_id: original_req_id,
+                    results: vec![result],
+                },
+            );
+            return;
+        }
+    };
+    let Some(timeout) = ctx.forwarded_attempt_timeout.checked_add(extra) else {
+        let _ = send_unavailable_mutation(
+            origin_tx,
+            original_req_id,
+            vec![p.key],
+            "relay concern timeout exceeds range",
+        );
+        return;
+    };
+    let Some(attempt_deadline) = Instant::now().checked_add(timeout) else {
+        let _ = send_unavailable_mutation(
+            origin_tx,
+            original_req_id,
+            vec![p.key],
+            "relay concern timeout exceeds range",
+        );
+        return;
+    };
     let keys = vec![p.key.clone()];
     let Some(registration) = register_mutation_relay(
         &ctx.tasks,
@@ -12445,7 +12483,7 @@ mod tests {
             auth_tag: Vec::new(),
             min_protocol_version: WIRE_PROTOCOL_VERSION,
             max_protocol_version: WIRE_PROTOCOL_VERSION,
-            capabilities: REQUIRED_WIRE_CAPABILITIES,
+            capabilities: 0x7f, // Fixed offer for the independent transcript vector.
             challenge: vec![1; HANDSHAKE_CHALLENGE_BYTES],
         };
         let listener = Hello {
@@ -12453,7 +12491,7 @@ mod tests {
             auth_tag: Vec::new(),
             min_protocol_version: WIRE_PROTOCOL_VERSION,
             max_protocol_version: WIRE_PROTOCOL_VERSION,
-            capabilities: REQUIRED_WIRE_CAPABILITIES,
+            capabilities: 0x7f, // Fixed offer for the independent transcript vector.
             challenge: vec![2; HANDSHAKE_CHALLENGE_BYTES],
         };
         let authenticated = handshake_auth_tag(b"secret", true, &dialer, &listener);
