@@ -8,6 +8,15 @@ Integration tests stay in `actordb/tests` to exercise real-node behavior and
 public APIs from outside the library. Test project behavior and failure modes,
 not generated builder plumbing or repetitive default/override assertions.
 
+Transport coverage in `actordb/tests/network.rs` exercises buffered in-process
+streams, partial I/O, peer replication/reconnects, and listener/stream ownership
+on cancellation and shutdown. `actordb-client/tests/transports.rs` verifies
+injected streams/acceptors, application authentication and validation, transient
+accept failures, handshake cancellation, and caller-configured TLS for both
+application traffic and peer replication. It also checks TLS trust/name failures
+and that unfinished TLS clients do not block healthy sessions. See the
+[transport guide](transports.md) for the adapter contract and runnable example.
+
 The separate `Verify release package` workflow check additionally verifies
 unpacked crates.io packages for backend-free defaults and opted-in storage
 features, and runs stdlib release-guard regressions. PR and `main` runs have no

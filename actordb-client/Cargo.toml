@@ -15,4 +15,6 @@ tokio = { version = "1", features = ["sync", "time", "net", "io-util"] }
 
 [dev-dependencies]
 actordb = { version = "0.5.0", path = "../actordb" }
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "ring"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

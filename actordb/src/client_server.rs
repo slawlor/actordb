@@ -1,11 +1,12 @@
-//! Opt-in application TCP listener composed around an existing [`crate::node::Node`].
+//! Opt-in application listener composed around an existing [`crate::node::Node`].
 //!
 //! Application clients never join peer membership. Credentials are separate
 //! from cluster secrets. TCP authentication proves possession but does not
-//! encrypt traffic; deploy this listener on a protected network or TLS proxy.
+//! encrypt traffic; supply a protected [`Network`] transport when needed.
 //! Listener shutdown closes application sessions and leaves the Node running.
 
 use crate::actor::{OpPriority, VersionedValue};
+use crate::network::{Acceptor, BoxStream, Network};
 use crate::node::{Node, NodeError};
 use actordb_protocol::{
     client as wire, CLIENT_CAPABILITIES, CLIENT_PROTOCOL_VERSION, MAX_FRAME_BYTES,
@@ -16,7 +17,6 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{watch, Semaphore};
 use tokio::task::{JoinHandle, JoinSet};
 
@@ -48,11 +48,97 @@ pub struct ClientServer {
     task: Option<JoinHandle<()>>,
 }
 impl ClientServer {
+    /// Bind a plain TCP application listener.
     pub async fn bind(
         node: Arc<Node>,
         addr: SocketAddr,
         options: ClientServerOptions,
     ) -> Result<Self, NodeError> {
+        Self::validate_options(&options)?;
+        let (addr, acceptor) = crate::network::bind_tcp(addr).await?;
+        Self::from_acceptor(node, addr, acceptor, options)
+    }
+
+    /// Bind an application listener using a caller-configured transport.
+    ///
+    /// The transport supplies byte streams; the application protocol and its
+    /// credentials remain independent of peer membership and cluster secrets.
+    /// Transport operations must obey [`Network`]'s cancellation and ownership
+    /// contract. TLS configuration and certificate validation belong to the caller.
+    pub async fn bind_with_network(
+        node: Arc<Node>,
+        addr: SocketAddr,
+        network: Arc<dyn Network>,
+        options: ClientServerOptions,
+    ) -> Result<Self, NodeError> {
+        Self::validate_options(&options)?;
+        let (addr, acceptor) = network
+            .bind(addr)
+            .await
+            .map_err(|e| NodeError::Network(e.to_string()))?;
+        Self::from_acceptor(node, addr, acceptor, options)
+    }
+
+    /// Serve application connections from an existing acceptor.
+    ///
+    /// `addr` is the listener address reported by [`Self::addr`]. Ownership of
+    /// the acceptor and every accepted stream transfers to this server, including
+    /// on validation failure. Shutdown cancels pending accepts, releases the
+    /// listener, and joins application sessions without shutting down the Node.
+    pub fn from_acceptor(
+        node: Arc<Node>,
+        addr: SocketAddr,
+        mut acceptor: Box<dyn Acceptor>,
+        options: ClientServerOptions,
+    ) -> Result<Self, NodeError> {
+        Self::validate_options(&options)?;
+        let (cancel, mut cancellation) = watch::channel(false);
+        let connections = Arc::new(Semaphore::new(options.max_connections));
+        let requests = Arc::new(Semaphore::new(options.max_in_flight_requests));
+        let bytes = Arc::new(Semaphore::new(options.receive_bytes));
+        let task = tokio::spawn(async move {
+            let mut sessions = JoinSet::new();
+            loop {
+                tokio::select! {
+                    _ = cancellation.changed() => break,
+                    Some(_) = sessions.join_next(), if !sessions.is_empty() => {},
+                    accepted = acceptor.accept() => {
+                        let stream = match accepted {
+                            Ok(stream) => stream,
+                            Err(error) => {
+                                tracing::warn!(%error, "application accept failed; retrying");
+                                tokio::select! {
+                                    _ = cancellation.changed() => break,
+                                    _ = tokio::time::sleep(Duration::from_millis(100)) => {},
+                                }
+                                continue;
+                            }
+                        };
+                        let Ok(permit) = connections.clone().try_acquire_owned() else { continue; };
+                        let node = node.clone(); let options = options.clone();
+                        let bytes = bytes.clone(); let requests = requests.clone();
+                        let mut cancellation = cancellation.clone();
+                        sessions.spawn(async move {
+                            let _connection_permit = permit;
+                            serve_connection(node, stream, options, bytes, requests, &mut cancellation).await;
+                        });
+                    }
+                }
+            }
+            // Release the listener before joining accepted mutation work.
+            drop(acceptor);
+            // Idle/read-only work cancels promptly. Accepted mutations own
+            // their apply and fan-out until completion, even after stream loss.
+            while sessions.join_next().await.is_some() {}
+        });
+        Ok(Self {
+            addr,
+            cancel,
+            task: Some(task),
+        })
+    }
+
+    fn validate_options(options: &ClientServerOptions) -> Result<(), NodeError> {
         if options.max_connections == 0
             || options.max_connections > Semaphore::MAX_PERMITS
             || options.max_in_flight_requests == 0
@@ -73,40 +159,7 @@ impl ClientServer {
                 "invalid application listener limits or credential".into(),
             ));
         }
-        let listener = TcpListener::bind(addr).await?;
-        let addr = listener.local_addr()?;
-        let (cancel, mut cancellation) = watch::channel(false);
-        let connections = Arc::new(Semaphore::new(options.max_connections));
-        let requests = Arc::new(Semaphore::new(options.max_in_flight_requests));
-        let bytes = Arc::new(Semaphore::new(options.receive_bytes));
-        let task = tokio::spawn(async move {
-            let mut sessions = JoinSet::new();
-            loop {
-                tokio::select! {
-                    _ = cancellation.changed() => break,
-                    Some(_) = sessions.join_next(), if !sessions.is_empty() => {},
-                    accepted = listener.accept() => {
-                        let Ok((stream, _)) = accepted else { break; };
-                        let Ok(permit) = connections.clone().try_acquire_owned() else { continue; };
-                        let node = node.clone(); let options = options.clone();
-                        let bytes = bytes.clone(); let requests = requests.clone();
-                        let mut cancellation = cancellation.clone();
-                        sessions.spawn(async move {
-                            let _connection_permit = permit;
-                            serve_connection(node, stream, options, bytes, requests, &mut cancellation).await;
-                        });
-                    }
-                }
-            }
-            // Idle/read-only work cancels promptly. Accepted mutations own
-            // their apply and fan-out until completion, even after socket loss.
-            while sessions.join_next().await.is_some() {}
-        });
-        Ok(Self {
-            addr,
-            cancel,
-            task: Some(task),
-        })
+        Ok(())
     }
     pub fn addr(&self) -> SocketAddr {
         self.addr
@@ -127,14 +180,13 @@ impl Drop for ClientServer {
 
 async fn serve_connection(
     node: Arc<Node>,
-    mut stream: TcpStream,
+    mut stream: BoxStream,
     options: ClientServerOptions,
     bytes: Arc<Semaphore>,
     requests: Arc<Semaphore>,
     cancellation: &mut watch::Receiver<bool>,
 ) {
     let handshake = async {
-        stream.set_nodelay(true).ok()?;
         let client = match receive(&mut stream, actordb_protocol::MAX_HANDSHAKE_BYTES, &bytes)
             .await?
             .0
@@ -763,17 +815,18 @@ fn decode_cell(
         _ => Err("invalid parameter"),
     }
 }
-async fn send(stream: &mut TcpStream, frame: wire::Frame) -> Option<()> {
+async fn send(stream: &mut BoxStream, frame: wire::Frame) -> Option<()> {
     if frame.encoded_len() > MAX_FRAME_BYTES {
         return None;
     }
     let bytes = frame.encode_to_vec();
     stream.write_u32(bytes.len() as u32).await.ok()?;
     stream.write_all(&bytes).await.ok()?;
+    stream.flush().await.ok()?;
     Some(())
 }
 async fn receive(
-    stream: &mut TcpStream,
+    stream: &mut BoxStream,
     max: usize,
     bytes: &Arc<Semaphore>,
 ) -> Option<(wire::Frame, tokio::sync::OwnedSemaphorePermit)> {

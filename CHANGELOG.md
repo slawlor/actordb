@@ -2,6 +2,11 @@
 
 ## 0.5.0
 
+- Add caller-supplied application transports with `Client::from_stream`,
+  `ClientServer::bind_with_network`, and `ClientServer::from_acceptor`, preserving
+  plain TCP defaults and the existing wire protocols. Flush complete peer and
+  application frames for buffered streams; include a caller-configured mTLS
+  example and transport lifecycle/conformance tests.
 - Add per-write `Local`, `Count(n)`, and `Majority` acknowledgement policies
   to Node and Rust client single-key put/delete APIs, including TTL/priority.
 - Return explicit acknowledgement receipts and partial progress on timeout;

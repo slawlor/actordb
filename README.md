@@ -131,6 +131,8 @@ Comprehensive guides live in [`docs/`](docs/):
   byte projections, and exact aggregates over the virtual `kv` table
 - [Rust client](actordb-client/README.md) — remote application connections,
   operation coverage, credentials, and mutation retry semantics
+- [Custom transports and TLS](docs/transports.md) — caller-owned stream transports
+  for the peer mesh, application listener, and SDK, with a runnable mTLS example
 - [Traffic classes & backpressure](docs/backpressure.md) — `OpPriority`,
   pool config, shed behavior and observability
 - [Configuration reference](docs/configuration.md) — every `NodeConfig`
