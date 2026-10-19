@@ -1,5 +1,16 @@
 # Release notes
 
+## 0.5.1
+
+- Add per-write requirements for a processed acknowledgement from another
+  configured region, with validated region maps and frozen replica eligibility.
+- Preserve the region requirement when the numeric acknowledgement threshold
+  is one; report region progress in success and timeout receipts.
+- Reject incomplete region configuration before apply and reject missing or
+  malformed required region progress in routed and SDK success replies.
+- Update all four public crate versions and inter-crate minimums to compatible
+  0.5.1 ranges. See `docs/write-concern-regions.md` for configuration and limits.
+
 ## 0.5.0
 
 - Add per-write `Local`, `Count(n)`, and `Majority` acknowledgement policies

@@ -2796,13 +2796,17 @@ impl Drop for StoreBindingStartupGuard {
     }
 }
 
-/// Runtime liveness and queue policy for a [`Node`].
+/// Runtime liveness, queue policy, and region configuration for a [`Node`].
 ///
 /// This is separate from [`NodeConfig`] so adding transport policy does not
 /// break existing exhaustive `NodeConfig` literals. [`Node::start`] uses the
 /// defaults; pass an override to [`Node::start_with_options`].
 #[derive(Clone, Debug, bon::Builder)]
 pub struct NodeRuntimeOptions {
+    /// Operator-supplied node-to-region labels. Labels compare by exact bytes;
+    /// they do not change placement or authenticate physical location.
+    #[builder(default, into)]
+    regions: Arc<HashMap<String, String>>,
     #[builder(default = PEER_CHANNEL_DEPTH)]
     peer_queue_frame_capacity: usize,
     #[builder(default = PEER_CHANNEL_BYTE_CAPACITY)]
@@ -2852,6 +2856,25 @@ impl Default for NodeRuntimeOptions {
 }
 
 impl NodeRuntimeOptions {
+    /// Set the node-to-region map used by region acknowledgement requirements.
+    /// Node IDs and region labels must each contain 1 to 255 UTF-8 bytes.
+    /// Startup validates supplied entries. Ordinary writes permit an empty or
+    /// partial map; region-constrained writes additionally validate the serving
+    /// replica set before applying their mutation.
+    ///
+    /// Configure consistent labels on every node that can receive mutations.
+    /// Labels are operator assertions, not measured network locations, and do
+    /// not influence replica placement.
+    pub fn with_regions(mut self, regions: HashMap<String, String>) -> Self {
+        self.regions = Arc::new(regions);
+        self
+    }
+
+    /// Operator-supplied node-to-region labels.
+    pub fn regions(&self) -> &HashMap<String, String> {
+        &self.regions
+    }
+
     /// Set the total number of frames buffered per peer connection. At least
     /// two slots are required so data and reader-generated responses each
     /// retain a bounded lane.
@@ -3127,6 +3150,18 @@ impl NodeRuntimeOptions {
     }
 
     fn validate(&self) -> Result<(), NodeError> {
+        for (node_id, region) in self.regions.iter() {
+            if node_id.is_empty() || node_id.len() > MAX_WIRE_NODE_ID_BYTES {
+                return Err(NodeError::Actor(format!(
+                    "region map node_id must contain 1 to {MAX_WIRE_NODE_ID_BYTES} bytes"
+                )));
+            }
+            if region.is_empty() || region.len() > MAX_WIRE_NODE_ID_BYTES {
+                return Err(NodeError::Actor(format!(
+                    "region label must contain 1 to {MAX_WIRE_NODE_ID_BYTES} bytes"
+                )));
+            }
+        }
         for (name, capacity) in [
             ("relay capacity", self.relay_capacity),
             ("relay key byte capacity", self.relay_key_byte_capacity),
@@ -3746,6 +3781,7 @@ impl Node {
             fragment_map.clone(),
             runtime_options.forwarded_mutation_capacity,
         );
+        write_concerns.configure_regions(runtime_options.regions.as_ref().clone());
         let node = Self {
             node_id: node_id.clone(),
             boot_id: fresh_boot_id(),
@@ -11945,6 +11981,41 @@ mod tests {
         assert!(truncated.len() <= MAX_WIRE_ERROR_BYTES);
         assert!(truncated.is_char_boundary(truncated.len()));
         assert_eq!(truncate_wire_error("short".to_string()), "short");
+    }
+
+    #[test]
+    fn runtime_regions_validate_utf8_byte_lengths() {
+        for (node_id, region) in [
+            (String::new(), "west".to_string()),
+            ("n".repeat(256), "west".to_string()),
+            ("node".to_string(), String::new()),
+            ("node".to_string(), "r".repeat(256)),
+            ("node".to_string(), "🦀".repeat(64)),
+        ] {
+            let options =
+                NodeRuntimeOptions::default().with_regions(HashMap::from([(node_id, region)]));
+            assert!(options.validate().is_err());
+        }
+        let options = NodeRuntimeOptions::builder()
+            .regions(HashMap::from([("n".repeat(255), "r".repeat(255))]))
+            .build();
+        assert!(options.validate().is_ok());
+        assert!(NodeRuntimeOptions::default().validate().is_ok());
+    }
+
+    #[tokio::test]
+    async fn invalid_region_config_fails_before_bind() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let options = NodeRuntimeOptions::default()
+            .with_regions(HashMap::from([("node".to_string(), String::new())]));
+        let result = Node::start_with_options(
+            "node".to_string(),
+            listener.local_addr().unwrap(),
+            NodeConfig::default(),
+            options,
+        )
+        .await;
+        assert!(matches!(result, Err(NodeError::Actor(error)) if error.contains("region label")));
     }
 
     #[test]

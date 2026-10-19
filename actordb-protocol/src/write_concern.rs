@@ -10,7 +10,7 @@ use crate::meta;
 
 pub const MAX_WRITE_CONCERN_REPLICAS: usize = 4096;
 pub const MAX_WRITE_CONCERN_POLICY_BYTES: usize = 1024;
-const MAX_RESULT_BYTES: usize = MAX_WRITE_CONCERN_REPLICAS * 258 + 8192;
+const MAX_RESULT_BYTES: usize = 2 * MAX_WRITE_CONCERN_REPLICAS * 258 + 8192;
 
 /// Total acknowledgements, including the receiving node.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -53,6 +53,10 @@ pub struct WriteConcernOptions {
     concern: WriteConcern,
     #[builder(default = Duration::from_secs(5))]
     timeout: Duration,
+    /// Additionally require a processed acknowledgement outside the receiver's
+    /// configured region, including for local and count-one policies.
+    #[builder(default)]
+    require_other_region: bool,
 }
 
 impl Default for WriteConcernOptions {
@@ -67,6 +71,15 @@ impl WriteConcernOptions {
     }
     pub fn timeout(&self) -> Duration {
         self.timeout
+    }
+    /// Whether success additionally requires a processed outside-region replica.
+    pub fn require_other_region(&self) -> bool {
+        self.require_other_region
+    }
+    /// Add or clear the independent region acknowledgement requirement.
+    pub fn with_require_other_region(mut self, required: bool) -> Self {
+        self.require_other_region = required;
+        self
     }
     pub fn validate(&self) -> Result<(), WriteConcernPolicyError> {
         let ms = self.timeout.as_millis();
@@ -92,6 +105,7 @@ impl WriteConcernOptions {
             level: level as i32,
             acknowledgements,
             timeout_ms: self.timeout.as_millis() as u64,
+            require_other_region: self.require_other_region,
         }
         .encode_to_vec())
     }
@@ -116,6 +130,7 @@ impl WriteConcernOptions {
         let options = Self {
             concern,
             timeout: Duration::from_millis(policy.timeout_ms),
+            require_other_region: policy.require_other_region,
         };
         options.validate()?;
         Ok(options)
@@ -150,6 +165,8 @@ pub struct WriteConcernReceipt {
     requested: u32,
     required: u32,
     acknowledged_nodes: Vec<String>,
+    receiving_region: Option<String>,
+    outside_region_acknowledged_nodes: Vec<String>,
 }
 
 impl WriteConcernReceipt {
@@ -166,6 +183,8 @@ impl WriteConcernReceipt {
             requested,
             required,
             acknowledged_nodes,
+            receiving_region: None,
+            outside_region_acknowledged_nodes: Vec::new(),
         };
         receipt.validate()?;
         Ok(receipt)
@@ -189,8 +208,63 @@ impl WriteConcernReceipt {
         self.required < self.requested
     }
 
+    /// Attach progress against the receiving node's frozen region requirement.
+    pub fn with_region_progress(
+        mut self,
+        receiving_region: String,
+        outside_region_acknowledged_nodes: Vec<String>,
+    ) -> Result<Self, WriteConcernPolicyError> {
+        self.receiving_region = Some(receiving_region);
+        self.outside_region_acknowledged_nodes = outside_region_acknowledged_nodes;
+        self.validate()?;
+        Ok(self)
+    }
+    /// Frozen receiving-region label, present when a region requirement was used.
+    pub fn receiving_region(&self) -> Option<&str> {
+        self.receiving_region.as_deref()
+    }
+    /// Eligible acknowledged identities classified outside the receiving region
+    /// by the receiving node's frozen configuration.
+    pub fn outside_region_acknowledged_nodes(&self) -> &[String] {
+        &self.outside_region_acknowledged_nodes
+    }
+    /// Whether an eligible outside-region processing acknowledgement was observed.
+    pub fn other_region_satisfied(&self) -> bool {
+        self.receiving_region.is_some() && !self.outside_region_acknowledged_nodes.is_empty()
+    }
+    /// Validate receipt correlation with the requested policy. A timed-out
+    /// receipt may lack the required progress but must preserve policy metadata.
+    pub fn validate_for(
+        &self,
+        options: &WriteConcernOptions,
+        satisfied: bool,
+    ) -> Result<(), WriteConcernPolicyError> {
+        self.validate()?;
+        let expected = options
+            .concern()
+            .required_acknowledgements(self.replica_count as usize)?;
+        if self.requested != expected {
+            return Err(invalid(
+                "write concern reply changed the requested threshold",
+            ));
+        }
+        if options.require_other_region()
+            && (self.receiving_region.is_none() || satisfied && !self.other_region_satisfied())
+        {
+            return Err(invalid(
+                "write concern reply lacks required region progress",
+            ));
+        }
+        if satisfied && self.acknowledged_nodes.len() < self.required as usize {
+            return Err(invalid("receipt lacks required acknowledgements"));
+        }
+        Ok(())
+    }
+
     fn validate(&self) -> Result<(), WriteConcernPolicyError> {
         let valid_id = |id: &str| !id.is_empty() && id.len() <= 255;
+        let acknowledged: HashSet<_> = self.acknowledged_nodes.iter().collect();
+        let outside: HashSet<_> = self.outside_region_acknowledged_nodes.iter().collect();
         if !valid_id(&self.receiving_node)
             || self.requested == 0
             || self.required == 0
@@ -203,12 +277,23 @@ impl WriteConcernReceipt {
             || (self.replica_count > 0
                 && self.acknowledged_nodes.len() > self.replica_count as usize)
             || self.acknowledged_nodes.iter().any(|id| !valid_id(id))
-            || self.acknowledged_nodes.iter().collect::<HashSet<_>>().len()
-                != self.acknowledged_nodes.len()
+            || acknowledged.len() != self.acknowledged_nodes.len()
             || !self
                 .acknowledged_nodes
                 .iter()
                 .any(|id| id == &self.receiving_node)
+            || self
+                .receiving_region
+                .as_ref()
+                .is_some_and(|region| !valid_id(region))
+            || self.receiving_region.is_some() && self.replica_count == 0
+            || self.receiving_region.is_none() && !self.outside_region_acknowledged_nodes.is_empty()
+            || self.outside_region_acknowledged_nodes.len() > self.acknowledged_nodes.len()
+            || outside.len() != self.outside_region_acknowledged_nodes.len()
+            || self
+                .outside_region_acknowledged_nodes
+                .iter()
+                .any(|id| id == &self.receiving_node || !acknowledged.contains(id))
         {
             return Err(invalid("invalid write concern receipt"));
         }
@@ -255,6 +340,9 @@ impl WriteConcernOutcome {
             result.requested_acknowledgements = receipt.requested;
             result.required_acknowledgements = receipt.required;
             result.acknowledged_nodes = receipt.acknowledged_nodes.clone();
+            result.receiving_region = receipt.receiving_region.clone();
+            result.outside_region_acknowledged_nodes =
+                receipt.outside_region_acknowledged_nodes.clone();
         }
         result.encode_to_vec()
     }
@@ -266,16 +354,25 @@ impl WriteConcernOutcome {
                 meta::WriteConcernStatus::WriteConcernSatisfied
                 | meta::WriteConcernStatus::WriteConcernTimedOut,
             ) => {
-                let receipt = WriteConcernReceipt::new(
+                let mut receipt = WriteConcernReceipt::new(
                     result.receiving_node,
                     result.replica_count,
                     result.requested_acknowledgements,
                     result.required_acknowledgements,
                     result.acknowledged_nodes,
                 )?;
+                if let Some(region) = result.receiving_region {
+                    receipt = receipt
+                        .with_region_progress(region, result.outside_region_acknowledged_nodes)?;
+                } else if !result.outside_region_acknowledged_nodes.is_empty() {
+                    return Err(invalid("region progress lacks receiving region"));
+                }
                 if result.status == meta::WriteConcernStatus::WriteConcernSatisfied as i32 {
                     if receipt.acknowledged_nodes.len() < receipt.required as usize {
                         return Err(invalid("receipt lacks required acknowledgements"));
+                    }
+                    if receipt.receiving_region.is_some() && !receipt.other_region_satisfied() {
+                        return Err(invalid("receipt lacks required region acknowledgement"));
                     }
                     Ok(Self::Satisfied(receipt))
                 } else {
@@ -315,11 +412,11 @@ pub fn preflight_policy(bytes: &[u8]) -> Result<(), WriteConcernPolicyError> {
         return Err(invalid("write concern policy exceeds byte limit"));
     }
     let mut pos = 0;
-    let mut seen = [false; 4];
+    let mut seen = [false; 5];
     while pos < bytes.len() {
         let tag = varint(bytes, &mut pos)?;
         let field = tag >> 3;
-        if !(1..=3).contains(&field) {
+        if !(1..=4).contains(&field) {
             return Err(WriteConcernPolicyError::Unsupported(
                 "unsupported write concern policy field".into(),
             ));
@@ -328,7 +425,10 @@ pub fn preflight_policy(bytes: &[u8]) -> Result<(), WriteConcernPolicyError> {
             return Err(invalid("invalid or duplicate policy field"));
         }
         seen[field as usize] = true;
-        varint(bytes, &mut pos)?;
+        let value = varint(bytes, &mut pos)?;
+        if field == 4 && value > 1 {
+            return Err(invalid("invalid region requirement boolean"));
+        }
     }
     Ok(())
 }
@@ -339,6 +439,7 @@ pub fn preflight_result(bytes: &[u8]) -> Result<(), WriteConcernPolicyError> {
     }
     let mut pos = 0;
     let mut nodes = 0usize;
+    let mut outside_nodes = 0usize;
     while pos < bytes.len() {
         let tag = varint(bytes, &mut pos)?;
         let field = tag >> 3;
@@ -368,7 +469,13 @@ pub fn preflight_result(bytes: &[u8]) -> Result<(), WriteConcernPolicyError> {
                         return Err(invalid("receipt acknowledgement limit"));
                     }
                 }
-                if field == 2 && len > 255 || field == 7 && len > 4096 {
+                if field == 9 {
+                    outside_nodes += 1;
+                    if outside_nodes > MAX_WRITE_CONCERN_REPLICAS || len > 255 {
+                        return Err(invalid("receipt region acknowledgement limit"));
+                    }
+                }
+                if (field == 2 || field == 8) && len > 255 || field == 7 && len > 4096 {
                     return Err(invalid("receipt string limit"));
                 }
                 pos = pos
@@ -426,5 +533,82 @@ mod tests {
             WriteConcernOutcome::decode(&result.encode()).unwrap(),
             result
         );
+    }
+    #[test]
+    fn region_policy_roundtrips_and_requires_canonical_boolean() {
+        let options = WriteConcernOptions::builder()
+            .require_other_region(true)
+            .build();
+        let encoded = options.encode().unwrap();
+        assert_eq!(WriteConcernOptions::decode(&encoded).unwrap(), options);
+        assert!(WriteConcernOptions::decode(&[encoded, vec![32, 1]].concat()).is_err());
+        assert!(WriteConcernOptions::decode(&[32, 2]).is_err());
+    }
+    #[test]
+    fn region_receipts_require_acknowledged_distinct_outside_nodes() {
+        let base =
+            WriteConcernReceipt::new("a".into(), 3, 1, 1, vec!["a".into(), "b".into()]).unwrap();
+        for nodes in [
+            vec!["a".into()],
+            vec!["outside".into()],
+            vec!["b".into(), "b".into()],
+        ] {
+            assert!(base
+                .clone()
+                .with_region_progress("west".into(), nodes)
+                .is_err());
+        }
+        let receipt = base
+            .with_region_progress("west".into(), vec!["b".into()])
+            .unwrap();
+        let options = WriteConcernOptions::default().with_require_other_region(true);
+        assert!(receipt.validate_for(&options, true).is_ok());
+        let outcome = WriteConcernOutcome::Satisfied(receipt);
+        assert_eq!(
+            WriteConcernOutcome::decode(&outcome.encode()).unwrap(),
+            outcome
+        );
+        let timed_out = WriteConcernReceipt::new("a".into(), 3, 1, 1, vec!["a".into()])
+            .unwrap()
+            .with_region_progress("west".into(), Vec::new())
+            .unwrap();
+        assert!(timed_out.validate_for(&options, false).is_ok());
+        assert!(timed_out.validate_for(&options, true).is_err());
+        assert!(WriteConcernOutcome::decode(
+            &WriteConcernOutcome::Satisfied(timed_out.clone()).encode()
+        )
+        .is_err());
+        let outcome = WriteConcernOutcome::TimedOut(timed_out);
+        assert_eq!(
+            WriteConcernOutcome::decode(&outcome.encode()).unwrap(),
+            outcome
+        );
+    }
+    #[test]
+    fn maximum_region_receipt_fits_and_preflight_bounds_region_fields() {
+        let ids: Vec<_> = (0..MAX_WRITE_CONCERN_REPLICAS)
+            .map(|i| format!("{i:04}{}", "x".repeat(251)))
+            .collect();
+        let receipt = WriteConcernReceipt::new(
+            ids[0].clone(),
+            MAX_WRITE_CONCERN_REPLICAS as u32,
+            1,
+            1,
+            ids.clone(),
+        )
+        .unwrap()
+        .with_region_progress("west".into(), ids[1..].to_vec())
+        .unwrap();
+        let outcome = WriteConcernOutcome::Satisfied(receipt);
+        assert_eq!(
+            WriteConcernOutcome::decode(&outcome.encode()).unwrap(),
+            outcome
+        );
+        // Field 9, 4097 one-byte strings.
+        let excessive = [74, 1, b'n'].repeat(MAX_WRITE_CONCERN_REPLICAS + 1);
+        assert!(preflight_result(&excessive).is_err());
+        let mut oversized_region = vec![66, 128, 2];
+        oversized_region.extend([b'x'; 256]);
+        assert!(preflight_result(&oversized_region).is_err());
     }
 }

@@ -16,18 +16,20 @@ The `0.5` release series requires Rust 1.88+:
 
 ```toml
 [dependencies]
-actordb = "0.5"
+actordb = "0.5.1"
 ```
 
 [Write concern](docs/write-concern.md) adds per-write acknowledgement counts
 and majority waits while preserving local acknowledgement as the default.
+[Region requirements](docs/write-concern-regions.md) can additionally require
+a processed acknowledgement outside the receiving node's configured region.
 
 The default crate includes no concrete storage backend. Its actor cache and
 `KvStore` contracts work without a database; `NodeConfig.store` remains `None`
 unless you supply a custom store. RocksDB is an independent opt-in:
 
 ```toml
-actordb = { version = "0.5", features = ["rocksdb"] }
+actordb = { version = "0.5.1", features = ["rocksdb"] }
 ```
 
 The separate `memory` feature exposes the no-op `MemoryStore` test double; it
