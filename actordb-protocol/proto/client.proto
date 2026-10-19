@@ -25,8 +25,9 @@ message Put {
   bytes value = 2;
   optional uint64 ttl_ms = 3;
   meta.Priority priority = 4;
+  optional bytes write_concern = 5;
 }
-message Delete { string key = 1; meta.Priority priority = 2; }
+message Delete { string key = 1; meta.Priority priority = 2; optional bytes write_concern = 3; }
 message BatchGet { repeated string keys = 1; meta.Priority priority = 2; }
 message BatchPut { repeated Put puts = 1; meta.Priority priority = 2; }
 message Query { string sql = 1; repeated meta.QueryCell params = 2; }
@@ -81,7 +82,7 @@ message Value {
   optional uint64 expires_at_ms = 4;
 }
 message ReadResult { string key = 1; Value value = 2; Error error = 3; }
-message MutationResult { string key = 1; Error error = 2; }
+message MutationResult { string key = 1; Error error = 2; optional bytes write_concern = 3; }
 message QueryResult { repeated string columns = 1; repeated meta.QueryPageRow rows = 2; }
 message FragmentHealth {
   uint32 fragment = 1;

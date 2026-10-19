@@ -430,6 +430,61 @@ fn preflight_repeated_field(
     Ok(())
 }
 
+fn preflight_concern_field(
+    message: &[u8],
+    concern_field: u32,
+    receipt: bool,
+) -> Result<(), WireDecodeError> {
+    let mut cursor = 0;
+    let mut seen = false;
+    while cursor < message.len() {
+        let tag = read_varint(message, &mut cursor)?;
+        if tag >> 3 == u64::from(concern_field) {
+            if tag & 7 != 2 || seen {
+                return Err(WireDecodeError::Malformed(
+                    "invalid or duplicate write concern",
+                ));
+            }
+            seen = true;
+            let bytes = take_length_delimited(message, &mut cursor)?;
+            if receipt {
+                actordb_protocol::write_concern::preflight_result(bytes)
+                    .map_err(|_| WireDecodeError::Malformed("invalid write concern receipt"))?;
+            } else if bytes.len() > actordb_protocol::write_concern::MAX_WRITE_CONCERN_POLICY_BYTES
+            {
+                return Err(WireDecodeError::Malformed(
+                    "write concern policy exceeds byte limit",
+                ));
+            }
+        } else {
+            skip_field(message, &mut cursor, (tag & 7) as u8)?;
+        }
+    }
+    Ok(())
+}
+
+fn preflight_concerns_in_entries(
+    message: &[u8],
+    entry_field: u32,
+    concern_field: u32,
+    receipt: bool,
+) -> Result<(), WireDecodeError> {
+    let mut cursor = 0;
+    while cursor < message.len() {
+        let tag = read_varint(message, &mut cursor)?;
+        if tag >> 3 == u64::from(entry_field) && tag & 7 == 2 {
+            preflight_concern_field(
+                take_length_delimited(message, &mut cursor)?,
+                concern_field,
+                receipt,
+            )?;
+        } else {
+            skip_field(message, &mut cursor, (tag & 7) as u8)?;
+        }
+    }
+    Ok(())
+}
+
 /// Inspect the envelope and dangerous repeated fields before Prost allocates.
 /// This intentionally understands only the outer message and immediate
 /// repeated fields; byte payloads stay opaque and are bounded by the frame.
@@ -456,6 +511,7 @@ pub(crate) fn preflight_envelope_decode(frame: &[u8]) -> Result<(), WireDecodeEr
             }
             let payload = take_length_delimited(frame, &mut cursor)?;
             match field {
+                5 => preflight_concern_field(payload, 12, false)?,
                 // Retired ReplicateOp, SyncRequest, and SyncResponse.
                 2..=4 => return Err(WireDecodeError::RetiredMessage),
                 9 => preflight_repeated_field(
@@ -482,7 +538,10 @@ pub(crate) fn preflight_envelope_decode(frame: &[u8]) -> Result<(), WireDecodeEr
                     MAX_RECONCILE_PAGE_ITEMS,
                     "ReconcileData.entries",
                 )?,
-                15 => preflight_repeated_field(payload, 1, MAX_WIRE_BATCH_ITEMS, "BatchPut.puts")?,
+                15 => {
+                    preflight_repeated_field(payload, 1, MAX_WIRE_BATCH_ITEMS, "BatchPut.puts")?;
+                    preflight_concerns_in_entries(payload, 1, 12, false)?;
+                }
                 16 => preflight_repeated_field(payload, 2, MAX_WIRE_BATCH_ITEMS, "BatchGet.keys")?,
                 17 => preflight_repeated_field(
                     payload,
@@ -490,12 +549,15 @@ pub(crate) fn preflight_envelope_decode(frame: &[u8]) -> Result<(), WireDecodeEr
                     MAX_WIRE_BATCH_ITEMS,
                     "BatchGetResponse.results",
                 )?,
-                18 => preflight_repeated_field(
-                    payload,
-                    2,
-                    MAX_WIRE_BATCH_ITEMS,
-                    "MutationResponse.results",
-                )?,
+                18 => {
+                    preflight_repeated_field(
+                        payload,
+                        2,
+                        MAX_WIRE_BATCH_ITEMS,
+                        "MutationResponse.results",
+                    )?;
+                    preflight_concerns_in_entries(payload, 2, 8, true)?;
+                }
                 // ScanResponse.matches: bounded by the per-fragment scan
                 // limit; the 16 MiB frame cap is the hard bound. This
                 // preflight count is a sanity ceiling against absurd
@@ -1265,6 +1327,8 @@ mod tests {
             priority: 2,
             hops: u32::MAX,
             req_id: u64::MAX,
+
+            write_concern: None,
         };
         let envelopes = [
             Envelope {
@@ -1339,6 +1403,8 @@ mod tests {
                         winner_node_id: "n".repeat(MAX_WIRE_NODE_ID_BYTES),
                         winner_is_tombstone: true,
                         request_index: u32::MAX,
+
+                        write_concern: None,
                     }],
                 })),
             },

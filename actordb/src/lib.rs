@@ -50,6 +50,9 @@ pub mod supervision;
 /// senders with batching, acks, and reconciliation).
 pub mod replication;
 
+/// Per-write processing acknowledgement policies and receipts.
+pub mod write_concern;
+
 /// Phase 8: dynamic placement controller — runtime fragment lifecycle,
 /// chunked bootstrap, and controller-sequenced migration.
 pub mod placement;

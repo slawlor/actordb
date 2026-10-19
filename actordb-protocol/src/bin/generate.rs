@@ -8,6 +8,8 @@ fn main() {
     std::env::set_var("PROTOC", protobuf_src::protoc());
     let mut config = prost_build::Config::new();
     config.out_dir(&temporary);
+    config.type_attribute(".meta.WriteConcernPolicy", "#[non_exhaustive]");
+    config.type_attribute(".meta.WriteConcernResult", "#[non_exhaustive]");
     config
         .compile_protos(
             &[source.join("meta.proto"), source.join("client.proto")],

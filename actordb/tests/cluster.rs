@@ -480,6 +480,8 @@ fn batch_put_response(
                 winner_node_id: String::new(),
                 winner_is_tombstone: false,
                 request_index: request_index as u32,
+
+                write_concern: None,
             };
             match status {
                 MutationStatus::Superseded => {
@@ -6609,6 +6611,8 @@ async fn timed_out_single_put_retries_the_exact_stamped_operation() {
                         winner_node_id: String::new(),
                         winner_is_tombstone: false,
                         request_index: 0,
+
+                        write_concern: None,
                     }],
                 })),
             },
@@ -8699,6 +8703,8 @@ async fn pre_handshake_forwarded_put_ignored() {
                 priority: 0,
                 hops: 0,
                 req_id: 1,
+
+                write_concern: None,
             })),
         },
     )

@@ -83,6 +83,7 @@ use read_service::{
     READ_WORKERS_PER_PRIORITY,
 };
 mod mutation_service;
+mod write_concern;
 use mutation_service::{
     MutationJob, MutationRequest, MutationService, FORWARDED_MUTATION_BYTE_CAPACITY,
     FORWARDED_MUTATION_CAPACITY,
@@ -117,6 +118,8 @@ pub const CAPABILITY_STABLE_DURABILITY_ACKS: u64 = 1 << 6;
 pub const CAPABILITY_SCAN: u64 = 1 << 7;
 /// Optional revision-guarded, bounded SQL query pages.
 pub const CAPABILITY_QUERY_PAGES: u64 = 1 << 8;
+/// Forwarded writes carry explicit acknowledgement policy and progress.
+pub const CAPABILITY_WRITE_CONCERNS: u64 = 1 << 9;
 /// Capabilities required by this binary before it installs a peer connection.
 pub const REQUIRED_WIRE_CAPABILITIES: u64 = CAPABILITY_MUTATION_RESULTS
     | CAPABILITY_DURABILITY_ACKS
@@ -124,7 +127,8 @@ pub const REQUIRED_WIRE_CAPABILITIES: u64 = CAPABILITY_MUTATION_RESULTS
     | CAPABILITY_CHALLENGE_AUTH
     | CAPABILITY_PAGED_ANTI_ENTROPY
     | CAPABILITY_BYTE_BOUNDED_BATCHES
-    | CAPABILITY_STABLE_DURABILITY_ACKS;
+    | CAPABILITY_STABLE_DURABILITY_ACKS
+    | CAPABILITY_WRITE_CONCERNS;
 
 /// Outbound queue depth per peer connection.
 const PEER_CHANNEL_DEPTH: usize = 256;
@@ -1513,6 +1517,8 @@ fn mutation_result(
         winner_node_id: String::new(),
         winner_is_tombstone: false,
         request_index: request_index as u32,
+
+        write_concern: None,
     };
     match result {
         Ok(ApplyOutcome::Applied) => {}
@@ -2038,6 +2044,7 @@ pub struct Node {
     retiring_senders: Arc<RetiringSenderRegistry>,
     /// Phase 5 sender tuning.
     sender_config: SenderConfig,
+    pub(crate) write_concerns: Arc<crate::write_concern::WriteConcernTracker>,
     /// Transport and replication liveness policy.
     runtime_options: NodeRuntimeOptions,
     /// State reports for each sender, keyed by (fragment, peer).
@@ -3734,6 +3741,11 @@ impl Node {
                 "node runtime stopped during serving read startup".to_string(),
             ));
         };
+        let write_concerns = crate::write_concern::WriteConcernTracker::new(
+            node_id.clone(),
+            fragment_map.clone(),
+            runtime_options.forwarded_mutation_capacity,
+        );
         let node = Self {
             node_id: node_id.clone(),
             boot_id: fresh_boot_id(),
@@ -3764,6 +3776,7 @@ impl Node {
             finalizing_senders: Arc::new(SenderFinalizationRegistry::default()),
             retiring_senders: Arc::new(RetiringSenderRegistry::default()),
             sender_config: config.replication.clone(),
+            write_concerns: write_concerns.clone(),
             runtime_options: runtime_options.clone(),
             sender_reports: Arc::new(Mutex::new(HashMap::new())),
             sync_entries_applied: Arc::new(AtomicU64::new(0)),
@@ -3780,9 +3793,10 @@ impl Node {
                 runtime_options.relay_capacity,
                 runtime_options.relay_key_byte_capacity,
             ),
-            mutation_service: MutationService::new(
+            mutation_service: MutationService::new_with_tracker(
                 runtime_options.forwarded_mutation_capacity,
                 runtime_options.forwarded_mutation_byte_capacity,
+                write_concerns,
             ),
             dial_intents: Arc::new(StdMutex::new(HashMap::new())),
             dial_intent_changes,
@@ -3846,7 +3860,10 @@ impl Node {
                 retiring_senders: node.retiring_senders.clone(),
                 sender_reports: node.sender_reports.clone(),
                 sender_config: node.sender_config.clone(),
-                sender_runtime: node.runtime_options.sender_options(),
+                sender_runtime: node
+                    .runtime_options
+                    .sender_options()
+                    .with_write_concerns(node.write_concerns.clone()),
                 peers: node.peers.clone(),
                 peer_failures: node.peer_failures.clone(),
                 tasks: Arc::downgrade(&node.placement_tasks),
@@ -4050,7 +4067,10 @@ impl Node {
             finalizing_senders: self.finalizing_senders.clone(),
             retiring_senders: self.retiring_senders.clone(),
             sender_config: self.sender_config.clone(),
-            sender_runtime: self.runtime_options.sender_options(),
+            sender_runtime: self
+                .runtime_options
+                .sender_options()
+                .with_write_concerns(self.write_concerns.clone()),
             runtime_options: self.runtime_options.clone(),
             receive_byte_budget: self.receive_byte_budget.clone(),
             relay_admission: self.relay_admission.clone(),
@@ -4118,7 +4138,10 @@ impl Node {
             peer,
             SenderEntryDeps {
                 config: &self.sender_config,
-                runtime: &self.runtime_options.sender_options(),
+                runtime: &self
+                    .runtime_options
+                    .sender_options()
+                    .with_write_concerns(self.write_concerns.clone()),
                 router: &self.router,
                 hlc: &self.hlc,
                 senders: &self.senders,
@@ -4326,116 +4349,10 @@ impl Node {
         op: ReplicatedOp,
         priority: OpPriority,
     ) -> Result<(), NodeError> {
-        validate_replicated_op(&op)?;
-        let frag = fragment_of(&op.key, self.router.fragment_count);
-        let mutation_lease = if self.placement_controller.is_some() {
-            Some(self.router.mutation_gate(frag).read_owned().await)
-        } else {
-            None
-        };
-        let local_actor = if self.serving.read().unwrap().contains(&frag) {
-            self.router.route_for_fragment(frag)
-        } else {
-            None
-        };
-        if let Some(actor) = local_actor {
-            let outcome = call_apply(&actor, op.clone(), priority, false).await?;
-
-            match outcome {
-                ApplyOutcome::Applied | ApplyOutcome::AlreadyPresent => {}
-                ApplyOutcome::Superseded {
-                    timestamp_ms,
-                    node_id,
-                    is_tombstone,
-                } => {
-                    return Err(NodeError::Superseded {
-                        timestamp_ms,
-                        node_id,
-                        is_tombstone,
-                    })
-                }
-                ApplyOutcome::Expired => {
-                    let mut expiry = op.clone();
-                    expiry.value = expiry.value.expiry_tombstone();
-                    self.enqueue_for_replication(frag, &expiry).await;
-                    return Err(NodeError::Expired);
-                }
-            }
-
-            self.enqueue_for_replication(frag, &op).await;
-            return Ok(());
-        }
-        drop(mutation_lease);
-
-        // Remote fragment: retry the exact stamped operation across the
-        // configured holders. A prior attempt may have applied the value and
-        // lost its response, so every retry carries the same LWW version.
-        let replicas = self.replica_order(frag);
-        if replicas.is_empty() {
-            return Err(NodeError::Actor(format!("no replica for fragment {frag}")));
-        }
-        let expected_key = op.key.clone();
-        let mut tried = Vec::with_capacity(replicas.len());
-        for owner in replicas {
-            tried.push(owner.clone());
-            let Some(tx) = self.peer_sender(&owner).await else {
-                continue;
-            };
-            let req_id = self.next_req_id.fetch_add(1, Ordering::Relaxed);
-            let (resp_tx, resp_rx) = oneshot::channel();
-            self.pending_mutations.lock().unwrap().insert(
-                req_id,
-                PendingMutation {
-                    expected_peer: owner.clone(),
-                    expected_keys: vec![expected_key.clone()],
-                    reply: resp_tx,
-                },
-            );
-            let _pending_guard = PendingMutationGuard {
-                req_id,
-                pending: self.pending_mutations.clone(),
-            };
-            let attempt_deadline = deadline_after(self.runtime_options.forwarded_attempt_timeout);
-            if !try_send_envelope_until(
-                &tx,
-                Envelope {
-                    msg: Some(EnvelopeMsg::ForwardedPut(ForwardedPut {
-                        key: op.key.clone(),
-                        value: op.value.value.clone(),
-                        timestamp_ms: op.value.timestamp_ms,
-                        node_id: op.value.node_id.clone(),
-                        seq: op.seq,
-                        boot_id: op.boot_id,
-                        expires_at_ms: op.value.expires_at_ms.unwrap_or(0),
-                        is_tombstone: op.value.is_tombstone,
-                        priority: priority_to_proto(priority),
-                        hops: 0,
-                        req_id,
-                    })),
-                },
-                attempt_deadline,
-            )
+        self.apply_routed_with_concern(op, priority, None)
             .await
-            {
-                continue;
-            }
-            let response = tokio::time::timeout_at(attempt_deadline, resp_rx).await;
-            let Ok(Ok(mut results)) = response else {
-                continue;
-            };
-            if validate_mutation_results(std::slice::from_ref(&expected_key), &results).is_err() {
-                continue;
-            }
-            let result = results.remove(0);
-            if MutationStatus::try_from(result.status) == Ok(MutationStatus::Unavailable) {
-                continue;
-            }
-            return decode_mutation_result(result);
-        }
-        Err(NodeError::Network(format!(
-            "no replica acknowledged mutation for fragment {frag} (tried {})",
-            tried.join(",")
-        )))
+            .map(|_| ())
+            .map_err(crate::write_concern::WriteConcernError::into_node_error)
     }
 
     /// Read a key locally when this node serves the fragment; otherwise try
@@ -4687,6 +4604,8 @@ impl Node {
                         priority: wire_priority,
                         hops: 0,
                         req_id: 0,
+
+                        write_concern: None,
                     },
                 ));
             }
@@ -5158,7 +5077,10 @@ impl Node {
         &self,
         targets: &[ReplicationDrainTarget],
     ) -> Result<Vec<ReplicationDrainWaiter>, String> {
-        let sender_runtime = self.runtime_options.sender_options();
+        let sender_runtime = self
+            .runtime_options
+            .sender_options()
+            .with_write_concerns(self.write_concerns.clone());
         let mut senders = Vec::with_capacity(targets.len());
         for target in targets {
             ensure_sender_entry(
@@ -8819,6 +8741,7 @@ async fn handle_connection(
                         }
                         continue;
                     };
+                    let concerned = p.write_concern.is_some();
                     let (job, completion) = MutationJob::new(
                         MutationRequest::Single(p),
                         actor,
@@ -8828,6 +8751,22 @@ async fn handle_connection(
                         mutation_lease,
                     );
                     mutation_service.submit(job);
+                    if concerned {
+                        let response_tx = tx.clone();
+                        if let Some(tasks) = tasks.upgrade() {
+                            if tasks
+                                .spawn(async move {
+                                    if let Ok(completion) = completion.await {
+                                        completion.send(&response_tx);
+                                    }
+                                })
+                                .await
+                            {
+                                continue;
+                            }
+                        }
+                        break;
+                    }
                     // Preserve connection frame order. Cancellation of this
                     // waiter never cancels the owned apply/outcome/fanout job.
                     let Ok(completion) = completion.await else {
@@ -9831,7 +9770,45 @@ async fn relay_put(
         return;
     };
     let relay_id = ctx.next_req_id.fetch_add(1, Ordering::Relaxed);
-    let attempt_deadline = deadline_after(ctx.forwarded_attempt_timeout);
+    let extra = match p
+        .write_concern
+        .as_deref()
+        .map(crate::write_concern::WriteConcernOptions::decode)
+        .transpose()
+    {
+        Ok(options) => options.map_or(Duration::ZERO, |options| options.timeout()),
+        Err(error) => {
+            let failure = crate::write_concern::WriteConcernError::from(error);
+            let mut result = mutation_result(p.key, 0, Err(NodeError::Codec(failure.to_string())));
+            result.write_concern = failure.outcome().map(|outcome| outcome.encode());
+            let _ = send_mutation_response(
+                origin_tx,
+                MutationResponse {
+                    req_id: original_req_id,
+                    results: vec![result],
+                },
+            );
+            return;
+        }
+    };
+    let Some(timeout) = ctx.forwarded_attempt_timeout.checked_add(extra) else {
+        let _ = send_unavailable_mutation(
+            origin_tx,
+            original_req_id,
+            vec![p.key],
+            "relay concern timeout exceeds range",
+        );
+        return;
+    };
+    let Some(attempt_deadline) = Instant::now().checked_add(timeout) else {
+        let _ = send_unavailable_mutation(
+            origin_tx,
+            original_req_id,
+            vec![p.key],
+            "relay concern timeout exceeds range",
+        );
+        return;
+    };
     let keys = vec![p.key.clone()];
     let Some(registration) = register_mutation_relay(
         &ctx.tasks,
@@ -11411,6 +11388,8 @@ mod tests {
             winner_node_id: String::new(),
             winner_is_tombstone: false,
             request_index,
+
+            write_concern: None,
         }
     }
 
@@ -11635,6 +11614,8 @@ mod tests {
                 priority: ProtoPriority::Default as i32,
                 hops: 0,
                 req_id: 0,
+
+                write_concern: None,
             },
             ForwardedPut {
                 key: "k".repeat(127),
@@ -11648,6 +11629,8 @@ mod tests {
                 priority: ProtoPriority::Default as i32,
                 hops: 0,
                 req_id: 0,
+
+                write_concern: None,
             },
         ];
         let priority = ProtoPriority::Default as i32;
@@ -11722,6 +11705,8 @@ mod tests {
             winner_node_id: "n".repeat(MAX_WIRE_NODE_ID_BYTES),
             winner_is_tombstone: true,
             request_index: u32::MAX,
+
+            write_concern: None,
         };
         assert_eq!(
             max_mutation_result_encoded_len(key.len()),
@@ -12498,7 +12483,7 @@ mod tests {
             auth_tag: Vec::new(),
             min_protocol_version: WIRE_PROTOCOL_VERSION,
             max_protocol_version: WIRE_PROTOCOL_VERSION,
-            capabilities: REQUIRED_WIRE_CAPABILITIES,
+            capabilities: 0x7f, // Fixed offer for the independent transcript vector.
             challenge: vec![1; HANDSHAKE_CHALLENGE_BYTES],
         };
         let listener = Hello {
@@ -12506,7 +12491,7 @@ mod tests {
             auth_tag: Vec::new(),
             min_protocol_version: WIRE_PROTOCOL_VERSION,
             max_protocol_version: WIRE_PROTOCOL_VERSION,
-            capabilities: REQUIRED_WIRE_CAPABILITIES,
+            capabilities: 0x7f, // Fixed offer for the independent transcript vector.
             challenge: vec![2; HANDSHAKE_CHALLENGE_BYTES],
         };
         let authenticated = handshake_auth_tag(b"secret", true, &dialer, &listener);
@@ -13433,6 +13418,8 @@ mod tests {
                     priority: ProtoPriority::Default as i32,
                     hops: MAX_FORWARD_HOPS,
                     req_id: 11,
+
+                    write_concern: None,
                 })),
             },
         )
@@ -13465,6 +13452,8 @@ mod tests {
                         priority: ProtoPriority::Default as i32,
                         hops: 0,
                         req_id: 12,
+
+                        write_concern: None,
                     }],
                     priority: ProtoPriority::Default as i32,
                     req_id: 12,
@@ -13496,6 +13485,8 @@ mod tests {
                     priority: ProtoPriority::Default as i32,
                     hops: 0,
                     req_id: 13,
+
+                    write_concern: None,
                 })),
             },
         )
@@ -16118,6 +16109,8 @@ mod tests {
                     priority: ProtoPriority::Background as i32,
                     hops: index as u32,
                     req_id: index as u64 + 500,
+
+                    write_concern: None,
                 })
                 .collect(),
         };
@@ -16249,6 +16242,8 @@ mod tests {
                     priority: ProtoPriority::Default as i32,
                     hops: 0,
                     req_id,
+
+                    write_concern: None,
                 })),
             };
             write_test_envelope(&mut client, read(10)).await;

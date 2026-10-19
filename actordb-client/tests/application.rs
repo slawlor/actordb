@@ -414,6 +414,8 @@ async fn malformed_ordered_results_and_query_rows_retire_connection() {
                     response.mutations = vec![wire::MutationResult {
                         key: "wrong".into(),
                         error: None,
+
+                        write_concern: None,
                     }]
                 }
                 _ => {

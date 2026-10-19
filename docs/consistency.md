@@ -2,7 +2,8 @@
 
 actordb provides **last-writer-wins (LWW) eventual consistency** with a
 read-your-write guarantee scoped to a single priority. There is no consensus
-protocol, no quorum, and no linearizability.
+protocol or linearizability. Per-write concern can require processing
+acknowledgements, including majority; see [Write concern](write-concern.md).
 
 ## Conflict resolution: LWW by HLC
 

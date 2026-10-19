@@ -94,6 +94,8 @@ message ForwardedPut {
   uint32 hops = 10;
   // Correlates the exact apply outcome back to the originating node.
   uint64 req_id = 11;
+  // Optional encoded WriteConcernPolicy. Absence preserves local acknowledgement.
+  optional bytes write_concern = 12;
 }
 
 // A single-key routed read. The origin tries configured holders in order; a
@@ -287,6 +289,35 @@ message MutationResult {
   string winner_node_id = 5;
   bool winner_is_tombstone = 6;
   uint32 request_index = 7;
+  // Encoded WriteConcernResult, present only when a policy was requested.
+  optional bytes write_concern = 8;
+}
+
+enum WriteConcernLevel {
+  WRITE_CONCERN_LOCAL = 0;
+  WRITE_CONCERN_COUNT = 1;
+  WRITE_CONCERN_MAJORITY = 2;
+}
+message WriteConcernPolicy {
+  WriteConcernLevel level = 1;
+  uint32 acknowledgements = 2;
+  uint64 timeout_ms = 3;
+}
+enum WriteConcernStatus {
+  WRITE_CONCERN_SATISFIED = 0;
+  WRITE_CONCERN_TIMED_OUT = 1;
+  WRITE_CONCERN_INVALID = 2;
+  WRITE_CONCERN_BACKPRESSURE = 3;
+  WRITE_CONCERN_UNSUPPORTED = 4;
+}
+message WriteConcernResult {
+  WriteConcernStatus status = 1;
+  string receiving_node = 2;
+  uint32 replica_count = 3;
+  uint32 requested_acknowledgements = 4;
+  uint32 required_acknowledgements = 5;
+  repeated string acknowledged_nodes = 6;
+  string error = 7;
 }
 
 message MutationResponse {
