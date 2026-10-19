@@ -2279,7 +2279,8 @@ async fn run_queued_peer_writer<W>(
         }
         let write = async {
             writer.write_u32(frame.len() as u32).await?;
-            writer.write_all(frame.bytes()).await
+            writer.write_all(frame.bytes()).await?;
+            writer.flush().await
         };
         let result = tokio::select! {
             changed = cancel_rx.changed() => {
@@ -2796,13 +2797,17 @@ impl Drop for StoreBindingStartupGuard {
     }
 }
 
-/// Runtime liveness and queue policy for a [`Node`].
+/// Runtime liveness, queue policy, and region configuration for a [`Node`].
 ///
 /// This is separate from [`NodeConfig`] so adding transport policy does not
 /// break existing exhaustive `NodeConfig` literals. [`Node::start`] uses the
 /// defaults; pass an override to [`Node::start_with_options`].
 #[derive(Clone, Debug, bon::Builder)]
 pub struct NodeRuntimeOptions {
+    /// Operator-supplied node-to-region labels. Labels compare by exact bytes;
+    /// they do not change placement or authenticate physical location.
+    #[builder(default, into)]
+    regions: Arc<HashMap<String, String>>,
     #[builder(default = PEER_CHANNEL_DEPTH)]
     peer_queue_frame_capacity: usize,
     #[builder(default = PEER_CHANNEL_BYTE_CAPACITY)]
@@ -2843,6 +2848,9 @@ pub struct NodeRuntimeOptions {
     replication_ack_timeout: Duration,
     #[builder(default = Duration::from_secs(5))]
     health_timeout: Duration,
+    /// Optional operational ceiling on acknowledgement counts for new writes.
+    /// This weakens requested write concerns and is never applied automatically.
+    write_concern_acknowledgement_cap: Option<u32>,
 }
 
 impl Default for NodeRuntimeOptions {
@@ -2852,6 +2860,25 @@ impl Default for NodeRuntimeOptions {
 }
 
 impl NodeRuntimeOptions {
+    /// Set the node-to-region map used by region acknowledgement requirements.
+    /// Node IDs and region labels must each contain 1 to 255 UTF-8 bytes.
+    /// Startup validates supplied entries. Ordinary writes permit an empty or
+    /// partial map; region-constrained writes additionally validate the serving
+    /// replica set before applying their mutation.
+    ///
+    /// Configure consistent labels on every node that can receive mutations.
+    /// Labels are operator assertions, not measured network locations, and do
+    /// not influence replica placement.
+    pub fn with_regions(mut self, regions: HashMap<String, String>) -> Self {
+        self.regions = Arc::new(regions);
+        self
+    }
+
+    /// Operator-supplied node-to-region labels.
+    pub fn regions(&self) -> &HashMap<String, String> {
+        &self.regions
+    }
+
     /// Set the total number of frames buffered per peer connection. At least
     /// two slots are required so data and reader-generated responses each
     /// retain a bounded lane.
@@ -3019,6 +3046,27 @@ impl NodeRuntimeOptions {
         self
     }
 
+    /// Lower acknowledgement requirements for writes received by this node to
+    /// at most `cap`. A cap must be positive; startup rejects zero. It never
+    /// raises a requested threshold or removes any additional write requirement.
+    ///
+    /// Use only when intentionally accepting weaker replication assurance.
+    pub fn with_write_concern_acknowledgement_cap(mut self, cap: u32) -> Self {
+        self.write_concern_acknowledgement_cap = Some(cap);
+        self
+    }
+
+    /// Restore requested acknowledgement counts in this startup configuration.
+    pub fn without_write_concern_acknowledgement_cap(mut self) -> Self {
+        self.write_concern_acknowledgement_cap = None;
+        self
+    }
+
+    /// Optional operational ceiling on acknowledgement counts for new writes.
+    pub fn write_concern_acknowledgement_cap(&self) -> Option<u32> {
+        self.write_concern_acknowledgement_cap
+    }
+
     /// Current per-peer outbound frame capacity.
     pub fn peer_queue_frame_capacity(&self) -> usize {
         self.peer_queue_frame_capacity
@@ -3127,6 +3175,23 @@ impl NodeRuntimeOptions {
     }
 
     fn validate(&self) -> Result<(), NodeError> {
+        for (node_id, region) in self.regions.iter() {
+            if node_id.is_empty() || node_id.len() > MAX_WIRE_NODE_ID_BYTES {
+                return Err(NodeError::Actor(format!(
+                    "region map node_id must contain 1 to {MAX_WIRE_NODE_ID_BYTES} bytes"
+                )));
+            }
+            if region.is_empty() || region.len() > MAX_WIRE_NODE_ID_BYTES {
+                return Err(NodeError::Actor(format!(
+                    "region label must contain 1 to {MAX_WIRE_NODE_ID_BYTES} bytes"
+                )));
+            }
+        }
+        if self.write_concern_acknowledgement_cap == Some(0) {
+            return Err(NodeError::Actor(
+                "write concern acknowledgement cap must be positive".to_string(),
+            ));
+        }
         for (name, capacity) in [
             ("relay capacity", self.relay_capacity),
             ("relay key byte capacity", self.relay_key_byte_capacity),
@@ -3746,6 +3811,12 @@ impl Node {
             fragment_map.clone(),
             runtime_options.forwarded_mutation_capacity,
         );
+        write_concerns.configure_regions(runtime_options.regions.as_ref().clone());
+        if let Some(cap) = runtime_options.write_concern_acknowledgement_cap {
+            write_concerns
+                .set_acknowledgement_cap(cap)
+                .expect("runtime options validated before startup");
+        }
         let node = Self {
             node_id: node_id.clone(),
             boot_id: fresh_boot_id(),
@@ -11945,6 +12016,54 @@ mod tests {
         assert!(truncated.len() <= MAX_WIRE_ERROR_BYTES);
         assert!(truncated.is_char_boundary(truncated.len()));
         assert_eq!(truncate_wire_error("short".to_string()), "short");
+    }
+
+    #[test]
+    fn runtime_regions_validate_utf8_byte_lengths() {
+        for (node_id, region) in [
+            (String::new(), "west".to_string()),
+            ("n".repeat(256), "west".to_string()),
+            ("node".to_string(), String::new()),
+            ("node".to_string(), "r".repeat(256)),
+            ("node".to_string(), "🦀".repeat(64)),
+        ] {
+            let options =
+                NodeRuntimeOptions::default().with_regions(HashMap::from([(node_id, region)]));
+            assert!(options.validate().is_err());
+        }
+        let options = NodeRuntimeOptions::builder()
+            .regions(HashMap::from([("n".repeat(255), "r".repeat(255))]))
+            .build();
+        assert!(options.validate().is_ok());
+        assert!(NodeRuntimeOptions::default().validate().is_ok());
+    }
+
+    #[tokio::test]
+    async fn invalid_region_config_fails_before_bind() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let options = NodeRuntimeOptions::default()
+            .with_regions(HashMap::from([("node".to_string(), String::new())]));
+        let result = Node::start_with_options(
+            "node".to_string(),
+            listener.local_addr().unwrap(),
+            NodeConfig::default(),
+            options,
+        )
+        .await;
+        assert!(matches!(result, Err(NodeError::Actor(error)) if error.contains("region label")));
+    }
+
+    #[test]
+    fn runtime_options_reject_zero_write_concern_acknowledgement_cap() {
+        assert!(NodeRuntimeOptions::default()
+            .with_write_concern_acknowledgement_cap(0)
+            .validate()
+            .is_err());
+        assert!(NodeRuntimeOptions::default()
+            .with_write_concern_acknowledgement_cap(0)
+            .without_write_concern_acknowledgement_cap()
+            .validate()
+            .is_ok());
     }
 
     #[test]

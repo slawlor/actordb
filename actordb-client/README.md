@@ -32,7 +32,13 @@ in-flight request closes that connection; later requests return `Closed`.
 
 Optional credentials are distinct from cluster secrets and must contain at
 least 32 random bytes. Mutual challenge authentication prevents replay but plain
-TCP does not encrypt traffic. Use a protected network or TLS termination.
+TCP does not encrypt traffic. Supply a caller-validated TLS stream with
+`Client::from_stream(stream, options)` and use `ClientServer::bind_with_network`
+or `ClientServer::from_acceptor` on the server. The caller owns TLS configuration
+and transport handshake deadlines; ActorDB retains application authentication,
+request limits, and cancellation semantics. See the [transport guide](../docs/transports.md).
+Run `cargo run -p actordb-client --example tls_demo` for a complete mTLS mesh and
+application example.
 Application connections never become replication peers. Administrative shutdown,
 placement mutation, local debug dumps, and peer replication/reconciliation RPCs
 are deliberately not application operations.
@@ -40,3 +46,10 @@ are deliberately not application operations.
 This crate's normal dependency tree contains no database actors, native storage
 engine, or protobuf compiler. Integration tests depend on `actordb` only for the
 real application listener.
+
+Per-write acknowledgement counts and region requirements are available through
+`put_with_write_concern` and `delete_with_write_concern`. Install
+`actordb-client = "0.6.0"` for region support; the compatible dependency minimums
+also select the required protocol and query revisions. See the
+[region guide](../docs/write-concern-regions.md) for configuration and receipt
+semantics. Local acknowledgement remains the default.

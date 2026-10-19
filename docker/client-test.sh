@@ -28,6 +28,11 @@ wait_marker() {
             return 0
         fi
         if [ "$(docker inspect --format '{{.State.Running}}' "$container")" != true ]; then
+            # The client may print its final marker and exit between the first
+            # log snapshot and inspect. Read the completed output before failing.
+            if docker logs "$container" 2>&1 | grep -Fx "$marker" >/dev/null; then
+                return 0
+            fi
             echo "$service exited before $marker"
             return 1
         fi

@@ -149,14 +149,9 @@ fn decode_concern_result(
                     "success receipt conflicts with mutation error".into(),
                 ));
             }
-            let expected = options
-                .concern()
-                .required_acknowledgements(receipt.replica_count().unwrap_or(0) as usize)?;
-            if receipt.requested_acknowledgements() != expected {
-                return Err(WriteConcernClientError::UnknownOutcome(
-                    "server changed requested acknowledgement count".into(),
-                ));
-            }
+            receipt
+                .validate_for(options, true)
+                .map_err(|e| WriteConcernClientError::UnknownOutcome(e.to_string()))?;
             Ok(receipt)
         }
         WriteConcernOutcome::TimedOut(receipt) => {
@@ -169,6 +164,9 @@ fn decode_concern_result(
                     "timeout receipt conflicts with mutation error".into(),
                 ));
             }
+            receipt
+                .validate_for(options, false)
+                .map_err(|e| WriteConcernClientError::UnknownOutcome(e.to_string()))?;
             Err(WriteConcernClientError::TimedOut(receipt))
         }
         WriteConcernOutcome::InvalidPolicy(e) => Err(WriteConcernClientError::InvalidPolicy(e)),

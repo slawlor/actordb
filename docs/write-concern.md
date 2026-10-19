@@ -118,22 +118,23 @@ concerns support at most 4,096 eligible replicas, and policy/result decoding is
 bounded before allocating repeated acknowledgement lists. No concern threshold
 is automatically lowered because peers are disconnected.
 
-## Separate extensions
+## Additional controls
 
 | Extension | Scope |
 | --- | --- |
 | Region requirement | Require at least one acknowledgement outside the receiving node's region, together with the numeric threshold. |
 | Operational cap | Explicitly lower the numeric threshold for new writes and report requested/effective counts in the receipt. |
 
-These extensions are developed as separate feature PRs. The base decoder
-rejects unknown required policy fields, so an older implementation cannot
-silently ignore a new constraint.
+The region requirement and operational cap apply independently. A numeric cap
+never removes a region requirement. Decoders reject unknown required policy
+fields, so an older implementation cannot silently ignore a new constraint.
 
 ## Release and compatibility
 
-This feature uses **0.5.0** because generated public message structs gain
-optional `write_concern` fields. Downstream struct literals must initialize
-those fields or use `Default`. All four public crates and inter-crate minimum
+The **0.5.0** release includes acknowledgement policies, region requirements,
+and operational caps. It uses a new minor version because generated public
+message structs gain optional `write_concern` fields. Downstream struct literals
+must initialize those fields or use `Default`. All four public crates and inter-crate minimum
 requirements move to compatible `0.5.0` ranges.
 
 Peers require the new write-concern capability before connecting. Upgrade the
@@ -141,3 +142,11 @@ peer cluster together. The application protocol negotiates concern support;
 older SDK operations without a concern retain their local-acknowledged wire
 behavior. The LWW record/store format and ordinary Node mutation signatures
 remain the same.
+
+## Operational overrides
+
+A receiving node can explicitly cap acknowledgement counts for new writes.
+The default is no cap. A cap never raises the requested count or removes an
+additional region requirement. Receipts retain both the requested and
+effective thresholds. See [operational write concern overrides](write-concern-overrides.md)
+for configuration, runtime controls, and their effect on existing waiters.

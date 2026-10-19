@@ -2,11 +2,16 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt;
+use std::num::NonZeroU32;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use sha2::{Digest, Sha256};
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 use tokio::time::Instant;
+
+mod overrides;
+use overrides::effective_acknowledgement_count;
 
 use crate::actor::ReplicatedOp;
 use crate::node::NodeError;
@@ -15,6 +20,8 @@ pub use actordb_protocol::write_concern::{
     WriteConcern, WriteConcernOptions, WriteConcernOutcome, WriteConcernPolicyError,
     WriteConcernReceipt, MAX_WRITE_CONCERN_REPLICAS,
 };
+mod regions;
+use regions::RegionRequirement;
 
 #[derive(Debug)]
 #[non_exhaustive]
@@ -89,17 +96,17 @@ pub(crate) fn decode_outcome(
         WriteConcernError::UnknownOutcome(format!("invalid write concern receipt: {e}"))
     })? {
         WriteConcernOutcome::Satisfied(receipt) => {
-            let expected = options
-                .concern()
-                .required_acknowledgements(receipt.replica_count().unwrap_or(0) as usize)?;
-            if expected != receipt.requested_acknowledgements() {
-                return Err(WriteConcernError::UnknownOutcome(
-                    "write concern reply changed the requested threshold".into(),
-                ));
-            }
+            receipt
+                .validate_for(options, true)
+                .map_err(|e| WriteConcernError::UnknownOutcome(e.to_string()))?;
             Ok(receipt)
         }
-        WriteConcernOutcome::TimedOut(receipt) => Err(WriteConcernError::TimedOut(receipt)),
+        WriteConcernOutcome::TimedOut(receipt) => {
+            receipt
+                .validate_for(options, false)
+                .map_err(|e| WriteConcernError::UnknownOutcome(e.to_string()))?;
+            Err(WriteConcernError::TimedOut(receipt))
+        }
         WriteConcernOutcome::InvalidPolicy(e) => Err(WriteConcernError::InvalidPolicy(e)),
         WriteConcernOutcome::Unsupported(e) => Err(WriteConcernError::Unsupported(e)),
         WriteConcernOutcome::Backpressure => Err(WriteConcernError::Backpressure),
@@ -117,23 +124,41 @@ pub(crate) struct WriteConcernPlan {
     pub(crate) required: u32,
     pub(crate) eligible: HashSet<String>,
     pub(crate) options: WriteConcernOptions,
+    region: Option<RegionRequirement>,
 }
 impl WriteConcernPlan {
     pub(crate) fn requires_wait(&self) -> bool {
-        self.required > 1
+        self.required > 1 || self.region.is_some()
     }
     fn complete(&self, nodes: &BTreeSet<String>) -> bool {
         nodes.len() >= self.required as usize
+            && self
+                .region
+                .as_ref()
+                .is_none_or(|region| region.satisfied_by(nodes))
     }
     fn receipt(&self, nodes: &BTreeSet<String>) -> WriteConcernReceipt {
-        WriteConcernReceipt::new(
+        let receipt = WriteConcernReceipt::new(
             self.receiver.clone(),
             self.replica_count,
             self.requested,
             self.required,
             nodes.iter().cloned().collect(),
         )
-        .expect("validated plan and distinct eligible acknowledgements")
+        .expect("validated plan and distinct eligible acknowledgements");
+        match &self.region {
+            Some(region) => receipt
+                .with_region_progress(
+                    region.receiver_region().to_string(),
+                    nodes
+                        .iter()
+                        .filter(|node| region.outside_nodes().contains(*node))
+                        .cloned()
+                        .collect(),
+                )
+                .expect("region progress contains distinct acknowledged eligible nodes"),
+            None => receipt,
+        }
     }
 }
 
@@ -155,7 +180,9 @@ pub(crate) struct WriteConcernTracker {
     pub(crate) receiver: String,
     placement: Arc<RwLock<HashMap<FragmentId, Vec<String>>>>,
     capacity: Arc<Semaphore>,
+    acknowledgement_cap: AtomicU32,
     pending: Mutex<HashMap<[u8; 32], Vec<Arc<Ticket>>>>,
+    regions: RwLock<HashMap<String, String>>,
 }
 
 impl WriteConcernTracker {
@@ -168,9 +195,32 @@ impl WriteConcernTracker {
             receiver,
             placement,
             capacity: Arc::new(Semaphore::new(capacity)),
+            acknowledgement_cap: AtomicU32::new(0),
             pending: Mutex::new(HashMap::new()),
+            regions: RwLock::new(HashMap::new()),
         })
     }
+    pub(crate) fn configure_regions(&self, regions: HashMap<String, String>) {
+        *self.regions.write().unwrap() = regions;
+    }
+    pub(crate) fn set_acknowledgement_cap(&self, cap: u32) -> Result<(), WriteConcernError> {
+        if cap == 0 {
+            return Err(WriteConcernError::InvalidPolicy(
+                "write concern acknowledgement cap must be positive".into(),
+            ));
+        }
+        self.acknowledgement_cap.store(cap, Ordering::Relaxed);
+        Ok(())
+    }
+
+    pub(crate) fn clear_acknowledgement_cap(&self) {
+        self.acknowledgement_cap.store(0, Ordering::Relaxed);
+    }
+
+    pub(crate) fn acknowledgement_cap(&self) -> Option<u32> {
+        NonZeroU32::new(self.acknowledgement_cap.load(Ordering::Relaxed)).map(NonZeroU32::get)
+    }
+
     pub(crate) fn plan(
         &self,
         fragment: FragmentId,
@@ -186,6 +236,12 @@ impl WriteConcernTracker {
             ));
         }
         let requested = options.concern().required_acknowledgements(replica_count)?;
+        // Freeze this operational override into the plan. Existing waiters keep
+        // their captured count even when the node's cap changes or is cleared.
+        let required = effective_acknowledgement_count(
+            requested,
+            NonZeroU32::new(self.acknowledgement_cap.load(Ordering::Relaxed)),
+        );
         let eligible: HashSet<_> = replicas
             .cloned()
             .unwrap_or_else(|| vec![self.receiver.clone()])
@@ -197,13 +253,26 @@ impl WriteConcernTracker {
             )
             .into());
         }
+        let region = if options.require_other_region() {
+            Some(
+                RegionRequirement::resolve(
+                    &self.receiver,
+                    &eligible,
+                    &self.regions.read().unwrap(),
+                )
+                .map_err(WriteConcernError::InvalidPolicy)?,
+            )
+        } else {
+            None
+        };
         Ok(WriteConcernPlan {
             receiver: self.receiver.clone(),
             replica_count: replica_count as u32,
             requested,
-            required: requested,
+            required,
             eligible,
             options: options.clone(),
+            region,
         })
     }
     pub(crate) fn prepare(
@@ -370,6 +439,198 @@ mod tests {
             1,
         )
     }
+    fn region_tracker() -> Arc<WriteConcernTracker> {
+        let tracker = tracker();
+        tracker.configure_regions(HashMap::from([
+            ("a".into(), "west".into()),
+            ("b".into(), "west".into()),
+            ("c".into(), "east".into()),
+        ]));
+        tracker
+    }
+    #[tokio::test]
+    async fn acknowledgement_cap_does_not_remove_other_region_requirement() {
+        let tracker = region_tracker();
+        tracker.set_acknowledgement_cap(1).unwrap();
+        let op = op();
+        let options = WriteConcernOptions::builder()
+            .concern(WriteConcern::Count(2))
+            .require_other_region(true)
+            .build();
+        let pending = tracker.prepare(FragmentId(0), &op, &options).unwrap();
+        assert!(pending.key.is_some());
+        assert_eq!(pending.ticket.plan.required, 1);
+        assert!(matches!(
+            tracker.prepare(FragmentId(0), &op, &options),
+            Err(WriteConcernError::Backpressure)
+        ));
+        pending.applied_locally();
+        assert!(!pending.ticket.progress.lock().unwrap().complete);
+        tracker.acknowledge("b", FragmentId(0), std::slice::from_ref(&op));
+        assert!(!pending.ticket.progress.lock().unwrap().complete);
+        tracker.acknowledge("c", FragmentId(0), &[op]);
+        let receipt = pending.wait().await.unwrap();
+        assert_eq!(receipt.requested_acknowledgements(), 2);
+        assert_eq!(receipt.required_acknowledgements(), 1);
+        assert!(receipt.was_overridden());
+        assert!(receipt.other_region_satisfied());
+        assert_eq!(receipt.outside_region_acknowledged_nodes(), &["c"]);
+    }
+
+    #[tokio::test]
+    async fn region_constraint_waits_after_numeric_threshold_and_ignores_unmatched_acks() {
+        let tracker = region_tracker();
+        let op = op();
+        let options = WriteConcernOptions::builder()
+            .concern(WriteConcern::Count(2))
+            .require_other_region(true)
+            .build();
+        let pending = tracker.prepare(FragmentId(0), &op, &options).unwrap();
+        pending.applied_locally();
+        tracker.acknowledge("b", FragmentId(0), std::slice::from_ref(&op));
+        tracker.acknowledge("b", FragmentId(0), std::slice::from_ref(&op));
+        tracker.acknowledge("ineligible", FragmentId(0), std::slice::from_ref(&op));
+        let mut stale = op.clone();
+        stale.value.timestamp_ms += 1;
+        tracker.acknowledge("c", FragmentId(0), &[stale]);
+        tracker.acknowledge("c", FragmentId(1), std::slice::from_ref(&op));
+        assert!(!pending.ticket.progress.lock().unwrap().complete);
+        tracker.acknowledge("c", FragmentId(0), &[op]);
+        let receipt = pending.wait().await.unwrap();
+        assert_eq!(receipt.acknowledged_nodes(), &["a", "b", "c"]);
+        assert_eq!(receipt.outside_region_acknowledged_nodes(), &["c"]);
+        assert!(receipt.other_region_satisfied());
+    }
+    #[tokio::test]
+    async fn local_region_constraint_registers_waiter_and_preserves_early_peer_ack() {
+        let tracker = region_tracker();
+        let op = op();
+        let options = WriteConcernOptions::default().with_require_other_region(true);
+        let pending = tracker.prepare(FragmentId(0), &op, &options).unwrap();
+        assert!(pending.key.is_some());
+        assert!(matches!(
+            tracker.prepare(FragmentId(0), &op, &options),
+            Err(WriteConcernError::Backpressure)
+        ));
+        tracker.acknowledge("c", FragmentId(0), &[op]);
+        assert!(!pending.ticket.progress.lock().unwrap().complete);
+        pending.applied_locally();
+        let receipt = pending.wait().await.unwrap();
+        assert_eq!(receipt.required_acknowledgements(), 1);
+        assert_eq!(receipt.acknowledged_nodes(), &["a", "c"]);
+        assert_eq!(receipt.receiving_region(), Some("west"));
+    }
+    #[test]
+    fn routed_decoder_rejects_receipt_that_omits_requested_region() {
+        let options = WriteConcernOptions::default().with_require_other_region(true);
+        let receipt = WriteConcernReceipt::new("a".into(), 3, 1, 1, vec!["a".into()]).unwrap();
+        let bytes = WriteConcernOutcome::Satisfied(receipt).encode();
+        assert!(matches!(
+            decode_outcome(&bytes, &options),
+            Err(WriteConcernError::UnknownOutcome(_))
+        ));
+    }
+    #[test]
+    fn maximum_legal_key_and_region_receipt_fit_mutation_reply_frame() {
+        use crate::proto::{
+            Envelope, EnvelopeMsg, MutationResponse, MutationResult, MutationStatus,
+        };
+        use crate::wire::{check_envelope_budget, check_record_budget, MAX_FRAME_BYTES};
+
+        let mut low = 0;
+        let mut high = MAX_FRAME_BYTES;
+        while low < high {
+            let midpoint = low + (high - low).div_ceil(2);
+            if check_record_budget(midpoint, 0, 255).is_ok() {
+                low = midpoint;
+            } else {
+                high = midpoint - 1;
+            }
+        }
+        assert!(check_record_budget(low, 0, 255).is_ok());
+        assert!(check_record_budget(low + 1, 0, 255).is_err());
+        let ids: Vec<_> = (0..MAX_WRITE_CONCERN_REPLICAS)
+            .map(|id| format!("{id:04}{}", "n".repeat(251)))
+            .collect();
+        let receipt = WriteConcernReceipt::new(
+            ids[0].clone(),
+            MAX_WRITE_CONCERN_REPLICAS as u32,
+            1,
+            1,
+            ids.clone(),
+        )
+        .unwrap()
+        .with_region_progress("r".repeat(255), ids[1..].to_vec())
+        .unwrap();
+        let envelope = Envelope {
+            msg: Some(EnvelopeMsg::MutationResponse(MutationResponse {
+                req_id: u64::MAX,
+                results: vec![MutationResult {
+                    key: "k".repeat(low),
+                    status: MutationStatus::Applied as i32,
+                    write_concern: Some(WriteConcernOutcome::Satisfied(receipt).encode()),
+                    ..Default::default()
+                }],
+            })),
+        };
+        check_envelope_budget(&envelope, MAX_FRAME_BYTES).unwrap();
+    }
+    #[test]
+    fn acknowledgement_cap_never_raises_or_legalizes_requested_counts() {
+        let tracker = tracker();
+        tracker.set_acknowledgement_cap(3).unwrap();
+        let count_one = WriteConcernOptions::builder()
+            .concern(WriteConcern::Count(1))
+            .build();
+        let plan = tracker.plan(FragmentId(0), &count_one).unwrap();
+        assert_eq!((plan.requested, plan.required), (1, 1));
+        assert!(!plan.requires_wait());
+
+        tracker.set_acknowledgement_cap(1).unwrap();
+        let invalid = WriteConcernOptions::builder()
+            .concern(WriteConcern::Count(3))
+            .build();
+        assert!(matches!(
+            tracker.plan(FragmentId(0), &invalid),
+            Err(WriteConcernError::InvalidPolicy(_))
+        ));
+        assert!(matches!(
+            tracker.set_acknowledgement_cap(0),
+            Err(WriteConcernError::InvalidPolicy(_))
+        ));
+        assert_eq!(tracker.acknowledgement_cap(), Some(1));
+    }
+
+    #[tokio::test]
+    async fn acknowledgement_cap_changes_only_new_plans_and_reports_effective_threshold() {
+        let tracker = tracker();
+        let op = op();
+        let options = WriteConcernOptions::builder()
+            .concern(WriteConcern::Majority)
+            .build();
+        let pending = tracker.prepare(FragmentId(0), &op, &options).unwrap();
+        pending.applied_locally();
+
+        tracker.set_acknowledgement_cap(1).unwrap();
+        let newer = tracker.prepare(FragmentId(0), &op, &options).unwrap();
+        newer.applied_locally();
+        assert!(!pending.ticket.progress.lock().unwrap().complete);
+        assert_eq!(pending.ticket.plan.required, 2);
+        let receipt = newer.wait().await.unwrap();
+        assert_eq!(receipt.requested_acknowledgements(), 2);
+        assert_eq!(receipt.required_acknowledgements(), 1);
+        assert!(receipt.was_overridden());
+        assert_eq!(receipt.acknowledged_nodes(), &["a"]);
+
+        tracker.clear_acknowledgement_cap();
+        assert_eq!(tracker.acknowledgement_cap(), None);
+        assert_eq!(tracker.plan(FragmentId(0), &options).unwrap().required, 2);
+        tracker.acknowledge("b", FragmentId(0), &[op]);
+        let receipt = pending.wait().await.unwrap();
+        assert_eq!(receipt.required_acknowledgements(), 2);
+        assert!(!receipt.was_overridden());
+    }
+
     #[tokio::test]
     async fn distinct_matching_processing_acks_satisfy_count() {
         let tracker = tracker();

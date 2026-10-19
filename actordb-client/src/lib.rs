@@ -1,10 +1,12 @@
 //! Async Rust companion for ActorDB's separate application listener.
 //!
-//! Clones share one TCP connection. Requests are serialized on that connection;
+//! Clones share one connection. Requests are serialized on that connection;
 //! frame count, encoded bytes and total deadlines bound queued work. Use separate
 //! Clients for parallel connections. Closing this handle never shuts down a Node.
 //! Writes are never transparently retried: a lost reply after dispatch is an
 //! [`ClientError::UnknownOutcome`], because repeating a write creates a new version.
+//! [`Client::connect`] uses plain TCP; [`Client::from_stream`] accepts a
+//! caller-established stream, including TLS, with the same application protocol.
 
 use actordb_protocol::{
     client as wire, CLIENT_CAPABILITIES, CLIENT_PROTOCOL_VERSION, MAX_FRAME_BYTES,
@@ -15,7 +17,7 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::{Mutex, Semaphore};
 use tokio::time::{timeout_at, Instant};
@@ -91,8 +93,13 @@ impl From<std::io::Error> for ClientError {
     }
 }
 
+trait ClientStream: AsyncRead + AsyncWrite + Send + Unpin + 'static {}
+impl<T: AsyncRead + AsyncWrite + Send + Unpin + 'static> ClientStream for T {}
+
+type BoxStream = Box<dyn ClientStream>;
+
 struct Inner {
-    stream: Mutex<Option<TcpStream>>,
+    stream: Mutex<Option<BoxStream>>,
     next_id: AtomicU64,
     count: Semaphore,
     bytes: Arc<Semaphore>,
@@ -105,7 +112,38 @@ pub struct Client {
 }
 
 impl Client {
+    /// Connect over plain TCP. The timeout includes dialing and authentication.
     pub async fn connect(addr: SocketAddr, options: ClientOptions) -> Result<Self, ClientError> {
+        let deadline = Self::validate_options(&options)?;
+        timeout_at(deadline, async {
+            let stream = TcpStream::connect(addr).await?;
+            stream.set_nodelay(true)?;
+            Self::from_stream_until(Box::new(stream), options, deadline).await
+        })
+        .await
+        .map_err(|_| ClientError::Timeout)?
+    }
+
+    /// Authenticate an application client over a caller-established stream.
+    ///
+    /// The caller owns dialing, TLS configuration, certificate validation, and
+    /// any transport handshake deadlines before this call. `options.timeout`
+    /// bounds ActorDB authentication. The stream must provide reliable, ordered
+    /// bidirectional bytes and propagate backpressure; writes are flushed after
+    /// each frame. Transport adapters must not transparently replay operations.
+    ///
+    /// Ownership transfers to the client. Failure or cancellation drops the
+    /// stream, which must release its connection and any transport work. Closing
+    /// the client shuts down the stream. TLS does not replace application credentials.
+    pub async fn from_stream<S>(stream: S, options: ClientOptions) -> Result<Self, ClientError>
+    where
+        S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+    {
+        let deadline = Self::validate_options(&options)?;
+        Self::from_stream_until(Box::new(stream), options, deadline).await
+    }
+
+    fn validate_options(options: &ClientOptions) -> Result<Instant, ClientError> {
         if options.identity.is_empty()
             || options.identity.len() > 255
             || options.timeout.is_zero()
@@ -123,12 +161,17 @@ impl Client {
                 "identity, timeout, queue bounds or credential length".into(),
             ));
         }
-        let deadline = Instant::now()
+        Instant::now()
             .checked_add(options.timeout)
-            .ok_or_else(|| ClientError::Invalid("timeout too large".into()))?;
+            .ok_or_else(|| ClientError::Invalid("timeout too large".into()))
+    }
+
+    async fn from_stream_until(
+        mut stream: BoxStream,
+        options: ClientOptions,
+        deadline: Instant,
+    ) -> Result<Self, ClientError> {
         let (stream, capabilities) = timeout_at(deadline, async {
-            let mut stream = TcpStream::connect(addr).await?;
-            stream.set_nodelay(true)?;
             let mut challenge = vec![0; 32];
             getrandom::fill(&mut challenge).map_err(|e| ClientError::Protocol(e.to_string()))?;
             let hello = wire::Hello {
@@ -762,16 +805,17 @@ fn decode_cell(cell: actordb_protocol::meta::QueryCell) -> Result<QueryValue, Cl
     }
 }
 
-async fn send_frame(stream: &mut TcpStream, frame: &wire::Frame) -> Result<(), ClientError> {
+async fn send_frame(stream: &mut BoxStream, frame: &wire::Frame) -> Result<(), ClientError> {
     if frame.encoded_len() > MAX_FRAME_BYTES {
         return Err(ClientError::Invalid("frame exceeds limit".into()));
     }
     let bytes = frame.encode_to_vec();
     stream.write_u32(bytes.len() as u32).await?;
     stream.write_all(&bytes).await?;
+    stream.flush().await?;
     Ok(())
 }
-async fn read_frame(stream: &mut TcpStream, max: usize) -> Result<wire::Frame, ClientError> {
+async fn read_frame(stream: &mut BoxStream, max: usize) -> Result<wire::Frame, ClientError> {
     let length = stream.read_u32().await? as usize;
     if length == 0 || length > max {
         return Err(ClientError::Protocol("invalid frame length".into()));

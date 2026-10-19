@@ -1,5 +1,15 @@
 # Release notes
 
+## 0.6.0
+
+- Add caller-supplied application transports with `Client::from_stream`,
+  `ClientServer::bind_with_network`, and `ClientServer::from_acceptor`, preserving
+  plain TCP defaults and the existing wire protocols. Flush complete peer and
+  application frames for buffered streams; include a caller-configured mTLS
+  example and transport lifecycle/conformance tests.
+- Move all four public crates and internal dependency minimums to compatible
+  `0.6.0` ranges. See `docs/transports.md` for the new application extension points.
+
 ## 0.5.0
 
 - Add per-write `Local`, `Count(n)`, and `Majority` acknowledgement policies
@@ -10,9 +20,27 @@
   captured replica set. Keep local acknowledgement as the ordinary default.
 - Isolate acknowledgement waits from forwarded apply workers and keep peer
   readers available for ACKs during forwarded writes.
+- Add per-write requirements for a processed acknowledgement from another
+  configured region, with validated region maps and frozen replica eligibility.
+  Preserve the region requirement when the numeric threshold is one and report
+  region progress in success and timeout receipts. Reject incomplete region
+  configuration before apply and missing or malformed required region progress
+  in routed and SDK receipts.
+- Add explicit per-node acknowledgement caps with validated startup
+  configuration and runtime set/clear controls. Receipts report requested and
+  effective thresholds; existing plans retain their captured thresholds.
+  Validate requested counts before overrides and preserve region requirements
+  independently of numeric caps.
+- Reject contradictory operation/receipt replies and preserve unknown outcomes
+  after lost forwarded responses, including subsequent pre-apply rejection.
 - Extend generated public wire structs with optional concern fields, require
-  peer capability support, and move all public crate dependency minimums to
-  compatible 0.5.0 ranges. See `docs/write-concern.md` for semantics and migration.
+  peer capability support, and move all four public crate versions and inter-crate
+  minimums to compatible 0.5.0 ranges.
+
+Write concern policies, region requirements, and operational caps are included
+in this single release. See `docs/write-concern.md`,
+`docs/write-concern-regions.md`, and `docs/write-concern-overrides.md` for support,
+semantics, and migration.
 
 ## 0.4.0
 

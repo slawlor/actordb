@@ -4,7 +4,7 @@ Status: implementation design, initially reviewed against `main` at `0e6f0c9`
 (ActorDB 0.3.0). Current usage is documented in [SQL queries](query.md) and the
 [Rust SDK guide](../actordb-client/README.md).
 This document consolidates independent protocol, Rust SDK, and query reviews.
-The architecture is implemented in the companion crates; streaming or multiplexed SDK requests, custom client transports, topology
+The architecture is implemented in the companion crates; streaming or multiplexed SDK requests, topology
 discovery, prepared mutation replay, and remote operator controls remain future
 work. The findings below describe the original baseline.
 
@@ -101,7 +101,7 @@ flowchart LR
 - **`actordb-protocol`**: canonical peer and application protobuf schemas,
   generated Rust messages, neutral value/query contracts, pure validation,
   and language-independent fixtures. Preserve `actordb::proto` reexports.
-- **`actordb-client`**: Tokio TCP SDK with bounded serialized requests,
+- **`actordb-client`**: Tokio stream SDK with a TCP convenience API, bounded serialized requests,
   operation methods, and structured errors. No normal
   dependency on ActorDB actors, RocksDB, or native protobuf compilation.
 - **`actordb::client_server::ClientServer`**: opt-in listener composed around
@@ -150,8 +150,10 @@ closes that client's resources.
 Application v1 negotiates versions and optional features independently of
 peer v3. Limits are fixed protocol contracts; topology discovery and explicit
 cluster identity negotiation remain future work. Client authentication is
-separate from the peer cluster secret. The first SDK implements TCP; custom
-streams and a TLS adapter remain future work. Challenge authentication and transport confidentiality have distinct contracts.
+separate from the peer cluster secret. The SDK supports caller-supplied streams
+through `Client::from_stream`; the listener accepts a custom `Network` or existing
+`Acceptor`. See the [transport guide](transports.md) and its caller-configured TLS
+example. Challenge authentication and transport confidentiality have distinct contracts.
 
 The first SDK serializes requests per connection and validates response kinds,
 IDs, keys, cardinality, and statuses. Future multiplexing needs independent
