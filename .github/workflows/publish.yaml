@@ -109,13 +109,13 @@ jobs:
             echo 'Set CARGO_REGISTRY_TOKEN to a token authorized to publish the ActorDB library packages.' >&2
             exit 1
           fi
-          cargo publish --package actordb-protocol --registry crates-io
+          cargo publish --package actordb-protocol --registry crates-io --target-dir "$ACTORDB_PACKAGE_TARGET"
 
       - name: Publish actordb-query
         if: github.event_name == 'release'
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: cargo publish --package actordb-query --registry crates-io
+        run: cargo publish --package actordb-query --registry crates-io --target-dir "$ACTORDB_PACKAGE_TARGET"
 
       - name: Wait for database dependencies in the registry index
         if: github.event_name == 'release'
@@ -127,7 +127,7 @@ jobs:
         if: github.event_name == 'release'
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: cargo publish --package actordb --registry crates-io
+        run: cargo publish --package actordb --registry crates-io --target-dir "$ACTORDB_PACKAGE_TARGET"
 
       - name: Wait for client dependencies in the registry index
         if: github.event_name == 'release'
@@ -140,4 +140,4 @@ jobs:
         if: github.event_name == 'release'
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: cargo publish --package actordb-client --registry crates-io
+        run: cargo publish --package actordb-client --registry crates-io --target-dir "$ACTORDB_PACKAGE_TARGET"
