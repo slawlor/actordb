@@ -9,6 +9,11 @@ pub mod meta {
 pub mod client {
     include!("generated/client.rs");
 }
+/// Stable quorum protocol; uses a separate endpoint and version negotiation.
+#[allow(clippy::large_enum_variant)]
+pub mod quorum {
+    include!("generated/quorum.rs");
+}
 
 pub const CLIENT_PROTOCOL_VERSION: u32 = 1;
 pub const CLIENT_CAPABILITY_QUERY: u64 = 1;

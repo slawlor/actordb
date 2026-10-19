@@ -54,6 +54,10 @@ pub mod replication;
 /// chunked bootstrap, and controller-sequenced migration.
 pub mod placement;
 
+/// Opt-in, stable quorum commits, conditional mutations, and durable changes.
+#[cfg(feature = "quorum")]
+pub mod quorum;
+
 mod runtime_tasks;
 
 // Shared protobuf framing limits and encoding helpers. Node and replication

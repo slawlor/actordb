@@ -10,13 +10,17 @@ fn main() {
     config.out_dir(&temporary);
     config
         .compile_protos(
-            &[source.join("meta.proto"), source.join("client.proto")],
+            &[
+                source.join("meta.proto"),
+                source.join("client.proto"),
+                source.join("quorum.proto"),
+            ],
             &[source],
         )
         .unwrap();
     let check = std::env::args().any(|argument| argument == "--check");
     let mut changed = false;
-    for name in ["meta.rs", "client.rs"] {
+    for name in ["meta.rs", "client.rs", "quorum.rs"] {
         let generated = std::fs::read(temporary.join(name)).unwrap();
         let target = destination.join(name);
         if std::fs::read(&target).ok().as_deref() != Some(&generated) {

@@ -1,5 +1,20 @@
 # Release notes
 
+## 0.4.1
+
+- Add the opt-in `quorum` feature and `QuorumNode`: conditional single-key
+  mutations, stable quorum commit receipts, linearizable reads, persisted
+  ownership ballots, failover recovery, and joint voter-set transitions.
+- Persist request identities and original outcomes through their explicit
+  retry deadlines. Expired retries are rejected after receipt reclamation.
+- Add replayable mutation/deletion/expiry changes, automatic expiry, explicit
+  retention gaps, and bounded certified snapshot reclamation.
+- Add a checksummed filesystem protocol store with atomic replacement, stable
+  fences, exclusive attachment, and immutable cluster/genesis identity.
+- Keep quorum endpoints, storage, and wire negotiation independent of the
+  existing LWW API. This is an additive release; see `docs/quorum.md` for
+  configuration, semantics, and performance limits.
+
 ## 0.4.0
 
 - Add a Rust companion SDK and a separate application listener, with point and

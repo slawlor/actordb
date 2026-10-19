@@ -1,0 +1,108 @@
+syntax = "proto3";
+package quorum;
+
+// Independent of the eventual-consistency peer and application protocols.
+message Ballot { uint64 round = 1; string node_id = 2; }
+message Membership { repeated string voters = 1; repeated string next_voters = 2; }
+message Record { bytes value = 1; uint64 revision = 2; optional uint64 expires_at_ms = 3; }
+message Entry { string key = 1; Record record = 2; }
+enum Condition { ANY = 0; ABSENT = 1; REVISION = 2; }
+message Mutation {
+  string request_id = 1;
+  uint64 valid_until_ms = 2;
+  string key = 3;
+  Condition condition = 4;
+  uint64 expected_revision = 5;
+  optional bytes value = 6; // absent means delete
+  optional uint64 expires_at_ms = 7;
+}
+message MutationResult { bool applied = 1; Record current = 2; uint64 revision = 3; }
+message Receipt {
+  string request_id = 1;
+  bytes fingerprint = 2;
+  uint64 valid_until_ms = 3;
+  MutationResult result = 4;
+}
+enum ChangeKind { PUT = 0; DELETE = 1; EXPIRE = 2; }
+message Change {
+  uint64 id = 1;
+  string key = 2;
+  ChangeKind kind = 3;
+  Record record = 4;
+  uint64 revision = 5;
+  uint64 time_ms = 6;
+}
+message Snapshot {
+  uint64 slot = 1;
+  Membership membership = 2;
+  repeated Entry entries = 3;
+  repeated Receipt receipts = 4;
+  repeated Change changes = 5;
+  uint64 last_change_id = 6;
+  uint64 change_floor = 7;
+  uint64 time_ms = 8;
+  bytes command_id = 9;
+  uint32 fragment = 10;
+  string cluster_id = 11;
+}
+message Certificate {
+  Snapshot snapshot = 1;
+  Ballot ballot = 2;
+  Membership voting_membership = 3;
+  repeated string acknowledgements = 4;
+}
+message Proposal { Ballot ballot = 1; Snapshot snapshot = 2; }
+message ReplicaState { Certificate committed = 1; Ballot promise = 2; Proposal accepted = 3; }
+message Prepare { Certificate base = 1; Ballot ballot = 2; }
+message Accept { Certificate base = 1; Proposal proposal = 2; }
+message Reconfigure { repeated string voters = 1; bool finish = 2; }
+message ChangesRequest { uint64 after = 1; uint32 limit = 2; }
+message Command {
+  uint32 fragment = 1;
+  oneof operation {
+    Mutation mutation = 2;
+    string get = 3;
+    ChangesRequest changes = 4;
+    bool maintain = 5;
+    Reconfigure reconfigure = 6;
+    bool snapshot = 7;
+  }
+}
+message Request {
+  string cluster_id = 1;
+  string node_id = 2;
+  uint32 fragment = 3;
+  oneof operation {
+    Prepare prepare = 4;
+    Accept accept = 5;
+    Certificate learn = 6;
+    Command execute = 7;
+  }
+}
+enum Status {
+  OK = 0;
+  REJECTED = 1;
+  AHEAD = 2;
+  INVALID = 3;
+  STORAGE = 4;
+  UNAVAILABLE = 5;
+  REQUEST_EXPIRED = 6;
+  REQUEST_CONFLICT = 7;
+  CURSOR_EXPIRED = 8;
+  RESOURCE_LIMIT = 9;
+  UNKNOWN_OUTCOME = 10;
+}
+message Response {
+  Status status = 1;
+  string error = 2;
+  ReplicaState state = 3;
+  MutationResult mutation = 4;
+  Record record = 5;
+  repeated Change changes = 6;
+  uint64 last_change_id = 7;
+  Certificate commit = 8;
+}
+// Both peers prove the transcript, binding fresh challenges and identities.
+message Hello { uint32 version = 1; string cluster_id = 2; string node_id = 3; bytes challenge = 4; bytes policy = 5; }
+message Frame { oneof message { Hello hello = 1; bytes proof = 2; Request request = 3; Response response = 4; } }
+message Manifest { uint32 version = 1; string cluster_id = 2; string node_id = 3; repeated Membership genesis = 4; bytes policy = 5; }

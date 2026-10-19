@@ -1,6 +1,6 @@
 [package]
 name = "actordb"
-version = "0.4.0"
+version = "0.4.1"
 authors = ["Sean Lawlor"]
 description = "An actor-first distributed database"
 documentation = "https://docs.rs/actordb"
@@ -17,18 +17,21 @@ rust-version = "1.88"
 default = []
 # Optional no-op store test double; not a durable database or the Node cache.
 memory = []
+# Stable quorum storage and conditional mutations, on a separate endpoint.
+quorum = ["dep:fs2"]
 # Opt-in RocksDB-backed durable storage. Independent of the memory feature.
 # librocksdb-sys runs bindgen at build time and needs libclang with working
 # header paths. The default crate includes no bundled store implementation.
 rocksdb = ["dep:rocksdb"]
 
 [dependencies]
-actordb-protocol = { version = "0.4", path = "../actordb-protocol" }
-actordb-query = { version = "0.4", path = "../actordb-query" }
+actordb-protocol = { version = "0.4.1", path = "../actordb-protocol" }
+actordb-query = { version = "0.4.1", path = "../actordb-query" }
 # Required dependencies
 bon = { version = "3.10.2" }
 bytes = { version = "1" }
 futures = { version = "0.3" }
+fs2 = { version = "0.4", optional = true }
 getrandom = { version = "0.4.3" }
 hmac = { version = "0.13.0" }
 prost = { version = "0.14" }

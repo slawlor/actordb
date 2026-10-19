@@ -19,6 +19,9 @@ The `0.4` release series requires Rust 1.88+:
 actordb = "0.4"
 ```
 
+For conditional mutations, stable quorum commits, fenced failover, and
+replayable changes, enable the separate [`quorum` feature](docs/quorum.md).
+
 The default crate includes no concrete storage backend. Its actor cache and
 `KvStore` contracts work without a database; `NodeConfig.store` remains `None`
 unless you supply a custom store. RocksDB is an independent opt-in:
