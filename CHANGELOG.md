@@ -2,6 +2,8 @@
 
 ## 0.6.0
 
+- Upgrade the optional protobuf generator dependency to `protobuf-src` 2.1.
+  Code generation requires CMake and a C/C++ toolchain.
 - Add caller-supplied application transports with `Client::from_stream`,
   `ClientServer::bind_with_network`, and `ClientServer::from_acceptor`, preserving
   plain TCP defaults and the existing wire protocols. Flush complete peer and
