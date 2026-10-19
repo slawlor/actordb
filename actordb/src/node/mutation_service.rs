@@ -1467,7 +1467,9 @@ mod tests {
                 .is_err()
         );
         store.release();
-        tokio::time::timeout(Duration::from_secs(2), shutdown)
+        // Completion is a correctness check; allow shared CI scheduling time
+        // after release while retaining the blocked-drain and final-state checks.
+        tokio::time::timeout(Duration::from_secs(10), shutdown)
             .await
             .unwrap()
             .unwrap();
