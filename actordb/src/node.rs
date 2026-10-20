@@ -2377,7 +2377,6 @@ async fn spawn_fragment_subtree_registered(
         FragmentSupervisor,
         SupervisorArgs::builder()
             .fragment(fragment)
-            .maybe_expiry_publisher(expiry_publisher)
             .worker_prefix(worker_prefix)
             .maybe_store(store)
             .hlc(hlc.clone())
@@ -2389,7 +2388,8 @@ async fn spawn_fragment_subtree_registered(
             .flush_interval(config.flush_interval)
             .clean_interval(config.clean_interval)
             .snapshot_interval(config.snapshot_interval)
-            .build(),
+            .build()
+            .with_expiry_publisher(expiry_publisher),
     )
     .map_err(|e| NodeError::Actor(e.to_string()))?;
 

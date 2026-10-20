@@ -112,14 +112,16 @@ impl std::error::Error for FragmentStartupStorageError {}
 
 /// Arguments to spawn a [`FragmentSupervisor`].
 /// The fragment, worker prefix and Node-wide HLC remain required. Omitted
-/// tuning settings match [`crate::node::NodeConfig`] defaults.
+/// tuning settings match [`crate::node::NodeConfig`] defaults. Use
+/// [`SupervisorArgs::builder`] for construction: Node-owned callback attachment
+/// is private, while fragment, worker prefix, and clock remain caller inputs.
 #[derive(Clone, bon::Builder)]
 pub struct SupervisorArgs {
     /// Which fragment this supervisor owns.
     pub fragment: FragmentId,
-    /// Opaque Node-owned callback ingress; disabled by default.
-    #[doc(hidden)]
-    pub expiry_publisher: Option<ExpiryPublisher>,
+    /// Node-owned callback ingress; deliberately absent from the public builder.
+    #[builder(skip = None)]
+    expiry_publisher: Option<ExpiryPublisher>,
     /// Prefix for worker actor names (unique per supervisor).
     #[builder(into)]
     pub worker_prefix: String,
@@ -151,6 +153,14 @@ pub struct SupervisorArgs {
     /// How often the snapshotter flushes to the store.
     #[builder(default = DEFAULT_SNAPSHOT_INTERVAL)]
     pub snapshot_interval: Duration,
+}
+
+impl SupervisorArgs {
+    /// Attach the Node-owned ingress after public builder construction.
+    pub(crate) fn with_expiry_publisher(mut self, publisher: Option<ExpiryPublisher>) -> Self {
+        self.expiry_publisher = publisher;
+        self
+    }
 }
 
 pub(crate) const DEFAULT_FLUSH_BATCH_SIZE: usize = 1000;

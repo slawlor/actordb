@@ -333,3 +333,14 @@ The obsolete `tombstone_gc_age` and `reset_senders` options have been removed
 from Node/actor configuration and sender dependencies. Remove those builder
 calls or literal fields when migrating. TTL materialization still installs
 retained tombstones; this cleanup does not enable tombstone reclamation.
+
+### Internal expiry publisher attachment
+
+`SupervisorArgs` now has a private, skipped publisher field. Replace external
+supervisor literals with `SupervisorArgs::builder()` and omit any
+`expiry_publisher`/`maybe_expiry_publisher` call. Fragment identity, worker prefix,
+store, shared HLC, and supported tuning settings remain public builder inputs.
+TTL notifications are configured through `NodeConfig::ttl_expiry_handler` and
+`ttl_expiry_options`; ActorDB attaches its crate-private publisher after builder
+construction. Maintenance message trigger types remain opaque public types
+because their messages are public; this does not grant event-publishing access.
