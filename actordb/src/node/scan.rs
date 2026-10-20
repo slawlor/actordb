@@ -110,8 +110,14 @@ impl Node {
             .map_err(|_| QueryExecutionError::ShuttingDown)?;
         // Covers previously merged rows while each fragment owns its own
         // page reservation; holding both is deliberately conservative.
+        let request_bytes = match &spec.matcher {
+            crate::actor::KeyMatcher::All => 1024,
+            crate::actor::KeyMatcher::Prefix(prefix) => {
+                prefix.capacity().saturating_mul(2).saturating_add(1024)
+            }
+        };
         let _runtime = self.query_admission.reserve_work(
-            1024,
+            request_bytes,
             QueryOptions::default().max_result_bytes + QueryOptions::default().max_buffer_bytes,
         )?;
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
