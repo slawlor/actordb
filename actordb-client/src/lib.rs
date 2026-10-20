@@ -19,7 +19,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::sync::{Mutex, Semaphore};
+use tokio::sync::{watch, Mutex, Semaphore};
 use tokio::time::{timeout_at, Instant};
 
 pub use actordb_protocol::meta::{Priority, ScanMatch};
@@ -105,6 +105,7 @@ struct Inner {
     bytes: Arc<Semaphore>,
     options: ClientOptions,
     capabilities: u64,
+    closing: watch::Sender<bool>,
 }
 #[derive(Clone)]
 pub struct Client {
@@ -134,7 +135,8 @@ impl Client {
     ///
     /// Ownership transfers to the client. Failure or cancellation drops the
     /// stream, which must release its connection and any transport work. Closing
-    /// the client shuts down the stream. TLS does not replace application credentials.
+    /// the client attempts bounded graceful shutdown, then drops the stream. TLS
+    /// does not replace application credentials.
     pub async fn from_stream<S>(stream: S, options: ClientOptions) -> Result<Self, ClientError>
     where
         S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
@@ -237,6 +239,7 @@ impl Client {
                 bytes: Arc::new(Semaphore::new(options.max_queued_bytes)),
                 options,
                 capabilities,
+                closing: watch::channel(false).0,
             }),
         })
     }
@@ -297,14 +300,25 @@ impl Client {
                     ClientError::Overloaded
                 }
             })?;
-        let mut guard = timeout_at(deadline, self.inner.stream.lock())
-            .await
-            .map_err(|_| ClientError::Timeout)?;
+        let mut closing = self.inner.closing.subscribe();
+        let cancelled = async {
+            if !*closing.borrow_and_update() {
+                let _ = closing.changed().await;
+            }
+        };
+        tokio::pin!(cancelled);
+        let mut guard = tokio::select! {
+            biased;
+            _ = &mut cancelled => return Err(ClientError::Closed),
+            guard = timeout_at(deadline, self.inner.stream.lock()) => {
+                guard.map_err(|_| ClientError::Timeout)?
+            }
+        };
         // Taking ownership makes cancellation close the socket. A partial
         // prefix/body can never be reused by the next queued request.
         let mut stream = guard.take().ok_or(ClientError::Closed)?;
         let mut dispatched = false;
-        let result = timeout_at(deadline, async {
+        let exchange = timeout_at(deadline, async {
             // Mark before write: even a failing write can transmit a complete request.
             dispatched = true;
             send_frame(&mut stream, &frame).await?;
@@ -317,9 +331,12 @@ impl Client {
                     "unexpected response or request id".into(),
                 )),
             }
-        })
-        .await
-        .unwrap_or(Err(ClientError::Timeout));
+        });
+        let result = tokio::select! {
+            biased;
+            _ = &mut cancelled => Err(ClientError::Closed),
+            result = exchange => result.unwrap_or(Err(ClientError::Timeout)),
+        };
         match result {
             Ok(response) => {
                 *guard = Some(stream);
@@ -340,11 +357,47 @@ impl Client {
         }
     }
 
+    /// Close the shared connection for this handle and all its clones.
+    ///
+    /// Admission stops immediately. Queued requests return [`ClientError::Closed`],
+    /// and active exchanges are cancelled. A mutation whose write has started
+    /// returns [`ClientError::UnknownOutcome`]: the server may have applied it.
+    /// A cancelled exchange drops the transport rather than reusing partial I/O.
+    ///
+    /// Graceful transport shutdown, including waiting for an active exchange to
+    /// release the connection, is bounded by [`ClientOptions::timeout`]. At the
+    /// deadline the owned stream is dropped. Repeated calls are safe. This does
+    /// not shut down the server Node. Transport adapters must release their
+    /// resources when dropped, even if graceful shutdown requires peer progress.
     pub async fn close(&self) {
+        self.close_with_timeout(self.inner.options.timeout).await;
+    }
+
+    /// Close with an explicit total graceful-shutdown budget.
+    ///
+    /// Cancellation and mutation outcomes follow [`Self::close`]. A zero budget
+    /// skips graceful shutdown. Cancellation of this future after it takes the
+    /// stream also drops the transport; request admission remains closed.
+    pub async fn close_with_timeout(&self, graceful_timeout: Duration) {
         self.inner.count.close();
         self.inner.bytes.close();
-        if let Some(mut stream) = self.inner.stream.lock().await.take() {
-            let _ = stream.shutdown().await;
+        self.inner.closing.send_replace(true);
+        let deadline = (!graceful_timeout.is_zero())
+            .then(|| Instant::now().checked_add(graceful_timeout))
+            .flatten();
+        if let Some(deadline) = deadline {
+            let _ = timeout_at(deadline, async {
+                let stream = self.inner.stream.lock().await.take();
+                if let Some(mut stream) = stream {
+                    let _ = stream.shutdown().await;
+                }
+            })
+            .await;
+        }
+        // Also cover a zero/overflowing budget without polling shutdown. Active
+        // requests own their stream and drop it when they observe cancellation.
+        if let Ok(mut guard) = self.inner.stream.try_lock() {
+            guard.take();
         }
     }
     pub async fn get(&self, key: impl Into<String>) -> Result<Option<Value>, ClientError> {
