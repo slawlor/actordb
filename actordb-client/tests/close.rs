@@ -107,10 +107,9 @@ async fn client() -> (Client, DuplexStream, Arc<State>) {
                 stream,
                 state: state.clone(),
             },
-            ClientOptions {
-                timeout: Duration::from_secs(1),
-                ..Default::default()
-            }
+            ClientOptions::builder()
+                .timeout(Duration::from_secs(1))
+                .build()
         ),
         handshake
     );

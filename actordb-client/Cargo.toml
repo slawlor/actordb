@@ -7,6 +7,7 @@ license = "MIT"
 description = "Async Rust companion client for ActorDB's application listener"
 
 [dependencies]
+bon = { version = "3.10.2" }
 actordb-protocol = { version = "0.7.0", path = "../actordb-protocol" }
 actordb-query = { version = "0.7.0", path = "../actordb-query" }
 prost = "0.14"

@@ -42,10 +42,9 @@ async fn client_receives_partial_timeout_and_keeps_connection_for_later_operatio
     .unwrap();
     let client = Client::connect(
         server.addr(),
-        ClientOptions {
-            timeout: Duration::from_millis(150),
-            ..Default::default()
-        },
+        ClientOptions::builder()
+            .timeout(Duration::from_millis(150))
+            .build(),
     )
     .await
     .unwrap();

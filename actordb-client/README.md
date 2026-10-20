@@ -4,6 +4,12 @@ Connect to the **application listener**, using `Client::connect(address,
 ClientOptions::default())`. A server explicitly binds
 `actordb::client_server::ClientServer` around an existing `Arc<Node>`.
 
+Construct `ClientOptions` and `PutOptions` with their Bon builders, or start
+with `Default` and modify public fields. In unpublished 0.7.0 these structs are
+`non_exhaustive`, allowing future optional settings without another literal
+construction break. Replace struct literals with builder chains; see the
+[option migration guide](../docs/client-options.md).
+
 Run the complete TCP and SQL example with
 `cargo run -p actordb-client --example query_demo`. It starts a local listener,
 writes records through the SDK, queries selected fragments, and reduces all

@@ -35,10 +35,10 @@ async fn full_application_catalog_preserves_peer_membership_and_node_lifecycle()
         .put_with_options(
             "item:1",
             b"123".to_vec(),
-            PutOptions {
-                ttl: Some(Duration::from_secs(60)),
-                priority: Priority::High,
-            },
+            PutOptions::builder()
+                .maybe_ttl(Some(Duration::from_secs(60)))
+                .priority(Priority::High)
+                .build(),
         )
         .await
         .unwrap();
@@ -133,19 +133,17 @@ async fn application_credentials_are_mutual_and_separate_from_cluster_auth() {
         .is_err());
     assert!(Client::connect(
         server.addr(),
-        ClientOptions {
-            credential: Some(vec![43; 32]),
-            ..Default::default()
-        }
+        ClientOptions::builder()
+            .maybe_credential(Some(vec![43; 32]))
+            .build()
     )
     .await
     .is_err());
     let client = Client::connect(
         server.addr(),
-        ClientOptions {
-            credential: Some(secret),
-            ..Default::default()
-        },
+        ClientOptions::builder()
+            .maybe_credential(Some(secret))
+            .build(),
     )
     .await
     .unwrap();
@@ -224,10 +222,7 @@ async fn canceled_partial_response_closes_connection_and_releases_queue() {
     });
     let client = Client::connect(
         addr,
-        ClientOptions {
-            max_queued_requests: 1,
-            ..Default::default()
-        },
+        ClientOptions::builder().max_queued_requests(1).build(),
     )
     .await
     .unwrap();
@@ -543,10 +538,9 @@ async fn incomplete_application_prefix_is_timed_out_and_idle_client_survives() {
 async fn excessive_public_queue_limits_return_errors_without_panicking() {
     let result = Client::connect(
         "127.0.0.1:1".parse().unwrap(),
-        ClientOptions {
-            max_queued_requests: usize::MAX,
-            ..Default::default()
-        },
+        ClientOptions::builder()
+            .max_queued_requests(usize::MAX)
+            .build(),
     )
     .await;
     assert!(matches!(result, Err(ClientError::Invalid(_))));
