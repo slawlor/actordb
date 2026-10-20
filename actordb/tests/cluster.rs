@@ -4655,6 +4655,7 @@ async fn sender_buffer_reset_and_reconcile() {
     let config = NodeConfig {
         fragment_map: fragment_map.clone(),
         replication: SenderConfig {
+            retained_byte_capacity: SenderConfig::default().retained_byte_capacity,
             batch_size: 5,
             batch_interval: Duration::from_millis(50),
             max_in_flight: 2,
@@ -4749,6 +4750,7 @@ async fn live_connected_overflow_reconciles_without_reconnect() {
 
     let config = NodeConfig {
         replication: SenderConfig {
+            retained_byte_capacity: SenderConfig::default().retained_byte_capacity,
             batch_size: 100,
             batch_interval: Duration::from_secs(3600),
             max_in_flight: 1,
@@ -4916,6 +4918,7 @@ async fn stale_reconcile_round_cannot_complete_live_reset() {
         NodeConfig {
             fragment_map,
             replication: SenderConfig {
+                retained_byte_capacity: SenderConfig::default().retained_byte_capacity,
                 batch_size: 100,
                 batch_interval: Duration::from_secs(3600),
                 max_in_flight: 1,
@@ -5314,6 +5317,7 @@ async fn silent_reconcile_phase_times_out_and_retries() {
         NodeConfig {
             fragment_map,
             replication: SenderConfig {
+                retained_byte_capacity: SenderConfig::default().retained_byte_capacity,
                 batch_size: 100,
                 batch_interval: Duration::from_secs(3600),
                 max_in_flight: 1,
@@ -5402,6 +5406,7 @@ async fn inbound_mutation_after_snapshot_invalidates_reset_completion() {
         NodeConfig {
             fragment_map,
             replication: SenderConfig {
+                retained_byte_capacity: SenderConfig::default().retained_byte_capacity,
                 batch_size: 100,
                 batch_interval: Duration::from_secs(3600),
                 max_in_flight: 1,
@@ -5556,6 +5561,7 @@ async fn malformed_reconcile_data_is_rejected_without_partial_apply() {
         NodeConfig {
             fragment_map,
             replication: SenderConfig {
+                retained_byte_capacity: SenderConfig::default().retained_byte_capacity,
                 batch_size: 100,
                 batch_interval: Duration::from_secs(3600),
                 max_in_flight: 1,
@@ -7858,6 +7864,7 @@ async fn placement_drain_waits_for_buffer_reset() {
             placement_poll_interval: Duration::from_millis(25),
             placement_drain_warn_interval: Duration::from_millis(100),
             replication: SenderConfig {
+                retained_byte_capacity: SenderConfig::default().retained_byte_capacity,
                 batch_size: 100,
                 batch_interval: Duration::from_secs(3600),
                 max_in_flight: 1,
@@ -8146,6 +8153,7 @@ async fn placement_readd_while_draining_cancels_teardown() {
             placement_poll_interval: Duration::from_millis(25),
             placement_drain_warn_interval: Duration::from_millis(100),
             replication: SenderConfig {
+                retained_byte_capacity: SenderConfig::default().retained_byte_capacity,
                 batch_size: 100,
                 batch_interval: Duration::from_secs(3600),
                 max_in_flight: 1,
@@ -9449,6 +9457,7 @@ async fn ordinary_ack_timeout_rotates_session_and_replays_exact_batch() {
         NodeConfig {
             fragment_map,
             replication: SenderConfig {
+                retained_byte_capacity: SenderConfig::default().retained_byte_capacity,
                 batch_size: 1,
                 batch_interval: Duration::from_millis(10),
                 max_in_flight: 1,
@@ -9601,6 +9610,7 @@ async fn older_batch_timeout_replays_only_the_unacknowledged_batch() {
         NodeConfig {
             fragment_map,
             replication: SenderConfig {
+                retained_byte_capacity: SenderConfig::default().retained_byte_capacity,
                 batch_size: 1,
                 batch_interval: Duration::from_millis(10),
                 max_in_flight: 2,
@@ -9769,6 +9779,7 @@ async fn weak_ack_does_not_prevent_timeout_and_exact_replay() {
         NodeConfig {
             fragment_map,
             replication: SenderConfig {
+                retained_byte_capacity: SenderConfig::default().retained_byte_capacity,
                 batch_size: 1,
                 batch_interval: Duration::from_millis(10),
                 max_in_flight: 1,
@@ -9987,6 +9998,7 @@ async fn failed_reconcile_repair_cannot_be_hidden_by_barrier_ack() {
     let store = Arc::new(FailOnceStore::default());
     let sender_config = NodeConfig {
         replication: SenderConfig {
+            retained_byte_capacity: SenderConfig::default().retained_byte_capacity,
             batch_size: 100,
             batch_interval: Duration::from_secs(3600),
             max_in_flight: 1,
@@ -10086,6 +10098,7 @@ async fn fetched_reconcile_value_retries_failed_local_store_fence() {
             snapshot_interval: Duration::from_secs(3600),
             fragment_map,
             replication: SenderConfig {
+                retained_byte_capacity: SenderConfig::default().retained_byte_capacity,
                 batch_size: 100,
                 batch_interval: Duration::from_secs(3600),
                 max_in_flight: 1,
