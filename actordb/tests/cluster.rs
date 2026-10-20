@@ -2982,6 +2982,9 @@ async fn reconcile_cursor_continues_after_revision_drift_for_verified_multi_pass
                 after_key: String::new(),
                 snapshot_revision: 0,
                 snapshot_time_ms: 0,
+
+                recovery_epoch: Vec::new(),
+                recovery_replica_digest: Vec::new(),
             })),
         },
     )
@@ -3010,6 +3013,9 @@ async fn reconcile_cursor_continues_after_revision_drift_for_verified_multi_pass
                 after_key: first.next_after_key,
                 snapshot_revision: first.snapshot_revision,
                 snapshot_time_ms: first.snapshot_time_ms,
+
+                recovery_epoch: Vec::new(),
+                recovery_replica_digest: Vec::new(),
             })),
         },
     )
@@ -3063,6 +3069,9 @@ async fn reconcile_barrier_revokes_prior_fetch_authorization() {
                 after_key: String::new(),
                 snapshot_revision: 0,
                 snapshot_time_ms: 0,
+
+                recovery_epoch: Vec::new(),
+                recovery_replica_digest: Vec::new(),
             })),
         },
     )
@@ -3192,6 +3201,9 @@ async fn reconcile_barrier_rejects_a_replaced_fragment_incarnation() {
                 after_key: String::new(),
                 snapshot_revision: 0,
                 snapshot_time_ms: 0,
+
+                recovery_epoch: Vec::new(),
+                recovery_replica_digest: Vec::new(),
             })),
         },
     )

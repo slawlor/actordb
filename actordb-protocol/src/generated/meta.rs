@@ -273,6 +273,11 @@ pub struct ReconcileRequest {
     pub snapshot_revision: u64,
     #[prost(uint64, tag = "7")]
     pub snapshot_time_ms: u64,
+    /// Explicit full-outage recovery authority; absent during ordinary startup.
+    #[prost(bytes = "vec", tag = "8")]
+    pub recovery_epoch: ::prost::alloc::vec::Vec<u8>,
+    #[prost(bytes = "vec", tag = "9")]
+    pub recovery_replica_digest: ::prost::alloc::vec::Vec<u8>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ReconcileResponse {

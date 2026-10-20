@@ -99,6 +99,8 @@ pub struct SenderRuntimeOptions {
     aggregate_retention: Arc<ByteBudget>,
     #[builder(skip = ByteBudget::new(64 * 1024 * 1024))]
     reconciliation_result_budget: Arc<ByteBudget>,
+    #[builder(skip)]
+    pub(crate) recovery: Option<Arc<crate::node::recovery::RecoveryContext>>,
 }
 
 impl std::fmt::Debug for SenderRuntimeOptions {
@@ -222,6 +224,14 @@ impl std::fmt::Display for SenderOptionsError {
 impl std::error::Error for SenderOptionsError {}
 
 impl SenderRuntimeOptions {
+    pub(crate) fn with_recovery(
+        mut self,
+        recovery: Option<Arc<crate::node::recovery::RecoveryContext>>,
+    ) -> Self {
+        self.recovery = recovery;
+        self
+    }
+
     /// Set the maximum wait for an acceptable ACK after an ordinary batch is
     /// admitted to the peer queue. Reconciliation barriers continue to use
     /// [`SenderConfig::reconcile_timeout`].
@@ -1156,6 +1166,7 @@ struct SenderPeer {
     local_work_timeout: Duration,
     reconciliation_result_budget: Arc<ByteBudget>,
     queue_failure_handler: Option<QueueFailureHandler>,
+    recovery: Option<Arc<crate::node::recovery::RecoveryContext>>,
 }
 
 impl SenderPeer {
@@ -1174,6 +1185,7 @@ impl SenderPeer {
             local_work_timeout: options.local_work_timeout,
             reconciliation_result_budget: options.reconciliation_result_budget.clone(),
             queue_failure_handler: options.queue_failure_handler.clone(),
+            recovery: options.recovery.clone(),
         }
     }
 
@@ -3355,6 +3367,11 @@ async fn begin_reconcile(
         }
     };
     let round_id = next_nonzero(next_round_id);
+    let (recovery_epoch, recovery_replica_digest) =
+        connection.peer_tx.recovery.as_ref().map_or_else(
+            || (Vec::new(), Vec::new()),
+            |recovery| recovery.request_fields(fragment),
+        );
     let ok = send_envelope(
         &connection.peer_tx,
         connection.next_streaming_deadline(),
@@ -3366,6 +3383,8 @@ async fn begin_reconcile(
             after_key: String::new(),
             snapshot_revision: 0,
             snapshot_time_ms: 0,
+            recovery_epoch,
+            recovery_replica_digest,
         }),
     )
     .await;
@@ -3818,6 +3837,11 @@ async fn send_summary_request(
     round_id: u64,
     summary: &ReconcileSummaryState,
 ) -> Result<(), ReconcileError> {
+    let (recovery_epoch, recovery_replica_digest) =
+        connection.peer_tx.recovery.as_ref().map_or_else(
+            || (Vec::new(), Vec::new()),
+            |recovery| recovery.request_fields(fragment),
+        );
     if send_envelope(
         &connection.peer_tx,
         connection.next_streaming_deadline(),
@@ -3829,6 +3853,8 @@ async fn send_summary_request(
             after_key: summary.after_key.clone(),
             snapshot_revision: summary.remote_snapshot_revision.unwrap_or(0),
             snapshot_time_ms: summary.remote_snapshot_time_ms.unwrap_or(0),
+            recovery_epoch,
+            recovery_replica_digest,
         }),
     )
     .await
