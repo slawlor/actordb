@@ -320,6 +320,39 @@ async fn selected_key_ranges_charge_only_selected_index_work() {
                 .collect::<Vec<_>>()
         );
     }
+    for key in ["雪", "雪:1", "雲"] {
+        node.put(key.into(), b"123".to_vec()).await.unwrap();
+    }
+    for (sql, expected) in [
+        (
+            "SELECT key FROM kv WHERE STARTS_WITH(key, X'e99b')",
+            vec!["雪", "雪:1", "雲"],
+        ),
+        ("SELECT key FROM kv WHERE STARTS_WITH(key, X'ff')", vec![]),
+        (
+            "SELECT key FROM kv WHERE STARTS_WITH(key, X'e9') AND key < 'a'",
+            vec![],
+        ),
+    ] {
+        let result = node
+            .query_plan_with_options(
+                &parse(sql).unwrap(),
+                QueryOptions {
+                    max_scanned_rows: 3,
+                    page_visits: 1,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            result.rows,
+            expected
+                .into_iter()
+                .map(|key| vec![QueryValue::Text(key.into())])
+                .collect::<Vec<_>>()
+        );
+    }
     let aggregate = node
         .query("SELECT COUNT(*) FROM kv WHERE key > 'z' AND key < 'a'")
         .await
