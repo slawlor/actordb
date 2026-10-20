@@ -84,6 +84,44 @@ configured deadline (5 seconds by default) covering queueing and response; a
 missing or malformed reply is never converted to success. Priority still
 controls admission and scheduling.
 
+## Embedded request admission and cancellation
+
+Embedded Node point/batch reads and writes reserve node-wide request count and
+retained request bytes before enqueueing actor work. `NodeRuntimeOptions`
+provides `embedded_operation_capacity` (default 128) and
+`embedded_operation_byte_capacity` (default 64 MiB), both Bon builder settings
+with setters/getters. Admission does not wait: saturation returns
+`NodeError::Backpressure` before consuming a write stamp or mutating state.
+Request charges include allocated String/Vec capacity and conservative
+routing/correlation/ApplyOp clone overhead. A batch retains one shared lease for
+its full input and bounded concurrent local chunk.
+
+Request ownership follows reads through dispatcher/worker completion, even when
+a local waiter times out or cancels. Accepted embedded mutations run in a separate
+completion owner: exact apply, deterministic expiry handling, and replication
+fanout finish while the original operation and placement leases remain held.
+`local_work_timeout` bounds the user waiter; expiry of that waiter returns
+`NodeError::UnknownOutcome` rather than a definite rejection. Write concern
+waiters additionally allow their acknowledgement budget. Dropping a user future
+also leaves accepted mutation completion owned. Explicit Node shutdown drains
+this owner before stopping senders or fragment actors; last-owner Node Drop is
+best effort and may abort work.
+
+`Node::embedded_operation_diagnostics()` reports admitted count and conservative
+retained request bytes, including work after its waiter ends. These limits cover
+request ownership across fragments/priorities; they do not cap cache,
+persistence, replication, query/scan result storage, caller-returned datasets,
+or allocator overhead. Queries/scans and serving peer reads have their own
+admission. `get_all` is a legacy debug operation with bounded request count but
+an unbounded whole-dataset result; production reads should use bounded scans or
+queries. Operators must budget these other allocations separately.
+
+Unknown mutation outcomes survive application and peer protocol mapping. Do not
+automatically repeat them as fresh writes: that would create a different LWW
+version. ActorDB's existing remote failover repeats only the exact stamped
+operation, and an earlier inconclusive attempt cannot make a later rejection
+prove that the mutation never applied.
+
 ## Replication lag and partitions
 
 Writes return after the serving owner's apply; reaching its other replicas is asynchronous

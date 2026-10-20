@@ -45,6 +45,12 @@ impl Node {
         options: WriteConcernOptions,
     ) -> Result<WriteConcernReceipt, WriteConcernError> {
         let _operation = self.admit_operation()?;
+        let retention =
+            self.embedded_operations
+                .admit(embedded_operations::single_request_bytes(
+                    &key,
+                    Some(&value),
+                ))?;
         options.validate()?;
         let fragment = fragment_of(&key, self.router.fragment_count);
         if self.serving.read().unwrap().contains(&fragment) {
@@ -75,7 +81,7 @@ impl Node {
             seq,
             boot_id: self.boot_id,
         };
-        self.apply_routed_with_concern(op, priority, Some(&options))
+        self.apply_routed_with_concern(op, priority, Some(&options), retention)
             .await?
             .ok_or_else(|| WriteConcernError::UnknownOutcome("missing concern receipt".into()))
     }
@@ -96,6 +102,9 @@ impl Node {
         options: WriteConcernOptions,
     ) -> Result<WriteConcernReceipt, WriteConcernError> {
         let _operation = self.admit_operation()?;
+        let retention = self
+            .embedded_operations
+            .admit(embedded_operations::single_request_bytes(&key, None))?;
         options.validate()?;
         let fragment = fragment_of(&key, self.router.fragment_count);
         if self.serving.read().unwrap().contains(&fragment) {
@@ -120,7 +129,7 @@ impl Node {
             seq,
             boot_id: self.boot_id,
         };
-        self.apply_routed_with_concern(op, priority, Some(&options))
+        self.apply_routed_with_concern(op, priority, Some(&options), retention)
             .await?
             .ok_or_else(|| WriteConcernError::UnknownOutcome("missing concern receipt".into()))
     }
@@ -129,12 +138,24 @@ impl Node {
         op: ReplicatedOp,
         priority: OpPriority,
         options: Option<&WriteConcernOptions>,
+        retention: Arc<RequestRetention>,
     ) -> Result<Option<WriteConcernReceipt>, WriteConcernError> {
         validate_replicated_op(&op)?;
         let policy = options.map(WriteConcernOptions::encode).transpose()?;
         let frag = fragment_of(&op.key, self.router.fragment_count);
         let mutation_lease = if self.placement_controller.is_some() {
-            Some(self.router.mutation_gate(frag).read_owned().await)
+            Some(
+                tokio::time::timeout(
+                    self.runtime_options.local_work_timeout(),
+                    self.router.mutation_gate(frag).read_owned(),
+                )
+                .await
+                .map_err(|_| {
+                    NodeError::Actor(
+                        "mutation authority wait timed out before apply admission".into(),
+                    )
+                })?,
+            )
         } else {
             None
         };
@@ -147,39 +168,69 @@ impl Node {
             let pending = options
                 .map(|options| self.write_concerns.prepare(frag, &op, options))
                 .transpose()?;
-            let outcome = call_apply(&actor, op.clone(), priority, false).await?;
-
-            match outcome {
-                ApplyOutcome::Applied | ApplyOutcome::AlreadyPresent => {}
-                ApplyOutcome::Superseded {
-                    timestamp_ms,
-                    logical_counter,
-                    node_id,
-                    is_tombstone,
-                } => {
-                    return Err(NodeError::Superseded {
-                        timestamp_ms,
-                        logical_counter,
-                        node_id,
-                        is_tombstone,
+            let operation = self.admit_operation()?;
+            let senders = self.senders.clone();
+            let (reply, response) = oneshot::channel();
+            let budget = self
+                .runtime_options
+                .local_work_timeout()
+                .checked_add(options.map_or(Duration::ZERO, WriteConcernOptions::timeout))
+                .ok_or_else(|| NodeError::Codec("local mutation deadline overflow".into()))?;
+            self.embedded_operations.submit(async move {
+                // These leases belong to actual completion, independently of
+                // the caller waiter. No accepted ApplyOp is abandoned at its
+                // user deadline; exact outcome and fanout must finish first.
+                let _retention = retention;
+                let _operation = operation;
+                let result = async {
+                    let outcome = call_apply(&actor, op.clone(), priority, false).await?;
+                    match outcome {
+                        ApplyOutcome::Applied | ApplyOutcome::AlreadyPresent => {}
+                        ApplyOutcome::Superseded {
+                            timestamp_ms,
+                            logical_counter,
+                            node_id,
+                            is_tombstone,
+                        } => {
+                            return Err(NodeError::Superseded {
+                                timestamp_ms,
+                                logical_counter,
+                                node_id,
+                                is_tombstone,
+                            }
+                            .into());
+                        }
+                        ApplyOutcome::Expired => {
+                            let mut expiry = op;
+                            expiry.value = expiry.value.expiry_tombstone();
+                            enqueue_to_senders(&senders, frag, &expiry).await;
+                            return Err(NodeError::Expired.into());
+                        }
                     }
-                    .into())
+                    enqueue_to_senders(&senders, frag, &op).await;
+                    drop(mutation_lease);
+                    if let Some(pending) = pending {
+                        pending.applied_locally();
+                        pending.wait().await.map(Some)
+                    } else {
+                        Ok(None)
+                    }
                 }
-                ApplyOutcome::Expired => {
-                    let mut expiry = op.clone();
-                    expiry.value = expiry.value.expiry_tombstone();
-                    self.enqueue_for_replication(frag, &expiry).await;
-                    return Err(NodeError::Expired.into());
-                }
-            }
-
-            self.enqueue_for_replication(frag, &op).await;
-            drop(mutation_lease);
-            if let Some(pending) = pending {
-                pending.applied_locally();
-                return pending.wait().await.map(Some);
-            }
-            return Ok(None);
+                .await;
+                let _ = reply.send(result);
+            })?;
+            return tokio::time::timeout(budget, response)
+                .await
+                .map_err(|_| {
+                    WriteConcernError::UnknownOutcome(
+                        "local mutation waiter deadline exceeded; completion remains owned".into(),
+                    )
+                })?
+                .map_err(|_| {
+                    WriteConcernError::UnknownOutcome(
+                        "local mutation completion owner lost its reply".into(),
+                    )
+                })?;
         }
         drop(mutation_lease);
 
@@ -277,10 +328,17 @@ impl Node {
                     "mutation reply omitted write concern acknowledgement".into(),
                 ));
             }
-            decode_mutation_result(result)?;
+            if let Err(error) = decode_mutation_result(result) {
+                if ambiguous_attempt {
+                    return Err(WriteConcernError::UnknownOutcome(format!(
+                        "an earlier forwarded mutation may have applied; latest attempt returned: {error}"
+                    )));
+                }
+                return Err(error.into());
+            }
             return Ok(None);
         }
-        if options.is_some() && ambiguous_attempt {
+        if ambiguous_attempt {
             return Err(WriteConcernError::UnknownOutcome(format!(
                 "forwarded mutation may have applied; no conclusive reply for fragment {frag} (tried {})",
                 tried.join(",")
