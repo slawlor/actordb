@@ -392,14 +392,11 @@ async fn run_worker(
     loop {
         let job = {
             let mut jobs = jobs.lock().await;
-            if *stop.borrow() {
-                jobs.close();
-            }
-            tokio::select! {
-                biased;
-                _ = stop.changed(), if !*stop.borrow() => { jobs.close(); jobs.recv().await }
-                job = jobs.recv() => job,
-            }
+            // Use the same snapshot for closing admission and enabling the
+            // change branch. A second borrow could observe shutdown between
+            // these decisions, disable the branch, and wait on an open queue.
+            let stopping = *stop.borrow_and_update();
+            receive_job(&mut jobs, &mut stop, stopping).await
         };
         let Some(job) = job else {
             return;
@@ -412,6 +409,21 @@ async fn run_worker(
                 error.into_inner().complete().await;
             }
         }
+    }
+}
+
+async fn receive_job(
+    jobs: &mut mpsc::Receiver<MutationJob>,
+    stop: &mut watch::Receiver<bool>,
+    stopping: bool,
+) -> Option<MutationJob> {
+    if stopping {
+        jobs.close();
+    }
+    tokio::select! {
+        biased;
+        _ = stop.changed(), if !stopping => { jobs.close(); jobs.recv().await }
+        job = jobs.recv() => job,
     }
 }
 
@@ -1485,6 +1497,25 @@ mod tests {
         .await;
         sender.stop().await;
         actor.stop(None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_after_receiver_snapshot_closes_an_empty_live_queue() {
+        let (sender, mut jobs) = mpsc::channel(1);
+        let (stop_sender, mut stop) = watch::channel(false);
+        let stopping = *stop.borrow_and_update();
+        assert!(!stopping);
+        // Precisely the interleaving that used to disable the change branch
+        // without closing the queue. Keep the producer alive while receiving.
+        stop_sender.send_replace(true);
+        let job = tokio::time::timeout(
+            Duration::from_secs(1),
+            receive_job(&mut jobs, &mut stop, stopping),
+        )
+        .await
+        .unwrap();
+        assert!(job.is_none());
+        assert!(sender.is_closed());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

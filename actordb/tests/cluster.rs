@@ -1048,6 +1048,7 @@ async fn legacy_tombstone_gc_api_remains_source_compatible_and_safe() {
         reset_senders: reset_senders.clone(),
     };
     let supervisor = SupervisorArgs {
+        expiry_publisher: None,
         fragment: FragmentId(0),
         worker_prefix: "compat".to_string(),
         store: None,

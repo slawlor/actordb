@@ -17,6 +17,14 @@ application traffic and peer replication. It also checks TLS trust/name failures
 and that unfinished TLS clients do not block healthy sessions. See the
 [transport guide](transports.md) for the adapter contract and runnable example.
 
+TTL callback tests use paused Tokio time and controlled materialization clocks
+for dispatcher batching, latency, limits, errors/panics/timeouts, drain cancellation
+and owner Drop. Fragment-state tests cover version races with replacement/TTL
+extension, disabled callbacks, silent read/snapshot synthesis, replica identities,
+saturation and persistence failure without replay. Public integration tests cover
+registration, startup conversion and restart, validation and bounded Node shutdown.
+The [TTL callback guide](ttl-expiry-callbacks.md) documents the delivery contract.
+
 The separate `Verify release package` workflow check additionally verifies
 unpacked crates.io packages for backend-free defaults and opted-in storage
 features, and runs stdlib release-guard regressions. PR and `main` runs have no

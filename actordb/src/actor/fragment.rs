@@ -25,6 +25,7 @@ use crate::actor::{
 };
 use crate::shard::FragmentId;
 use crate::store::KvStore;
+use crate::ttl_expiry::{ExpiryPublisher, PreparedExpiry};
 use crate::wire::check_versioned_value_budget;
 
 /// Local, non-atomic fragment snapshot served by the [`FragmentSupervisor`].
@@ -116,6 +117,9 @@ impl std::error::Error for FragmentStartupStorageError {}
 pub struct SupervisorArgs {
     /// Which fragment this supervisor owns.
     pub fragment: FragmentId,
+    /// Opaque Node-owned callback ingress; disabled by default.
+    #[doc(hidden)]
+    pub expiry_publisher: Option<ExpiryPublisher>,
     /// Prefix for worker actor names (unique per supervisor).
     #[builder(into)]
     pub worker_prefix: String,
@@ -180,19 +184,33 @@ enum SupervisorLifecycle {
     Flushed,
 }
 
+struct LoadedCache {
+    values: HashMap<String, VersionedValue>,
+    high_water: Option<u64>,
+    expirations: Vec<PreparedExpiry>,
+}
+
 impl SupervisorState {
     /// Load the fragment's cache from the store. A corrupt store fails
     /// boot loudly rather than silently dropping data.
     async fn load_cache(
         store: &Option<Arc<dyn KvStore>>,
-    ) -> Result<(HashMap<String, VersionedValue>, Option<u64>), ActorProcessingErr> {
+        fragment: FragmentId,
+        publisher: &Option<ExpiryPublisher>,
+    ) -> Result<LoadedCache, ActorProcessingErr> {
         match store {
             Some(kvstore) => {
                 let mut map = HashMap::new();
                 let mut expiry_updates = Vec::new();
+                let mut expirations = HashMap::new();
                 let mut high_water: Option<u64> = None;
                 let now = now_ms();
-                for (k, v) in kvstore.load().map_err(FragmentStartupStorageError::boxed)? {
+                for (index, (k, v)) in kvstore
+                    .load()
+                    .map_err(FragmentStartupStorageError::boxed)?
+                    .into_iter()
+                    .enumerate()
+                {
                     high_water = Some(
                         high_water
                             .map(|current| current.max(v.timestamp_ms))
@@ -200,12 +218,15 @@ impl SupervisorState {
                     );
                     let key =
                         String::from_utf8(k.clone()).map_err(FragmentStartupStorageError::boxed)?;
-                    let value = if v.is_expired(now) {
+                    // Match the loader's existing last-row-wins cache behavior
+                    // even if a custom store returns a duplicate key.
+                    expirations.remove(&key);
+                    let (value, previous_value) = if v.is_expired(now) {
                         let tombstone = v.expiry_tombstone();
                         expiry_updates.push((k, tombstone.clone()));
-                        tombstone
+                        (tombstone, if publisher.is_some() { Some(v) } else { None })
                     } else {
-                        v
+                        (v, None)
                     };
                     check_versioned_value_budget(&key, &value).map_err(|error| {
                         let prefix: String = key.chars().take(64).collect();
@@ -214,6 +235,13 @@ impl SupervisorState {
                             key.len()
                         ))
                     })?;
+                    if let (Some(publisher), Some(previous_value)) = (publisher, previous_value) {
+                        if let Some(expiration) =
+                            publisher.prepare_startup(fragment, &key, previous_value)
+                        {
+                            expirations.insert(key.clone(), (index, expiration));
+                        }
+                    }
                     map.insert(key, value);
                 }
                 // Persist boot-time expiry conversion before the fragment
@@ -224,9 +252,19 @@ impl SupervisorState {
                         .write_batch(&expiry_updates)
                         .map_err(FragmentStartupStorageError::boxed)?;
                 }
-                Ok((map, high_water))
+                let mut expirations: Vec<_> = expirations.into_values().collect();
+                expirations.sort_unstable_by_key(|(index, _)| *index);
+                Ok(LoadedCache {
+                    values: map,
+                    high_water,
+                    expirations: expirations.into_iter().map(|(_, event)| event).collect(),
+                })
             }
-            None => Ok((HashMap::new(), None)),
+            None => Ok(LoadedCache {
+                values: HashMap::new(),
+                high_water: None,
+                expirations: Vec::new(),
+            }),
         }
     }
 
@@ -375,20 +413,30 @@ impl FragmentSupervisor {
         args: SupervisorArgs,
         children: &mut SupervisorStartupChildren,
     ) -> Result<SupervisorState, ActorProcessingErr> {
-        let (cache, persisted_high_water) = SupervisorState::load_cache(&args.store).await?;
-        if let Some(timestamp_ms) = persisted_high_water {
+        let loaded =
+            SupervisorState::load_cache(&args.store, args.fragment, &args.expiry_publisher).await?;
+        if let Some(timestamp_ms) = loaded.high_water {
             args.hlc
                 .lock()
                 .await
                 .seed_persisted(timestamp_ms)
                 .map_err(FragmentStartupStorageError::boxed)?;
         }
-        let shared = Arc::new(FragmentState::new(
-            cache,
-            args.store.clone(),
-            args.flush_batch_size,
-            args.flush_interval,
-        ));
+        let shared = Arc::new(
+            FragmentState::new(
+                loaded.values,
+                args.store.clone(),
+                args.flush_batch_size,
+                args.flush_interval,
+            )
+            .with_expiry_publisher(args.fragment, args.expiry_publisher.clone()),
+        );
+        // Publish only after boot-time normalization was validated and persisted
+        // and the HLC accepted its version floor. Publish before starting cleaner
+        // children, so their subsequent materializations cannot overtake these.
+        for expiration in loaded.expirations {
+            expiration.publish();
+        }
         let cell = myself.get_cell();
 
         let (dispatcher, _h) = KvActor::spawn_linked(
@@ -1023,6 +1071,7 @@ mod tests {
                 rate_limit_per_sec: None,
             };
             SupervisorArgs {
+                expiry_publisher: None,
                 fragment: FragmentId(0),
                 worker_prefix: prefix.to_string(),
                 store: None,
@@ -1281,6 +1330,7 @@ mod tests {
                 rate_limit_per_sec: None,
             };
             let args = SupervisorArgs {
+                expiry_publisher: None,
                 fragment: FragmentId(0),
                 worker_prefix: "paged-final-quiesce".into(),
                 store: Some(store.clone()),
@@ -1413,6 +1463,7 @@ mod tests {
                 None,
                 FragmentSupervisor,
                 SupervisorArgs {
+                    expiry_publisher: None,
                     fragment: FragmentId(0),
                     worker_prefix: "failed-supervisor".to_string(),
                     store: None,
@@ -1456,6 +1507,7 @@ mod tests {
                 None,
                 FragmentSupervisor,
                 SupervisorArgs {
+                    expiry_publisher: None,
                     fragment: FragmentId(0),
                     worker_prefix: "failed-snapshotter".to_string(),
                     store: Some(Arc::new(DropSignalStore(Some(store_dropped)))),
@@ -1499,6 +1551,7 @@ mod tests {
                 None,
                 FragmentSupervisor,
                 SupervisorArgs {
+                    expiry_publisher: None,
                     fragment: FragmentId(0),
                     worker_prefix: "quiesce-drain-test".to_string(),
                     store: Some(store.clone()),

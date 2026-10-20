@@ -1,6 +1,6 @@
 [package]
 name = "actordb"
-version = "0.6.0"
+version = "0.7.0"
 authors = ["Sean Lawlor"]
 description = "An actor-first distributed database"
 documentation = "https://docs.rs/actordb"
@@ -23,8 +23,8 @@ memory = []
 rocksdb = ["dep:rocksdb"]
 
 [dependencies]
-actordb-protocol = { version = "0.6.0", path = "../actordb-protocol" }
-actordb-query = { version = "0.6.0", path = "../actordb-query" }
+actordb-protocol = { version = "0.7.0", path = "../actordb-protocol" }
+actordb-query = { version = "0.7.0", path = "../actordb-query" }
 # Required dependencies
 bon = { version = "3.10.2" }
 bytes = { version = "1" }

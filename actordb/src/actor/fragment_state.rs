@@ -19,7 +19,9 @@ use super::protocol::{
     VersionedPage, VersionedValue,
 };
 use super::scan::{KeyMatcher, ScanMatch, ScanSpec, ValueTransform};
+use crate::shard::FragmentId;
 use crate::store::{KvStore, StoreCommitDurability};
+use crate::ttl_expiry::ExpiryPublisher;
 use crate::wire::check_versioned_value_budget;
 
 // Actor-owned summary clones stay bounded before wire metadata is added.
@@ -56,6 +58,7 @@ pub struct FragmentState {
     flush_in_progress: Mutex<()>,
     flush_batch_size: usize,
     flush_interval: Duration,
+    expiry_publisher: Option<(FragmentId, ExpiryPublisher)>,
 }
 
 /// Values and their ordered key index. Both live under one lock so every
@@ -155,6 +158,35 @@ impl FragmentState {
             flush_in_progress: Mutex::new(()),
             flush_batch_size,
             flush_interval,
+            expiry_publisher: None,
+        }
+    }
+
+    pub(crate) fn with_expiry_publisher(
+        mut self,
+        fragment: FragmentId,
+        publisher: Option<ExpiryPublisher>,
+    ) -> Self {
+        self.expiry_publisher = publisher.map(|publisher| (fragment, publisher));
+        self
+    }
+
+    fn publish_expiry(&self, key: &str, previous_value: VersionedValue) {
+        if let Some((fragment, publisher)) = &self.expiry_publisher {
+            publisher.offer(*fragment, key, previous_value);
+        }
+    }
+
+    fn install_expiry(
+        &self,
+        value: &mut VersionedValue,
+        tombstone: VersionedValue,
+    ) -> Option<VersionedValue> {
+        if self.expiry_publisher.is_some() {
+            Some(std::mem::replace(value, tombstone))
+        } else {
+            *value = tombstone;
+            None
         }
     }
 
@@ -828,9 +860,17 @@ impl FragmentState {
         if self.kvstore.is_none() {
             let mut cache = self.cache.write().await;
             let mut converted = 0;
-            for value in cache.values.values_mut() {
+            for (key, value) in cache.values.iter_mut() {
                 if value.is_expired(now_ms) {
-                    *value = value.expiry_tombstone();
+                    let tombstone = value.expiry_tombstone();
+                    if self.expiry_publisher.is_some() {
+                        let previous_value = std::mem::replace(value, tombstone);
+                        // Nonwaiting admission under the mutation lock preserves
+                        // fragment order. User code runs in a separate task.
+                        self.publish_expiry(key, previous_value);
+                    } else {
+                        *value = tombstone;
+                    }
                     converted += 1;
                 }
             }
@@ -850,8 +890,16 @@ impl FragmentState {
             for (key, value) in cache.values.iter_mut() {
                 if value.is_expired(now_ms) {
                     let tombstone = value.expiry_tombstone();
-                    *value = tombstone.clone();
+                    let previous_value = if self.expiry_publisher.is_some() {
+                        Some(std::mem::replace(value, tombstone.clone()))
+                    } else {
+                        *value = tombstone.clone();
+                        None
+                    };
                     flush.pending.push((key.clone(), tombstone));
+                    if let Some(previous_value) = previous_value {
+                        self.publish_expiry(key, previous_value);
+                    }
                     converted += 1;
                 }
             }
@@ -933,11 +981,15 @@ impl FragmentState {
                     next_cursor = Some(key.clone());
                     if expired {
                         let tombstone = value.expiry_tombstone();
-                        if let Some(flush) = &mut flush {
-                            *value = tombstone.clone();
+                        let previous_value = if let Some(flush) = &mut flush {
+                            let previous = self.install_expiry(value, tombstone.clone());
                             flush.pending.push((key.clone(), tombstone));
+                            previous
                         } else {
-                            *value = tombstone;
+                            self.install_expiry(value, tombstone)
+                        };
+                        if let Some(previous_value) = previous_value {
+                            self.publish_expiry(key, previous_value);
                         }
                         page.converted += 1;
                     }
@@ -2380,5 +2432,335 @@ mod query_page_tests {
         let oversized = state.query_page(&work).await;
         assert_eq!(oversized.status, QueryPageStatus::Budget as i32);
         assert!(oversized.rows.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod expiry_callback_tests {
+    use super::flush_tests::FlakyStore;
+    use super::*;
+    use crate::actor::test_support::test_op;
+    use crate::ttl_expiry::{
+        expiry_handler_fn, ExpiryBatch, ExpiryCallbackError, ExpiryRuntime, TtlExpiryOptions,
+    };
+    use std::sync::Mutex as StdMutex;
+    use tokio::sync::{mpsc, Notify};
+
+    fn expiring(version: u64) -> VersionedValue {
+        let mut value = VersionedValue::new(vec![0xff, 0, 0x80], version, "writer".into());
+        value.expires_at_ms = Some(100);
+        value
+    }
+
+    fn fixture(
+        node: &str,
+        cache: HashMap<String, VersionedValue>,
+        store: Option<Arc<dyn KvStore>>,
+    ) -> (
+        FragmentState,
+        ExpiryRuntime,
+        mpsc::Receiver<ExpiryBatch>,
+        Arc<AtomicU64>,
+    ) {
+        let (sender, receiver) = mpsc::channel(1024);
+        let handler = expiry_handler_fn(move |batch| {
+            let sender = sender.clone();
+            async move {
+                sender
+                    .try_send(batch)
+                    .map_err(|_| ExpiryCallbackError::new("test receiver full"))
+            }
+        });
+        let clock = Arc::new(AtomicU64::new(200));
+        let clock_handler = clock.clone();
+        let runtime = ExpiryRuntime::start_with_clock(
+            node.into(),
+            Arc::new(handler),
+            TtlExpiryOptions::builder().batch_size(1).build(),
+            Arc::new(move || clock_handler.load(Ordering::SeqCst)),
+        );
+        let state = FragmentState::new(cache, store, usize::MAX, Duration::from_secs(3600))
+            .with_expiry_publisher(FragmentId(7), Some(runtime.publisher()));
+        (state, runtime, receiver, clock)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reads_and_synthesized_tombstones_are_silent_and_cleanup_reports_original_once() {
+        let original = expiring(1);
+        let pointer = original.value.as_ptr() as usize;
+        let (state, runtime, mut output, _) =
+            fixture("node", HashMap::from([("key".into(), original)]), None);
+        assert!(state.get("key").await.is_none());
+        assert!(
+            state
+                .get_versioned("key", Some(100))
+                .await
+                .unwrap()
+                .is_tombstone
+        );
+        let (snapshot, revision) = state.snapshot_with_revision().await;
+        assert!(snapshot["key"].is_tombstone);
+        assert_eq!(revision, 0);
+        assert!(!state.cache.read().await.values["key"].is_tombstone);
+        assert_eq!(runtime.diagnostics().enqueued_events, 0);
+        assert_eq!(state.expire_values(100).await.unwrap(), 1);
+        assert_eq!(state.expire_values(100).await.unwrap(), 0);
+        assert_eq!(state.gc_tombstones(u64::MAX, 0).await, 0);
+        runtime.shutdown().await;
+        let batch = output.try_recv().unwrap();
+        let event = &batch.events[0];
+        assert_eq!(event.fragment, FragmentId(7));
+        assert_eq!(event.key, "key");
+        assert_eq!(event.previous_value.value, [0xff, 0, 0x80]);
+        assert_eq!(event.previous_value.value.as_ptr() as usize, pointer);
+        assert!(!event.previous_value.is_tombstone);
+        assert_eq!(event.original_version(), (1, "writer"));
+        assert_eq!(event.expires_at_ms, 100);
+        assert_eq!(event.observed_at_ms, 200);
+        assert_eq!(
+            state.get_all().await["key"],
+            event.previous_value.expiry_tombstone()
+        );
+        assert_eq!(runtime.diagnostics().delivered_events, 1);
+        assert!(output.try_recv().is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn disabled_callbacks_materialize_the_same_tombstone_without_a_publisher() {
+        let original = expiring(1);
+        let tombstone = original.expiry_tombstone();
+        let state = FragmentState::new(
+            HashMap::from([("key".into(), original)]),
+            None,
+            100,
+            Duration::from_secs(3600),
+        );
+        assert!(state.expiry_publisher.is_none());
+        assert_eq!(state.expire_values(100).await.unwrap(), 1);
+        assert_eq!(state.get_all().await["key"], tombstone);
+        assert_eq!(state.expire_values(100).await.unwrap(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn delete_overwrite_and_winning_or_losing_already_expired_apply_are_not_cleanup() {
+        for kind in 0..4 {
+            let (state, runtime, mut output, _) =
+                fixture("node", HashMap::from([("key".into(), expiring(1))]), None);
+            let incoming = match kind {
+                0 => VersionedValue::tombstone(2, "writer".into()),
+                1 => VersionedValue::new(b"replacement".to_vec(), 2, "writer".into()),
+                2 => {
+                    let mut v = expiring(2);
+                    v.expires_at_ms = Some(1);
+                    v
+                }
+                _ => {
+                    let mut v = expiring(0);
+                    v.expires_at_ms = Some(1);
+                    v
+                }
+            };
+            let result = state.apply(&test_op("key", incoming)).await.unwrap();
+            if kind == 3 {
+                assert!(matches!(result, ApplyOutcome::Superseded { .. }));
+                // The losing replicated update is silent. Only expiring the
+                // existing winning live version now produces an event.
+                assert_eq!(runtime.diagnostics().enqueued_events, 0);
+                assert_eq!(state.expire_values(100).await.unwrap(), 1);
+            } else {
+                if kind == 2 {
+                    assert_eq!(result, ApplyOutcome::Expired);
+                }
+                assert_eq!(state.expire_values(100).await.unwrap(), 0);
+            }
+            runtime.shutdown().await;
+            assert_eq!(runtime.diagnostics().delivered_events, u64::from(kind == 3));
+            if kind == 3 {
+                assert_eq!(
+                    output.try_recv().unwrap().events[0].original_version(),
+                    (1, "writer")
+                );
+            } else {
+                assert!(output.try_recv().is_err());
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn replacement_and_ttl_extension_race_with_cleanup_under_the_mutation_lock() {
+        for durable in [false, true] {
+            for cleanup_first in [false, true] {
+                for extends_ttl in [false, true] {
+                    let store = Arc::new(FlakyStore {
+                        failures_left: StdMutex::new(0),
+                        written: StdMutex::new(Vec::new()),
+                    });
+                    let (state, runtime, mut output, _) = fixture(
+                        "node",
+                        HashMap::from([("key".into(), expiring(1))]),
+                        durable.then(|| store.clone() as Arc<dyn KvStore>),
+                    );
+                    let mut newer = VersionedValue::new(b"newer".to_vec(), 2, "writer".into());
+                    if extends_ttl {
+                        newer.expires_at_ms = Some(u64::MAX);
+                    }
+                    let op = test_op("key", newer.clone());
+                    let lock = state.cache.write().await;
+                    let mut apply = Box::pin(state.apply(&op));
+                    let mut cleanup = Box::pin(state.expire_values(100));
+                    if cleanup_first {
+                        assert!(futures::poll!(&mut cleanup).is_pending());
+                        assert!(futures::poll!(&mut apply).is_pending());
+                    } else {
+                        assert!(futures::poll!(&mut apply).is_pending());
+                        assert!(futures::poll!(&mut cleanup).is_pending());
+                    }
+                    drop(lock);
+                    if cleanup_first {
+                        assert_eq!(cleanup.await.unwrap(), 1);
+                        assert_eq!(apply.await.unwrap(), ApplyOutcome::Applied);
+                    } else {
+                        assert_eq!(apply.await.unwrap(), ApplyOutcome::Applied);
+                        assert_eq!(cleanup.await.unwrap(), 0);
+                    }
+                    assert_eq!(state.get_all().await["key"], newer);
+                    state.flush().await.unwrap();
+                    runtime.shutdown().await;
+                    assert_eq!(
+                        runtime.diagnostics().delivered_events,
+                        u64::from(cleanup_first)
+                    );
+                    if cleanup_first {
+                        let event = output.try_recv().unwrap().events.remove(0);
+                        assert_eq!(event.original_version(), (1, "writer"));
+                        // Callback delivery occurs after the newer version was
+                        // installed. A consumer must compare versions first.
+                        assert!(newer.wins_over(&event.previous_value));
+                    } else {
+                        assert!(output.try_recv().is_err());
+                    }
+                    if durable {
+                        assert_eq!(store.written.lock().unwrap().last().unwrap().1, newer);
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn paged_cleanup_preserves_fragment_order_and_snapshot_only_reads_stay_silent() {
+        let cache = (0..600)
+            .map(|i| (format!("k{i:04}"), expiring(i)))
+            .collect();
+        let (state, runtime, mut output, _) = fixture("node", cache, None);
+        let mut pass = ExpiryPass::new(100);
+        let mut converted = 0;
+        loop {
+            let page = state.expire_values_page(&mut pass).await.unwrap();
+            converted += page.converted;
+            if page.done {
+                break;
+            }
+        }
+        assert_eq!(converted, 600);
+        assert_eq!(state.expire_values(100).await.unwrap(), 0);
+        state.snapshot_with_revision().await;
+        runtime.shutdown().await;
+        let mut keys = Vec::new();
+        while let Ok(batch) = output.try_recv() {
+            keys.extend(batch.events.into_iter().map(|e| e.key));
+        }
+        assert_eq!(
+            keys,
+            (0..600).map(|i| format!("k{i:04}")).collect::<Vec<_>>()
+        );
+        assert_eq!(runtime.diagnostics().delivered_events, 600);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn replica_copies_of_the_same_version_generate_the_same_identity() {
+        let original = {
+            let mut value = expiring(42);
+            value.expires_at_ms = Some(u64::MAX);
+            value
+        };
+        let (a, runtime_a, mut events_a, clock_a) = fixture("replica-a", HashMap::new(), None);
+        let (b, runtime_b, mut events_b, clock_b) = fixture("replica-b", HashMap::new(), None);
+        let op = test_op("replicated", original.clone());
+        assert_eq!(a.apply(&op).await.unwrap(), ApplyOutcome::Applied);
+        assert_eq!(b.apply(&op).await.unwrap(), ApplyOutcome::Applied);
+        clock_a.store(u64::MAX, Ordering::SeqCst);
+        clock_b.store(u64::MAX, Ordering::SeqCst);
+        assert_eq!(a.expire_values(u64::MAX).await.unwrap(), 1);
+        assert_eq!(b.expire_values(u64::MAX).await.unwrap(), 1);
+        runtime_a.shutdown().await;
+        runtime_b.shutdown().await;
+        let batch_a = events_a.try_recv().unwrap();
+        let batch_b = events_b.try_recv().unwrap();
+        assert_ne!(batch_a.local_node_id, batch_b.local_node_id);
+        assert_eq!(batch_a.events[0].id, batch_b.events[0].id);
+        assert_eq!(batch_a.events[0].previous_value, original);
+        assert_eq!(batch_b.events[0].previous_value, original);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn failed_persistence_does_not_replay_the_local_transition_callback() {
+        let store = Arc::new(FlakyStore {
+            failures_left: StdMutex::new(1),
+            written: StdMutex::new(Vec::new()),
+        });
+        let (mut state, runtime, mut output, _) = fixture(
+            "node",
+            HashMap::from([("key".into(), expiring(1))]),
+            Some(store.clone()),
+        );
+        state.flush_batch_size = 1;
+        assert!(state.expire_values(100).await.is_err());
+        assert!(state.get_all().await["key"].is_tombstone);
+        assert!(store.written.lock().unwrap().is_empty());
+        assert_eq!(state.expire_values(100).await.unwrap(), 0);
+        state.flush().await.unwrap();
+        runtime.shutdown().await;
+        assert_eq!(
+            output.try_recv().unwrap().events[0].original_version(),
+            (1, "writer")
+        );
+        assert_eq!(runtime.diagnostics().delivered_events, 1);
+        assert_eq!(
+            store.written.lock().unwrap()[0].1,
+            expiring(1).expiry_tombstone()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn queue_saturation_never_prevents_cleanup_or_revision_publication() {
+        let gate = Arc::new(Notify::new());
+        let gate_handler = gate.clone();
+        let handler = expiry_handler_fn(move |_batch| {
+            let gate = gate_handler.clone();
+            async move {
+                gate.notified().await;
+                Ok(())
+            }
+        });
+        let runtime = ExpiryRuntime::start_with_clock(
+            "node".into(),
+            Arc::new(handler),
+            TtlExpiryOptions::builder()
+                .queue_event_capacity(1)
+                .batch_size(1)
+                .build(),
+            Arc::new(|| 200),
+        );
+        let cache = (0..100).map(|i| (format!("k{i}"), expiring(i))).collect();
+        let state = FragmentState::new(cache, None, 100, Duration::from_secs(3600))
+            .with_expiry_publisher(FragmentId(0), Some(runtime.publisher()));
+        assert_eq!(state.expire_values(100).await.unwrap(), 100);
+        assert!(state.get_all().await.values().all(|v| v.is_tombstone));
+        assert_eq!(state.snapshot_with_revision().await.1, 100);
+        assert_eq!(runtime.diagnostics().dropped_events, 99);
+        gate.notify_one();
+        runtime.shutdown().await;
+        assert_eq!(runtime.diagnostics().delivered_events, 1);
     }
 }

@@ -69,6 +69,9 @@ use crate::shard::{fragment_of, FragmentId};
 use crate::store::{
     KvStore, PrefixDeleteOutcome, PrefixDeleteSupport, PrefixedStore, StoreBinding, StoreIdentity,
 };
+use crate::ttl_expiry::{
+    ExpiryDiagnostics, ExpiryPublisher, ExpiryRuntime, TtlExpiryHandler, TtlExpiryOptions,
+};
 use crate::wire::{
     bytes_field_len, check_envelope_budget, check_record_budget, encode_envelope,
     message_field_len, preflight_envelope_decode, varint_field_len, BudgetedFrame, BudgetedPeerTx,
@@ -2076,6 +2079,7 @@ pub struct Node {
     shutdown_state: Mutex<ShutdownProgress>,
     replication_drain_report: StdMutex<Option<ReplicationDrainReport>>,
     network: Arc<dyn Network>,
+    ttl_expiry: Option<ExpiryRuntime>,
     /// Exclusive live attachment to the configured store. Clean shutdown
     /// releases it only after every fragment actor has stopped; cancellation
     /// and best-effort Drop leave managed backends fail-closed.
@@ -2100,6 +2104,9 @@ struct ReplicationDrainWaiter {
 
 impl Drop for Node {
     fn drop(&mut self) {
+        if let Some(expiry) = &self.ttl_expiry {
+            expiry.request_abort();
+        }
         // Async cleanup still belongs to `shutdown`, but never leave task
         // admission open merely because a caller dropped the handle.
         self.operation_gate.begin_shutdown();
@@ -2306,6 +2313,7 @@ async fn spawn_fragment_subtree_registered(
     config: &NodeConfig,
     hlc: &Arc<Mutex<HlcClock>>,
     registry: &Arc<SupervisorRegistry>,
+    expiry_publisher: Option<ExpiryPublisher>,
 ) -> Result<(ActorRef<SupervisorMessage>, ActorRef<KvMessage>), NodeError> {
     // Unique per supervisor: tests run nodes in parallel in one
     // process, and the actor registry is process-global.
@@ -2324,6 +2332,7 @@ async fn spawn_fragment_subtree_registered(
         FragmentSupervisor,
         SupervisorArgs::builder()
             .fragment(fragment)
+            .maybe_expiry_publisher(expiry_publisher)
             .worker_prefix(worker_prefix)
             .maybe_store(store)
             .hlc(hlc.clone())
@@ -2503,7 +2512,8 @@ async fn spawn_fragment_subtree(
     hlc: &Arc<Mutex<HlcClock>>,
 ) -> Result<(ActorRef<SupervisorMessage>, ActorRef<KvMessage>), NodeError> {
     let registry = Arc::new(SupervisorRegistry::new(1));
-    let result = spawn_fragment_subtree_registered(node_id, fragment, config, hlc, &registry).await;
+    let result =
+        spawn_fragment_subtree_registered(node_id, fragment, config, hlc, &registry, None).await;
     if let Ok((supervisor, _)) = &result {
         registry.remove_if(fragment, supervisor);
     }
@@ -3348,6 +3358,16 @@ impl NodeRuntimeOptions {
 /// ```
 #[derive(Clone, bon::Builder)]
 pub struct NodeConfig {
+    /// Optional best-effort local TTL cleanup handler. Disabled by default;
+    /// expired value payloads are not copied or retained for notifications then.
+    /// Callbacks may run during successful fragment initialization. They do not
+    /// establish durable/quorum delivery or replay and can precede a later startup
+    /// failure. See [`crate::ttl_expiry`] for ordering, deduplication and cancellation.
+    pub ttl_expiry_handler: Option<Arc<dyn TtlExpiryHandler>>,
+    /// Bounded callback queue, batching and handler/drain deadlines. Validated
+    /// when a handler is configured; unused when notifications are disabled.
+    #[builder(default)]
+    pub ttl_expiry_options: TtlExpiryOptions,
     /// Optional durable storage behind the node's in-memory cache.
     /// `None` (default) = no persistence; the node is purely in-memory.
     /// With the `rocksdb` feature, `NodeConfig::with_rocksdb` builds a
@@ -3536,6 +3556,12 @@ impl Node {
         runtime_options: NodeRuntimeOptions,
     ) -> Result<Self, NodeError> {
         runtime_options.validate()?;
+        if config.ttl_expiry_handler.is_some() {
+            config
+                .ttl_expiry_options
+                .validate()
+                .map_err(NodeError::Actor)?;
+        }
         if node_id.is_empty() || node_id.len() > MAX_WIRE_NODE_ID_BYTES {
             return Err(NodeError::Actor(format!(
                 "node_id must contain 1 to {MAX_WIRE_NODE_ID_BYTES} bytes"
@@ -3731,6 +3757,14 @@ impl Node {
             }));
         let tasks = RuntimeTasks::new(TASK_COMMAND_CAPACITY);
         let placement_tasks = RuntimeTasks::new(TASK_COMMAND_CAPACITY);
+        let ttl_expiry = config.ttl_expiry_handler.as_ref().map(|handler| {
+            ExpiryRuntime::start(
+                node_id.clone(),
+                handler.clone(),
+                config.ttl_expiry_options.clone(),
+            )
+        });
+        let expiry_publisher = ttl_expiry.as_ref().map(ExpiryRuntime::publisher);
         let mut startup_supervisors = SupervisorStartupGuard::new(my_fragments.len());
         for fragment in my_fragments {
             // From this point cancellation may leave a synchronously starting
@@ -3742,6 +3776,7 @@ impl Node {
                 &config,
                 &hlc,
                 &supervisor_stops,
+                expiry_publisher.clone(),
             )
             .await
             {
@@ -3876,6 +3911,7 @@ impl Node {
             shutdown_state: Mutex::new(ShutdownProgress::Running),
             replication_drain_report: StdMutex::new(None),
             network: config.network.clone(),
+            ttl_expiry,
             store_binding: StdMutex::new(store_binding.transfer_to_node()),
         };
 
@@ -3941,6 +3977,7 @@ impl Node {
                 dispatcher_tasks: Arc::downgrade(&node.tasks),
                 operation_gate: node.operation_gate.clone(),
                 hlc: hlc.clone(),
+                expiry_publisher: node.ttl_expiry.as_ref().map(ExpiryRuntime::publisher),
             };
             let membership_rx = membership_rx.expect("checked above");
             if !node
@@ -5394,6 +5431,12 @@ impl Node {
         }
 
         if matches!(progress, ShutdownProgress::StoppingFragments) {
+            // Every fragment's authoritative final sweep/fence is complete.
+            // Drain notifications with a manager-owned deadline; cancellation
+            // of this shutdown waiter does not detach or restart the drain.
+            if let Some(expiry) = &self.ttl_expiry {
+                expiry.shutdown().await;
+            }
             let supervisors = self.supervisor_stops.snapshot();
             for (_, entry) in &supervisors {
                 if matches!(&*entry.startup.borrow(), SupervisorStartupState::Ready) {
@@ -5447,6 +5490,12 @@ impl Node {
             *progress = ShutdownProgress::StoppingTransport;
         }
         self.finish_local_shutdown(&mut progress).await
+    }
+
+    /// Callback diagnostics, or `None` when registration is disabled. Counters
+    /// describe local best-effort delivery and are readable after shutdown.
+    pub fn ttl_expiry_diagnostics(&self) -> Option<ExpiryDiagnostics> {
+        self.ttl_expiry.as_ref().map(ExpiryRuntime::diagnostics)
     }
 
     /// Fence locally admitted mutations, reconcile every frozen peer target
@@ -5721,6 +5770,7 @@ impl Node {
 /// ownership; `Clone` for spawning per-fragment gain/lose tasks.
 #[derive(Clone)]
 struct PlacementDriverDeps {
+    expiry_publisher: Option<ExpiryPublisher>,
     node_id: String,
     controller: Arc<dyn PlacementController>,
     poll_interval: Duration,
@@ -6126,6 +6176,7 @@ async fn gain_fragment(deps: &PlacementDriverDeps, fragment: FragmentId, preload
             &deps.subtree_config,
             &deps.hlc,
             &deps.supervisor_stops,
+            deps.expiry_publisher.clone(),
         )
         .await
         {
@@ -11323,6 +11374,7 @@ mod tests {
             }
         }
         PlacementDriverDeps {
+            expiry_publisher: None,
             node_id: "node-a".to_string(),
             controller: Arc::new(crate::placement::StaticPlacement::new(HashMap::new())),
             poll_interval: Duration::from_secs(3600),
@@ -11506,6 +11558,7 @@ mod tests {
                 &config,
                 &spawn_hlc,
                 &spawn_registry,
+                None,
             )
             .await
         });
