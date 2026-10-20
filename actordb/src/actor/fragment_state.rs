@@ -617,8 +617,6 @@ impl FragmentState {
             QUERY_WORK_BYTES,
         };
         use actordb_query::{AggregateInput, Projection, QueryAccumulator};
-        use std::ops::Bound::{Excluded, Unbounded};
-
         let req = &work.request;
         let plan = &work.plan;
         if let Err(error) = plan.validate() {
@@ -696,12 +694,17 @@ impl FragmentState {
         if req.verify_only || !plan.matches_fragment(req.fragment) {
             return page;
         }
-        let lower = if req.continuation {
-            Excluded(req.after_key.clone())
-        } else {
-            Unbounded
-        };
-        let mut keys = cache.ordered_keys.range((lower, Unbounded)).peekable();
+        let bounds = crate::query::query_key_bounds(
+            plan,
+            req.continuation.then_some(req.after_key.as_str()),
+        )
+        .unwrap_or_else(|| {
+            (
+                std::ops::Bound::Included(String::new()),
+                std::ops::Bound::Excluded(String::new()),
+            )
+        });
+        let mut keys = cache.ordered_keys.range(bounds).peekable();
         let mut accumulator = QueryAccumulator::new(plan);
         while let Some(key) = keys.peek().copied() {
             if page.visited as usize == max_visits

@@ -268,3 +268,190 @@ pub(crate) fn projected_row_wire_bytes(
     }
     bytes
 }
+
+/// Ordered index bounds implied by all conjunctive key predicates. `None`
+/// means the intersection is empty, including impossible binary prefixes.
+pub(crate) fn query_key_bounds(
+    plan: &QueryPlan,
+    after: Option<&str>,
+) -> Option<(std::ops::Bound<String>, std::ops::Bound<String>)> {
+    use actordb_query::KeyPredicate;
+    use std::ops::Bound::{self, Excluded, Included, Unbounded};
+    let mut lower = Unbounded;
+    let mut upper = Unbounded;
+    fn tighten(current: &mut Bound<String>, candidate: Bound<String>, lower: bool) {
+        let (key, exclusive) = match &candidate {
+            Included(key) => (key, false),
+            Excluded(key) => (key, true),
+            Unbounded => return,
+        };
+        let replace = match &*current {
+            Unbounded => true,
+            Included(old) | Excluded(old) => {
+                let ordering = key.cmp(old);
+                (if lower {
+                    ordering.is_gt()
+                } else {
+                    ordering.is_lt()
+                }) || (ordering.is_eq() && exclusive)
+            }
+        };
+        if replace {
+            *current = candidate;
+        }
+    }
+    for predicate in &plan.predicates {
+        match predicate {
+            KeyPredicate::Equal(key) => {
+                tighten(&mut lower, Included(key.clone()), true);
+                tighten(&mut upper, Included(key.clone()), false);
+            }
+            KeyPredicate::GreaterThan(key) => tighten(&mut lower, Excluded(key.clone()), true),
+            KeyPredicate::GreaterOrEqual(key) => tighten(&mut lower, Included(key.clone()), true),
+            KeyPredicate::LessThan(key) => tighten(&mut upper, Excluded(key.clone()), false),
+            KeyPredicate::LessOrEqual(key) => tighten(&mut upper, Included(key.clone()), false),
+            KeyPredicate::Prefix(prefix) => {
+                tighten(&mut lower, Included(utf8_ceiling(prefix)?), true);
+                // Bytes beginning with prefix form [prefix, successor(prefix)).
+                let mut successor = prefix.clone();
+                while successor.last() == Some(&255) {
+                    successor.pop();
+                }
+                if let Some(last) = successor.last_mut() {
+                    *last += 1;
+                    if let Some(end) = utf8_ceiling(&successor) {
+                        tighten(&mut upper, Excluded(end), false);
+                    }
+                }
+            }
+        }
+    }
+    if let Some(after) = after {
+        tighten(&mut lower, Excluded(after.to_owned()), true);
+    }
+    match (&lower, &upper) {
+        (Included(a), Included(b)) if a > b => None,
+        (Included(a) | Excluded(a), Included(b) | Excluded(b))
+            if a >= b && (a != b || !matches!((&lower, &upper), (Included(_), Included(_)))) =>
+        {
+            None
+        }
+        _ => Some((lower, upper)),
+    }
+}
+
+/// Smallest valid UTF-8 string at or above an arbitrary byte sequence.
+/// UTF-8 scalar encodings sort in scalar order, allowing a bounded binary
+/// search at the first invalid/incomplete scalar rather than a cache scan.
+fn utf8_ceiling(bytes: &[u8]) -> Option<String> {
+    let error = match std::str::from_utf8(bytes) {
+        Ok(text) => return Some(text.to_owned()),
+        Err(error) => error,
+    };
+    let mut prefix = std::str::from_utf8(&bytes[..error.valid_up_to()])
+        .ok()?
+        .to_owned();
+    let suffix = &bytes[error.valid_up_to()..];
+    let scalar =
+        |index: u32| char::from_u32(if index < 0xd800 { index } else { index + 0x800 }).unwrap();
+    let mut low = 0u32;
+    let mut high = 0x110000 - 0x800;
+    while low < high {
+        let mid = low + (high - low) / 2;
+        let mut encoded = [0; 4];
+        if scalar(mid).encode_utf8(&mut encoded).as_bytes() < suffix {
+            low = mid + 1;
+        } else {
+            high = mid;
+        }
+    }
+    if low < 0x110000 - 0x800 {
+        prefix.push(scalar(low));
+        return Some(prefix);
+    }
+    // No scalar can finish this prefix; carry into the previous scalar.
+    while let Some(last) = prefix.pop() {
+        if last != char::MAX {
+            let mut next = last as u32 + 1;
+            if next == 0xd800 {
+                next = 0xe000;
+            }
+            prefix.push(char::from_u32(next)?);
+            return Some(prefix);
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod key_bound_tests {
+    use super::*;
+    use actordb_query::{KeyPredicate, Projection};
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn conjunctive_bounds_select_exact_range_and_binary_prefixes() {
+        let keys: BTreeSet<String> = ["", "a", "aa", "ab", "az", "b", "é", "雪", "𐀀", "\u{10ffff}"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        let cases = vec![
+            vec![KeyPredicate::Equal("az".into())],
+            vec![
+                KeyPredicate::GreaterThan("aa".into()),
+                KeyPredicate::LessOrEqual("az".into()),
+            ],
+            vec![
+                KeyPredicate::GreaterOrEqual("a".into()),
+                KeyPredicate::LessThan("a".into()),
+            ],
+            vec![
+                KeyPredicate::Equal("a".into()),
+                KeyPredicate::Equal("b".into()),
+            ],
+            vec![KeyPredicate::Prefix(vec![])],
+            vec![
+                KeyPredicate::Prefix(b"a".to_vec()),
+                KeyPredicate::LessThan("ab".into()),
+            ],
+            vec![KeyPredicate::Prefix("雪".as_bytes().to_vec())],
+            vec![KeyPredicate::Prefix(vec![0xe9])],
+            vec![KeyPredicate::Prefix(vec![0xf0, 0x90])],
+            vec![KeyPredicate::Prefix(vec![0xff])],
+            vec![KeyPredicate::Prefix(vec![0xc0])],
+            vec![KeyPredicate::Prefix(vec![0xe9, 0x00])],
+            vec![KeyPredicate::Prefix(vec![0xf4, 0x8f, 0xbf, 0xbf, 0xff])],
+            vec![
+                KeyPredicate::Prefix(b"a".to_vec()),
+                KeyPredicate::Prefix(b"b".to_vec()),
+            ],
+        ];
+        for predicates in cases {
+            let plan = QueryPlan {
+                projections: vec![Projection::Key],
+                predicates,
+                fragments: None,
+                limit: None,
+                offset: 0,
+            };
+            for after in [None, Some(""), Some("aa"), Some("雪"), Some("\u{10ffff}")] {
+                let expected: Vec<_> = keys
+                    .iter()
+                    .filter(|key| {
+                        plan.matches_key(key) && after.is_none_or(|after| key.as_str() > after)
+                    })
+                    .cloned()
+                    .collect();
+                let actual: Vec<_> = query_key_bounds(&plan, after)
+                    .map(|bounds| {
+                        keys.range(bounds)
+                            .filter(|key| plan.matches_key(key))
+                            .cloned()
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                assert_eq!(actual, expected, "{:?} after {:?}", plan.predicates, after);
+            }
+        }
+    }
+}

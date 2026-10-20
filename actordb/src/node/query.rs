@@ -1,6 +1,7 @@
 //! Server coordinator for bounded, revision-guarded query pages.
 
-use std::collections::{HashMap, VecDeque};
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap, VecDeque};
 use std::sync::{Arc, Mutex as StdMutex};
 
 use actordb_query::{QueryAccumulator, QueryPlan, QueryResult, QueryValue};
@@ -66,6 +67,7 @@ impl FragmentCursor {
     fn storage(&self) -> usize {
         std::mem::size_of::<Self>()
             .saturating_add(self.after_key.capacity())
+            .saturating_add(self.rows.front().map_or(0, |row| row.key.capacity()))
             .saturating_add(
                 self.rows
                     .capacity()
@@ -77,7 +79,10 @@ impl FragmentCursor {
 
 impl Node {
     /// Execute one SQL statement over selected fragments with global key ordering.
-    /// Queries fail completely on resource exhaustion or a changed fragment.
+    /// Conjunctive equality, range, and byte-prefix predicates seek the ordered
+    /// index directly. Work limits count keys within that selected range,
+    /// including tombstones and expired values. Queries fail completely on
+    /// resource exhaustion or a changed fragment.
     pub async fn query(&self, sql: &str) -> Result<QueryResult, QueryExecutionError> {
         let plan = actordb_query::parse(sql)?;
         self.query_plan(&plan).await
@@ -213,6 +218,17 @@ impl Node {
         if plan.limit == Some(0) {
             return Ok(result);
         }
+        // Reserve heap headers before admitting pages. Cursor accounting also
+        // includes the duplicated head key while the heap owns it.
+        let mut merge_options = options.clone();
+        if !plan.is_aggregate() {
+            merge_options.max_buffer_bytes = merge_options.max_buffer_bytes.saturating_sub(
+                cursors
+                    .len()
+                    .saturating_mul(std::mem::size_of::<Reverse<(String, usize)>>()),
+            );
+        }
+        let options = &merge_options;
         let mut visited = 0u64;
         if plan.is_aggregate() {
             let mut aggregate = QueryAccumulator::new(&plan);
@@ -249,6 +265,7 @@ impl Node {
                 result.rows.clear();
             }
         } else {
+            let mut heads = BinaryHeap::with_capacity(cursors.len());
             // Obtain one bounded head page from each selected fragment. No
             // fragment-wide Vec or unbounded concurrent RPC fan-out is used.
             for index in 0..cursors.len() {
@@ -264,17 +281,14 @@ impl Node {
                 )
                 .await?;
                 check_buffer(cursors, options, sql.len())?;
+                if let Some(row) = cursors[index].rows.front() {
+                    heads.push(Reverse((row.key.clone(), index)));
+                }
             }
             let mut skipped = 0u64;
             let mut payload_bytes = 0usize;
             loop {
-                let smallest = cursors
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(i, c)| c.rows.front().map(|row| (i, &row.key)))
-                    .min_by(|a, b| a.1.cmp(b.1))
-                    .map(|(i, _)| i);
-                let Some(index) = smallest else {
+                let Some(Reverse((_key, index))) = heads.pop() else {
                     break;
                 };
                 let row = cursors[index]
@@ -318,6 +332,9 @@ impl Node {
                 )
                 .await?;
                 check_buffer(cursors, options, sql.len())?;
+                if let Some(row) = cursors[index].rows.front() {
+                    heads.push(Reverse((row.key.clone(), index)));
+                }
             }
         }
         // Recheck every accepted contribution, including completed fragments,

@@ -275,3 +275,79 @@ async fn query_budgets_and_bad_numeric_values_fail_explicitly() {
     );
     node.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn selected_key_ranges_charge_only_selected_index_work() {
+    let node = start(
+        "query-seek",
+        NodeConfig {
+            fragment_count: 1,
+            store: Some(loaded_store(10_000, 1)),
+            ..NodeConfig::default()
+        },
+    )
+    .await;
+    for (sql, expected) in [
+        (
+            "SELECT key FROM kv WHERE key = 'record:009999'",
+            vec!["record:009999"],
+        ),
+        (
+            "SELECT key FROM kv WHERE key >= 'record:009997' AND key < 'record:009999'",
+            vec!["record:009997", "record:009998"],
+        ),
+        (
+            "SELECT key FROM kv WHERE key = 'record:009999' AND key < 'record:000000'",
+            vec![],
+        ),
+    ] {
+        let result = node
+            .query_plan_with_options(
+                &parse(sql).unwrap(),
+                QueryOptions {
+                    max_scanned_rows: 3,
+                    page_visits: 1,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            result.rows,
+            expected
+                .into_iter()
+                .map(|key| vec![QueryValue::Text(key.into())])
+                .collect::<Vec<_>>()
+        );
+    }
+    let aggregate = node
+        .query("SELECT COUNT(*) FROM kv WHERE key > 'z' AND key < 'a'")
+        .await
+        .unwrap();
+    assert_eq!(aggregate.rows, vec![vec![QueryValue::Integer(0)]]);
+    node.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn many_fragment_heads_merge_in_global_key_order() {
+    let node = start(
+        "query-heap",
+        NodeConfig {
+            fragment_count: 32,
+            store: Some(loaded_store(200, 32)),
+            ..Default::default()
+        },
+    )
+    .await;
+    let result = node
+        .query("SELECT key FROM kv ORDER BY key ASC LIMIT 100 OFFSET 50")
+        .await
+        .unwrap();
+    assert_eq!(
+        result.rows,
+        (50..150)
+            .map(|index| vec![QueryValue::Text(format!("record:{index:06}"))])
+            .collect::<Vec<_>>()
+    );
+    node.shutdown().await.unwrap();
+}
