@@ -58,8 +58,8 @@ pub use maintenance::MaintenanceTrigger;
 pub use pool::{worker_idx, PoolConfig, PoolConfigBuilder, TokenBucket};
 pub use protocol::{
     ApplyDurability, ApplyError, ApplyOutcome, BatchReadContinuation, BatchReadEntry,
-    BatchReadPage, KvMessage, OpPriority, ReplicatedOp, RetainedBatchRead, SnapshotSummary,
-    SummaryPage, VersionedPage, VersionedValue,
+    BatchReadPage, KvMessage, OpPriority, ReplicatedOp, RetainedActorMessage, RetainedBatchRead,
+    SnapshotSummary, SummaryPage, VersionedPage, VersionedValue,
 };
 pub use scan::{KeyMatcher, ScanMatch, ScanSpec, ValueTransform, DEFAULT_SCAN_LIMIT};
 pub use snapshotter::{

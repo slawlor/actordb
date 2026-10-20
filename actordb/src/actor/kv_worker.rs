@@ -88,7 +88,9 @@ pub(super) async fn handle_worker_message(
     shared: &Arc<FragmentState>,
     message: KvMessage,
 ) -> Result<(), ActorProcessingErr> {
+    let (message, _retention) = message.into_retained_parts();
     match message {
+        KvMessage::Retained(_) => unreachable!("retained message was unwrapped"),
         KvMessage::ApplyOp {
             op,
             priority: _,
@@ -96,8 +98,9 @@ pub(super) async fn handle_worker_message(
             reply,
         } => {
             // Cache merge and durable enqueue are one ordered operation.
-            // A DB error fails the actor loudly rather than diverging
-            // silently.
+            // Storage failures retain their authoritative retry winners.
+            // The worker remains healthy and returns the exact storage error
+            // instead of restarting and discarding unrelated queued work.
             match shared.apply(&op).await {
                 Ok(outcome) => {
                     if let Some(reply) = reply {
@@ -106,21 +109,10 @@ pub(super) async fn handle_worker_message(
                     Ok(())
                 }
                 Err(error) => {
-                    let fatal = match &error {
-                        ApplyError::Storage(message) => {
-                            Some(ActorProcessingErr::from(message.clone()))
-                        }
-                        ApplyError::Backpressure
-                        | ApplyError::InvalidInput(_)
-                        | ApplyError::VersionConflict { .. } => None,
-                    };
                     if let Some(reply) = reply {
                         let _ = reply.send(Err(error));
                     }
-                    match fatal {
-                        Some(error) => Err(error),
-                        None => Ok(()),
-                    }
+                    Ok(())
                 }
             }
         }
@@ -240,6 +232,77 @@ mod tests {
     use ractor::rpc::CallResult;
     use std::collections::HashMap;
     use std::time::Duration;
+    struct OutageStore(std::sync::atomic::AtomicBool);
+    impl crate::store::KvStore for OutageStore {
+        fn load(&self) -> Result<Vec<(Vec<u8>, VersionedValue)>, crate::store::StoreError> {
+            Ok(Vec::new())
+        }
+        fn write_batch(
+            &self,
+            _: &[(Vec<u8>, VersionedValue)],
+        ) -> Result<(), crate::store::StoreError> {
+            if self.0.load(std::sync::atomic::Ordering::Acquire) {
+                Err(crate::store::StoreError("injected outage".into()))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn storage_outage_retains_winners_without_restarting_worker() {
+        let store = Arc::new(OutageStore(std::sync::atomic::AtomicBool::new(true)));
+        let shared = Arc::new(FragmentState::new(
+            HashMap::new(),
+            Some(store.clone()),
+            1,
+            Duration::from_secs(3600),
+        ));
+        let (worker, handle) = KvWorker::spawn(
+            None,
+            KvWorker,
+            KvWorkerArgs::builder().shared(shared.clone()).build(),
+        )
+        .await
+        .unwrap();
+        let value = VersionedValue::new(vec![1], 10, "writer".into());
+        let write = worker
+            .call(
+                |reply| KvMessage::ApplyOp {
+                    op: test_op("key", value.clone()),
+                    priority: OpPriority::Default,
+                    is_replication: false,
+                    reply: Some(reply),
+                },
+                Some(Duration::from_secs(2)),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            write,
+            CallResult::Success(Err(ApplyError::Storage(_)))
+        ));
+        let read = worker
+            .call(
+                |reply| KvMessage::Get {
+                    key: "key".into(),
+                    priority: OpPriority::Default,
+                    reply,
+                },
+                Some(Duration::from_secs(2)),
+            )
+            .await
+            .unwrap();
+        assert_eq!(read, CallResult::Success(Ok(Some(value))));
+        assert!(!handle.is_finished());
+        assert_eq!(shared.persistence_backlog().await.0, 1);
+        store.0.store(false, std::sync::atomic::Ordering::Release);
+        shared.flush().await.unwrap();
+        assert_eq!(shared.persistence_backlog().await, (0, 0));
+        worker.stop(None);
+        handle.await.unwrap();
+    }
+
     #[tokio::test]
     async fn worker_without_pending_counter_serves_operations() {
         let shared = Arc::new(test_state(HashMap::new()));

@@ -53,6 +53,7 @@ use crate::proto::{
     Envelope, EnvelopeMsg, KeySummary, ReconcileFetch, ReconcileRequest, ReplicateBatch,
     ReplicateOp as ProtoReplicateOp, ReplicationAckLevel, SessionStart, SyncEntry,
 };
+use crate::retained::{ByteBudget, BytePermit};
 use crate::shard::FragmentId;
 use crate::wire::{
     bytes_field_len, check_envelope_budget, check_replicated_op_budget, encode_envelope,
@@ -84,6 +85,8 @@ type QueueFailureHandler = Arc<dyn Fn(mpsc::Sender<Vec<u8>>) + Send + Sync>;
 pub struct SenderRuntimeOptions {
     #[builder(default = Duration::from_secs(30))]
     ack_timeout: Duration,
+    #[builder(default = Duration::from_secs(30))]
+    local_work_timeout: Duration,
     #[builder(default = Duration::from_secs(5))]
     queue_admission_timeout: Duration,
     #[builder(skip = 64)]
@@ -92,6 +95,10 @@ pub struct SenderRuntimeOptions {
     queue_failure_handler: Option<QueueFailureHandler>,
     #[builder(skip = None)]
     write_concerns: Option<Arc<crate::write_concern::WriteConcernTracker>>,
+    #[builder(skip = ByteBudget::new(256 * 1024 * 1024))]
+    aggregate_retention: Arc<ByteBudget>,
+    #[builder(skip = ByteBudget::new(64 * 1024 * 1024))]
+    reconciliation_result_budget: Arc<ByteBudget>,
 }
 
 impl std::fmt::Debug for SenderRuntimeOptions {
@@ -122,6 +129,8 @@ pub enum SenderOptionsError {
     ZeroMaxInFlight,
     /// No operation could be buffered before reset.
     ZeroBufferCapacity,
+    /// Retained operation byte allowance must be nonzero.
+    ZeroRetainedBytes,
     /// The Node mutation lane exceeds Tokio's supported bound.
     BufferCapacityTooLarge,
     /// Periodic reconciliation would spin continuously.
@@ -130,6 +139,10 @@ pub enum SenderOptionsError {
     ZeroReconcileTimeout,
     /// An ordinary batch would expire immediately.
     ZeroAckTimeout,
+    /// A local actor-work waiter must have a usable deadline.
+    InvalidLocalWorkTimeout,
+    /// Result allowance must cover one worst-case local summary and value page.
+    InvalidReconciliationResultBudget,
     /// An outbound queue reservation would expire immediately.
     ZeroQueueAdmissionTimeout,
     /// The ordinary ACK timeout cannot be represented by Tokio's clock.
@@ -154,6 +167,9 @@ impl std::fmt::Display for SenderOptionsError {
             Self::ZeroBatchSize => write!(f, "replication batch size must be non-zero"),
             Self::ZeroBatchInterval => write!(f, "replication batch interval must be non-zero"),
             Self::ZeroMaxInFlight => write!(f, "replication max in-flight must be non-zero"),
+            Self::ZeroRetainedBytes => {
+                write!(f, "replication retained byte capacity must be non-zero")
+            }
             Self::ZeroBufferCapacity => {
                 write!(f, "replication buffer capacity must be non-zero")
             }
@@ -165,6 +181,13 @@ impl std::fmt::Display for SenderOptionsError {
             }
             Self::ZeroReconcileTimeout => {
                 write!(f, "replication reconcile timeout must be non-zero")
+            }
+            Self::InvalidReconciliationResultBudget => write!(
+                f,
+                "reconciliation result allowance must be at least four maximum frames"
+            ),
+            Self::InvalidLocalWorkTimeout => {
+                write!(f, "local work timeout must be positive and representable")
             }
             Self::ZeroAckTimeout => write!(f, "replication ack timeout must be non-zero"),
             Self::ZeroQueueAdmissionTimeout => {
@@ -237,12 +260,47 @@ impl SenderRuntimeOptions {
         self
     }
 
+    /// Bound one phase of local actor work; submitted storage calls retain ownership.
+    pub fn with_local_work_timeout(mut self, timeout: Duration) -> Self {
+        self.local_work_timeout = timeout;
+        self
+    }
+    pub fn local_work_timeout(&self) -> Duration {
+        self.local_work_timeout
+    }
+
+    /// Set aggregate local reconciliation page ownership. Minimum 64 MiB
+    /// covers a worst-case summary cursor and value/protobuf page together.
+    pub fn with_reconciliation_retained_byte_capacity(mut self, capacity: usize) -> Self {
+        self.reconciliation_result_budget = ByteBudget::new(capacity);
+        self
+    }
+    pub(crate) fn with_reconciliation_result_budget(mut self, budget: Arc<ByteBudget>) -> Self {
+        self.reconciliation_result_budget = budget;
+        self
+    }
+
+    pub(crate) fn with_aggregate_retention(mut self, budget: Arc<ByteBudget>) -> Self {
+        self.aggregate_retention = budget;
+        self
+    }
+
     pub(crate) fn with_queue_failure_handler(mut self, handler: QueueFailureHandler) -> Self {
         self.queue_failure_handler = Some(handler);
         self
     }
 
     fn validate(&self) -> Result<(), SenderOptionsError> {
+        if self.reconciliation_result_budget.limit() < 4 * MAX_FRAME_BYTES {
+            return Err(SenderOptionsError::InvalidReconciliationResultBudget);
+        }
+        if self.local_work_timeout.is_zero()
+            || Instant::now()
+                .checked_add(self.local_work_timeout)
+                .is_none()
+        {
+            return Err(SenderOptionsError::InvalidLocalWorkTimeout);
+        }
         if self.ack_timeout.is_zero() {
             return Err(SenderOptionsError::ZeroAckTimeout);
         }
@@ -285,6 +343,10 @@ pub struct SenderConfig {
     /// reads the authoritative fragment snapshot.
     #[builder(default = 10_000)]
     pub buffer_capacity: usize,
+    /// Charged bytes retained through ingress, deque and ACK ownership.
+    /// Saturation enters visible reset recovery from the fragment cache.
+    #[builder(default = 64 * 1024 * 1024)]
+    pub retained_byte_capacity: usize,
     /// How often a connected sender runs anti-entropy reconciliation
     /// to repair divergence.
     #[builder(default = Duration::from_secs(300))]
@@ -320,6 +382,9 @@ impl SenderConfig {
         if self.max_in_flight == 0 {
             return Err(SenderOptionsError::ZeroMaxInFlight);
         }
+        if self.retained_byte_capacity == 0 {
+            return Err(SenderOptionsError::ZeroRetainedBytes);
+        }
         if self.buffer_capacity == 0 {
             return Err(SenderOptionsError::ZeroBufferCapacity);
         }
@@ -348,6 +413,114 @@ impl SenderConfig {
         }
         Ok(())
     }
+}
+
+#[derive(Clone, Debug)]
+struct SenderRetention {
+    local: Arc<ByteBudget>,
+    aggregate: Arc<ByteBudget>,
+}
+#[derive(Debug)]
+struct RetentionLease {
+    _local: BytePermit,
+    _aggregate: BytePermit,
+}
+impl SenderRetention {
+    fn reserve(&self, bytes: usize) -> Option<RetentionLease> {
+        Some(RetentionLease {
+            _local: self.local.reserve(bytes)?,
+            _aggregate: self.aggregate.reserve(bytes)?,
+        })
+    }
+    fn owned(&self, op: crate::actor::ReplicatedOp) -> Option<RetainedOp> {
+        let lease = self.reserve(retained_op_bytes(&op))?;
+        Some(RetainedOp { op, _lease: lease })
+    }
+    fn borrowed(&self, op: &crate::actor::ReplicatedOp) -> Option<RetainedOp> {
+        // Reserve before fanout clones a payload for this replica.
+        let lease = self.reserve(retained_borrowed_op_bytes(op))?;
+        Some(RetainedOp {
+            op: op.clone(),
+            _lease: lease,
+        })
+    }
+}
+fn retained_op_bytes(op: &crate::actor::ReplicatedOp) -> usize {
+    3usize.saturating_mul(
+        256usize
+            .saturating_add(op.key.capacity())
+            .saturating_add(op.value.node_id.capacity())
+            .saturating_add(op.value.value.capacity()),
+    )
+}
+fn retained_borrowed_op_bytes(op: &crate::actor::ReplicatedOp) -> usize {
+    // Clones own only initialized data, not spare capacity of the caller.
+    3usize.saturating_mul(
+        256usize
+            .saturating_add(op.key.len())
+            .saturating_add(op.value.node_id.len())
+            .saturating_add(op.value.value.len()),
+    )
+}
+#[derive(Debug)]
+struct RetainedOp {
+    op: crate::actor::ReplicatedOp,
+    _lease: RetentionLease,
+}
+impl std::ops::Deref for RetainedOp {
+    type Target = crate::actor::ReplicatedOp;
+    fn deref(&self) -> &Self::Target {
+        &self.op
+    }
+}
+impl std::borrow::Borrow<crate::actor::ReplicatedOp> for RetainedOp {
+    fn borrow(&self) -> &crate::actor::ReplicatedOp {
+        &self.op
+    }
+}
+impl std::ops::DerefMut for RetainedOp {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.op
+    }
+}
+struct RetainedControl {
+    msg: SenderMsg,
+    lease: RetentionLease,
+}
+fn retained_control_bytes(msg: &SenderMsg) -> usize {
+    let owned = match msg {
+        SenderMsg::ReconcileResponse {
+            summaries,
+            next_after_key,
+            ..
+        } => next_after_key
+            .capacity()
+            .saturating_add(
+                summaries
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<KeySummary>()),
+            )
+            .saturating_add(summaries.iter().fold(0usize, |bytes, s| {
+                bytes
+                    .saturating_add(128)
+                    .saturating_add(s.key.capacity())
+                    .saturating_add(s.node_id.capacity())
+                    .saturating_add(s.content_digest.capacity())
+            })),
+        SenderMsg::ReconcileData { entries, .. } => entries
+            .capacity()
+            .saturating_mul(std::mem::size_of::<SyncEntry>())
+            .saturating_add(entries.iter().fold(0usize, |bytes, s| {
+                bytes
+                    .saturating_add(128)
+                    .saturating_add(s.key.capacity())
+                    .saturating_add(s.node_id.capacity())
+                    .saturating_add(s.value.capacity())
+            })),
+        SenderMsg::Nack { error, .. } => error.capacity(),
+        _ => return 0,
+    };
+    2usize.saturating_mul(256usize.saturating_add(owned))
 }
 
 /// Messages driving a `ReplicationSender` (the task spawned by `spawn_sender`).
@@ -428,12 +601,29 @@ struct NodeSenderPeer {
     budgeted: Option<BudgetedPeerTx>,
 }
 
-#[derive(Default)]
 struct NodeSenderIngress {
+    retention: SenderRetention,
+    reconciliation_result_budget: Arc<ByteBudget>,
     draining: StdMutex<bool>,
     pending_data: AtomicUsize,
     issued_overflow_generation: AtomicU64,
     settled_overflow_generation: AtomicU64,
+}
+
+impl Default for NodeSenderIngress {
+    fn default() -> Self {
+        Self {
+            retention: SenderRetention {
+                local: ByteBudget::new(64 * 1024 * 1024),
+                aggregate: ByteBudget::new(256 * 1024 * 1024),
+            },
+            reconciliation_result_budget: ByteBudget::new(64 * 1024 * 1024),
+            draining: StdMutex::new(false),
+            pending_data: AtomicUsize::new(0),
+            issued_overflow_generation: AtomicU64::new(0),
+            settled_overflow_generation: AtomicU64::new(0),
+        }
+    }
 }
 
 struct NodeSenderDrainRuntime {
@@ -442,9 +632,50 @@ struct NodeSenderDrainRuntime {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum NodeSenderSendError {
+pub enum SenderIngressError {
     Full,
     Closed,
+}
+
+pub(crate) type NodeSenderSendError = SenderIngressError;
+
+/// Bounded standalone replication ingress with independent control signals.
+/// Locally merged mutations may be shed into visible snapshot reset recovery
+/// on count or byte saturation; an applied write is never rejected afterwards.
+#[derive(Clone)]
+pub struct BoundedSender {
+    inner: NodeSender,
+}
+impl BoundedSender {
+    /// Enqueue an already-applied operation or protocol/lifecycle message.
+    pub fn send(&self, message: SenderMsg) -> Result<(), SenderIngressError> {
+        self.inner.send(message)
+    }
+    /// Current charged retained bytes including queued and in-flight payloads.
+    pub fn retained_bytes(&self) -> usize {
+        self.inner.ingress.retention.local.used()
+    }
+    /// Charged local result bytes across standalone senders sharing options.
+    pub fn reconciliation_retained_bytes(&self) -> usize {
+        self.inner.ingress.reconciliation_result_budget.used()
+    }
+    /// Close admission, stop the sender and release its owned queue permits.
+    pub async fn stop(&self) {
+        self.inner.stop().await;
+    }
+}
+
+/// Spawn a standalone sender whose ingress and retained payloads are bounded.
+/// Use this constructor for sustained workloads; the legacy unbounded channel
+/// constructors bound only work already consumed by their sender task.
+pub fn spawn_bounded_sender(
+    fragment: FragmentId,
+    peer_id: String,
+    config: SenderConfig,
+    deps: SenderDeps,
+    options: SenderRuntimeOptions,
+) -> Result<BoundedSender, SenderOptionsError> {
+    spawn_node_sender(fragment, peer_id, config, deps, options).map(|inner| BoundedSender { inner })
 }
 
 /// Node-owned bounded ingress for one replication sender.
@@ -456,8 +687,8 @@ pub(crate) enum NodeSenderSendError {
 /// lifecycle/recovery signals remain available even when either lane is full.
 #[derive(Clone)]
 pub(crate) struct NodeSender {
-    data_tx: mpsc::Sender<crate::actor::ReplicatedOp>,
-    control_tx: mpsc::Sender<SenderMsg>,
+    data_tx: mpsc::Sender<RetainedOp>,
+    control_tx: mpsc::Sender<RetainedControl>,
     signals_tx: watch::Sender<NodeSenderSignals>,
     ingress: Arc<NodeSenderIngress>,
     abort: AbortHandle,
@@ -566,10 +797,24 @@ impl NodeSender {
     }
 
     fn send_data(&self, op: crate::actor::ReplicatedOp) -> Result<(), NodeSenderSendError> {
+        self.offer(&op)
+    }
+
+    /// Charge both sender and node byte allowances before cloning fanout data.
+    pub(crate) fn offer(&self, op: &crate::actor::ReplicatedOp) -> Result<(), NodeSenderSendError> {
         let draining = self.ingress.draining.lock().unwrap();
-        if *draining {
+        if *draining || self.is_closed() {
             return Err(NodeSenderSendError::Closed);
         }
+        let Some(op) = self.ingress.retention.borrowed(op) else {
+            tracing::warn!(
+                retained_bytes = self.ingress.retention.local.used(),
+                aggregate_retained_bytes = self.ingress.retention.aggregate.used(),
+                "replication byte allowance saturated; scheduling reset"
+            );
+            self.schedule_reset();
+            return Ok(());
+        };
         self.ingress.pending_data.fetch_add(1, Ordering::AcqRel);
         let result = match self.data_tx.try_send(op) {
             Ok(()) => Ok(()),
@@ -588,7 +833,18 @@ impl NodeSender {
     }
 
     fn send_control(&self, control: SenderMsg) -> Result<(), NodeSenderSendError> {
-        match self.control_tx.try_send(control) {
+        let Some(lease) = self
+            .ingress
+            .retention
+            .reserve(retained_control_bytes(&control))
+        else {
+            self.schedule_reset();
+            return Err(NodeSenderSendError::Full);
+        };
+        match self.control_tx.try_send(RetainedControl {
+            msg: control,
+            lease,
+        }) {
             Ok(()) => Ok(()),
             Err(mpsc::error::TrySendError::Full(_)) => Err(NodeSenderSendError::Full),
             Err(mpsc::error::TrySendError::Closed(_)) => Err(NodeSenderSendError::Closed),
@@ -691,7 +947,8 @@ impl NodeSender {
 
 enum SenderInput {
     Message(SenderMsg),
-    Data(crate::actor::ReplicatedOp, Arc<NodeSenderIngress>),
+    Data(RetainedOp, Arc<NodeSenderIngress>),
+    Control(RetainedControl),
     Overflow(u64, Arc<NodeSenderIngress>),
     PeerChanged(Option<NodeSenderPeer>),
     ReconcileNow,
@@ -702,8 +959,8 @@ enum SenderInput {
 enum SenderInbox {
     Legacy(mpsc::UnboundedReceiver<SenderMsg>),
     Node {
-        data_rx: mpsc::Receiver<crate::actor::ReplicatedOp>,
-        control_rx: mpsc::Receiver<SenderMsg>,
+        data_rx: mpsc::Receiver<RetainedOp>,
+        control_rx: mpsc::Receiver<RetainedControl>,
         signals_rx: watch::Receiver<NodeSenderSignals>,
         delivered_overflow_generation: u64,
         delivered_reconcile_generation: u64,
@@ -773,7 +1030,7 @@ impl SenderInbox {
                     }
                     control = control_rx.recv() => {
                         return control
-                            .map(SenderInput::Message)
+                            .map(SenderInput::Control)
                             .unwrap_or(SenderInput::Closed);
                     }
                     data = data_rx.recv() => {
@@ -822,7 +1079,7 @@ impl ReplicationAckDurability {
 /// A batch awaiting its ack.
 struct InflightBatch {
     batch_seq: u64,
-    ops: Vec<crate::actor::ReplicatedOp>,
+    ops: Vec<RetainedOp>,
     kind: InflightKind,
     required_ack_durability: ReplicationAckDurability,
 }
@@ -841,7 +1098,7 @@ enum InflightAckResult {
     },
     Accepted {
         kind: InflightKind,
-        ops: Vec<crate::actor::ReplicatedOp>,
+        ops: Vec<RetainedOp>,
     },
 }
 
@@ -896,6 +1153,8 @@ struct SenderPeer {
     tx: mpsc::Sender<Vec<u8>>,
     budgeted: Option<BudgetedPeerTx>,
     queue_admission_timeout: Duration,
+    local_work_timeout: Duration,
+    reconciliation_result_budget: Arc<ByteBudget>,
     queue_failure_handler: Option<QueueFailureHandler>,
 }
 
@@ -912,6 +1171,8 @@ impl SenderPeer {
             tx,
             budgeted,
             queue_admission_timeout: options.queue_admission_timeout,
+            local_work_timeout: options.local_work_timeout,
+            reconciliation_result_budget: options.reconciliation_result_budget.clone(),
             queue_failure_handler: options.queue_failure_handler.clone(),
         }
     }
@@ -1024,6 +1285,7 @@ struct ReconcileSummaryState {
 }
 
 struct ReconcileLocalCursor {
+    result_retention: Option<Arc<BytePermit>>,
     after_key: String,
     revision: Option<u64>,
     snapshot_time_ms: Option<u64>,
@@ -1058,12 +1320,11 @@ struct ReconcileRound {
     /// Peer-wide credit retained for the complete round, including its
     /// durability barrier. Dropping or completing the round releases it.
     connection_permit: Option<ReconcilePermit>,
+    /// Keep the remote summary charge while derived fetch-key chunks remain.
+    control_retention: Option<RetentionLease>,
 }
 
-fn requeue_in_flight(
-    in_flight: &mut VecDeque<InflightBatch>,
-    buffer: &mut VecDeque<crate::actor::ReplicatedOp>,
-) {
+fn requeue_in_flight(in_flight: &mut VecDeque<InflightBatch>, buffer: &mut VecDeque<RetainedOp>) {
     // Pop newest batches first and push each batch in reverse so the final
     // buffer preserves original batch and operation order.
     while let Some(batch) = in_flight.pop_back() {
@@ -1076,7 +1337,7 @@ fn requeue_in_flight(
 fn disconnect_transport(
     connection: &mut Option<ActiveConnection>,
     delivery: DeliveryState,
-    buffer: &mut VecDeque<crate::actor::ReplicatedOp>,
+    buffer: &mut VecDeque<RetainedOp>,
 ) -> bool {
     if connection
         .as_ref()
@@ -1101,6 +1362,10 @@ pub struct SenderStateReport {
     pub session_id: u64,
     /// Ops currently buffered.
     pub buffered: usize,
+    /// Charged bytes across this sender ingress, queued and in-flight work.
+    pub retained_bytes: usize,
+    /// Charged bytes across all senders sharing the node allowance.
+    pub aggregate_retained_bytes: usize,
     /// Batches in flight.
     pub in_flight: usize,
     /// Durability fence reported by the most recent well-formed ACK. This may
@@ -1198,7 +1463,14 @@ pub(crate) fn spawn_node_sender(
     let (data_tx, data_rx) = mpsc::channel(config.buffer_capacity);
     let (control_tx, control_rx) = mpsc::channel(options.control_channel_capacity);
     let (signals_tx, signals_rx) = watch::channel(NodeSenderSignals::default());
-    let ingress = Arc::new(NodeSenderIngress::default());
+    let ingress = Arc::new(NodeSenderIngress {
+        retention: SenderRetention {
+            local: ByteBudget::new(config.retained_byte_capacity),
+            aggregate: options.aggregate_retention.clone(),
+        },
+        reconciliation_result_budget: options.reconciliation_result_budget.clone(),
+        ..NodeSenderIngress::default()
+    });
     let (stopped_tx, stopped) = watch::channel(false);
     let (drain_completed_tx, drain_completed) = watch::channel(0u64);
     let configured_ack_durability = config.required_ack_durability;
@@ -1270,13 +1542,13 @@ fn proto_op_encoded_len(op: &crate::actor::ReplicatedOp) -> usize {
 }
 
 fn take_streaming_batch(
-    buffer: &mut VecDeque<crate::actor::ReplicatedOp>,
+    buffer: &mut VecDeque<RetainedOp>,
     max_items: usize,
     session_id: u64,
     batch_seq: u64,
     fragment: FragmentId,
     required_ack_level: i32,
-) -> Result<(Vec<crate::actor::ReplicatedOp>, Vec<ProtoReplicateOp>), ()> {
+) -> Result<(Vec<RetainedOp>, Vec<ProtoReplicateOp>), ()> {
     let mut ops = Vec::new();
     let mut batch = ReplicateBatch {
         session_id,
@@ -1440,7 +1712,14 @@ async fn sender_task(
 ) {
     let mut delivery = DeliveryState::Streaming;
     let mut connection: Option<ActiveConnection> = None;
-    let mut buffer: VecDeque<crate::actor::ReplicatedOp> = VecDeque::new();
+    let retention = match &inbox {
+        SenderInbox::Node { ingress, .. } => ingress.retention.clone(),
+        SenderInbox::Legacy(_) => SenderRetention {
+            local: ByteBudget::new(config.retained_byte_capacity),
+            aggregate: runtime.aggregate_retention.clone(),
+        },
+    };
+    let mut buffer: VecDeque<RetainedOp> = VecDeque::new();
     // `interval()` ticks immediately once, which made the first batch race
     // sender startup instead of consistently observing `batch_interval`.
     let mut batch_timer =
@@ -1549,6 +1828,8 @@ async fn sender_task(
                 state: state.to_string(),
                 session_id: connection.as_ref().map_or(0, |c| c.session_id),
                 buffered: buffer.len(),
+                retained_bytes: retention.local.used(),
+                aggregate_retained_bytes: retention.aggregate.used(),
                 in_flight: connection.as_ref().map_or(0, |c| c.in_flight.len()),
                 last_ack_durability,
                 ack_durability_mismatch,
@@ -1592,12 +1873,23 @@ async fn sender_task(
         tokio::select! {
             input = inbox.recv() => {
                 let mut overflow = None;
+                let mut retained_enqueue = None;
+                let mut control_lease = None;
+                let mut byte_overflow = false;
                 let mut budgeted_peer = None;
                 let msg = match input {
-                    SenderInput::Message(msg) => Some(msg),
+                    SenderInput::Message(msg) => {
+                        if !matches!(&msg, SenderMsg::Enqueue(_)) {
+                            control_lease = retention.reserve(retained_control_bytes(&msg));
+                            byte_overflow = control_lease.is_none();
+                        }
+                        Some(msg)
+                    },
+                    SenderInput::Control(control) => { control_lease = Some(control.lease); Some(control.msg) },
                     SenderInput::Data(op, ingress) => {
                         publish_data_completion = Some(ingress);
-                        Some(SenderMsg::Enqueue(op))
+                        retained_enqueue = Some(op);
+                        None
                     }
                     SenderInput::Overflow(generation, ingress) => {
                         overflow = Some((ingress, generation));
@@ -1619,11 +1911,16 @@ async fn sender_task(
                     }
                     SenderInput::Closed => break,
                 };
-                let data_overflow = msg.as_ref().is_some_and(|msg| {
-                    matches!(msg, SenderMsg::Enqueue(_))
-                        && buffer.len() >= config.buffer_capacity
-                });
-                if overflow.is_some() || data_overflow {
+                let msg = match msg {
+                    Some(SenderMsg::Enqueue(op)) => {
+                        retained_enqueue = retention.owned(op);
+                        byte_overflow = retained_enqueue.is_none();
+                        None
+                    }
+                    other => other,
+                };
+                let data_overflow = retained_enqueue.is_some() && buffer.len() >= config.buffer_capacity;
+                if overflow.is_some() || data_overflow || byte_overflow {
                     if let Some(overflow) = overflow {
                         active_ingress_overflow = Some(overflow);
                     }
@@ -1703,13 +2000,16 @@ async fn sender_task(
                     }
                     continue;
                 }
+                if let Some(op) = retained_enqueue { buffer.push_back(op); continue; }
+                // Keep protocol payload permits until selected local work completes.
+                let mut _control_lease = control_lease;
                 let Some(msg) = msg else { continue };
                 match msg {
                     SenderMsg::Enqueue(op) => {
                         // During reset these are post-snapshot deltas. If this
                         // bounded deque fills, the common branch above advances
                         // the reset epoch and takes a fresh snapshot.
-                        buffer.push_back(op);
+                        if let Some(op) = retention.owned(op) { buffer.push_back(op); }
                     }
                     SenderMsg::PeerConnected { peer_tx: tx } => {
                         if connection
@@ -1861,7 +2161,7 @@ async fn sender_task(
                                 }
                                 InflightAckResult::Accepted { kind, ops } => {
                                     if let Some(tracker) = runtime.write_concerns.as_ref() {
-                                        tracker.acknowledge(&peer_id, fragment, &ops);
+                                        for op in &ops { tracker.acknowledge(&peer_id, fragment, std::slice::from_ref(&op.op)); }
                                     }
                                     last_ack_durability = Some(durability);
                                     ack_durability_mismatch = false;
@@ -1887,7 +2187,7 @@ async fn sender_task(
                                 ReconcilePurpose::Routine | ReconcilePurpose::Drain { .. } => {
                                     let snapshot_is_current = match (
                                         round.snapshot_revision,
-                                        fragment_revision(fragment, &deps.router).await,
+                                        fragment_revision(fragment, &deps.router, runtime.local_work_timeout).await,
                                     ) {
                                         (Some(expected), Ok(current)) => expected == current,
                                         _ => false,
@@ -2042,7 +2342,7 @@ async fn sender_task(
 
                                     let snapshot_is_current = match (
                                         round.snapshot_revision,
-                                        fragment_revision(fragment, &deps.router).await,
+                                        fragment_revision(fragment, &deps.router, runtime.local_work_timeout).await,
                                     ) {
                                         (Some(expected), Ok(current)) => expected == current,
                                         _ => false,
@@ -2323,6 +2623,7 @@ async fn sender_task(
                         }
                         let _ = connection_valid.send(true);
                         let Some(mut round) = active_reconcile.take() else { continue };
+                        round.control_retention = _control_lease.take();
                         if restart {
                             reconcile_retry =
                                 Some((Instant::now() + NACK_RETRY_DELAY, round.purpose));
@@ -2574,7 +2875,7 @@ async fn sender_task(
                             local_reconcile_flush_pending = true;
                         }
                         received_keys.extend(entries.iter().map(|entry| entry.key.clone()));
-                        if apply_reconcile_entries(fragment, &deps.router, entries)
+                        if apply_reconcile_entries(fragment, &deps.router, entries, runtime.local_work_timeout)
                             .await
                             .is_err()
                         {
@@ -3083,6 +3384,7 @@ async fn begin_reconcile(
             remote_snapshot_time_ms: None,
             remote_revision_stable: true,
             local: ReconcileLocalCursor {
+                result_retention: None,
                 after_key: String::new(),
                 revision: None,
                 snapshot_time_ms: None,
@@ -3097,6 +3399,7 @@ async fn begin_reconcile(
         phase_deadline: deadline_after(phase_timeout),
         snapshot_revision: None,
         connection_permit,
+        control_retention: None,
     }))
 }
 
@@ -3133,7 +3436,7 @@ async fn send_reconcile_barrier(
 async fn send_repair_ops(
     fragment: FragmentId,
     connection: &ActiveConnection,
-    ops: &[crate::actor::ReplicatedOp],
+    ops: &[impl std::borrow::Borrow<crate::actor::ReplicatedOp>],
 ) -> Result<(), ReconcileError> {
     let mut offset = 0;
     while offset < ops.len() {
@@ -3149,6 +3452,7 @@ async fn send_repair_ops(
         let mut sizing = RepeatedFieldSizer::new(9, 4, batch.encoded_len());
         let mut consumed = 0;
         for op in ops[offset..].iter().take(100) {
+            let op = op.borrow();
             let item_len = proto_op_encoded_len(op);
             let encoded_len = sizing.encoded_len_with(item_len);
             if encoded_len > MAX_FRAME_BYTES {
@@ -3169,7 +3473,7 @@ async fn send_repair_ops(
         if consumed == 0 {
             tracing::warn!(
                 fragment = fragment.0,
-                key = %ops[offset].key,
+                key = %ops[offset].borrow().key,
                 "reconciliation repair cannot fit in one wire frame"
             );
             return Err(ReconcileError::Local);
@@ -3271,6 +3575,8 @@ async fn ensure_local_summary(
     fragment: FragmentId,
     router: &FragmentRouter,
     local: &mut ReconcileLocalCursor,
+    deadline: Instant,
+    result_budget: &Arc<ByteBudget>,
 ) -> Result<(), ReconcileError> {
     while local.current.is_none() {
         if let Some(summary) = local.buffered.pop_front() {
@@ -3283,20 +3589,34 @@ async fn ensure_local_summary(
         let actor = router
             .route_for_fragment(fragment)
             .ok_or(ReconcileError::Local)?;
+        let result_retention = if let Some(retention) = &local.result_retention {
+            retention.clone()
+        } else {
+            let retention = Arc::new(
+                result_budget
+                    .reserve(2 * MAX_FRAME_BYTES)
+                    .ok_or(ReconcileError::Local)?,
+            );
+            local.result_retention = Some(retention.clone());
+            retention
+        };
         let first_page = local.revision.is_none();
         let page = match actor
             .call(
-                |reply| KvMessage::GetSummaryPage {
-                    after_key: (!first_page).then_some(local.after_key.clone()),
-                    // Reconciliation is a bounded, monotonic scan rather
-                    // than a lock-held snapshot. Drift is recorded below and
-                    // forces a fresh verification pass after the barrier.
-                    expected_revision: None,
-                    snapshot_time_ms: local.snapshot_time_ms,
-                    limit: RECONCILE_LOCAL_READ_CHUNK,
-                    reply,
+                |reply| {
+                    KvMessage::GetSummaryPage {
+                        after_key: (!first_page).then_some(local.after_key.clone()),
+                        // Reconciliation is a bounded, monotonic scan rather
+                        // than a lock-held snapshot. Drift is recorded below and
+                        // forces a fresh verification pass after the barrier.
+                        expected_revision: None,
+                        snapshot_time_ms: local.snapshot_time_ms,
+                        limit: RECONCILE_LOCAL_READ_CHUNK,
+                        reply,
+                    }
+                    .with_retention(result_retention)
                 },
-                None,
+                Some(deadline.saturating_duration_since(Instant::now())),
             )
             .await
         {
@@ -3349,10 +3669,18 @@ async fn send_repair_keys(
     connection: &ActiveConnection,
     keys: Vec<String>,
     snapshot_time_ms: u64,
+    deadline: Instant,
 ) -> Result<(), ReconcileError> {
     let actor = router
         .route_for_fragment(fragment)
         .ok_or(ReconcileError::Local)?;
+    let result_retention = Arc::new(
+        connection
+            .peer_tx
+            .reconciliation_result_budget
+            .reserve(2 * MAX_FRAME_BYTES)
+            .ok_or(ReconcileError::Local)?,
+    );
     let keys = Arc::new(keys);
     let mut next_key_index = 0usize;
     let mut page = Vec::new();
@@ -3367,15 +3695,19 @@ async fn send_repair_keys(
     let mut sizing = RepeatedFieldSizer::new(9, 4, base_payload_len);
     while next_key_index < keys.len() {
         let request_keys = keys.clone();
+        let request_retention = result_retention.clone();
         let value_page = match actor
             .call(
-                move |reply| KvMessage::GetVersionedPage {
-                    keys: request_keys,
-                    start_index: next_key_index,
-                    snapshot_time_ms: Some(snapshot_time_ms),
-                    reply,
+                move |reply| {
+                    KvMessage::GetVersionedPage {
+                        keys: request_keys,
+                        start_index: next_key_index,
+                        snapshot_time_ms: Some(snapshot_time_ms),
+                        reply,
+                    }
+                    .with_retention(request_retention)
                 },
-                None,
+                Some(deadline.saturating_duration_since(Instant::now())),
             )
             .await
         {
@@ -3425,6 +3757,11 @@ async fn send_repair_keys(
             }
             sizing.push(item_len);
             page.push(op);
+        }
+        if !page.is_empty() {
+            send_repair_ops(fragment, connection, &page).await?;
+            page.clear();
+            sizing.reset(base_payload_len);
         }
     }
     if !page.is_empty() {
@@ -3540,16 +3877,30 @@ async fn reconcile_summary_page(
     summaries: &[KeySummary],
     done: bool,
 ) -> Result<VecDeque<Vec<String>>, ReconcileError> {
+    let deadline = deadline_after(connection.peer_tx.local_work_timeout);
     let mut fetch_keys = Vec::new();
     let mut repair_keys = Vec::new();
+    let mut repair_key_bytes = 0usize;
     for remote in summaries {
         loop {
-            ensure_local_summary(fragment, router, &mut summary.local).await?;
+            ensure_local_summary(
+                fragment,
+                router,
+                &mut summary.local,
+                deadline,
+                &connection.peer_tx.reconciliation_result_budget,
+            )
+            .await?;
             match summary.local.current.as_ref() {
                 Some(local) if local.key < remote.key => {
                     let local = take_local_summary(&mut summary.local).expect("matched Some");
+                    repair_key_bytes = repair_key_bytes
+                        .saturating_add(local.key.capacity())
+                        .saturating_add(std::mem::size_of::<String>());
                     repair_keys.push(local.key);
-                    if repair_keys.len() >= RECONCILE_LOCAL_READ_CHUNK {
+                    if repair_keys.len() >= RECONCILE_LOCAL_READ_CHUNK
+                        || repair_key_bytes >= ANTI_ENTROPY_PAGE_BYTES
+                    {
                         summary.changed_any = true;
                         let snapshot_time_ms = summary
                             .local
@@ -3561,8 +3912,10 @@ async fn reconcile_summary_page(
                             connection,
                             std::mem::take(&mut repair_keys),
                             snapshot_time_ms,
+                            deadline,
                         )
                         .await?;
+                        repair_key_bytes = 0;
                     }
                 }
                 Some(local) if local.key == remote.key => {
@@ -3570,7 +3923,29 @@ async fn reconcile_summary_page(
                     if remote_summary_wins(remote, &local) {
                         fetch_keys.push(remote.key.clone());
                     } else if local_summary_wins(&local, remote) {
+                        repair_key_bytes = repair_key_bytes
+                            .saturating_add(remote.key.len())
+                            .saturating_add(std::mem::size_of::<String>());
                         repair_keys.push(remote.key.clone());
+                        if repair_keys.len() >= RECONCILE_LOCAL_READ_CHUNK
+                            || repair_key_bytes >= ANTI_ENTROPY_PAGE_BYTES
+                        {
+                            summary.changed_any = true;
+                            let snapshot_time_ms = summary
+                                .local
+                                .snapshot_time_ms
+                                .ok_or(ReconcileError::Local)?;
+                            send_repair_keys(
+                                fragment,
+                                router,
+                                connection,
+                                std::mem::take(&mut repair_keys),
+                                snapshot_time_ms,
+                                deadline,
+                            )
+                            .await?;
+                            repair_key_bytes = 0;
+                        }
                     } else if remote.content_digest.as_slice() != local.content_digest {
                         tracing::error!(fragment = fragment.0, key = %remote.key,
                             timestamp_ms = remote.timestamp_ms, logical_counter = remote.logical_counter,
@@ -3599,18 +3974,32 @@ async fn reconcile_summary_page(
             connection,
             std::mem::take(&mut repair_keys),
             snapshot_time_ms,
+            deadline,
         )
         .await?;
+        repair_key_bytes = 0;
     }
 
     if done {
         loop {
-            ensure_local_summary(fragment, router, &mut summary.local).await?;
+            ensure_local_summary(
+                fragment,
+                router,
+                &mut summary.local,
+                deadline,
+                &connection.peer_tx.reconciliation_result_budget,
+            )
+            .await?;
             let Some(local) = take_local_summary(&mut summary.local) else {
                 break;
             };
+            repair_key_bytes = repair_key_bytes
+                .saturating_add(local.key.capacity())
+                .saturating_add(std::mem::size_of::<String>());
             repair_keys.push(local.key);
-            if repair_keys.len() >= RECONCILE_LOCAL_READ_CHUNK {
+            if repair_keys.len() >= RECONCILE_LOCAL_READ_CHUNK
+                || repair_key_bytes >= ANTI_ENTROPY_PAGE_BYTES
+            {
                 summary.changed_any = true;
                 let snapshot_time_ms = summary
                     .local
@@ -3622,8 +4011,10 @@ async fn reconcile_summary_page(
                     connection,
                     std::mem::take(&mut repair_keys),
                     snapshot_time_ms,
+                    deadline,
                 )
                 .await?;
+                repair_key_bytes = 0;
             }
         }
         if !repair_keys.is_empty() {
@@ -3632,7 +4023,15 @@ async fn reconcile_summary_page(
                 .local
                 .snapshot_time_ms
                 .ok_or(ReconcileError::Local)?;
-            send_repair_keys(fragment, router, connection, repair_keys, snapshot_time_ms).await?;
+            send_repair_keys(
+                fragment,
+                router,
+                connection,
+                repair_keys,
+                snapshot_time_ms,
+                deadline,
+            )
+            .await?;
         }
     }
 
@@ -3643,7 +4042,9 @@ async fn apply_reconcile_entries(
     fragment: FragmentId,
     router: &FragmentRouter,
     entries: Vec<SyncEntry>,
+    timeout: Duration,
 ) -> Result<(), ReconcileError> {
+    let deadline = deadline_after(timeout);
     let actor = router
         .route_for_fragment(fragment)
         .ok_or(ReconcileError::Local)?;
@@ -3673,7 +4074,7 @@ async fn apply_reconcile_entries(
                     is_replication: true,
                     reply: Some(reply),
                 },
-                None,
+                Some(deadline.saturating_duration_since(Instant::now())),
             )
             .await
         {
@@ -3699,7 +4100,7 @@ async fn enter_reconcile_barrier(
     local_reconcile_flush_pending: &mut bool,
 ) -> Result<(), ReconcileError> {
     if *local_reconcile_flush_pending {
-        flush_reconcile(fragment, router).await?;
+        flush_reconcile(fragment, router, connection.peer_tx.local_work_timeout).await?;
         *local_reconcile_flush_pending = false;
     }
     let required_ack_durability = round
@@ -3716,12 +4117,13 @@ async fn enter_reconcile_barrier(
 async fn fragment_revision(
     fragment: FragmentId,
     router: &FragmentRouter,
+    timeout: Duration,
 ) -> Result<u64, ReconcileError> {
     let actor = router
         .route_for_fragment(fragment)
         .ok_or(ReconcileError::Local)?;
     match actor
-        .call(|reply| KvMessage::GetRevision { reply }, None)
+        .call(|reply| KvMessage::GetRevision { reply }, Some(timeout))
         .await
     {
         Ok(CallResult::Success(revision)) => Ok(revision),
@@ -3732,11 +4134,15 @@ async fn fragment_revision(
 async fn flush_reconcile(
     fragment: FragmentId,
     router: &FragmentRouter,
+    timeout: Duration,
 ) -> Result<(), ReconcileError> {
     let actor = router
         .route_for_fragment(fragment)
         .ok_or(ReconcileError::Local)?;
-    match actor.call(|reply| KvMessage::Flush { reply }, None).await {
+    match actor
+        .call(|reply| KvMessage::Flush { reply }, Some(timeout))
+        .await
+    {
         Ok(CallResult::Success(Ok(
             ApplyDurability::StableCommitted
             | ApplyDurability::StoreCommitted
@@ -3784,16 +4190,230 @@ mod tests {
         }
     }
 
+    fn retained(op: crate::actor::ReplicatedOp) -> RetainedOp {
+        SenderRetention {
+            local: ByteBudget::new(64 * 1024 * 1024),
+            aggregate: ByteBudget::new(256 * 1024 * 1024),
+        }
+        .owned(op)
+        .unwrap()
+    }
+
     fn state_report() -> Arc<Mutex<SenderStateReport>> {
         Arc::new(Mutex::new(SenderStateReport {
             state: "disconnected".to_string(),
             session_id: 0,
             buffered: 0,
+            retained_bytes: 0,
+            aggregate_retained_bytes: 0,
             in_flight: 0,
             last_ack_durability: None,
             ack_durability_mismatch: false,
             reconcile_rounds: 0,
         }))
+    }
+
+    #[tokio::test]
+    async fn public_bounded_sender_charges_wide_ingress_before_task_selection() {
+        let mut wide = op("wide");
+        wide.value.value = vec![7; 1024 * 1024];
+        let charge = retained_borrowed_op_bytes(&wide);
+        let sender = spawn_bounded_sender(
+            FragmentId(0),
+            "peer".into(),
+            SenderConfig {
+                retained_byte_capacity: charge,
+                buffer_capacity: 100,
+                ..Default::default()
+            },
+            SenderDeps {
+                router: FragmentRouter::new(1, 0),
+                hlc: Arc::new(Mutex::new(HlcClock::new())),
+                reset_senders: Arc::new(Mutex::new(HashMap::new())),
+                state_report: state_report(),
+            },
+            SenderRuntimeOptions::default(),
+        )
+        .unwrap();
+        // No await occurs before these assertions on a current-thread
+        // runtime, so the receiver has not selected either queued mutation.
+        sender.send(SenderMsg::Enqueue(wide.clone())).unwrap();
+        assert_eq!(sender.retained_bytes(), charge);
+        assert_eq!(sender.inner.data_tx.capacity(), 99);
+        sender.send(SenderMsg::Enqueue(wide)).unwrap();
+        assert_eq!(sender.retained_bytes(), charge);
+        assert_eq!(sender.inner.data_tx.capacity(), 99);
+        assert_eq!(sender.inner.signals_tx.borrow().overflow_generation, 1);
+        assert_eq!(sender.inner.ingress.pending_data.load(Ordering::Acquire), 1);
+        sender.stop().await;
+        assert_eq!(sender.retained_bytes(), 0);
+    }
+
+    #[tokio::test]
+    async fn retained_bytes_reset_before_count_saturation_and_release_on_stop() {
+        let mut wide = op("wide");
+        wide.value.value = vec![7; 128 * 1024];
+        let charge = retained_op_bytes(&wide);
+        let aggregate = ByteBudget::new(charge);
+        let report = state_report();
+        let sender = spawn_node_sender(
+            FragmentId(0),
+            "peer".into(),
+            SenderConfig {
+                retained_byte_capacity: charge,
+                buffer_capacity: 100,
+                ..Default::default()
+            },
+            SenderDeps {
+                router: FragmentRouter::new(1, 0),
+                hlc: Arc::new(Mutex::new(HlcClock::new())),
+                reset_senders: Arc::new(Mutex::new(HashMap::new())),
+                state_report: report.clone(),
+            },
+            SenderRuntimeOptions::default().with_aggregate_retention(aggregate.clone()),
+        )
+        .unwrap();
+        sender.offer(&wide).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while report.lock().await.buffered != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(aggregate.used(), charge);
+        // ACK/lifecycle controls remain admissible at the payload byte cap.
+        sender
+            .send(SenderMsg::Ack {
+                session_id: 1,
+                batch_seq: 1,
+                durability: ReplicationAckDurability::MemoryApplied,
+            })
+            .unwrap();
+        sender.offer(&wide).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while report.lock().await.state != "buffer_reset" {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(report.lock().await.buffered, 0);
+        sender.stop().await;
+        assert_eq!(aggregate.used(), 0);
+    }
+
+    #[test]
+    fn retention_survives_inflight_retry_and_releases_only_after_ack_ownership() {
+        let value = op("key");
+        let charge = retained_op_bytes(&value);
+        let retention = SenderRetention {
+            local: ByteBudget::new(charge),
+            aggregate: ByteBudget::new(charge),
+        };
+        let mut batches = VecDeque::from([InflightBatch {
+            batch_seq: 1,
+            ops: vec![retention.owned(value).unwrap()],
+            kind: InflightKind::Streaming {
+                ack_deadline: Instant::now() + Duration::from_secs(1),
+            },
+            required_ack_durability: ReplicationAckDurability::StoreCommitted,
+        }]);
+        let mut buffer = VecDeque::new();
+        requeue_in_flight(&mut batches, &mut buffer);
+        assert_eq!(retention.aggregate.used(), charge);
+        let (tx, _rx) = mpsc::channel(1);
+        let mut connection = ActiveConnection {
+            peer_tx: SenderPeer::new(tx, None, &SenderRuntimeOptions::default()),
+            session_id: 1,
+            session_ready: true,
+            next_batch_seq: 2,
+            in_flight: VecDeque::from([InflightBatch {
+                batch_seq: 1,
+                ops: buffer.drain(..).collect(),
+                kind: InflightKind::Streaming {
+                    ack_deadline: Instant::now() + Duration::from_secs(1),
+                },
+                required_ack_durability: ReplicationAckDurability::StoreCommitted,
+            }]),
+        };
+        assert!(matches!(
+            acknowledge_in_flight(&mut connection, 1, ReplicationAckDurability::MemoryApplied),
+            InflightAckResult::BelowRequired { .. }
+        ));
+        assert_eq!(retention.aggregate.used(), charge);
+        let accepted =
+            acknowledge_in_flight(&mut connection, 1, ReplicationAckDurability::StoreCommitted);
+        assert_eq!(retention.aggregate.used(), charge);
+        drop(accepted);
+        assert_eq!(retention.local.used(), 0);
+        assert_eq!(retention.aggregate.used(), 0);
+    }
+
+    #[test]
+    fn queued_summary_control_charges_malformed_digest_spare_capacity() {
+        let digest_capacity = 4 * 1024 * 1024;
+        let (connection_valid, _) = oneshot::channel();
+        let message = SenderMsg::ReconcileResponse {
+            session_id: 1,
+            round_id: 1,
+            page_seq: 0,
+            next_after_key: String::new(),
+            snapshot_revision: 1,
+            snapshot_time_ms: 1,
+            done: true,
+            restart: false,
+            summaries: vec![KeySummary {
+                key: "key".into(),
+                timestamp_ms: 1,
+                logical_counter: 0,
+                node_id: "node".into(),
+                is_tombstone: false,
+                content_digest: Vec::with_capacity(digest_capacity),
+            }],
+            connection_valid,
+        };
+        assert!(retained_control_bytes(&message) >= 2 * digest_capacity);
+    }
+
+    #[test]
+    fn owning_legacy_operations_charge_spare_capacity_but_fanout_clones_do_not() {
+        let mut value = op("key");
+        value.value.value = Vec::with_capacity(4096);
+        value.value.value.push(1);
+        let copied = retained_borrowed_op_bytes(&value);
+        assert!(retained_op_bytes(&value) > copied);
+        let retention = SenderRetention {
+            local: ByteBudget::new(copied),
+            aggregate: ByteBudget::new(copied),
+        };
+        let clone = retention.borrowed(&value).unwrap();
+        assert_eq!(clone.value.value.capacity(), 1);
+        drop(clone);
+        assert!(retention.owned(value).is_none());
+        assert_eq!(retention.local.used(), 0);
+    }
+
+    #[test]
+    fn shared_sender_allowance_bounds_replica_fanout_before_cloning() {
+        let mut value = op("wide");
+        value.value.value = vec![9; 128 * 1024];
+        let charge = retained_op_bytes(&value);
+        let aggregate = ByteBudget::new(charge);
+        let first = SenderRetention {
+            local: ByteBudget::new(charge * 2),
+            aggregate: aggregate.clone(),
+        };
+        let second = SenderRetention {
+            local: ByteBudget::new(charge * 2),
+            aggregate: aggregate.clone(),
+        };
+        let owned = first.borrowed(&value).unwrap();
+        assert!(second.borrowed(&value).is_none());
+        assert_eq!(aggregate.used(), charge);
+        drop(owned);
+        assert!(second.borrowed(&value).is_some());
+        assert_eq!(aggregate.used(), 0);
     }
 
     #[test]
@@ -3828,7 +4448,11 @@ mod tests {
         let mut second = op("second");
         second.value.value = vec![2; ANTI_ENTROPY_PAGE_BYTES / 2 + 1024];
         let third = op("third");
-        let mut buffer = VecDeque::from([first.clone(), second.clone(), third.clone()]);
+        let mut buffer = VecDeque::from([
+            retained(first.clone()),
+            retained(second.clone()),
+            retained(third.clone()),
+        ]);
 
         let (taken, encoded) = take_streaming_batch(
             &mut buffer,
@@ -3846,7 +4470,7 @@ mod tests {
         assert_eq!(encoded.len(), 1);
         assert_eq!(encoded[0].key, "first");
         assert_eq!(
-            buffer.into_iter().map(|op| op.key).collect::<Vec<_>>(),
+            buffer.into_iter().map(|op| op.op.key).collect::<Vec<_>>(),
             vec![second.key, third.key]
         );
     }
@@ -3854,7 +4478,7 @@ mod tests {
     #[test]
     fn streaming_batch_preserves_the_wire_item_count_ceiling() {
         let mut buffer = (0..=MAX_WIRE_BATCH_ITEMS)
-            .map(|index| op(&format!("key-{index}")))
+            .map(|index| retained(op(&format!("key-{index}"))))
             .collect::<VecDeque<_>>();
 
         let (taken, encoded) = take_streaming_batch(
@@ -4049,6 +4673,7 @@ mod tests {
                 changed_any: false,
                 summary_done: true,
                 local: ReconcileLocalCursor {
+                    result_retention: None,
                     after_key: String::new(),
                     revision: Some(0),
                     snapshot_time_ms: Some(100),
@@ -4234,7 +4859,10 @@ mod tests {
         assert_eq!(data_rx.recv().await.unwrap().key, "queued");
         assert!(matches!(
             control_rx.recv().await,
-            Some(SenderMsg::Ack { .. })
+            Some(RetainedControl {
+                msg: SenderMsg::Ack { .. },
+                ..
+            })
         ));
         let pending_before_closed_send = sender.ingress.pending_data.load(Ordering::Acquire);
         let overflow_before_closed_send = sender.signals_tx.borrow().overflow_generation;
@@ -4615,7 +5243,7 @@ mod tests {
         let mut in_flight = VecDeque::from([
             InflightBatch {
                 batch_seq: 0,
-                ops: vec![op("a"), op("b")],
+                ops: vec![retained(op("a")), retained(op("b"))],
                 kind: InflightKind::Streaming {
                     ack_deadline: Instant::now() + Duration::from_secs(1),
                 },
@@ -4623,18 +5251,18 @@ mod tests {
             },
             InflightBatch {
                 batch_seq: 1,
-                ops: vec![op("c")],
+                ops: vec![retained(op("c"))],
                 kind: InflightKind::Streaming {
                     ack_deadline: Instant::now() + Duration::from_secs(1),
                 },
                 required_ack_durability: ReplicationAckDurability::MemoryApplied,
             },
         ]);
-        let mut buffer = VecDeque::from([op("d")]);
+        let mut buffer = VecDeque::from([retained(op("d"))]);
         requeue_in_flight(&mut in_flight, &mut buffer);
         assert!(in_flight.is_empty());
         assert_eq!(
-            buffer.into_iter().map(|op| op.key).collect::<Vec<_>>(),
+            buffer.into_iter().map(|op| op.op.key).collect::<Vec<_>>(),
             ["a", "b", "c", "d"]
         );
     }

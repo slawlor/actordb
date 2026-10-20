@@ -526,6 +526,8 @@ async fn ensure_sender_entry(fragment: FragmentId, peer: &str, deps: SenderEntry
         state: "disconnected".to_string(),
         session_id: 0,
         buffered: 0,
+        retained_bytes: 0,
+        aggregate_retained_bytes: 0,
         in_flight: 0,
         last_ack_durability: None,
         ack_durability_mismatch: false,
@@ -1208,7 +1210,10 @@ impl FragmentRouter {
         let mut all = HashMap::new();
         for actor in actors {
             let res = actor
-                .call(|reply| KvMessage::GetAll { reply }, None)
+                .call(
+                    |reply| KvMessage::GetAll { reply },
+                    Some(Duration::from_secs(30)),
+                )
                 .await
                 .map_err(|e| NodeError::Actor(e.to_string()))?;
             match res {
@@ -1374,11 +1379,19 @@ async fn flush_fence(
     let result = match required {
         ReplicationAckDurability::StableCommitted => {
             actor
-                .call(|reply| KvMessage::FlushStable { reply }, None)
+                .call(
+                    |reply| KvMessage::FlushStable { reply },
+                    Some(Duration::from_secs(30)),
+                )
                 .await
         }
         ReplicationAckDurability::MemoryApplied | ReplicationAckDurability::StoreCommitted => {
-            actor.call(|reply| KvMessage::Flush { reply }, None).await
+            actor
+                .call(
+                    |reply| KvMessage::Flush { reply },
+                    Some(Duration::from_secs(30)),
+                )
+                .await
         }
     };
     match result.map_err(|error| NodeError::Actor(error.to_string()))? {
@@ -1413,7 +1426,7 @@ async fn enqueue_to_senders(senders: &SenderMap, frag: FragmentId, op: &Replicat
         .map(|(_, sender)| sender.clone())
         .collect();
     for sender in targets {
-        let _ = sender.send(SenderMsg::Enqueue(op.clone()));
+        let _ = sender.offer(op);
     }
 }
 
@@ -2079,6 +2092,8 @@ pub struct Node {
     pub(crate) write_concerns: Arc<crate::write_concern::WriteConcernTracker>,
     /// Transport and replication liveness policy.
     runtime_options: NodeRuntimeOptions,
+    storage_executor: Arc<crate::store::executor::StorageExecutor>,
+    persistence_budget: Arc<crate::retained::ByteBudget>,
     /// State reports for each sender, keyed by (fragment, peer).
     sender_reports: SenderReportMap,
     /// Compatibility counter for the retired full-state sync protocol.
@@ -2370,6 +2385,7 @@ async fn spawn_fragment_subtree_registered(
             .high_pool(config.high_pool.clone())
             .background_pool(config.background_pool.clone())
             .flush_batch_size(config.flush_batch_size)
+            .persistence(config.persistence.clone())
             .flush_interval(config.flush_interval)
             .clean_interval(config.clean_interval)
             .snapshot_interval(config.snapshot_interval)
@@ -2844,6 +2860,16 @@ impl Drop for StoreBindingStartupGuard {
 /// defaults; pass an override to [`Node::start_with_options`].
 #[derive(Clone, Debug, bon::Builder)]
 pub struct NodeRuntimeOptions {
+    #[builder(default = 256 * 1024 * 1024)]
+    replication_retained_byte_capacity: usize,
+    #[builder(default = Duration::from_secs(30))]
+    local_work_timeout: Duration,
+    #[builder(skip = crate::retained::ByteBudget::new(256 * 1024 * 1024))]
+    replication_retention: Arc<crate::retained::ByteBudget>,
+    #[builder(default = 64 * 1024 * 1024)]
+    reconciliation_retained_byte_capacity: usize,
+    #[builder(skip = crate::retained::ByteBudget::new(64 * 1024 * 1024))]
+    reconciliation_retention: Arc<crate::retained::ByteBudget>,
     /// Operator-supplied node-to-region labels. Labels compare by exact bytes;
     /// they do not change placement or authenticate physical location.
     #[builder(default, into)]
@@ -3222,14 +3248,55 @@ impl NodeRuntimeOptions {
         self.health_timeout
     }
 
+    /// Node-wide local reconciliation page allowance; minimum 64 MiB.
+    pub fn reconciliation_retained_byte_capacity(&self) -> usize {
+        self.reconciliation_retained_byte_capacity
+    }
+    /// Deadline for embedded actor read waiters and local reconciliation work.
+    /// Accepted mutations retain completion ownership after their waiter ends.
+    pub fn local_work_timeout(&self) -> Duration {
+        self.local_work_timeout
+    }
+    pub fn with_local_work_timeout(mut self, timeout: Duration) -> Self {
+        self.local_work_timeout = timeout;
+        self
+    }
+
     fn sender_options(&self) -> SenderRuntimeOptions {
         SenderRuntimeOptions::default()
+            .with_aggregate_retention(self.replication_retention.clone())
+            .with_reconciliation_result_budget(self.reconciliation_retention.clone())
+            .with_local_work_timeout(self.local_work_timeout)
             .with_ack_timeout(self.replication_ack_timeout)
             .with_queue_admission_timeout(self.queue_admission_timeout)
             .with_control_channel_capacity(self.replication_control_message_capacity)
     }
 
+    /// Current charged retained replication work across this node.
+    pub fn replication_retained_bytes(&self) -> usize {
+        self.replication_retention.used()
+    }
+
     fn validate(&self) -> Result<(), NodeError> {
+        if self.reconciliation_retained_byte_capacity < 4 * MAX_FRAME_BYTES {
+            return Err(NodeError::Actor(
+                "reconciliation result allowance must be at least 64 MiB".into(),
+            ));
+        }
+        if self.local_work_timeout.is_zero()
+            || Instant::now()
+                .checked_add(self.local_work_timeout)
+                .is_none()
+        {
+            return Err(NodeError::Actor(
+                "local work timeout must be positive and representable".into(),
+            ));
+        }
+        if self.replication_retained_byte_capacity == 0 {
+            return Err(NodeError::Actor(
+                "node replication byte allowance must be nonzero".into(),
+            ));
+        }
         for (node_id, region) in self.regions.iter() {
             if node_id.is_empty() || node_id.len() > MAX_WIRE_NODE_ID_BYTES {
                 return Err(NodeError::Actor(format!(
@@ -3433,6 +3500,9 @@ pub struct NodeConfig {
     /// Ignored when `store` is `None`.
     #[builder(default = crate::actor::DEFAULT_FLUSH_BATCH_SIZE)]
     pub flush_batch_size: usize,
+    /// Per-fragment and aggregate node persistence backlog admission.
+    #[builder(default)]
+    pub persistence: crate::store::PersistenceConfig,
     /// Flush the store write buffer after this long, even if the batch
     /// isn't full (checked on each applied write). Ignored when `store`
     /// is `None`.
@@ -3593,6 +3663,24 @@ impl Node {
         }
     }
 
+    /// Current charged replication payload bytes across every local sender.
+    pub fn replication_retained_bytes(&self) -> usize {
+        self.runtime_options.replication_retention.used()
+    }
+
+    /// Charged local reconciliation page ownership across every sender.
+    pub fn reconciliation_retained_bytes(&self) -> usize {
+        self.runtime_options.reconciliation_retention.used()
+    }
+    /// Current charged authoritative persistence bytes across local fragments.
+    pub fn persistence_retained_bytes(&self) -> usize {
+        self.persistence_budget.used()
+    }
+    /// Submitted synchronous store jobs still owning execution slots.
+    pub fn active_storage_jobs(&self) -> usize {
+        self.storage_executor.active()
+    }
+
     /// Start a node: spawn its [crate::actor::KvActor] and begin
     /// listening for peer connections. Binds `listen_addr` (use port 0
     /// for an ephemeral port) and returns the bound address via [Node::addr].
@@ -3614,6 +3702,11 @@ impl Node {
         runtime_options: NodeRuntimeOptions,
     ) -> Result<Self, NodeError> {
         runtime_options.validate()?;
+        let mut runtime_options = runtime_options;
+        runtime_options.replication_retention =
+            crate::retained::ByteBudget::new(runtime_options.replication_retained_byte_capacity);
+        runtime_options.reconciliation_retention =
+            crate::retained::ByteBudget::new(runtime_options.reconciliation_retained_byte_capacity);
         if config.ttl_expiry_handler.is_some() {
             config
                 .ttl_expiry_options
@@ -3737,15 +3830,24 @@ impl Node {
             config.fragment_map.clone()
         };
 
+        let mut config = config;
+        config.persistence = config.persistence.for_runtime().map_err(NodeError::Actor)?;
+
         // Bind immutable storage identity before network or actor side effects.
         // The binding remains owned by Node until every fragment has stopped.
         let store_identity = StoreIdentity::new(node_id.clone(), config.fragment_count as u32);
-        let store_binding = config
-            .store
-            .as_ref()
-            .map(|store| store.bind(&store_identity))
-            .transpose()
-            .map_err(|error| NodeError::Storage(error.to_string()))?;
+        let store_binding = if let Some(store) = config.store.clone() {
+            Some(
+                config
+                    .persistence
+                    .executor()
+                    .run(move || store.bind(&store_identity))
+                    .await
+                    .map_err(|error| NodeError::Storage(error.to_string()))?,
+            )
+        } else {
+            None
+        };
         let mut store_binding = StoreBindingStartupGuard::new(store_binding);
 
         // One actor per fragment. With persistence, each fragment gets
@@ -3843,6 +3945,7 @@ impl Node {
                     tasks.shutdown().await;
                     supervisor_stops.stop_and_join_all().await;
                     startup_supervisors.disarm();
+                    config.persistence.executor().drain().await;
                     store_binding.allow_release_after_join();
                     return Err(error);
                 }
@@ -3867,6 +3970,7 @@ impl Node {
                 tasks.shutdown().await;
                 supervisor_stops.stop_and_join_all().await;
                 startup_supervisors.disarm();
+                config.persistence.executor().drain().await;
                 store_binding.allow_release_after_join();
                 return Err(NodeError::Actor(
                     "node runtime stopped during dispatcher-monitor startup".to_string(),
@@ -3894,6 +3998,7 @@ impl Node {
             tasks.shutdown().await;
             supervisor_stops.stop_and_join_all().await;
             startup_supervisors.disarm();
+            config.persistence.executor().drain().await;
             store_binding.allow_release_after_join();
             return Err(NodeError::Actor(
                 "node runtime stopped during serving read startup".to_string(),
@@ -3942,6 +4047,8 @@ impl Node {
             sender_config: config.replication.clone(),
             write_concerns: write_concerns.clone(),
             runtime_options: runtime_options.clone(),
+            storage_executor: config.persistence.executor(),
+            persistence_budget: config.persistence.aggregate(),
             sender_reports: Arc::new(Mutex::new(HashMap::new())),
             sync_entries_applied: Arc::new(AtomicU64::new(0)),
             membership_tx: membership_tx.clone(),
@@ -4573,7 +4680,7 @@ impl Node {
                         reply,
                         priority,
                     },
-                    None,
+                    Some(self.runtime_options.local_work_timeout),
                 )
                 .await
                 .map_err(|e| NodeError::Actor(e.to_string()))?;
@@ -4665,7 +4772,12 @@ impl Node {
     /// Read the full local copy across all fragments (debugging / tests).
     pub async fn get_all(&self) -> Result<HashMap<String, VersionedValue>, NodeError> {
         let _operation = self.admit_operation()?;
-        let all = self.router.get_all().await?;
+        let all = tokio::time::timeout(
+            self.runtime_options.local_work_timeout,
+            self.router.get_all(),
+        )
+        .await
+        .map_err(|_| NodeError::Actor("get_all local work timed out".into()))??;
         // Hide tombstones from user reads (sync needs them, users don't).
         Ok(all.into_iter().filter(|(_, v)| !v.is_tombstone).collect())
     }
@@ -5535,6 +5647,7 @@ impl Node {
             }
             self.supervisors.lock().await.clear();
             self.supervisor_stops.clear();
+            self.storage_executor.drain().await;
             let store_binding = self.store_binding.lock().unwrap().take();
             drop(store_binding);
             self.operation_gate.finish_shutdown();
@@ -6642,13 +6755,13 @@ async fn finish_fragment_prefix_retirement(
         .as_ref()
         .expect("prefix retirement requires a configured store")
         .clone();
-    let fragment_store = PrefixedStore::new(base_store, fragment);
+    let fragment_store = Arc::new(PrefixedStore::new(base_store, fragment));
     let mut next_delete_warning = std::time::Instant::now();
     loop {
         // Placement publication uses this same mutex. Holding it through the
         // synchronous, idempotent delete makes the final revoked-map check and
         // namespace mutation one atomic lifecycle decision.
-        let states = deps.placement_states.lock().await;
+        let states = deps.placement_states.clone().lock_owned().await;
         if !fragment_placement_matches(deps, fragment, &expected_replicas, expected_generation) {
             tracing::info!(
                 fragment = fragment.0,
@@ -6657,10 +6770,19 @@ async fn finish_fragment_prefix_retirement(
             drop(states);
             break;
         }
-        match fragment_store.delete_prefix(&[]) {
+        let backend = fragment_store.clone();
+        let deleted = deps
+            .subtree_config
+            .persistence
+            .executor()
+            .run(move || {
+                let _placement_guard = states;
+                backend.delete_prefix(&[])
+            })
+            .await;
+        match deleted {
             Ok(PrefixDeleteOutcome::Deleted) => {
                 tracing::info!(fragment = fragment.0, "retired durable fragment prefix");
-                drop(states);
                 break;
             }
             Ok(PrefixDeleteOutcome::Retained) => {
@@ -6668,11 +6790,9 @@ async fn finish_fragment_prefix_retirement(
                     fragment = fragment.0,
                     "store retained fragment prefix after retirement request"
                 );
-                drop(states);
                 break;
             }
             Err(error) => {
-                drop(states);
                 if std::time::Instant::now() >= next_delete_warning {
                     tracing::warn!(
                         fragment = fragment.0,
@@ -10626,6 +10746,56 @@ mod tests {
     use std::sync::atomic::AtomicBool;
     use std::sync::Condvar;
 
+    struct StalledLocalActor;
+    impl Actor for StalledLocalActor {
+        type Msg = KvMessage;
+        type State = Vec<KvMessage>;
+        type Arguments = ();
+        async fn pre_start(
+            &self,
+            _: ActorRef<KvMessage>,
+            _: (),
+        ) -> Result<Self::State, ActorProcessingErr> {
+            Ok(Vec::new())
+        }
+        async fn handle(
+            &self,
+            _: ActorRef<KvMessage>,
+            message: KvMessage,
+            state: &mut Self::State,
+        ) -> Result<(), ActorProcessingErr> {
+            state.push(message);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn embedded_get_has_an_explicit_local_actor_wait_deadline() {
+        let node = Node::start_with_options(
+            "local-deadline".into(),
+            "127.0.0.1:0".parse().unwrap(),
+            NodeConfig::default(),
+            NodeRuntimeOptions::builder()
+                .local_work_timeout(Duration::from_millis(20))
+                .build(),
+        )
+        .await
+        .unwrap();
+        let original = node.router.route_for_fragment(FragmentId(0)).unwrap();
+        let (stalled, handle) = StalledLocalActor::spawn(None, StalledLocalActor, ())
+            .await
+            .unwrap();
+        node.router.insert(FragmentId(0), stalled.clone());
+        let result = tokio::time::timeout(Duration::from_secs(2), node.get("key".into()))
+            .await
+            .unwrap();
+        assert!(matches!(result,Err(NodeError::Actor(message)) if message.contains("timed out")));
+        node.router.insert(FragmentId(0), original);
+        stalled.stop(None);
+        handle.await.unwrap();
+        node.shutdown().await.unwrap();
+    }
+
     #[tokio::test]
     async fn nodes_serve_and_invalid_settings_fail_before_bind() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -11530,6 +11700,8 @@ mod tests {
             state: "disconnected".to_string(),
             session_id: 0,
             buffered: 0,
+            retained_bytes: 0,
+            aggregate_retained_bytes: 0,
             in_flight: 0,
             last_ack_durability: None,
             ack_durability_mismatch: false,
@@ -14078,6 +14250,8 @@ mod tests {
             state: "disconnected".to_string(),
             session_id: 0,
             buffered: 0,
+            retained_bytes: 0,
+            aggregate_retained_bytes: 0,
             in_flight: 0,
             last_ack_durability: None,
             ack_durability_mismatch: false,
@@ -16727,6 +16901,8 @@ mod tests {
             state: "disconnected".to_string(),
             session_id: 0,
             buffered: 0,
+            retained_bytes: 0,
+            aggregate_retained_bytes: 0,
             in_flight: 0,
             last_ack_durability: None,
             ack_durability_mismatch: false,
@@ -16796,6 +16972,8 @@ mod tests {
             state: "disconnected".to_string(),
             session_id: 0,
             buffered: 0,
+            retained_bytes: 0,
+            aggregate_retained_bytes: 0,
             in_flight: 0,
             last_ack_durability: None,
             ack_durability_mismatch: false,
@@ -16882,6 +17060,8 @@ mod tests {
             state: "disconnected".to_string(),
             session_id: 0,
             buffered: 0,
+            retained_bytes: 0,
+            aggregate_retained_bytes: 0,
             in_flight: 0,
             last_ack_durability: None,
             ack_durability_mismatch: false,
@@ -17008,6 +17188,8 @@ mod tests {
             state: "disconnected".to_string(),
             session_id: 0,
             buffered: 0,
+            retained_bytes: 0,
+            aggregate_retained_bytes: 0,
             in_flight: 0,
             last_ack_durability: None,
             ack_durability_mismatch: false,
@@ -17153,6 +17335,8 @@ mod tests {
             state: "disconnected".to_string(),
             session_id: 0,
             buffered: 0,
+            retained_bytes: 0,
+            aggregate_retained_bytes: 0,
             in_flight: 0,
             last_ack_durability: None,
             ack_durability_mismatch: false,
@@ -17311,6 +17495,8 @@ mod tests {
             state: "disconnected".to_string(),
             session_id: 0,
             buffered: 0,
+            retained_bytes: 0,
+            aggregate_retained_bytes: 0,
             in_flight: 0,
             last_ack_durability: None,
             ack_durability_mismatch: false,
@@ -17422,6 +17608,8 @@ mod tests {
             state: "disconnected".to_string(),
             session_id: 0,
             buffered: 0,
+            retained_bytes: 0,
+            aggregate_retained_bytes: 0,
             in_flight: 0,
             last_ack_durability: None,
             ack_durability_mismatch: false,

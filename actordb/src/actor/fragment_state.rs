@@ -19,8 +19,9 @@ use super::protocol::{
     VersionedPage, VersionedValue,
 };
 use super::scan::{KeyMatcher, ScanMatch, ScanSpec, ValueTransform};
+use crate::retained::{ByteBudget, BytePermit};
 use crate::shard::FragmentId;
-use crate::store::{KvStore, StoreCommitDurability};
+use crate::store::{KvStore, PersistenceConfig, StoreCommitDurability};
 use crate::ttl_expiry::ExpiryPublisher;
 use crate::wire::check_versioned_value_budget;
 
@@ -51,11 +52,12 @@ pub struct FragmentState {
     revision: AtomicU64,
     query_incarnation: u64,
     /// Buffered writes awaiting flush.
-    flush: Mutex<FlushBuffer>,
+    flush: Arc<Mutex<FlushBuffer>>,
+    executor: Arc<crate::store::executor::StorageExecutor>,
     /// Allows exactly one store write at a time for this fragment. The
     /// buffered batch remains recorded while the write is in progress, so a
     /// cancelled or failed flush can be retried without losing it.
-    flush_in_progress: Mutex<()>,
+    flush_in_progress: Arc<Mutex<()>>,
     flush_batch_size: usize,
     flush_interval: Duration,
     expiry_publisher: Option<(FragmentId, ExpiryPublisher)>,
@@ -145,12 +147,31 @@ fn expiry_record_work_bytes(
     bytes
 }
 
+struct PendingWrite {
+    value: VersionedValue,
+    local: BytePermit,
+    aggregate: BytePermit,
+}
 struct FlushBuffer {
-    pending: Vec<(String, VersionedValue)>,
-    /// The batch currently being attempted. It stays here until the store
-    /// write succeeds; retries may therefore write the same versions again.
-    in_flight: Option<Vec<(String, VersionedValue)>>,
+    pending: HashMap<String, PendingWrite>,
+    /// Immutable authoritative ownership during an ordered store call.
+    in_flight: Option<Arc<HashMap<String, PendingWrite>>>,
+    local_budget: Arc<ByteBudget>,
+    aggregate_budget: Arc<ByteBudget>,
+    max_records: usize,
     last_flush: Instant,
+    failed: bool,
+}
+
+fn persistence_record_bytes(key: &str, value: &VersionedValue) -> usize {
+    // Both authoritative and backend-owned encoded representations; hash
+    // buckets, String/Vec headers, permits, and allocator slack are charged.
+    2usize.saturating_mul(
+        256usize
+            .saturating_add(key.len())
+            .saturating_add(value.value.len())
+            .saturating_add(value.node_id.len()),
+    )
 }
 
 impl FragmentState {
@@ -174,16 +195,49 @@ impl FragmentState {
             kvstore,
             revision: AtomicU64::new(0),
             query_incarnation: NEXT_QUERY_INCARNATION.fetch_add(1, Ordering::Relaxed),
-            flush: Mutex::new(FlushBuffer {
-                pending: Vec::new(),
+            flush: Arc::new(Mutex::new(FlushBuffer {
+                pending: HashMap::new(),
                 in_flight: None,
+                local_budget: ByteBudget::new(PersistenceConfig::default().max_bytes()),
+                aggregate_budget: ByteBudget::new(PersistenceConfig::default().node_max_bytes()),
+                max_records: PersistenceConfig::default().max_records(),
                 last_flush: Instant::now(),
-            }),
-            flush_in_progress: Mutex::new(()),
+                failed: false,
+            })),
+            executor: crate::store::executor::StorageExecutor::new(4),
+            flush_in_progress: Arc::new(Mutex::new(())),
             flush_batch_size,
             flush_interval,
             expiry_publisher: None,
         }
+    }
+
+    /// Configure retained persistence admission before sharing or applying work.
+    /// Rejections from subsequent writes return [`ApplyError::Backpressure`]
+    /// before cache mutation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid limits, shared work, or a retained backlog.
+    pub fn with_persistence_config(mut self, config: PersistenceConfig) -> Result<Self, String> {
+        config.validate()?;
+        let flush = Arc::get_mut(&mut self.flush)
+            .ok_or_else(|| "persistence work is already shared".to_string())?
+            .get_mut();
+        if flush.record_count() != 0 {
+            return Err("persistence configuration requires an empty backlog".to_string());
+        }
+        flush.local_budget = ByteBudget::new(config.max_bytes());
+        flush.max_records = config.max_records();
+        flush.aggregate_budget = config.aggregate();
+        self.executor = config.executor();
+        Ok(self)
+    }
+
+    /// Charged authoritative pending/active bytes and retained records.
+    pub async fn persistence_backlog(&self) -> (usize, usize) {
+        let flush = self.flush.lock().await;
+        (flush.record_count(), flush.local_budget.used())
     }
 
     pub(crate) fn with_expiry_publisher(
@@ -273,17 +327,27 @@ impl FragmentState {
             // through it.
             let mut flush = self.flush.lock().await;
             let mut cache = self.cache.write().await;
-            if expired {
-                Self::check_version_conflict(&cache, &op.key, &op.value)?;
+            // Raw equal-version conflicts must precede normalization-driven
+            // persistence admission, including an already-expired input.
+            Self::check_version_conflict(&cache, &op.key, &op.value)?;
+            let winning = cache
+                .values
+                .get(&op.key)
+                .is_none_or(|existing| value != existing && value.wins_over(existing));
+            if winning && !flush.enqueue(&op.key, value) {
+                tracing::warn!(
+                    records = flush.record_count(),
+                    retained_bytes = flush.local_budget.used(),
+                    "rejecting mutation at persistence admission limit"
+                );
+                return Err(ApplyError::Backpressure);
             }
             let outcome = Self::merge_cache(&mut cache, &op.key, value, digests)?;
             if outcome != ApplyOutcome::Applied {
                 return Ok(Self::reported_outcome(outcome, expired));
             }
-            flush.pending.push((op.key.clone(), value.clone()));
             self.revision.fetch_add(1, Ordering::Release);
-            let should_flush = flush.pending.len() >= self.flush_batch_size
-                || flush.last_flush.elapsed() >= self.flush_interval;
+            let should_flush = flush.should_flush(self.flush_batch_size, self.flush_interval);
             (outcome, should_flush)
         };
 
@@ -369,63 +433,98 @@ impl FragmentState {
     /// it. Writes that arrive during the store call remain pending for the
     /// next flush.
     pub async fn flush(&self) -> Result<(), ActorProcessingErr> {
-        let _single_flight = self.flush_in_progress.lock().await;
-        let batch = {
-            let mut flush = self.flush.lock().await;
-            match flush.begin_batch() {
-                Some(batch) => batch,
-                None => return Ok(()),
-            }
-        };
-
-        self.write_batch(&batch)?;
-        self.flush.lock().await.commit_batch();
-        Ok(())
+        self.flush_owned(false).await.map(|_| ())
     }
 
-    /// Flush the fragment's ordered persistence buffer, then ask the backend
-    /// for its strongest explicit stable-storage fence.
-    ///
-    /// Storeless fragments remain memory-only. A backend which reports a
-    /// buffered fence preserves the ordinary [`ApplyDurability::StoreCommitted`]
-    /// result; only an explicit stable fence yields
-    /// [`ApplyDurability::StableCommitted`].
+    /// Flush and complete the backend's strongest stable-storage fence under
+    /// the same ordering guard. The accepted operation remains owned when its
+    /// waiter is canceled; safe teardown still waits for backend completion.
     pub async fn flush_stable(&self) -> Result<ApplyDurability, ActorProcessingErr> {
-        self.flush().await?;
-        let Some(kvstore) = &self.kvstore else {
+        self.flush_owned(true).await
+    }
+
+    async fn flush_owned(&self, stable: bool) -> Result<ApplyDurability, ActorProcessingErr> {
+        let ordering = self.flush_in_progress.clone();
+        let guard = ordering.clone().lock_owned().await;
+        let Some(kvstore) = self.kvstore.clone() else {
             return Ok(ApplyDurability::MemoryApplied);
         };
-        kvstore
-            .stable_fence()
-            .map(|durability| match durability {
-                StoreCommitDurability::Buffered => ApplyDurability::StoreCommitted,
-                StoreCommitDurability::Stable => ApplyDurability::StableCommitted,
-            })
-            .map_err(|error| ActorProcessingErr::from(error.to_string()))
-    }
-
-    fn write_batch(&self, batch: &[(String, VersionedValue)]) -> Result<(), ActorProcessingErr> {
-        if let Some(kvstore) = &self.kvstore {
-            // A busy key may appear several times in one batch. Send only
-            // its LWW winner so backend implementations do not need to
-            // define duplicate-key ordering within a batch.
-            let mut coalesced: HashMap<Vec<u8>, VersionedValue> =
-                HashMap::with_capacity(batch.len());
-            for (key, value) in batch {
-                let replace = match coalesced.get(key.as_bytes()) {
-                    Some(existing) => value.wins_over(existing),
-                    None => true,
-                };
-                if replace {
-                    coalesced.insert(key.as_bytes().to_vec(), value.clone());
-                }
-            }
-            let encoded: Vec<(Vec<u8>, VersionedValue)> = coalesced.into_iter().collect();
-            kvstore
-                .write_batch(&encoded)
-                .map_err(|e| ActorProcessingErr::from(e.to_string()))?;
+        let batch = self.flush.lock().await.begin_batch();
+        if batch.is_none() && !stable {
+            return Ok(ApplyDurability::StoreCommitted);
         }
-        Ok(())
+        let flush = self.flush.clone();
+        let executor = self.executor.clone();
+        let (reply, completion) = tokio::sync::oneshot::channel();
+        // Registration is synchronous after taking the authoritative batch.
+        // The executor retains and reaps this owner. The ordering guard is
+        // captured by the blocking call itself, including runtime teardown.
+        let owner_executor = executor.clone();
+        executor.spawn_owner(async move {
+            let completed = owner_executor
+                .run(move || {
+                    // Keep the ordering guard outside the unwind boundary.
+                    // A panicking backend must not let another flush replace
+                    // the authoritative batch before this owner restores it.
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        if let Some(batch) = &batch {
+                            let encoded: Vec<_> = batch
+                                .iter()
+                                .map(|(key, write)| (key.as_bytes().to_vec(), write.value.clone()))
+                                .collect();
+                            kvstore.write_batch(&encoded)?;
+                        }
+                        if stable {
+                            Ok(match kvstore.stable_fence()? {
+                                StoreCommitDurability::Buffered => ApplyDurability::StoreCommitted,
+                                StoreCommitDurability::Stable => ApplyDurability::StableCommitted,
+                            })
+                        } else {
+                            Ok(ApplyDurability::StoreCommitted)
+                        }
+                    }))
+                    .unwrap_or_else(|_| {
+                        Err(crate::store::StoreError("storage backend panicked".into()))
+                    });
+                    drop(batch);
+                    Ok((result, guard))
+                })
+                .await;
+            let result = match completed {
+                Ok((result, _ordering_guard)) => {
+                    let mut flush = flush.lock().await;
+                    if result.is_ok() {
+                        flush.commit_batch();
+                    } else {
+                        flush.restore_batch();
+                        flush.failed = true;
+                        tracing::warn!(
+                            records = flush.record_count(),
+                            retained_bytes = flush.local_budget.used(),
+                            "retaining persistence winners after storage failure"
+                        );
+                    }
+                    result
+                }
+                Err(error) => {
+                    // A canceled/not-started blocking job can drop its guard.
+                    // Reacquire ordering before touching any batch: a newer
+                    // flush may have started while this owner was waking.
+                    let _ordering_guard = ordering.lock_owned().await;
+                    let mut flush = flush.lock().await;
+                    flush.restore_batch();
+                    flush.failed = true;
+                    Err(error)
+                }
+            };
+            let _ = reply.send(result);
+        });
+        completion
+            .await
+            .map_err(|error| {
+                ActorProcessingErr::from(format!("storage completion owner stopped: {error}"))
+            })?
+            .map_err(|error| ActorProcessingErr::from(error.to_string()))
     }
 
     /// Read a key, treating expired values and tombstones as absent.
@@ -674,7 +773,7 @@ impl FragmentState {
                 let cells = match plan.project(key, &value.value, req.fragment) {
                     Ok(values) => values.into_iter().map(value_to_cell).collect(),
                     Err(error) => {
-                        return page_error(req, QueryPageStatus::Invalid, error.to_string())
+                        return page_error(req, QueryPageStatus::Invalid, error.to_string());
                     }
                 };
                 page.rows.push(QueryPageRow {
@@ -975,10 +1074,11 @@ impl FragmentState {
             return Ok(converted);
         }
 
-        let (converted, should_flush) = {
+        let (converted, should_flush, saturated) = {
             let mut flush = self.flush.lock().await;
             let mut cache = self.cache.write().await;
             let mut converted = 0;
+            let mut saturated = false;
             let FragmentCache {
                 values,
                 content_digests,
@@ -986,18 +1086,21 @@ impl FragmentState {
             } = &mut *cache;
             for (key, value) in values.iter_mut() {
                 if value.is_expired(now_ms) {
+                    let tombstone = value.expiry_tombstone();
+                    if !flush.enqueue(key, &tombstone) {
+                        saturated = true;
+                        continue;
+                    }
                     content_digests
                         .get_mut(key)
                         .expect("cache digest exists")
                         .expire();
-                    let tombstone = value.expiry_tombstone();
                     let previous_value = if self.expiry_publisher.is_some() {
                         Some(std::mem::replace(value, tombstone.clone()))
                     } else {
                         *value = tombstone.clone();
                         None
                     };
-                    flush.pending.push((key.clone(), tombstone));
                     if let Some(previous_value) = previous_value {
                         self.publish_expiry(key, previous_value);
                     }
@@ -1010,14 +1113,18 @@ impl FragmentState {
                     Ordering::Release,
                 );
             }
-            let should_flush = converted > 0
-                && (flush.pending.len() >= self.flush_batch_size
-                    || flush.last_flush.elapsed() >= self.flush_interval);
-            (converted, should_flush)
+            let should_flush =
+                converted > 0 && flush.should_flush(self.flush_batch_size, self.flush_interval);
+            (converted, should_flush || saturated, saturated)
         };
 
         if should_flush {
             self.flush().await?;
+        }
+        if saturated {
+            return Err(ActorProcessingErr::from(
+                "expiry persistence admission saturated; retry remaining expirations",
+            ));
         }
         Ok(converted)
     }
@@ -1082,18 +1189,19 @@ impl FragmentState {
                     page.visited += 1;
                     next_cursor = Some(key.clone());
                     if expired {
+                        let tombstone = value.expiry_tombstone();
+                        let previous_value = if let Some(flush) = &mut flush {
+                            if !flush.enqueue(key, &tombstone) {
+                                continue;
+                            }
+                            self.install_expiry(value, tombstone)
+                        } else {
+                            self.install_expiry(value, tombstone)
+                        };
                         content_digests
                             .get_mut(key)
                             .expect("cache digest exists")
                             .expire();
-                        let tombstone = value.expiry_tombstone();
-                        let previous_value = if let Some(flush) = &mut flush {
-                            let previous = self.install_expiry(value, tombstone.clone());
-                            flush.pending.push((key.clone(), tombstone));
-                            previous
-                        } else {
-                            self.install_expiry(value, tombstone)
-                        };
                         if let Some(previous_value) = previous_value {
                             self.publish_expiry(key, previous_value);
                         }
@@ -1119,8 +1227,7 @@ impl FragmentState {
             }
             let should_flush = page.converted > 0
                 && flush.as_ref().is_some_and(|flush| {
-                    flush.pending.len() >= self.flush_batch_size
-                        || flush.last_flush.elapsed() >= self.flush_interval
+                    flush.should_flush(self.flush_batch_size, self.flush_interval)
                 });
             (page, should_flush)
         };
@@ -1132,26 +1239,80 @@ impl FragmentState {
 }
 
 impl FlushBuffer {
-    /// Start or resume a flush attempt. The returned batch is a snapshot;
-    /// its authoritative copy remains in `in_flight` until commit.
-    ///
-    /// Pending writes are appended to a failed/cancelled attempt before its
-    /// retry, preserving the cache's winning-version order. The attempt time
-    /// is stamped even on failure to avoid a hot retry loop against a sick
-    /// store.
-    fn begin_batch(&mut self) -> Option<Vec<(String, VersionedValue)>> {
-        if self.in_flight.is_none() && self.pending.is_empty() {
+    fn should_flush(&self, batch_size: usize, interval: Duration) -> bool {
+        let elapsed = self.last_flush.elapsed();
+        elapsed >= interval || (!self.failed && self.record_count() >= batch_size)
+    }
+    fn record_count(&self) -> usize {
+        self.pending.len() + self.in_flight.as_ref().map_or(0, |batch| batch.len())
+    }
+    /// Reserve only the growth delta when replacing a pending winner. Failed
+    /// admission leaves the old value and both accounting reservations intact.
+    fn enqueue(&mut self, key: &str, value: &VersionedValue) -> bool {
+        let bytes = persistence_record_bytes(key, value);
+        if let Some(existing) = self.pending.get_mut(key) {
+            let previous = existing.local.bytes();
+            if !existing.local.resize(bytes) {
+                return false;
+            }
+            if !existing.aggregate.resize(bytes) {
+                assert!(existing.local.resize(previous));
+                return false;
+            }
+            existing.value = value.clone();
+            return true;
+        }
+        if self.record_count() >= self.max_records {
+            return false;
+        }
+        let Some(local) = self.local_budget.reserve(bytes) else {
+            return false;
+        };
+        let Some(aggregate) = self.aggregate_budget.reserve(bytes) else {
+            return false;
+        };
+        self.pending.insert(
+            key.to_string(),
+            PendingWrite {
+                value: value.clone(),
+                local,
+                aggregate,
+            },
+        );
+        true
+    }
+    fn restore_batch(&mut self) {
+        if let Some(batch) = self.in_flight.take() {
+            let batch = Arc::try_unwrap(batch)
+                .unwrap_or_else(|_| panic!("active persistence batch still owned"));
+            for (key, write) in batch {
+                match self.pending.entry(key) {
+                    std::collections::hash_map::Entry::Occupied(mut entry) => {
+                        if write.value.wins_over(&entry.get().value) {
+                            entry.insert(write);
+                        }
+                    }
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        entry.insert(write);
+                    }
+                }
+            }
+        }
+    }
+    fn begin_batch(&mut self) -> Option<Arc<HashMap<String, PendingWrite>>> {
+        // An abandoned waiter may leave a completed attempt recorded. The
+        // fragment ordering mutex proves there is no active store call here.
+        self.restore_batch();
+        if self.pending.is_empty() {
             return None;
         }
-        let pending = std::mem::take(&mut self.pending);
-        self.in_flight.get_or_insert_with(Vec::new).extend(pending);
+        let batch = Arc::new(std::mem::take(&mut self.pending));
+        self.in_flight = Some(batch.clone());
         self.last_flush = Instant::now();
-        self.in_flight.clone()
+        Some(batch)
     }
-
-    /// Forget only the batch whose store write has completed. Writes that
-    /// arrived during that call remain in `pending`.
     fn commit_batch(&mut self) {
+        self.failed = false;
         self.in_flight = None;
     }
 }
@@ -1269,6 +1430,180 @@ mod flush_tests {
             store.written.lock().unwrap().as_slice(),
             &[(b"key".to_vec(), value)]
         );
+    }
+
+    #[tokio::test]
+    async fn failing_store_coalesces_hot_key_and_rejects_before_cache_mutation() {
+        let store = Arc::new(FlakyStore {
+            failures_left: StdMutex::new(1000),
+            written: StdMutex::new(Vec::new()),
+        });
+        let config = PersistenceConfig::builder()
+            .max_records(2)
+            .max_bytes(4096)
+            .node_max_bytes(4096)
+            .build()
+            .for_runtime()
+            .unwrap();
+        let state = FragmentState::new(
+            HashMap::new(),
+            Some(store.clone()),
+            1,
+            Duration::from_secs(3600),
+        )
+        .with_persistence_config(config)
+        .unwrap();
+        for version in 1..=100 {
+            let value = VersionedValue::new(vec![1; 256], version, "node".into());
+            let applied = state.apply(&op("hot", value)).await;
+            assert!(applied.is_ok() || matches!(applied, Err(ApplyError::Storage(_))));
+            assert!(state.flush().await.is_err());
+            assert_eq!(state.persistence_backlog().await.0, 1);
+            assert!(state.persistence_backlog().await.1 <= 4096);
+        }
+        assert!(matches!(
+            state
+                .apply(&op(
+                    "other",
+                    VersionedValue::new(vec![2; 256], 101, "node".into())
+                ))
+                .await,
+            Ok(ApplyOutcome::Applied) | Err(ApplyError::Storage(_))
+        ));
+        let before = state.current_revision().await;
+        assert_eq!(
+            state
+                .apply(&op(
+                    "rejected",
+                    VersionedValue::new(vec![3; 256], 102, "node".into())
+                ))
+                .await,
+            Err(ApplyError::Backpressure)
+        );
+        assert!(state.get("rejected").await.is_none());
+        assert_eq!(state.current_revision().await, before);
+        assert_eq!(
+            state
+                .apply(&op(
+                    "hot",
+                    VersionedValue::new(vec![4; 2048], 103, "node".into())
+                ))
+                .await,
+            Err(ApplyError::Backpressure)
+        );
+        assert_eq!(state.get("hot").await.unwrap().timestamp_ms, 100);
+        *store.failures_left.lock().unwrap() = 0;
+        state.flush().await.unwrap();
+        assert_eq!(state.persistence_backlog().await, (0, 0));
+        let written = store.written.lock().unwrap();
+        assert_eq!(written.len(), 2);
+        assert!(written
+            .iter()
+            .any(|(key, value)| key == b"hot" && value.timestamp_ms == 100));
+    }
+
+    #[test]
+    fn low_level_state_rejects_zero_storage_slots_before_async_work() {
+        let configured = FragmentState::new(HashMap::new(), None, 1, Duration::from_secs(1))
+            .with_persistence_config(PersistenceConfig::builder().storage_concurrency(0).build());
+        assert!(configured.is_err());
+    }
+
+    #[tokio::test]
+    async fn raw_expired_version_conflict_never_enters_persistence_backlog() {
+        let store = Arc::new(FlakyStore {
+            failures_left: StdMutex::new(0),
+            written: StdMutex::new(Vec::new()),
+        });
+        let mut original = VersionedValue::new(vec![1], 10, "writer".into());
+        original.expires_at_ms = Some(1);
+        let state = FragmentState::new(
+            HashMap::from([("key".into(), original.clone())]),
+            Some(store),
+            100,
+            Duration::from_secs(3600),
+        );
+        let mut conflict = original.clone();
+        conflict.value = vec![2];
+        assert!(matches!(
+            state.apply(&op("key", conflict)).await,
+            Err(ApplyError::VersionConflict { .. })
+        ));
+        assert_eq!(state.persistence_backlog().await, (0, 0));
+        let cache = state.cache.read().await;
+        assert_eq!(cache.values["key"], original);
+        assert_eq!(cache.content_digests["key"].live, original.content_digest());
+        assert_eq!(state.revision.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn saturated_expiry_keeps_live_cached_digest_until_marker_admission() {
+        let store = Arc::new(FlakyStore {
+            failures_left: StdMutex::new(0),
+            written: StdMutex::new(Vec::new()),
+        });
+        let mut expiring = VersionedValue::new(vec![7], 10, "writer".into());
+        expiring.expires_at_ms = Some(500);
+        let config = PersistenceConfig::builder().max_records(1).build();
+        let state = FragmentState::new(
+            HashMap::from([("ttl".into(), expiring.clone())]),
+            Some(store),
+            usize::MAX,
+            Duration::from_secs(3600),
+        )
+        .with_persistence_config(config)
+        .unwrap();
+        state
+            .apply(&op(
+                "occupied",
+                VersionedValue::new(vec![1], 20, "writer".into()),
+            ))
+            .await
+            .unwrap();
+        let page = state
+            .expire_values_page(&mut ExpiryPass::new(500))
+            .await
+            .unwrap();
+        assert_eq!(page.converted, 0);
+        let cache = state.cache.read().await;
+        assert_eq!(cache.values["ttl"], expiring);
+        assert_eq!(cache.content_digests["ttl"].live, expiring.content_digest());
+    }
+
+    #[tokio::test]
+    async fn aggregate_persistence_budget_bounds_multiple_fragments() {
+        let store = Arc::new(FlakyStore {
+            failures_left: StdMutex::new(0),
+            written: StdMutex::new(Vec::new()),
+        });
+        let value = VersionedValue::new(vec![1; 256], 1, "node".into());
+        let charge = persistence_record_bytes("key", &value);
+        let config = PersistenceConfig::builder()
+            .max_bytes(charge * 2)
+            .node_max_bytes(charge)
+            .build()
+            .for_runtime()
+            .unwrap();
+        let first = FragmentState::new(
+            HashMap::new(),
+            Some(store.clone()),
+            100,
+            Duration::from_secs(3600),
+        )
+        .with_persistence_config(config.clone())
+        .unwrap();
+        let second =
+            FragmentState::new(HashMap::new(), Some(store), 100, Duration::from_secs(3600))
+                .with_persistence_config(config.clone())
+                .unwrap();
+        first.apply(&op("key", value.clone())).await.unwrap();
+        assert_eq!(
+            second.apply(&op("key", value.clone())).await,
+            Err(ApplyError::Backpressure)
+        );
+        first.flush().await.unwrap();
+        second.apply(&op("key", value)).await.unwrap();
+        assert_eq!(config.retained_bytes(), charge);
     }
 
     #[tokio::test]
@@ -1489,6 +1824,147 @@ mod flush_tests {
         }
     }
 
+    struct GatedPanicStore {
+        calls: AtomicUsize,
+        release: (StdMutex<bool>, Condvar),
+        stored: StdMutex<HashMap<Vec<u8>, VersionedValue>>,
+    }
+    impl KvStore for GatedPanicStore {
+        fn load(&self) -> Result<Vec<(Vec<u8>, VersionedValue)>, StoreError> {
+            Ok(Vec::new())
+        }
+        fn write_batch(&self, writes: &[(Vec<u8>, VersionedValue)]) -> Result<(), StoreError> {
+            if self.calls.fetch_add(1, AtomicOrdering::SeqCst) == 0 {
+                let (released, wake) = &self.release;
+                let mut released = released.lock().unwrap();
+                while !*released {
+                    released = wake.wait(released).unwrap();
+                }
+                drop(released);
+                panic!("gated backend panic");
+            }
+            self.stored.lock().unwrap().extend(writes.iter().cloned());
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn backend_panic_retains_ordering_until_authoritative_batch_is_restored() {
+        let store = Arc::new(GatedPanicStore {
+            calls: AtomicUsize::new(0),
+            release: (StdMutex::new(false), Condvar::new()),
+            stored: StdMutex::new(HashMap::new()),
+        });
+        let config = PersistenceConfig::builder().storage_concurrency(1).build();
+        let state = Arc::new(
+            FragmentState::new(
+                HashMap::new(),
+                Some(store.clone()),
+                100,
+                Duration::from_secs(3600),
+            )
+            .with_persistence_config(config.clone())
+            .unwrap(),
+        );
+        let winner = VersionedValue::new(vec![7], 100, "node".into());
+        state.apply(&op("key", winner.clone())).await.unwrap();
+        let writing = state.clone();
+        let writer = tokio::spawn(async move { writing.flush().await });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while store.calls.load(AtomicOrdering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let buffer = state.flush.lock().await;
+        *store.release.0.lock().unwrap() = true;
+        store.release.1.notify_all();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while config.active_storage_jobs() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            state.flush_in_progress.try_lock().is_err(),
+            "backend panic released ordering before restoring its batch"
+        );
+        assert!(config.executor().owned_tasks() >= 1);
+        drop(buffer);
+        let error = tokio::time::timeout(Duration::from_secs(2), writer)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert!(error.to_string().contains("storage backend panicked"));
+        assert_eq!(state.persistence_backlog().await.0, 1);
+        state.flush().await.unwrap();
+        config.executor().drain().await;
+        assert_eq!(state.persistence_backlog().await, (0, 0));
+        assert_eq!(
+            store.stored.lock().unwrap().get(b"key".as_slice()),
+            Some(&winner)
+        );
+        assert_eq!(config.executor().owned_tasks(), 0);
+    }
+
+    #[tokio::test]
+    async fn blocked_storage_keeps_current_thread_live_and_cancelled_flush_ordered() {
+        let store = Arc::new(GatedStore {
+            calls: AtomicUsize::new(0),
+            release_first: (StdMutex::new(false), Condvar::new()),
+            stored: StdMutex::new(HashMap::new()),
+        });
+        let config = PersistenceConfig::builder().storage_concurrency(1).build();
+        let state = Arc::new(
+            FragmentState::new(
+                HashMap::new(),
+                Some(store.clone()),
+                100,
+                Duration::from_secs(3600),
+            )
+            .with_persistence_config(config.clone())
+            .unwrap(),
+        );
+        let old = VersionedValue::new(vec![1], 100, "node".into());
+        let winner = VersionedValue::new(vec![2], 200, "node".into());
+        state.apply(&op("key", old)).await.unwrap();
+        let first_state = state.clone();
+        let waiter = tokio::spawn(async move { first_state.flush().await });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while store.calls.load(AtomicOrdering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        waiter.abort();
+        let _ = waiter.await;
+        assert_eq!(config.active_storage_jobs(), 1);
+        // This coroutine runs on the same current-thread runtime while the
+        // synchronous store call is blocked on a separate executor thread.
+        state.apply(&op("key", winner.clone())).await.unwrap();
+        let next_state = state.clone();
+        let next = tokio::spawn(async move { next_state.flush_stable().await });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(store.calls.load(AtomicOrdering::SeqCst), 1);
+        assert!(!next.is_finished());
+        store.release_first();
+        tokio::time::timeout(Duration::from_secs(2), next)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.persistence_backlog().await, (0, 0));
+        assert_eq!(
+            store.stored.lock().unwrap().get(b"key".as_slice()),
+            Some(&winner)
+        );
+        assert_eq!(config.active_storage_jobs(), 0);
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn overlapping_flushes_are_serialized_and_preserve_latest_version() {
         let store = Arc::new(GatedStore {
@@ -1570,7 +2046,9 @@ mod maintenance_diagnostics {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[ignore = "manual release diagnostic; no shared-runner latency threshold"]
     async fn maintenance_foreground_latency_distribution() {
-        eprintln!("mode,keys,map_capacity,ttl_percent,materialization_us,total_through_drain_us,class,operations,stored_samples,p50_us,p95_us,p99_us,max_us");
+        eprintln!(
+            "mode,keys,map_capacity,ttl_percent,materialization_us,total_through_drain_us,class,operations,stored_samples,p50_us,p95_us,p99_us,max_us"
+        );
         for cardinality in [10_000usize, 100_000] {
             for capacity_multiple in [1usize, 8] {
                 for ttl_percent in [0usize, 1, 100] {
@@ -1784,8 +2262,16 @@ mod maintenance_diagnostics {
                     .map(|ns| format!("{:.3}", *ns as f64 / 1000.0))
                     .unwrap_or_else(|| "na".into())
             };
-            eprintln!("{mode:?},{cardinality},{map_capacity},{ttl_percent},{},{},{label},{operations},{},{},{},{},{}",
-                materialization.as_micros(), total.as_micros(), samples.len(), quantile(50), quantile(95), quantile(99), quantile(100));
+            eprintln!(
+                "{mode:?},{cardinality},{map_capacity},{ttl_percent},{},{},{label},{operations},{},{},{},{},{}",
+                materialization.as_micros(),
+                total.as_micros(),
+                samples.len(),
+                quantile(50),
+                quantile(95),
+                quantile(99),
+                quantile(100)
+            );
         }
     }
 }
@@ -2031,9 +2517,10 @@ mod tests {
             value.expiry_tombstone()
         );
         assert_eq!(state.revision.load(Ordering::Acquire), 1);
-        assert!(state.flush.lock().await.in_flight.is_some());
+        assert!(state.flush.lock().await.pending.contains_key("key"));
         let winner = VersionedValue::new(vec![2], 11, "writer".into());
         state.apply(&test_op("key", winner.clone())).await.unwrap();
+        state.flush().await.unwrap();
         assert_eq!(
             store.written.lock().unwrap().as_slice(),
             &[(b"key".to_vec(), winner)]

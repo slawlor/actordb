@@ -334,3 +334,106 @@ length prefix, decoded protobuf/request objects, queue/frame/task/allocator
 headers, cache/persistence/replication payloads, query results, and kernel socket
 buffers. Connection/frame counts and those independent admission budgets still
 need separate deployment allowances; this is not a total process-heap ceiling.
+
+## Persistence outage admission
+
+`NodeConfig::persistence` sets authoritative pending/active persistence limits:
+10,000 records and 64 MiB per fragment, and 256 MiB across a node by default.
+These are conservative charged bytes, including the backend batch copy, rather
+than process RSS. Pending writes retain only the latest winner for each key;
+failed attempts restore their winners into that map. An active batch remains
+immutable until its store call ends. Same-size pending overwrites are admitted
+at capacity. Growth or a new key that exceeds a count/byte allowance returns
+`ApplyError::Backpressure` before cache mutation. Already-applied writes whose
+flush fails still have an unknown durable outcome and remain retryable.
+
+`FragmentState::persistence_backlog()` reports charged records/bytes. Admission
+rejection and failed flushes emit structured backlog diagnostics. Ordinary
+storage errors return to callers while workers remain alive, preserving queued
+requests and pacing retries instead of creating worker restart churn. TTL cleanup
+reserves its durable marker before replacing the live record; a full final
+sweep reports saturation so shutdown cannot certify an undurable transition.
+The cache and immutable key/version floors are independent of these budgets.
+
+## Replication retained-memory admission
+
+`SenderConfig::retained_byte_capacity` defaults to 64 MiB per sender.
+`NodeRuntimeOptions::replication_retained_byte_capacity` defaults to 256 MiB
+across a node. Owning byte permits follow each operation from ingress through
+the deque and in-flight ACK batch; retransmission keeps the same reservation.
+Charges conservatively include operation/protobuf/encoded representations.
+Node fanout acquires both allowances before cloning a value for a replica.
+Payload-bearing reconciliation control messages also reserve the allowance
+until local processing completes; fixed-size ACK/lifecycle controls keep their
+independent count-bounded lane so cleanup can progress at byte saturation.
+
+Saturation schedules visible `buffer_reset` recovery from the authoritative
+fragment cache. It cannot retroactively reject an applied local mutation.
+ACK retirement, reset, sender cancellation and shutdown release owning permits.
+`SenderStateReport::{retained_bytes,aggregate_retained_bytes}` and
+`Node::replication_retained_bytes()` expose charges; structured saturation
+diagnostics include both allowances. These charges exclude the separately
+bounded peer frame pipeline and the cache.
+
+Standalone callers should use `replication::spawn_bounded_sender`. Legacy
+`spawn_sender`/`spawn_sender_with_options` still return unbounded channels for
+compatibility: their consumed payloads are byte-bounded, but callers must
+externally bound the preceding legacy channel.
+
+## Storage execution and local deadlines
+
+Synchronous `KvStore` bind, load, write, stable-fence and lifecycle prefix-delete
+calls run on Tokio blocking threads behind the node's shared storage executor.
+`PersistenceConfig::storage_concurrency` defaults to four submitted jobs.
+`PersistenceConfig::validate()` rejects zero or unsupported concurrency before
+Node/supervisor startup; low-level state configuration returns a validation
+error before any async storage work can wait on an unusable executor.
+Queued flushes retain their authoritative backlog charge while waiting for
+an execution slot. `Node::active_storage_jobs()` reports submitted work;
+`Node::persistence_retained_bytes()` reports the node-wide persistence charge.
+
+`NodeRuntimeOptions::local_work_timeout` and
+`SenderRuntimeOptions::local_work_timeout` default to 30 seconds. Local point
+read waiters and each local reconciliation phase use explicit deadlines,
+including summary/value reads, replicated applies, revisions and flushes.
+A timed-out reconciliation waiter retries its idempotent round; an accepted
+apply or flush may still finish in its actor or storage owner.
+
+A storage deadline bounds the waiter, not the backend operation: synchronous
+backend calls cannot be safely interrupted. Submitted flushes retain their
+immutable batch and fragment ordering guard until the actual call and stable
+fence finish and the authoritative buffer is committed or restored. Backend
+panics are caught while retaining that fence; executor join/cancellation errors
+reacquire ordering before retry-state recovery. Caller cancellation does not release those guards or discard
+the authoritative retry batch. Explicit shutdown joins fragment work and drains
+submitted storage jobs before releasing the exclusive store binding. The
+executor retains and reaps both backend-completion and flush-owner task handles;
+canceling a drain leaves them registered for a later shutdown attempt. A backend
+that never returns can therefore prevent safe final teardown, while unrelated
+async tasks continue running. Cancellation/best-effort Drop retains the existing
+fail-closed store lease policy. Configure backend I/O limits for a finite storage
+completion bound; lower waiter limits do not create one.
+
+### Reconciliation result ownership
+
+`NodeRuntimeOptions::reconciliation_retained_byte_capacity` provides a separate
+aggregate 64 MiB allowance for local reconciliation summary/value pages.
+Standalone `SenderRuntimeOptions::with_reconciliation_retained_byte_capacity`
+configures the same policy. The minimum 64 MiB covers one maximum-size summary
+cursor and one value/protobuf page together. This conservative reservation
+charges a possible maximum-size reply before the actor clones it.
+
+Opaque actor request leases keep result admission owned through dispatcher or
+worker completion after cancellation of the waiter. Summary leases remain with
+the local cursor; remote summary leases remain with their derived fetch-key
+chunks through the round. Repair-key chunks stop at their byte target as well
+as their count target, allowing one bounded wide key. Repairs ship each actor value page before fetching
+the next, so two wide result pages do not overlap. Reset, timeout and shutdown
+release credits when their owning work actually ends.
+
+`Node::reconciliation_retained_bytes()` reports this aggregate result allowance.
+Add this allowance to the independently configured replication backlog,
+persistence, receive, query and peer-frame allowances when planning deployment
+memory. All are charged admissions, not RSS; immutable cached key/version floors
+and the loaded dataset remain independent. Result admission failure retries the
+round with existing pacing and local deadlines.

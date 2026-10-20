@@ -1064,6 +1064,7 @@ async fn legacy_tombstone_gc_api_remains_source_compatible_and_safe() {
         high_pool: PoolConfig::default(),
         background_pool: PoolConfig::default(),
         flush_batch_size: 100,
+        persistence: Default::default(),
         flush_interval: Duration::from_secs(1),
         clean_interval: Duration::from_secs(1),
         snapshot_interval: Duration::from_secs(1),
@@ -2029,6 +2030,7 @@ async fn replication_report_survives_a_later_local_flush_failure() {
             fragment_map: placement.clone(),
             store: Some(source_store.clone()),
             flush_batch_size: usize::MAX,
+            persistence: Default::default(),
             flush_interval: Duration::from_secs(3600),
             snapshot_interval: Duration::from_secs(3600),
             clean_interval: Duration::from_secs(3600),
@@ -2632,6 +2634,48 @@ async fn cancelled_connect_owner_releases_pending_intent_to_waiter() {
 }
 
 #[tokio::test]
+async fn wide_reconciliation_keys_use_bounded_pages_and_release_result_admission() {
+    use actordb::shard::FragmentId;
+    let source = test_node("wide-key-source").await;
+    let keys: Vec<_> = (0..64)
+        .map(|index| format!("{index:03}-{}", "k".repeat(32 * 1024)))
+        .collect();
+    for key in &keys {
+        source.put(key.clone(), vec![7]).await.unwrap();
+    }
+    let receiver = test_node("wide-key-receiver").await;
+    receiver.connect(source.addr()).await.unwrap();
+    wait_for_peers(&source, &receiver).await;
+    common::wait_for(
+        || async {
+            for key in &keys {
+                if receiver
+                    .get(key.clone())
+                    .await
+                    .unwrap()
+                    .map(|value| value.value)
+                    != Some(vec![7])
+                {
+                    return false;
+                }
+            }
+            source
+                .sender_report(FragmentId(0), "wide-key-receiver")
+                .await
+                .is_some_and(|report| report.reconcile_rounds >= 1)
+                && source.reconciliation_retained_bytes() == 0
+        },
+        Duration::from_secs(10),
+    )
+    .await;
+    assert!(receiver.reconciliation_retained_bytes() <= 64 * 1024 * 1024);
+    source.shutdown().await.unwrap();
+    receiver.shutdown().await.unwrap();
+    assert_eq!(source.reconciliation_retained_bytes(), 0);
+    assert_eq!(receiver.reconciliation_retained_bytes(), 0);
+}
+
+#[tokio::test]
 async fn late_joiner_converges_via_immediate_reconciliation() {
     use actordb::shard::FragmentId;
 
@@ -3227,6 +3271,7 @@ async fn failed_immediate_reconciliation_is_not_counted_and_retries() {
         NodeConfig {
             store: Some(Arc::new(AlwaysFailStore)),
             flush_batch_size: 1,
+            persistence: Default::default(),
             ..NodeConfig::default()
         },
     )
@@ -3541,6 +3586,7 @@ async fn shutdown_flush_failure_is_retryable_across_all_fragments() {
         fragment_count: 2,
         store: Some(store.clone()),
         flush_batch_size: usize::MAX,
+        persistence: Default::default(),
         flush_interval: Duration::from_secs(3600),
         snapshot_interval: Duration::from_secs(3600),
         clean_interval: Duration::from_secs(3600),
@@ -3606,6 +3652,7 @@ async fn shutdown_retry_skips_fragments_that_already_reached_the_durability_fenc
         fragment_count: 2,
         store: Some(store.clone()),
         flush_batch_size: usize::MAX,
+        persistence: Default::default(),
         flush_interval: Duration::from_secs(3600),
         snapshot_interval: Duration::from_secs(3600),
         clean_interval: Duration::from_secs(3600),
@@ -3681,6 +3728,7 @@ async fn cancelled_shutdown_waiter_resumes_retained_final_flush() {
             NodeConfig {
                 store: Some(store.clone()),
                 flush_batch_size: usize::MAX,
+                persistence: Default::default(),
                 flush_interval: Duration::from_secs(3600),
                 snapshot_interval: Duration::from_secs(3600),
                 clean_interval: Duration::from_secs(3600),
@@ -3737,6 +3785,7 @@ async fn shutdown_rejects_new_calls_and_waits_for_an_admitted_put() {
             NodeConfig {
                 store: Some(store.clone()),
                 flush_batch_size: 1,
+                persistence: Default::default(),
                 flush_interval: Duration::from_secs(3600),
                 snapshot_interval: Duration::from_secs(3600),
                 clean_interval: Duration::from_secs(3600),
@@ -3864,6 +3913,7 @@ async fn shutdown_materializes_expiry_before_the_final_flush() {
         NodeConfig {
             store: Some(store.clone()),
             flush_batch_size: usize::MAX,
+            persistence: Default::default(),
             flush_interval: Duration::from_secs(3600),
             clean_interval: Duration::from_secs(3600),
             snapshot_interval: Duration::from_secs(3600),
@@ -3900,6 +3950,7 @@ async fn memory_store_exercises_persistence_plumbing() {
     let config = NodeConfig {
         store: Some(Arc::new(MemoryStore)),
         flush_batch_size: 1,
+        persistence: Default::default(),
         ..NodeConfig::default()
     };
     let a = Node::start("a".to_string(), "127.0.0.1:0".parse().unwrap(), config)
@@ -3917,6 +3968,7 @@ async fn ttl_expiry_is_persisted_as_a_versioned_tombstone() {
     let config = NodeConfig {
         store: Some(store.clone()),
         flush_batch_size: 1,
+        persistence: Default::default(),
         clean_interval: Duration::from_millis(10),
         ..NodeConfig::default()
     };
@@ -4051,6 +4103,7 @@ async fn persisted_version_seeds_clock_before_first_write() {
     let config = NodeConfig {
         store: Some(store.clone()),
         flush_batch_size: 1,
+        persistence: Default::default(),
         ..NodeConfig::default()
     };
 
@@ -4358,6 +4411,7 @@ async fn ttl_expiry_removes_key() {
     let config = NodeConfig {
         store: Some(store.clone()),
         flush_batch_size: 1,
+        persistence: Default::default(),
         clean_interval: Duration::from_millis(50),
         ..NodeConfig::default()
     };
@@ -4643,6 +4697,7 @@ async fn sender_buffer_reset_and_reconcile() {
     let config = NodeConfig {
         fragment_map: fragment_map.clone(),
         replication: SenderConfig {
+            retained_byte_capacity: SenderConfig::default().retained_byte_capacity,
             batch_size: 5,
             batch_interval: Duration::from_millis(50),
             max_in_flight: 2,
@@ -4737,6 +4792,7 @@ async fn live_connected_overflow_reconciles_without_reconnect() {
 
     let config = NodeConfig {
         replication: SenderConfig {
+            retained_byte_capacity: SenderConfig::default().retained_byte_capacity,
             batch_size: 100,
             batch_interval: Duration::from_secs(3600),
             max_in_flight: 1,
@@ -4904,6 +4960,7 @@ async fn stale_reconcile_round_cannot_complete_live_reset() {
         NodeConfig {
             fragment_map,
             replication: SenderConfig {
+                retained_byte_capacity: SenderConfig::default().retained_byte_capacity,
                 batch_size: 100,
                 batch_interval: Duration::from_secs(3600),
                 max_in_flight: 1,
@@ -5302,6 +5359,7 @@ async fn silent_reconcile_phase_times_out_and_retries() {
         NodeConfig {
             fragment_map,
             replication: SenderConfig {
+                retained_byte_capacity: SenderConfig::default().retained_byte_capacity,
                 batch_size: 100,
                 batch_interval: Duration::from_secs(3600),
                 max_in_flight: 1,
@@ -5390,6 +5448,7 @@ async fn inbound_mutation_after_snapshot_invalidates_reset_completion() {
         NodeConfig {
             fragment_map,
             replication: SenderConfig {
+                retained_byte_capacity: SenderConfig::default().retained_byte_capacity,
                 batch_size: 100,
                 batch_interval: Duration::from_secs(3600),
                 max_in_flight: 1,
@@ -5544,6 +5603,7 @@ async fn malformed_reconcile_data_is_rejected_without_partial_apply() {
         NodeConfig {
             fragment_map,
             replication: SenderConfig {
+                retained_byte_capacity: SenderConfig::default().retained_byte_capacity,
                 batch_size: 100,
                 batch_interval: Duration::from_secs(3600),
                 max_in_flight: 1,
@@ -7235,6 +7295,7 @@ async fn forwarded_put_returns_remote_storage_failure() {
     let config_b = NodeConfig {
         store: Some(Arc::new(AlwaysFailStore)),
         flush_batch_size: 1,
+        persistence: Default::default(),
         ..config_a.clone()
     };
 
@@ -7845,6 +7906,7 @@ async fn placement_drain_waits_for_buffer_reset() {
             placement_poll_interval: Duration::from_millis(25),
             placement_drain_warn_interval: Duration::from_millis(100),
             replication: SenderConfig {
+                retained_byte_capacity: SenderConfig::default().retained_byte_capacity,
                 batch_size: 100,
                 batch_interval: Duration::from_secs(3600),
                 max_in_flight: 1,
@@ -8029,6 +8091,7 @@ async fn placement_readd_waits_for_failed_final_flush_and_reloads() {
             placement_drain_warn_interval: Duration::from_millis(50),
             store: Some(store.clone()),
             flush_batch_size: usize::MAX,
+            persistence: Default::default(),
             flush_interval: Duration::from_secs(3600),
             snapshot_interval: Duration::from_secs(3600),
             clean_interval: Duration::from_secs(3600),
@@ -8132,6 +8195,7 @@ async fn placement_readd_while_draining_cancels_teardown() {
             placement_poll_interval: Duration::from_millis(25),
             placement_drain_warn_interval: Duration::from_millis(100),
             replication: SenderConfig {
+                retained_byte_capacity: SenderConfig::default().retained_byte_capacity,
                 batch_size: 100,
                 batch_interval: Duration::from_secs(3600),
                 max_in_flight: 1,
@@ -9009,6 +9073,7 @@ async fn same_session_replay_does_not_clear_reconcile_failure() {
         NodeConfig {
             store: Some(Arc::new(AlwaysFailStore)),
             flush_batch_size: 1,
+            persistence: Default::default(),
             flush_interval: Duration::from_secs(3600),
             snapshot_interval: Duration::from_secs(3600),
             ..NodeConfig::default()
@@ -9185,6 +9250,7 @@ async fn memory_applied_ack_does_not_force_a_receiver_store_flush() {
     let config_b = NodeConfig {
         store: Some(store.clone()),
         flush_batch_size: usize::MAX,
+        persistence: Default::default(),
         flush_interval: Duration::from_secs(3600),
         snapshot_interval: Duration::from_secs(3600),
         ..NodeConfig::default()
@@ -9272,6 +9338,7 @@ async fn replication_ack_waits_for_the_receiver_store_fence() {
     let config_b = NodeConfig {
         store: Some(store.clone()),
         flush_batch_size: 1_000_000,
+        persistence: Default::default(),
         // Observe the explicit replication ACK fence rather than an apply's
         // age-triggered flush after a slow handshake under parallel load.
         flush_interval: Duration::from_secs(3600),
@@ -9432,6 +9499,7 @@ async fn ordinary_ack_timeout_rotates_session_and_replays_exact_batch() {
         NodeConfig {
             fragment_map,
             replication: SenderConfig {
+                retained_byte_capacity: SenderConfig::default().retained_byte_capacity,
                 batch_size: 1,
                 batch_interval: Duration::from_millis(10),
                 max_in_flight: 1,
@@ -9584,6 +9652,7 @@ async fn older_batch_timeout_replays_only_the_unacknowledged_batch() {
         NodeConfig {
             fragment_map,
             replication: SenderConfig {
+                retained_byte_capacity: SenderConfig::default().retained_byte_capacity,
                 batch_size: 1,
                 batch_interval: Duration::from_millis(10),
                 max_in_flight: 2,
@@ -9752,6 +9821,7 @@ async fn weak_ack_does_not_prevent_timeout_and_exact_replay() {
         NodeConfig {
             fragment_map,
             replication: SenderConfig {
+                retained_byte_capacity: SenderConfig::default().retained_byte_capacity,
                 batch_size: 1,
                 batch_interval: Duration::from_millis(10),
                 max_in_flight: 1,
@@ -9903,6 +9973,7 @@ async fn replication_nack_retries_the_exact_batch_after_store_failure() {
     let config_b = NodeConfig {
         store: Some(store.clone()),
         flush_batch_size: 1_000_000,
+        persistence: Default::default(),
         ..NodeConfig::default()
     };
     let a = Node::start(
@@ -9969,6 +10040,7 @@ async fn failed_reconcile_repair_cannot_be_hidden_by_barrier_ack() {
     let store = Arc::new(FailOnceStore::default());
     let sender_config = NodeConfig {
         replication: SenderConfig {
+            retained_byte_capacity: SenderConfig::default().retained_byte_capacity,
             batch_size: 100,
             batch_interval: Duration::from_secs(3600),
             max_in_flight: 1,
@@ -9984,6 +10056,7 @@ async fn failed_reconcile_repair_cannot_be_hidden_by_barrier_ack() {
         // Force the first repair op to encounter the injected store failure
         // before the rest of that untracked repair batch can be applied.
         flush_batch_size: 1,
+        persistence: Default::default(),
         flush_interval: Duration::from_secs(3600),
         snapshot_interval: Duration::from_secs(3600),
         ..NodeConfig::default()
@@ -10062,10 +10135,12 @@ async fn fetched_reconcile_value_retries_failed_local_store_fence() {
         NodeConfig {
             store: Some(store.clone()),
             flush_batch_size: usize::MAX,
+            persistence: Default::default(),
             flush_interval: Duration::from_secs(3600),
             snapshot_interval: Duration::from_secs(3600),
             fragment_map,
             replication: SenderConfig {
+                retained_byte_capacity: SenderConfig::default().retained_byte_capacity,
                 batch_size: 100,
                 batch_interval: Duration::from_secs(3600),
                 max_in_flight: 1,

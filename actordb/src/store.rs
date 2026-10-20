@@ -88,6 +88,7 @@ use std::fmt;
 
 use crate::actor::VersionedValue;
 
+pub(crate) mod executor;
 #[cfg(feature = "memory")]
 pub mod memory;
 pub mod prefixed;
@@ -99,6 +100,95 @@ pub use memory::MemoryStore;
 pub use prefixed::PrefixedStore;
 #[cfg(feature = "rocksdb")]
 pub use rocksdb::RocksDbStore;
+
+/// Admission limits for authoritative persistence work.
+///
+/// A pending winner replaces the previous pending value for its key. Active
+/// store batches remain immutable and charged until completion. Byte charges
+/// include a second batch representation used by synchronous backends.
+#[derive(Clone, Debug, bon::Builder)]
+pub struct PersistenceConfig {
+    /// Maximum retained pending and active records per fragment.
+    #[builder(default = 10_000)]
+    max_records: usize,
+    /// Maximum charged retained bytes per fragment.
+    #[builder(default = 64 * 1024 * 1024)]
+    max_bytes: usize,
+    /// Maximum charged retained bytes across this node's fragments.
+    #[builder(default = 256 * 1024 * 1024)]
+    node_max_bytes: usize,
+
+    /// Maximum concurrent synchronous storage jobs across the node.
+    #[builder(default = 4)]
+    storage_concurrency: usize,
+    #[builder(skip = std::sync::Arc::new(std::sync::OnceLock::new()))]
+    resources: std::sync::Arc<std::sync::OnceLock<PersistenceResources>>,
+}
+#[derive(Debug)]
+struct PersistenceResources {
+    aggregate: std::sync::Arc<crate::retained::ByteBudget>,
+    executor: std::sync::Arc<executor::StorageExecutor>,
+}
+impl Default for PersistenceConfig {
+    fn default() -> Self {
+        Self::builder().build()
+    }
+}
+impl PersistenceConfig {
+    fn resources(&self) -> &PersistenceResources {
+        self.resources.get_or_init(|| PersistenceResources {
+            aggregate: crate::retained::ByteBudget::new(self.node_max_bytes),
+            executor: executor::StorageExecutor::new(self.storage_concurrency),
+        })
+    }
+    pub(crate) fn aggregate(&self) -> std::sync::Arc<crate::retained::ByteBudget> {
+        self.resources().aggregate.clone()
+    }
+    pub(crate) fn executor(&self) -> std::sync::Arc<executor::StorageExecutor> {
+        self.resources().executor.clone()
+    }
+
+    pub fn storage_concurrency(&self) -> usize {
+        self.storage_concurrency
+    }
+    /// Submitted storage jobs still owning backend execution slots.
+    pub fn active_storage_jobs(&self) -> usize {
+        self.resources().executor.active()
+    }
+    pub fn max_records(&self) -> usize {
+        self.max_records
+    }
+    pub fn max_bytes(&self) -> usize {
+        self.max_bytes
+    }
+    pub fn node_max_bytes(&self) -> usize {
+        self.node_max_bytes
+    }
+    /// Current charged bytes for this runtime's persistence work.
+    pub fn retained_bytes(&self) -> usize {
+        self.resources().aggregate.used()
+    }
+    /// Validate nonzero admission and supported executor concurrency limits.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.storage_concurrency == 0
+            || self.storage_concurrency > u32::MAX as usize
+            || self.storage_concurrency > tokio::sync::Semaphore::MAX_PERMITS
+        {
+            return Err("storage concurrency must fit a positive u32".into());
+        }
+        if self.max_records == 0 || self.max_bytes == 0 || self.node_max_bytes == 0 {
+            return Err("persistence admission limits must be nonzero".to_string());
+        }
+        Ok(())
+    }
+
+    pub(crate) fn for_runtime(&self) -> Result<Self, String> {
+        self.validate()?;
+        let mut runtime = self.clone();
+        runtime.resources = std::sync::Arc::new(std::sync::OnceLock::new());
+        Ok(runtime)
+    }
+}
 
 /// Error from a [`KvStore`] operation.
 #[derive(Debug)]
@@ -391,6 +481,16 @@ impl RocksDbOptions {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn persistence_admission_rejects_zero_executor_slots() {
+        assert!(PersistenceConfig::builder()
+            .storage_concurrency(0)
+            .build()
+            .validate()
+            .is_err());
+        assert!(PersistenceConfig::default().validate().is_ok());
+    }
 
     #[test]
     fn custom_store_capabilities_default_to_retention_and_buffering() {

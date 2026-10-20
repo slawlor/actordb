@@ -768,6 +768,8 @@ mod tests {
             state: "disconnected".to_string(),
             session_id: 0,
             buffered: 0,
+            retained_bytes: 0,
+            aggregate_retained_bytes: 0,
             in_flight: 0,
             last_ack_durability: None,
             ack_durability_mismatch: false,

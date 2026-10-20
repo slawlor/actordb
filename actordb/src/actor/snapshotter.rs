@@ -23,6 +23,8 @@ pub enum SnapshotterMessage {
     /// Internal, coalesced automatic flush. Direct callers use `Snap`.
     #[doc(hidden)]
     AutomaticSnap(MaintenanceTrigger),
+    #[cfg(test)]
+    CompletionBarrier(ractor::RpcReplyPort<()>),
 }
 
 /// Background actor: periodically flushes the fragment's write buffer,
@@ -86,6 +88,11 @@ impl Actor for Snapshotter {
         match message {
             SnapshotterMessage::Snap => state.shared.flush().await,
             SnapshotterMessage::AutomaticSnap(_trigger) => state.shared.flush().await,
+            #[cfg(test)]
+            SnapshotterMessage::CompletionBarrier(reply) => {
+                let _ = reply.send(());
+                Ok(())
+            }
         }
     }
 }
@@ -106,6 +113,7 @@ mod tests {
     #[derive(Default)]
     struct RecordingSnapshotStore {
         batches: StdMutex<Vec<SnapshotWrites>>,
+        completed: tokio::sync::Notify,
     }
 
     impl KvStore for RecordingSnapshotStore {
@@ -115,8 +123,33 @@ mod tests {
 
         fn write_batch(&self, writes: &[(Vec<u8>, VersionedValue)]) -> Result<(), StoreError> {
             self.batches.lock().unwrap().push(writes.to_vec());
+            self.completed.notify_one();
             Ok(())
         }
+    }
+
+    impl RecordingSnapshotStore {
+        async fn wait_for_batches(&self, expected: usize) {
+            loop {
+                let completed = self.completed.notified();
+                if self.batches.lock().unwrap().len() >= expected {
+                    return;
+                }
+                completed.await;
+            }
+        }
+    }
+
+    async fn completed_automatic_snap(actor: &ActorRef<SnapshotterMessage>) {
+        // FIFO processing fences the completed flush and its trigger drop.
+        // A paused-clock timeout cannot represent blocking-thread progress.
+        assert!(matches!(
+            actor
+                .call(SnapshotterMessage::CompletionBarrier, None)
+                .await
+                .unwrap(),
+            ractor::rpc::CallResult::Success(())
+        ));
     }
 
     #[tokio::test(start_paused = true)]
@@ -159,14 +192,10 @@ mod tests {
         }
         assert!(store.batches.lock().unwrap().is_empty());
         tokio::time::advance(interval).await;
-        for _ in 0..100 {
-            tokio::task::yield_now().await;
-            if store.batches.lock().unwrap().len() == 1 {
-                break;
-            }
-        }
+        store.wait_for_batches(1).await;
+        completed_automatic_snap(&snapshotter).await;
         assert_eq!(
-            *store.batches.lock().unwrap(),
+            store.batches.lock().unwrap().clone(),
             vec![vec![(b"first".to_vec(), first.clone())]]
         );
 
@@ -189,14 +218,10 @@ mod tests {
         );
         assert_eq!(store.batches.lock().unwrap().len(), 1);
         tokio::time::advance(interval).await;
-        for _ in 0..100 {
-            tokio::task::yield_now().await;
-            if store.batches.lock().unwrap().len() == 2 {
-                break;
-            }
-        }
+        store.wait_for_batches(2).await;
+        completed_automatic_snap(&snapshotter).await;
         assert_eq!(
-            *store.batches.lock().unwrap(),
+            store.batches.lock().unwrap().clone(),
             vec![
                 vec![(b"first".to_vec(), first.clone())],
                 vec![(b"second".to_vec(), floor.clone())],

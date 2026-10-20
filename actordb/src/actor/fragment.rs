@@ -138,6 +138,9 @@ pub struct SupervisorArgs {
     /// Flush the write buffer after this many buffered ops.
     #[builder(default = DEFAULT_FLUSH_BATCH_SIZE)]
     pub flush_batch_size: usize,
+    /// Authoritative persistence backlog admission limits.
+    #[builder(default)]
+    pub persistence: crate::store::PersistenceConfig,
     /// A new write triggers a flush after this long, even if not full.
     /// The snapshotter separately flushes idle fragments.
     #[builder(default = DEFAULT_FLUSH_INTERVAL)]
@@ -197,6 +200,7 @@ impl SupervisorState {
         store: &Option<Arc<dyn KvStore>>,
         fragment: FragmentId,
         publisher: &Option<ExpiryPublisher>,
+        executor: &Arc<crate::store::executor::StorageExecutor>,
     ) -> Result<LoadedCache, ActorProcessingErr> {
         match store {
             Some(kvstore) => {
@@ -204,13 +208,13 @@ impl SupervisorState {
                 let mut expiry_updates = Vec::new();
                 let mut expirations = HashMap::new();
                 let mut high_water: Option<actordb_protocol::RecordVersion> = None;
+                let backend = kvstore.clone();
+                let loaded = executor
+                    .run(move || backend.load())
+                    .await
+                    .map_err(FragmentStartupStorageError::boxed)?;
                 let now = now_ms();
-                for (index, (k, v)) in kvstore
-                    .load()
-                    .map_err(FragmentStartupStorageError::boxed)?
-                    .into_iter()
-                    .enumerate()
-                {
+                for (index, (k, v)) in loaded.into_iter().enumerate() {
                     high_water = Some(
                         high_water
                             .map(|current| current.max(v.version()))
@@ -254,8 +258,10 @@ impl SupervisorState {
                 // serves reads or sync. Otherwise a crash could reload the
                 // live value and later resurrect an older replica's data.
                 if !expiry_updates.is_empty() {
-                    kvstore
-                        .write_batch(&expiry_updates)
+                    let backend = kvstore.clone();
+                    executor
+                        .run(move || backend.write_batch(&expiry_updates))
+                        .await
                         .map_err(FragmentStartupStorageError::boxed)?;
                 }
                 let mut expirations: Vec<_> = expirations.into_values().collect();
@@ -419,8 +425,16 @@ impl FragmentSupervisor {
         args: SupervisorArgs,
         children: &mut SupervisorStartupChildren,
     ) -> Result<SupervisorState, ActorProcessingErr> {
-        let loaded =
-            SupervisorState::load_cache(&args.store, args.fragment, &args.expiry_publisher).await?;
+        args.persistence
+            .validate()
+            .map_err(FragmentStartupStorageError::boxed)?;
+        let loaded = SupervisorState::load_cache(
+            &args.store,
+            args.fragment,
+            &args.expiry_publisher,
+            &args.persistence.executor(),
+        )
+        .await?;
         if let Some(timestamp_ms) = loaded.high_water {
             args.hlc
                 .lock()
@@ -435,6 +449,8 @@ impl FragmentSupervisor {
                 args.flush_batch_size,
                 args.flush_interval,
             )
+            .with_persistence_config(args.persistence.clone())
+            .map_err(FragmentStartupStorageError::boxed)?
             .with_expiry_publisher(args.fragment, args.expiry_publisher.clone()),
         );
         // Publish only after boot-time normalization was validated and persisted
@@ -1086,6 +1102,7 @@ mod tests {
                 high_pool: pool.clone(),
                 background_pool: pool,
                 flush_batch_size: 100,
+                persistence: Default::default(),
                 flush_interval: Duration::from_secs(3600),
                 clean_interval: Duration::from_secs(3600),
                 snapshot_interval: Duration::from_secs(3600),
@@ -1345,6 +1362,7 @@ mod tests {
                 high_pool: pool.clone(),
                 background_pool: pool.clone(),
                 flush_batch_size: 1,
+                persistence: Default::default(),
                 flush_interval: Duration::from_secs(3600),
                 clean_interval: Duration::from_millis(2),
                 snapshot_interval: Duration::from_secs(3600),
@@ -1478,6 +1496,7 @@ mod tests {
                     high_pool: pool.clone(),
                     background_pool: pool,
                     flush_batch_size: 100,
+                    persistence: Default::default(),
                     flush_interval: Duration::from_secs(3600),
                     clean_interval: Duration::from_secs(3600),
                     snapshot_interval: Duration::from_secs(3600),
@@ -1522,6 +1541,7 @@ mod tests {
                     high_pool: pool.clone(),
                     background_pool: pool,
                     flush_batch_size: 100,
+                    persistence: Default::default(),
                     flush_interval: Duration::from_secs(3600),
                     clean_interval: Duration::from_secs(3600),
                     snapshot_interval: Duration::ZERO,
@@ -1566,6 +1586,7 @@ mod tests {
                     high_pool: pool.clone(),
                     background_pool: pool,
                     flush_batch_size: 1,
+                    persistence: Default::default(),
                     flush_interval: Duration::from_secs(3600),
                     clean_interval: Duration::from_secs(3600),
                     snapshot_interval: Duration::from_secs(3600),
@@ -1682,5 +1703,54 @@ mod tests {
             supervisor.stop(None);
             supervisor.wait(None).await.unwrap();
         }
+    }
+}
+
+#[cfg(test)]
+mod persistence_validation_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct StartupStore(AtomicUsize);
+    impl KvStore for StartupStore {
+        fn load(&self) -> Result<Vec<(Vec<u8>, VersionedValue)>, crate::store::StoreError> {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Ok(Vec::new())
+        }
+        fn write_batch(
+            &self,
+            _: &[(Vec<u8>, VersionedValue)],
+        ) -> Result<(), crate::store::StoreError> {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_storage_slots_fail_before_supervisor_store_operations() {
+        let store = Arc::new(StartupStore(AtomicUsize::new(0)));
+        let args = SupervisorArgs::builder()
+            .fragment(FragmentId(0))
+            .worker_prefix("invalid-storage-slots")
+            .hlc(Arc::new(Mutex::new(HlcClock::new())))
+            .store(store.clone() as Arc<dyn KvStore>)
+            .persistence(
+                crate::store::PersistenceConfig::builder()
+                    .storage_concurrency(0)
+                    .build(),
+            )
+            .build();
+        let started = tokio::time::timeout(
+            Duration::from_secs(1),
+            FragmentSupervisor::spawn(None, FragmentSupervisor, args),
+        )
+        .await
+        .expect("invalid startup waited for an unusable storage executor");
+        if let Ok((actor, handle)) = started {
+            actor.stop(None);
+            let _ = handle.await;
+            panic!("zero storage slots were accepted");
+        }
+        assert_eq!(store.0.load(Ordering::Relaxed), 0);
     }
 }
