@@ -64,3 +64,11 @@ harness = false
 [[bench]]
 name = "sender_registry"
 harness = false
+
+[[bench]]
+name = "expiry"
+harness = false
+
+[[bench]]
+name = "query"
+harness = false

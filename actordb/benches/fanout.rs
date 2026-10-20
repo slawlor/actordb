@@ -122,15 +122,31 @@ fn bench_fanout(c: &mut Criterion) {
         group.throughput(Throughput::Elements(n as u64));
         let value = vec![0xCDu8; 100];
 
-        // --- put_multi: fresh keys per iteration.
+        // Fixed batches keep the resident key set stable through warmup and
+        // measurement. Preparation is excluded from the operation sample.
+        const PUT_SETS: usize = 4;
+        let put_sets: Vec<Vec<(String, Vec<u8>)>> = (0..PUT_SETS)
+            .map(|set| {
+                (0..n)
+                    .map(|i| (format!("fanout-put-{n}-{set}-{i}"), value.clone()))
+                    .collect()
+            })
+            .collect();
+        rt.block_on(async {
+            for keys in &put_sets {
+                assert!(node_a
+                    .put_multi(keys.clone())
+                    .await
+                    .iter()
+                    .all(Result::is_ok));
+            }
+        });
         let put_counter = Arc::new(AtomicU64::new(0));
         group.bench_with_input(BenchmarkId::new("put_multi", n), &n, |b, _| {
             b.to_async(&rt).iter_batched(
                 || {
-                    let base = put_counter.fetch_add(n as u64, Ordering::Relaxed);
-                    (0..n)
-                        .map(|i| (format!("fanout-{base}-{i}"), value.clone()))
-                        .collect::<Vec<_>>()
+                    let set = put_counter.fetch_add(1, Ordering::Relaxed) as usize % PUT_SETS;
+                    put_sets[set].clone()
                 },
                 |kvs| async {
                     let results = node_a.put_multi(kvs).await;
