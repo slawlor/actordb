@@ -53,6 +53,9 @@ pub mod replication;
 /// Per-write processing acknowledgement policies and receipts.
 pub mod write_concern;
 
+/// Optional, bounded, best-effort callbacks for local TTL expiry transitions.
+pub mod ttl_expiry;
+
 /// Phase 8: dynamic placement controller — runtime fragment lifecycle,
 /// chunked bootstrap, and controller-sequenced migration.
 pub mod placement;

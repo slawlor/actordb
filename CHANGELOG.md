@@ -1,5 +1,20 @@
 # Release notes
 
+## 0.7.0
+
+- Add optional best-effort local TTL expiry callbacks with owned opaque values,
+  original LWW versions, stable replica-deduplication identities and batch context.
+- Add an async closure adapter and bounded serial dispatcher with batching,
+  count/byte admission, handler deadlines, panic/error isolation and bounded
+  shutdown draining with drop/abandonment and latency diagnostics.
+- Preserve expiry tombstones, snapshot/read visibility, replication and persistence;
+  report eligible startup conversions without promising notification replay.
+- Include a bounded application-worker example and deterministic expiry/race and
+  dispatcher lifecycle tests. See `docs/ttl-expiry-callbacks.md` for delivery limits.
+- Move the four public crates and compatible internal dependency requirements
+  to `0.7.0`. Full NodeConfig/SupervisorArgs literals need the added defaults;
+  wire protocol versions and stored record formats are unchanged.
+
 ## 0.6.0
 
 - Upgrade the optional protobuf generator dependency to `protobuf-src` 2.1.

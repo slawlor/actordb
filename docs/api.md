@@ -6,6 +6,8 @@ For remote application connections, use the companion
 scopes, projections, and exact aggregates, see the [query guide](query.md).
 For caller-supplied streams, application acceptors, and TLS configuration,
 see the [transport guide](transports.md).
+For optional local TTL cleanup notifications and their delivery contract,
+see [TTL expiry callbacks](ttl-expiry-callbacks.md).
 
 The main application surface lives in `actordb::node`. Start from
 `NodeConfig::builder()` for database behavior and `NodeRuntimeOptions::builder()`
