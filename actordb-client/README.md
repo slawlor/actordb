@@ -28,7 +28,13 @@ semantics and scans share the query engine's byte bounds.
 No write retries happen automatically. Connection loss or timeout after possible
 dispatch returns `UnknownOutcome`: the write might have committed. Canceling an
 in-flight request closes that connection; later requests return `Closed`.
-`Client::close` closes application transport; it never shuts down the database.
+`Client::close` stops admission for all clones and cancels active and queued
+requests. An active mutation whose write has started returns `UnknownOutcome`;
+queued operations and cancelled reads return `Closed`. Graceful transport
+shutdown has a total budget of `ClientOptions.timeout`, then the stream is
+dropped. `close_with_timeout` supplies a different budget; zero skips graceful
+shutdown. Transport adapters must release resources on Drop. Closing the client
+never shuts down the database.
 
 Optional credentials are distinct from cluster secrets and must contain at
 least 32 random bytes. Mutual challenge authentication prevents replay but plain
