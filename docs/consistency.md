@@ -135,3 +135,11 @@ On partition:
   each node's clock; a heavily skewed clock can serve an expired key slightly
   longer or hide a live one slightly early. The cleaner eventually persists a
   deterministic expiry tombstone using the TTL write's original LWW version.
+
+## Content digest compatibility
+
+Peer protocol v4 also requires `CAPABILITY_RECORD_CONTENT_DIGEST` (bit 10).
+A v4 peer from the earlier clock-only implementation is rejected during Hello
+negotiation if it cannot advertise and compare the 32-byte content digest.
+The capability is part of the authenticated Hello transcript; independent
+authentication test vectors remain unchanged.
