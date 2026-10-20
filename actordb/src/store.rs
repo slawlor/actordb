@@ -484,13 +484,11 @@ mod tests {
 
     #[test]
     fn persistence_admission_rejects_zero_executor_slots() {
-        assert!(
-            PersistenceConfig::builder()
-                .storage_concurrency(0)
-                .build()
-                .validate()
-                .is_err()
-        );
+        assert!(PersistenceConfig::builder()
+            .storage_concurrency(0)
+            .build()
+            .validate()
+            .is_err());
         assert!(PersistenceConfig::default().validate().is_ok());
     }
 

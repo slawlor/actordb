@@ -6,8 +6,8 @@
 //! Shared cache, ordered persistence, expiry, and snapshot state.
 
 use std::collections::{BTreeSet, HashMap};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use ractor::ActorProcessingErr;
@@ -212,24 +212,26 @@ impl FragmentState {
         }
     }
 
-    /// Configure retained persistence admission before sharing this state.
-    /// Rejections return [`ApplyError::Backpressure`] before cache mutation.
+    /// Configure retained persistence admission before sharing or applying work.
+    /// Rejections from subsequent writes return [`ApplyError::Backpressure`]
+    /// before cache mutation.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if [`PersistenceConfig::validate`] rejects the configuration.
-    pub fn with_persistence_config(mut self, config: PersistenceConfig) -> Self {
-        config
-            .validate()
-            .expect("invalid persistence configuration");
+    /// Returns an error for invalid limits, shared work, or a retained backlog.
+    pub fn with_persistence_config(mut self, config: PersistenceConfig) -> Result<Self, String> {
+        config.validate()?;
         let flush = Arc::get_mut(&mut self.flush)
-            .expect("state is not shared during configuration")
+            .ok_or_else(|| "persistence work is already shared".to_string())?
             .get_mut();
+        if flush.record_count() != 0 {
+            return Err("persistence configuration requires an empty backlog".to_string());
+        }
         flush.local_budget = ByteBudget::new(config.max_bytes());
         flush.max_records = config.max_records();
         flush.aggregate_budget = config.aggregate();
         self.executor = config.executor();
-        self
+        Ok(self)
     }
 
     /// Charged authoritative pending/active bytes and retained records.
@@ -598,8 +600,8 @@ impl FragmentState {
     ) -> crate::proto::QueryPageResponse {
         use crate::proto::{QueryPageRow, QueryPageStatus};
         use crate::query::{
-            MAX_QUERY_PAGE_BYTES, QUERY_PAGE_VISITS, QUERY_WORK_BYTES, page_encoded_len,
-            page_error, value_to_cell,
+            page_encoded_len, page_error, value_to_cell, MAX_QUERY_PAGE_BYTES, QUERY_PAGE_VISITS,
+            QUERY_WORK_BYTES,
         };
         use actordb_query::{AggregateInput, Projection, QueryAccumulator};
         use std::ops::Bound::{Excluded, Unbounded};
@@ -1322,7 +1324,7 @@ mod flush_tests {
     use crate::actor::{KvActor, KvArgs, KvMessage, OpPriority, PoolConfig};
     use crate::shard::FragmentId;
     use crate::store::{KvStore, StoreError};
-    use ractor::{Actor, rpc::CallResult};
+    use ractor::{rpc::CallResult, Actor};
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use std::sync::{Condvar, Mutex as StdMutex};
@@ -1439,7 +1441,8 @@ mod flush_tests {
             1,
             Duration::from_secs(3600),
         )
-        .with_persistence_config(config);
+        .with_persistence_config(config)
+        .unwrap();
         for version in 1..=100 {
             let value = VersionedValue::new(vec![1; 256], version, "node".into());
             let applied = state.apply(&op("hot", value)).await;
@@ -1484,18 +1487,16 @@ mod flush_tests {
         assert_eq!(state.persistence_backlog().await, (0, 0));
         let written = store.written.lock().unwrap();
         assert_eq!(written.len(), 2);
-        assert!(
-            written
-                .iter()
-                .any(|(key, value)| key == b"hot" && value.timestamp_ms == 100)
-        );
+        assert!(written
+            .iter()
+            .any(|(key, value)| key == b"hot" && value.timestamp_ms == 100));
     }
 
     #[test]
-    #[should_panic(expected = "invalid persistence configuration")]
     fn low_level_state_rejects_zero_storage_slots_before_async_work() {
-        FragmentState::new(HashMap::new(), None, 1, Duration::from_secs(1))
+        let configured = FragmentState::new(HashMap::new(), None, 1, Duration::from_secs(1))
             .with_persistence_config(PersistenceConfig::builder().storage_concurrency(0).build());
+        assert!(configured.is_err());
     }
 
     #[tokio::test]
@@ -1518,10 +1519,12 @@ mod flush_tests {
             100,
             Duration::from_secs(3600),
         )
-        .with_persistence_config(config.clone());
+        .with_persistence_config(config.clone())
+        .unwrap();
         let second =
             FragmentState::new(HashMap::new(), Some(store), 100, Duration::from_secs(3600))
-                .with_persistence_config(config.clone());
+                .with_persistence_config(config.clone())
+                .unwrap();
         first.apply(&op("key", value.clone())).await.unwrap();
         assert_eq!(
             second.apply(&op("key", value.clone())).await,
@@ -1765,7 +1768,8 @@ mod flush_tests {
                 100,
                 Duration::from_secs(3600),
             )
-            .with_persistence_config(config.clone()),
+            .with_persistence_config(config.clone())
+            .unwrap(),
         );
         let old = VersionedValue::new(vec![1], 100, "node".into());
         let winner = VersionedValue::new(vec![2], 200, "node".into());
@@ -1870,8 +1874,8 @@ mod maintenance_diagnostics {
         Cleaner, CleanerArgs, KvActor, KvArgs, KvMessage, OpPriority, PoolConfig, ReplicatedOp,
     };
     use crate::shard::FragmentId;
-    use ractor::Actor;
     use ractor::rpc::CallResult;
+    use ractor::Actor;
     use tokio::sync::Barrier;
 
     const MAX_SAMPLES_PER_CLASS: usize = 20_000;
@@ -2344,14 +2348,12 @@ mod tests {
             Duration::from_secs(3600),
         );
         let mut pass = ExpiryPass::new(100);
-        assert!(
-            state
-                .expire_values_page(&mut pass)
-                .await
-                .unwrap_err()
-                .to_string()
-                .contains("injected failure")
-        );
+        assert!(state
+            .expire_values_page(&mut pass)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("injected failure"));
         assert_eq!(pass.after_key.as_deref(), Some("key"));
         assert_eq!(
             state.cache.read().await.values["key"],
@@ -2876,10 +2878,10 @@ mod expiry_callback_tests {
     use super::*;
     use crate::actor::test_support::test_op;
     use crate::ttl_expiry::{
-        ExpiryBatch, ExpiryCallbackError, ExpiryRuntime, TtlExpiryOptions, expiry_handler_fn,
+        expiry_handler_fn, ExpiryBatch, ExpiryCallbackError, ExpiryRuntime, TtlExpiryOptions,
     };
     use std::sync::Mutex as StdMutex;
-    use tokio::sync::{Notify, mpsc};
+    use tokio::sync::{mpsc, Notify};
 
     fn expiring(version: u64) -> VersionedValue {
         let mut value = VersionedValue::new(vec![0xff, 0, 0x80], version, "writer".into());

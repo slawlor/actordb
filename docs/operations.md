@@ -386,8 +386,8 @@ Synchronous `KvStore` bind, load, write, stable-fence and lifecycle prefix-delet
 calls run on Tokio blocking threads behind the node's shared storage executor.
 `PersistenceConfig::storage_concurrency` defaults to four submitted jobs.
 `PersistenceConfig::validate()` rejects zero or unsupported concurrency before
-Node/supervisor startup; low-level state configuration panics on invalid limits
-before any async storage work can wait on an unusable executor.
+Node/supervisor startup; low-level state configuration returns a validation
+error before any async storage work can wait on an unusable executor.
 Queued flushes retain their authoritative backlog charge while waiting for
 an execution slot. `Node::active_storage_jobs()` reports submitted work;
 `Node::persistence_retained_bytes()` reports the node-wide persistence charge.
