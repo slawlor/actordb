@@ -289,6 +289,8 @@ enum MutationStatus {
   MUTATION_STATUS_STORAGE_ERROR = 6;
   MUTATION_STATUS_ACTOR_ERROR = 7;
   MUTATION_STATUS_UNAVAILABLE = 8;
+  // The mutation may have applied; a fresh-version retry is unsafe.
+  MUTATION_STATUS_UNKNOWN_OUTCOME = 9;
 }
 
 message MutationResult {

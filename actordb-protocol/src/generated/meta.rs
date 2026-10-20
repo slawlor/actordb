@@ -740,6 +740,8 @@ pub enum MutationStatus {
     StorageError = 6,
     ActorError = 7,
     Unavailable = 8,
+    /// The mutation may have applied; a fresh-version retry is unsafe.
+    UnknownOutcome = 9,
 }
 impl MutationStatus {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -757,6 +759,7 @@ impl MutationStatus {
             Self::StorageError => "MUTATION_STATUS_STORAGE_ERROR",
             Self::ActorError => "MUTATION_STATUS_ACTOR_ERROR",
             Self::Unavailable => "MUTATION_STATUS_UNAVAILABLE",
+            Self::UnknownOutcome => "MUTATION_STATUS_UNKNOWN_OUTCOME",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -771,6 +774,7 @@ impl MutationStatus {
             "MUTATION_STATUS_STORAGE_ERROR" => Some(Self::StorageError),
             "MUTATION_STATUS_ACTOR_ERROR" => Some(Self::ActorError),
             "MUTATION_STATUS_UNAVAILABLE" => Some(Self::Unavailable),
+            "MUTATION_STATUS_UNKNOWN_OUTCOME" => Some(Self::UnknownOutcome),
             _ => None,
         }
     }

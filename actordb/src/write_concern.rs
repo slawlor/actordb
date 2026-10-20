@@ -57,7 +57,10 @@ impl fmt::Display for WriteConcernError {
 impl std::error::Error for WriteConcernError {}
 impl From<NodeError> for WriteConcernError {
     fn from(e: NodeError) -> Self {
-        Self::Operation(e)
+        match e {
+            NodeError::UnknownOutcome(error) => Self::UnknownOutcome(error),
+            error => Self::Operation(error),
+        }
     }
 }
 impl From<WriteConcernPolicyError> for WriteConcernError {
@@ -74,6 +77,7 @@ impl WriteConcernError {
     pub(crate) fn into_node_error(self) -> NodeError {
         match self {
             Self::Operation(error) => error,
+            Self::UnknownOutcome(error) => NodeError::UnknownOutcome(error),
             error => NodeError::Network(error.to_string()),
         }
     }

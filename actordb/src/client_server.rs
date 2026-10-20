@@ -756,6 +756,7 @@ fn node_error(failure: NodeError) -> wire::Error {
     use wire::ErrorCode;
     let code = match &failure {
         NodeError::Io(_) | NodeError::Actor(_) | NodeError::Network(_) => ErrorCode::Unavailable,
+        NodeError::UnknownOutcome(_) => ErrorCode::UnknownOutcome,
         NodeError::Codec(_) => ErrorCode::Invalid,
         NodeError::Backpressure(_) => ErrorCode::Backpressure,
         NodeError::Storage(_) => ErrorCode::Storage,
@@ -843,4 +844,20 @@ async fn receive(
     stream.read_exact(&mut body).await.ok()?;
     actordb_protocol::preflight_client_frame(&body).ok()?;
     Some((wire::Frame::decode(body.as_slice()).ok()?, permit))
+}
+
+#[cfg(test)]
+mod outcome_mapping_tests {
+    use super::*;
+    #[test]
+    fn embedded_unknown_mutation_remains_unknown_in_application_response() {
+        let result = mutation_result(
+            "key".into(),
+            Err(NodeError::UnknownOutcome("still owned".into())),
+        );
+        assert_eq!(
+            result.error.unwrap().code,
+            wire::ErrorCode::UnknownOutcome as i32
+        );
+    }
 }

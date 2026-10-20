@@ -90,6 +90,13 @@ use read_service::{
     ReadJob, ReadRequest, ReadRoute, ReadService, READ_KEY_BYTE_CAPACITY, READ_QUEUE_CAPACITY,
     READ_WORKERS_PER_PRIORITY,
 };
+mod embedded_operations;
+pub use embedded_operations::EmbeddedOperationDiagnostics;
+use embedded_operations::{
+    EmbeddedOperations, RequestRetention, EMBEDDED_OPERATION_BYTE_CAPACITY,
+    EMBEDDED_OPERATION_CAPACITY,
+};
+
 mod mutation_service;
 mod write_concern;
 use mutation_service::{
@@ -133,6 +140,8 @@ pub const CAPABILITY_QUERY_PAGES: u64 = 1 << 8;
 pub const CAPABILITY_WRITE_CONCERNS: u64 = 1 << 9;
 /// Summaries carry content digests and reject equal-version divergent contents.
 pub const CAPABILITY_RECORD_CONTENT_DIGEST: u64 = 1 << 10;
+/// Mutation replies preserve uncertain outcomes instead of definite rejection.
+pub const CAPABILITY_TYPED_UNKNOWN_MUTATION: u64 = 1 << 11;
 /// Capabilities required by this binary before it installs a peer connection.
 pub const REQUIRED_WIRE_CAPABILITIES: u64 = CAPABILITY_MUTATION_RESULTS
     | CAPABILITY_DURABILITY_ACKS
@@ -142,7 +151,8 @@ pub const REQUIRED_WIRE_CAPABILITIES: u64 = CAPABILITY_MUTATION_RESULTS
     | CAPABILITY_BYTE_BOUNDED_BATCHES
     | CAPABILITY_STABLE_DURABILITY_ACKS
     | CAPABILITY_WRITE_CONCERNS
-    | CAPABILITY_RECORD_CONTENT_DIGEST;
+    | CAPABILITY_RECORD_CONTENT_DIGEST
+    | CAPABILITY_TYPED_UNKNOWN_MUTATION;
 
 /// Outbound queue depth per peer connection.
 const PEER_CHANNEL_DEPTH: usize = 256;
@@ -1189,7 +1199,15 @@ impl FragmentRouter {
         }
     }
 
+    #[cfg(test)]
     async fn get_all(&self) -> Result<HashMap<String, VersionedValue>, NodeError> {
+        self.get_all_retained(None).await
+    }
+
+    async fn get_all_retained(
+        &self,
+        retention: Option<Arc<dyn Send + Sync>>,
+    ) -> Result<HashMap<String, VersionedValue>, NodeError> {
         // Clone the refs first; don't hold the lock across awaits.
         let actors: Vec<ActorRef<KvMessage>> = self
             .actors
@@ -1202,7 +1220,7 @@ impl FragmentRouter {
         for actor in actors {
             let res = actor
                 .call(
-                    |reply| KvMessage::GetAll { reply },
+                    |reply| KvMessage::GetAll { reply }.with_optional_retention(retention.clone()),
                     Some(Duration::from_secs(30)),
                 )
                 .await
@@ -1230,6 +1248,10 @@ pub enum NodeError {
     Codec(String),
     Actor(String),
     Network(String),
+    /// An accepted mutation outlived its waiter or lost its exact completion
+    /// reply. It may have applied; do not retry it as a fresh write automatically.
+    /// The node retains accepted completion through apply and replication handoff.
+    UnknownOutcome(String),
     /// The operation was shed due to backpressure (queue cap or rate
     /// limit). The caller should retry with backoff or reduce load.
     /// Distinct from "not found" — a shed Get never returns Ok(None).
@@ -1262,6 +1284,7 @@ impl std::fmt::Display for NodeError {
             NodeError::Codec(e) => write!(f, "codec error: {e}"),
             NodeError::Actor(e) => write!(f, "actor error: {e}"),
             NodeError::Network(e) => write!(f, "network error: {e}"),
+            NodeError::UnknownOutcome(e) => write!(f, "mutation outcome unknown: {e}"),
             NodeError::Backpressure(e) => write!(f, "backpressure shed: {e}"),
             NodeError::Storage(e) => write!(f, "storage error: {e}"),
             NodeError::Superseded {
@@ -1585,6 +1608,10 @@ fn mutation_result(
             wire.winner_node_id = node_id;
             wire.winner_is_tombstone = is_tombstone;
         }
+        Err(NodeError::UnknownOutcome(error)) => {
+            wire.status = MutationStatus::UnknownOutcome as i32;
+            wire.error = error;
+        }
         Err(NodeError::Network(error)) => {
             wire.status = MutationStatus::Unavailable as i32;
             wire.error = error;
@@ -1612,6 +1639,7 @@ fn decode_mutation_result(result: MutationResult) -> Result<(), NodeError> {
         Ok(MutationStatus::StorageError) => Err(NodeError::Storage(result.error)),
         Ok(MutationStatus::ActorError) => Err(NodeError::Actor(result.error)),
         Ok(MutationStatus::Unavailable) => Err(NodeError::Network(result.error)),
+        Ok(MutationStatus::UnknownOutcome) => Err(NodeError::UnknownOutcome(result.error)),
         Ok(MutationStatus::Unknown) => Err(NodeError::Codec(
             "peer returned an unspecified mutation status".to_string(),
         )),
@@ -1668,7 +1696,8 @@ fn validate_mutation_results(
                 MutationStatus::Backpressure
                 | MutationStatus::StorageError
                 | MutationStatus::ActorError
-                | MutationStatus::Unavailable,
+                | MutationStatus::Unavailable
+                | MutationStatus::UnknownOutcome,
             ) => {
                 if result.winner_timestamp_ms != 0
                     || result.winner_logical_counter != 0
@@ -2108,6 +2137,7 @@ pub struct Node {
     node_peer_queue_budget: Arc<NodePeerByteBudget>,
     relay_admission: Arc<RelayAdmission>,
     mutation_service: Arc<MutationService>,
+    embedded_operations: Arc<EmbeddedOperations>,
     dial_intents: Arc<StdMutex<HashMap<SocketAddr, DialIntentState>>>,
     dial_intent_changes: watch::Sender<u64>,
     peer_changes: watch::Sender<u64>,
@@ -2148,6 +2178,7 @@ impl Drop for Node {
         // admission open merely because a caller dropped the handle.
         self.operation_gate.begin_shutdown();
         self.mutation_service.request_shutdown();
+        self.embedded_operations.request_shutdown();
         self.placement_tasks.request_shutdown();
         self.tasks.request_shutdown();
         if let Ok(senders) = self.senders.try_lock() {
@@ -2888,6 +2919,10 @@ pub struct NodeRuntimeOptions {
     serving_read_queue_capacity: usize,
     #[builder(default = READ_KEY_BYTE_CAPACITY)]
     serving_read_key_byte_capacity: usize,
+    #[builder(default = EMBEDDED_OPERATION_CAPACITY)]
+    embedded_operation_capacity: usize,
+    #[builder(default = EMBEDDED_OPERATION_BYTE_CAPACITY)]
+    embedded_operation_byte_capacity: usize,
     #[builder(default = FORWARDED_MUTATION_CAPACITY)]
     forwarded_mutation_capacity: usize,
     #[builder(default = FORWARDED_MUTATION_BYTE_CAPACITY)]
@@ -2950,6 +2985,30 @@ impl NodeRuntimeOptions {
     /// Current node-wide conservative query/scan execution byte allowance.
     pub fn query_runtime_byte_capacity(&self) -> usize {
         self.query_runtime_byte_capacity
+    }
+
+    /// Bound concurrent embedded point/batch requests before dispatcher enqueue.
+    /// Default 128. Admission is nonwaiting and returns `NodeError::Backpressure`.
+    /// Count ownership follows actor work and accepted mutation completion after
+    /// caller cancellation. Query/scan and peer-serving reads have separate limits.
+    pub fn with_embedded_operation_capacity(mut self, capacity: usize) -> Self {
+        self.embedded_operation_capacity = capacity;
+        self
+    }
+    /// Bound retained embedded request storage, including allocated buffer/vector
+    /// capacities and conservative routing/ApplyOp clone overhead. Default 64 MiB.
+    /// Cache/persistence/replication values and returned datasets are separate.
+    pub fn with_embedded_operation_byte_capacity(mut self, capacity: usize) -> Self {
+        self.embedded_operation_byte_capacity = capacity;
+        self
+    }
+    /// Concurrent embedded requests allowed across all fragments and priorities.
+    pub fn embedded_operation_capacity(&self) -> usize {
+        self.embedded_operation_capacity
+    }
+    /// Retained embedded request-byte allowance across the Node.
+    pub fn embedded_operation_byte_capacity(&self) -> usize {
+        self.embedded_operation_byte_capacity
     }
 
     /// Set the node-to-region map used by region acknowledgement requirements.
@@ -3330,6 +3389,14 @@ impl NodeRuntimeOptions {
                 "query runtime byte capacity",
                 self.query_runtime_byte_capacity,
             ),
+            (
+                "embedded operation capacity",
+                self.embedded_operation_capacity,
+            ),
+            (
+                "embedded operation byte capacity",
+                self.embedded_operation_byte_capacity,
+            ),
             ("relay capacity", self.relay_capacity),
             ("relay key byte capacity", self.relay_key_byte_capacity),
             (
@@ -3347,6 +3414,11 @@ impl NodeRuntimeOptions {
                     Semaphore::MAX_PERMITS
                 )));
             }
+        }
+        if self.embedded_operation_byte_capacity > u32::MAX as usize {
+            return Err(NodeError::Actor(
+                "embedded operation byte capacity exceeds u32 permit range".into(),
+            ));
         }
         if self.serving_read_queue_capacity == 0
             || self
@@ -3677,6 +3749,12 @@ impl Node {
     /// frame/task/allocator overhead, cache/storage, and kernel socket buffers.
     pub fn peer_writer_diagnostics(&self) -> PeerWriterDiagnostics {
         self.node_peer_queue_budget.diagnostics()
+    }
+
+    /// Current embedded request count and retained request-byte admission use.
+    /// Includes actor/owner requests after cancelled or timed-out waiters.
+    pub fn embedded_operation_diagnostics(&self) -> EmbeddedOperationDiagnostics {
+        self.embedded_operations.diagnostics()
     }
 
     fn admit_operation(&self) -> Result<OperationPermit, NodeError> {
@@ -4120,6 +4198,10 @@ impl Node {
                 runtime_options.forwarded_mutation_byte_capacity,
                 write_concerns,
             ),
+            embedded_operations: EmbeddedOperations::new(
+                runtime_options.embedded_operation_capacity,
+                runtime_options.embedded_operation_byte_capacity,
+            ),
             dial_intents: Arc::new(StdMutex::new(HashMap::new())),
             dial_intent_changes,
             peer_changes,
@@ -4520,16 +4602,6 @@ impl Node {
         self.peers.lock().await.get(node_id).cloned()
     }
 
-    /// Enqueue an op for asynchronous replication to every sender serving
-    /// `frag`. The client write path does not await those replica ACKs; each
-    /// sender retains its own batch through the configured receiver fence.
-    async fn enqueue_for_replication(&self, frag: FragmentId, op: &ReplicatedOp) {
-        // Ensure senders exist for all current replication targets.
-        // (Static peers got senders at startup; legacy-mode peers get
-        // them on connect.)
-        enqueue_to_senders(&self.senders, frag, op).await;
-    }
-
     /// Write a key. The op is applied locally when this node serves the
     /// fragment; otherwise the exact stamped version is tried across the
     /// configured replica holders in placement order.
@@ -4541,7 +4613,13 @@ impl Node {
     /// or await asynchronous fan-out to the other replicas.
     pub async fn put(&self, key: String, value: Vec<u8>) -> Result<(), NodeError> {
         let _operation = self.admit_operation()?;
-        self.put_with_ttl_and_priority(key, value, None, OpPriority::Default)
+        let retention =
+            self.embedded_operations
+                .admit(embedded_operations::single_request_bytes(
+                    &key,
+                    Some(&value),
+                ))?;
+        self.put_with_ttl_and_priority(key, value, None, OpPriority::Default, retention)
             .await
     }
 
@@ -4560,7 +4638,13 @@ impl Node {
         priority: OpPriority,
     ) -> Result<(), NodeError> {
         let _operation = self.admit_operation()?;
-        self.put_with_ttl_and_priority(key, value, None, priority)
+        let retention =
+            self.embedded_operations
+                .admit(embedded_operations::single_request_bytes(
+                    &key,
+                    Some(&value),
+                ))?;
+        self.put_with_ttl_and_priority(key, value, None, priority, retention)
             .await
     }
 
@@ -4573,7 +4657,13 @@ impl Node {
         priority: OpPriority,
     ) -> Result<(), NodeError> {
         let _operation = self.admit_operation()?;
-        self.put_with_ttl_and_priority(key, value, ttl, priority)
+        let retention =
+            self.embedded_operations
+                .admit(embedded_operations::single_request_bytes(
+                    &key,
+                    Some(&value),
+                ))?;
+        self.put_with_ttl_and_priority(key, value, ttl, priority, retention)
             .await
     }
 
@@ -4587,6 +4677,7 @@ impl Node {
         value: Vec<u8>,
         ttl: Option<Duration>,
         priority: OpPriority,
+        retention: Arc<RequestRetention>,
     ) -> Result<(), NodeError> {
         // Capture and validate expiry before waiting for sequence/clock state
         // or constructing an operation. Invalid TTLs cannot consume a stamp,
@@ -4614,7 +4705,8 @@ impl Node {
             seq,
             boot_id: self.boot_id,
         };
-        self.apply_local_with_priority(op, priority).await
+        self.apply_local_with_priority(op, priority, retention)
+            .await
     }
 
     /// Write `value` under `key`, with an optional time-to-live. When
@@ -4645,7 +4737,13 @@ impl Node {
         ttl: Option<Duration>,
     ) -> Result<(), NodeError> {
         let _operation = self.admit_operation()?;
-        self.put_with_ttl_and_priority(key, value, ttl, OpPriority::Default)
+        let retention =
+            self.embedded_operations
+                .admit(embedded_operations::single_request_bytes(
+                    &key,
+                    Some(&value),
+                ))?;
+        self.put_with_ttl_and_priority(key, value, ttl, OpPriority::Default, retention)
             .await
     }
 
@@ -4664,6 +4762,9 @@ impl Node {
         priority: OpPriority,
     ) -> Result<(), NodeError> {
         let _operation = self.admit_operation()?;
+        let retention = self
+            .embedded_operations
+            .admit(embedded_operations::single_request_bytes(&key, None))?;
         let seq = {
             let mut guard = self.next_seq.lock().await;
             *guard += 1;
@@ -4681,15 +4782,17 @@ impl Node {
             seq,
             boot_id: self.boot_id,
         };
-        self.apply_local_with_priority(op, priority).await
+        self.apply_local_with_priority(op, priority, retention)
+            .await
     }
 
     async fn apply_local_with_priority(
         &self,
         op: ReplicatedOp,
         priority: OpPriority,
+        retention: Arc<RequestRetention>,
     ) -> Result<(), NodeError> {
-        self.apply_routed_with_concern(op, priority, None)
+        self.apply_routed_with_concern(op, priority, None, retention)
             .await
             .map(|_| ())
             .map_err(crate::write_concern::WriteConcernError::into_node_error)
@@ -4700,7 +4803,10 @@ impl Node {
     /// holder is distinct from a valid not-found response.
     pub async fn get(&self, key: String) -> Result<Option<VersionedValue>, NodeError> {
         let _operation = self.admit_operation()?;
-        self.get_with_priority_admitted(key, OpPriority::Default)
+        let retention = self
+            .embedded_operations
+            .admit(embedded_operations::single_request_bytes(&key, None))?;
+        self.get_with_priority_admitted(key, OpPriority::Default, retention)
             .await
     }
 
@@ -4717,32 +4823,49 @@ impl Node {
         priority: OpPriority,
     ) -> Result<Option<VersionedValue>, NodeError> {
         let _operation = self.admit_operation()?;
-        self.get_with_priority_admitted(key, priority).await
+        let retention = self
+            .embedded_operations
+            .admit(embedded_operations::single_request_bytes(&key, None))?;
+        self.get_with_priority_admitted(key, priority, retention)
+            .await
     }
 
     async fn get_with_priority_admitted(
         &self,
         key: String,
         priority: OpPriority,
+        retention: Arc<RequestRetention>,
     ) -> Result<Option<VersionedValue>, NodeError> {
         if let Some(actor) = self.fragment_actor(&key) {
+            let ownership: Arc<dyn Send + Sync> = Arc::new((retention, self.admit_operation()?));
             let res = actor
                 .call(
-                    |reply| KvMessage::Get {
-                        key,
-                        reply,
-                        priority,
+                    |reply| {
+                        KvMessage::GetBatchRetained(crate::actor::RetainedBatchRead::new(
+                            vec![key],
+                            0,
+                            MAX_FRAME_BYTES,
+                            reply,
+                            priority,
+                            ownership,
+                        ))
                     },
-                    Some(self.runtime_options.local_work_timeout),
+                    Some(self.runtime_options.local_work_timeout()),
                 )
                 .await
-                .map_err(|e| NodeError::Actor(e.to_string()))?;
+                .map_err(|error| NodeError::Actor(error.to_string()))?;
             return match res {
-                CallResult::Success(Ok(value)) => Ok(value),
-                CallResult::Success(Err(shed)) => Err(NodeError::Backpressure(shed)),
-                CallResult::Timeout => Err(NodeError::Actor("get timed out".to_string())),
+                CallResult::Success(mut page) if page.entries.len() == 1 => page
+                    .entries
+                    .remove(0)
+                    .result
+                    .map_err(NodeError::Backpressure),
+                CallResult::Success(_) => {
+                    Err(NodeError::Actor("point read result cardinality".into()))
+                }
+                CallResult::Timeout => Err(NodeError::Actor("get timed out".into())),
                 CallResult::SenderError => {
-                    Err(NodeError::Actor("get reply channel dropped".to_string()))
+                    Err(NodeError::Actor("get reply channel dropped".into()))
                 }
             };
         }
@@ -4823,11 +4946,17 @@ impl Node {
     }
 
     /// Read the full local copy across all fragments (debugging / tests).
+    /// Request count admission is bounded, but this legacy debug API clones the
+    /// whole local dataset. Use bounded queries/scans for production reads.
     pub async fn get_all(&self) -> Result<HashMap<String, VersionedValue>, NodeError> {
         let _operation = self.admit_operation()?;
+        let retention = self
+            .embedded_operations
+            .admit(std::mem::size_of::<KvMessage>())?;
+        let ownership: Arc<dyn Send + Sync> = Arc::new((retention, self.admit_operation()?));
         let all = tokio::time::timeout(
-            self.runtime_options.local_work_timeout,
-            self.router.get_all(),
+            self.runtime_options.local_work_timeout(),
+            self.router.get_all_retained(Some(ownership)),
         )
         .await
         .map_err(|_| NodeError::Actor("get_all local work timed out".into()))??;
@@ -4864,13 +4993,22 @@ impl Node {
                     .collect()
             }
         };
-        self.put_multi_with_priority_admitted(kvs, priority).await
+        let retention = match self
+            .embedded_operations
+            .admit(embedded_operations::batch_put_request_bytes(&kvs))
+        {
+            Ok(retention) => retention,
+            Err(error) => return embedded_operations::reject_batch(kvs, error),
+        };
+        self.put_multi_with_priority_admitted(kvs, priority, retention)
+            .await
     }
 
     async fn put_multi_with_priority_admitted(
         &self,
         kvs: Vec<(String, Vec<u8>)>,
         priority: OpPriority,
+        retention: Arc<RequestRetention>,
     ) -> Vec<Result<(), NodeError>> {
         // Partition into local ops and remote groups (by fragment).
         let mut local: Vec<(usize, String, Vec<u8>)> = Vec::new();
@@ -4904,9 +5042,10 @@ impl Node {
             }
             let local_futs = chunk.into_iter().map(|(i, key, value)| {
                 let this = self;
+                let retention = retention.clone();
                 async move {
                     let r = this
-                        .put_with_ttl_and_priority(key, value, None, priority)
+                        .put_with_ttl_and_priority(key, value, None, priority, retention)
                         .await;
                     (i, r)
                 }
@@ -5103,7 +5242,14 @@ impl Node {
                     .collect()
             }
         };
-        self.put_multi_with_priority_admitted(kvs, OpPriority::Background)
+        let retention = match self
+            .embedded_operations
+            .admit(embedded_operations::batch_put_request_bytes(&kvs))
+        {
+            Ok(retention) => retention,
+            Err(error) => return embedded_operations::reject_batch(kvs, error),
+        };
+        self.put_multi_with_priority_admitted(kvs, OpPriority::Background, retention)
             .await
     }
 
@@ -5140,13 +5286,22 @@ impl Node {
                     .collect()
             }
         };
-        self.get_multi_with_priority_admitted(keys, priority).await
+        let retention = match self
+            .embedded_operations
+            .admit(embedded_operations::batch_get_request_bytes(&keys))
+        {
+            Ok(retention) => retention,
+            Err(error) => return embedded_operations::reject_batch(keys, error),
+        };
+        self.get_multi_with_priority_admitted(keys, priority, retention)
+            .await
     }
 
     async fn get_multi_with_priority_admitted(
         &self,
         keys: Vec<String>,
         priority: OpPriority,
+        retention: Arc<RequestRetention>,
     ) -> Vec<Result<Option<VersionedValue>, NodeError>> {
         let mut local: Vec<(usize, String)> = Vec::new();
         let mut remote: HashMap<FragmentId, Vec<(usize, String)>> = HashMap::new();
@@ -5177,8 +5332,11 @@ impl Node {
             }
             let local_futs = chunk.into_iter().map(|(i, key)| {
                 let this = self;
+                let retention = retention.clone();
                 async move {
-                    let r = this.get_with_priority_admitted(key, priority).await;
+                    let r = this
+                        .get_with_priority_admitted(key, priority, retention)
+                        .await;
                     (i, r)
                 }
             });
@@ -5354,7 +5512,14 @@ impl Node {
                     .collect()
             }
         };
-        self.get_multi_with_priority_admitted(keys, OpPriority::Background)
+        let retention = match self
+            .embedded_operations
+            .admit(embedded_operations::batch_get_request_bytes(&keys))
+        {
+            Ok(retention) => retention,
+            Err(error) => return embedded_operations::reject_batch(keys, error),
+        };
+        self.get_multi_with_priority_admitted(keys, OpPriority::Background, retention)
             .await
     }
 
@@ -5551,6 +5716,7 @@ impl Node {
     ) -> Result<(), NodeError> {
         if matches!(progress, ShutdownProgress::StoppingTransport) {
             self.mutation_service.request_shutdown();
+            self.embedded_operations.request_shutdown();
             // Placement owns fragment and sender topology. Join it before the
             // general task set so no cancelled transition can publish work
             // after the transport/sender snapshot below.
@@ -5560,6 +5726,7 @@ impl Node {
             // ownership. Drain complete outcomes/fanout while every sender and
             // fragment actor is still alive. A canceled caller may resume this.
             self.mutation_service.shutdown().await;
+            self.embedded_operations.shutdown().await;
 
             // Release every request/relay waiter retained by a cancelled
             // handler. Admitted remote operations then leave the public gate
@@ -13235,6 +13402,24 @@ mod tests {
         };
         assert_eq!(validate_peer_hello("local", Some("peer"), &hello), Ok(()));
         hello.capabilities &= !CAPABILITY_RECORD_CONTENT_DIGEST;
+        assert_eq!(
+            validate_peer_hello("local", Some("peer"), &hello),
+            Err("peer omitted required wire capabilities")
+        );
+    }
+
+    #[test]
+    fn v4_peer_without_typed_unknown_outcomes_is_rejected_at_hello() {
+        let mut hello = Hello {
+            node_id: "peer".into(),
+            auth_tag: Vec::new(),
+            min_protocol_version: WIRE_PROTOCOL_VERSION,
+            max_protocol_version: WIRE_PROTOCOL_VERSION,
+            capabilities: REQUIRED_WIRE_CAPABILITIES,
+            challenge: vec![1; HANDSHAKE_CHALLENGE_BYTES],
+        };
+        assert_eq!(validate_peer_hello("local", Some("peer"), &hello), Ok(()));
+        hello.capabilities &= !CAPABILITY_TYPED_UNKNOWN_MUTATION;
         assert_eq!(
             validate_peer_hello("local", Some("peer"), &hello),
             Err("peer omitted required wire capabilities")
