@@ -4673,6 +4673,7 @@ mod tests {
                 changed_any: false,
                 summary_done: true,
                 local: ReconcileLocalCursor {
+                    result_retention: None,
                     after_key: String::new(),
                     revision: Some(0),
                     snapshot_time_ms: Some(100),
