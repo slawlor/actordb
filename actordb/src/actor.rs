@@ -24,7 +24,7 @@
 //! inbound ops merge here with last-writer-wins. Because the merge is
 //! idempotent and commutative for unique record versions, replicas converge
 //! without coordination. Reusing a full version for different contents is
-//! rejected explicitly; see [`VersionedValue`].
+//! rejected explicitly; see [`crate::actor::VersionedValue`].
 //!
 //! This is also the canonical facade for the fragment supervisor, cleaner,
 //! and snapshotter. Their previous [`crate::supervision`] imports remain
