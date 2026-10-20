@@ -66,11 +66,18 @@ impl NodePeerByteBudget {
         })
     }
     fn saturated(&self) {
-        let _ = self
-            .saturations
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
-                Some(value.saturating_add(1))
-            });
+        let mut observed = self.saturations.load(Ordering::Relaxed);
+        loop {
+            match self.saturations.compare_exchange_weak(
+                observed,
+                observed.saturating_add(1),
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return,
+                Err(actual) => observed = actual,
+            }
+        }
     }
     pub(crate) fn diagnostics(&self) -> PeerWriterDiagnostics {
         PeerWriterDiagnostics {
