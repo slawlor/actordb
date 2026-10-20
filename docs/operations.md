@@ -402,9 +402,13 @@ apply or flush may still finish in its actor or storage owner.
 A storage deadline bounds the waiter, not the backend operation: synchronous
 backend calls cannot be safely interrupted. Submitted flushes retain their
 immutable batch and fragment ordering guard until the actual call and stable
-fence finish. Caller cancellation does not release those guards or discard
+fence finish and the authoritative buffer is committed or restored. Backend
+panics are caught while retaining that fence; executor join/cancellation errors
+reacquire ordering before retry-state recovery. Caller cancellation does not release those guards or discard
 the authoritative retry batch. Explicit shutdown joins fragment work and drains
-submitted storage jobs before releasing the exclusive store binding. A backend
+submitted storage jobs before releasing the exclusive store binding. The
+executor retains and reaps both backend-completion and flush-owner task handles;
+canceling a drain leaves them registered for a later shutdown attempt. A backend
 that never returns can therefore prevent safe final teardown, while unrelated
 async tasks continue running. Cancellation/best-effort Drop retains the existing
 fail-closed store lease policy. Configure backend I/O limits for a finite storage

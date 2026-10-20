@@ -444,7 +444,8 @@ impl FragmentState {
     }
 
     async fn flush_owned(&self, stable: bool) -> Result<ApplyDurability, ActorProcessingErr> {
-        let guard = self.flush_in_progress.clone().lock_owned().await;
+        let ordering = self.flush_in_progress.clone();
+        let guard = ordering.clone().lock_owned().await;
         let Some(kvstore) = self.kvstore.clone() else {
             return Ok(ApplyDurability::MemoryApplied);
         };
@@ -456,12 +457,16 @@ impl FragmentState {
         let executor = self.executor.clone();
         let (reply, completion) = tokio::sync::oneshot::channel();
         // Registration is synchronous after taking the authoritative batch.
-        // This owner has no external abort handle. The ordering guard is
+        // The executor retains and reaps this owner. The ordering guard is
         // captured by the blocking call itself, including runtime teardown.
-        drop(tokio::spawn(async move {
-            let completed = executor
+        let owner_executor = executor.clone();
+        executor.spawn_owner(async move {
+            let completed = owner_executor
                 .run(move || {
-                    let result = (|| {
+                    // Keep the ordering guard outside the unwind boundary.
+                    // A panicking backend must not let another flush replace
+                    // the authoritative batch before this owner restores it.
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         if let Some(batch) = &batch {
                             let encoded: Vec<_> = batch
                                 .iter()
@@ -477,7 +482,10 @@ impl FragmentState {
                         } else {
                             Ok(ApplyDurability::StoreCommitted)
                         }
-                    })();
+                    }))
+                    .unwrap_or_else(|_| {
+                        Err(crate::store::StoreError("storage backend panicked".into()))
+                    });
                     drop(batch);
                     Ok((result, guard))
                 })
@@ -499,8 +507,10 @@ impl FragmentState {
                     result
                 }
                 Err(error) => {
-                    // Panic/completion failure still ends the synchronous job;
-                    // keep the authoritative batch retryable under its lock.
+                    // A canceled/not-started blocking job can drop its guard.
+                    // Reacquire ordering before touching any batch: a newer
+                    // flush may have started while this owner was waking.
+                    let _ordering_guard = ordering.lock_owned().await;
                     let mut flush = flush.lock().await;
                     flush.restore_batch();
                     flush.failed = true;
@@ -508,7 +518,7 @@ impl FragmentState {
                 }
             };
             let _ = reply.send(result);
-        }));
+        });
         completion
             .await
             .map_err(|error| {
@@ -1751,6 +1761,92 @@ mod flush_tests {
             }
             Ok(())
         }
+    }
+
+    struct GatedPanicStore {
+        calls: AtomicUsize,
+        release: (StdMutex<bool>, Condvar),
+        stored: StdMutex<HashMap<Vec<u8>, VersionedValue>>,
+    }
+    impl KvStore for GatedPanicStore {
+        fn load(&self) -> Result<Vec<(Vec<u8>, VersionedValue)>, StoreError> {
+            Ok(Vec::new())
+        }
+        fn write_batch(&self, writes: &[(Vec<u8>, VersionedValue)]) -> Result<(), StoreError> {
+            if self.calls.fetch_add(1, AtomicOrdering::SeqCst) == 0 {
+                let (released, wake) = &self.release;
+                let mut released = released.lock().unwrap();
+                while !*released {
+                    released = wake.wait(released).unwrap();
+                }
+                drop(released);
+                panic!("gated backend panic");
+            }
+            self.stored.lock().unwrap().extend(writes.iter().cloned());
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn backend_panic_retains_ordering_until_authoritative_batch_is_restored() {
+        let store = Arc::new(GatedPanicStore {
+            calls: AtomicUsize::new(0),
+            release: (StdMutex::new(false), Condvar::new()),
+            stored: StdMutex::new(HashMap::new()),
+        });
+        let config = PersistenceConfig::builder().storage_concurrency(1).build();
+        let state = Arc::new(
+            FragmentState::new(
+                HashMap::new(),
+                Some(store.clone()),
+                100,
+                Duration::from_secs(3600),
+            )
+            .with_persistence_config(config.clone())
+            .unwrap(),
+        );
+        let winner = VersionedValue::new(vec![7], 100, "node".into());
+        state.apply(&op("key", winner.clone())).await.unwrap();
+        let writing = state.clone();
+        let writer = tokio::spawn(async move { writing.flush().await });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while store.calls.load(AtomicOrdering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let buffer = state.flush.lock().await;
+        *store.release.0.lock().unwrap() = true;
+        store.release.1.notify_all();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while config.active_storage_jobs() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            state.flush_in_progress.try_lock().is_err(),
+            "backend panic released ordering before restoring its batch"
+        );
+        assert!(config.executor().owned_tasks() >= 1);
+        drop(buffer);
+        let error = tokio::time::timeout(Duration::from_secs(2), writer)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert!(error.to_string().contains("storage backend panicked"));
+        assert_eq!(state.persistence_backlog().await.0, 1);
+        state.flush().await.unwrap();
+        config.executor().drain().await;
+        assert_eq!(state.persistence_backlog().await, (0, 0));
+        assert_eq!(
+            store.stored.lock().unwrap().get(b"key".as_slice()),
+            Some(&winner)
+        );
+        assert_eq!(config.executor().owned_tasks(), 0);
     }
 
     #[tokio::test]
