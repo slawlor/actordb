@@ -285,7 +285,8 @@ impl FragmentState {
     /// cache lock ensures that concurrent
     /// workers cannot enqueue versions in a different order from the cache
     /// merge. This matters across priority pools, where the same key can be
-    /// handled by different workers.
+    /// handled by different workers. Incoming TTL is evaluated after these
+    /// locks are acquired; normalization is not a cleanup callback event.
     ///
     /// An equal full LWW tuple with a different payload or expiry deadline is a
     /// [`ApplyError::VersionConflict`]. This rejects the operation before changing
@@ -298,38 +299,41 @@ impl FragmentState {
                 "key/value cannot fit every required peer frame: {error}"
             ))
         })?;
-        let expired = op.value.is_expired(now_ms());
-        let expiry_tombstone;
-        let value = if expired {
-            expiry_tombstone = op.value.expiry_tombstone();
-            &expiry_tombstone
-        } else {
-            &op.value
-        };
-
-        let digests = CachedDigests::new(value);
+        // Hash the raw payload before lock waits; TTL selection only copies
+        // its cached live/expired digests inside the mutation critical section.
+        let digests = CachedDigests::new(&op.value);
         if self.kvstore.is_none() {
             let mut cache = self.cache.write().await;
+            Self::check_version_conflict(&cache, &op.key, &op.value)?;
+            let expired = op.value.is_expired(now_ms());
+            let tombstone = expired.then(|| op.value.expiry_tombstone());
+            let value = tombstone.as_ref().unwrap_or(&op.value);
+            let mut selected_digests = digests;
             if expired {
-                Self::check_version_conflict(&cache, &op.key, &op.value)?;
+                selected_digests.expire();
             }
-            let outcome = Self::merge_cache(&mut cache, &op.key, value, digests)?;
+            let outcome = Self::merge_cache(&mut cache, &op.key, value, selected_digests)?;
             if outcome == ApplyOutcome::Applied {
                 self.revision.fetch_add(1, Ordering::Release);
             }
             return Ok(Self::reported_outcome(outcome, expired));
         }
 
-        let (outcome, should_flush) = {
-            // Keep the winning cache mutation and its durable enqueue
-            // adjacent, with no await point between them. Flushes may take a
-            // batch before or after this critical section, never halfway
-            // through it.
+        let (outcome, expired, should_flush) = {
+            // Preserve raw and normalized conflict checks before persistence
+            // admission. Nothing mutates or awaits after acquiring both locks
+            // until the winning merge, durable enqueue, and revision agree.
             let mut flush = self.flush.lock().await;
             let mut cache = self.cache.write().await;
-            // Raw equal-version conflicts must precede normalization-driven
-            // persistence admission, including an already-expired input.
             Self::check_version_conflict(&cache, &op.key, &op.value)?;
+            let expired = op.value.is_expired(now_ms());
+            let tombstone = expired.then(|| op.value.expiry_tombstone());
+            let value = tombstone.as_ref().unwrap_or(&op.value);
+            let mut selected_digests = digests;
+            if expired {
+                selected_digests.expire();
+                Self::check_version_conflict(&cache, &op.key, value)?;
+            }
             let winning = cache
                 .values
                 .get(&op.key)
@@ -342,15 +346,14 @@ impl FragmentState {
                 );
                 return Err(ApplyError::Backpressure);
             }
-            let outcome = Self::merge_cache(&mut cache, &op.key, value, digests)?;
+            let outcome = Self::merge_cache(&mut cache, &op.key, value, selected_digests)?;
             if outcome != ApplyOutcome::Applied {
                 return Ok(Self::reported_outcome(outcome, expired));
             }
             self.revision.fetch_add(1, Ordering::Release);
             let should_flush = flush.should_flush(self.flush_batch_size, self.flush_interval);
-            (outcome, should_flush)
+            (outcome, expired, should_flush)
         };
-
         if should_flush {
             self.flush()
                 .await
@@ -3362,5 +3365,74 @@ mod expiry_callback_tests {
         gate.notify_one();
         runtime.shutdown().await;
         assert_eq!(runtime.diagnostics().delivered_events, 1);
+    }
+}
+
+#[cfg(test)]
+mod apply_expiry_contention_tests {
+    use super::flush_tests::FlakyStore;
+    use super::*;
+    use std::sync::Mutex as StdMutex;
+
+    #[tokio::test]
+    async fn apply_normalizes_ttl_after_cache_and_flush_contention() {
+        for durable in [false, true] {
+            for contend_on_flush in [false, true] {
+                if contend_on_flush && !durable {
+                    continue;
+                }
+                let store = Arc::new(FlakyStore {
+                    failures_left: StdMutex::new(0),
+                    written: StdMutex::new(Vec::new()),
+                });
+                let state = FragmentState::new(
+                    HashMap::new(),
+                    durable.then(|| store.clone() as Arc<dyn KvStore>),
+                    usize::MAX,
+                    Duration::from_secs(3600),
+                );
+                let cache_guard = if contend_on_flush {
+                    None
+                } else {
+                    Some(state.cache.write().await)
+                };
+                let flush_guard = if contend_on_flush {
+                    Some(state.flush.lock().await)
+                } else {
+                    None
+                };
+                let mut value = VersionedValue::new(b"payload".to_vec(), now_ms(), "n1".into());
+                let deadline = now_ms() + 30;
+                value.expires_at_ms = Some(deadline);
+                let op = ReplicatedOp {
+                    key: "ttl".into(),
+                    value: value.clone(),
+                    seq: 0,
+                    boot_id: 0,
+                };
+                let apply = state.apply(&op);
+                tokio::pin!(apply);
+                assert!(futures::poll!(&mut apply).is_pending());
+                while now_ms() < deadline {
+                    tokio::time::sleep(Duration::from_millis(2)).await;
+                }
+                drop(cache_guard);
+                drop(flush_guard);
+                assert_eq!(apply.await.unwrap(), ApplyOutcome::Expired);
+                assert_eq!(
+                    state.get_versioned("ttl", None).await,
+                    Some(value.expiry_tombstone())
+                );
+                assert!(state.cache.read().await.values["ttl"].is_tombstone);
+                assert_eq!(state.expire_values(now_ms()).await.unwrap(), 0);
+                if durable {
+                    state.flush().await.unwrap();
+                    assert_eq!(
+                        store.written.lock().unwrap().as_slice(),
+                        &[(b"ttl".to_vec(), value.expiry_tombstone())]
+                    );
+                }
+            }
+        }
     }
 }
