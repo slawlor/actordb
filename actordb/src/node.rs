@@ -1349,6 +1349,9 @@ async fn call_apply(
             "fragment worker pool is at capacity".to_string(),
         )),
         CallResult::Success(Err(ApplyError::InvalidInput(error))) => Err(NodeError::Codec(error)),
+        CallResult::Success(Err(error @ ApplyError::VersionConflict { .. })) => {
+            Err(NodeError::Codec(error.to_string()))
+        }
         CallResult::Success(Err(ApplyError::Storage(error))) => Err(NodeError::Storage(error)),
         CallResult::Timeout => Err(NodeError::Actor("apply timed out".to_string())),
         CallResult::SenderError => Err(NodeError::Actor("apply reply channel dropped".to_string())),
@@ -1378,6 +1381,9 @@ async fn flush_fence(
         CallResult::Success(Err(ApplyError::InvalidInput(error))) => Err(NodeError::Actor(
             format!("flush fence unexpectedly returned invalid input: {error}"),
         )),
+        CallResult::Success(Err(error @ ApplyError::VersionConflict { .. })) => {
+            Err(NodeError::Actor(error.to_string()))
+        }
         CallResult::Timeout => Err(NodeError::Actor("flush fence timed out".to_string())),
         CallResult::SenderError => Err(NodeError::Actor(
             "flush fence reply channel dropped".to_string(),
@@ -8485,6 +8491,7 @@ async fn handle_connection(
                                 logical_counter: summary.logical_counter,
                                 node_id: summary.node_id,
                                 is_tombstone: summary.is_tombstone,
+                                content_digest: summary.content_digest.to_vec(),
                             })
                             .collect();
                         let mut response = ReconcileResponse {
@@ -12030,6 +12037,7 @@ mod tests {
         assert!(empty.done);
 
         let summary = |key: String| KeySummary {
+            content_digest: vec![0; 32],
             key,
             timestamp_ms: u64::MAX,
             logical_counter: 0,

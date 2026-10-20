@@ -234,7 +234,7 @@ pub struct BatchNack {
     #[prost(string, tag = "4")]
     pub error: ::prost::alloc::string::String,
 }
-/// Incremental anti-entropy: exchange (timestamp, tombstone) summaries,
+/// Incremental anti-entropy: exchange version and content-digest summaries,
 /// then only the divergent keys.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct KeySummary {
@@ -248,6 +248,9 @@ pub struct KeySummary {
     pub is_tombstone: bool,
     #[prost(uint64, tag = "5")]
     pub logical_counter: u64,
+    /// Exactly 32 bytes: SHA-256 over canonical payload and optional TTL deadline.
+    #[prost(bytes = "vec", tag = "6")]
+    pub content_digest: ::prost::alloc::vec::Vec<u8>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ReconcileRequest {

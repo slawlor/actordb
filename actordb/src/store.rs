@@ -252,7 +252,13 @@ pub enum PrefixDeleteOutcome {
 ///
 /// Every persisted [`VersionedValue::node_id`] must contain 1 to 255 UTF-8
 /// bytes. Node actors validate this before calling the store and again while
-/// loading, but direct store users must preserve the same invariant.
+/// loading, but direct store users must preserve the same invariant. For each
+/// key, a full LWW tuple must identify one payload and expiry deadline; direct
+/// writes and restore tools must not replace its contents while retaining its
+/// version. Use a fresh version for edited data and preserve clock floors.
+/// Node startup rejects duplicate keys rather than choosing a row by load order.
+/// Digests are derived from loaded winners in memory and require no persisted
+/// digest metadata.
 pub trait KvStore: Send + Sync + 'static {
     /// Attach one live node and validate any backend identity metadata.
     ///
@@ -264,7 +270,8 @@ pub trait KvStore: Send + Sync + 'static {
     fn bind(&self, _identity: &StoreIdentity) -> Result<StoreBinding, StoreError> {
         Ok(StoreBinding::unmanaged())
     }
-    /// Load the full backing dataset. The default [`KvStore::load_prefix`]
+    /// Load the full backing dataset, with exactly one current winner per key.
+    /// The default [`KvStore::load_prefix`]
     /// implementation filters this result during fragment startup.
     fn load(&self) -> Result<Vec<(Vec<u8>, VersionedValue)>, StoreError>;
     /// Load only keys beginning with `prefix`. The default preserves source

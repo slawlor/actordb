@@ -22,7 +22,9 @@
 //! messages: a local write becomes a `ReplicatedOp` which the node's
 //! transport layer forwards to the fragment's replica holders, and
 //! inbound ops merge here with last-writer-wins. Because the merge is
-//! idempotent and commutative, replicas converge without coordination.
+//! idempotent and commutative for unique record versions, replicas converge
+//! without coordination. Reusing a full version for different contents is
+//! rejected explicitly; see [`VersionedValue`].
 //!
 //! This is also the canonical facade for the fragment supervisor, cleaner,
 //! and snapshotter. Their previous [`crate::supervision`] imports remain

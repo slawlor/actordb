@@ -66,6 +66,25 @@ pub struct FragmentState {
 struct FragmentCache {
     values: HashMap<String, VersionedValue>,
     ordered_keys: BTreeSet<String>,
+    /// Hash wide payloads once before mutation locks; summaries only copy hashes.
+    content_digests: HashMap<String, CachedDigests>,
+}
+
+#[derive(Clone, Copy)]
+struct CachedDigests {
+    live: [u8; 32],
+    expired: [u8; 32],
+}
+impl CachedDigests {
+    fn new(value: &VersionedValue) -> Self {
+        Self {
+            live: value.content_digest(),
+            expired: value.expiry_tombstone().content_digest(),
+        }
+    }
+    fn expire(&mut self) {
+        self.live = self.expired;
+    }
 }
 
 pub(crate) const EXPIRY_PAGE_VISIT_LIMIT: usize = 256;
@@ -142,10 +161,15 @@ impl FragmentState {
         flush_interval: Duration,
     ) -> Self {
         let ordered_keys = cache.keys().cloned().collect();
+        let content_digests = cache
+            .iter()
+            .map(|(key, value)| (key.clone(), CachedDigests::new(value)))
+            .collect();
         Self {
             cache: RwLock::new(FragmentCache {
                 values: cache,
                 ordered_keys,
+                content_digests,
             }),
             kvstore,
             revision: AtomicU64::new(0),
@@ -208,6 +232,12 @@ impl FragmentState {
     /// workers cannot enqueue versions in a different order from the cache
     /// merge. This matters across priority pools, where the same key can be
     /// handled by different workers.
+    ///
+    /// An equal full LWW tuple with a different payload or expiry deadline is a
+    /// [`ApplyError::VersionConflict`]. This rejects the operation before changing
+    /// the cache, revision, or persistence buffer; it never selects a winner by
+    /// arrival order. Custom writers must preserve [`VersionedValue`]'s unique
+    /// version invariant.
     pub async fn apply(&self, op: &ReplicatedOp) -> Result<ApplyOutcome, ApplyError> {
         check_versioned_value_budget(&op.key, &op.value).map_err(|error| {
             ApplyError::InvalidInput(format!(
@@ -223,9 +253,13 @@ impl FragmentState {
             &op.value
         };
 
+        let digests = CachedDigests::new(value);
         if self.kvstore.is_none() {
             let mut cache = self.cache.write().await;
-            let outcome = Self::merge_cache(&mut cache, &op.key, value);
+            if expired {
+                Self::check_version_conflict(&cache, &op.key, &op.value)?;
+            }
+            let outcome = Self::merge_cache(&mut cache, &op.key, value, digests)?;
             if outcome == ApplyOutcome::Applied {
                 self.revision.fetch_add(1, Ordering::Release);
             }
@@ -239,7 +273,10 @@ impl FragmentState {
             // through it.
             let mut flush = self.flush.lock().await;
             let mut cache = self.cache.write().await;
-            let outcome = Self::merge_cache(&mut cache, &op.key, value);
+            if expired {
+                Self::check_version_conflict(&cache, &op.key, &op.value)?;
+            }
+            let outcome = Self::merge_cache(&mut cache, &op.key, value, digests)?;
             if outcome != ApplyOutcome::Applied {
                 return Ok(Self::reported_outcome(outcome, expired));
             }
@@ -258,26 +295,56 @@ impl FragmentState {
         Ok(Self::reported_outcome(outcome, expired))
     }
 
-    fn merge_cache(cache: &mut FragmentCache, key: &str, value: &VersionedValue) -> ApplyOutcome {
+    fn check_version_conflict(
+        cache: &FragmentCache,
+        key: &str,
+        value: &VersionedValue,
+    ) -> Result<(), ApplyError> {
+        if cache
+            .values
+            .get(key)
+            .is_some_and(|existing| existing.same_version(value) && existing != value)
+        {
+            return Err(ApplyError::VersionConflict {
+                key: key.to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    fn merge_cache(
+        cache: &mut FragmentCache,
+        key: &str,
+        value: &VersionedValue,
+        digests: CachedDigests,
+    ) -> Result<ApplyOutcome, ApplyError> {
         if let Some(existing) = cache.values.get_mut(key) {
-            if existing == value {
-                return ApplyOutcome::AlreadyPresent;
+            if existing.same_version(value) {
+                return if existing == value {
+                    Ok(ApplyOutcome::AlreadyPresent)
+                } else {
+                    Err(ApplyError::VersionConflict {
+                        key: key.to_string(),
+                    })
+                };
             }
             if !value.wins_over(existing) {
-                return ApplyOutcome::Superseded {
+                return Ok(ApplyOutcome::Superseded {
                     timestamp_ms: existing.timestamp_ms,
                     logical_counter: existing.logical_counter,
                     node_id: existing.node_id.clone(),
                     is_tombstone: existing.is_tombstone,
-                };
+                });
             }
             *existing = value.clone();
-            ApplyOutcome::Applied
+            cache.content_digests.insert(key.to_string(), digests);
+            Ok(ApplyOutcome::Applied)
         } else {
             let key = key.to_string();
             cache.ordered_keys.insert(key.clone());
+            cache.content_digests.insert(key.clone(), digests);
             cache.values.insert(key, value.clone());
-            ApplyOutcome::Applied
+            Ok(ApplyOutcome::Applied)
         }
     }
 
@@ -735,14 +802,22 @@ impl FragmentState {
                 break;
             }
             if let Some(value) = cache.values.get(key) {
-                let summary_bytes = key.len().saturating_add(value.node_id.len());
+                let summary_bytes = key
+                    .len()
+                    .saturating_add(value.node_id.len())
+                    .saturating_add(32);
                 if !summaries.is_empty()
                     && payload_bytes.saturating_add(summary_bytes) > SUMMARY_PAGE_TARGET_BYTES
                 {
                     done = false;
                     break;
                 }
-                summaries.push(Self::snapshot_summary(key, value, snapshot_time_ms));
+                summaries.push(Self::snapshot_summary(
+                    key,
+                    value,
+                    cache.content_digests[key],
+                    snapshot_time_ms,
+                ));
                 payload_bytes = payload_bytes.saturating_add(summary_bytes);
             }
         }
@@ -825,9 +900,15 @@ impl FragmentState {
     fn snapshot_summary(
         key: &str,
         value: &VersionedValue,
+        digests: CachedDigests,
         snapshot_time_ms: u64,
     ) -> SnapshotSummary {
         SnapshotSummary {
+            content_digest: if value.is_expired(snapshot_time_ms) {
+                digests.expired
+            } else {
+                digests.live
+            },
             key: key.to_string(),
             timestamp_ms: value.timestamp_ms,
             logical_counter: value.logical_counter,
@@ -862,8 +943,17 @@ impl FragmentState {
         if self.kvstore.is_none() {
             let mut cache = self.cache.write().await;
             let mut converted = 0;
-            for (key, value) in cache.values.iter_mut() {
+            let FragmentCache {
+                values,
+                content_digests,
+                ..
+            } = &mut *cache;
+            for (key, value) in values.iter_mut() {
                 if value.is_expired(now_ms) {
+                    content_digests
+                        .get_mut(key)
+                        .expect("cache digest exists")
+                        .expire();
                     let tombstone = value.expiry_tombstone();
                     if self.expiry_publisher.is_some() {
                         let previous_value = std::mem::replace(value, tombstone);
@@ -889,8 +979,17 @@ impl FragmentState {
             let mut flush = self.flush.lock().await;
             let mut cache = self.cache.write().await;
             let mut converted = 0;
-            for (key, value) in cache.values.iter_mut() {
+            let FragmentCache {
+                values,
+                content_digests,
+                ..
+            } = &mut *cache;
+            for (key, value) in values.iter_mut() {
                 if value.is_expired(now_ms) {
+                    content_digests
+                        .get_mut(key)
+                        .expect("cache digest exists")
+                        .expire();
                     let tombstone = value.expiry_tombstone();
                     let previous_value = if self.expiry_publisher.is_some() {
                         Some(std::mem::replace(value, tombstone.clone()))
@@ -964,6 +1063,7 @@ impl FragmentState {
                 let FragmentCache {
                     values,
                     ordered_keys,
+                    content_digests,
                 } = &mut *cache;
                 let mut keys = ordered_keys.range::<str, _>((lower, Included(high_water)));
                 let limit = pass.remaining.min(EXPIRY_PAGE_VISIT_LIMIT);
@@ -982,6 +1082,10 @@ impl FragmentState {
                     page.visited += 1;
                     next_cursor = Some(key.clone());
                     if expired {
+                        content_digests
+                            .get_mut(key)
+                            .expect("cache digest exists")
+                            .expire();
                         let tombstone = value.expiry_tombstone();
                         let previous_value = if let Some(flush) = &mut flush {
                             let previous = self.install_expiry(value, tombstone.clone());

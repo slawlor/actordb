@@ -218,9 +218,15 @@ impl SupervisorState {
                     );
                     let key =
                         String::from_utf8(k.clone()).map_err(FragmentStartupStorageError::boxed)?;
-                    // Match the loader's existing last-row-wins cache behavior
-                    // even if a custom store returns a duplicate key.
-                    expirations.remove(&key);
+                    if map.contains_key(&key) {
+                        let prefix: String = key.chars().take(64).collect();
+                        return Err(FragmentStartupStorageError::boxed(format!(
+                            "persisted dataset contains duplicate key ({} bytes, prefix {prefix:?}); load must return one winner per key", key.len()
+                        )));
+                    }
+                    // Validate original records before expiry strips their payload.
+                    check_versioned_value_budget(&key, &v)
+                        .map_err(FragmentStartupStorageError::boxed)?;
                     let (value, previous_value) = if v.is_expired(now) {
                         let tombstone = v.expiry_tombstone();
                         expiry_updates.push((k, tombstone.clone()));

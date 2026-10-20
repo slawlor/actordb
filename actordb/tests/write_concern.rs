@@ -1,3 +1,7 @@
+#[path = "common/content_digest.rs"]
+mod content_digest;
+use content_digest::content_digest;
+
 use std::collections::HashMap;
 use std::net::{SocketAddr, TcpListener};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -308,6 +312,7 @@ async fn forwarded_concern_accepts_replication_ack_on_the_same_peer_connection()
                         summaries.insert(
                             op.key.clone(),
                             actordb::proto::KeySummary {
+                                content_digest: content_digest(&op.value, op.expires_at_ms),
                                 key: op.key,
                                 timestamp_ms: op.timestamp_ms,
                                 logical_counter: op.logical_counter,

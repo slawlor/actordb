@@ -201,7 +201,7 @@ message BatchNack {
   string error = 4;
 }
 
-// Incremental anti-entropy: exchange (timestamp, tombstone) summaries,
+// Incremental anti-entropy: exchange version and content-digest summaries,
 // then only the divergent keys.
 message KeySummary {
   string key = 1;
@@ -209,6 +209,8 @@ message KeySummary {
   string node_id = 3;
   bool is_tombstone = 4;
   uint64 logical_counter = 5;
+  // Exactly 32 bytes: SHA-256 over canonical payload and optional TTL deadline.
+  bytes content_digest = 6;
 }
 
 message ReconcileRequest {
