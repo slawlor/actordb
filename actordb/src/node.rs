@@ -6295,7 +6295,7 @@ async fn placement_driver(deps: PlacementDriverDeps, mut membership_rx: watch::R
 async fn placement_tick(deps: &PlacementDriverDeps) {
     let desired = deps.controller.desired_placement();
     if let Err(e) = validate_placement(&desired, deps.fragment_count) {
-        eprintln!("[placement] invalid desired placement ({e}); keeping current");
+        tracing::warn!(error = %e, "invalid desired placement; keeping current map");
         return;
     }
     let mine_desired: HashSet<FragmentId> = desired
@@ -6622,7 +6622,7 @@ async fn gain_fragment(deps: &PlacementDriverDeps, fragment: FragmentId, preload
         {
             Ok(x) => x,
             Err(e) => {
-                eprintln!("[placement] failed to spawn subtree for {fragment}: {e}");
+                tracing::warn!(%fragment, error = %e, "failed to spawn placement subtree");
                 // Drop the Bootstrapping mark so the next tick retries.
                 deps.placement_states.lock().await.remove(&fragment);
                 return;
