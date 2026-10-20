@@ -75,10 +75,15 @@ use crate::ttl_expiry::{
 use crate::wire::{
     bytes_field_len, check_envelope_budget, check_record_budget, encode_envelope,
     message_field_len, preflight_envelope_decode, varint_field_len, BudgetedFrame, BudgetedPeerTx,
-    ReconcileGate, RepeatedFieldSizer, ANTI_ENTROPY_PAGE_BYTES, MAX_FRAME_BYTES,
-    MAX_RECONCILE_FETCH_KEYS, MAX_RECONCILE_PAGE_ITEMS, MAX_WIRE_BATCH_ITEMS, MAX_WIRE_ERROR_BYTES,
-    MAX_WIRE_NODE_ID_BYTES,
+    NodePeerByteBudget, ReconcileGate, RepeatedFieldSizer, ANTI_ENTROPY_PAGE_BYTES,
+    MAX_FRAME_BYTES, MAX_RECONCILE_FETCH_KEYS, MAX_RECONCILE_PAGE_ITEMS, MAX_WIRE_BATCH_ITEMS,
+    MAX_WIRE_ERROR_BYTES, MAX_WIRE_NODE_ID_BYTES, NODE_PEER_QUEUE_BYTE_CAPACITY,
 };
+
+pub use crate::wire::PeerWriterDiagnostics;
+
+#[cfg(test)]
+mod peer_writer_budget_tests;
 
 mod read_service;
 use read_service::{
@@ -1006,6 +1011,7 @@ struct ConnContext {
     sender_runtime: SenderRuntimeOptions,
     runtime_options: NodeRuntimeOptions,
     receive_byte_budget: Arc<Semaphore>,
+    node_peer_queue_budget: Arc<NodePeerByteBudget>,
     relay_admission: Arc<RelayAdmission>,
     mutation_service: Arc<MutationService>,
     sender_reports: SenderReportMap,
@@ -2093,6 +2099,7 @@ pub struct Node {
     read_service: Arc<ReadService>,
     inbound_connections: Arc<Semaphore>,
     receive_byte_budget: Arc<Semaphore>,
+    node_peer_queue_budget: Arc<NodePeerByteBudget>,
     relay_admission: Arc<RelayAdmission>,
     mutation_service: Arc<MutationService>,
     dial_intents: Arc<StdMutex<HashMap<SocketAddr, DialIntentState>>>,
@@ -2843,6 +2850,8 @@ pub struct NodeRuntimeOptions {
     regions: Arc<HashMap<String, String>>,
     #[builder(default = PEER_CHANNEL_DEPTH)]
     peer_queue_frame_capacity: usize,
+    #[builder(default = NODE_PEER_QUEUE_BYTE_CAPACITY)]
+    node_peer_queue_byte_capacity: usize,
     #[builder(default = PEER_CHANNEL_BYTE_CAPACITY)]
     peer_queue_byte_capacity: usize,
     #[builder(default = REPLICATION_CONTROL_CHANNEL_DEPTH)]
@@ -2893,6 +2902,19 @@ impl Default for NodeRuntimeOptions {
 }
 
 impl NodeRuntimeOptions {
+    /// Set aggregate encoded-body admission across every physical peer writer.
+    /// Default 256 MiB; minimum 32 MiB. Ordinary producers leave one maximum
+    /// 16 MiB priority response reserved across the Node. This does not include
+    /// protobuf objects, frame/task overhead, caches, or kernel socket buffers.
+    pub fn with_node_peer_queue_byte_capacity(mut self, capacity: usize) -> Self {
+        self.node_peer_queue_byte_capacity = capacity;
+        self
+    }
+    /// Aggregate encoded-body allowance across the Node's peer writers.
+    pub fn node_peer_queue_byte_capacity(&self) -> usize {
+        self.node_peer_queue_byte_capacity
+    }
+
     /// Set the node-to-region map used by region acknowledgement requirements.
     /// Node IDs and region labels must each contain 1 to 255 UTF-8 bytes.
     /// Startup validates supplied entries. Ordinary writes permit an empty or
@@ -3267,6 +3289,12 @@ impl NodeRuntimeOptions {
                 "peer queue frame capacity must be at least 2".to_string(),
             ));
         }
+        if self.node_peer_queue_byte_capacity < 2 * MAX_FRAME_BYTES
+            || self.node_peer_queue_byte_capacity > u32::MAX as usize
+            || self.node_peer_queue_byte_capacity > Semaphore::MAX_PERMITS
+        {
+            return Err(NodeError::Actor("node peer queue byte capacity must fit two maximum frames and the u32/semaphore permit range".into()));
+        }
         if self.peer_queue_byte_capacity < MIN_PEER_CHANNEL_BYTE_CAPACITY {
             return Err(NodeError::Actor(format!(
                 "peer queue byte capacity must be at least {MIN_PEER_CHANNEL_BYTE_CAPACITY}"
@@ -3545,6 +3573,13 @@ impl NodeConfig {
 }
 
 impl Node {
+    /// Aggregate encoded-body reservations and saturation across all peers.
+    /// Includes queued and active socket writes; excludes unencoded payloads,
+    /// frame/task/allocator overhead, cache/storage, and kernel socket buffers.
+    pub fn peer_writer_diagnostics(&self) -> PeerWriterDiagnostics {
+        self.node_peer_queue_budget.diagnostics()
+    }
+
     fn admit_operation(&self) -> Result<OperationPermit, NodeError> {
         self.operation_gate.try_enter()
     }
@@ -3918,6 +3953,9 @@ impl Node {
                 runtime_options.inbound_connection_capacity,
             )),
             receive_byte_budget: Arc::new(Semaphore::new(runtime_options.receive_byte_capacity)),
+            node_peer_queue_budget: NodePeerByteBudget::new(
+                runtime_options.node_peer_queue_byte_capacity,
+            ),
             relay_admission: RelayAdmission::new(
                 runtime_options.relay_capacity,
                 runtime_options.relay_key_byte_capacity,
@@ -4204,6 +4242,7 @@ impl Node {
                 .with_write_concerns(self.write_concerns.clone()),
             runtime_options: self.runtime_options.clone(),
             receive_byte_budget: self.receive_byte_budget.clone(),
+            node_peer_queue_budget: self.node_peer_queue_budget.clone(),
             relay_admission: self.relay_admission.clone(),
             mutation_service: self.mutation_service.clone(),
             sender_reports: self.sender_reports.clone(),
@@ -7653,6 +7692,7 @@ async fn handle_connection(
         sender_runtime,
         runtime_options,
         receive_byte_budget,
+        node_peer_queue_budget,
         relay_admission,
         mutation_service,
         sender_reports,
@@ -7707,6 +7747,7 @@ async fn handle_connection(
     ));
     let mut tx = PeerChannel {
         outbound: BudgetedPeerTx {
+            node_byte_budget: node_peer_queue_budget,
             tx: frame_tx,
             response_tx,
             byte_budget: byte_budget.clone(),
@@ -10437,6 +10478,17 @@ fn try_send_envelope_immediate(tx: &PeerChannel, envelope: Envelope) -> bool {
             return false;
         }
     };
+    let global_permits = match tx
+        .outbound
+        .node_byte_budget
+        .try_response(encoded_len as u32)
+    {
+        Ok(permits) => permits,
+        Err(()) => {
+            tx.cancel();
+            return false;
+        }
+    };
     let frame = match encode_envelope(&envelope) {
         Ok(frame) => frame,
         Err(error) => {
@@ -10444,7 +10496,8 @@ fn try_send_envelope_immediate(tx: &PeerChannel, envelope: Envelope) -> bool {
             return false;
         }
     };
-    frame_permit.send(BudgetedFrame::new_response(frame, byte_permit));
+    frame_permit
+        .send(BudgetedFrame::new_response(frame, byte_permit).with_global_permits(global_permits));
     true
 }
 
@@ -10534,6 +10587,17 @@ async fn try_send_envelope_with_deadline(
             return false;
         }
     };
+    let global_permits = match tx
+        .outbound
+        .acquire_global_producer(encoded_len as u32, admission_deadline)
+        .await
+    {
+        Ok(permits) => permits,
+        Err(()) => {
+            tx.cancel();
+            return false;
+        }
+    };
     if Instant::now() >= admission_deadline {
         tx.cancel();
         return false;
@@ -10545,11 +10609,10 @@ async fn try_send_envelope_with_deadline(
             return false;
         }
     };
-    frame_permit.send(BudgetedFrame::new_producer(
-        frame,
-        byte_permit,
-        producer_byte_permit,
-    ));
+    frame_permit.send(
+        BudgetedFrame::new_producer(frame, byte_permit, producer_byte_permit)
+            .with_global_permits(global_permits),
+    );
     true
 }
 
@@ -11433,6 +11496,7 @@ mod tests {
         (
             PeerChannel {
                 outbound: BudgetedPeerTx {
+                    node_byte_budget: NodePeerByteBudget::new(NODE_PEER_QUEUE_BYTE_CAPACITY),
                     tx,
                     response_tx,
                     byte_budget: Arc::new(Semaphore::new(PEER_CHANNEL_BYTE_CAPACITY)),
@@ -11565,6 +11629,7 @@ mod tests {
                 sender_runtime: SenderRuntimeOptions::default(),
                 runtime_options: NodeRuntimeOptions::default(),
                 receive_byte_budget: Arc::new(Semaphore::new(RECEIVE_BYTE_CAPACITY)),
+                node_peer_queue_budget: NodePeerByteBudget::new(NODE_PEER_QUEUE_BYTE_CAPACITY),
                 relay_admission: RelayAdmission::new(RELAY_CAPACITY, RELAY_KEY_BYTE_CAPACITY),
                 mutation_service: MutationService::new(
                     FORWARDED_MUTATION_CAPACITY,
@@ -15537,6 +15602,7 @@ mod tests {
         let producer_byte_budget = Arc::new(Semaphore::new(encoded_len * 2));
         let peer = PeerChannel {
             outbound: BudgetedPeerTx {
+                node_byte_budget: NodePeerByteBudget::new(NODE_PEER_QUEUE_BYTE_CAPACITY),
                 tx: frame_tx,
                 response_tx,
                 byte_budget,
@@ -15576,6 +15642,7 @@ mod tests {
         let producer_byte_budget = Arc::new(Semaphore::new(encoded_len));
         let peer = PeerChannel {
             outbound: BudgetedPeerTx {
+                node_byte_budget: NodePeerByteBudget::new(NODE_PEER_QUEUE_BYTE_CAPACITY),
                 tx: frame_tx,
                 response_tx,
                 byte_budget: byte_budget.clone(),

@@ -298,3 +298,39 @@ Operational rules of thumb:
   individually exact-byte bounded (1 MiB soft target, 16 MiB hard frame), and
   the writer defaults to a 32 MiB encoded-data budget regardless of its 256
   frame slots.
+
+## Aggregate peer writer bodies
+
+Each Node limits encoded peer-envelope bodies across all physical outbound and
+inbound connections with `NodeRuntimeOptions::node_peer_queue_byte_capacity`
+(default 256 MiB, minimum 32 MiB). Configure it through the Bon builder or
+`with_node_peer_queue_byte_capacity`. Per-connection frame and byte limits still
+apply; their configured maxima no longer multiply into an unconstrained total
+of encoded writer bodies.
+
+Ordinary RPC and replication producers reserve both their connection allowance
+and the shared Node allowance before allocating an encoded body. The Node-wide
+producer share excludes 16 MiB so one maximum-size reader-generated priority
+response can be admitted when ordinary producers saturate. The reserve is shared
+across the Node, not repeated for every peer. Priority responses use nonwaiting
+admission; exhaustion closes the contributing physical connection. Ordinary
+producers retain existing queue/socket deadlines and fail through the visible
+connection reset/reconciliation path when their bounded wait expires.
+
+Owned permits remain attached to each body through queueing and an active socket
+write. Dropping a body after completion, failure, cancellation, or writer abort
+releases its shared allowance. Closing one connection closes only its own gates;
+other connections retain access to the Node budget. A peer close also wakes its
+pending aggregate admission when that writer queue closes.
+
+`Node::peer_writer_diagnostics()` reports the aggregate capacity, reserved or
+admitted body bytes, ordinary producer bytes, and saturation events. Saturation
+counts failed immediate shared-byte acquisitions, including attempts that later
+wait successfully. Counters saturate without wrapping and contain no payloads.
+These snapshots are approximate during concurrent admission/release.
+
+This budget charges encoded protobuf body length. It excludes the four-byte
+length prefix, decoded protobuf/request objects, queue/frame/task/allocator
+headers, cache/persistence/replication payloads, query results, and kernel socket
+buffers. Connection/frame counts and those independent admission budgets still
+need separate deployment allowances; this is not a total process-heap ceiling.
