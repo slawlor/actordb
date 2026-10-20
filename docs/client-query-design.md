@@ -129,11 +129,10 @@ Use a cheap-to-clone `Client` sharing a serialized TCP connection:
 
 ```rust,ignore
 use actordb_client::{Client, ClientOptions};
-let options = ClientOptions {
-    timeout: Duration::from_secs(5),
-    max_queued_requests: 256,
-    ..ClientOptions::default()
-};
+let options = ClientOptions::builder()
+    .timeout(Duration::from_secs(5))
+    .max_queued_requests(256)
+    .build();
 let client = Client::connect("127.0.0.1:7449".parse()?, options).await?;
 client.put("user:42", b"ada".to_vec()).await?;
 let value = client.get("user:42").await?;

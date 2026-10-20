@@ -32,28 +32,54 @@ pub use actordb_protocol::write_concern::{WriteConcern, WriteConcernOptions, Wri
 pub use write_concern::WriteConcernClientError;
 
 /// Connection and queue bounds. Credentials are independent of cluster secrets.
-#[derive(Debug, Clone)]
+///
+/// Use [`Self::builder`] to set selected fields or [`Default`] for all defaults.
+/// Public fields remain mutable after construction; external struct literals are
+/// unavailable so later optional settings do not require another source break.
+///
+/// ```
+/// use actordb_client::{ClientOptions, PutOptions, Priority};
+/// use std::time::Duration;
+/// let connection = ClientOptions::builder()
+///     .identity("application")
+///     .timeout(Duration::from_secs(5))
+///     .build();
+/// let put = PutOptions::builder()
+///     .ttl(Duration::from_secs(60))
+///     .priority(Priority::High)
+///     .build();
+/// ```
+#[derive(Debug, Clone, bon::Builder)]
+#[non_exhaustive]
 pub struct ClientOptions {
+    /// Application authentication identity, 1 to 255 UTF-8 bytes.
+    #[builder(default = "rust-client".to_string(), into)]
     pub identity: String,
+    /// Optional application credential, independent of the peer cluster secret.
     pub credential: Option<Vec<u8>>,
+    /// Total request/authentication deadline and default graceful close budget.
+    #[builder(default = Duration::from_secs(30))]
     pub timeout: Duration,
+    /// Admitted queued/active requests sharing this connection. Default 64.
+    #[builder(default = 64)]
     pub max_queued_requests: usize,
+    /// Encoded request bytes retained by admitted requests. Default 32 MiB.
+    #[builder(default = 32 * 1024 * 1024)]
     pub max_queued_bytes: usize,
 }
 impl Default for ClientOptions {
     fn default() -> Self {
-        Self {
-            identity: "rust-client".into(),
-            credential: None,
-            timeout: Duration::from_secs(30),
-            max_queued_requests: 64,
-            max_queued_bytes: 32 * 1024 * 1024,
-        }
+        Self::builder().build()
     }
 }
-#[derive(Debug, Clone, Default)]
+/// Per-put expiry and scheduling priority. Use [`Self::builder`] or [`Default`].
+#[derive(Debug, Clone, Default, bon::Builder)]
+#[non_exhaustive]
 pub struct PutOptions {
+    /// Optional wall-clock TTL anchored at the originating server.
     pub ttl: Option<Duration>,
+    /// Scheduling priority, independent of replication acknowledgement concern.
+    #[builder(default)]
     pub priority: Priority,
 }
 
@@ -458,15 +484,8 @@ impl Client {
         value: Vec<u8>,
         ttl: Option<Duration>,
     ) -> Result<(), ClientError> {
-        self.put_with_options(
-            key,
-            value,
-            PutOptions {
-                ttl,
-                ..PutOptions::default()
-            },
-        )
-        .await
+        self.put_with_options(key, value, PutOptions::builder().maybe_ttl(ttl).build())
+            .await
     }
     pub async fn put_with_priority(
         &self,
@@ -474,15 +493,8 @@ impl Client {
         value: Vec<u8>,
         priority: Priority,
     ) -> Result<(), ClientError> {
-        self.put_with_options(
-            key,
-            value,
-            PutOptions {
-                priority,
-                ..PutOptions::default()
-            },
-        )
-        .await
+        self.put_with_options(key, value, PutOptions::builder().priority(priority).build())
+            .await
     }
     pub async fn delete(&self, key: impl Into<String>) -> Result<(), ClientError> {
         self.delete_with_priority(key, Priority::Default).await

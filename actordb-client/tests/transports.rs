@@ -76,10 +76,9 @@ async fn custom_acceptor_and_buffered_client_preserve_authentication_and_catalog
         ));
         let client = Client::from_stream(
             network.connect(addr).await.unwrap(),
-            ClientOptions {
-                credential: Some(credential),
-                ..Default::default()
-            },
+            ClientOptions::builder()
+                .maybe_credential(Some(credential))
+                .build(),
         )
         .await
         .unwrap();
@@ -151,10 +150,7 @@ async fn invalid_options_release_injected_resources_before_startup() {
         assert!(matches!(
             Client::from_stream(
                 stream,
-                ClientOptions {
-                    timeout: Duration::ZERO,
-                    ..Default::default()
-                }
+                ClientOptions::builder().timeout(Duration::ZERO).build()
             )
             .await,
             Err(ClientError::Invalid(_))
@@ -207,10 +203,9 @@ async fn injected_client_handshake_timeout_and_cancellation_close_streams() {
         assert!(matches!(
             Client::from_stream(
                 BufStream::new(stream),
-                ClientOptions {
-                    timeout: Duration::from_millis(20),
-                    ..Default::default()
-                }
+                ClientOptions::builder()
+                    .timeout(Duration::from_millis(20))
+                    .build()
             )
             .await,
             Err(ClientError::Timeout)
@@ -288,10 +283,9 @@ async fn caller_configured_mtls_supports_application_traffic_and_peer_replicatio
         .is_err());
         let client = Client::from_stream(
             network.connect(server.addr()).await.unwrap(),
-            ClientOptions {
-                credential: Some(credential),
-                ..Default::default()
-            },
+            ClientOptions::builder()
+                .maybe_credential(Some(credential))
+                .build(),
         )
         .await
         .unwrap();

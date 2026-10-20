@@ -36,12 +36,11 @@ fn marker(message: &str) -> Result<()> {
     Ok(())
 }
 fn options(credential: Option<&str>) -> ClientOptions {
-    ClientOptions {
-        identity: "external-sdk-scenario".into(),
-        credential: credential.map(|secret| secret.as_bytes().to_vec()),
-        timeout: Duration::from_secs(5),
-        ..Default::default()
-    }
+    ClientOptions::builder()
+        .identity("external-sdk-scenario")
+        .maybe_credential(credential.map(|secret| secret.as_bytes().to_vec()))
+        .timeout(Duration::from_secs(5))
+        .build()
 }
 async fn connect(endpoint: &str, credential: Option<&str>) -> Result<Client> {
     let addr = tokio::net::lookup_host(endpoint)
@@ -214,10 +213,10 @@ async fn healthy(clients: &[Client], records: &[(String, Vec<u8>, u32)]) -> Resu
         .put_with_options(
             &ttl_key,
             b"expires".to_vec(),
-            PutOptions {
-                ttl: Some(Duration::from_secs(5)),
-                priority: Priority::High,
-            },
+            PutOptions::builder()
+                .ttl(Duration::from_secs(5))
+                .priority(Priority::High)
+                .build(),
         )
         .await?;
     let ttl = client

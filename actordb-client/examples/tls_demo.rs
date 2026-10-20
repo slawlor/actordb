@@ -44,10 +44,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let stream = network.connect(listener.addr()).await?;
     let client = Client::from_stream(
         stream,
-        ClientOptions {
-            credential: Some(credential),
-            ..Default::default()
-        },
+        ClientOptions::builder()
+            .maybe_credential(Some(credential))
+            .build(),
     )
     .await?;
     client.put("greeting", b"hello over mTLS".to_vec()).await?;
