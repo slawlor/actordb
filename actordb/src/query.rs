@@ -4,7 +4,9 @@
 //! mutation between pages fails with [`crate::query::QueryExecutionError::QueryChanged`];
 //! this is a checked per-fragment read, not a distributed snapshot transaction.
 
+use crate::retained::{ByteBudget, BytePermit};
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -95,40 +97,97 @@ pub(crate) const MAX_QUERY_PAGE_BYTES: usize = crate::wire::MAX_FRAME_BYTES - 40
 pub(crate) const QUERY_PAGE_VISITS: usize = 256;
 pub(crate) const QUERY_WORK_BYTES: usize = 1024 * 1024;
 
+pub(crate) const DEFAULT_QUERY_RUNTIME_BYTES: usize = 256 * 1024 * 1024;
+
+/// Admission counters for active query/scan execution. These are conservative
+/// reservations, not RSS measurements or storage retained by returned callers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QueryDiagnostics {
+    /// Configured node-wide allowance for results, merge pages, and active work.
+    pub runtime_byte_capacity: usize,
+    /// Bytes reserved through active coordinators and actor work.
+    pub reserved_runtime_bytes: usize,
+    /// Number of query/scan admissions rejected at any count/byte limit.
+    pub admission_rejections: u64,
+}
+
 pub(crate) struct QueryAdmission {
     jobs: Arc<Semaphore>,
     bytes: Arc<Semaphore>,
+    runtime: Arc<ByteBudget>,
+    runtime_capacity: usize,
+    rejected: AtomicU64,
 }
 
 /// Admission ownership retained by actor work after its waiting future is cancelled.
 pub struct QueryRetention {
     _job: OwnedSemaphorePermit,
     _bytes: OwnedSemaphorePermit,
+    _runtime: BytePermit,
 }
 impl QueryAdmission {
+    #[cfg(test)]
     pub(crate) fn new() -> Arc<Self> {
+        Self::with_runtime_capacity(DEFAULT_QUERY_RUNTIME_BYTES)
+    }
+    pub(crate) fn with_runtime_capacity(capacity: usize) -> Arc<Self> {
         Arc::new(Self {
             jobs: Arc::new(Semaphore::new(32)),
             bytes: Arc::new(Semaphore::new(32 * 1024 * 1024)),
+            runtime: ByteBudget::new(capacity),
+            runtime_capacity: capacity,
+            rejected: AtomicU64::new(0),
         })
     }
-    pub(crate) fn reserve(&self, bytes: usize) -> Result<Arc<QueryRetention>, QueryExecutionError> {
-        let bytes = u32::try_from(bytes.max(1))
-            .map_err(|_| QueryExecutionError::BudgetExceeded("query request storage".into()))?;
-        let job = self
-            .jobs
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| QueryExecutionError::Backpressure("32 active query jobs".into()))?;
-        let bytes = self
-            .bytes
-            .clone()
-            .try_acquire_many_owned(bytes)
-            .map_err(|_| QueryExecutionError::Backpressure("query request bytes".into()))?;
-        Ok(Arc::new(QueryRetention {
-            _job: job,
-            _bytes: bytes,
-        }))
+    pub(crate) fn diagnostics(&self) -> QueryDiagnostics {
+        QueryDiagnostics {
+            runtime_byte_capacity: self.runtime_capacity,
+            reserved_runtime_bytes: self.runtime.used(),
+            admission_rejections: self.rejected.load(Ordering::Relaxed),
+        }
+    }
+    pub(crate) fn reserve_work(
+        &self,
+        bytes: usize,
+        runtime_bytes: usize,
+    ) -> Result<Arc<QueryRetention>, QueryExecutionError> {
+        // Try-acquire only: blocked callers never accumulate owning request
+        // payloads behind an unbounded semaphore waiter list.
+        let result = (|| {
+            let bytes = u32::try_from(bytes.max(1))
+                .map_err(|_| QueryExecutionError::BudgetExceeded("query request storage".into()))?;
+            let job =
+                self.jobs.clone().try_acquire_owned().map_err(|_| {
+                    QueryExecutionError::Backpressure("32 active query jobs".into())
+                })?;
+            let bytes = self
+                .bytes
+                .clone()
+                .try_acquire_many_owned(bytes)
+                .map_err(|_| QueryExecutionError::Backpressure("query request bytes".into()))?;
+            let runtime = self.runtime.reserve(runtime_bytes).ok_or_else(|| {
+                tracing::warn!(
+                    reserved_bytes = self.runtime.used(),
+                    requested_bytes = runtime_bytes,
+                    capacity_bytes = self.runtime_capacity,
+                    "query runtime admission rejected"
+                );
+                QueryExecutionError::Backpressure("shared query runtime bytes".into())
+            })?;
+            Ok(Arc::new(QueryRetention {
+                _job: job,
+                _bytes: bytes,
+                _runtime: runtime,
+            }))
+        })();
+        if result.is_err() {
+            let _ = self
+                .rejected
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                    Some(n.saturating_add(1))
+                });
+        }
+        result
     }
 }
 
@@ -453,5 +512,41 @@ mod key_bound_tests {
                 assert_eq!(actual, expected, "{:?} after {:?}", plan.predicates, after);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod runtime_admission_tests {
+    use super::*;
+
+    #[test]
+    fn aggregate_runtime_admission_rejects_without_waiting_and_rolls_back() {
+        let admission = QueryAdmission::new();
+        let mut active = Vec::new();
+        let per_query = 48 * 1024 * 1024;
+        for _ in 0..5 {
+            active.push(admission.reserve_work(1024, per_query).unwrap());
+        }
+        assert_eq!(
+            admission.diagnostics().reserved_runtime_bytes,
+            5 * per_query
+        );
+        for _ in 0..100 {
+            assert!(matches!(
+                admission.reserve_work(1024, per_query),
+                Err(QueryExecutionError::Backpressure(_))
+            ));
+        }
+        assert_eq!(admission.diagnostics().admission_rejections, 100);
+        active.pop();
+        assert!(admission.reserve_work(1024, per_query).is_ok());
+        drop(active);
+        assert_eq!(admission.diagnostics().reserved_runtime_bytes, 0);
+        // Failed runtime acquisition must not leak request/count permits.
+        let tiny = QueryAdmission::with_runtime_capacity(1);
+        for _ in 0..40 {
+            assert!(tiny.reserve_work(1, 2).is_err());
+        }
+        assert!(tiny.reserve_work(1, 1).is_ok());
     }
 }

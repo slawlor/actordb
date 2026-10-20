@@ -351,3 +351,47 @@ async fn many_fragment_heads_merge_in_global_key_order() {
     );
     node.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn runtime_allowance_is_configurable_and_visible_in_diagnostics() {
+    use actordb::node::NodeRuntimeOptions;
+    let node = Node::start_with_options(
+        "query-runtime-budget".into(),
+        "127.0.0.1:0".parse().unwrap(),
+        NodeConfig::default(),
+        NodeRuntimeOptions::default().with_query_runtime_byte_capacity(1024 * 1024),
+    )
+    .await
+    .unwrap();
+    let plan = parse("SELECT COUNT(*) FROM kv").unwrap();
+    assert!(matches!(
+        node.query_plan(&plan).await,
+        Err(actordb::query::QueryExecutionError::Backpressure(_))
+    ));
+    let result = node
+        .query_plan_with_options(
+            &plan,
+            QueryOptions {
+                max_result_bytes: 16 * 1024,
+                max_buffer_bytes: 128 * 1024,
+                page_bytes: 1024,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.rows, vec![vec![QueryValue::Integer(0)]]);
+    let diagnostics = node.query_diagnostics();
+    assert_eq!(diagnostics.runtime_byte_capacity, 1024 * 1024);
+    assert_eq!(diagnostics.reserved_runtime_bytes, 0);
+    assert_eq!(diagnostics.admission_rejections, 1);
+    node.shutdown().await.unwrap();
+    assert!(Node::start_with_options(
+        "query-zero".into(),
+        "127.0.0.1:0".parse().unwrap(),
+        NodeConfig::default(),
+        NodeRuntimeOptions::default().with_query_runtime_byte_capacity(0)
+    )
+    .await
+    .is_err());
+}

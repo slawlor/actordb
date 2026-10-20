@@ -2870,6 +2870,9 @@ pub struct NodeRuntimeOptions {
     node_peer_queue_byte_capacity: usize,
     #[builder(default = PEER_CHANNEL_BYTE_CAPACITY)]
     peer_queue_byte_capacity: usize,
+    /// Aggregate conservative query/scan result and merge reservations.
+    #[builder(default = crate::query::DEFAULT_QUERY_RUNTIME_BYTES)]
+    query_runtime_byte_capacity: usize,
     #[builder(default = REPLICATION_CONTROL_CHANNEL_DEPTH)]
     replication_control_message_capacity: usize,
     #[builder(default = INBOUND_CONNECTION_CAPACITY)]
@@ -2929,6 +2932,23 @@ impl NodeRuntimeOptions {
     /// Aggregate encoded-body allowance across the Node's peer writers.
     pub fn node_peer_queue_byte_capacity(&self) -> usize {
         self.node_peer_queue_byte_capacity
+    }
+
+    /// Set the node-wide query/scan execution byte allowance. Default 256 MiB.
+    /// Each coordinator reserves its configured result plus merge limits before
+    /// accepting work; incoming peer pages reserve a conservative 32 times their
+    /// encoded page limit. Admission rejects immediately at capacity. Ownership
+    /// follows actor work after waiter cancellation. Returned caller-owned results,
+    /// cache/storage, raw receive frames, and encoded writer queues use separate
+    /// budgets. Smaller nonzero allowances can reject otherwise legal queries.
+    pub fn with_query_runtime_byte_capacity(mut self, capacity: usize) -> Self {
+        self.query_runtime_byte_capacity = capacity;
+        self
+    }
+
+    /// Current node-wide conservative query/scan execution byte allowance.
+    pub fn query_runtime_byte_capacity(&self) -> usize {
+        self.query_runtime_byte_capacity
     }
 
     /// Set the node-to-region map used by region acknowledgement requirements.
@@ -3305,6 +3325,10 @@ impl NodeRuntimeOptions {
             ));
         }
         for (name, capacity) in [
+            (
+                "query runtime byte capacity",
+                self.query_runtime_byte_capacity,
+            ),
             ("relay capacity", self.relay_capacity),
             ("relay key byte capacity", self.relay_key_byte_capacity),
             (
@@ -4022,7 +4046,9 @@ impl Node {
             pending_batch_gets: Arc::new(StdMutex::new(HashMap::new())),
             pending_scans: Arc::new(StdMutex::new(HashMap::new())),
             pending_query_pages: Arc::new(StdMutex::new(HashMap::new())),
-            query_admission: crate::query::QueryAdmission::new(),
+            query_admission: crate::query::QueryAdmission::with_runtime_capacity(
+                runtime_options.query_runtime_byte_capacity,
+            ),
             pending_mutations: Arc::new(StdMutex::new(HashMap::new())),
             pending_relays: Arc::new(StdMutex::new(HashMap::new())),
             pending_mutation_relays: Arc::new(StdMutex::new(HashMap::new())),
@@ -9711,7 +9737,7 @@ async fn handle_connection(
                     break;
                 }
                 let retention = match query_admission
-                    .reserve(req.encoded_len().saturating_add(1024))
+                    .reserve_work(req.encoded_len().saturating_add(1024), 48 * 1024 * 1024)
                 {
                     Ok(retention) => retention,
                     Err(error) => {

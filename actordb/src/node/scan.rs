@@ -108,6 +108,12 @@ impl Node {
         let _operation = self
             .admit_operation()
             .map_err(|_| QueryExecutionError::ShuttingDown)?;
+        // Covers previously merged rows while each fragment owns its own
+        // page reservation; holding both is deliberately conservative.
+        let _runtime = self.query_admission.reserve_work(
+            1024,
+            QueryOptions::default().max_result_bytes + QueryOptions::default().max_buffer_bytes,
+        )?;
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
         tokio::time::timeout_at(deadline, async {
             let mut merged = Vec::new();
@@ -289,7 +295,7 @@ pub(super) async fn serve_scan_request(
         .call(
             |reply| KvMessage::ScanRetained {
                 spec,
-                retention,
+                retention: retention.clone(),
                 reply,
             },
             Some(SCAN_FRAGMENT_TIMEOUT),

@@ -78,6 +78,13 @@ impl FragmentCursor {
 }
 
 impl Node {
+    /// Return conservative node-wide query/scan admission reservations.
+    /// Returned result ownership belongs to the caller and is outside this
+    /// execution allowance after the coordinator completes.
+    pub fn query_diagnostics(&self) -> crate::query::QueryDiagnostics {
+        self.query_admission.diagnostics()
+    }
+
     /// Execute one SQL statement over selected fragments with global key ordering.
     /// Conjunctive equality, range, and byte-prefix predicates seek the ordered
     /// index directly. Work limits count keys within that selected range,
@@ -145,9 +152,15 @@ impl Node {
                 "query text exceeds 1 MiB".into(),
             ));
         }
-        let retention = self
-            .query_admission
-            .reserve(sql.len().saturating_mul(4).saturating_add(1024))?;
+        let retention = self.query_admission.reserve_work(
+            sql.len().saturating_mul(4).saturating_add(1024),
+            options
+                .max_result_bytes
+                .checked_add(options.max_buffer_bytes)
+                .ok_or_else(|| {
+                    QueryExecutionError::BudgetExceeded("query runtime reservation overflow".into())
+                })?,
+        )?;
         if plan.fragments.as_ref().is_some_and(|ids| {
             ids.iter()
                 .any(|id| *id as usize >= self.router.fragment_count())
@@ -838,11 +851,17 @@ pub(super) async fn serve_query_page(
                     "fragment is not serving",
                 )
             } else if let Some(actor) = router.route_for_fragment(fragment) {
-                actor_page(actor, Arc::new(plan), request.clone(), retention, deadline)
-                    .await
-                    .unwrap_or_else(|error| {
-                        page_error(&request, QueryPageStatus::Unavailable, error.to_string())
-                    })
+                actor_page(
+                    actor,
+                    Arc::new(plan),
+                    request.clone(),
+                    retention.clone(),
+                    deadline,
+                )
+                .await
+                .unwrap_or_else(|error| {
+                    page_error(&request, QueryPageStatus::Unavailable, error.to_string())
+                })
             } else {
                 page_error(&request, QueryPageStatus::Unavailable, "no fragment actor")
             }
@@ -860,13 +879,24 @@ pub(super) fn reserve_inbound(
             "SQL text exceeds 1 MiB".into(),
         ));
     }
-    admission.reserve(
+    let page_bytes = if request.max_bytes == 0 {
+        1024 * 1024
+    } else {
+        request.max_bytes as usize
+    };
+    if !(1024..=MAX_QUERY_PAGE_BYTES).contains(&page_bytes) {
+        return Err(QueryExecutionError::InvalidQuery(
+            "invalid page byte budget".into(),
+        ));
+    }
+    admission.reserve_work(
         request
             .sql
             .capacity()
             .saturating_mul(4)
             .saturating_add(request.after_key.capacity())
             .saturating_add(1024),
+        page_bytes.saturating_mul(32).saturating_add(4096),
     )
 }
 
@@ -908,6 +938,25 @@ mod page_validation_tests {
         assert!(responses.try_recv().is_err());
         assert_eq!(node.peer_count().await, 1);
         node.shutdown().await.unwrap();
+    }
+
+    #[test]
+    fn inbound_pages_share_runtime_admission_and_release_on_completion() {
+        let admission = QueryAdmission::with_runtime_capacity(64 * 1024);
+        let request = QueryPageRequest {
+            max_bytes: 1024,
+            sql: "SELECT key FROM kv".into(),
+            ..Default::default()
+        };
+        let first = reserve_inbound(&admission, &request).unwrap();
+        assert!(reserve_inbound(&admission, &request).is_err());
+        assert_eq!(
+            admission.diagnostics().reserved_runtime_bytes,
+            32 * 1024 + 4096
+        );
+        drop(first);
+        assert_eq!(admission.diagnostics().reserved_runtime_bytes, 0);
+        assert!(reserve_inbound(&admission, &request).is_ok());
     }
 
     fn page() -> (QueryPageRequest, QueryPlan, QueryPageResponse) {

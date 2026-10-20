@@ -2911,8 +2911,8 @@ mod query_page_tests {
         use crate::actor::{KvMessage, KvWorker, KvWorkerArgs};
         use ractor::Actor;
         let state = Arc::new(query_state(["a".into()]));
-        let admission = crate::query::QueryAdmission::new();
-        let retention = admission.reserve(1024).unwrap();
+        let admission = crate::query::QueryAdmission::with_runtime_capacity(64 * 1024);
+        let retention = admission.reserve_work(1024, 64 * 1024).unwrap();
         let weak = Arc::downgrade(&retention);
         let (worker, handle) = Actor::spawn(
             None,
@@ -2938,34 +2938,28 @@ mod query_page_tests {
         tokio::time::sleep(Duration::from_millis(10)).await;
         drop(response);
         assert!(weak.upgrade().is_some());
+        assert_eq!(admission.diagnostics().reserved_runtime_bytes, 64 * 1024);
+        assert!(admission.reserve_work(1024, 1).is_err());
         drop(cache);
         crate::common_test::periodic_check(|| weak.upgrade().is_none(), Duration::from_secs(2))
             .await;
         assert!(weak.upgrade().is_none());
+        assert_eq!(admission.diagnostics().reserved_runtime_bytes, 0);
+        assert!(admission.reserve_work(1024, 64 * 1024).is_ok());
         worker.stop(None);
         handle.await.unwrap();
     }
 
     #[tokio::test]
-    async fn sparse_query_pages_advance_through_nonmatches() {
+    async fn sparse_query_pages_seek_past_nonmatching_prefixes() {
         let state = query_state((0..600).map(|n| format!("a{n:04}")).chain(["z-hit".into()]));
-        let mut work = work("SELECT key FROM kv WHERE STARTS_WITH(key, 'z')", 256);
-        let first = state.query_page(&work).await;
-        assert_eq!(first.status, QueryPageStatus::Ok as i32);
-        assert_eq!(first.visited, 256);
-        assert!(!first.done);
-        assert!(first.rows.is_empty());
-        resume(&mut work, &first);
-        let second = state.query_page(&work).await;
-        assert_eq!(second.visited, 256);
-        assert!(second.next_after_key > first.next_after_key);
-        assert!(!second.done);
-        resume(&mut work, &second);
-        let third = state.query_page(&work).await;
-        assert!(third.done);
-        assert_eq!(third.visited, 89);
-        assert_eq!(third.rows.len(), 1);
-        assert_eq!(third.rows[0].key, "z-hit");
+        let work = work("SELECT key FROM kv WHERE STARTS_WITH(key, 'z')", 256);
+        let page = state.query_page(&work).await;
+        assert_eq!(page.status, QueryPageStatus::Ok as i32);
+        assert!(page.done);
+        assert_eq!(page.visited, 1);
+        assert_eq!(page.rows.len(), 1);
+        assert_eq!(page.rows[0].key, "z-hit");
     }
 
     #[tokio::test]
