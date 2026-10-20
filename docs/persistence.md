@@ -334,8 +334,8 @@ explicitly widen the bound after investigating the data.
 ## What persistence does not do
 
 - **No tombstone reclamation.** Tombstones are retained in memory and on disk.
-  `Node::start` rejects every `tombstone_gc_age: Some(..)` setting because a
-  time bound cannot prove durable replica convergence. Safe reclamation needs
+  Obsolete time-based collection settings have been removed because a time
+  bound cannot prove durable replica convergence. Safe reclamation needs
   such evidence plus store deletion support (see
   [Tombstones & deletes](tombstones.md)).
 - **No orphan-prefix scan after a crash.** Dynamic placement deletes an opted-in

@@ -2389,7 +2389,6 @@ async fn spawn_fragment_subtree_registered(
             .flush_interval(config.flush_interval)
             .clean_interval(config.clean_interval)
             .snapshot_interval(config.snapshot_interval)
-            .maybe_tombstone_gc_age(config.tombstone_gc_age)
             .build(),
     )
     .map_err(|e| NodeError::Actor(e.to_string()))?;
@@ -3482,6 +3481,13 @@ impl NodeRuntimeOptions {
 /// use actordb::node::NodeConfig;
 /// let _ = NodeConfig { ..NodeConfig::default() };
 /// ```
+///
+/// Time-based tombstone collection is not a configuration option:
+///
+/// ```compile_fail
+/// use actordb::node::NodeConfig;
+/// let _ = NodeConfig::builder().maybe_tombstone_gc_age(None).build();
+/// ```
 #[derive(Clone, bon::Builder)]
 #[non_exhaustive]
 pub struct NodeConfig {
@@ -3564,11 +3570,6 @@ pub struct NodeConfig {
     /// Tokio's clock, including for in-memory nodes.
     #[builder(default = crate::actor::DEFAULT_SNAPSHOT_INTERVAL)]
     pub snapshot_interval: Duration,
-    /// Reserved compatibility field for the removed time-based tombstone
-    /// collector. Must be `None`; [`Node::start`] rejects every `Some` value
-    /// because age alone cannot prove that no replica can resurrect a deleted
-    /// value.
-    pub tombstone_gc_age: Option<Duration>,
     /// Wall-clock offset (ms) applied to this node's HLC. Zero in
     /// production; tests use it to simulate clock skew. Hidden from
     /// docs: not a tuning knob.
@@ -3785,12 +3786,7 @@ impl Node {
                 )));
             }
         }
-        if config.tombstone_gc_age.is_some() {
-            return Err(NodeError::Actor(
-                "tombstone_gc_age is unsupported because time alone cannot prove replica convergence; it must be None"
-                    .to_string(),
-            ));
-        }
+
         if config
             .cluster_secret
             .as_ref()
@@ -13187,7 +13183,6 @@ mod tests {
                 SenderDeps {
                     router: FragmentRouter::new(1, 0),
                     hlc: Arc::new(Mutex::new(HlcClock::new())),
-                    reset_senders: Arc::new(Mutex::new(HashMap::new())),
                     state_report: report.clone(),
                 },
                 SenderRuntimeOptions::default().with_control_channel_capacity(1),
@@ -13285,7 +13280,6 @@ mod tests {
                 SenderDeps {
                     router: FragmentRouter::new(1, 0),
                     hlc: Arc::new(Mutex::new(HlcClock::new())),
-                    reset_senders: Arc::new(Mutex::new(HashMap::new())),
                     state_report: report.clone(),
                 },
                 SenderRuntimeOptions::default().with_control_channel_capacity(1),
@@ -13417,7 +13411,6 @@ mod tests {
                 SenderDeps {
                     router: FragmentRouter::new(1, 0),
                     hlc: Arc::new(Mutex::new(HlcClock::new())),
-                    reset_senders: Arc::new(Mutex::new(HashMap::new())),
                     state_report: report.clone(),
                 },
                 SenderRuntimeOptions::default().with_control_channel_capacity(1),
@@ -13439,7 +13432,6 @@ mod tests {
                 SenderDeps {
                     router: FragmentRouter::new(1, 0),
                     hlc: Arc::new(Mutex::new(HlcClock::new())),
-                    reset_senders: Arc::new(Mutex::new(HashMap::new())),
                     state_report: replacement_report.clone(),
                 },
                 SenderRuntimeOptions::default(),
@@ -13573,7 +13565,6 @@ mod tests {
                 SenderDeps {
                     router: FragmentRouter::new(1, 0),
                     hlc: Arc::new(Mutex::new(HlcClock::new())),
-                    reset_senders: Arc::new(Mutex::new(HashMap::new())),
                     state_report: report.clone(),
                 },
                 SenderRuntimeOptions::default().with_control_channel_capacity(1),
@@ -14273,7 +14264,6 @@ mod tests {
             SenderDeps {
                 router: FragmentRouter::new(1, 0),
                 hlc: Arc::new(Mutex::new(HlcClock::new())),
-                reset_senders: Arc::new(Mutex::new(HashMap::new())),
                 state_report: report.clone(),
             },
             SenderRuntimeOptions::default(),
@@ -14541,7 +14531,6 @@ mod tests {
             SenderDeps {
                 router: FragmentRouter::new(2, 0),
                 hlc: Arc::new(Mutex::new(HlcClock::new())),
-                reset_senders: Arc::new(Mutex::new(HashMap::new())),
                 state_report: other_report.clone(),
             },
             SenderRuntimeOptions::default(),
@@ -14559,7 +14548,6 @@ mod tests {
             SenderDeps {
                 router: FragmentRouter::new(2, 0),
                 hlc: Arc::new(Mutex::new(HlcClock::new())),
-                reset_senders: Arc::new(Mutex::new(HashMap::new())),
                 state_report: test_sender_report(),
             },
             SenderRuntimeOptions::default(),
@@ -14598,7 +14586,6 @@ mod tests {
             SenderDeps {
                 router: router.clone(),
                 hlc: hlc.clone(),
-                reset_senders: Arc::new(Mutex::new(HashMap::new())),
                 state_report: report.clone(),
             },
             SenderRuntimeOptions::default(),
@@ -14693,7 +14680,6 @@ mod tests {
             SenderDeps {
                 router: router.clone(),
                 hlc: hlc.clone(),
-                reset_senders: Arc::new(Mutex::new(HashMap::new())),
                 state_report: report.clone(),
             },
             SenderRuntimeOptions::default(),
@@ -14926,7 +14912,6 @@ mod tests {
             SenderDeps {
                 router: FragmentRouter::new(1, 0),
                 hlc: Arc::new(Mutex::new(HlcClock::new())),
-                reset_senders: Arc::new(Mutex::new(HashMap::new())),
                 state_report: report.clone(),
             },
             SenderRuntimeOptions::default(),
@@ -14940,7 +14925,6 @@ mod tests {
             SenderDeps {
                 router: FragmentRouter::new(1, 0),
                 hlc: Arc::new(Mutex::new(HlcClock::new())),
-                reset_senders: Arc::new(Mutex::new(HashMap::new())),
                 state_report: replacement_report.clone(),
             },
             SenderRuntimeOptions::default(),
@@ -15562,7 +15546,6 @@ mod tests {
             SenderDeps {
                 router: FragmentRouter::new(1, 0),
                 hlc: Arc::new(Mutex::new(HlcClock::new())),
-                reset_senders: Arc::new(Mutex::new(HashMap::new())),
                 state_report: test_sender_report(),
             },
             SenderRuntimeOptions::default(),
@@ -16927,7 +16910,6 @@ mod tests {
             SenderDeps {
                 router,
                 hlc: Arc::new(Mutex::new(HlcClock::new())),
-                reset_senders: Arc::new(Mutex::new(HashMap::new())),
                 state_report: report.clone(),
             },
         );
@@ -17001,7 +16983,6 @@ mod tests {
             SenderDeps {
                 router,
                 hlc: Arc::new(Mutex::new(HlcClock::new())),
-                reset_senders: Arc::new(Mutex::new(HashMap::new())),
                 state_report: report.clone(),
             },
             SenderRuntimeOptions::default().with_queue_admission_timeout(Duration::from_millis(20)),
@@ -17088,7 +17069,6 @@ mod tests {
             SenderDeps {
                 router,
                 hlc: Arc::new(Mutex::new(HlcClock::new())),
-                reset_senders: Arc::new(Mutex::new(HashMap::new())),
                 state_report: report.clone(),
             },
             SenderRuntimeOptions::default(),
@@ -17216,7 +17196,6 @@ mod tests {
             SenderDeps {
                 router,
                 hlc: Arc::new(Mutex::new(HlcClock::new())),
-                reset_senders: Arc::new(Mutex::new(HashMap::new())),
                 state_report: report.clone(),
             },
             SenderRuntimeOptions::default(),
@@ -17376,7 +17355,6 @@ mod tests {
             SenderDeps {
                 router,
                 hlc: Arc::new(Mutex::new(HlcClock::new())),
-                reset_senders: Arc::new(Mutex::new(HashMap::new())),
                 state_report: report.clone(),
             },
             runtime,
@@ -17522,7 +17500,6 @@ mod tests {
             SenderDeps {
                 router,
                 hlc: Arc::new(Mutex::new(HlcClock::new())),
-                reset_senders: Arc::new(Mutex::new(HashMap::new())),
                 state_report: report.clone(),
             },
             SenderRuntimeOptions::default(),
@@ -17636,7 +17613,6 @@ mod tests {
             SenderDeps {
                 router,
                 hlc: Arc::new(Mutex::new(HlcClock::new())),
-                reset_senders: Arc::new(Mutex::new(HashMap::new())),
                 state_report: report.clone(),
             },
             SenderRuntimeOptions::default(),

@@ -1007,31 +1007,12 @@ async fn static_placement_ignores_unused_placement_intervals() {
 }
 
 #[tokio::test]
-async fn time_based_tombstone_gc_is_rejected_before_binding() {
-    use actordb::node::NodeError;
-
-    let occupied = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = occupied.local_addr().unwrap();
-    let config = NodeConfig::builder()
-        .maybe_tombstone_gc_age(Some(Duration::from_secs(24 * 60 * 60)))
-        .build();
-
-    assert!(matches!(
-        Node::start("unsafe-gc".to_string(), addr, config).await,
-        Err(NodeError::Actor(message))
-            if message
-                == "tombstone_gc_age is unsupported because time alone cannot prove replica convergence; it must be None"
-    ));
-}
-
-#[tokio::test]
-async fn legacy_tombstone_gc_api_remains_source_compatible_and_safe() {
+async fn maintenance_builders_retain_tombstone_version_floors() {
     use actordb::actor::{FragmentState, HlcClock, PoolConfig};
     use actordb::shard::FragmentId;
     use actordb::supervision::{CleanerArgs, FragmentHealth, SupervisorArgs};
     use tokio::sync::Mutex;
 
-    let reset_senders = Arc::new(Mutex::new(HashMap::new()));
     let shared = Arc::new(FragmentState::new(
         HashMap::from([(
             "deleted".to_string(),
@@ -1041,30 +1022,23 @@ async fn legacy_tombstone_gc_api_remains_source_compatible_and_safe() {
         100,
         Duration::from_secs(1),
     ));
-    let cleaner = CleanerArgs {
-        fragment: FragmentId(0),
-        shared: shared.clone(),
-        interval: Duration::from_secs(1),
-        tombstone_gc_age: Some(Duration::ZERO),
-        reset_senders: reset_senders.clone(),
-    };
-    let supervisor = SupervisorArgs {
-        expiry_publisher: None,
-        fragment: FragmentId(0),
-        worker_prefix: "compat".to_string(),
-        store: None,
-        hlc: Arc::new(Mutex::new(HlcClock::new())),
-        default_pool: PoolConfig::default(),
-        high_pool: PoolConfig::default(),
-        background_pool: PoolConfig::default(),
-        flush_batch_size: 100,
-        persistence: Default::default(),
-        flush_interval: Duration::from_secs(1),
-        clean_interval: Duration::from_secs(1),
-        snapshot_interval: Duration::from_secs(1),
-        tombstone_gc_age: None,
-        reset_senders,
-    };
+    let cleaner = CleanerArgs::builder()
+        .fragment(FragmentId(0))
+        .shared(shared.clone())
+        .interval(Duration::from_secs(1))
+        .build();
+    let supervisor = SupervisorArgs::builder()
+        .fragment(FragmentId(0))
+        .worker_prefix("compat")
+        .hlc(Arc::new(Mutex::new(HlcClock::new())))
+        .default_pool(PoolConfig::default())
+        .high_pool(PoolConfig::default())
+        .background_pool(PoolConfig::default())
+        .flush_batch_size(100)
+        .flush_interval(Duration::from_secs(1))
+        .clean_interval(Duration::from_secs(1))
+        .snapshot_interval(Duration::from_secs(1))
+        .build();
     let health = FragmentHealth {
         fragment: FragmentId(0),
         worker_count: 0,

@@ -34,7 +34,7 @@
 //!   awaited locally, and a tracked empty batch fences outbound repairs
 //!   before the reset completes.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
@@ -1388,18 +1388,13 @@ pub struct SenderStateReport {
 
 /// Shared dependencies for a sender task.
 ///
-/// The builder requires the real router, node HLC, and state report. Only the
-/// ignored legacy reset registry defaults to a fresh empty registry.
+/// The builder requires the real router, node HLC, and state report.
 #[derive(bon::Builder)]
 pub struct SenderDeps {
     pub router: FragmentRouter,
     /// Node-wide HLC. Reconcile frames are observed here only after the sender
     /// has authenticated their exact session/round/phase correlation.
     pub hlc: Arc<Mutex<HlcClock>>,
-    /// Legacy compatibility field. Ignored because tombstone collection no
-    /// longer depends on transient sender reset state.
-    #[builder(default = Arc::new(Mutex::new(HashMap::new())))]
-    pub reset_senders: Arc<Mutex<HashMap<(FragmentId, String), u64>>>,
     /// Where the sender publishes its state.
     pub state_report: Arc<Mutex<SenderStateReport>>,
 }
@@ -4235,7 +4230,6 @@ mod tests {
             SenderDeps {
                 router: FragmentRouter::new(1, 0),
                 hlc: Arc::new(Mutex::new(HlcClock::new())),
-                reset_senders: Arc::new(Mutex::new(HashMap::new())),
                 state_report: state_report(),
             },
             SenderRuntimeOptions::default(),
@@ -4273,7 +4267,6 @@ mod tests {
             SenderDeps {
                 router: FragmentRouter::new(1, 0),
                 hlc: Arc::new(Mutex::new(HlcClock::new())),
-                reset_senders: Arc::new(Mutex::new(HashMap::new())),
                 state_report: report.clone(),
             },
             SenderRuntimeOptions::default().with_aggregate_retention(aggregate.clone()),
@@ -5154,7 +5147,6 @@ mod tests {
             SenderDeps {
                 router: crate::node::FragmentRouter::new(1, 0),
                 hlc: Arc::new(Mutex::new(HlcClock::new())),
-                reset_senders: Arc::new(Mutex::new(HashMap::new())),
                 state_report: state_report(),
             },
             SenderRuntimeOptions::default(),
@@ -5184,7 +5176,6 @@ mod tests {
             SenderDeps {
                 router: crate::node::FragmentRouter::new(1, 0),
                 hlc: Arc::new(Mutex::new(HlcClock::new())),
-                reset_senders: Arc::new(Mutex::new(HashMap::new())),
                 state_report: report.clone(),
             },
             SenderRuntimeOptions::default()
@@ -5235,7 +5226,6 @@ mod tests {
             SenderDeps {
                 router: crate::node::FragmentRouter::new(1, 0),
                 hlc: Arc::new(Mutex::new(HlcClock::new())),
-                reset_senders: Arc::new(Mutex::new(HashMap::new())),
                 state_report: state_report(),
             },
         );
@@ -5661,7 +5651,6 @@ mod tests {
             SenderDeps {
                 router: crate::node::FragmentRouter::new(1, 0),
                 hlc: Arc::new(Mutex::new(HlcClock::new())),
-                reset_senders: Arc::new(Mutex::new(HashMap::new())),
                 state_report: report.clone(),
             },
             SenderRuntimeOptions::default().with_queue_admission_timeout(Duration::from_millis(10)),
@@ -5701,7 +5690,6 @@ mod tests {
             SenderDeps {
                 router: crate::node::FragmentRouter::new(1, 0),
                 hlc: Arc::new(Mutex::new(HlcClock::new())),
-                reset_senders: Arc::new(Mutex::new(HashMap::new())),
                 state_report: report.clone(),
             },
             SenderRuntimeOptions::default().with_queue_admission_timeout(Duration::from_millis(10)),

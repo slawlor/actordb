@@ -96,7 +96,6 @@ below before using the default plain-TCP transport in production.
 | `background_pool` | `PoolConfig` | `2` workers, cap `5_000`, `1000`/s | Bulk traffic; rate-limited by default. |
 | `clean_interval` | `Duration` | `30 s` | How often each fragment's cleaner materializes TTL-expiry tombstones. |
 | `snapshot_interval` | `Duration` | `60 s` | Snapshotter flush cadence (periodic durable flush, not a checkpoint). |
-| `tombstone_gc_age` | `Option<Duration>` | `None` | Compatibility field for the removed collector. Must remain `None`; `Node::start` rejects every `Some(age)` because elapsed time cannot prove replica convergence. |
 | `replication` | `SenderConfig` | see below | Per-fragment×peer sender tuning. |
 | `placement_controller` | `Option<Arc<dyn PlacementController>>` | `None` | `None` = static placement. Set to `ManualPlacement` (or your own controller) for dynamic migration. |
 | `placement_poll_interval` | `Duration` | `1 s` | Driver re-evaluation cadence. Ignored in static mode. |
@@ -327,3 +326,10 @@ let mut config = NodeConfig::builder()
     .build();
 config.flush_interval = Duration::from_millis(50);
 ```
+
+### Removed collection options
+
+The obsolete `tombstone_gc_age` and `reset_senders` options have been removed
+from Node/actor configuration and sender dependencies. Remove those builder
+calls or literal fields when migrating. TTL materialization still installs
+retained tombstones; this cleanup does not enable tombstone reclamation.

@@ -75,8 +75,8 @@ nodes certify one another.
   wins, silently.
 - TTL expiry creates a tombstone with the TTL write's version, so a
   pre-expiry value on the other side cannot reappear when the partition heals.
-- Tombstones are retained indefinitely. `Node::start` rejects every
-  `tombstone_gc_age: Some(..)` setting: buffered delivery, `MemoryApplied`
+- Tombstones are retained indefinitely. Time-based collection options have
+  been removed: buffered delivery, `MemoryApplied`
   receiver crashes, and restart can all erase convergence evidence that a
   time bound cannot replace.
 - While partitioned, remotely routed single-key and batch reads and writes fail
@@ -289,7 +289,7 @@ Operational rules of thumb:
   static mode — a mismatch silently makes keys unreachable.
 - Keep at least two replicas per fragment if you care about the unflushed
   write tail surviving `kill -9`.
-- `tombstone_gc_age` must be `None`; every `Some(..)` setting fails startup.
+- Time-based tombstone collection options are unavailable; all version floors remain retained.
   Size durable storage for retained tombstones until the system has a
   durable, replica-aware reclamation protocol.
 - The background pool's default 1000 ops/s rate limit is a feature, not a bug
