@@ -1510,6 +1510,67 @@ mod flush_tests {
     }
 
     #[tokio::test]
+    async fn raw_expired_version_conflict_never_enters_persistence_backlog() {
+        let store = Arc::new(FlakyStore {
+            failures_left: StdMutex::new(0),
+            written: StdMutex::new(Vec::new()),
+        });
+        let mut original = VersionedValue::new(vec![1], 10, "writer".into());
+        original.expires_at_ms = Some(1);
+        let state = FragmentState::new(
+            HashMap::from([("key".into(), original.clone())]),
+            Some(store),
+            100,
+            Duration::from_secs(3600),
+        );
+        let mut conflict = original.clone();
+        conflict.value = vec![2];
+        assert!(matches!(
+            state.apply(&op("key", conflict)).await,
+            Err(ApplyError::VersionConflict { .. })
+        ));
+        assert_eq!(state.persistence_backlog().await, (0, 0));
+        let cache = state.cache.read().await;
+        assert_eq!(cache.values["key"], original);
+        assert_eq!(cache.content_digests["key"].live, original.content_digest());
+        assert_eq!(state.revision.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn saturated_expiry_keeps_live_cached_digest_until_marker_admission() {
+        let store = Arc::new(FlakyStore {
+            failures_left: StdMutex::new(0),
+            written: StdMutex::new(Vec::new()),
+        });
+        let mut expiring = VersionedValue::new(vec![7], 10, "writer".into());
+        expiring.expires_at_ms = Some(500);
+        let config = PersistenceConfig::builder().max_records(1).build();
+        let state = FragmentState::new(
+            HashMap::from([("ttl".into(), expiring.clone())]),
+            Some(store),
+            usize::MAX,
+            Duration::from_secs(3600),
+        )
+        .with_persistence_config(config)
+        .unwrap();
+        state
+            .apply(&op(
+                "occupied",
+                VersionedValue::new(vec![1], 20, "writer".into()),
+            ))
+            .await
+            .unwrap();
+        let page = state
+            .expire_values_page(&mut ExpiryPass::new(500))
+            .await
+            .unwrap();
+        assert_eq!(page.converted, 0);
+        let cache = state.cache.read().await;
+        assert_eq!(cache.values["ttl"], expiring);
+        assert_eq!(cache.content_digests["ttl"].live, expiring.content_digest());
+    }
+
+    #[tokio::test]
     async fn aggregate_persistence_budget_bounds_multiple_fragments() {
         let store = Arc::new(FlakyStore {
             failures_left: StdMutex::new(0),

@@ -505,6 +505,7 @@ fn retained_control_bytes(msg: &SenderMsg) -> usize {
                     .saturating_add(128)
                     .saturating_add(s.key.capacity())
                     .saturating_add(s.node_id.capacity())
+                    .saturating_add(s.content_digest.capacity())
             })),
         SenderMsg::ReconcileData { entries, .. } => entries
             .capacity()
@@ -4347,6 +4348,32 @@ mod tests {
         drop(accepted);
         assert_eq!(retention.local.used(), 0);
         assert_eq!(retention.aggregate.used(), 0);
+    }
+
+    #[test]
+    fn queued_summary_control_charges_malformed_digest_spare_capacity() {
+        let digest_capacity = 4 * 1024 * 1024;
+        let (connection_valid, _) = oneshot::channel();
+        let message = SenderMsg::ReconcileResponse {
+            session_id: 1,
+            round_id: 1,
+            page_seq: 0,
+            next_after_key: String::new(),
+            snapshot_revision: 1,
+            snapshot_time_ms: 1,
+            done: true,
+            restart: false,
+            summaries: vec![KeySummary {
+                key: "key".into(),
+                timestamp_ms: 1,
+                logical_counter: 0,
+                node_id: "node".into(),
+                is_tombstone: false,
+                content_digest: Vec::with_capacity(digest_capacity),
+            }],
+            connection_valid,
+        };
+        assert!(retained_control_bytes(&message) >= 2 * digest_capacity);
     }
 
     #[test]
