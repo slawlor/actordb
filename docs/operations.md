@@ -352,3 +352,28 @@ rejection and failed flushes emit structured backlog diagnostics. TTL cleanup
 reserves its durable marker before replacing the live record; a full final
 sweep reports saturation so shutdown cannot certify an undurable transition.
 The cache and immutable key/version floors are independent of these budgets.
+
+## Replication retained-memory admission
+
+`SenderConfig::retained_byte_capacity` defaults to 64 MiB per sender.
+`NodeRuntimeOptions::replication_retained_byte_capacity` defaults to 256 MiB
+across a node. Owning byte permits follow each operation from ingress through
+the deque and in-flight ACK batch; retransmission keeps the same reservation.
+Charges conservatively include operation/protobuf/encoded representations.
+Node fanout acquires both allowances before cloning a value for a replica.
+Payload-bearing reconciliation control messages also reserve the allowance
+until local processing completes; fixed-size ACK/lifecycle controls keep their
+independent count-bounded lane so cleanup can progress at byte saturation.
+
+Saturation schedules visible `buffer_reset` recovery from the authoritative
+fragment cache. It cannot retroactively reject an applied local mutation.
+ACK retirement, reset, sender cancellation and shutdown release owning permits.
+`SenderStateReport::{retained_bytes,aggregate_retained_bytes}` and
+`Node::replication_retained_bytes()` expose charges; structured saturation
+diagnostics include both allowances. These charges exclude the separately
+bounded peer frame pipeline and the cache.
+
+Standalone callers should use `replication::spawn_bounded_sender`. Legacy
+`spawn_sender`/`spawn_sender_with_options` still return unbounded channels for
+compatibility: their consumed payloads are byte-bounded, but callers must
+externally bound the preceding legacy channel.

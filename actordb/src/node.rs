@@ -526,6 +526,8 @@ async fn ensure_sender_entry(fragment: FragmentId, peer: &str, deps: SenderEntry
         state: "disconnected".to_string(),
         session_id: 0,
         buffered: 0,
+        retained_bytes: 0,
+        aggregate_retained_bytes: 0,
         in_flight: 0,
         last_ack_durability: None,
         ack_durability_mismatch: false,
@@ -1413,7 +1415,7 @@ async fn enqueue_to_senders(senders: &SenderMap, frag: FragmentId, op: &Replicat
         .map(|(_, sender)| sender.clone())
         .collect();
     for sender in targets {
-        let _ = sender.send(SenderMsg::Enqueue(op.clone()));
+        let _ = sender.offer(op);
     }
 }
 
@@ -2845,6 +2847,10 @@ impl Drop for StoreBindingStartupGuard {
 /// defaults; pass an override to [`Node::start_with_options`].
 #[derive(Clone, Debug, bon::Builder)]
 pub struct NodeRuntimeOptions {
+    #[builder(default = 256 * 1024 * 1024)]
+    replication_retained_byte_capacity: usize,
+    #[builder(skip = crate::retained::ByteBudget::new(256 * 1024 * 1024))]
+    replication_retention: Arc<crate::retained::ByteBudget>,
     /// Operator-supplied node-to-region labels. Labels compare by exact bytes;
     /// they do not change placement or authenticate physical location.
     #[builder(default, into)]
@@ -3225,12 +3231,23 @@ impl NodeRuntimeOptions {
 
     fn sender_options(&self) -> SenderRuntimeOptions {
         SenderRuntimeOptions::default()
+            .with_aggregate_retention(self.replication_retention.clone())
             .with_ack_timeout(self.replication_ack_timeout)
             .with_queue_admission_timeout(self.queue_admission_timeout)
             .with_control_channel_capacity(self.replication_control_message_capacity)
     }
 
+    /// Current charged retained replication work across this node.
+    pub fn replication_retained_bytes(&self) -> usize {
+        self.replication_retention.used()
+    }
+
     fn validate(&self) -> Result<(), NodeError> {
+        if self.replication_retained_byte_capacity == 0 {
+            return Err(NodeError::Actor(
+                "node replication byte allowance must be nonzero".into(),
+            ));
+        }
         for (node_id, region) in self.regions.iter() {
             if node_id.is_empty() || node_id.len() > MAX_WIRE_NODE_ID_BYTES {
                 return Err(NodeError::Actor(format!(
@@ -3601,6 +3618,11 @@ impl Node {
     /// listening for peer connections. Binds `listen_addr` (use port 0
     /// for an ephemeral port) and returns the bound address via [Node::addr].
     /// `node_id` must contain 1 to 255 bytes.
+    /// Current charged replication payload bytes across every local sender.
+    pub fn replication_retained_bytes(&self) -> usize {
+        self.runtime_options.replication_retention.used()
+    }
+
     pub async fn start(
         node_id: String,
         listen_addr: SocketAddr,
@@ -3618,6 +3640,9 @@ impl Node {
         runtime_options: NodeRuntimeOptions,
     ) -> Result<Self, NodeError> {
         runtime_options.validate()?;
+        let mut runtime_options = runtime_options;
+        runtime_options.replication_retention =
+            crate::retained::ByteBudget::new(runtime_options.replication_retained_byte_capacity);
         if config.ttl_expiry_handler.is_some() {
             config
                 .ttl_expiry_options
@@ -11537,6 +11562,8 @@ mod tests {
             state: "disconnected".to_string(),
             session_id: 0,
             buffered: 0,
+            retained_bytes: 0,
+            aggregate_retained_bytes: 0,
             in_flight: 0,
             last_ack_durability: None,
             ack_durability_mismatch: false,
@@ -14085,6 +14112,8 @@ mod tests {
             state: "disconnected".to_string(),
             session_id: 0,
             buffered: 0,
+            retained_bytes: 0,
+            aggregate_retained_bytes: 0,
             in_flight: 0,
             last_ack_durability: None,
             ack_durability_mismatch: false,
@@ -16734,6 +16763,8 @@ mod tests {
             state: "disconnected".to_string(),
             session_id: 0,
             buffered: 0,
+            retained_bytes: 0,
+            aggregate_retained_bytes: 0,
             in_flight: 0,
             last_ack_durability: None,
             ack_durability_mismatch: false,
@@ -16803,6 +16834,8 @@ mod tests {
             state: "disconnected".to_string(),
             session_id: 0,
             buffered: 0,
+            retained_bytes: 0,
+            aggregate_retained_bytes: 0,
             in_flight: 0,
             last_ack_durability: None,
             ack_durability_mismatch: false,
@@ -16889,6 +16922,8 @@ mod tests {
             state: "disconnected".to_string(),
             session_id: 0,
             buffered: 0,
+            retained_bytes: 0,
+            aggregate_retained_bytes: 0,
             in_flight: 0,
             last_ack_durability: None,
             ack_durability_mismatch: false,
@@ -17015,6 +17050,8 @@ mod tests {
             state: "disconnected".to_string(),
             session_id: 0,
             buffered: 0,
+            retained_bytes: 0,
+            aggregate_retained_bytes: 0,
             in_flight: 0,
             last_ack_durability: None,
             ack_durability_mismatch: false,
@@ -17160,6 +17197,8 @@ mod tests {
             state: "disconnected".to_string(),
             session_id: 0,
             buffered: 0,
+            retained_bytes: 0,
+            aggregate_retained_bytes: 0,
             in_flight: 0,
             last_ack_durability: None,
             ack_durability_mismatch: false,
@@ -17318,6 +17357,8 @@ mod tests {
             state: "disconnected".to_string(),
             session_id: 0,
             buffered: 0,
+            retained_bytes: 0,
+            aggregate_retained_bytes: 0,
             in_flight: 0,
             last_ack_durability: None,
             ack_durability_mismatch: false,
@@ -17429,6 +17470,8 @@ mod tests {
             state: "disconnected".to_string(),
             session_id: 0,
             buffered: 0,
+            retained_bytes: 0,
+            aggregate_retained_bytes: 0,
             in_flight: 0,
             last_ack_durability: None,
             ack_durability_mismatch: false,
