@@ -437,3 +437,37 @@ persistence, receive, query and peer-frame allowances when planning deployment
 memory. All are charged admissions, not RSS; immutable cached key/version floors
 and the loaded dataset remain independent. Result admission failure retries the
 round with existing pacing and local deadlines.
+
+## Query and compatibility scan execution limits
+
+`NodeRuntimeOptions::with_query_runtime_byte_capacity` sets one node-wide
+execution allowance (default **256 MiB**) shared by SQL coordinators, embedded
+scans, incoming query pages, and compatibility peer scans. Each coordinator
+reserves its configured result plus merge limits before accepting work. Incoming
+pages reserve a conservative 32 times their encoded page allowance plus fixed
+metadata. Embedded scans also reserve for the rows accumulated from completed
+fragments. Admission rejects immediately with backpressure when the allowance
+is exhausted; there is no retained semaphore-waiter queue.
+
+Reservations follow accepted actor work through caller cancellation and follow
+peer replies through writer admission. `Node::query_diagnostics()` reports the
+allowance, current reserved bytes, and admission rejections. These reservations
+bound active execution capacity, not RSS: returned results owned by embedded
+callers, allocator overhead, caches, persistence, raw receive frames, and encoded
+writer queues have separate ownership. The default 16 MiB result plus 32 MiB
+merge limits therefore allow at most five such SQL coordinators concurrently
+under the default allowance. Smaller per-query budgets admit more work.
+
+Exact keys, conjunctive ranges, and byte prefixes seek the ordered fragment
+index. Hash partitioning still requires range/prefix queries to contact every
+selected fragment; additional indexes and explicit key-set routing are tracked
+in [SQL scalability #114](https://github.com/slawlor/actordb/issues/114).
+Initial head-page fetches remain sequential to preserve exact aggregate work
+and memory admission. A heap merges fragment heads in global key order.
+
+Compatibility scans preserve per-fragment offsets/limits and fragment-order
+merging, with a 16 MiB aggregate result allowance and one-million-record work
+limit. Oversize work, unavailable fragments, and revision changes fail the whole
+operation. Low-level `FragmentState::scan` now returns `Result` for the same
+explicit failures. TTL maintenance visits only indexed live deadlines due at a
+pinned time, in bounded pages; tombstone keys/version floors remain resident.

@@ -1,6 +1,7 @@
 //! Server coordinator for bounded, revision-guarded query pages.
 
-use std::collections::{HashMap, VecDeque};
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap, VecDeque};
 use std::sync::{Arc, Mutex as StdMutex};
 
 use actordb_query::{QueryAccumulator, QueryPlan, QueryResult, QueryValue};
@@ -66,6 +67,7 @@ impl FragmentCursor {
     fn storage(&self) -> usize {
         std::mem::size_of::<Self>()
             .saturating_add(self.after_key.capacity())
+            .saturating_add(self.rows.front().map_or(0, |row| row.key.capacity()))
             .saturating_add(
                 self.rows
                     .capacity()
@@ -76,8 +78,18 @@ impl FragmentCursor {
 }
 
 impl Node {
+    /// Return conservative node-wide query/scan admission reservations.
+    /// Returned result ownership belongs to the caller and is outside this
+    /// execution allowance after the coordinator completes.
+    pub fn query_diagnostics(&self) -> crate::query::QueryDiagnostics {
+        self.query_admission.diagnostics()
+    }
+
     /// Execute one SQL statement over selected fragments with global key ordering.
-    /// Queries fail completely on resource exhaustion or a changed fragment.
+    /// Conjunctive equality, range, and byte-prefix predicates seek the ordered
+    /// index directly. Work limits count keys within that selected range,
+    /// including tombstones and expired values. Queries fail completely on
+    /// resource exhaustion or a changed fragment.
     pub async fn query(&self, sql: &str) -> Result<QueryResult, QueryExecutionError> {
         let plan = actordb_query::parse(sql)?;
         self.query_plan(&plan).await
@@ -102,6 +114,16 @@ impl Node {
         plan: &QueryPlan,
         options: QueryOptions,
     ) -> Result<QueryResult, QueryExecutionError> {
+        self.query_plan_with_options_and_visits(plan, options)
+            .await
+            .map(|(result, _)| result)
+    }
+
+    pub(super) async fn query_plan_with_options_and_visits(
+        &self,
+        plan: &QueryPlan,
+        options: QueryOptions,
+    ) -> Result<(QueryResult, u64), QueryExecutionError> {
         let _operation = self
             .admit_operation()
             .map_err(|_| QueryExecutionError::ShuttingDown)?;
@@ -130,9 +152,15 @@ impl Node {
                 "query text exceeds 1 MiB".into(),
             ));
         }
-        let retention = self
-            .query_admission
-            .reserve(sql.len().saturating_mul(4).saturating_add(1024))?;
+        let retention = self.query_admission.reserve_work(
+            sql.len().saturating_mul(4).saturating_add(1024),
+            options
+                .max_result_bytes
+                .checked_add(options.max_buffer_bytes)
+                .ok_or_else(|| {
+                    QueryExecutionError::BudgetExceeded("query runtime reservation overflow".into())
+                })?,
+        )?;
         if plan.fragments.as_ref().is_some_and(|ids| {
             ids.iter()
                 .any(|id| *id as usize >= self.router.fragment_count())
@@ -199,7 +227,7 @@ impl Node {
         options: &QueryOptions,
         retention: Arc<QueryRetention>,
         deadline: Instant,
-    ) -> Result<QueryResult, QueryExecutionError> {
+    ) -> Result<(QueryResult, u64), QueryExecutionError> {
         let mut result = QueryResult {
             columns: plan.columns(),
             rows: Vec::new(),
@@ -211,8 +239,19 @@ impl Node {
             return Err(QueryExecutionError::BudgetExceeded("result columns".into()));
         }
         if plan.limit == Some(0) {
-            return Ok(result);
+            return Ok((result, 0));
         }
+        // Reserve heap headers before admitting pages. Cursor accounting also
+        // includes the duplicated head key while the heap owns it.
+        let mut merge_options = options.clone();
+        if !plan.is_aggregate() {
+            merge_options.max_buffer_bytes = merge_options.max_buffer_bytes.saturating_sub(
+                cursors
+                    .len()
+                    .saturating_mul(std::mem::size_of::<Reverse<(String, usize)>>()),
+            );
+        }
+        let options = &merge_options;
         let mut visited = 0u64;
         if plan.is_aggregate() {
             let mut aggregate = QueryAccumulator::new(&plan);
@@ -249,6 +288,7 @@ impl Node {
                 result.rows.clear();
             }
         } else {
+            let mut heads = BinaryHeap::with_capacity(cursors.len());
             // Obtain one bounded head page from each selected fragment. No
             // fragment-wide Vec or unbounded concurrent RPC fan-out is used.
             for index in 0..cursors.len() {
@@ -264,19 +304,14 @@ impl Node {
                 )
                 .await?;
                 check_buffer(cursors, options, sql.len())?;
+                if let Some(row) = cursors[index].rows.front() {
+                    heads.push(Reverse((row.key.clone(), index)));
+                }
             }
             let mut skipped = 0u64;
             let mut payload_bytes = 0usize;
-            loop {
-                let smallest = cursors
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(i, c)| c.rows.front().map(|row| (i, &row.key)))
-                    .min_by(|a, b| a.1.cmp(b.1))
-                    .map(|(i, _)| i);
-                let Some(index) = smallest else {
-                    break;
-                };
+            while let Some(Reverse((key, index))) = heads.pop() {
+                drop(key);
                 let row = cursors[index]
                     .rows
                     .pop_front()
@@ -318,6 +353,9 @@ impl Node {
                 )
                 .await?;
                 check_buffer(cursors, options, sql.len())?;
+                if let Some(row) = cursors[index].rows.front() {
+                    heads.push(Reverse((row.key.clone(), index)));
+                }
             }
         }
         // Recheck every accepted contribution, including completed fragments,
@@ -352,7 +390,7 @@ impl Node {
                 "aggregate result storage".into(),
             ));
         }
-        Ok(result)
+        Ok((result, visited))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -811,11 +849,17 @@ pub(super) async fn serve_query_page(
                     "fragment is not serving",
                 )
             } else if let Some(actor) = router.route_for_fragment(fragment) {
-                actor_page(actor, Arc::new(plan), request.clone(), retention, deadline)
-                    .await
-                    .unwrap_or_else(|error| {
-                        page_error(&request, QueryPageStatus::Unavailable, error.to_string())
-                    })
+                actor_page(
+                    actor,
+                    Arc::new(plan),
+                    request.clone(),
+                    retention.clone(),
+                    deadline,
+                )
+                .await
+                .unwrap_or_else(|error| {
+                    page_error(&request, QueryPageStatus::Unavailable, error.to_string())
+                })
             } else {
                 page_error(&request, QueryPageStatus::Unavailable, "no fragment actor")
             }
@@ -833,13 +877,24 @@ pub(super) fn reserve_inbound(
             "SQL text exceeds 1 MiB".into(),
         ));
     }
-    admission.reserve(
+    let page_bytes = if request.max_bytes == 0 {
+        1024 * 1024
+    } else {
+        request.max_bytes as usize
+    };
+    if !(1024..=MAX_QUERY_PAGE_BYTES).contains(&page_bytes) {
+        return Err(QueryExecutionError::InvalidQuery(
+            "invalid page byte budget".into(),
+        ));
+    }
+    admission.reserve_work(
         request
             .sql
             .capacity()
             .saturating_mul(4)
             .saturating_add(request.after_key.capacity())
             .saturating_add(1024),
+        page_bytes.saturating_mul(32).saturating_add(4096),
     )
 }
 
@@ -881,6 +936,25 @@ mod page_validation_tests {
         assert!(responses.try_recv().is_err());
         assert_eq!(node.peer_count().await, 1);
         node.shutdown().await.unwrap();
+    }
+
+    #[test]
+    fn inbound_pages_share_runtime_admission_and_release_on_completion() {
+        let admission = QueryAdmission::with_runtime_capacity(64 * 1024);
+        let request = QueryPageRequest {
+            max_bytes: 1024,
+            sql: "SELECT key FROM kv".into(),
+            ..Default::default()
+        };
+        let first = reserve_inbound(&admission, &request).unwrap();
+        assert!(reserve_inbound(&admission, &request).is_err());
+        assert_eq!(
+            admission.diagnostics().reserved_runtime_bytes,
+            32 * 1024 + 4096
+        );
+        drop(first);
+        assert_eq!(admission.diagnostics().reserved_runtime_bytes, 0);
+        assert!(reserve_inbound(&admission, &request).is_ok());
     }
 
     fn page() -> (QueryPageRequest, QueryPlan, QueryPageResponse) {

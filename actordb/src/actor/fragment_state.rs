@@ -18,7 +18,7 @@ use super::protocol::{
     ApplyDurability, ApplyError, ApplyOutcome, ReplicatedOp, SnapshotSummary, SummaryPage,
     VersionedPage, VersionedValue,
 };
-use super::scan::{KeyMatcher, ScanMatch, ScanSpec, ValueTransform};
+use super::scan::{ScanMatch, ScanSpec};
 use crate::retained::{ByteBudget, BytePermit};
 use crate::shard::FragmentId;
 use crate::store::{KvStore, PersistenceConfig, StoreCommitDurability};
@@ -70,6 +70,9 @@ struct FragmentCache {
     ordered_keys: BTreeSet<String>,
     /// Hash wide payloads once before mutation locks; summaries only copy hashes.
     content_digests: HashMap<String, CachedDigests>,
+    // Exactly one deadline per live TTL winner. Replacements remove the old
+    // entry eagerly, so hot-key updates cannot accumulate stale heap entries.
+    expiry_deadlines: BTreeSet<(u64, String)>,
 }
 
 #[derive(Clone, Copy)]
@@ -92,14 +95,13 @@ impl CachedDigests {
 pub(crate) const EXPIRY_PAGE_VISIT_LIMIT: usize = 256;
 pub(crate) const EXPIRY_PAGE_WORK_BYTES: usize = 1024 * 1024;
 
-/// A weakly consistent, finite periodic pass. The first page captures its
-/// ordered high-water key and cardinality under the same cache write lock.
+/// A weakly consistent, finite pass over deadlines due at a pinned time.
+/// The initial index cardinality bounds insert churn without scanning keys.
 pub(crate) struct ExpiryPass {
     now_ms: u64,
     initialized: bool,
     remaining: usize,
-    after_key: Option<String>,
-    high_water: Option<String>,
+    after_deadline: Option<(u64, String)>,
 }
 
 impl ExpiryPass {
@@ -108,8 +110,7 @@ impl ExpiryPass {
             now_ms,
             initialized: false,
             remaining: 0,
-            after_key: None,
-            high_water: None,
+            after_deadline: None,
         }
     }
 }
@@ -120,6 +121,7 @@ pub(crate) struct ExpiryPage {
     pub(crate) converted: usize,
     pub(crate) work_bytes: usize,
     pub(crate) done: bool,
+    saturated: bool,
 }
 
 fn expiry_record_work_bytes(
@@ -186,11 +188,21 @@ impl FragmentState {
             .iter()
             .map(|(key, value)| (key.clone(), CachedDigests::new(value)))
             .collect();
+        let expiry_deadlines = cache
+            .iter()
+            .filter_map(|(key, value)| {
+                (!value.is_tombstone)
+                    .then_some(value.expires_at_ms)
+                    .flatten()
+                    .map(|deadline| (deadline, key.clone()))
+            })
+            .collect();
         Self {
             cache: RwLock::new(FragmentCache {
                 values: cache,
                 ordered_keys,
                 content_digests,
+                expiry_deadlines,
             }),
             kvstore,
             revision: AtomicU64::new(0),
@@ -285,7 +297,8 @@ impl FragmentState {
     /// cache lock ensures that concurrent
     /// workers cannot enqueue versions in a different order from the cache
     /// merge. This matters across priority pools, where the same key can be
-    /// handled by different workers.
+    /// handled by different workers. Incoming TTL is evaluated after these
+    /// locks are acquired; normalization is not a cleanup callback event.
     ///
     /// An equal full LWW tuple with a different payload or expiry deadline is a
     /// [`ApplyError::VersionConflict`]. This rejects the operation before changing
@@ -298,38 +311,41 @@ impl FragmentState {
                 "key/value cannot fit every required peer frame: {error}"
             ))
         })?;
-        let expired = op.value.is_expired(now_ms());
-        let expiry_tombstone;
-        let value = if expired {
-            expiry_tombstone = op.value.expiry_tombstone();
-            &expiry_tombstone
-        } else {
-            &op.value
-        };
-
-        let digests = CachedDigests::new(value);
+        // Hash the raw payload before lock waits; TTL selection only copies
+        // its cached live/expired digests inside the mutation critical section.
+        let digests = CachedDigests::new(&op.value);
         if self.kvstore.is_none() {
             let mut cache = self.cache.write().await;
+            Self::check_version_conflict(&cache, &op.key, &op.value)?;
+            let expired = op.value.is_expired(now_ms());
+            let tombstone = expired.then(|| op.value.expiry_tombstone());
+            let value = tombstone.as_ref().unwrap_or(&op.value);
+            let mut selected_digests = digests;
             if expired {
-                Self::check_version_conflict(&cache, &op.key, &op.value)?;
+                selected_digests.expire();
             }
-            let outcome = Self::merge_cache(&mut cache, &op.key, value, digests)?;
+            let outcome = Self::merge_cache(&mut cache, &op.key, value, selected_digests)?;
             if outcome == ApplyOutcome::Applied {
                 self.revision.fetch_add(1, Ordering::Release);
             }
             return Ok(Self::reported_outcome(outcome, expired));
         }
 
-        let (outcome, should_flush) = {
-            // Keep the winning cache mutation and its durable enqueue
-            // adjacent, with no await point between them. Flushes may take a
-            // batch before or after this critical section, never halfway
-            // through it.
+        let (outcome, expired, should_flush) = {
+            // Preserve raw and normalized conflict checks before persistence
+            // admission. Nothing mutates or awaits after acquiring both locks
+            // until the winning merge, durable enqueue, and revision agree.
             let mut flush = self.flush.lock().await;
             let mut cache = self.cache.write().await;
-            // Raw equal-version conflicts must precede normalization-driven
-            // persistence admission, including an already-expired input.
             Self::check_version_conflict(&cache, &op.key, &op.value)?;
+            let expired = op.value.is_expired(now_ms());
+            let tombstone = expired.then(|| op.value.expiry_tombstone());
+            let value = tombstone.as_ref().unwrap_or(&op.value);
+            let mut selected_digests = digests;
+            if expired {
+                selected_digests.expire();
+                Self::check_version_conflict(&cache, &op.key, value)?;
+            }
             let winning = cache
                 .values
                 .get(&op.key)
@@ -342,15 +358,14 @@ impl FragmentState {
                 );
                 return Err(ApplyError::Backpressure);
             }
-            let outcome = Self::merge_cache(&mut cache, &op.key, value, digests)?;
+            let outcome = Self::merge_cache(&mut cache, &op.key, value, selected_digests)?;
             if outcome != ApplyOutcome::Applied {
                 return Ok(Self::reported_outcome(outcome, expired));
             }
             self.revision.fetch_add(1, Ordering::Release);
             let should_flush = flush.should_flush(self.flush_batch_size, self.flush_interval);
-            (outcome, should_flush)
+            (outcome, expired, should_flush)
         };
-
         if should_flush {
             self.flush()
                 .await
@@ -400,6 +415,16 @@ impl FragmentState {
                     is_tombstone: existing.is_tombstone,
                 });
             }
+            if !existing.is_tombstone {
+                if let Some(deadline) = existing.expires_at_ms {
+                    cache.expiry_deadlines.remove(&(deadline, key.to_owned()));
+                }
+            }
+            if !value.is_tombstone {
+                if let Some(deadline) = value.expires_at_ms {
+                    cache.expiry_deadlines.insert((deadline, key.to_owned()));
+                }
+            }
             *existing = value.clone();
             cache.content_digests.insert(key.to_string(), digests);
             Ok(ApplyOutcome::Applied)
@@ -407,6 +432,11 @@ impl FragmentState {
             let key = key.to_string();
             cache.ordered_keys.insert(key.clone());
             cache.content_digests.insert(key.clone(), digests);
+            if !value.is_tombstone {
+                if let Some(deadline) = value.expires_at_ms {
+                    cache.expiry_deadlines.insert((deadline, key.clone()));
+                }
+            }
             cache.values.insert(key, value.clone());
             Ok(ApplyOutcome::Applied)
         }
@@ -539,66 +569,103 @@ impl FragmentState {
             .cloned()
     }
 
-    /// Scan the fragment's local cache, returning transformed matches.
+    /// Scan through bounded, revision-guarded pages in lexicographic order.
     ///
-    /// Single fused pass under one read lock: filter (key matcher, then
-    /// [`get`](Self::get)-style visibility — tombstones and TTL-expired
-    /// values are hidden) and transform happen inline, and only matches are
-    /// materialized. Never clone-then-filter.
-    ///
-    /// Matches are returned in lexicographic key order (the fragment's
-    /// ordered key index), so [`ScanSpec::offset`] pagination is stable as
-    /// long as the key set does not change between pages. At most
-    /// [`ScanSpec::effective_limit`](crate::actor::ScanSpec::effective_limit)
-    /// matches are returned.
-    ///
-    /// The read lock is held for the whole pass: concurrent writes to this
-    /// fragment pause for the scan's duration (reads do not). Keep `limit`
-    /// tight; chunked scans are a future follow-up.
-    pub async fn scan(&self, spec: &ScanSpec) -> Vec<ScanMatch> {
-        let now = now_ms();
-        let limit = spec.effective_limit();
-        let cache = self.cache.read().await;
+    /// The per-fragment offset and effective limit are preserved. Cache locks
+    /// are released between pages. The complete scan fails on a concurrent
+    /// mutation, one million visited records, or a 16 MiB result/work budget;
+    /// partial results are never returned. Use key/prefix transforms for wide
+    /// values. Already expired values and tombstones remain invisible.
+    pub async fn scan(&self, spec: &ScanSpec) -> Result<Vec<ScanMatch>, String> {
+        use crate::proto::{QueryPageRequest, QueryPageStatus};
+        use crate::query::{cell_to_value, QueryOptions, QueryPageWork};
+        use actordb_query::QueryValue;
+        let plan = Arc::new(spec.query_plan(None));
+        let options = QueryOptions::default();
+        let mut req = QueryPageRequest {
+            max_rows: 256,
+            max_bytes: options.page_bytes as u32,
+            max_visits: options.page_visits as u32,
+            ..Default::default()
+        };
         let mut out = Vec::new();
-        let mut skipped: u64 = 0;
-        // Lexicographic order via the ordered key index: deterministic
-        // results, stable offset pagination.
-        for key in cache.ordered_keys.iter() {
-            let Some(value) = cache.values.get(key) else {
-                continue;
-            };
-            // Same visibility as `get`: tombstones and expired values are
-            // not matches.
-            if value.is_tombstone || value.is_expired(now) {
-                continue;
+        let mut skipped = 0u64;
+        let mut visited = 0u64;
+        let mut retained = 0usize;
+        // Reserve framing metadata before constructing owning result copies.
+        let mut encoded = 4096usize;
+        loop {
+            let remaining = options.max_scanned_rows.saturating_sub(visited);
+            if remaining == 0 {
+                return Err("scan visited record budget exceeded".into());
             }
-            let matched = match &spec.matcher {
-                KeyMatcher::All => true,
-                KeyMatcher::Prefix(prefix) => key.as_bytes().starts_with(prefix),
-            };
-            if !matched {
-                continue;
+            req.max_visits = (options.page_visits as u64).min(remaining) as u32;
+            req.max_rows = (spec
+                .effective_limit()
+                .saturating_sub(out.len() as u64)
+                .saturating_add(spec.offset.saturating_sub(skipped)))
+            .min(256) as u32;
+            // Page projection clones remain bounded in addition to the retained
+            // reply; reject a projected row before copying a full wide value.
+            let work = QueryPageWork::new(plan.clone(), req.clone());
+            let page = self.query_page(&work).await;
+            if page.status != QueryPageStatus::Ok as i32 {
+                return Err(page.error);
             }
-            if skipped < spec.offset {
-                skipped += 1;
-                continue;
-            }
-            let transformed = match spec.transform {
-                ValueTransform::Identity => value.value.clone(),
-                ValueTransform::KeyOnly => Vec::new(),
-                ValueTransform::PrefixBytes(n) => {
-                    value.value[..value.value.len().min(n as usize)].to_vec()
+            visited += u64::from(page.visited);
+            for row in page.rows {
+                if skipped < spec.offset {
+                    skipped += 1;
+                    continue;
                 }
-            };
-            out.push(ScanMatch {
-                key: key.clone(),
-                value: transformed,
-            });
-            if out.len() as u64 >= limit {
-                break;
+                let mut cells = row.cells.into_iter().map(cell_to_value);
+                let Some(Ok(QueryValue::Text(key))) = cells.next() else {
+                    return Err("scan key projection".into());
+                };
+                let value = match cells.next() {
+                    Some(Ok(QueryValue::Bytes(bytes))) => bytes,
+                    None => Vec::new(),
+                    _ => return Err("scan value projection".into()),
+                };
+                retained = retained
+                    .saturating_add(key.capacity())
+                    .saturating_add(value.capacity());
+                let row_wire = crate::wire::bytes_field_len(1, key.len())
+                    .saturating_add(crate::wire::bytes_field_len(2, value.len()));
+                encoded = encoded.saturating_add(crate::wire::message_field_len(2, row_wire));
+                // Vec growth can allocate up to twice the next cardinality.
+                let storage = retained.saturating_add(
+                    (out.len() + 1)
+                        .saturating_mul(2)
+                        .saturating_mul(std::mem::size_of::<ScanMatch>()),
+                );
+                if storage > options.max_result_bytes || encoded > crate::wire::MAX_FRAME_BYTES {
+                    return Err("scan result byte budget exceeded".into());
+                }
+                out.push(ScanMatch { key, value });
             }
+            if page.done || out.len() as u64 == spec.effective_limit() {
+                // Fence the final accepted contribution, including a truncated
+                // page. Holding no lock across awaits avoids long read stalls.
+                req.continuation = true;
+                req.revision = page.revision;
+                req.snapshot_time_ms = page.snapshot_time_ms;
+                req.incarnation = page.incarnation;
+                req.after_key = page.next_after_key;
+                req.verify_only = true;
+                let verify = self.query_page(&QueryPageWork::new(plan, req)).await;
+                if verify.status != QueryPageStatus::Ok as i32 {
+                    return Err(verify.error);
+                }
+                return Ok(out);
+            }
+            req.continuation = true;
+            req.revision = page.revision;
+            req.snapshot_time_ms = page.snapshot_time_ms;
+            req.incarnation = page.incarnation;
+            req.after_key = page.next_after_key;
+            tokio::task::yield_now().await;
         }
-        out
     }
 
     /// Read a revision-guarded page through the background worker pool.
@@ -614,8 +681,6 @@ impl FragmentState {
             QUERY_WORK_BYTES,
         };
         use actordb_query::{AggregateInput, Projection, QueryAccumulator};
-        use std::ops::Bound::{Excluded, Unbounded};
-
         let req = &work.request;
         let plan = &work.plan;
         if let Err(error) = plan.validate() {
@@ -693,12 +758,17 @@ impl FragmentState {
         if req.verify_only || !plan.matches_fragment(req.fragment) {
             return page;
         }
-        let lower = if req.continuation {
-            Excluded(req.after_key.clone())
-        } else {
-            Unbounded
-        };
-        let mut keys = cache.ordered_keys.range((lower, Unbounded)).peekable();
+        let bounds = crate::query::query_key_bounds(
+            plan,
+            req.continuation.then_some(req.after_key.as_str()),
+        )
+        .unwrap_or_else(|| {
+            (
+                std::ops::Bound::Included(String::new()),
+                std::ops::Bound::Excluded(String::new()),
+            )
+        });
+        let mut keys = cache.ordered_keys.range(bounds).peekable();
         let mut accumulator = QueryAccumulator::new(plan);
         while let Some(key) = keys.peek().copied() {
             if page.visited as usize == max_visits
@@ -1035,91 +1105,23 @@ impl FragmentState {
         0
     }
 
-    /// Convert all expired live values to durable expiry tombstones. Returns
-    /// the number converted. Cache replacement and persistence enqueueing use
-    /// the same lock order as normal writes, preserving their shared order.
+    /// Convert all due live values to durable expiry tombstones using the
+    /// deadline index. Non-TTL values and retained tombstones are never visited.
+    /// Locks are released between bounded pages; concurrent writes may change
+    /// the finite pass. Persistence admission failure keeps the deadline indexed
+    /// and returns an error so shutdown can retry its final expiry fence.
     pub async fn expire_values(&self, now_ms: u64) -> Result<usize, ActorProcessingErr> {
-        if self.kvstore.is_none() {
-            let mut cache = self.cache.write().await;
-            let mut converted = 0;
-            let FragmentCache {
-                values,
-                content_digests,
-                ..
-            } = &mut *cache;
-            for (key, value) in values.iter_mut() {
-                if value.is_expired(now_ms) {
-                    content_digests
-                        .get_mut(key)
-                        .expect("cache digest exists")
-                        .expire();
-                    let tombstone = value.expiry_tombstone();
-                    if self.expiry_publisher.is_some() {
-                        let previous_value = std::mem::replace(value, tombstone);
-                        // Nonwaiting admission under the mutation lock preserves
-                        // fragment order. User code runs in a separate task.
-                        self.publish_expiry(key, previous_value);
-                    } else {
-                        *value = tombstone;
-                    }
-                    converted += 1;
-                }
+        let mut pass = ExpiryPass::new(now_ms);
+        let mut converted = 0usize;
+        let mut saturated = false;
+        loop {
+            let page = self.expire_values_page(&mut pass).await?;
+            converted = converted.saturating_add(page.converted);
+            saturated |= page.saturated;
+            if page.done {
+                break;
             }
-            if converted != 0 {
-                self.revision.fetch_add(
-                    u64::try_from(converted).unwrap_or(u64::MAX),
-                    Ordering::Release,
-                );
-            }
-            return Ok(converted);
-        }
-
-        let (converted, should_flush, saturated) = {
-            let mut flush = self.flush.lock().await;
-            let mut cache = self.cache.write().await;
-            let mut converted = 0;
-            let mut saturated = false;
-            let FragmentCache {
-                values,
-                content_digests,
-                ..
-            } = &mut *cache;
-            for (key, value) in values.iter_mut() {
-                if value.is_expired(now_ms) {
-                    let tombstone = value.expiry_tombstone();
-                    if !flush.enqueue(key, &tombstone) {
-                        saturated = true;
-                        continue;
-                    }
-                    content_digests
-                        .get_mut(key)
-                        .expect("cache digest exists")
-                        .expire();
-                    let previous_value = if self.expiry_publisher.is_some() {
-                        Some(std::mem::replace(value, tombstone.clone()))
-                    } else {
-                        *value = tombstone.clone();
-                        None
-                    };
-                    if let Some(previous_value) = previous_value {
-                        self.publish_expiry(key, previous_value);
-                    }
-                    converted += 1;
-                }
-            }
-            if converted != 0 {
-                self.revision.fetch_add(
-                    u64::try_from(converted).unwrap_or(u64::MAX),
-                    Ordering::Release,
-                );
-            }
-            let should_flush =
-                converted > 0 && flush.should_flush(self.flush_batch_size, self.flush_interval);
-            (converted, should_flush || saturated, saturated)
-        };
-
-        if should_flush {
-            self.flush().await?;
+            tokio::task::yield_now().await;
         }
         if saturated {
             return Err(ActorProcessingErr::from(
@@ -1129,31 +1131,25 @@ impl FragmentState {
         Ok(converted)
     }
 
-    /// Periodic maintenance only; authoritative shutdown still uses the full
-    /// public sweep. Every visited current value counts, including non-TTL
-    /// records. One terminal record may cross the soft work-byte target.
+    /// Visit at most 256 due deadlines under one cache write lock. One terminal
+    /// record may cross the soft work-byte target. Successful conversion removes
+    /// the deadline while retaining the tombstone's key/version floor forever.
     pub(crate) async fn expire_values_page(
         &self,
         pass: &mut ExpiryPass,
     ) -> Result<ExpiryPage, ActorProcessingErr> {
+        use std::ops::Bound::{Excluded, Unbounded};
         let (page, should_flush) = {
-            // Preserve normal apply's lock order and adjacent cache/enqueue/
-            // revision publication. No await occurs after the cache is locked.
+            // Shared ordering with apply: reserve persistence before installing
+            // a tombstone, then publish its revision/callback without an await.
             let mut flush = if self.kvstore.is_some() {
                 Some(self.flush.lock().await)
             } else {
                 None
             };
             let mut cache = self.cache.write().await;
-            let mut initial_work = 0usize;
             if !pass.initialized {
-                pass.remaining = cache.ordered_keys.len();
-                pass.high_water = cache.ordered_keys.last().cloned();
-                if let Some(high_water) = &pass.high_water {
-                    // Charge this single pass-metadata clone to the first
-                    // visited record, including an oversized first record.
-                    initial_work = std::mem::size_of::<String>().saturating_add(high_water.len());
-                }
+                pass.remaining = cache.expiry_deadlines.len();
                 pass.initialized = true;
             }
             let mut page = ExpiryPage {
@@ -1161,61 +1157,68 @@ impl FragmentState {
                 converted: 0,
                 work_bytes: 0,
                 done: pass.remaining == 0,
+                saturated: false,
             };
-            let mut next_cursor = None;
-            let mut exhausted = false;
-            if let Some(high_water) = pass.high_water.as_deref().filter(|_| !page.done) {
-                use std::ops::Bound::{Excluded, Included, Unbounded};
-                let lower = pass.after_key.as_deref().map_or(Unbounded, Excluded);
-                let FragmentCache {
-                    values,
-                    ordered_keys,
-                    content_digests,
-                } = &mut *cache;
-                let mut keys = ordered_keys.range::<str, _>((lower, Included(high_water)));
-                let limit = pass.remaining.min(EXPIRY_PAGE_VISIT_LIMIT);
-                while page.visited < limit
-                    && (page.visited == 0 || page.work_bytes < EXPIRY_PAGE_WORK_BYTES)
+            let limit = pass.remaining.min(EXPIRY_PAGE_VISIT_LIMIT);
+            while page.visited < limit
+                && (page.visited == 0 || page.work_bytes < EXPIRY_PAGE_WORK_BYTES)
+            {
+                let lower = pass.after_deadline.as_ref().map_or(Unbounded, Excluded);
+                let Some(entry) = cache
+                    .expiry_deadlines
+                    .range((lower, Unbounded))
+                    .next()
+                    .filter(|(deadline, _)| *deadline <= pass.now_ms)
+                    .cloned()
+                else {
+                    page.done = true;
+                    break;
+                };
+                let (deadline, key) = &entry;
+                let value = cache
+                    .values
+                    .get_mut(key)
+                    .expect("indexed deadline has a value");
+                debug_assert_eq!(value.expires_at_ms, Some(*deadline));
+                debug_assert!(value.is_expired(pass.now_ms));
+                let charge = expiry_record_work_bytes(key, value, true, flush.is_some())
+                    .saturating_add(std::mem::size_of::<(u64, String)>());
+                page.work_bytes = page.work_bytes.saturating_add(charge);
+                page.visited += 1;
+                let tombstone = value.expiry_tombstone();
+                if flush
+                    .as_mut()
+                    .is_some_and(|flush| !flush.enqueue(key, &tombstone))
                 {
-                    let Some(key) = keys.next() else {
-                        exhausted = true;
-                        break;
-                    };
-                    let value = values.get_mut(key).expect("ordered cache key has a value");
-                    let expired = value.is_expired(pass.now_ms);
-                    let charge = expiry_record_work_bytes(key, value, expired, flush.is_some())
-                        .saturating_add(std::mem::take(&mut initial_work));
-                    page.work_bytes = page.work_bytes.saturating_add(charge);
-                    page.visited += 1;
-                    next_cursor = Some(key.clone());
-                    if expired {
-                        let tombstone = value.expiry_tombstone();
-                        let previous_value = if let Some(flush) = &mut flush {
-                            if !flush.enqueue(key, &tombstone) {
-                                continue;
-                            }
-                            self.install_expiry(value, tombstone)
-                        } else {
-                            self.install_expiry(value, tombstone)
-                        };
-                        content_digests
-                            .get_mut(key)
-                            .expect("cache digest exists")
-                            .expire();
-                        if let Some(previous_value) = previous_value {
-                            self.publish_expiry(key, previous_value);
-                        }
-                        page.converted += 1;
-                    }
+                    page.saturated = true;
+                    pass.after_deadline = Some(entry);
+                    continue;
                 }
+                let previous_value = self.install_expiry(value, tombstone);
+                cache
+                    .content_digests
+                    .get_mut(key)
+                    .expect("cache digest exists")
+                    .expire();
+                if let Some(previous_value) = previous_value {
+                    self.publish_expiry(key, previous_value);
+                }
+                cache.expiry_deadlines.remove(&entry);
+                pass.after_deadline = Some(entry);
+                page.converted += 1;
             }
             pass.remaining -= page.visited;
-            if let Some(cursor) = next_cursor {
-                pass.after_key = Some(cursor);
+            page.done |= pass.remaining == 0;
+            // A quota larger than the due set must finish on this page, even
+            // when the page ends exactly at a visit/work boundary.
+            if !page.done {
+                let lower = pass.after_deadline.as_ref().map_or(Unbounded, Excluded);
+                page.done = cache
+                    .expiry_deadlines
+                    .range((lower, Unbounded))
+                    .next()
+                    .is_none_or(|(deadline, _)| *deadline > pass.now_ms);
             }
-            page.done |= exhausted
-                || pass.remaining == 0
-                || pass.after_key.as_deref() == pass.high_water.as_deref();
             if page.done {
                 pass.remaining = 0;
             }
@@ -1225,10 +1228,11 @@ impl FragmentState {
                     Ordering::Release,
                 );
             }
-            let should_flush = page.converted > 0
-                && flush.as_ref().is_some_and(|flush| {
-                    flush.should_flush(self.flush_batch_size, self.flush_interval)
-                });
+            let should_flush = page.saturated
+                || (page.converted > 0
+                    && flush.as_ref().is_some_and(|flush| {
+                        flush.should_flush(self.flush_batch_size, self.flush_interval)
+                    }));
             (page, should_flush)
         };
         if should_flush {
@@ -2320,7 +2324,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn expiry_pages_bound_visits_even_for_sparse_non_ttl_cache_and_empty_key() {
+    async fn expiry_pages_ignore_non_ttl_tombstones_and_future_deadlines() {
         let mut values = HashMap::with_capacity(100_000);
         values.insert(String::new(), VersionedValue::new(vec![], 1, "n".into()));
         for i in 0..600 {
@@ -2333,20 +2337,41 @@ mod tests {
         let mut pass = ExpiryPass::new(100);
         let first = state.expire_values_page(&mut pass).await.unwrap();
         assert_eq!(
-            (first.visited, first.converted, first.done),
-            (256, 0, false)
+            (first.visited, first.converted, first.work_bytes, first.done),
+            (0, 0, 0, true)
         );
-        assert_eq!(pass.after_key.as_deref(), Some("k0254"));
-        let second = state.expire_values_page(&mut pass).await.unwrap();
-        assert_eq!(
-            (second.visited, second.converted, second.done),
-            (256, 0, false)
-        );
-        let third = state.expire_values_page(&mut pass).await.unwrap();
-        assert_eq!((third.visited, third.converted, third.done), (89, 0, true));
         assert_eq!(state.revision.load(Ordering::Acquire), 0);
         assert_eq!(
             state.expire_values_page(&mut pass).await.unwrap().visited,
+            0
+        );
+        let tombstones = (0..10_000)
+            .map(|i| {
+                (
+                    format!("deleted:{i}"),
+                    VersionedValue::tombstone(1, "n".into()),
+                )
+            })
+            .collect();
+        let state = test_state(tombstones);
+        assert_eq!(
+            state
+                .expire_values_page(&mut ExpiryPass::new(u64::MAX))
+                .await
+                .unwrap()
+                .visited,
+            0
+        );
+        let state = test_state(HashMap::from([(
+            "future".into(),
+            expiring_value(vec![1], 101),
+        )]));
+        assert_eq!(
+            state
+                .expire_values_page(&mut ExpiryPass::new(100))
+                .await
+                .unwrap()
+                .visited,
             0
         );
 
@@ -2366,7 +2391,10 @@ mod tests {
         let mut pass = ExpiryPass::new(100);
         let page = empty_key.expire_values_page(&mut pass).await.unwrap();
         assert_eq!((page.visited, page.converted, page.done), (1, 1, true));
-        assert_eq!(pass.after_key.as_deref(), Some(""));
+        assert_eq!(
+            pass.after_deadline.as_ref().map(|(_, key)| key.as_str()),
+            Some("")
+        );
     }
 
     #[tokio::test]
@@ -2384,7 +2412,7 @@ mod tests {
         assert_eq!((page.visited, page.converted, page.done), (1, 1, false));
         assert_eq!(
             page.work_bytes,
-            oversized_charge + std::mem::size_of::<String>() + 1
+            oversized_charge + std::mem::size_of::<(u64, String)>()
         );
         assert!(page.work_bytes >= EXPIRY_PAGE_WORK_BYTES);
         assert_eq!(
@@ -2401,7 +2429,10 @@ mod tests {
         let mut pass = ExpiryPass::new(100);
         let page = state.expire_values_page(&mut pass).await.unwrap();
         assert_eq!((page.visited, page.converted, page.done), (2, 2, false));
-        assert_eq!(pass.after_key.as_deref(), Some("b"));
+        assert_eq!(
+            pass.after_deadline.as_ref().map(|(_, key)| key.as_str()),
+            Some("b")
+        );
         assert_eq!(
             state.expire_values_page(&mut pass).await.unwrap().visited,
             1
@@ -2438,8 +2469,8 @@ mod tests {
         assert_eq!(apply_future.await.unwrap(), ApplyOutcome::Applied);
         let before_second = state.revision.load(Ordering::Acquire);
         let second = next_page.await.unwrap();
-        assert_eq!((second.visited, second.converted), (256, 254));
-        assert_eq!(state.revision.load(Ordering::Acquire), before_second + 254);
+        assert_eq!((second.visited, second.converted), (256, 256));
+        assert_eq!(state.revision.load(Ordering::Acquire), before_second + 256);
         assert_eq!(state.cache.read().await.values.get("k0256"), Some(&winner));
         assert!(!state.cache.read().await.values["k0257"].is_tombstone);
         let summary = state
@@ -2467,14 +2498,12 @@ mod tests {
                 .apply(&test_op(key, expiring_value(vec![2], u64::MAX)))
                 .await
                 .unwrap();
-            state
-                .cache
-                .write()
-                .await
-                .values
-                .get_mut(key)
-                .unwrap()
-                .expires_at_ms = Some(100);
+            let mut cache = state.cache.write().await;
+            cache.expiry_deadlines.remove(&(u64::MAX, key.to_owned()));
+            cache.values.get_mut(key).unwrap().expires_at_ms = Some(100);
+            let digests = CachedDigests::new(&cache.values[key]);
+            cache.content_digests.insert(key.to_owned(), digests);
+            cache.expiry_deadlines.insert((100, key.to_owned()));
         }
         let page = state.expire_values_page(&mut pass).await.unwrap();
         assert_eq!((page.visited, page.converted, page.done), (44, 44, true));
@@ -2511,7 +2540,10 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("injected failure"));
-        assert_eq!(pass.after_key.as_deref(), Some("key"));
+        assert_eq!(
+            pass.after_deadline.as_ref().map(|(_, key)| key.as_str()),
+            Some("key")
+        );
         assert_eq!(
             state.cache.read().await.values["key"],
             value.expiry_tombstone()
@@ -2565,7 +2597,7 @@ mod tests {
             .expire_values_page(&mut ExpiryPass::new(100))
             .await
             .unwrap();
-        assert_eq!((page.visited, page.converted, page.done), (1, 0, true));
+        assert_eq!((page.visited, page.converted, page.done), (0, 0, true));
         let winner = VersionedValue::new(vec![2], 11, "writer".into());
         state.apply(&test_op("key", winner.clone())).await.unwrap();
         assert_eq!(
@@ -2879,8 +2911,8 @@ mod query_page_tests {
         use crate::actor::{KvMessage, KvWorker, KvWorkerArgs};
         use ractor::Actor;
         let state = Arc::new(query_state(["a".into()]));
-        let admission = crate::query::QueryAdmission::new();
-        let retention = admission.reserve(1024).unwrap();
+        let admission = crate::query::QueryAdmission::with_runtime_capacity(64 * 1024);
+        let retention = admission.reserve_work(1024, 64 * 1024).unwrap();
         let weak = Arc::downgrade(&retention);
         let (worker, handle) = Actor::spawn(
             None,
@@ -2906,34 +2938,28 @@ mod query_page_tests {
         tokio::time::sleep(Duration::from_millis(10)).await;
         drop(response);
         assert!(weak.upgrade().is_some());
+        assert_eq!(admission.diagnostics().reserved_runtime_bytes, 64 * 1024);
+        assert!(admission.reserve_work(1024, 1).is_err());
         drop(cache);
         crate::common_test::periodic_check(|| weak.upgrade().is_none(), Duration::from_secs(2))
             .await;
         assert!(weak.upgrade().is_none());
+        assert_eq!(admission.diagnostics().reserved_runtime_bytes, 0);
+        assert!(admission.reserve_work(1024, 64 * 1024).is_ok());
         worker.stop(None);
         handle.await.unwrap();
     }
 
     #[tokio::test]
-    async fn sparse_query_pages_advance_through_nonmatches() {
+    async fn sparse_query_pages_seek_past_nonmatching_prefixes() {
         let state = query_state((0..600).map(|n| format!("a{n:04}")).chain(["z-hit".into()]));
-        let mut work = work("SELECT key FROM kv WHERE STARTS_WITH(key, 'z')", 256);
-        let first = state.query_page(&work).await;
-        assert_eq!(first.status, QueryPageStatus::Ok as i32);
-        assert_eq!(first.visited, 256);
-        assert!(!first.done);
-        assert!(first.rows.is_empty());
-        resume(&mut work, &first);
-        let second = state.query_page(&work).await;
-        assert_eq!(second.visited, 256);
-        assert!(second.next_after_key > first.next_after_key);
-        assert!(!second.done);
-        resume(&mut work, &second);
-        let third = state.query_page(&work).await;
-        assert!(third.done);
-        assert_eq!(third.visited, 89);
-        assert_eq!(third.rows.len(), 1);
-        assert_eq!(third.rows[0].key, "z-hit");
+        let work = work("SELECT key FROM kv WHERE STARTS_WITH(key, 'z')", 256);
+        let page = state.query_page(&work).await;
+        assert_eq!(page.status, QueryPageStatus::Ok as i32);
+        assert!(page.done);
+        assert_eq!(page.visited, 1);
+        assert_eq!(page.rows.len(), 1);
+        assert_eq!(page.rows[0].key, "z-hit");
     }
 
     #[tokio::test]
@@ -3362,5 +3388,203 @@ mod expiry_callback_tests {
         gate.notify_one();
         runtime.shutdown().await;
         assert_eq!(runtime.diagnostics().delivered_events, 1);
+    }
+}
+
+#[cfg(test)]
+mod apply_expiry_contention_tests {
+    use super::flush_tests::FlakyStore;
+    use super::*;
+    use std::sync::Mutex as StdMutex;
+
+    #[tokio::test]
+    async fn apply_normalizes_ttl_after_cache_and_flush_contention() {
+        for durable in [false, true] {
+            for contend_on_flush in [false, true] {
+                if contend_on_flush && !durable {
+                    continue;
+                }
+                let store = Arc::new(FlakyStore {
+                    failures_left: StdMutex::new(0),
+                    written: StdMutex::new(Vec::new()),
+                });
+                let state = FragmentState::new(
+                    HashMap::new(),
+                    durable.then(|| store.clone() as Arc<dyn KvStore>),
+                    usize::MAX,
+                    Duration::from_secs(3600),
+                );
+                let cache_guard = if contend_on_flush {
+                    None
+                } else {
+                    Some(state.cache.write().await)
+                };
+                let flush_guard = if contend_on_flush {
+                    Some(state.flush.lock().await)
+                } else {
+                    None
+                };
+                let mut value = VersionedValue::new(b"payload".to_vec(), now_ms(), "n1".into());
+                let deadline = now_ms() + 30;
+                value.expires_at_ms = Some(deadline);
+                let op = ReplicatedOp {
+                    key: "ttl".into(),
+                    value: value.clone(),
+                    seq: 0,
+                    boot_id: 0,
+                };
+                let apply = state.apply(&op);
+                tokio::pin!(apply);
+                assert!(futures::poll!(&mut apply).is_pending());
+                while now_ms() < deadline {
+                    tokio::time::sleep(Duration::from_millis(2)).await;
+                }
+                drop(cache_guard);
+                drop(flush_guard);
+                assert_eq!(apply.await.unwrap(), ApplyOutcome::Expired);
+                assert_eq!(
+                    state.get_versioned("ttl", None).await,
+                    Some(value.expiry_tombstone())
+                );
+                {
+                    let cache = state.cache.read().await;
+                    assert!(cache.values["ttl"].is_tombstone);
+                    assert!(cache.expiry_deadlines.is_empty());
+                    assert_eq!(
+                        cache.content_digests["ttl"].live,
+                        value.expiry_tombstone().content_digest()
+                    );
+                }
+                assert_eq!(state.expire_values(now_ms()).await.unwrap(), 0);
+                if durable {
+                    state.flush().await.unwrap();
+                    assert_eq!(
+                        store.written.lock().unwrap().as_slice(),
+                        &[(b"ttl".to_vec(), value.expiry_tombstone())]
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn conflicting_ttl_crossing_cache_wait_leaves_cache_index_and_backlog_unchanged() {
+        for durable in [false, true] {
+            let store = Arc::new(FlakyStore {
+                failures_left: StdMutex::new(0),
+                written: StdMutex::new(Vec::new()),
+            });
+            let mut original = VersionedValue::new(b"original".to_vec(), now_ms(), "n1".into());
+            let deadline = now_ms() + 30;
+            original.expires_at_ms = Some(deadline);
+            let state = FragmentState::new(
+                HashMap::from([("ttl".into(), original.clone())]),
+                durable.then(|| store.clone() as Arc<dyn KvStore>),
+                usize::MAX,
+                Duration::from_secs(3600),
+            );
+            let cache_guard = state.cache.write().await;
+            let mut conflicting = original.clone();
+            conflicting.value = b"conflicting".to_vec();
+            let op = ReplicatedOp {
+                key: "ttl".into(),
+                value: conflicting,
+                seq: 0,
+                boot_id: 0,
+            };
+            let apply = state.apply(&op);
+            tokio::pin!(apply);
+            assert!(futures::poll!(&mut apply).is_pending());
+            while now_ms() < deadline {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+            drop(cache_guard);
+            assert!(matches!(
+                apply.await,
+                Err(ApplyError::VersionConflict { .. })
+            ));
+            assert_eq!(state.persistence_backlog().await, (0, 0));
+            let cache = state.cache.read().await;
+            assert_eq!(cache.values["ttl"], original);
+            assert_eq!(cache.content_digests["ttl"].live, original.content_digest());
+            assert_eq!(cache.expiry_deadlines.len(), 1);
+            assert!(cache
+                .expiry_deadlines
+                .contains(&(deadline, "ttl".to_owned())));
+            assert_eq!(state.revision.load(Ordering::Acquire), 0);
+            assert!(store.written.lock().unwrap().is_empty());
+        }
+    }
+}
+
+#[cfg(test)]
+mod expiry_index_tests {
+    use super::*;
+    use crate::actor::test_support::test_op;
+
+    #[tokio::test]
+    async fn deadline_index_tracks_only_live_winners_without_hot_key_growth() {
+        let state = FragmentState::new(HashMap::new(), None, 100, Duration::from_secs(1));
+        for version in 1..=500 {
+            let mut value = VersionedValue::new(vec![1], version, "n".into());
+            value.expires_at_ms = Some(u64::MAX - version);
+            state.apply(&test_op("hot", value)).await.unwrap();
+            assert_eq!(state.cache.read().await.expiry_deadlines.len(), 1);
+        }
+        let older = VersionedValue::new(vec![2], 1, "n".into());
+        assert!(matches!(
+            state.apply(&test_op("hot", older)).await.unwrap(),
+            ApplyOutcome::Superseded { .. }
+        ));
+        assert_eq!(state.cache.read().await.expiry_deadlines.len(), 1);
+        let deleted = VersionedValue::tombstone(501, "n".into());
+        state.apply(&test_op("hot", deleted)).await.unwrap();
+        assert!(state.cache.read().await.expiry_deadlines.is_empty());
+        assert_eq!(state.expire_values(u64::MAX).await.unwrap(), 0);
+        assert!(state.cache.read().await.values["hot"].is_tombstone);
+    }
+
+    #[tokio::test]
+    async fn persistence_saturation_retains_due_deadline_for_retry() {
+        use super::flush_tests::FlakyStore;
+        use crate::store::PersistenceConfig;
+        use std::sync::Mutex as StdMutex;
+        let store = Arc::new(FlakyStore {
+            failures_left: StdMutex::new(0),
+            written: StdMutex::new(Vec::new()),
+        });
+        let mut due = VersionedValue::new(vec![1], 1, "n".into());
+        due.expires_at_ms = Some(100);
+        let initial_digest = due.content_digest();
+        let state = FragmentState::new(
+            HashMap::from([("due".into(), due)]),
+            Some(store),
+            usize::MAX,
+            Duration::from_secs(3600),
+        )
+        .with_persistence_config(PersistenceConfig::builder().max_records(1).build())
+        .unwrap();
+        state
+            .apply(&test_op(
+                "live",
+                VersionedValue::new(vec![2], 2, "n".into()),
+            ))
+            .await
+            .unwrap();
+        assert!(state.expire_values(100).await.is_err());
+        assert_eq!(state.cache.read().await.expiry_deadlines.len(), 1);
+        assert!(!state.cache.read().await.values["due"].is_tombstone);
+        assert_eq!(
+            state.cache.read().await.content_digests["due"].live,
+            initial_digest
+        );
+        assert_eq!(state.expire_values(100).await.unwrap(), 1);
+        assert!(state.cache.read().await.expiry_deadlines.is_empty());
+        assert!(state.cache.read().await.values["due"].is_tombstone);
+        let cache = state.cache.read().await;
+        assert_eq!(
+            cache.content_digests["due"].live,
+            cache.values["due"].content_digest()
+        );
     }
 }

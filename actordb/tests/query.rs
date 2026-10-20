@@ -275,3 +275,156 @@ async fn query_budgets_and_bad_numeric_values_fail_explicitly() {
     );
     node.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn selected_key_ranges_charge_only_selected_index_work() {
+    let node = start(
+        "query-seek",
+        NodeConfig {
+            fragment_count: 1,
+            store: Some(loaded_store(10_000, 1)),
+            ..NodeConfig::default()
+        },
+    )
+    .await;
+    for (sql, expected) in [
+        (
+            "SELECT key FROM kv WHERE key = 'record:009999'",
+            vec!["record:009999"],
+        ),
+        (
+            "SELECT key FROM kv WHERE key >= 'record:009997' AND key < 'record:009999'",
+            vec!["record:009997", "record:009998"],
+        ),
+        (
+            "SELECT key FROM kv WHERE key = 'record:009999' AND key < 'record:000000'",
+            vec![],
+        ),
+    ] {
+        let result = node
+            .query_plan_with_options(
+                &parse(sql).unwrap(),
+                QueryOptions {
+                    max_scanned_rows: 3,
+                    page_visits: 1,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            result.rows,
+            expected
+                .into_iter()
+                .map(|key| vec![QueryValue::Text(key.into())])
+                .collect::<Vec<_>>()
+        );
+    }
+    for key in ["雪", "雪:1", "雲"] {
+        node.put(key.into(), b"123".to_vec()).await.unwrap();
+    }
+    for (sql, expected) in [
+        (
+            "SELECT key FROM kv WHERE STARTS_WITH(key, X'e99b')",
+            vec!["雪", "雪:1", "雲"],
+        ),
+        ("SELECT key FROM kv WHERE STARTS_WITH(key, X'ff')", vec![]),
+        (
+            "SELECT key FROM kv WHERE STARTS_WITH(key, X'e9') AND key < 'a'",
+            vec![],
+        ),
+    ] {
+        let result = node
+            .query_plan_with_options(
+                &parse(sql).unwrap(),
+                QueryOptions {
+                    max_scanned_rows: 3,
+                    page_visits: 1,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            result.rows,
+            expected
+                .into_iter()
+                .map(|key| vec![QueryValue::Text(key.into())])
+                .collect::<Vec<_>>()
+        );
+    }
+    let aggregate = node
+        .query("SELECT COUNT(*) FROM kv WHERE key > 'z' AND key < 'a'")
+        .await
+        .unwrap();
+    assert_eq!(aggregate.rows, vec![vec![QueryValue::Integer(0)]]);
+    node.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn many_fragment_heads_merge_in_global_key_order() {
+    let node = start(
+        "query-heap",
+        NodeConfig {
+            fragment_count: 32,
+            store: Some(loaded_store(200, 32)),
+            ..Default::default()
+        },
+    )
+    .await;
+    let result = node
+        .query("SELECT key FROM kv ORDER BY key ASC LIMIT 100 OFFSET 50")
+        .await
+        .unwrap();
+    assert_eq!(
+        result.rows,
+        (50..150)
+            .map(|index| vec![QueryValue::Text(format!("record:{index:06}"))])
+            .collect::<Vec<_>>()
+    );
+    node.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn runtime_allowance_is_configurable_and_visible_in_diagnostics() {
+    use actordb::node::NodeRuntimeOptions;
+    let node = Node::start_with_options(
+        "query-runtime-budget".into(),
+        "127.0.0.1:0".parse().unwrap(),
+        NodeConfig::default(),
+        NodeRuntimeOptions::default().with_query_runtime_byte_capacity(1024 * 1024),
+    )
+    .await
+    .unwrap();
+    let plan = parse("SELECT COUNT(*) FROM kv").unwrap();
+    assert!(matches!(
+        node.query_plan(&plan).await,
+        Err(actordb::query::QueryExecutionError::Backpressure(_))
+    ));
+    let result = node
+        .query_plan_with_options(
+            &plan,
+            QueryOptions {
+                max_result_bytes: 16 * 1024,
+                max_buffer_bytes: 128 * 1024,
+                page_bytes: 1024,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.rows, vec![vec![QueryValue::Integer(0)]]);
+    let diagnostics = node.query_diagnostics();
+    assert_eq!(diagnostics.runtime_byte_capacity, 1024 * 1024);
+    assert_eq!(diagnostics.reserved_runtime_bytes, 0);
+    assert_eq!(diagnostics.admission_rejections, 1);
+    node.shutdown().await.unwrap();
+    assert!(Node::start_with_options(
+        "query-zero".into(),
+        "127.0.0.1:0".parse().unwrap(),
+        NodeConfig::default(),
+        NodeRuntimeOptions::default().with_query_runtime_byte_capacity(0)
+    )
+    .await
+    .is_err());
+}

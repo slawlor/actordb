@@ -24,10 +24,10 @@
 //!
 //! ## Wire size
 //!
-//! The scan response is a single envelope per fragment. The per-fragment
-//! `ScanSpec::limit` bounds it: `limit` × average value size must stay
-//! comfortably under the 16 MiB frame cap. Keep limits tight and prefer
-//! `KeyOnly`/`PrefixBytes` transforms for wide scans.
+//! Embedded scans use bounded query pages with a 16 MiB aggregate result
+//! budget and a one-million-record work budget. Compatibility peer requests
+//! also execute bounded pages before encoding their single response. Wide
+//! replies fail completely; prefer `KeyOnly`/`PrefixBytes` transforms.
 //!
 //! ## Consistency
 //!
@@ -43,14 +43,9 @@ use std::fmt;
 use std::sync::{Arc, RwLock as StdRwLock};
 use std::time::Duration;
 
-use futures::future::join_all;
 use ractor::rpc::CallResult;
-use tokio::sync::oneshot;
 
-use super::{
-    deadline_after, try_send_envelope_until, Node, NodeError, PeerChannel, PendingScan,
-    PendingScanGuard,
-};
+use super::{deadline_after, try_send_envelope_until, Node, NodeError, PeerChannel};
 use crate::actor::{KvMessage, ScanMatch, ScanSpec};
 use crate::proto::{self, Envelope, EnvelopeMsg, ScanResponse};
 use crate::shard::FragmentId;
@@ -101,49 +96,64 @@ impl std::error::Error for ScanError {}
 
 impl Node {
     /// Scan through bounded query pages while retaining the legacy per-fragment
-    /// offset/limit and fragment-order merge. Intended for external client
-    /// listeners; unlike the compatibility `scan`, wide replies fail at a
-    /// 16 MiB aggregate storage budget instead of materializing full fragments.
+    /// offset/limit and fragment-order merge. Replies fail completely at a
+    /// 16 MiB aggregate storage budget or one million visited records.
+    /// Fragment work is sequential, keeping active page copies bounded.
     pub async fn scan_bounded(
         &self,
         spec: &ScanSpec,
     ) -> Result<Vec<ScanMatch>, crate::query::QueryExecutionError> {
-        use crate::actor::{KeyMatcher, ValueTransform};
         use crate::query::{QueryExecutionError, QueryOptions};
-        use actordb_query::{KeyPredicate, Projection, QueryPlan, QueryValue};
+        use actordb_query::QueryValue;
         let _operation = self
             .admit_operation()
             .map_err(|_| QueryExecutionError::ShuttingDown)?;
+        // Covers previously merged rows while each fragment owns its own
+        // page reservation; holding both is deliberately conservative.
+        let request_bytes = match &spec.matcher {
+            crate::actor::KeyMatcher::All => 1024,
+            crate::actor::KeyMatcher::Prefix(prefix) => {
+                prefix.capacity().saturating_mul(2).saturating_add(1024)
+            }
+        };
+        let _runtime = self.query_admission.reserve_work(
+            request_bytes,
+            QueryOptions::default().max_result_bytes + QueryOptions::default().max_buffer_bytes,
+        )?;
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
         tokio::time::timeout_at(deadline, async {
             let mut merged = Vec::new();
             let mut retained = 0usize;
+            let mut retained_payload = 0usize;
+            let mut visited = 0u64;
             for fragment in 0..self.router.fragment_count() {
-                let projections = match spec.transform {
-                    ValueTransform::Identity => vec![Projection::Key, Projection::Value],
-                    ValueTransform::KeyOnly => vec![Projection::Key],
-                    ValueTransform::PrefixBytes(n) => {
-                        vec![Projection::Key, Projection::PrefixBytes(n)]
-                    }
+                let mut plan = spec.query_plan(Some(fragment as u32));
+                plan.limit = Some(spec.effective_limit().min(MAX_SCAN_TOTAL_MATCHES as u64));
+                // Even after the aggregate count cap, validate later fragments
+                // so an unavailable holder never produces silent partial success.
+                if merged.len() == MAX_SCAN_TOTAL_MATCHES {
+                    plan.projections = vec![actordb_query::Projection::Key];
+                }
+                let remaining = if merged.len() == MAX_SCAN_TOTAL_MATCHES {
+                    16 * 1024 * 1024usize
+                } else {
+                    (16 * 1024 * 1024usize).saturating_sub(retained)
                 };
-                let predicates = match &spec.matcher {
-                    KeyMatcher::All => Vec::new(),
-                    KeyMatcher::Prefix(prefix) => vec![KeyPredicate::Prefix(prefix.clone())],
-                };
-                let plan = QueryPlan {
-                    projections,
-                    predicates,
-                    fragments: Some(vec![fragment as u32]),
-                    limit: Some(spec.effective_limit().min(MAX_SCAN_TOTAL_MATCHES as u64)),
-                    offset: spec.offset,
-                };
-                let remaining = (16 * 1024 * 1024usize).saturating_sub(retained);
                 let options = QueryOptions {
                     max_result_bytes: remaining,
+                    max_scanned_rows: 1_000_000u64.saturating_sub(visited),
                     timeout: deadline.saturating_duration_since(tokio::time::Instant::now()),
                     ..Default::default()
                 };
-                let result = self.query_plan_with_options(&plan, options).await?;
+                if options.max_scanned_rows == 0 {
+                    return Err(QueryExecutionError::BudgetExceeded(
+                        "scan visited record limit".into(),
+                    ));
+                }
+                let (result, work) = self
+                    .query_plan_with_options_and_visits(&plan, options)
+                    .await?;
+                visited += work;
                 for row in result.rows {
                     if merged.len() == MAX_SCAN_TOTAL_MATCHES {
                         break;
@@ -161,10 +171,16 @@ impl Node {
                             ))
                         }
                     };
-                    retained = retained
+                    retained_payload = retained_payload
                         .saturating_add(key.capacity())
-                        .saturating_add(value.capacity())
-                        .saturating_add(std::mem::size_of::<ScanMatch>());
+                        .saturating_add(value.capacity());
+                    let capacity = if merged.len() == merged.capacity() {
+                        merged.capacity().saturating_mul(2).max(4)
+                    } else {
+                        merged.capacity()
+                    };
+                    retained = retained_payload
+                        .saturating_add(capacity.saturating_mul(std::mem::size_of::<ScanMatch>()));
                     if retained > 16 * 1024 * 1024 {
                         return Err(QueryExecutionError::BudgetExceeded(
                             "scan result storage".into(),
@@ -183,8 +199,8 @@ impl Node {
     /// and merge the transformed matches.
     ///
     /// This node coordinates: each fragment is scanned once, from a single
-    /// holder — in-process via `KvMessage::Scan` when held locally,
-    /// otherwise via a forwarded `ScanRequest` to the first reachable
+    /// holder — in-process through bounded query pages when held locally,
+    /// otherwise via forwarded query pages to the first reachable
     /// holder in `replica_order` (same pattern as `ForwardedGet`). Remote
     /// holders are retried in order; if none answers, the whole scan fails
     /// with [`ScanError::FragmentsUnavailable`]. v1 never returns partial
@@ -221,192 +237,15 @@ impl Node {
     /// # }
     /// ```
     pub async fn scan(&self, spec: &ScanSpec) -> Result<Vec<ScanMatch>, ScanError> {
-        let _operation = self
-            .admit_operation()
-            .map_err(|_| ScanError::ShuttingDown)?;
-
-        let fragment_count = self.router.fragment_count();
-        let has_placement = !self.fragment_map.read().unwrap().is_empty();
-
-        // Fan out per fragment concurrently; latency is max(fragment),
-        // not sum.
-        let futures = (0..fragment_count).map(|index| {
-            let fragment = FragmentId(index as u32);
-            self.scan_one_fragment(fragment, spec.clone(), has_placement)
-        });
-        let results = join_all(futures).await;
-
-        // Merge. Unavailable fragments fail the whole scan; other errors
-        // propagate immediately. v1 never returns partial results.
-        let mut merged = Vec::new();
-        let mut unavailable = Vec::new();
-        for (index, result) in results.into_iter().enumerate() {
-            match result {
-                Ok(matches) => {
-                    let remaining = MAX_SCAN_TOTAL_MATCHES.saturating_sub(merged.len());
-                    merged.extend(matches.into_iter().take(remaining));
-                }
-                Err(ScanError::FragmentsUnavailable(_)) => {
-                    unavailable.push(FragmentId(index as u32));
-                }
-                Err(error) => return Err(error),
+        use crate::query::QueryExecutionError;
+        self.scan_bounded(spec).await.map_err(|error| match error {
+            QueryExecutionError::FragmentsUnavailable(ids) => {
+                ScanError::FragmentsUnavailable(ids.into_iter().map(FragmentId).collect())
             }
-        }
-        if !unavailable.is_empty() {
-            return Err(ScanError::FragmentsUnavailable(unavailable));
-        }
-        Ok(merged)
-    }
-
-    /// Scan one fragment: in-process when held locally, otherwise forward
-    /// to a replica holder with failover.
-    async fn scan_one_fragment(
-        &self,
-        fragment: FragmentId,
-        spec: ScanSpec,
-        has_placement: bool,
-    ) -> Result<Vec<ScanMatch>, ScanError> {
-        if self.serving.read().unwrap().contains(&fragment) {
-            return self.scan_fragment_local(fragment, &spec).await;
-        }
-        if !has_placement {
-            // No placement map means full replication: every fragment is
-            // local. Not serving here is a misconfiguration.
-            return Err(ScanError::Actor(format!(
-                "fragment {fragment} not served locally and no placement map configured"
-            )));
-        }
-        self.scan_fragment_remote(fragment, &spec).await
-    }
-
-    /// Run the scan against this node's own fragment actor.
-    async fn scan_fragment_local(
-        &self,
-        fragment: FragmentId,
-        spec: &ScanSpec,
-    ) -> Result<Vec<ScanMatch>, ScanError> {
-        let Some(actor) = self.router.route_for_fragment(fragment) else {
-            return Err(ScanError::Actor(format!(
-                "fragment {fragment} is marked serving but has no actor"
-            )));
-        };
-        match actor
-            .call(
-                |reply| KvMessage::Scan {
-                    spec: spec.clone(),
-                    reply,
-                },
-                Some(SCAN_FRAGMENT_TIMEOUT),
-            )
-            .await
-        {
-            Ok(CallResult::Success(Ok(matches))) => Ok(matches),
-            Ok(CallResult::Success(Err(shed))) => Err(ScanError::Backpressure(format!(
-                "fragment {fragment} shed scan: {shed}"
-            ))),
-            Ok(CallResult::Timeout) => Err(ScanError::Actor(format!(
-                "fragment {fragment} scan timed out"
-            ))),
-            Ok(CallResult::SenderError) => Err(ScanError::Actor(format!(
-                "fragment {fragment} actor unavailable"
-            ))),
-            Err(_) => Err(ScanError::Actor(format!(
-                "fragment {fragment} scan call failed"
-            ))),
-        }
-    }
-
-    /// Forward the scan to a replica holder, failing over across
-    /// `replica_order`. Mirrors the `ForwardedGet` remote path: transport,
-    /// timeout, and holder-refusal all retry the next holder; only a
-    /// successful response is terminal.
-    async fn scan_fragment_remote(
-        &self,
-        fragment: FragmentId,
-        spec: &ScanSpec,
-    ) -> Result<Vec<ScanMatch>, ScanError> {
-        let replicas = self.replica_order(fragment);
-        if replicas.is_empty() {
-            return Err(ScanError::FragmentsUnavailable(vec![fragment]));
-        }
-        let mut tried: Vec<String> = Vec::with_capacity(replicas.len());
-        for owner in replicas {
-            tried.push(owner.clone());
-            match self.scan_fragment_from_owner(&owner, fragment, spec).await {
-                Ok(matches) => return Ok(matches),
-                Err(error) => {
-                    tracing::warn!(
-                        %fragment,
-                        owner = %owner,
-                        %error,
-                        "scan of remote fragment failed, failing over"
-                    );
-                }
-            }
-        }
-        Err(ScanError::FragmentsUnavailable(vec![fragment]))
-    }
-
-    /// One scan attempt against one holder.
-    async fn scan_fragment_from_owner(
-        &self,
-        owner: &str,
-        fragment: FragmentId,
-        spec: &ScanSpec,
-    ) -> Result<Vec<ScanMatch>, ScanError> {
-        let Some(tx) = self.peer_sender(owner).await else {
-            return Err(ScanError::Actor(format!(
-                "not connected to scan holder {owner}"
-            )));
-        };
-        if tx.capabilities & super::CAPABILITY_SCAN == 0 {
-            return Err(ScanError::Actor(format!(
-                "holder {owner} does not support scans"
-            )));
-        }
-        let req_id = self
-            .next_req_id
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let (resp_tx, resp_rx) = oneshot::channel();
-        self.pending_scans.lock().unwrap().insert(
-            req_id,
-            PendingScan {
-                expected_peer: owner.to_string(),
-                reply: resp_tx,
-            },
-        );
-        let _guard = PendingScanGuard {
-            req_id,
-            pending: self.pending_scans.clone(),
-        };
-
-        let deadline = deadline_after(SCAN_FRAGMENT_TIMEOUT);
-        let request = spec.to_scan_request(req_id, fragment.0);
-        if !try_send_envelope_until(
-            &tx,
-            Envelope {
-                msg: Some(EnvelopeMsg::ScanRequest(request)),
-            },
-            deadline,
-        )
-        .await
-        {
-            return Err(ScanError::Actor(format!(
-                "could not send scan request to {owner}"
-            )));
-        }
-
-        match tokio::time::timeout_at(deadline, resp_rx).await {
-            Ok(Ok(Ok(proto_matches))) => {
-                Ok(proto_matches.iter().map(ScanMatch::from_proto).collect())
-            }
-            Ok(Ok(Err(error))) => Err(ScanError::Actor(format!(
-                "holder {owner} refused scan of fragment {fragment}: {error}"
-            ))),
-            _ => Err(ScanError::Actor(format!(
-                "scan of fragment {fragment} via {owner} timed out"
-            ))),
-        }
+            QueryExecutionError::Backpressure(reason) => ScanError::Backpressure(reason),
+            QueryExecutionError::ShuttingDown => ScanError::ShuttingDown,
+            other => ScanError::Actor(other.to_string()),
+        })
     }
 }
 
@@ -462,7 +301,7 @@ pub(super) async fn serve_scan_request(
         .call(
             |reply| KvMessage::ScanRetained {
                 spec,
-                retention,
+                retention: retention.clone(),
                 reply,
             },
             Some(SCAN_FRAGMENT_TIMEOUT),
@@ -486,8 +325,13 @@ pub(super) async fn serve_scan_request(
         }
     };
 
-    let proto_matches: Vec<proto::ScanMatchProto> =
-        matches.into_iter().map(|m| m.to_proto()).collect();
+    let proto_matches: Vec<proto::ScanMatchProto> = matches
+        .into_iter()
+        .map(|m| proto::ScanMatchProto {
+            key: m.key,
+            value: m.value,
+        })
+        .collect();
     send_scan_response(&tx, req_id, proto_matches, String::new()).await;
 }
 
