@@ -25,8 +25,15 @@ type CompletionJob = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 pub struct EmbeddedOperationDiagnostics {
     active_requests: usize,
     retained_request_bytes: usize,
+    active_mutation_completions: usize,
 }
 impl EmbeddedOperationDiagnostics {
+    /// Accepted point mutations owned through actual apply/fanout completion.
+    /// A batch may have several completions sharing one request lease.
+    pub fn active_mutation_completions(&self) -> usize {
+        self.active_mutation_completions
+    }
+
     /// Admitted requests whose ownership has not yet been released.
     pub fn active_requests(&self) -> usize {
         self.active_requests
@@ -47,6 +54,7 @@ pub(super) struct EmbeddedOperations {
     capacity: usize,
     byte_capacity: usize,
     count: Arc<Semaphore>,
+    completions: Arc<Semaphore>,
     bytes: Arc<Semaphore>,
     jobs: mpsc::Sender<CompletionJob>,
     stop: watch::Sender<bool>,
@@ -65,6 +73,7 @@ impl EmbeddedOperations {
             capacity,
             byte_capacity,
             count: Arc::new(Semaphore::new(capacity)),
+            completions: Arc::new(Semaphore::new(capacity)),
             bytes: Arc::new(Semaphore::new(byte_capacity)),
             jobs,
             stop,
@@ -79,6 +88,9 @@ impl EmbeddedOperations {
             retained_request_bytes: self
                 .byte_capacity
                 .saturating_sub(self.bytes.available_permits()),
+            active_mutation_completions: self
+                .capacity
+                .saturating_sub(self.completions.available_permits()),
         }
     }
     pub(super) fn admit(&self, bytes: usize) -> Result<Arc<RequestRetention>, NodeError> {
@@ -116,9 +128,17 @@ impl EmbeddedOperations {
         }
         // A successful nonwaiting send transfers ownership before the caller
         // can hit another await. Shutdown closes and drains this exact queue.
-        self.jobs.try_send(Box::pin(job)).map_err(|_| {
-            NodeError::Backpressure("embedded mutation completion queue unavailable".into())
-        })
+        let completion = self.completions.clone().try_acquire_owned().map_err(|_| {
+            NodeError::Backpressure("embedded mutation completion capacity exhausted".into())
+        })?;
+        self.jobs
+            .try_send(Box::pin(async move {
+                let _completion = completion;
+                job.await;
+            }))
+            .map_err(|_| {
+                NodeError::Backpressure("embedded mutation completion queue unavailable".into())
+            })
     }
     pub(super) fn request_shutdown(&self) {
         self.accepting.store(false, Ordering::Release);
@@ -482,6 +502,63 @@ mod tests {
         );
         cleanup(&node, &gate, &actor).await;
         peer.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn timed_out_batch_cannot_accumulate_unbounded_mutation_completion_jobs() {
+        let (node, gate, actor) = gated_node(
+            NodeRuntimeOptions::builder()
+                .embedded_operation_capacity(1)
+                .local_work_timeout(Duration::from_millis(20))
+                .build(),
+        )
+        .await;
+        let _release = ReleaseGate(gate.clone());
+        let writing = node.clone();
+        let batch = tokio::spawn(async move {
+            writing
+                .put_multi(
+                    (0..65)
+                        .map(|index| (format!("key-{index}"), vec![1]))
+                        .collect(),
+                )
+                .await
+        });
+        gate.entered.notified().await;
+        let results = tokio::time::timeout(Duration::from_secs(2), batch)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(results.len(), 65);
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| matches!(result, Err(NodeError::UnknownOutcome(_))))
+                .count(),
+            1
+        );
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| matches!(result, Err(NodeError::Backpressure(_))))
+                .count(),
+            64
+        );
+        assert_eq!(gate.received.load(Ordering::SeqCst), 1);
+        let diagnostics = node.embedded_operation_diagnostics();
+        assert_eq!(diagnostics.active_requests(), 1);
+        assert_eq!(diagnostics.active_mutation_completions(), 1);
+        assert!(diagnostics.retained_request_bytes() > 0);
+        gate.release.add_permits(1);
+        let permit = tokio::time::timeout(
+            Duration::from_secs(2),
+            node.embedded_operations.count.acquire(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        drop(permit);
+        cleanup(&node, &gate, &actor).await;
     }
 
     #[tokio::test]

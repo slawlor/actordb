@@ -92,6 +92,10 @@ provides `embedded_operation_capacity` (default 128) and
 `embedded_operation_byte_capacity` (default 64 MiB), both Bon builder settings
 with setters/getters. Admission does not wait: saturation returns
 `NodeError::Backpressure` before consuming a write stamp or mutating state.
+Input admission occurs before stamping. Accepted mutation completion also has a
+separate count limit equal to `embedded_operation_capacity`; a batch cannot
+accumulate new completion jobs indefinitely after local waiters time out. Completion
+admission may reject an already-stamped operation before any actor enqueue.
 Request charges include allocated String/Vec capacity and conservative
 routing/correlation/ApplyOp clone overhead. A batch retains one shared lease for
 its full input and bounded concurrent local chunk.
@@ -107,8 +111,8 @@ also leaves accepted mutation completion owned. Explicit Node shutdown drains
 this owner before stopping senders or fragment actors; last-owner Node Drop is
 best effort and may abort work.
 
-`Node::embedded_operation_diagnostics()` reports admitted count and conservative
-retained request bytes, including work after its waiter ends. These limits cover
+`Node::embedded_operation_diagnostics()` reports admitted request count, active
+mutation completions, and conservative retained request bytes, including work after its waiter ends. These limits cover
 request ownership across fragments/priorities; they do not cap cache,
 persistence, replication, query/scan result storage, caller-returned datasets,
 or allocator overhead. Queries/scans and serving peer reads have their own
