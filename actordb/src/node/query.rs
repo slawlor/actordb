@@ -311,9 +311,10 @@ impl Node {
             let mut skipped = 0u64;
             let mut payload_bytes = 0usize;
             loop {
-                let Some(Reverse((_key, index))) = heads.pop() else {
+                let Some(Reverse((key, index))) = heads.pop() else {
                     break;
                 };
+                drop(key);
                 let row = cursors[index]
                     .rows
                     .pop_front()
