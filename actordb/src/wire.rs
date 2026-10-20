@@ -278,6 +278,8 @@ pub(crate) enum WireEncodeError {
     FrameTooLarge { encoded_len: usize, budget: usize },
     /// Record provenance is absent or exceeds the cluster identity bound.
     InvalidNodeIdLength { node_len: usize },
+    /// Zero is reserved for an absent expiry in the peer and durable codecs.
+    InvalidExpiryDeadline,
     /// Prost rejected the message while writing into the pre-sized buffer.
     Encode(prost::EncodeError),
 }
@@ -296,6 +298,9 @@ impl fmt::Display for WireEncodeError {
                 f,
                 "record node id is {node_len} bytes; expected 1 to {MAX_WIRE_NODE_ID_BYTES}"
             ),
+            Self::InvalidExpiryDeadline => {
+                write!(f, "expiry deadline zero is reserved for no expiry")
+            }
             Self::Encode(error) => write!(f, "failed to encode envelope: {error}"),
         }
     }
@@ -304,7 +309,9 @@ impl fmt::Display for WireEncodeError {
 impl std::error::Error for WireEncodeError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::FrameTooLarge { .. } | Self::InvalidNodeIdLength { .. } => None,
+            Self::FrameTooLarge { .. }
+            | Self::InvalidNodeIdLength { .. }
+            | Self::InvalidExpiryDeadline => None,
             Self::Encode(error) => Some(error),
         }
     }
@@ -806,7 +813,8 @@ fn replicated_record_max_encoded_len(
         + max_u64_field_len(2)
         + bytes_field_len(3, node_len)
         + bool_field_len(4, tombstone)
-        + max_u64_field_len(5);
+        + max_u64_field_len(5)
+        + bytes_field_len(6, 32);
     let reconcile_response = max_u32_field_len(1)
         + message_field_len(2, key_summary)
         + max_u64_field_len(3)
@@ -907,6 +915,9 @@ pub(crate) fn check_versioned_value_budget(
     key: &str,
     value: &VersionedValue,
 ) -> Result<(), WireEncodeError> {
+    if value.expires_at_ms == Some(0) {
+        return Err(WireEncodeError::InvalidExpiryDeadline);
+    }
     check_record_budget(key.len(), value.value.len(), value.node_id.len())
 }
 
@@ -1367,6 +1378,7 @@ mod tests {
                 msg: Some(EnvelopeMsg::ReconcileResponse(ReconcileResponse {
                     fragment: u32::MAX,
                     summaries: vec![KeySummary {
+                        content_digest: vec![0; 32],
                         key: op.key.clone(),
                         timestamp_ms: u64::MAX,
                         logical_counter: u64::MAX,

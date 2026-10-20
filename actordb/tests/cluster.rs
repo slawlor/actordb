@@ -1,3 +1,7 @@
+#[path = "common/content_digest.rs"]
+mod content_digest;
+use content_digest::content_digest;
+
 // Integration tests: multi-node replication over real TCP on localhost.
 
 mod common;
@@ -567,6 +571,7 @@ async fn recv_reconcile_repairs_and_barrier(
         if let Some(EnvelopeMsg::ReplicateBatch(batch)) = recv_frame(stream).await.msg {
             if batch.batch_seq == u64::MAX {
                 summaries.extend(batch.ops.into_iter().map(|op| actordb::proto::KeySummary {
+                    content_digest: content_digest(&op.value, op.expires_at_ms),
                     key: op.key,
                     timestamp_ms: op.timestamp_ms,
                     logical_counter: op.logical_counter,
@@ -1262,6 +1267,7 @@ async fn drain_ignores_stale_old_session_ack_after_rotation() {
         .ops
         .iter()
         .map(|op| KeySummary {
+            content_digest: content_digest(&op.value, op.expires_at_ms),
             key: op.key.clone(),
             timestamp_ms: op.timestamp_ms,
             logical_counter: op.logical_counter,
@@ -3236,6 +3242,7 @@ async fn failed_immediate_reconciliation_is_not_counted_and_retries() {
         }
     };
     let summary = KeySummary {
+        content_digest: content_digest(b"value", 0),
         key: "failed-reconcile".to_string(),
         timestamp_ms: now_ms(),
         logical_counter: 0,
@@ -4953,6 +4960,7 @@ async fn stale_reconcile_round_cannot_complete_live_reset() {
                 // would immediately produce a ReconcileFetch. The valid
                 // response below is deliberately different.
                 let summaries = vec![KeySummary {
+                    content_digest: content_digest(b"", 0),
                     key: "stale-round-only".to_string(),
                     // A stale frame must be discarded before HLC validation;
                     // this value would close the connection if observed.
@@ -5148,6 +5156,7 @@ async fn placement_bootstrap_fetch_requires_verification_round() {
     );
 
     let summary = KeySummary {
+        content_digest: content_digest(b"fetched", 0),
         key: "bootstrap-fetched".to_string(),
         timestamp_ms: now_ms(),
         logical_counter: 0,
@@ -5561,6 +5570,7 @@ async fn malformed_reconcile_data_is_rejected_without_partial_apply() {
 
     let remote_timestamp = now_ms();
     let summary = KeySummary {
+        content_digest: content_digest(b"", 0),
         key: "remote-fetch".to_string(),
         timestamp_ms: remote_timestamp,
         logical_counter: 0,
@@ -10085,6 +10095,7 @@ async fn fetched_reconcile_value_retries_failed_local_store_fence() {
 
     let remote_timestamp = now_ms();
     let summary = KeySummary {
+        content_digest: content_digest(b"durable", 0),
         key: "fetched-durable".to_string(),
         timestamp_ms: remote_timestamp,
         logical_counter: 0,
@@ -10114,6 +10125,7 @@ async fn fetched_reconcile_value_retries_failed_local_store_fence() {
             Some(EnvelopeMsg::ReconcileFetch(fetch)) => break fetch,
             Some(EnvelopeMsg::ReplicateBatch(batch)) if batch.batch_seq == u64::MAX => {
                 remote_summaries.extend(batch.ops.into_iter().map(|op| KeySummary {
+                    content_digest: content_digest(&op.value, op.expires_at_ms),
                     key: op.key,
                     timestamp_ms: op.timestamp_ms,
                     logical_counter: op.logical_counter,

@@ -41,6 +41,14 @@ pub enum OpPriority {
 /// matching the cluster identity bound. Actor apply and startup validation
 /// reject values outside that range without mutating state.
 ///
+/// For each key, one `(timestamp_ms, logical_counter, node_id, is_tombstone)`
+/// tuple must identify exactly one payload and expiry deadline. Custom writers
+/// and restore tools must never reuse it for different contents. Node-generated
+/// versions satisfy this when node identities are unique and persisted clock
+/// floors are retained across restarts. Fragment apply rejects an equal tuple
+/// with different contents as [`ApplyError::VersionConflict`]; anti-entropy
+/// detects such divergence and refuses to certify convergence.
+///
 /// A tombstone (`is_tombstone`) marks a deleted key. Tombstones participate
 /// in LWW like writes: a tombstone with a higher timestamp shadows a live
 /// value, and a live write with a higher timestamp resurrects the key.
@@ -54,7 +62,8 @@ pub struct VersionedValue {
     /// Logical component; independent of physical clock skew and TTL deadlines.
     pub logical_counter: u64,
     pub node_id: String,
-    /// Wall-clock expiry in ms since epoch. `None` = no expiry.
+    /// Wall-clock expiry in ms since epoch. `None` = no expiry. Zero is reserved
+    /// for absent expiry in the wire and durable codecs; `Some(0)` is rejected.
     pub expires_at_ms: Option<u64>,
     /// True if this is a deletion marker.
     pub is_tombstone: bool,
@@ -113,6 +122,37 @@ impl VersionedValue {
         }
     }
 
+    /// Whether both values have the same full LWW ordering tuple.
+    ///
+    /// Equal tuples must have equal payloads and expiry deadlines. An expiry
+    /// conversion sets the tombstone bit, so it is a distinct ordered version.
+    pub fn same_version(&self, other: &Self) -> bool {
+        self.version() == other.version()
+            && self.node_id == other.node_id
+            && self.is_tombstone == other.is_tombstone
+    }
+
+    /// Digest of the payload and expiry deadline used in anti-entropy summaries.
+    ///
+    /// SHA-256 uses a domain prefix, payload length, and an explicit optional
+    /// deadline tag so distinct field boundaries cannot produce identical input.
+    /// This detects divergent contents; it does not resolve a reused version.
+    pub(crate) fn content_digest(&self) -> [u8; 32] {
+        use sha2::{Digest, Sha256};
+        let mut digest = Sha256::new();
+        digest.update(b"actordb-record-content-v1\0");
+        digest.update((self.value.len() as u64).to_be_bytes());
+        digest.update(&self.value);
+        match self.expires_at_ms {
+            Some(deadline) => {
+                digest.update([1]);
+                digest.update(deadline.to_be_bytes());
+            }
+            None => digest.update([0]),
+        }
+        digest.finalize().into()
+    }
+
     /// Returns `true` if `self` wins over `other` under last-writer-wins.
     /// Tombstones win exact `(timestamp, logical_counter, node_id)` ties.
     pub fn wins_over(&self, other: &VersionedValue) -> bool {
@@ -149,11 +189,14 @@ pub struct ReplicatedOp {
 /// Version metadata for one key in an anti-entropy snapshot.
 ///
 /// Values are intentionally omitted so callers can compare snapshots before
-/// fetching only the keys whose versions differ. An expired live value is
+/// fetching only the keys whose versions differ. `content_digest` also detects
+/// invalid reuse of the same version for different payloads or TTL deadlines. An expired live value is
 /// represented as its deterministic expiry tombstone at the snapshot's
 /// pinned wall-clock time.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SnapshotSummary {
+    /// SHA-256 of the payload and expiry deadline at the pinned snapshot time.
+    pub content_digest: [u8; 32],
     pub key: String,
     pub timestamp_ms: u64,
     pub logical_counter: u64,
@@ -304,6 +347,9 @@ pub enum ApplyError {
     Backpressure,
     /// The operation cannot be represented safely by the peer protocol.
     InvalidInput(String),
+    /// The key already has this full LWW tuple with different payload or TTL.
+    /// The existing value and persistence buffer are left unchanged.
+    VersionConflict { key: String },
     /// Persistence failed while applying a batch-triggering mutation.
     Storage(String),
 }
@@ -314,6 +360,10 @@ impl std::fmt::Display for ApplyError {
             Self::Backpressure => write!(f, "fragment worker pool is at capacity"),
             Self::InvalidInput(error) => write!(f, "invalid mutation: {error}"),
             Self::Storage(error) => write!(f, "persistence failed: {error}"),
+            Self::VersionConflict { key } => write!(
+                f,
+                "record version reused with different contents for key {key:?}"
+            ),
         }
     }
 }

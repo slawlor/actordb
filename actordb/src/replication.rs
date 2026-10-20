@@ -2986,6 +2986,7 @@ const RECONCILE_LOCAL_READ_CHUNK: usize = 256;
 enum ReconcileError {
     Local,
     Transport,
+    VersionConflict,
 }
 
 fn next_nonzero(counter: &mut u64) -> u64 {
@@ -3187,7 +3188,11 @@ fn reconcile_summaries_are_well_formed(
     next_after_key: &str,
     done: bool,
 ) -> bool {
-    if summaries.len() > MAX_RECONCILE_PAGE_ITEMS {
+    if summaries.len() > MAX_RECONCILE_PAGE_ITEMS
+        || summaries.iter().any(|summary| {
+            summary.content_digest.len() != 32 || !(1..=255).contains(&summary.node_id.len())
+        })
+    {
         return false;
     }
     if summaries.is_empty() {
@@ -3557,6 +3562,12 @@ async fn reconcile_summary_page(
                         fetch_keys.push(remote.key.clone());
                     } else if local_summary_wins(&local, remote) {
                         repair_keys.push(remote.key.clone());
+                    } else if remote.content_digest.as_slice() != local.content_digest {
+                        tracing::error!(fragment = fragment.0, key = %remote.key,
+                            timestamp_ms = remote.timestamp_ms, logical_counter = remote.logical_counter,
+                            writer = %remote.node_id, is_tombstone = remote.is_tombstone,
+                            "reconciliation found a reused record version with conflicting contents");
+                        return Err(ReconcileError::VersionConflict);
                     }
                     break;
                 }
@@ -3955,6 +3966,7 @@ mod tests {
     fn summary_page_validation_distinguishes_empty_key_from_no_cursor() {
         let router = FragmentRouter::new(1, 0);
         let first = vec![KeySummary {
+            content_digest: vec![0; 32],
             key: String::new(),
             timestamp_ms: 1,
             logical_counter: 0,
@@ -3972,6 +3984,7 @@ mod tests {
         ));
 
         let second = vec![KeySummary {
+            content_digest: vec![0; 32],
             key: "next".to_string(),
             timestamp_ms: 2,
             logical_counter: 0,
@@ -3986,6 +3999,112 @@ mod tests {
             &second,
             "next",
             true,
+        ));
+    }
+
+    #[tokio::test]
+    async fn equal_version_content_conflict_cannot_complete_reconciliation() {
+        let router = FragmentRouter::new(1, 0);
+        let (peer_tx, mut peer_rx) = mpsc::channel(2);
+        let connection = ActiveConnection {
+            peer_tx: SenderPeer::new(peer_tx, None, &SenderRuntimeOptions::default()),
+            session_id: 1,
+            session_ready: true,
+            next_batch_seq: 0,
+            in_flight: VecDeque::new(),
+        };
+        for same_contents in [false, true] {
+            let local = SnapshotSummary {
+                key: "key".into(),
+                timestamp_ms: 100,
+                logical_counter: 9,
+                node_id: "writer".into(),
+                is_tombstone: false,
+                content_digest: [1; 32],
+            };
+            let remote = KeySummary {
+                key: local.key.clone(),
+                timestamp_ms: local.timestamp_ms,
+                logical_counter: local.logical_counter,
+                node_id: local.node_id.clone(),
+                is_tombstone: false,
+                content_digest: vec![if same_contents { 1 } else { 2 }; 32],
+            };
+            let mut summary = ReconcileSummaryState {
+                next_page_seq: 0,
+                next_fetch_chunk_seq: 0,
+                after_key: String::new(),
+                remote_snapshot_revision: Some(0),
+                remote_snapshot_time_ms: Some(100),
+                remote_revision_stable: true,
+                changed_any: false,
+                summary_done: true,
+                local: ReconcileLocalCursor {
+                    after_key: String::new(),
+                    revision: Some(0),
+                    snapshot_time_ms: Some(100),
+                    revision_stable: true,
+                    buffered: VecDeque::new(),
+                    current: Some(local),
+                    done: true,
+                },
+            };
+            let result = reconcile_summary_page(
+                FragmentId(0),
+                &router,
+                &connection,
+                1,
+                &mut summary,
+                &[remote],
+                true,
+            )
+            .await;
+            if same_contents {
+                assert!(result.unwrap().is_empty());
+            } else {
+                assert_eq!(result.unwrap_err(), ReconcileError::VersionConflict);
+            }
+            assert!(!summary.changed_any);
+            assert!(
+                peer_rx.try_recv().is_err(),
+                "a conflict must not select an arbitrary repair winner"
+            );
+        }
+    }
+
+    #[test]
+    fn summary_page_requires_complete_content_digest_and_valid_writer() {
+        let router = FragmentRouter::new(1, 0);
+        let mut summary = KeySummary {
+            key: "key".into(),
+            timestamp_ms: 1,
+            logical_counter: 0,
+            node_id: "writer".into(),
+            is_tombstone: false,
+            content_digest: vec![0; 32],
+        };
+        for length in [0, 1, 31, 33] {
+            summary.content_digest = vec![0; length];
+            assert!(!reconcile_summaries_are_well_formed(
+                FragmentId(0),
+                &router,
+                false,
+                "",
+                &[summary.clone()],
+                "key",
+                true
+            ));
+        }
+        summary.content_digest = vec![0; 32];
+        summary.node_id.clear();
+        assert!(!reconcile_summaries_are_well_formed(
+            FragmentId(0),
+            &router,
+            false,
+            "",
+            &[summary],
+            "key",
+            true
         ));
     }
 

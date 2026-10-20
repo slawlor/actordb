@@ -8,32 +8,54 @@ acknowledgements, including majority; see [Write concern](write-concern.md).
 ## Conflict resolution: LWW by HLC
 
 Every write — put, TTL put, delete (tombstone) — is stamped by the node's
-**hybrid logical clock** (`HlcClock`, one per node):
+**hybrid logical clock** (`HlcClock`, one per node). Its physical millisecond
+timestamp and logical counter form `RecordVersion`:
 
-- `tick()`: `max(wall_clock_ms, last + 1)` — monotonic, never moves backward.
-- `observe(remote_ms)`: first rejects values beyond `max_clock_skew`, then
-  advances to `max(wall, last + 1, remote + 1)`. Validation happens before
-  replicated, forwarded, synchronized, reconciled, or read-response versions
-  are accepted; a violating peer connection is closed.
-- `seed_persisted(timestamp_ms)`: runs while each durable fragment starts, so
-  the first post-restart write advances beyond every loaded version. A durable
-  timestamp beyond `max_clock_skew` fails startup instead of freezing keys.
+- `tick()` advances physical time to wall time when it can; events
+  within the same millisecond advance the logical counter. More than 1,000
+  events per second do not create physical skew.
+- `observe_version(remote)` first rejects physical timestamps beyond
+  `max_clock_skew`, then advances beyond the local and remote versions.
+  Validation precedes acceptance of peer versions.
+- `seed_version(version)` retains the highest durable version during
+  fragment startup. The first new write advances beyond every loaded version;
+  excessive durable physical skew fails startup.
+- Complete counter/time exhaustion returns an explicit clock error instead of
+  reusing a version.
 
-Conflicts resolve by `VersionedValue::wins_over` on
-`(timestamp_ms, node_id, is_tombstone)`: the higher timestamp wins; exact
-(timestamp, node_id) ties go to the tombstone. The comparison is total and
-commutative, so replicas converge without coordination. `seq`/`boot_id` are
-origin metadata; the current receiver does not deduplicate on them, and they
-play no role in conflict resolution.
+`VersionedValue::wins_over` orders
+`(timestamp_ms, logical_counter, node_id, is_tombstone)`: higher physical/logical
+versions win, writer identity breaks ties, and a tombstone wins an otherwise
+exact tie. `seq` and `boot_id` are origin metadata and play no role in LWW.
 
-Under bounded clock skew the HLC keeps ordering sane: the
-`hlc_orders_writes_under_clock_skew` integration test simulates skewed clocks
-and asserts the later logical write still wins everywhere. The clock uses a physical millisecond timestamp and an independent logical
-counter. More than one event per millisecond advances the counter without
-creating physical skew. Ordering is `(timestamp_ms, logical_counter, node_id,
-is_tombstone)`. Future-skew admission validates the physical component only.
-Complete counter/time exhaustion produces an explicit clock error instead of
-reusing a record version.
+For each key, one full ordering tuple **must identify exactly one payload and
+expiry deadline**. Node-generated versions preserve this invariant when writer
+identities are unique and durable clock floors are retained across restarts.
+Custom low-level callers, offline writers, and restore tools must preserve it:
+do not run independent writers with the same node identity, do not reset a
+writer's durable high-water version, and give edited restore data fresh versions.
+A correct identical replay remains idempotent.
+
+Fragment apply returns `ApplyError::VersionConflict` for an equal full tuple
+with different retained contents, before changing cache, revision, or persistence.
+Anti-entropy carries a SHA-256 digest of payload and TTL semantics as well as
+ordering metadata. Digests are computed once when records enter the cache,
+including their deterministic expiry representation; bounded summary pages copy
+cached hashes. Equal ordering metadata with unequal digests fails the round and
+emits a version-conflict diagnostic. ActorDB does not choose an arbitrary content
+winner or certify convergence for this invalid input. Repair requires an
+operator to restore the intended contents under a fresh version. The digest
+uses cryptographic collision resistance; it is not an independent proof of
+historical data integrity.
+
+Deletes and expiry remain valid ordered transformations: setting the tombstone
+bit makes a distinct winning tuple. Expiry strips the payload, retains its
+original deadline, and never resurrects the older live write. An expired
+snapshot's synthetic tombstone has the same digest as the installed marker.
+Digests are derived again from durable winners on startup; the persisted format
+needs no digest field. Store loads must return one winner per key: duplicate
+persisted keys fail startup, and an optional expiry deadline of zero is rejected
+because the peer and durable codecs reserve zero for no expiry.
 
 ## Local apply outcomes and read-your-write
 
@@ -113,3 +135,11 @@ On partition:
   each node's clock; a heavily skewed clock can serve an expired key slightly
   longer or hide a live one slightly early. The cleaner eventually persists a
   deterministic expiry tombstone using the TTL write's original LWW version.
+
+## Content digest compatibility
+
+Peer protocol v4 also requires `CAPABILITY_RECORD_CONTENT_DIGEST` (bit 10).
+A v4 peer from the earlier clock-only implementation is rejected during Hello
+negotiation if it cannot advertise and compare the 32-byte content digest.
+The capability is part of the authenticated Hello transcript; independent
+authentication test vectors remain unchanged.

@@ -128,7 +128,9 @@ impl Actor for PoolWorker {
                             ApplyError::Storage(message) => {
                                 Some(ActorProcessingErr::from(message.clone()))
                             }
-                            ApplyError::Backpressure | ApplyError::InvalidInput(_) => None,
+                            ApplyError::Backpressure
+                            | ApplyError::InvalidInput(_)
+                            | ApplyError::VersionConflict { .. } => None,
                         };
                         if let Some(reply) = reply {
                             let _ = reply.send(Err(error));

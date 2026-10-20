@@ -123,6 +123,8 @@ pub const CAPABILITY_SCAN: u64 = 1 << 7;
 pub const CAPABILITY_QUERY_PAGES: u64 = 1 << 8;
 /// Forwarded writes carry explicit acknowledgement policy and progress.
 pub const CAPABILITY_WRITE_CONCERNS: u64 = 1 << 9;
+/// Summaries carry content digests and reject equal-version divergent contents.
+pub const CAPABILITY_RECORD_CONTENT_DIGEST: u64 = 1 << 10;
 /// Capabilities required by this binary before it installs a peer connection.
 pub const REQUIRED_WIRE_CAPABILITIES: u64 = CAPABILITY_MUTATION_RESULTS
     | CAPABILITY_DURABILITY_ACKS
@@ -131,7 +133,8 @@ pub const REQUIRED_WIRE_CAPABILITIES: u64 = CAPABILITY_MUTATION_RESULTS
     | CAPABILITY_PAGED_ANTI_ENTROPY
     | CAPABILITY_BYTE_BOUNDED_BATCHES
     | CAPABILITY_STABLE_DURABILITY_ACKS
-    | CAPABILITY_WRITE_CONCERNS;
+    | CAPABILITY_WRITE_CONCERNS
+    | CAPABILITY_RECORD_CONTENT_DIGEST;
 
 /// Outbound queue depth per peer connection.
 const PEER_CHANNEL_DEPTH: usize = 256;
@@ -1349,6 +1352,9 @@ async fn call_apply(
             "fragment worker pool is at capacity".to_string(),
         )),
         CallResult::Success(Err(ApplyError::InvalidInput(error))) => Err(NodeError::Codec(error)),
+        CallResult::Success(Err(error @ ApplyError::VersionConflict { .. })) => {
+            Err(NodeError::Codec(error.to_string()))
+        }
         CallResult::Success(Err(ApplyError::Storage(error))) => Err(NodeError::Storage(error)),
         CallResult::Timeout => Err(NodeError::Actor("apply timed out".to_string())),
         CallResult::SenderError => Err(NodeError::Actor("apply reply channel dropped".to_string())),
@@ -1378,6 +1384,9 @@ async fn flush_fence(
         CallResult::Success(Err(ApplyError::InvalidInput(error))) => Err(NodeError::Actor(
             format!("flush fence unexpectedly returned invalid input: {error}"),
         )),
+        CallResult::Success(Err(error @ ApplyError::VersionConflict { .. })) => {
+            Err(NodeError::Actor(error.to_string()))
+        }
         CallResult::Timeout => Err(NodeError::Actor("flush fence timed out".to_string())),
         CallResult::SenderError => Err(NodeError::Actor(
             "flush fence reply channel dropped".to_string(),
@@ -8485,6 +8494,7 @@ async fn handle_connection(
                                 logical_counter: summary.logical_counter,
                                 node_id: summary.node_id,
                                 is_tombstone: summary.is_tombstone,
+                                content_digest: summary.content_digest.to_vec(),
                             })
                             .collect();
                         let mut response = ReconcileResponse {
@@ -12030,6 +12040,7 @@ mod tests {
         assert!(empty.done);
 
         let summary = |key: String| KeySummary {
+            content_digest: vec![0; 32],
             key,
             timestamp_ms: u64::MAX,
             logical_counter: 0,
@@ -12856,6 +12867,24 @@ mod tests {
             &listener,
             &reflected,
         ));
+    }
+
+    #[test]
+    fn clock_only_v4_peer_is_rejected_before_digest_reconciliation() {
+        let mut hello = Hello {
+            node_id: "peer".into(),
+            auth_tag: Vec::new(),
+            min_protocol_version: WIRE_PROTOCOL_VERSION,
+            max_protocol_version: WIRE_PROTOCOL_VERSION,
+            capabilities: REQUIRED_WIRE_CAPABILITIES,
+            challenge: vec![1; HANDSHAKE_CHALLENGE_BYTES],
+        };
+        assert_eq!(validate_peer_hello("local", Some("peer"), &hello), Ok(()));
+        hello.capabilities &= !CAPABILITY_RECORD_CONTENT_DIGEST;
+        assert_eq!(
+            validate_peer_hello("local", Some("peer"), &hello),
+            Err("peer omitted required wire capabilities")
+        );
     }
 
     #[test]
