@@ -2634,6 +2634,48 @@ async fn cancelled_connect_owner_releases_pending_intent_to_waiter() {
 }
 
 #[tokio::test]
+async fn wide_reconciliation_keys_use_bounded_pages_and_release_result_admission() {
+    use actordb::shard::FragmentId;
+    let source = test_node("wide-key-source").await;
+    let keys: Vec<_> = (0..64)
+        .map(|index| format!("{index:03}-{}", "k".repeat(32 * 1024)))
+        .collect();
+    for key in &keys {
+        source.put(key.clone(), vec![7]).await.unwrap();
+    }
+    let receiver = test_node("wide-key-receiver").await;
+    receiver.connect(source.addr()).await.unwrap();
+    wait_for_peers(&source, &receiver).await;
+    common::wait_for(
+        || async {
+            for key in &keys {
+                if receiver
+                    .get(key.clone())
+                    .await
+                    .unwrap()
+                    .map(|value| value.value)
+                    != Some(vec![7])
+                {
+                    return false;
+                }
+            }
+            source
+                .sender_report(FragmentId(0), "wide-key-receiver")
+                .await
+                .is_some_and(|report| report.reconcile_rounds >= 1)
+                && source.reconciliation_retained_bytes() == 0
+        },
+        Duration::from_secs(10),
+    )
+    .await;
+    assert!(receiver.reconciliation_retained_bytes() <= 64 * 1024 * 1024);
+    source.shutdown().await.unwrap();
+    receiver.shutdown().await.unwrap();
+    assert_eq!(source.reconciliation_retained_bytes(), 0);
+    assert_eq!(receiver.reconciliation_retained_bytes(), 0);
+}
+
+#[tokio::test]
 async fn late_joiner_converges_via_immediate_reconciliation() {
     use actordb::shard::FragmentId;
 

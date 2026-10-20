@@ -3879,6 +3879,7 @@ async fn reconcile_summary_page(
     let deadline = deadline_after(connection.peer_tx.local_work_timeout);
     let mut fetch_keys = Vec::new();
     let mut repair_keys = Vec::new();
+    let mut repair_key_bytes = 0usize;
     for remote in summaries {
         loop {
             ensure_local_summary(
@@ -3892,8 +3893,13 @@ async fn reconcile_summary_page(
             match summary.local.current.as_ref() {
                 Some(local) if local.key < remote.key => {
                     let local = take_local_summary(&mut summary.local).expect("matched Some");
+                    repair_key_bytes = repair_key_bytes
+                        .saturating_add(local.key.capacity())
+                        .saturating_add(std::mem::size_of::<String>());
                     repair_keys.push(local.key);
-                    if repair_keys.len() >= RECONCILE_LOCAL_READ_CHUNK {
+                    if repair_keys.len() >= RECONCILE_LOCAL_READ_CHUNK
+                        || repair_key_bytes >= ANTI_ENTROPY_PAGE_BYTES
+                    {
                         summary.changed_any = true;
                         let snapshot_time_ms = summary
                             .local
@@ -3908,6 +3914,7 @@ async fn reconcile_summary_page(
                             deadline,
                         )
                         .await?;
+                        repair_key_bytes = 0;
                     }
                 }
                 Some(local) if local.key == remote.key => {
@@ -3915,7 +3922,29 @@ async fn reconcile_summary_page(
                     if remote_summary_wins(remote, &local) {
                         fetch_keys.push(remote.key.clone());
                     } else if local_summary_wins(&local, remote) {
+                        repair_key_bytes = repair_key_bytes
+                            .saturating_add(remote.key.len())
+                            .saturating_add(std::mem::size_of::<String>());
                         repair_keys.push(remote.key.clone());
+                        if repair_keys.len() >= RECONCILE_LOCAL_READ_CHUNK
+                            || repair_key_bytes >= ANTI_ENTROPY_PAGE_BYTES
+                        {
+                            summary.changed_any = true;
+                            let snapshot_time_ms = summary
+                                .local
+                                .snapshot_time_ms
+                                .ok_or(ReconcileError::Local)?;
+                            send_repair_keys(
+                                fragment,
+                                router,
+                                connection,
+                                std::mem::take(&mut repair_keys),
+                                snapshot_time_ms,
+                                deadline,
+                            )
+                            .await?;
+                            repair_key_bytes = 0;
+                        }
                     } else if remote.content_digest.as_slice() != local.content_digest {
                         tracing::error!(fragment = fragment.0, key = %remote.key,
                             timestamp_ms = remote.timestamp_ms, logical_counter = remote.logical_counter,
@@ -3947,6 +3976,7 @@ async fn reconcile_summary_page(
             deadline,
         )
         .await?;
+        repair_key_bytes = 0;
     }
 
     if done {
@@ -3962,8 +3992,13 @@ async fn reconcile_summary_page(
             let Some(local) = take_local_summary(&mut summary.local) else {
                 break;
             };
+            repair_key_bytes = repair_key_bytes
+                .saturating_add(local.key.capacity())
+                .saturating_add(std::mem::size_of::<String>());
             repair_keys.push(local.key);
-            if repair_keys.len() >= RECONCILE_LOCAL_READ_CHUNK {
+            if repair_keys.len() >= RECONCILE_LOCAL_READ_CHUNK
+                || repair_key_bytes >= ANTI_ENTROPY_PAGE_BYTES
+            {
                 summary.changed_any = true;
                 let snapshot_time_ms = summary
                     .local
@@ -3978,6 +4013,7 @@ async fn reconcile_summary_page(
                     deadline,
                 )
                 .await?;
+                repair_key_bytes = 0;
             }
         }
         if !repair_keys.is_empty() {

@@ -419,7 +419,8 @@ charges a possible maximum-size reply before the actor clones it.
 Opaque actor request leases keep result admission owned through dispatcher or
 worker completion after cancellation of the waiter. Summary leases remain with
 the local cursor; remote summary leases remain with their derived fetch-key
-chunks through the round. Repairs ship each actor value page before fetching
+chunks through the round. Repair-key chunks stop at their byte target as well
+as their count target, allowing one bounded wide key. Repairs ship each actor value page before fetching
 the next, so two wide result pages do not overlap. Reset, timeout and shutdown
 release credits when their owning work actually ends.
 
