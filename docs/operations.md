@@ -334,3 +334,21 @@ length prefix, decoded protobuf/request objects, queue/frame/task/allocator
 headers, cache/persistence/replication payloads, query results, and kernel socket
 buffers. Connection/frame counts and those independent admission budgets still
 need separate deployment allowances; this is not a total process-heap ceiling.
+
+## Persistence outage admission
+
+`NodeConfig::persistence` sets authoritative pending/active persistence limits:
+10,000 records and 64 MiB per fragment, and 256 MiB across a node by default.
+These are conservative charged bytes, including the backend batch copy, rather
+than process RSS. Pending writes retain only the latest winner for each key;
+failed attempts restore their winners into that map. An active batch remains
+immutable until its store call ends. Same-size pending overwrites are admitted
+at capacity. Growth or a new key that exceeds a count/byte allowance returns
+`ApplyError::Backpressure` before cache mutation. Already-applied writes whose
+flush fails still have an unknown durable outcome and remain retryable.
+
+`FragmentState::persistence_backlog()` reports charged records/bytes. Admission
+rejection and failed flushes emit structured backlog diagnostics. TTL cleanup
+reserves its durable marker before replacing the live record; a full final
+sweep reports saturation so shutdown cannot certify an undurable transition.
+The cache and immutable key/version floors are independent of these budgets.

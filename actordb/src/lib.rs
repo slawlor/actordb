@@ -60,6 +60,7 @@ pub mod ttl_expiry;
 /// chunked bootstrap, and controller-sequenced migration.
 pub mod placement;
 
+mod retained;
 mod runtime_tasks;
 
 // Shared protobuf framing limits and encoding helpers. Node and replication

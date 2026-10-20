@@ -1064,6 +1064,7 @@ async fn legacy_tombstone_gc_api_remains_source_compatible_and_safe() {
         high_pool: PoolConfig::default(),
         background_pool: PoolConfig::default(),
         flush_batch_size: 100,
+        persistence: Default::default(),
         flush_interval: Duration::from_secs(1),
         clean_interval: Duration::from_secs(1),
         snapshot_interval: Duration::from_secs(1),
@@ -2029,6 +2030,7 @@ async fn replication_report_survives_a_later_local_flush_failure() {
             fragment_map: placement.clone(),
             store: Some(source_store.clone()),
             flush_batch_size: usize::MAX,
+            persistence: Default::default(),
             flush_interval: Duration::from_secs(3600),
             snapshot_interval: Duration::from_secs(3600),
             clean_interval: Duration::from_secs(3600),
@@ -3227,6 +3229,7 @@ async fn failed_immediate_reconciliation_is_not_counted_and_retries() {
         NodeConfig {
             store: Some(Arc::new(AlwaysFailStore)),
             flush_batch_size: 1,
+            persistence: Default::default(),
             ..NodeConfig::default()
         },
     )
@@ -3541,6 +3544,7 @@ async fn shutdown_flush_failure_is_retryable_across_all_fragments() {
         fragment_count: 2,
         store: Some(store.clone()),
         flush_batch_size: usize::MAX,
+        persistence: Default::default(),
         flush_interval: Duration::from_secs(3600),
         snapshot_interval: Duration::from_secs(3600),
         clean_interval: Duration::from_secs(3600),
@@ -3606,6 +3610,7 @@ async fn shutdown_retry_skips_fragments_that_already_reached_the_durability_fenc
         fragment_count: 2,
         store: Some(store.clone()),
         flush_batch_size: usize::MAX,
+        persistence: Default::default(),
         flush_interval: Duration::from_secs(3600),
         snapshot_interval: Duration::from_secs(3600),
         clean_interval: Duration::from_secs(3600),
@@ -3681,6 +3686,7 @@ async fn cancelled_shutdown_waiter_resumes_retained_final_flush() {
             NodeConfig {
                 store: Some(store.clone()),
                 flush_batch_size: usize::MAX,
+                persistence: Default::default(),
                 flush_interval: Duration::from_secs(3600),
                 snapshot_interval: Duration::from_secs(3600),
                 clean_interval: Duration::from_secs(3600),
@@ -3737,6 +3743,7 @@ async fn shutdown_rejects_new_calls_and_waits_for_an_admitted_put() {
             NodeConfig {
                 store: Some(store.clone()),
                 flush_batch_size: 1,
+                persistence: Default::default(),
                 flush_interval: Duration::from_secs(3600),
                 snapshot_interval: Duration::from_secs(3600),
                 clean_interval: Duration::from_secs(3600),
@@ -3864,6 +3871,7 @@ async fn shutdown_materializes_expiry_before_the_final_flush() {
         NodeConfig {
             store: Some(store.clone()),
             flush_batch_size: usize::MAX,
+            persistence: Default::default(),
             flush_interval: Duration::from_secs(3600),
             clean_interval: Duration::from_secs(3600),
             snapshot_interval: Duration::from_secs(3600),
@@ -3900,6 +3908,7 @@ async fn memory_store_exercises_persistence_plumbing() {
     let config = NodeConfig {
         store: Some(Arc::new(MemoryStore)),
         flush_batch_size: 1,
+        persistence: Default::default(),
         ..NodeConfig::default()
     };
     let a = Node::start("a".to_string(), "127.0.0.1:0".parse().unwrap(), config)
@@ -3917,6 +3926,7 @@ async fn ttl_expiry_is_persisted_as_a_versioned_tombstone() {
     let config = NodeConfig {
         store: Some(store.clone()),
         flush_batch_size: 1,
+        persistence: Default::default(),
         clean_interval: Duration::from_millis(10),
         ..NodeConfig::default()
     };
@@ -4051,6 +4061,7 @@ async fn persisted_version_seeds_clock_before_first_write() {
     let config = NodeConfig {
         store: Some(store.clone()),
         flush_batch_size: 1,
+        persistence: Default::default(),
         ..NodeConfig::default()
     };
 
@@ -4358,6 +4369,7 @@ async fn ttl_expiry_removes_key() {
     let config = NodeConfig {
         store: Some(store.clone()),
         flush_batch_size: 1,
+        persistence: Default::default(),
         clean_interval: Duration::from_millis(50),
         ..NodeConfig::default()
     };
@@ -7235,6 +7247,7 @@ async fn forwarded_put_returns_remote_storage_failure() {
     let config_b = NodeConfig {
         store: Some(Arc::new(AlwaysFailStore)),
         flush_batch_size: 1,
+        persistence: Default::default(),
         ..config_a.clone()
     };
 
@@ -8029,6 +8042,7 @@ async fn placement_readd_waits_for_failed_final_flush_and_reloads() {
             placement_drain_warn_interval: Duration::from_millis(50),
             store: Some(store.clone()),
             flush_batch_size: usize::MAX,
+            persistence: Default::default(),
             flush_interval: Duration::from_secs(3600),
             snapshot_interval: Duration::from_secs(3600),
             clean_interval: Duration::from_secs(3600),
@@ -9009,6 +9023,7 @@ async fn same_session_replay_does_not_clear_reconcile_failure() {
         NodeConfig {
             store: Some(Arc::new(AlwaysFailStore)),
             flush_batch_size: 1,
+            persistence: Default::default(),
             flush_interval: Duration::from_secs(3600),
             snapshot_interval: Duration::from_secs(3600),
             ..NodeConfig::default()
@@ -9185,6 +9200,7 @@ async fn memory_applied_ack_does_not_force_a_receiver_store_flush() {
     let config_b = NodeConfig {
         store: Some(store.clone()),
         flush_batch_size: usize::MAX,
+        persistence: Default::default(),
         flush_interval: Duration::from_secs(3600),
         snapshot_interval: Duration::from_secs(3600),
         ..NodeConfig::default()
@@ -9272,6 +9288,7 @@ async fn replication_ack_waits_for_the_receiver_store_fence() {
     let config_b = NodeConfig {
         store: Some(store.clone()),
         flush_batch_size: 1_000_000,
+        persistence: Default::default(),
         // Observe the explicit replication ACK fence rather than an apply's
         // age-triggered flush after a slow handshake under parallel load.
         flush_interval: Duration::from_secs(3600),
@@ -9903,6 +9920,7 @@ async fn replication_nack_retries_the_exact_batch_after_store_failure() {
     let config_b = NodeConfig {
         store: Some(store.clone()),
         flush_batch_size: 1_000_000,
+        persistence: Default::default(),
         ..NodeConfig::default()
     };
     let a = Node::start(
@@ -9984,6 +10002,7 @@ async fn failed_reconcile_repair_cannot_be_hidden_by_barrier_ack() {
         // Force the first repair op to encounter the injected store failure
         // before the rest of that untracked repair batch can be applied.
         flush_batch_size: 1,
+        persistence: Default::default(),
         flush_interval: Duration::from_secs(3600),
         snapshot_interval: Duration::from_secs(3600),
         ..NodeConfig::default()
@@ -10062,6 +10081,7 @@ async fn fetched_reconcile_value_retries_failed_local_store_fence() {
         NodeConfig {
             store: Some(store.clone()),
             flush_batch_size: usize::MAX,
+            persistence: Default::default(),
             flush_interval: Duration::from_secs(3600),
             snapshot_interval: Duration::from_secs(3600),
             fragment_map,

@@ -100,6 +100,54 @@ pub use prefixed::PrefixedStore;
 #[cfg(feature = "rocksdb")]
 pub use rocksdb::RocksDbStore;
 
+/// Admission limits for authoritative persistence work.
+///
+/// A pending winner replaces the previous pending value for its key. Active
+/// store batches remain immutable and charged until completion. Byte charges
+/// include a second batch representation used by synchronous backends.
+#[derive(Clone, Debug, bon::Builder)]
+pub struct PersistenceConfig {
+    /// Maximum retained pending and active records per fragment.
+    #[builder(default = 10_000)]
+    max_records: usize,
+    /// Maximum charged retained bytes per fragment.
+    #[builder(default = 64 * 1024 * 1024)]
+    max_bytes: usize,
+    /// Maximum charged retained bytes across this node's fragments.
+    #[builder(default = 256 * 1024 * 1024)]
+    node_max_bytes: usize,
+    #[builder(skip = crate::retained::ByteBudget::new(256 * 1024 * 1024))]
+    pub(crate) aggregate: std::sync::Arc<crate::retained::ByteBudget>,
+}
+impl Default for PersistenceConfig {
+    fn default() -> Self {
+        Self::builder().build()
+    }
+}
+impl PersistenceConfig {
+    pub fn max_records(&self) -> usize {
+        self.max_records
+    }
+    pub fn max_bytes(&self) -> usize {
+        self.max_bytes
+    }
+    pub fn node_max_bytes(&self) -> usize {
+        self.node_max_bytes
+    }
+    /// Current charged bytes for this runtime's persistence work.
+    pub fn retained_bytes(&self) -> usize {
+        self.aggregate.used()
+    }
+    pub(crate) fn for_runtime(&self) -> Result<Self, String> {
+        if self.max_records == 0 || self.max_bytes == 0 || self.node_max_bytes == 0 {
+            return Err("persistence admission limits must be nonzero".to_string());
+        }
+        let mut runtime = self.clone();
+        runtime.aggregate = crate::retained::ByteBudget::new(self.node_max_bytes);
+        Ok(runtime)
+    }
+}
+
 /// Error from a [`KvStore`] operation.
 #[derive(Debug)]
 pub struct StoreError(pub String);

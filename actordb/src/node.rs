@@ -2370,6 +2370,7 @@ async fn spawn_fragment_subtree_registered(
             .high_pool(config.high_pool.clone())
             .background_pool(config.background_pool.clone())
             .flush_batch_size(config.flush_batch_size)
+            .persistence(config.persistence.clone())
             .flush_interval(config.flush_interval)
             .clean_interval(config.clean_interval)
             .snapshot_interval(config.snapshot_interval)
@@ -3433,6 +3434,9 @@ pub struct NodeConfig {
     /// Ignored when `store` is `None`.
     #[builder(default = crate::actor::DEFAULT_FLUSH_BATCH_SIZE)]
     pub flush_batch_size: usize,
+    /// Per-fragment and aggregate node persistence backlog admission.
+    #[builder(default)]
+    pub persistence: crate::store::PersistenceConfig,
     /// Flush the store write buffer after this long, even if the batch
     /// isn't full (checked on each applied write). Ignored when `store`
     /// is `None`.
@@ -3736,6 +3740,9 @@ impl Node {
             }
             config.fragment_map.clone()
         };
+
+        let mut config = config;
+        config.persistence = config.persistence.for_runtime().map_err(NodeError::Actor)?;
 
         // Bind immutable storage identity before network or actor side effects.
         // The binding remains owned by Node until every fragment has stopped.

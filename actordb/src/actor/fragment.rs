@@ -138,6 +138,9 @@ pub struct SupervisorArgs {
     /// Flush the write buffer after this many buffered ops.
     #[builder(default = DEFAULT_FLUSH_BATCH_SIZE)]
     pub flush_batch_size: usize,
+    /// Authoritative persistence backlog admission limits.
+    #[builder(default)]
+    pub persistence: crate::store::PersistenceConfig,
     /// A new write triggers a flush after this long, even if not full.
     /// The snapshotter separately flushes idle fragments.
     #[builder(default = DEFAULT_FLUSH_INTERVAL)]
@@ -435,6 +438,7 @@ impl FragmentSupervisor {
                 args.flush_batch_size,
                 args.flush_interval,
             )
+            .with_persistence_config(args.persistence.clone())
             .with_expiry_publisher(args.fragment, args.expiry_publisher.clone()),
         );
         // Publish only after boot-time normalization was validated and persisted
@@ -1086,6 +1090,7 @@ mod tests {
                 high_pool: pool.clone(),
                 background_pool: pool,
                 flush_batch_size: 100,
+                persistence: Default::default(),
                 flush_interval: Duration::from_secs(3600),
                 clean_interval: Duration::from_secs(3600),
                 snapshot_interval: Duration::from_secs(3600),
@@ -1345,6 +1350,7 @@ mod tests {
                 high_pool: pool.clone(),
                 background_pool: pool.clone(),
                 flush_batch_size: 1,
+                persistence: Default::default(),
                 flush_interval: Duration::from_secs(3600),
                 clean_interval: Duration::from_millis(2),
                 snapshot_interval: Duration::from_secs(3600),
@@ -1478,6 +1484,7 @@ mod tests {
                     high_pool: pool.clone(),
                     background_pool: pool,
                     flush_batch_size: 100,
+                    persistence: Default::default(),
                     flush_interval: Duration::from_secs(3600),
                     clean_interval: Duration::from_secs(3600),
                     snapshot_interval: Duration::from_secs(3600),
@@ -1522,6 +1529,7 @@ mod tests {
                     high_pool: pool.clone(),
                     background_pool: pool,
                     flush_batch_size: 100,
+                    persistence: Default::default(),
                     flush_interval: Duration::from_secs(3600),
                     clean_interval: Duration::from_secs(3600),
                     snapshot_interval: Duration::ZERO,
@@ -1566,6 +1574,7 @@ mod tests {
                     high_pool: pool.clone(),
                     background_pool: pool,
                     flush_batch_size: 1,
+                    persistence: Default::default(),
                     flush_interval: Duration::from_secs(3600),
                     clean_interval: Duration::from_secs(3600),
                     snapshot_interval: Duration::from_secs(3600),
