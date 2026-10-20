@@ -226,6 +226,9 @@ message ReconcileRequest {
   string after_key = 5;
   uint64 snapshot_revision = 6;
   uint64 snapshot_time_ms = 7;
+  // Explicit full-outage recovery authority; absent during ordinary startup.
+  bytes recovery_epoch = 8;
+  bytes recovery_replica_digest = 9;
 }
 
 message ReconcileResponse {

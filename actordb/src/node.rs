@@ -97,6 +97,9 @@ use mutation_service::{
     FORWARDED_MUTATION_CAPACITY,
 };
 mod query;
+pub(crate) mod recovery;
+use recovery::RecoveryContext;
+pub use recovery::RecoveryOptions;
 pub mod scan;
 pub use scan::{ScanError, MAX_SCAN_TOTAL_MATCHES};
 
@@ -1013,6 +1016,7 @@ struct ConnContext {
     cluster_secret: Option<Vec<u8>>,
     #[cfg(test)]
     sender_snapshot_hook: Option<SenderSnapshotHook>,
+    recovery: Option<Arc<RecoveryContext>>,
 }
 
 /// Max re-forward hops for a routed op. Bounds the chain when peers'
@@ -2116,6 +2120,7 @@ pub struct Node {
     /// releases it only after every fragment actor has stopped; cancellation
     /// and best-effort Drop leave managed backends fail-closed.
     store_binding: StdMutex<Option<StoreBinding>>,
+    recovery: Option<Arc<RecoveryContext>>,
 }
 
 enum ShutdownProgress {
@@ -3487,6 +3492,9 @@ impl NodeRuntimeOptions {
 /// ```
 #[derive(Clone, bon::Builder)]
 pub struct NodeConfig {
+    /// Explicit full-outage recovery authority for a complete durable dynamic
+    /// replica set. Default None requires an already-serving bootstrap source.
+    pub recovery: Option<RecoveryOptions>,
     /// Optional best-effort local TTL cleanup handler. Disabled by default;
     /// expired value payloads are not copied or retained for notifications then.
     /// Callbacks may run during successful fragment initialization. They do not
@@ -3739,6 +3747,16 @@ impl Node {
             )));
         }
         let dynamic = config.placement_controller.is_some();
+        if let Some(recovery) = config.recovery.as_ref() {
+            recovery
+                .validate()
+                .map_err(|error| NodeError::Codec(error.into()))?;
+            if !dynamic || config.store.is_none() {
+                return Err(NodeError::Codec(
+                    "recovery requires dynamic placement and a durable store".into(),
+                ));
+            }
+        }
         if config.fragment_count == 0 {
             return Err(NodeError::Actor(
                 "fragment_count must be non-zero".to_string(),
@@ -3843,6 +3861,17 @@ impl Node {
 
         let mut config = config;
         config.persistence = config.persistence.for_runtime().map_err(NodeError::Actor)?;
+        let recovery = config.recovery.clone().map(|options| {
+            Arc::new(RecoveryContext::new(
+                options,
+                node_id.clone(),
+                initial_placement.clone(),
+            ))
+        });
+        let mut sender_config = config.replication.clone();
+        if recovery.is_some() {
+            sender_config.required_ack_durability = ReplicationAckDurability::StableCommitted;
+        }
 
         // Bind immutable storage identity before network or actor side effects.
         // The binding remains owned by Node until every fragment has stopped.
@@ -4027,6 +4056,7 @@ impl Node {
                 .expect("runtime options validated before startup");
         }
         let node = Self {
+            recovery: recovery.clone(),
             node_id: node_id.clone(),
             boot_id: fresh_boot_id(),
             listen_addr: bound_addr,
@@ -4057,7 +4087,7 @@ impl Node {
             senders: Arc::new(Mutex::new(HashMap::new())),
             finalizing_senders: Arc::new(SenderFinalizationRegistry::default()),
             retiring_senders: Arc::new(RetiringSenderRegistry::default()),
-            sender_config: config.replication.clone(),
+            sender_config,
             write_concerns: write_concerns.clone(),
             runtime_options: runtime_options.clone(),
             storage_executor: config.persistence.executor(),
@@ -4129,6 +4159,7 @@ impl Node {
         // the controller's desired placement.
         if dynamic {
             let deps = PlacementDriverDeps {
+                recovery: recovery.clone(),
                 node_id: node_id.clone(),
                 controller: node.placement_controller.clone().expect("checked above"),
                 poll_interval: node.placement_poll_interval,
@@ -4151,7 +4182,8 @@ impl Node {
                 sender_runtime: node
                     .runtime_options
                     .sender_options()
-                    .with_write_concerns(node.write_concerns.clone()),
+                    .with_write_concerns(node.write_concerns.clone())
+                    .with_recovery(recovery.clone()),
                 peers: node.peers.clone(),
                 peer_failures: node.peer_failures.clone(),
                 tasks: Arc::downgrade(&node.placement_tasks),
@@ -4331,6 +4363,7 @@ impl Node {
 
     fn connection_context(&self) -> ConnContext {
         ConnContext {
+            recovery: self.recovery.clone(),
             node_id: self.node_id.clone(),
             router: self.router.clone(),
             serving: self.serving.clone(),
@@ -4359,7 +4392,8 @@ impl Node {
             sender_runtime: self
                 .runtime_options
                 .sender_options()
-                .with_write_concerns(self.write_concerns.clone()),
+                .with_write_concerns(self.write_concerns.clone())
+                .with_recovery(self.recovery.clone()),
             runtime_options: self.runtime_options.clone(),
             receive_byte_budget: self.receive_byte_budget.clone(),
             node_peer_queue_budget: self.node_peer_queue_budget.clone(),
@@ -4431,7 +4465,8 @@ impl Node {
                 runtime: &self
                     .runtime_options
                     .sender_options()
-                    .with_write_concerns(self.write_concerns.clone()),
+                    .with_write_concerns(self.write_concerns.clone())
+                    .with_recovery(self.recovery.clone()),
                 router: &self.router,
                 hlc: &self.hlc,
                 senders: &self.senders,
@@ -6019,6 +6054,7 @@ struct PlacementDriverDeps {
     dispatcher_tasks: Weak<RuntimeTasks>,
     operation_gate: Arc<OperationGate>,
     hlc: Arc<Mutex<HlcClock>>,
+    recovery: Option<Arc<RecoveryContext>>,
 }
 
 impl PlacementDriverDeps {
@@ -6340,13 +6376,34 @@ async fn converge_fragment_gain(deps: &PlacementDriverDeps, fragment: FragmentId
             (desired, replicas, generation)
         };
 
+        if deps
+            .recovery
+            .as_ref()
+            .is_some_and(|recovery| !recovery.matches_placement(fragment, &replicas))
+        {
+            tracing::warn!(
+                fragment = fragment.0,
+                "recovery placement changed; explicit new recovery authority required"
+            );
+            return false;
+        }
         ensure_fragment_senders(deps, fragment, &desired).await;
         let sources: Vec<String> = replicas
             .iter()
             .filter(|peer| *peer != &deps.node_id)
             .cloned()
             .collect();
-        if !sources.is_empty() && !bootstrap_from(deps, fragment, &sources).await {
+        let recovery_fence = if deps.recovery.is_some() {
+            recovery::bootstrap_all(deps, fragment, &sources).await
+        } else {
+            None
+        };
+        let bootstrapped = if deps.recovery.is_some() {
+            recovery_fence.is_some()
+        } else {
+            sources.is_empty() || bootstrap_from(deps, fragment, &sources).await
+        };
+        if !bootstrapped {
             tracing::warn!(
                 fragment = fragment.0,
                 "fragment bootstrap timed out; refusing to publish incomplete state"
@@ -7380,6 +7437,8 @@ struct ServedReconcileState {
     /// Dispatcher restarts preserve this generation because they share state;
     /// destructive placement remove/re-add cycles allocate a new one.
     route_generation: u64,
+    recovery_epoch: Vec<u8>,
+    recovery_replica_digest: Vec<u8>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -7797,6 +7856,7 @@ async fn handle_connection(
 ) -> ConnectionOutcome {
     let handshake_deadline = deadline_after(ctx.runtime_options.handshake_timeout);
     let ConnContext {
+        recovery,
         node_id,
         router,
         serving,
@@ -8326,7 +8386,19 @@ async fn handle_connection(
                 });
 
                 if failure.is_none() && reconcile_barrier {
-                    let same_serving_incarnation = serving.read().unwrap().contains(&frag)
+                    let source_authorized = serving.read().unwrap().contains(&frag)
+                        || served_reconciles.get(&session_key).is_some_and(|state| {
+                            recovery.as_ref().is_some_and(|authority| {
+                                authority.authorizes(
+                                    frag,
+                                    &peer,
+                                    &state.recovery_epoch,
+                                    &state.recovery_replica_digest,
+                                    &placement.read().unwrap(),
+                                )
+                            })
+                        });
+                    let same_serving_incarnation = source_authorized
                         && route.as_ref().is_some_and(|(generation, _)| {
                             served_reconciles.get(&session_key).is_some_and(|state| {
                                 state.session_id == b.session_id
@@ -8573,7 +8645,16 @@ async fn handle_connection(
                     );
                     continue;
                 }
-                if !serving.read().unwrap().contains(&frag) {
+                let recovery_authorized = recovery.as_ref().is_some_and(|authority| {
+                    authority.authorizes(
+                        frag,
+                        &peer,
+                        &r.recovery_epoch,
+                        &r.recovery_replica_digest,
+                        &placement.read().unwrap(),
+                    )
+                });
+                if !serving.read().unwrap().contains(&frag) && !recovery_authorized {
                     // Independent placement observers can legitimately race:
                     // the serving replica may start its routine round before
                     // this node has finished bootstrapping the same fragment.
@@ -8720,6 +8801,8 @@ async fn handle_connection(
                             )
                         };
                         let served_state = (!response.restart).then(|| ServedReconcileState {
+                            recovery_epoch: r.recovery_epoch.clone(),
+                            recovery_replica_digest: r.recovery_replica_digest.clone(),
                             session_id: response.session_id,
                             round_id: response.round_id,
                             next_page_seq: response.page_seq.saturating_add(1),
@@ -8771,7 +8854,21 @@ async fn handle_connection(
                     );
                     continue;
                 }
-                if !serving.read().unwrap().contains(&frag) {
+                let recovery_authorized =
+                    served_reconciles
+                        .get(&(peer.clone(), frag))
+                        .is_some_and(|state| {
+                            recovery.as_ref().is_some_and(|authority| {
+                                authority.authorizes(
+                                    frag,
+                                    &peer,
+                                    &state.recovery_epoch,
+                                    &state.recovery_replica_digest,
+                                    &placement.read().unwrap(),
+                                )
+                            })
+                        });
+                if !serving.read().unwrap().contains(&frag) && !recovery_authorized {
                     // A fragment can lose authority between the summary and
                     // fetch phases. Let the correlated sender expire and retry
                     // without tearing down other traffic on this connection.
@@ -11738,6 +11835,7 @@ mod tests {
         }
         PlacementDriverDeps {
             expiry_publisher: None,
+            recovery: None,
             node_id: "node-a".to_string(),
             controller: Arc::new(crate::placement::StaticPlacement::new(HashMap::new())),
             poll_interval: Duration::from_secs(3600),
@@ -11786,6 +11884,7 @@ mod tests {
         let (peer_changes, _) = watch::channel(0u64);
         (
             ConnContext {
+                recovery: None,
                 node_id: "local".to_string(),
                 router,
                 serving,
@@ -13708,6 +13807,9 @@ mod tests {
                     after_key: String::new(),
                     snapshot_revision: 0,
                     snapshot_time_ms: 0,
+
+                    recovery_epoch: Vec::new(),
+                    recovery_replica_digest: Vec::new(),
                 })
             };
             write_test_envelope(
