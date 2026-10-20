@@ -22,11 +22,19 @@ impl ByteBudget {
         self.used.load(Ordering::Acquire)
     }
     fn acquire(&self, bytes: usize) -> bool {
-        self.used
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
-                used.checked_add(bytes).filter(|next| *next <= self.limit)
-            })
-            .is_ok()
+        let mut used = self.used.load(Ordering::Acquire);
+        loop {
+            let Some(next) = used.checked_add(bytes).filter(|next| *next <= self.limit) else {
+                return false;
+            };
+            match self
+                .used
+                .compare_exchange_weak(used, next, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => return true,
+                Err(current) => used = current,
+            }
+        }
     }
     pub(crate) fn reserve(self: &Arc<Self>, bytes: usize) -> Option<BytePermit> {
         self.acquire(bytes).then(|| BytePermit {
