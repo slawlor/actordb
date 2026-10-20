@@ -1378,6 +1378,16 @@ async fn send_envelope(
                 return false;
             }
         };
+        let global_permits = match outbound
+            .acquire_global_producer(encoded_len as u32, admission_deadline)
+            .await
+        {
+            Ok(permits) => permits,
+            Err(()) => {
+                peer.report_failure();
+                return false;
+            }
+        };
         if Instant::now() >= admission_deadline {
             peer.report_failure();
             return false;
@@ -1389,11 +1399,10 @@ async fn send_envelope(
                 return false;
             }
         };
-        frame_permit.send(BudgetedFrame::new_producer(
-            buf,
-            byte_permit,
-            producer_byte_permit,
-        ));
+        frame_permit.send(
+            BudgetedFrame::new_producer(buf, byte_permit, producer_byte_permit)
+                .with_global_permits(global_permits),
+        );
         true
     } else {
         let frame_permit =
@@ -4815,6 +4824,9 @@ mod tests {
         let budget = Arc::new(tokio::sync::Semaphore::new(encoded_len * 2));
         let producer_budget = Arc::new(tokio::sync::Semaphore::new(encoded_len * 2));
         let outbound = BudgetedPeerTx {
+            node_byte_budget: crate::wire::NodePeerByteBudget::new(
+                crate::wire::NODE_PEER_QUEUE_BYTE_CAPACITY,
+            ),
             tx: frame_tx,
             response_tx,
             byte_budget: budget.clone(),
@@ -4838,6 +4850,61 @@ mod tests {
         assert!(send_envelope(&second, None, msg()).await);
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn replication_peers_share_aggregate_encoded_body_admission() {
+        let budget = crate::wire::NodePeerByteBudget::new(2 * MAX_FRAME_BYTES);
+        let msg = EnvelopeMsg::SessionStart(SessionStart {
+            session_id: 7,
+            fragment: 0,
+        });
+        let bytes = Envelope {
+            msg: Some(msg.clone()),
+        }
+        .encoded_len();
+        let held = budget
+            .acquire_producer(
+                (MAX_FRAME_BYTES - bytes) as u32,
+                Instant::now() + Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
+        let make_peer = || {
+            let (tx, rx) = mpsc::channel(4);
+            let (response_tx, _response_rx) = mpsc::channel(4);
+            let (identity, _identity_rx) = mpsc::channel(1);
+            let outbound = BudgetedPeerTx {
+                tx,
+                response_tx,
+                identity: identity.clone(),
+                byte_budget: Arc::new(tokio::sync::Semaphore::new(4096)),
+                producer_byte_budget: Arc::new(tokio::sync::Semaphore::new(4096)),
+                node_byte_budget: budget.clone(),
+                reconcile_gate: crate::wire::ReconcileGate::new(),
+            };
+            (
+                SenderPeer::new(identity, Some(outbound), &SenderRuntimeOptions::default()),
+                rx,
+            )
+        };
+        let (a, mut a_data) = make_peer();
+        let (b, mut b_data) = make_peer();
+        assert!(send_envelope(&a, None, msg.clone()).await);
+        let mut blocked = Box::pin(send_envelope(&b, None, msg));
+        use std::future::Future;
+        std::future::poll_fn(|cx| {
+            assert!(blocked.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        assert_eq!(b_data.len(), 0);
+        drop(a_data.recv().await.unwrap());
+        assert!(blocked.await);
+        assert!(budget.diagnostics().saturation_events() > 0);
+        drop(b_data.recv().await.unwrap());
+        drop(held);
+        assert_eq!(budget.diagnostics().admitted_bytes(), 0);
+    }
+
     #[tokio::test]
     async fn node_reconciliation_rounds_share_one_connection_credit() {
         let (frame_tx, mut frame_rx) = mpsc::channel(4);
@@ -4845,6 +4912,9 @@ mod tests {
         let (identity, _identity_rx) = mpsc::channel(1);
         let reconcile_gate = crate::wire::ReconcileGate::new();
         let outbound = BudgetedPeerTx {
+            node_byte_budget: crate::wire::NodePeerByteBudget::new(
+                crate::wire::NODE_PEER_QUEUE_BYTE_CAPACITY,
+            ),
             tx: frame_tx,
             response_tx,
             byte_budget: Arc::new(tokio::sync::Semaphore::new(4096)),

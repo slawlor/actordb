@@ -15,6 +15,12 @@ use tokio::sync::{mpsc, watch, OwnedSemaphorePermit, Semaphore};
 use crate::actor::{ReplicatedOp, VersionedValue};
 use crate::proto::Envelope;
 
+mod peer_budget;
+pub use peer_budget::PeerWriterDiagnostics;
+pub(crate) use peer_budget::{
+    GlobalBytePermits, NodePeerByteBudget, NODE_PEER_QUEUE_BYTE_CAPACITY,
+};
+
 /// Hard limit for one length-prefixed protobuf envelope body.
 pub(crate) const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 
@@ -55,6 +61,8 @@ pub(crate) struct BudgetedFrame {
     bytes: Vec<u8>,
     _byte_permit: OwnedSemaphorePermit,
     _producer_byte_permit: Option<OwnedSemaphorePermit>,
+    _global_byte_permit: Option<OwnedSemaphorePermit>,
+    _global_producer_byte_permit: Option<OwnedSemaphorePermit>,
 }
 
 impl BudgetedFrame {
@@ -67,6 +75,8 @@ impl BudgetedFrame {
             bytes,
             _byte_permit: byte_permit,
             _producer_byte_permit: Some(producer_byte_permit),
+            _global_byte_permit: None,
+            _global_producer_byte_permit: None,
         }
     }
 
@@ -75,7 +85,15 @@ impl BudgetedFrame {
             bytes,
             _byte_permit: byte_permit,
             _producer_byte_permit: None,
+            _global_byte_permit: None,
+            _global_producer_byte_permit: None,
         }
+    }
+
+    pub(crate) fn with_global_permits(mut self, permits: GlobalBytePermits) -> Self {
+        self._global_byte_permit = Some(permits.total);
+        self._global_producer_byte_permit = permits.producer;
+        self
     }
 
     pub(crate) fn len(&self) -> usize {
@@ -102,6 +120,8 @@ pub(crate) struct BudgetedPeerTx {
     /// total leaves room for one ordinary anti-entropy/control response even
     /// when data producers have consumed their entire allowance.
     pub(crate) producer_byte_budget: Arc<Semaphore>,
+    /// Node-wide shared gate. Closing this physical connection leaves it open.
+    pub(crate) node_byte_budget: Arc<NodePeerByteBudget>,
     /// One anti-entropy round at a time per physical connection. This bounds
     /// responder work independently of the configured fragment count.
     pub(crate) reconcile_gate: ReconcileGate,
@@ -244,6 +264,18 @@ impl Drop for ReconcilePermit {
 impl BudgetedPeerTx {
     pub(crate) fn same_channel(&self, other: &Self) -> bool {
         self.tx.same_channel(&other.tx)
+    }
+
+    pub(crate) async fn acquire_global_producer(
+        &self,
+        bytes: u32,
+        deadline: tokio::time::Instant,
+    ) -> Result<GlobalBytePermits, ()> {
+        tokio::select! {
+            biased;
+            _ = self.tx.closed() => Err(()),
+            result = self.node_byte_budget.acquire_producer(bytes, deadline) => result,
+        }
     }
 
     pub(crate) fn close(&self) {
