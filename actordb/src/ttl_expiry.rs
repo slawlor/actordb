@@ -309,12 +309,16 @@ struct Metrics {
 }
 
 fn add(counter: &AtomicU64, value: u64) -> u64 {
-    let before = counter
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
-            Some(n.saturating_add(value))
-        })
-        .unwrap();
-    before.saturating_add(value)
+    // fetch_update is deprecated on current stable; its replacement is newer
+    // than our MSRV. Keep the same saturating operation using the portable CAS.
+    let mut current = counter.load(Ordering::Relaxed);
+    loop {
+        let next = current.saturating_add(value);
+        match counter.compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return next,
+            Err(actual) => current = actual,
+        }
+    }
 }
 
 type WallClock = Arc<dyn Fn() -> u64 + Send + Sync>;
@@ -1497,5 +1501,13 @@ mod tests {
         ] {
             assert!(options.validate().is_err());
         }
+    }
+
+    #[test]
+    fn diagnostic_counters_saturate_without_wrapping() {
+        let counter = AtomicU64::new(u64::MAX - 1);
+        assert_eq!(add(&counter, 1), u64::MAX);
+        assert_eq!(add(&counter, 100), u64::MAX);
+        assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
     }
 }
