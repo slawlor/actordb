@@ -9,8 +9,10 @@
 //! producing byte streams. The peer mesh and [`ClientServer`](crate::client_server::ClientServer)
 //! can use the same transport interface. Everything above — framing, handshake, gossip —
 //! operates on those streams generically. The default is [`TcpNetwork`](crate::network::TcpNetwork)
-//! (plain TCP); implement [`Network`](crate::network::Network) to run the mesh over TLS, a
-//! Meta-internal transport, or anything else that moves bytes.
+//! (plain TCP). Enable the crate's `tls` feature for the built-in
+//! [`TlsNetwork`](crate::network::TlsNetwork), or implement [`Network`](crate::network::Network)
+//! to run the mesh over another TLS stack, a Meta-internal transport, or anything else that moves
+//! bytes.
 //!
 //! # Cancellation and resource ownership
 //!
@@ -34,6 +36,11 @@ use std::pin::Pin;
 
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
+
+#[cfg(feature = "tls")]
+mod tls;
+#[cfg(feature = "tls")]
+pub use tls::TlsNetwork;
 
 /// A peer or application connection: any async bidirectional byte stream.
 ///

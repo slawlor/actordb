@@ -1,5 +1,9 @@
 # actordb
 
+<p align="center">
+  <img src="https://raw.githubusercontent.com/slawlor/actordb/main/docs/assets/actordb-logo-draft.svg" alt="ActorDB distributed Ferris graph" width="420">
+</p>
+
 A Rust actor-based distributed database with pluggable, opt-in storage
 
 * [<img alt="github" src="https://img.shields.io/badge/github-slawlor/actordb-8da0cb?style=for-the-badge&labelColor=555555&logo=github" height="20">](https://github.com/slawlor/actordb)
