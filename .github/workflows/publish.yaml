@@ -79,7 +79,7 @@ jobs:
       - name: Create the verified release artifact
         # Modern Cargo stages publish dry-runs in a temporary registry rather
         # than the normal package directory. Do not depend on internal paths.
-        run: cargo package --package actordb-protocol --package actordb-query --package actordb --package actordb --package actordb-client --target-dir "$ACTORDB_PACKAGE_TARGET"
+        run: cargo package --package actordb-protocol --package actordb-query --package actordb --package actordb-client --target-dir "$ACTORDB_PACKAGE_TARGET"
 
       # PR/main CI owns RocksDB validation. Publication only repeats the cheap
       # backend-free and memory checks; never build the native backend here.
