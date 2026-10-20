@@ -310,10 +310,7 @@ impl Node {
             }
             let mut skipped = 0u64;
             let mut payload_bytes = 0usize;
-            loop {
-                let Some(Reverse((key, index))) = heads.pop() else {
-                    break;
-                };
+            while let Some(Reverse((key, index))) = heads.pop() {
                 drop(key);
                 let row = cursors[index]
                     .rows

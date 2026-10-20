@@ -181,11 +181,15 @@ impl QueryAdmission {
             }))
         })();
         if result.is_err() {
-            let _ = self
-                .rejected
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
-                    Some(n.saturating_add(1))
-                });
+            let mut previous = self.rejected.load(Ordering::Relaxed);
+            while let Err(current) = self.rejected.compare_exchange_weak(
+                previous,
+                previous.saturating_add(1),
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                previous = current;
+            }
         }
         result
     }

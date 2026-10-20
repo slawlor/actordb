@@ -824,9 +824,6 @@ struct PendingScan {
     reply: oneshot::Sender<Result<Vec<crate::proto::ScanMatchProto>, String>>,
 }
 
-/// Removes a pending scan request even if the coordinator future is
-/// cancelled while waiting for the holder's response.
-
 /// Removes a pending request even if its future is cancelled while waiting
 /// for outbound queue capacity or a peer response.
 struct PendingMutationGuard {
