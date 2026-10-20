@@ -43,7 +43,7 @@ const ROCKSDB_METADATA_CF: &str = "actordb-metadata";
 const ROCKSDB_MANIFEST_KEY: &[u8] = b"manifest";
 const ROCKSDB_MANIFEST_MAGIC: &[u8; 8] = b"ACTORDB\0";
 const ROCKSDB_MANIFEST_VERSION: u32 = 1;
-const ROCKSDB_DATA_FORMAT_VERSION: u32 = 1;
+const ROCKSDB_DATA_FORMAT_VERSION: u32 = 2;
 const ROCKSDB_PARTITIONER_VERSION: u32 = 1;
 
 impl RocksDbStore {
@@ -230,7 +230,7 @@ impl RocksDbStore {
             )));
         }
         let data_version = u32::from_be_bytes(encoded[12..16].try_into().unwrap());
-        if data_version != ROCKSDB_DATA_FORMAT_VERSION {
+        if ![1, ROCKSDB_DATA_FORMAT_VERSION].contains(&data_version) {
             return Err(StoreError(format!(
                 "unsupported RocksDB data format version {data_version} (expected {ROCKSDB_DATA_FORMAT_VERSION})"
             )));
@@ -345,6 +345,17 @@ impl RocksDbStore {
                         identity.fragment_count
                     )));
                 }
+                if u32::from_be_bytes(encoded[12..16].try_into().unwrap()) == 1 {
+                    self.validate_legacy_records(identity)?;
+                    self.db
+                        .put_cf_opt(
+                            &metadata,
+                            ROCKSDB_MANIFEST_KEY,
+                            Self::encode_manifest(identity),
+                            &self.sync_write_options,
+                        )
+                        .map_err(|error| StoreError(error.to_string()))?;
+                }
                 return Ok(());
             }
         }
@@ -453,28 +464,34 @@ impl RocksDbStore {
     }
 
     fn encode(v: &VersionedValue) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(21 + v.node_id.len() + v.value.len());
+        let mut buf = Vec::with_capacity(29 + v.node_id.len() + v.value.len());
         buf.extend_from_slice(&v.timestamp_ms.to_be_bytes());
         // 0 = no expiry.
         buf.extend_from_slice(&v.expires_at_ms.unwrap_or(0).to_be_bytes());
-        buf.push(v.is_tombstone as u8);
+        buf.push(0x80 | v.is_tombstone as u8);
         buf.extend_from_slice(&(v.node_id.len() as u32).to_be_bytes());
+        buf.extend_from_slice(&v.logical_counter.to_be_bytes());
         buf.extend_from_slice(v.node_id.as_bytes());
         buf.extend_from_slice(&v.value);
         buf
     }
 
-    fn encoded_record_layout(bytes: &[u8]) -> Result<(bool, usize), String> {
+    fn encoded_record_layout(bytes: &[u8]) -> Result<(bool, usize, usize), String> {
         if bytes.len() < 21 {
             return Err(format!("value too short: {} bytes", bytes.len()));
         }
         let is_tombstone = match bytes[16] {
-            0 => false,
-            1 => true,
+            0 | 128 => false,
+            1 | 129 => true,
             flag => return Err(format!("invalid tombstone flag {flag}; expected 0 or 1")),
         };
         let node_id_len = u32::from_be_bytes(bytes[17..21].try_into().unwrap()) as usize;
-        let value_offset = 21usize
+        let node_offset = if bytes[16] & 0x80 != 0 {
+            29usize
+        } else {
+            21usize
+        };
+        let value_offset = node_offset
             .checked_add(node_id_len)
             .ok_or_else(|| "node_id length overflowed usize".to_string())?;
         if bytes.len() < value_offset {
@@ -483,12 +500,13 @@ impl RocksDbStore {
                 bytes.len()
             ));
         }
-        Ok((is_tombstone, value_offset))
+        Ok((is_tombstone, node_offset, value_offset))
     }
 
     fn preflight_encoded_record(logical_key_len: usize, bytes: &[u8]) -> Result<(), StoreError> {
-        let (_, value_offset) = Self::encoded_record_layout(bytes).map_err(StoreError)?;
-        let node_id_len = value_offset - 21;
+        let (_, node_offset, value_offset) =
+            Self::encoded_record_layout(bytes).map_err(StoreError)?;
+        let node_id_len = value_offset - node_offset;
         check_record_budget(logical_key_len, bytes.len() - value_offset, node_id_len).map_err(
             |error| {
                 StoreError(format!(
@@ -499,7 +517,12 @@ impl RocksDbStore {
     }
 
     fn decode(bytes: &[u8]) -> Result<VersionedValue, String> {
-        let (is_tombstone, value_offset) = Self::encoded_record_layout(bytes)?;
+        let (is_tombstone, node_offset, value_offset) = Self::encoded_record_layout(bytes)?;
+        let logical_counter = if node_offset == 29 {
+            u64::from_be_bytes(bytes[21..29].try_into().unwrap())
+        } else {
+            0
+        };
         let timestamp_ms = u64::from_be_bytes(bytes[0..8].try_into().unwrap());
         let expires_raw = u64::from_be_bytes(bytes[8..16].try_into().unwrap());
         let expires_at_ms = if expires_raw == 0 {
@@ -507,13 +530,14 @@ impl RocksDbStore {
         } else {
             Some(expires_raw)
         };
-        let node_id = std::str::from_utf8(&bytes[21..value_offset])
+        let node_id = std::str::from_utf8(&bytes[node_offset..value_offset])
             .map_err(|error| format!("node_id not UTF-8: {error}"))?
             .to_owned();
         let value = bytes[value_offset..].to_vec();
         Ok(VersionedValue {
             value,
             timestamp_ms,
+            logical_counter,
             node_id,
             expires_at_ms,
             is_tombstone,
@@ -683,6 +707,53 @@ mod tests {
         assert_eq!(RocksDbStore::decode(&RocksDbStore::encode(&v)).unwrap(), v);
         let v = VersionedValue::new(vec![], 0, "n".to_string());
         assert_eq!(RocksDbStore::decode(&RocksDbStore::encode(&v)).unwrap(), v);
+    }
+
+    #[test]
+    fn format_one_records_upgrade_and_preserve_logical_restart_versions() {
+        let dir = tempfile::tempdir().unwrap();
+        let identity = StoreIdentity::new("owner".into(), 1);
+        let key = [0u32.to_be_bytes().as_slice(), b"legacy"].concat();
+        let old = VersionedValue::new(b"old".to_vec(), 42, "owner".into());
+        {
+            let store = RocksDbStore::open(dir.path()).unwrap();
+            let binding = store.bind(&identity).unwrap();
+            let mut legacy = RocksDbStore::encode(&old);
+            legacy.drain(21..29);
+            legacy[16] &= 0x7f;
+            store.db.put(&key, legacy).unwrap();
+            let mut manifest = RocksDbStore::encode_manifest(&identity);
+            manifest[12..16].copy_from_slice(&1u32.to_be_bytes());
+            store
+                .db
+                .put_cf(
+                    &store.metadata_cf().unwrap(),
+                    ROCKSDB_MANIFEST_KEY,
+                    manifest,
+                )
+                .unwrap();
+            drop(binding);
+        }
+        let store = RocksDbStore::open(dir.path()).unwrap();
+        let binding = store.bind(&identity).unwrap();
+        assert_eq!(store.load().unwrap(), vec![(key.clone(), old)]);
+        let manifest = store
+            .db
+            .get_cf(&store.metadata_cf().unwrap(), ROCKSDB_MANIFEST_KEY)
+            .unwrap()
+            .unwrap();
+        assert_eq!(u32::from_be_bytes(manifest[12..16].try_into().unwrap()), 2);
+        let new = VersionedValue::new_version(
+            b"new".to_vec(),
+            actordb_protocol::RecordVersion::new(42, 1_000_000),
+            "owner".into(),
+        );
+        store.write_batch(&[(key.clone(), new.clone())]).unwrap();
+        drop(binding);
+        drop(store);
+        let reopened = RocksDbStore::open(dir.path()).unwrap();
+        let _binding = reopened.bind(&identity).unwrap();
+        assert_eq!(reopened.load().unwrap(), vec![(key, new)]);
     }
 
     #[test]

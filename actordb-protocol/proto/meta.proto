@@ -70,6 +70,7 @@ message ReplicateOp {
   uint64 expires_at_ms = 7;
   // True if this is a deletion tombstone.
   bool is_tombstone = 8;
+  uint64 logical_counter = 9;
 }
 
 // A client-routed write: "you own this key's fragment — apply it as
@@ -96,6 +97,7 @@ message ForwardedPut {
   uint64 req_id = 11;
   // Optional encoded WriteConcernPolicy. Absence preserves local acknowledgement.
   optional bytes write_concern = 12;
+  uint64 logical_counter = 13;
 }
 
 // A single-key routed read. The origin tries configured holders in order; a
@@ -125,6 +127,7 @@ message GetResponse {
   // Phase 7: true if the read was shed due to backpressure (distinct
   // from not-found).
   bool shed = 8;
+  uint64 logical_counter = 9;
 }
 
 // Retired protocol-v1/v2 full-state frames. They remain generated for source
@@ -147,6 +150,7 @@ message SyncEntry {
   uint64 expires_at_ms = 5;
   // True if this is a deletion tombstone.
   bool is_tombstone = 6;
+  uint64 logical_counter = 7;
 }
 
 // Top-level wire envelope, length-delimited on the wire
@@ -204,6 +208,7 @@ message KeySummary {
   uint64 timestamp_ms = 2;
   string node_id = 3;
   bool is_tombstone = 4;
+  uint64 logical_counter = 5;
 }
 
 message ReconcileRequest {
@@ -291,6 +296,7 @@ message MutationResult {
   uint32 request_index = 7;
   // Encoded WriteConcernResult, present only when a policy was requested.
   optional bytes write_concern = 8;
+  uint64 winner_logical_counter = 9;
 }
 
 enum WriteConcernLevel {
@@ -348,6 +354,7 @@ message BatchGetResponse {
     // Phase 7: true if the read was shed due to backpressure (distinct
     // from not-found).
     bool shed = 8;
+  uint64 logical_counter = 9;
   }
   // With CAPABILITY_BYTE_BOUNDED_BATCHES, a non-empty request returns either
   // an empty unavailable response or a non-empty ordered prefix. The caller

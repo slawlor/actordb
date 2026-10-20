@@ -693,7 +693,8 @@ pub(crate) fn batch_get_result_encoded_len(
         .saturating_add(varint_field_len(4, value.timestamp_ms))
         .saturating_add(bytes_field_len(5, value.node_id.len()))
         .saturating_add(varint_field_len(6, value.expires_at_ms.unwrap_or(0)))
-        .saturating_add(varint_field_len(7, u64::from(value.is_tombstone)));
+        .saturating_add(varint_field_len(7, u64::from(value.is_tombstone)))
+        .saturating_add(varint_field_len(9, value.logical_counter));
     encoded_len
 }
 
@@ -773,7 +774,8 @@ fn replicated_record_max_encoded_len(
         + max_u64_field_len(5)
         + max_u64_field_len(6)
         + max_u64_field_len(7)
-        + bool_field_len(8, tombstone);
+        + bool_field_len(8, tombstone)
+        + max_u64_field_len(9);
     let replicate_batch = max_u64_field_len(1)
         + max_u64_field_len(2)
         + max_u32_field_len(3)
@@ -786,7 +788,8 @@ fn replicated_record_max_encoded_len(
         + max_u64_field_len(3)
         + bytes_field_len(4, node_len)
         + max_u64_field_len(5)
-        + bool_field_len(6, tombstone);
+        + bool_field_len(6, tombstone)
+        + max_u64_field_len(7);
     let reconcile_data = max_u32_field_len(1)
         + message_field_len(2, sync_entry)
         + max_u64_field_len(3)
@@ -802,7 +805,8 @@ fn replicated_record_max_encoded_len(
     let key_summary = bytes_field_len(1, key_len)
         + max_u64_field_len(2)
         + bytes_field_len(3, node_len)
-        + bool_field_len(4, tombstone);
+        + bool_field_len(4, tombstone)
+        + max_u64_field_len(5);
     let reconcile_response = max_u32_field_len(1)
         + message_field_len(2, key_summary)
         + max_u64_field_len(3)
@@ -824,7 +828,8 @@ fn replicated_record_max_encoded_len(
         + bool_field_len(8, tombstone)
         + small_varint_field_len(9)
         + max_u32_field_len(10)
-        + max_u64_field_len(11);
+        + max_u64_field_len(11)
+        + max_u64_field_len(13);
     let batch_put =
         message_field_len(1, forwarded_put) + small_varint_field_len(2) + max_u64_field_len(3);
     let batch_put_envelope = message_field_len(15, batch_put);
@@ -835,7 +840,8 @@ fn replicated_record_max_encoded_len(
         + max_u64_field_len(4)
         + bytes_field_len(5, node_len)
         + max_u64_field_len(6)
-        + bool_field_len(7, tombstone);
+        + bool_field_len(7, tombstone)
+        + max_u64_field_len(9);
     let batch_get_response = max_u64_field_len(1) + message_field_len(2, batch_key_value);
     let batch_get_envelope = message_field_len(17, batch_get_response);
 
@@ -848,7 +854,8 @@ fn replicated_record_max_encoded_len(
         + max_u64_field_len(4)
         + bytes_field_len(5, MAX_WIRE_NODE_ID_BYTES)
         + bool_field_len(6, true)
-        + max_u32_field_len(7);
+        + max_u32_field_len(7)
+        + max_u64_field_len(9);
     let mutation_response = max_u64_field_len(1) + message_field_len(2, mutation_result);
     let mutation_response_envelope = message_field_len(18, mutation_response);
 
@@ -929,6 +936,7 @@ mod tests {
                     key: "key".to_string(),
                     value: vec![0; value_len],
                     timestamp_ms: 11,
+                    logical_counter: 0,
                     node_id: "node".to_string(),
                     expires_at_ms: 0,
                     is_tombstone: false,
@@ -1168,6 +1176,7 @@ mod tests {
             found: true,
             value: value.value.clone(),
             timestamp_ms: value.timestamp_ms,
+            logical_counter: value.logical_counter,
             node_id: value.node_id.clone(),
             expires_at_ms: value.expires_at_ms.unwrap_or(0),
             is_tombstone: value.is_tombstone,
@@ -1301,6 +1310,7 @@ mod tests {
             key: op.key.clone(),
             value: op.value.value.clone(),
             timestamp_ms: u64::MAX,
+            logical_counter: u64::MAX,
             node_id: op.value.node_id.clone(),
             seq: u64::MAX,
             boot_id: u64::MAX,
@@ -1311,6 +1321,7 @@ mod tests {
             key: op.key.clone(),
             value: op.value.value.clone(),
             timestamp_ms: u64::MAX,
+            logical_counter: u64::MAX,
             node_id: op.value.node_id.clone(),
             expires_at_ms: u64::MAX,
             is_tombstone: false,
@@ -1319,6 +1330,7 @@ mod tests {
             key: op.key.clone(),
             value: op.value.value.clone(),
             timestamp_ms: u64::MAX,
+            logical_counter: u64::MAX,
             node_id: op.value.node_id.clone(),
             seq: u64::MAX,
             boot_id: u64::MAX,
@@ -1357,6 +1369,7 @@ mod tests {
                     summaries: vec![KeySummary {
                         key: op.key.clone(),
                         timestamp_ms: u64::MAX,
+                        logical_counter: u64::MAX,
                         node_id: op.value.node_id.clone(),
                         is_tombstone: false,
                     }],
@@ -1385,6 +1398,7 @@ mod tests {
                         found: true,
                         value: op.value.value.clone(),
                         timestamp_ms: u64::MAX,
+                        logical_counter: u64::MAX,
                         node_id: op.value.node_id.clone(),
                         expires_at_ms: u64::MAX,
                         is_tombstone: false,
@@ -1400,6 +1414,7 @@ mod tests {
                         status: MutationStatus::Unavailable as i32,
                         error: "e".repeat(MAX_WIRE_ERROR_BYTES),
                         winner_timestamp_ms: u64::MAX,
+                        winner_logical_counter: u64::MAX,
                         winner_node_id: "n".repeat(MAX_WIRE_NODE_ID_BYTES),
                         winner_is_tombstone: true,
                         request_index: u32::MAX,
@@ -1431,6 +1446,7 @@ mod tests {
                     key,
                     value: Vec::new(),
                     timestamp_ms: u64::MAX,
+                    logical_counter: 0,
                     node_id: "node".to_string(),
                     seq: u64::MAX,
                     boot_id: u64::MAX,

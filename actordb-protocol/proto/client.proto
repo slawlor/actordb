@@ -74,12 +74,14 @@ message Error {
   uint64 winner_timestamp_ms = 3;
   string winner_node_id = 4;
   bool winner_is_tombstone = 5;
+  uint64 winner_logical_counter = 6;
 }
 message Value {
   bytes bytes = 1;
   uint64 timestamp_ms = 2;
   string node_id = 3;
   optional uint64 expires_at_ms = 4;
+  uint64 logical_counter = 5;
 }
 message ReadResult { string key = 1; Value value = 2; Error error = 3; }
 message MutationResult { string key = 1; Error error = 2; optional bytes write_concern = 3; }

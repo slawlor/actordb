@@ -406,6 +406,7 @@ fn fingerprint(fragment: FragmentId, op: &ReplicatedOp) -> [u8; 32] {
     digest.update((op.key.len() as u64).to_be_bytes());
     digest.update(op.key.as_bytes());
     digest.update(op.value.timestamp_ms.to_be_bytes());
+    digest.update(op.value.logical_counter.to_be_bytes());
     digest.update((op.value.node_id.len() as u64).to_be_bytes());
     digest.update(op.value.node_id.as_bytes());
     digest.update([

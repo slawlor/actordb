@@ -288,6 +288,7 @@ async fn forwarded_concern_accepts_replication_ack_on_the_same_peer_connection()
                 key: "same-connection".into(),
                 value: vec![1],
                 timestamp_ms: timestamp,
+                logical_counter: 0,
                 node_id: plan.ids[1].clone(),
                 seq: 1,
                 boot_id: 1,
@@ -309,6 +310,7 @@ async fn forwarded_concern_accepts_replication_ack_on_the_same_peer_connection()
                             actordb::proto::KeySummary {
                                 key: op.key,
                                 timestamp_ms: op.timestamp_ms,
+                                logical_counter: op.logical_counter,
                                 node_id: op.node_id,
                                 is_tombstone: op.is_tombstone,
                             },

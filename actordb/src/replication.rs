@@ -1247,6 +1247,7 @@ fn proto_op(op: &crate::actor::ReplicatedOp) -> ProtoReplicateOp {
         key: op.key.clone(),
         value: op.value.value.clone(),
         timestamp_ms: op.value.timestamp_ms,
+        logical_counter: op.value.logical_counter,
         node_id: op.value.node_id.clone(),
         seq: op.seq,
         boot_id: op.boot_id,
@@ -1265,6 +1266,7 @@ fn proto_op_encoded_len(op: &crate::actor::ReplicatedOp) -> usize {
         .saturating_add(varint_field_len(6, op.boot_id))
         .saturating_add(varint_field_len(7, op.value.expires_at_ms.unwrap_or(0)))
         .saturating_add(varint_field_len(8, u64::from(op.value.is_tombstone)))
+        .saturating_add(varint_field_len(9, op.value.logical_counter))
 }
 
 fn take_streaming_batch(
@@ -2296,9 +2298,9 @@ async fn sender_task(
                         }
                         if !restart {
                             if let Some(timestamp_ms) =
-                                summaries.iter().map(|summary| summary.timestamp_ms).max()
+                                summaries.iter().map(|summary| actordb_protocol::RecordVersion::new(summary.timestamp_ms, summary.logical_counter)).max()
                             {
-                                if let Err(error) = deps.hlc.lock().await.observe(timestamp_ms) {
+                                if let Err(error) = deps.hlc.lock().await.observe_version(timestamp_ms) {
                                     tracing::warn!(
                                         peer = %peer_id,
                                         fragment = fragment.0,
@@ -2525,9 +2527,9 @@ async fn sender_task(
                         }
                         if well_formed {
                             if let Some(timestamp_ms) =
-                                entries.iter().map(|entry| entry.timestamp_ms).max()
+                                entries.iter().map(|entry| actordb_protocol::RecordVersion::new(entry.timestamp_ms, entry.logical_counter)).max()
                             {
-                                if let Err(error) = deps.hlc.lock().await.observe(timestamp_ms) {
+                                if let Err(error) = deps.hlc.lock().await.observe_version(timestamp_ms) {
                                     tracing::warn!(
                                         peer = %peer_id,
                                         fragment = fragment.0,
@@ -3224,13 +3226,31 @@ fn reconcile_entries_are_well_formed(
 }
 
 fn remote_summary_wins(remote: &KeySummary, local: &SnapshotSummary) -> bool {
-    (remote.timestamp_ms, &remote.node_id, remote.is_tombstone)
-        > (local.timestamp_ms, &local.node_id, local.is_tombstone)
+    (
+        remote.timestamp_ms,
+        remote.logical_counter,
+        &remote.node_id,
+        remote.is_tombstone,
+    ) > (
+        local.timestamp_ms,
+        local.logical_counter,
+        &local.node_id,
+        local.is_tombstone,
+    )
 }
 
 fn local_summary_wins(local: &SnapshotSummary, remote: &KeySummary) -> bool {
-    (local.timestamp_ms, &local.node_id, local.is_tombstone)
-        > (remote.timestamp_ms, &remote.node_id, remote.is_tombstone)
+    (
+        local.timestamp_ms,
+        local.logical_counter,
+        &local.node_id,
+        local.is_tombstone,
+    ) > (
+        remote.timestamp_ms,
+        remote.logical_counter,
+        &remote.node_id,
+        remote.is_tombstone,
+    )
 }
 
 async fn ensure_local_summary(
@@ -3608,7 +3628,11 @@ async fn apply_reconcile_entries(
         .route_for_fragment(fragment)
         .ok_or(ReconcileError::Local)?;
     for entry in entries {
-        let mut value = VersionedValue::new(entry.value, entry.timestamp_ms, entry.node_id);
+        let mut value = VersionedValue::new_version(
+            entry.value,
+            actordb_protocol::RecordVersion::new(entry.timestamp_ms, entry.logical_counter),
+            entry.node_id,
+        );
         value.expires_at_ms = (entry.expires_at_ms != 0).then_some(entry.expires_at_ms);
         value.is_tombstone = entry.is_tombstone;
         let op = crate::actor::ReplicatedOp {
@@ -3758,6 +3782,7 @@ mod tests {
             let value = VersionedValue {
                 value: vec![7; value_len],
                 timestamp_ms: if index % 2 == 0 { 0 } else { u64::MAX },
+                logical_counter: 0,
                 node_id: if index == 0 {
                     String::new()
                 } else {
@@ -3932,6 +3957,7 @@ mod tests {
         let first = vec![KeySummary {
             key: String::new(),
             timestamp_ms: 1,
+            logical_counter: 0,
             node_id: "node".to_string(),
             is_tombstone: false,
         }];
@@ -3948,6 +3974,7 @@ mod tests {
         let second = vec![KeySummary {
             key: "next".to_string(),
             timestamp_ms: 2,
+            logical_counter: 0,
             node_id: "node".to_string(),
             is_tombstone: false,
         }];

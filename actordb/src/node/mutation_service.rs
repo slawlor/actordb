@@ -486,7 +486,11 @@ async fn complete_job(
                 continue;
             }
         };
-        let mut value = VersionedValue::new(put.value, put.timestamp_ms, put.node_id);
+        let mut value = VersionedValue::new_version(
+            put.value,
+            actordb_protocol::RecordVersion::new(put.timestamp_ms, put.logical_counter),
+            put.node_id,
+        );
         value.expires_at_ms = (put.expires_at_ms != 0).then_some(put.expires_at_ms);
         value.is_tombstone = put.is_tombstone;
         let op = ReplicatedOp {
@@ -725,6 +729,7 @@ mod tests {
             key: "key".to_string(),
             value: b"value".to_vec(),
             timestamp_ms: 1,
+            logical_counter: 0,
             node_id: "writer".to_string(),
             seq: req_id,
             boot_id: 7,

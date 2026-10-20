@@ -469,8 +469,8 @@ async fn incomplete_application_prefix_is_timed_out_and_idle_client_survives() {
     let hello = wire::Hello {
         identity: "raw".into(),
         challenge: vec![8; 32],
-        min_version: 1,
-        max_version: 1,
+        min_version: CLIENT_PROTOCOL_VERSION,
+        max_version: CLIENT_PROTOCOL_VERSION,
         capabilities: 0,
     };
     send(

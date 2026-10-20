@@ -28,10 +28,12 @@ play no role in conflict resolution.
 
 Under bounded clock skew the HLC keeps ordering sane: the
 `hlc_orders_writes_under_clock_skew` integration test simulates skewed clocks
-and asserts the later logical write still wins everywhere. The current clock
-is still a scalar millisecond value: sustained rates above one event per
-millisecond can move it ahead of wall time. A future on-disk/wire format change
-is required for a true physical/logical tuple.
+and asserts the later logical write still wins everywhere. The clock uses a physical millisecond timestamp and an independent logical
+counter. More than one event per millisecond advances the counter without
+creating physical skew. Ordering is `(timestamp_ms, logical_counter, node_id,
+is_tombstone)`. Future-skew admission validates the physical component only.
+Complete counter/time exhaustion produces an explicit clock error instead of
+reusing a record version.
 
 ## Local apply outcomes and read-your-write
 

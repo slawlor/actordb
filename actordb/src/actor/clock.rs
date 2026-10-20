@@ -32,28 +32,36 @@ impl std::fmt::Display for ClockSkewError {
 
 impl std::error::Error for ClockSkewError {}
 
-/// Hybrid logical clock (simplified): monotonic per node, tracks the
-/// max of wall-clock and observed remote timestamps.
+/// A timestamp could not be generated or accepted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ClockError {
+    Skew(ClockSkewError),
+    /// Both the physical and logical components have exhausted their range.
+    Exhausted,
+}
+impl std::fmt::Display for ClockError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Skew(error) => error.fmt(f),
+            Self::Exhausted => f.write_str("hybrid clock version range exhausted"),
+        }
+    }
+}
+impl std::error::Error for ClockError {}
+
+use actordb_protocol::RecordVersion;
+
+/// Hybrid logical clock with independent physical time and logical counters.
 ///
-/// Pure wall-clock LWW breaks under clock skew: a fast-clocked node's
-/// writes shadow newer data from slow-clocked nodes, silently. HLC
-/// keeps the `(timestamp, node_id)` tiebreak shape so the merge stays
-/// idempotent and commutative, but guarantees per-node monotonicity and
-/// moves forward when it sees a higher remote timestamp.
-///
-/// Timestamps are still wall-clock-meaningful when clocks agree; under
-/// skew they degrade to logical ordering, which is the correct
-/// tradeoff for LWW.
+/// Event rate advances the logical component, never the physical component.
+/// Remote and persisted versions are skew-checked against physical wall time.
+/// Counter exhaustion carries to the next physical millisecond only after
+/// checking that bound; complete version exhaustion returns an explicit error.
 #[derive(Debug, Clone)]
 pub struct HlcClock {
-    last_ms: u64,
-    /// Wall-clock offset in ms. Zero in production; tests use it to
-    /// simulate clock skew between nodes.
+    last: RecordVersion,
     offset_ms: i64,
-    /// Maximum a remote or persisted timestamp may exceed our wall clock
-    /// before it is rejected. Bounds `observe()` so a single far-future
-    /// timestamp cannot permanently poison stored LWW versions.
-    /// `u64::MAX` = unbounded (legacy behavior).
     max_skew_ms: u64,
 }
 
@@ -61,26 +69,19 @@ impl HlcClock {
     pub fn new() -> Self {
         Self::with_offset(0)
     }
-
-    /// Create a clock whose wall-clock reads are shifted by `offset_ms`.
-    /// Used to simulate clock skew in tests.
+    /// Shift physical wall time for clock-skew tests.
     pub fn with_offset(offset_ms: i64) -> Self {
         Self {
-            last_ms: 0,
+            last: RecordVersion::default(),
             offset_ms,
             max_skew_ms: u64::MAX,
         }
     }
-
-    /// Set the maximum accepted future skew for remote and persisted
-    /// timestamps. Values beyond the bound are rejected, not clamped: storing
-    /// the original value after clamping only the clock would still poison
-    /// LWW ordering.
+    /// Maximum accepted physical future skew. Logical counters are not skew.
     pub fn with_max_skew(mut self, max_skew_ms: u64) -> Self {
         self.max_skew_ms = max_skew_ms;
         self
     }
-
     fn wall(&self) -> u64 {
         let now = now_ms();
         if self.offset_ms >= 0 {
@@ -89,46 +90,73 @@ impl HlcClock {
             now.saturating_sub(self.offset_ms.unsigned_abs())
         }
     }
-
-    /// Timestamp for a local event: `max(wall, last + 1)`.
-    pub fn tick(&mut self) -> u64 {
-        let wall = self.wall();
-        self.last_ms = wall.max(self.last_ms.saturating_add(1));
-        self.last_ms
+    /// Generate one monotonic local physical/logical timestamp.
+    pub fn tick(&mut self) -> Result<RecordVersion, ClockError> {
+        self.tick_at(self.wall())
     }
-
-    /// Observe an accepted remote timestamp:
-    /// `max(wall, last + 1, remote + 1)`.
-    pub fn observe(&mut self, remote_ms: u64) -> Result<(), ClockSkewError> {
-        let wall = self.wall();
-        self.validate(remote_ms, wall)?;
-        self.last_ms = wall
-            .max(self.last_ms.saturating_add(1))
-            .max(remote_ms.saturating_add(1));
+    fn successor(&self, version: RecordVersion, wall: u64) -> Result<RecordVersion, ClockError> {
+        if let Some(logical) = version.logical_counter.checked_add(1) {
+            return Ok(RecordVersion::new(version.timestamp_ms, logical));
+        }
+        let physical = version
+            .timestamp_ms
+            .checked_add(1)
+            .ok_or(ClockError::Exhausted)?;
+        self.validate(physical, wall).map_err(ClockError::Skew)?;
+        Ok(RecordVersion::new(physical, 0))
+    }
+    fn tick_at(&mut self, wall: u64) -> Result<RecordVersion, ClockError> {
+        let next = if wall > self.last.timestamp_ms {
+            RecordVersion::from(wall)
+        } else {
+            self.successor(self.last, wall)?
+        };
+        self.validate(next.timestamp_ms, wall)
+            .map_err(ClockError::Skew)?;
+        self.last = next;
+        Ok(next)
+    }
+    /// Observe a legacy timestamp with logical counter zero.
+    pub fn observe(&mut self, timestamp_ms: u64) -> Result<(), ClockError> {
+        self.observe_version(RecordVersion::from(timestamp_ms))
+    }
+    /// Observe a remote timestamp after validating its physical component.
+    pub fn observe_version(&mut self, remote: RecordVersion) -> Result<(), ClockError> {
+        self.observe_at(remote, self.wall())
+    }
+    fn observe_at(&mut self, remote: RecordVersion, wall: u64) -> Result<(), ClockError> {
+        self.validate(remote.timestamp_ms, wall)
+            .map_err(ClockError::Skew)?;
+        let floor = self.last.max(remote);
+        self.last = if wall > floor.timestamp_ms {
+            RecordVersion::from(wall)
+        } else {
+            self.successor(floor, wall)?
+        };
         Ok(())
     }
-
-    /// Seed the clock from a durable version before serving writes. This does
-    /// not create an event; the next [`Self::tick`] advances beyond it.
+    /// Seed a legacy durable timestamp without creating an event.
     pub fn seed_persisted(&mut self, timestamp_ms: u64) -> Result<(), ClockSkewError> {
-        let wall = self.wall();
-        self.validate(timestamp_ms, wall)?;
-        self.last_ms = self.last_ms.max(timestamp_ms);
+        self.seed_version(RecordVersion::from(timestamp_ms))
+    }
+    /// Seed the highest durable physical/logical timestamp before serving.
+    pub fn seed_version(&mut self, version: RecordVersion) -> Result<(), ClockSkewError> {
+        self.validate(version.timestamp_ms, self.wall())?;
+        self.last = self.last.max(version);
         Ok(())
     }
-
-    fn validate(&self, timestamp_ms: u64, wall_ms: u64) -> Result<(), ClockSkewError> {
-        let max_allowed_ms = wall_ms.saturating_add(self.max_skew_ms);
+    fn validate(&self, timestamp_ms: u64, wall: u64) -> Result<(), ClockSkewError> {
+        let max_allowed_ms = wall.saturating_add(self.max_skew_ms);
         if timestamp_ms > max_allowed_ms {
-            return Err(ClockSkewError {
+            Err(ClockSkewError {
                 timestamp_ms,
                 max_allowed_ms,
-            });
+            })
+        } else {
+            Ok(())
         }
-        Ok(())
     }
 }
-
 impl Default for HlcClock {
     fn default() -> Self {
         Self::new()
@@ -137,58 +165,55 @@ impl Default for HlcClock {
 
 #[cfg(test)]
 mod tests {
-    //! HLC ordering, future timestamp rejection, and persisted seeding.
-
     use super::*;
     #[test]
-    fn hlc_is_monotonic_and_observes_remote() {
-        let mut hlc = HlcClock::new();
-        let t1 = hlc.tick();
-        let t2 = hlc.tick();
-        assert!(t2 >= t1, "ticks must be monotonic");
-        // Observing a far-future remote timestamp moves the clock past it
-        // (unbounded by default, preserving legacy behavior).
-        hlc.observe(t2 + 100_000).unwrap();
-        let t3 = hlc.tick();
-        assert!(t3 > t2 + 100_000, "clock must move past observed remote");
-        // Observing a stale timestamp never moves the clock backward.
-        hlc.observe(1).unwrap();
-        let t4 = hlc.tick();
-        assert!(t4 >= t3, "clock must never go backward");
+    fn millions_of_events_do_not_create_physical_skew() {
+        let mut clock = HlcClock::new().with_max_skew(300_000);
+        let wall = 1_000_000;
+        for _ in 0..1_000_000 {
+            clock.tick_at(wall).unwrap();
+        }
+        assert_eq!(clock.last, RecordVersion::new(wall, 999_999));
+        let mut receiver = HlcClock::new().with_max_skew(300_000);
+        receiver.observe_at(clock.last, wall).unwrap();
+        assert!(receiver.last > clock.last);
     }
-
     #[test]
-    fn hlc_rejects_far_future_remote_timestamps() {
-        // Adversarial review #5: a far-future timestamp must not
-        // permanently poison the clock.
-        let mut hlc = HlcClock::new().with_max_skew(300_000); // 5 min
-        let t1 = hlc.tick();
-        // u64::MAX would previously drag the clock to u64::MAX forever.
-        let error = hlc.observe(u64::MAX).unwrap_err();
-        assert_eq!(error.timestamp_ms, u64::MAX);
-        let t2 = hlc.tick();
-        // Rejection leaves the clock near wall time instead of storing or
-        // advancing to the poisonous timestamp.
-        let wall = hlc.wall();
-        assert!(
-            t2 <= wall.saturating_add(10),
-            "far-future remote must be rejected, got t2={t2} wall={wall}"
+    fn observations_order_both_components_and_reject_skew_without_changes() {
+        let mut clock = HlcClock::new().with_max_skew(100);
+        clock
+            .observe_at(RecordVersion::new(1_010, 500), 1_000)
+            .unwrap();
+        assert_eq!(clock.last, RecordVersion::new(1_010, 501));
+        assert_eq!(
+            clock.tick_at(1_000).unwrap(),
+            RecordVersion::new(1_010, 502)
         );
-        assert!(t2 >= t1, "clock must still be monotonic");
-        // A moderately-ahead (within skew) remote still moves the clock.
-        hlc.observe(wall + 60_000).unwrap();
-        let t3 = hlc.tick();
-        assert!(t3 > wall + 60_000, "in-skew remote must be observed");
+        let before = clock.last;
+        assert!(matches!(
+            clock.observe_at(RecordVersion::new(1_101, 0), 1_000),
+            Err(ClockError::Skew(_))
+        ));
+        assert_eq!(clock.last, before);
+        assert_eq!(clock.tick_at(1_020).unwrap(), RecordVersion::new(1_020, 0));
     }
-
     #[test]
-    fn hlc_seeds_from_persisted_versions() {
-        let mut hlc = HlcClock::new().with_max_skew(300_000);
-        let persisted = hlc.wall() + 60_000;
-        hlc.seed_persisted(persisted).unwrap();
-        assert!(
-            hlc.tick() > persisted,
-            "the first post-restart write must beat durable state"
-        );
+    fn exhaustion_is_explicit_and_does_not_reuse_versions() {
+        let mut clock = HlcClock::new();
+        clock.last = RecordVersion::new(u64::MAX, u64::MAX);
+        assert_eq!(clock.tick_at(u64::MAX), Err(ClockError::Exhausted));
+        clock.last = RecordVersion::new(100, u64::MAX);
+        assert_eq!(clock.tick_at(100).unwrap(), RecordVersion::new(101, 0));
+        clock.last = RecordVersion::new(100, u64::MAX);
+        clock.max_skew_ms = 0;
+        assert!(matches!(clock.tick_at(100), Err(ClockError::Skew(_))));
+    }
+    #[test]
+    fn durable_logical_high_water_survives_restart() {
+        let mut clock = HlcClock::new().with_max_skew(300_000);
+        let version = RecordVersion::new(clock.wall() + 60_000, 42);
+        clock.seed_version(version).unwrap();
+        assert!(clock.tick().unwrap() > version);
+        assert!(clock.seed_persisted(u64::MAX).is_err());
     }
 }
