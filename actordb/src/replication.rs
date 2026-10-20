@@ -324,9 +324,15 @@ impl SenderRuntimeOptions {
     }
 }
 
-/// Tuning knobs for the replication sender. All fields are public so
-/// embedders can tune; `Default` is sane for tests and small clusters.
+/// Extensible tuning for the replication sender. Construct with the Bon
+/// builder or `Default`; public fields remain available for tuning and inspection.
+///
+/// ```compile_fail
+/// use actordb::replication::SenderConfig;
+/// let _ = SenderConfig { ..SenderConfig::default() };
+/// ```
 #[derive(Debug, Clone, bon::Builder)]
+#[non_exhaustive]
 pub struct SenderConfig {
     /// Max ops per batch.
     #[builder(default = 100)]

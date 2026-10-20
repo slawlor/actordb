@@ -63,11 +63,10 @@ async fn aggregate_exhausts_input_beyond_both_legacy_scan_caps() {
     let count = 110_003;
     let node = start(
         "query-complete",
-        NodeConfig {
-            fragment_count: 4,
-            store: Some(loaded_store(count, 4)),
-            ..NodeConfig::default()
-        },
+        NodeConfig::builder()
+            .fragment_count(4)
+            .maybe_store(Some(loaded_store(count, 4)))
+            .build(),
     )
     .await;
     let result = node
@@ -99,14 +98,13 @@ async fn aggregate_exhausts_input_beyond_both_legacy_scan_caps() {
 async fn fragment_scope_and_key_equality_do_not_contact_unavailable_fragments() {
     let node = start(
         "query-scoped",
-        NodeConfig {
-            fragment_count: 2,
-            fragment_map: HashMap::from([
+        NodeConfig::builder()
+            .fragment_count(2)
+            .fragment_map(HashMap::from([
                 (FragmentId(0), vec!["query-scoped".into()]),
                 (FragmentId(1), vec!["missing-holder".into()]),
-            ]),
-            ..NodeConfig::default()
-        },
+            ]))
+            .build(),
     )
     .await;
     let key = (0..1_000)
@@ -147,10 +145,11 @@ async fn query_merges_local_and_remote_fragment_views_in_global_key_order() {
         (FragmentId(2), vec!["query-a".into()]),
         (FragmentId(3), vec!["query-b".into()]),
     ]);
-    let config = || NodeConfig {
-        fragment_count: 4,
-        fragment_map: placement.clone(),
-        ..NodeConfig::default()
+    let config = || {
+        NodeConfig::builder()
+            .fragment_count(4)
+            .fragment_map(placement.clone())
+            .build()
     };
     let a = start("query-a", config()).await;
     let b = start("query-b", config()).await;
@@ -229,11 +228,10 @@ async fn queries_hide_deletes_and_expiry_and_preserve_empty_unicode_keys() {
 async fn query_budgets_and_bad_numeric_values_fail_explicitly() {
     let node = start(
         "query-budget",
-        NodeConfig {
-            fragment_count: 1,
-            store: Some(loaded_store(10, 1)),
-            ..NodeConfig::default()
-        },
+        NodeConfig::builder()
+            .fragment_count(1)
+            .maybe_store(Some(loaded_store(10, 1)))
+            .build(),
     )
     .await;
     let plan = parse("SELECT COUNT(*) FROM kv").unwrap();

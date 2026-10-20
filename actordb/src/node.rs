@@ -2855,9 +2855,9 @@ impl Drop for StoreBindingStartupGuard {
 
 /// Runtime liveness, queue policy, and region configuration for a [`Node`].
 ///
-/// This is separate from [`NodeConfig`] so adding transport policy does not
-/// break existing exhaustive `NodeConfig` literals. [`Node::start`] uses the
-/// defaults; pass an override to [`Node::start_with_options`].
+/// Configure runtime policies through this type’s builder or setters.
+/// [`Node::start`] uses the defaults; pass an override to
+/// [`Node::start_with_options`].
 #[derive(Clone, Debug, bon::Builder)]
 pub struct NodeRuntimeOptions {
     #[builder(default = 256 * 1024 * 1024)]
@@ -3456,7 +3456,8 @@ impl NodeRuntimeOptions {
 
 /// Configuration for a [Node]. Use [`NodeConfig::builder`] to override only
 /// the settings you need; omitted fields retain the documented defaults.
-/// Existing public struct literals and [`Default`] remain supported.
+/// The non-exhaustive settings retain public fields for inspection and tuning;
+/// construct them through the builder or [`Default`] so added options remain compatible.
 /// This is the seed of the operator-facing
 /// configuration surface (see the `NodeConfig` productionization issue).
 ///
@@ -3474,7 +3475,15 @@ impl NodeRuntimeOptions {
 /// assert_eq!(config.background_pool.rate_limit_per_sec, Some(1000));
 /// assert_eq!(runtime.forwarded_mutation_capacity(), 256);
 /// ```
+///
+/// External construction uses the extensible builder:
+///
+/// ```compile_fail
+/// use actordb::node::NodeConfig;
+/// let _ = NodeConfig { ..NodeConfig::default() };
+/// ```
 #[derive(Clone, bon::Builder)]
+#[non_exhaustive]
 pub struct NodeConfig {
     /// Optional best-effort local TTL cleanup handler. Disabled by default;
     /// expired value payloads are not copied or retained for notifications then.

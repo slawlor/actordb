@@ -308,3 +308,22 @@ required single-record envelope; an oversized legacy record, or one whose
 provenance node id is empty or exceeds 255 UTF-8 bytes, fails startup rather
 than loading data that can never replicate or be returned remotely. Repair or
 remove that record offline before restarting.
+
+## Extensible public options
+
+`NodeConfig` and `SenderConfig` are non-exhaustive. Use their Bon builders to
+select settings; omitted fields keep their documented defaults. Public fields
+remain available for inspecting or adjusting a configuration created through a
+builder or `Default`. This replaces external struct literals in the unpublished
+0.7 API and allows future optional settings to be added compatibly.
+
+```rust
+use actordb::{node::NodeConfig, replication::SenderConfig};
+use std::time::Duration;
+
+let mut config = NodeConfig::builder()
+    .fragment_count(4)
+    .replication(SenderConfig::builder().batch_size(256).build())
+    .build();
+config.flush_interval = Duration::from_millis(50);
+```
