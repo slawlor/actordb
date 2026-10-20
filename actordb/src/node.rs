@@ -2866,6 +2866,10 @@ pub struct NodeRuntimeOptions {
     local_work_timeout: Duration,
     #[builder(skip = crate::retained::ByteBudget::new(256 * 1024 * 1024))]
     replication_retention: Arc<crate::retained::ByteBudget>,
+    #[builder(default = 64 * 1024 * 1024)]
+    reconciliation_retained_byte_capacity: usize,
+    #[builder(skip = crate::retained::ByteBudget::new(64 * 1024 * 1024))]
+    reconciliation_retention: Arc<crate::retained::ByteBudget>,
     /// Operator-supplied node-to-region labels. Labels compare by exact bytes;
     /// they do not change placement or authenticate physical location.
     #[builder(default, into)]
@@ -3246,6 +3250,10 @@ impl NodeRuntimeOptions {
 
     /// Deadline for embedded actor read waiters and local reconciliation work.
     /// Accepted mutations retain completion ownership after their waiter ends.
+    /// Node-wide local reconciliation page allowance; minimum 64 MiB.
+    pub fn reconciliation_retained_byte_capacity(&self) -> usize {
+        self.reconciliation_retained_byte_capacity
+    }
     pub fn local_work_timeout(&self) -> Duration {
         self.local_work_timeout
     }
@@ -3257,6 +3265,7 @@ impl NodeRuntimeOptions {
     fn sender_options(&self) -> SenderRuntimeOptions {
         SenderRuntimeOptions::default()
             .with_aggregate_retention(self.replication_retention.clone())
+            .with_reconciliation_result_budget(self.reconciliation_retention.clone())
             .with_local_work_timeout(self.local_work_timeout)
             .with_ack_timeout(self.replication_ack_timeout)
             .with_queue_admission_timeout(self.queue_admission_timeout)
@@ -3269,6 +3278,11 @@ impl NodeRuntimeOptions {
     }
 
     fn validate(&self) -> Result<(), NodeError> {
+        if self.reconciliation_retained_byte_capacity < 4 * MAX_FRAME_BYTES {
+            return Err(NodeError::Actor(
+                "reconciliation result allowance must be at least 64 MiB".into(),
+            ));
+        }
         if self.local_work_timeout.is_zero()
             || Instant::now()
                 .checked_add(self.local_work_timeout)
@@ -3654,6 +3668,10 @@ impl Node {
         self.runtime_options.replication_retention.used()
     }
 
+    /// Charged local reconciliation page ownership across every sender.
+    pub fn reconciliation_retained_bytes(&self) -> usize {
+        self.runtime_options.reconciliation_retention.used()
+    }
     /// Current charged authoritative persistence bytes across local fragments.
     pub fn persistence_retained_bytes(&self) -> usize {
         self.persistence_budget.used()
@@ -3687,6 +3705,8 @@ impl Node {
         let mut runtime_options = runtime_options;
         runtime_options.replication_retention =
             crate::retained::ByteBudget::new(runtime_options.replication_retained_byte_capacity);
+        runtime_options.reconciliation_retention =
+            crate::retained::ByteBudget::new(runtime_options.reconciliation_retained_byte_capacity);
         if config.ttl_expiry_handler.is_some() {
             config
                 .ttl_expiry_options

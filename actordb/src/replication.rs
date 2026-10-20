@@ -97,6 +97,8 @@ pub struct SenderRuntimeOptions {
     write_concerns: Option<Arc<crate::write_concern::WriteConcernTracker>>,
     #[builder(skip = ByteBudget::new(256 * 1024 * 1024))]
     aggregate_retention: Arc<ByteBudget>,
+    #[builder(skip = ByteBudget::new(64 * 1024 * 1024))]
+    reconciliation_result_budget: Arc<ByteBudget>,
 }
 
 impl std::fmt::Debug for SenderRuntimeOptions {
@@ -139,6 +141,8 @@ pub enum SenderOptionsError {
     ZeroAckTimeout,
     /// A local actor-work waiter must have a usable deadline.
     InvalidLocalWorkTimeout,
+    /// Result allowance must cover one worst-case local summary and value page.
+    InvalidReconciliationResultBudget,
     /// An outbound queue reservation would expire immediately.
     ZeroQueueAdmissionTimeout,
     /// The ordinary ACK timeout cannot be represented by Tokio's clock.
@@ -178,6 +182,10 @@ impl std::fmt::Display for SenderOptionsError {
             Self::ZeroReconcileTimeout => {
                 write!(f, "replication reconcile timeout must be non-zero")
             }
+            Self::InvalidReconciliationResultBudget => write!(
+                f,
+                "reconciliation result allowance must be at least four maximum frames"
+            ),
             Self::InvalidLocalWorkTimeout => {
                 write!(f, "local work timeout must be positive and representable")
             }
@@ -261,6 +269,17 @@ impl SenderRuntimeOptions {
         self.local_work_timeout
     }
 
+    /// Set aggregate local reconciliation page ownership. Minimum 64 MiB
+    /// covers a worst-case summary cursor and value/protobuf page together.
+    pub fn with_reconciliation_retained_byte_capacity(mut self, capacity: usize) -> Self {
+        self.reconciliation_result_budget = ByteBudget::new(capacity);
+        self
+    }
+    pub(crate) fn with_reconciliation_result_budget(mut self, budget: Arc<ByteBudget>) -> Self {
+        self.reconciliation_result_budget = budget;
+        self
+    }
+
     pub(crate) fn with_aggregate_retention(mut self, budget: Arc<ByteBudget>) -> Self {
         self.aggregate_retention = budget;
         self
@@ -272,6 +291,9 @@ impl SenderRuntimeOptions {
     }
 
     fn validate(&self) -> Result<(), SenderOptionsError> {
+        if self.reconciliation_result_budget.limit() < 4 * MAX_FRAME_BYTES {
+            return Err(SenderOptionsError::InvalidReconciliationResultBudget);
+        }
         if self.local_work_timeout.is_zero()
             || Instant::now()
                 .checked_add(self.local_work_timeout)
@@ -416,7 +438,7 @@ impl SenderRetention {
     }
     fn borrowed(&self, op: &crate::actor::ReplicatedOp) -> Option<RetainedOp> {
         // Reserve before fanout clones a payload for this replica.
-        let lease = self.reserve(retained_op_bytes(op))?;
+        let lease = self.reserve(retained_borrowed_op_bytes(op))?;
         Some(RetainedOp {
             op: op.clone(),
             _lease: lease,
@@ -424,7 +446,15 @@ impl SenderRetention {
     }
 }
 fn retained_op_bytes(op: &crate::actor::ReplicatedOp) -> usize {
-    // The operation and temporary protobuf/encoded batch representations.
+    3usize.saturating_mul(
+        256usize
+            .saturating_add(op.key.capacity())
+            .saturating_add(op.value.node_id.capacity())
+            .saturating_add(op.value.value.capacity()),
+    )
+}
+fn retained_borrowed_op_bytes(op: &crate::actor::ReplicatedOp) -> usize {
+    // Clones own only initialized data, not spare capacity of the caller.
     3usize.saturating_mul(
         256usize
             .saturating_add(op.key.len())
@@ -463,26 +493,30 @@ fn retained_control_bytes(msg: &SenderMsg) -> usize {
             summaries,
             next_after_key,
             ..
-        } => next_after_key.len().saturating_add(
-            summaries
-                .iter()
-                .map(|s| {
-                    256usize
-                        .saturating_add(s.key.len())
-                        .saturating_add(s.node_id.len())
-                })
-                .sum::<usize>(),
-        ),
+        } => next_after_key
+            .capacity()
+            .saturating_add(
+                summaries
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<KeySummary>()),
+            )
+            .saturating_add(summaries.iter().fold(0usize, |bytes, s| {
+                bytes
+                    .saturating_add(128)
+                    .saturating_add(s.key.capacity())
+                    .saturating_add(s.node_id.capacity())
+            })),
         SenderMsg::ReconcileData { entries, .. } => entries
-            .iter()
-            .map(|s| {
-                256usize
-                    .saturating_add(s.key.len())
-                    .saturating_add(s.node_id.len())
-                    .saturating_add(s.value.len())
-            })
-            .sum(),
-        SenderMsg::Nack { error, .. } => error.len(),
+            .capacity()
+            .saturating_mul(std::mem::size_of::<SyncEntry>())
+            .saturating_add(entries.iter().fold(0usize, |bytes, s| {
+                bytes
+                    .saturating_add(128)
+                    .saturating_add(s.key.capacity())
+                    .saturating_add(s.node_id.capacity())
+                    .saturating_add(s.value.capacity())
+            })),
+        SenderMsg::Nack { error, .. } => error.capacity(),
         _ => return 0,
     };
     2usize.saturating_mul(256usize.saturating_add(owned))
@@ -568,6 +602,7 @@ struct NodeSenderPeer {
 
 struct NodeSenderIngress {
     retention: SenderRetention,
+    reconciliation_result_budget: Arc<ByteBudget>,
     draining: StdMutex<bool>,
     pending_data: AtomicUsize,
     issued_overflow_generation: AtomicU64,
@@ -581,6 +616,7 @@ impl Default for NodeSenderIngress {
                 local: ByteBudget::new(64 * 1024 * 1024),
                 aggregate: ByteBudget::new(256 * 1024 * 1024),
             },
+            reconciliation_result_budget: ByteBudget::new(64 * 1024 * 1024),
             draining: StdMutex::new(false),
             pending_data: AtomicUsize::new(0),
             issued_overflow_generation: AtomicU64::new(0),
@@ -617,6 +653,10 @@ impl BoundedSender {
     /// Current charged retained bytes including queued and in-flight payloads.
     pub fn retained_bytes(&self) -> usize {
         self.inner.ingress.retention.local.used()
+    }
+    /// Charged local result bytes across standalone senders sharing options.
+    pub fn reconciliation_retained_bytes(&self) -> usize {
+        self.inner.ingress.reconciliation_result_budget.used()
     }
     /// Close admission, stop the sender and release its owned queue permits.
     pub async fn stop(&self) {
@@ -1113,6 +1153,7 @@ struct SenderPeer {
     budgeted: Option<BudgetedPeerTx>,
     queue_admission_timeout: Duration,
     local_work_timeout: Duration,
+    reconciliation_result_budget: Arc<ByteBudget>,
     queue_failure_handler: Option<QueueFailureHandler>,
 }
 
@@ -1130,6 +1171,7 @@ impl SenderPeer {
             budgeted,
             queue_admission_timeout: options.queue_admission_timeout,
             local_work_timeout: options.local_work_timeout,
+            reconciliation_result_budget: options.reconciliation_result_budget.clone(),
             queue_failure_handler: options.queue_failure_handler.clone(),
         }
     }
@@ -1242,6 +1284,7 @@ struct ReconcileSummaryState {
 }
 
 struct ReconcileLocalCursor {
+    result_retention: Option<Arc<BytePermit>>,
     after_key: String,
     revision: Option<u64>,
     snapshot_time_ms: Option<u64>,
@@ -1276,6 +1319,8 @@ struct ReconcileRound {
     /// Peer-wide credit retained for the complete round, including its
     /// durability barrier. Dropping or completing the round releases it.
     connection_permit: Option<ReconcilePermit>,
+    /// Keep the remote summary charge while derived fetch-key chunks remain.
+    control_retention: Option<RetentionLease>,
 }
 
 fn requeue_in_flight(in_flight: &mut VecDeque<InflightBatch>, buffer: &mut VecDeque<RetainedOp>) {
@@ -1422,6 +1467,7 @@ pub(crate) fn spawn_node_sender(
             local: ByteBudget::new(config.retained_byte_capacity),
             aggregate: options.aggregate_retention.clone(),
         },
+        reconciliation_result_budget: options.reconciliation_result_budget.clone(),
         ..NodeSenderIngress::default()
     });
     let (stopped_tx, stopped) = watch::channel(false);
@@ -1831,7 +1877,13 @@ async fn sender_task(
                 let mut byte_overflow = false;
                 let mut budgeted_peer = None;
                 let msg = match input {
-                    SenderInput::Message(msg) => Some(msg),
+                    SenderInput::Message(msg) => {
+                        if !matches!(&msg, SenderMsg::Enqueue(_)) {
+                            control_lease = retention.reserve(retained_control_bytes(&msg));
+                            byte_overflow = control_lease.is_none();
+                        }
+                        Some(msg)
+                    },
                     SenderInput::Control(control) => { control_lease = Some(control.lease); Some(control.msg) },
                     SenderInput::Data(op, ingress) => {
                         publish_data_completion = Some(ingress);
@@ -1949,7 +2001,7 @@ async fn sender_task(
                 }
                 if let Some(op) = retained_enqueue { buffer.push_back(op); continue; }
                 // Keep protocol payload permits until selected local work completes.
-                let _control_lease = control_lease;
+                let mut _control_lease = control_lease;
                 let Some(msg) = msg else { continue };
                 match msg {
                     SenderMsg::Enqueue(op) => {
@@ -2570,6 +2622,7 @@ async fn sender_task(
                         }
                         let _ = connection_valid.send(true);
                         let Some(mut round) = active_reconcile.take() else { continue };
+                        round.control_retention = _control_lease.take();
                         if restart {
                             reconcile_retry =
                                 Some((Instant::now() + NACK_RETRY_DELAY, round.purpose));
@@ -3330,6 +3383,7 @@ async fn begin_reconcile(
             remote_snapshot_time_ms: None,
             remote_revision_stable: true,
             local: ReconcileLocalCursor {
+                result_retention: None,
                 after_key: String::new(),
                 revision: None,
                 snapshot_time_ms: None,
@@ -3344,6 +3398,7 @@ async fn begin_reconcile(
         phase_deadline: deadline_after(phase_timeout),
         snapshot_revision: None,
         connection_permit,
+        control_retention: None,
     }))
 }
 
@@ -3520,6 +3575,7 @@ async fn ensure_local_summary(
     router: &FragmentRouter,
     local: &mut ReconcileLocalCursor,
     deadline: Instant,
+    result_budget: &Arc<ByteBudget>,
 ) -> Result<(), ReconcileError> {
     while local.current.is_none() {
         if let Some(summary) = local.buffered.pop_front() {
@@ -3532,18 +3588,32 @@ async fn ensure_local_summary(
         let actor = router
             .route_for_fragment(fragment)
             .ok_or(ReconcileError::Local)?;
+        let result_retention = if let Some(retention) = &local.result_retention {
+            retention.clone()
+        } else {
+            let retention = Arc::new(
+                result_budget
+                    .reserve(2 * MAX_FRAME_BYTES)
+                    .ok_or(ReconcileError::Local)?,
+            );
+            local.result_retention = Some(retention.clone());
+            retention
+        };
         let first_page = local.revision.is_none();
         let page = match actor
             .call(
-                |reply| KvMessage::GetSummaryPage {
-                    after_key: (!first_page).then_some(local.after_key.clone()),
-                    // Reconciliation is a bounded, monotonic scan rather
-                    // than a lock-held snapshot. Drift is recorded below and
-                    // forces a fresh verification pass after the barrier.
-                    expected_revision: None,
-                    snapshot_time_ms: local.snapshot_time_ms,
-                    limit: RECONCILE_LOCAL_READ_CHUNK,
-                    reply,
+                |reply| {
+                    KvMessage::GetSummaryPage {
+                        after_key: (!first_page).then_some(local.after_key.clone()),
+                        // Reconciliation is a bounded, monotonic scan rather
+                        // than a lock-held snapshot. Drift is recorded below and
+                        // forces a fresh verification pass after the barrier.
+                        expected_revision: None,
+                        snapshot_time_ms: local.snapshot_time_ms,
+                        limit: RECONCILE_LOCAL_READ_CHUNK,
+                        reply,
+                    }
+                    .with_retention(result_retention)
                 },
                 Some(deadline.saturating_duration_since(Instant::now())),
             )
@@ -3603,6 +3673,13 @@ async fn send_repair_keys(
     let actor = router
         .route_for_fragment(fragment)
         .ok_or(ReconcileError::Local)?;
+    let result_retention = Arc::new(
+        connection
+            .peer_tx
+            .reconciliation_result_budget
+            .reserve(2 * MAX_FRAME_BYTES)
+            .ok_or(ReconcileError::Local)?,
+    );
     let keys = Arc::new(keys);
     let mut next_key_index = 0usize;
     let mut page = Vec::new();
@@ -3617,13 +3694,17 @@ async fn send_repair_keys(
     let mut sizing = RepeatedFieldSizer::new(9, 4, base_payload_len);
     while next_key_index < keys.len() {
         let request_keys = keys.clone();
+        let request_retention = result_retention.clone();
         let value_page = match actor
             .call(
-                move |reply| KvMessage::GetVersionedPage {
-                    keys: request_keys,
-                    start_index: next_key_index,
-                    snapshot_time_ms: Some(snapshot_time_ms),
-                    reply,
+                move |reply| {
+                    KvMessage::GetVersionedPage {
+                        keys: request_keys,
+                        start_index: next_key_index,
+                        snapshot_time_ms: Some(snapshot_time_ms),
+                        reply,
+                    }
+                    .with_retention(request_retention)
                 },
                 Some(deadline.saturating_duration_since(Instant::now())),
             )
@@ -3675,6 +3756,11 @@ async fn send_repair_keys(
             }
             sizing.push(item_len);
             page.push(op);
+        }
+        if !page.is_empty() {
+            send_repair_ops(fragment, connection, &page).await?;
+            page.clear();
+            sizing.reset(base_payload_len);
         }
     }
     if !page.is_empty() {
@@ -3795,7 +3881,14 @@ async fn reconcile_summary_page(
     let mut repair_keys = Vec::new();
     for remote in summaries {
         loop {
-            ensure_local_summary(fragment, router, &mut summary.local, deadline).await?;
+            ensure_local_summary(
+                fragment,
+                router,
+                &mut summary.local,
+                deadline,
+                &connection.peer_tx.reconciliation_result_budget,
+            )
+            .await?;
             match summary.local.current.as_ref() {
                 Some(local) if local.key < remote.key => {
                     let local = take_local_summary(&mut summary.local).expect("matched Some");
@@ -3858,7 +3951,14 @@ async fn reconcile_summary_page(
 
     if done {
         loop {
-            ensure_local_summary(fragment, router, &mut summary.local, deadline).await?;
+            ensure_local_summary(
+                fragment,
+                router,
+                &mut summary.local,
+                deadline,
+                &connection.peer_tx.reconciliation_result_budget,
+            )
+            .await?;
             let Some(local) = take_local_summary(&mut summary.local) else {
                 break;
             };
@@ -4175,6 +4275,24 @@ mod tests {
         drop(accepted);
         assert_eq!(retention.local.used(), 0);
         assert_eq!(retention.aggregate.used(), 0);
+    }
+
+    #[test]
+    fn owning_legacy_operations_charge_spare_capacity_but_fanout_clones_do_not() {
+        let mut value = op("key");
+        value.value.value = Vec::with_capacity(4096);
+        value.value.value.push(1);
+        let copied = retained_borrowed_op_bytes(&value);
+        assert!(retained_op_bytes(&value) > copied);
+        let retention = SenderRetention {
+            local: ByteBudget::new(copied),
+            aggregate: ByteBudget::new(copied),
+        };
+        let clone = retention.borrowed(&value).unwrap();
+        assert_eq!(clone.value.value.capacity(), 1);
+        drop(clone);
+        assert!(retention.owned(value).is_none());
+        assert_eq!(retention.local.used(), 0);
     }
 
     #[test]

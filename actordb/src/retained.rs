@@ -18,6 +18,9 @@ impl ByteBudget {
             used: AtomicUsize::new(0),
         })
     }
+    pub(crate) fn limit(&self) -> usize {
+        self.limit
+    }
     pub(crate) fn used(&self) -> usize {
         self.used.load(Ordering::Acquire)
     }

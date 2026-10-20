@@ -404,3 +404,26 @@ that never returns can therefore prevent safe final teardown, while unrelated
 async tasks continue running. Cancellation/best-effort Drop retains the existing
 fail-closed store lease policy. Configure backend I/O limits for a finite storage
 completion bound; lower waiter limits do not create one.
+
+### Reconciliation result ownership
+
+`NodeRuntimeOptions::reconciliation_retained_byte_capacity` provides a separate
+aggregate 64 MiB allowance for local reconciliation summary/value pages.
+Standalone `SenderRuntimeOptions::with_reconciliation_retained_byte_capacity`
+configures the same policy. The minimum 64 MiB covers one maximum-size summary
+cursor and one value/protobuf page together. This conservative reservation
+charges a possible maximum-size reply before the actor clones it.
+
+Opaque actor request leases keep result admission owned through dispatcher or
+worker completion after cancellation of the waiter. Summary leases remain with
+the local cursor; remote summary leases remain with their derived fetch-key
+chunks through the round. Repairs ship each actor value page before fetching
+the next, so two wide result pages do not overlap. Reset, timeout and shutdown
+release credits when their owning work actually ends.
+
+`Node::reconciliation_retained_bytes()` reports this aggregate result allowance.
+Add this allowance to the independently configured replication backlog,
+persistence, receive, query and peer-frame allowances when planning deployment
+memory. All are charged admissions, not RSS; immutable cached key/version floors
+and the loaded dataset remain independent. Result admission failure retries the
+round with existing pacing and local deadlines.
