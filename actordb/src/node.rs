@@ -3248,12 +3248,12 @@ impl NodeRuntimeOptions {
         self.health_timeout
     }
 
-    /// Deadline for embedded actor read waiters and local reconciliation work.
-    /// Accepted mutations retain completion ownership after their waiter ends.
     /// Node-wide local reconciliation page allowance; minimum 64 MiB.
     pub fn reconciliation_retained_byte_capacity(&self) -> usize {
         self.reconciliation_retained_byte_capacity
     }
+    /// Deadline for embedded actor read waiters and local reconciliation work.
+    /// Accepted mutations retain completion ownership after their waiter ends.
     pub fn local_work_timeout(&self) -> Duration {
         self.local_work_timeout
     }

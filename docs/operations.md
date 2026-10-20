@@ -348,7 +348,9 @@ at capacity. Growth or a new key that exceeds a count/byte allowance returns
 flush fails still have an unknown durable outcome and remain retryable.
 
 `FragmentState::persistence_backlog()` reports charged records/bytes. Admission
-rejection and failed flushes emit structured backlog diagnostics. TTL cleanup
+rejection and failed flushes emit structured backlog diagnostics. Ordinary
+storage errors return to callers while workers remain alive, preserving queued
+requests and pacing retries instead of creating worker restart churn. TTL cleanup
 reserves its durable marker before replacing the live record; a full final
 sweep reports saturation so shutdown cannot certify an undurable transition.
 The cache and immutable key/version floors are independent of these budgets.
