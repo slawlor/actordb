@@ -107,6 +107,16 @@ impl Node {
         plan: &QueryPlan,
         options: QueryOptions,
     ) -> Result<QueryResult, QueryExecutionError> {
+        self.query_plan_with_options_and_visits(plan, options)
+            .await
+            .map(|(result, _)| result)
+    }
+
+    pub(super) async fn query_plan_with_options_and_visits(
+        &self,
+        plan: &QueryPlan,
+        options: QueryOptions,
+    ) -> Result<(QueryResult, u64), QueryExecutionError> {
         let _operation = self
             .admit_operation()
             .map_err(|_| QueryExecutionError::ShuttingDown)?;
@@ -204,7 +214,7 @@ impl Node {
         options: &QueryOptions,
         retention: Arc<QueryRetention>,
         deadline: Instant,
-    ) -> Result<QueryResult, QueryExecutionError> {
+    ) -> Result<(QueryResult, u64), QueryExecutionError> {
         let mut result = QueryResult {
             columns: plan.columns(),
             rows: Vec::new(),
@@ -216,7 +226,7 @@ impl Node {
             return Err(QueryExecutionError::BudgetExceeded("result columns".into()));
         }
         if plan.limit == Some(0) {
-            return Ok(result);
+            return Ok((result, 0));
         }
         // Reserve heap headers before admitting pages. Cursor accounting also
         // includes the duplicated head key while the heap owns it.
@@ -369,7 +379,7 @@ impl Node {
                 "aggregate result storage".into(),
             ));
         }
-        Ok(result)
+        Ok((result, visited))
     }
 
     #[allow(clippy::too_many_arguments)]

@@ -18,7 +18,7 @@ use super::protocol::{
     ApplyDurability, ApplyError, ApplyOutcome, ReplicatedOp, SnapshotSummary, SummaryPage,
     VersionedPage, VersionedValue,
 };
-use super::scan::{KeyMatcher, ScanMatch, ScanSpec, ValueTransform};
+use super::scan::{ScanMatch, ScanSpec};
 use crate::retained::{ByteBudget, BytePermit};
 use crate::shard::FragmentId;
 use crate::store::{KvStore, PersistenceConfig, StoreCommitDurability};
@@ -542,66 +542,103 @@ impl FragmentState {
             .cloned()
     }
 
-    /// Scan the fragment's local cache, returning transformed matches.
+    /// Scan through bounded, revision-guarded pages in lexicographic order.
     ///
-    /// Single fused pass under one read lock: filter (key matcher, then
-    /// [`get`](Self::get)-style visibility — tombstones and TTL-expired
-    /// values are hidden) and transform happen inline, and only matches are
-    /// materialized. Never clone-then-filter.
-    ///
-    /// Matches are returned in lexicographic key order (the fragment's
-    /// ordered key index), so [`ScanSpec::offset`] pagination is stable as
-    /// long as the key set does not change between pages. At most
-    /// [`ScanSpec::effective_limit`](crate::actor::ScanSpec::effective_limit)
-    /// matches are returned.
-    ///
-    /// The read lock is held for the whole pass: concurrent writes to this
-    /// fragment pause for the scan's duration (reads do not). Keep `limit`
-    /// tight; chunked scans are a future follow-up.
-    pub async fn scan(&self, spec: &ScanSpec) -> Vec<ScanMatch> {
-        let now = now_ms();
-        let limit = spec.effective_limit();
-        let cache = self.cache.read().await;
+    /// The per-fragment offset and effective limit are preserved. Cache locks
+    /// are released between pages. The complete scan fails on a concurrent
+    /// mutation, one million visited records, or a 16 MiB result/work budget;
+    /// partial results are never returned. Use key/prefix transforms for wide
+    /// values. Already expired values and tombstones remain invisible.
+    pub async fn scan(&self, spec: &ScanSpec) -> Result<Vec<ScanMatch>, String> {
+        use crate::proto::{QueryPageRequest, QueryPageStatus};
+        use crate::query::{cell_to_value, QueryOptions, QueryPageWork};
+        use actordb_query::QueryValue;
+        let plan = Arc::new(spec.query_plan(None));
+        let options = QueryOptions::default();
+        let mut req = QueryPageRequest {
+            max_rows: 256,
+            max_bytes: options.page_bytes as u32,
+            max_visits: options.page_visits as u32,
+            ..Default::default()
+        };
         let mut out = Vec::new();
-        let mut skipped: u64 = 0;
-        // Lexicographic order via the ordered key index: deterministic
-        // results, stable offset pagination.
-        for key in cache.ordered_keys.iter() {
-            let Some(value) = cache.values.get(key) else {
-                continue;
-            };
-            // Same visibility as `get`: tombstones and expired values are
-            // not matches.
-            if value.is_tombstone || value.is_expired(now) {
-                continue;
+        let mut skipped = 0u64;
+        let mut visited = 0u64;
+        let mut retained = 0usize;
+        // Reserve framing metadata before constructing owning result copies.
+        let mut encoded = 4096usize;
+        loop {
+            let remaining = options.max_scanned_rows.saturating_sub(visited);
+            if remaining == 0 {
+                return Err("scan visited record budget exceeded".into());
             }
-            let matched = match &spec.matcher {
-                KeyMatcher::All => true,
-                KeyMatcher::Prefix(prefix) => key.as_bytes().starts_with(prefix),
-            };
-            if !matched {
-                continue;
+            req.max_visits = (options.page_visits as u64).min(remaining) as u32;
+            req.max_rows = (spec
+                .effective_limit()
+                .saturating_sub(out.len() as u64)
+                .saturating_add(spec.offset.saturating_sub(skipped)))
+            .min(256) as u32;
+            // Page projection clones remain bounded in addition to the retained
+            // reply; reject a projected row before copying a full wide value.
+            let work = QueryPageWork::new(plan.clone(), req.clone());
+            let page = self.query_page(&work).await;
+            if page.status != QueryPageStatus::Ok as i32 {
+                return Err(page.error);
             }
-            if skipped < spec.offset {
-                skipped += 1;
-                continue;
-            }
-            let transformed = match spec.transform {
-                ValueTransform::Identity => value.value.clone(),
-                ValueTransform::KeyOnly => Vec::new(),
-                ValueTransform::PrefixBytes(n) => {
-                    value.value[..value.value.len().min(n as usize)].to_vec()
+            visited += u64::from(page.visited);
+            for row in page.rows {
+                if skipped < spec.offset {
+                    skipped += 1;
+                    continue;
                 }
-            };
-            out.push(ScanMatch {
-                key: key.clone(),
-                value: transformed,
-            });
-            if out.len() as u64 >= limit {
-                break;
+                let mut cells = row.cells.into_iter().map(cell_to_value);
+                let Some(Ok(QueryValue::Text(key))) = cells.next() else {
+                    return Err("scan key projection".into());
+                };
+                let value = match cells.next() {
+                    Some(Ok(QueryValue::Bytes(bytes))) => bytes,
+                    None => Vec::new(),
+                    _ => return Err("scan value projection".into()),
+                };
+                retained = retained
+                    .saturating_add(key.capacity())
+                    .saturating_add(value.capacity());
+                let row_wire = crate::wire::bytes_field_len(1, key.len())
+                    .saturating_add(crate::wire::bytes_field_len(2, value.len()));
+                encoded = encoded.saturating_add(crate::wire::message_field_len(2, row_wire));
+                // Vec growth can allocate up to twice the next cardinality.
+                let storage = retained.saturating_add(
+                    (out.len() + 1)
+                        .saturating_mul(2)
+                        .saturating_mul(std::mem::size_of::<ScanMatch>()),
+                );
+                if storage > options.max_result_bytes || encoded > crate::wire::MAX_FRAME_BYTES {
+                    return Err("scan result byte budget exceeded".into());
+                }
+                out.push(ScanMatch { key, value });
             }
+            if page.done || out.len() as u64 == spec.effective_limit() {
+                // Fence the final accepted contribution, including a truncated
+                // page. Holding no lock across awaits avoids long read stalls.
+                req.continuation = true;
+                req.revision = page.revision;
+                req.snapshot_time_ms = page.snapshot_time_ms;
+                req.incarnation = page.incarnation;
+                req.after_key = page.next_after_key;
+                req.verify_only = true;
+                let verify = self.query_page(&QueryPageWork::new(plan, req)).await;
+                if verify.status != QueryPageStatus::Ok as i32 {
+                    return Err(verify.error);
+                }
+                return Ok(out);
+            }
+            req.continuation = true;
+            req.revision = page.revision;
+            req.snapshot_time_ms = page.snapshot_time_ms;
+            req.incarnation = page.incarnation;
+            req.after_key = page.next_after_key;
+            tokio::task::yield_now().await;
         }
-        out
     }
 
     /// Read a revision-guarded page through the background worker pool.

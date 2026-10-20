@@ -826,16 +826,6 @@ struct PendingScan {
 
 /// Removes a pending scan request even if the coordinator future is
 /// cancelled while waiting for the holder's response.
-struct PendingScanGuard {
-    req_id: u64,
-    pending: PendingScans,
-}
-
-impl Drop for PendingScanGuard {
-    fn drop(&mut self) {
-        self.pending.lock().unwrap().remove(&self.req_id);
-    }
-}
 
 /// Removes a pending request even if its future is cancelled while waiting
 /// for outbound queue capacity or a peer response.

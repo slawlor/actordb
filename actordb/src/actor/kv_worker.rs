@@ -129,7 +129,7 @@ pub(super) async fn handle_worker_message(
             // Worker-executed (unlike the dispatcher-served GetAll family
             // below): the scan runs against shared state inside the worker's
             // message handler. The receiver may be gone; that's fine.
-            let _ = reply.send(Ok(shared.scan(&spec).await));
+            let _ = reply.send(shared.scan(&spec).await);
             Ok(())
         }
         KvMessage::ScanRetained {
@@ -139,7 +139,7 @@ pub(super) async fn handle_worker_message(
         } => {
             let _retention = retention;
             if !reply.is_closed() {
-                let _ = reply.send(Ok(shared.scan(&spec).await));
+                let _ = reply.send(shared.scan(&spec).await);
             }
             Ok(())
         }

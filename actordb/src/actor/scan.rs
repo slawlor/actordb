@@ -29,10 +29,9 @@
 //!   means "no explicit limit" and falls back to [`DEFAULT_SCAN_LIMIT`].
 //!   The bound is load-bearing: an unbounded full-table scan is an OOM
 //!   vector on the reply path.
-//! * **No snapshot isolation**: the scan holds the fragment's read lock for
-//!   a single pass, so concurrent writes pause for the scan's duration
-//!   (writes need the write lock; reads do not). Each fragment is read at
-//!   its own instant. This matches the system's AP/eventual-consistency
+//! * **Checked fragment revisions**: scans release the read lock between
+//!   bounded pages and fail completely if a winning mutation changes the
+//!   fragment before validation. Each fragment is read at its own instant. This matches the system's AP/eventual-consistency
 //!   contract — callers merging multi-fragment results must not assume a
 //!   global linearizable snapshot.
 //! * **Scheduling**: the dispatcher routes [`crate::actor::KvMessage::Scan`]
@@ -84,6 +83,24 @@ pub struct ScanSpec {
 }
 
 impl ScanSpec {
+    pub(crate) fn query_plan(&self, fragment: Option<u32>) -> actordb_query::QueryPlan {
+        use actordb_query::{KeyPredicate, Projection, QueryPlan};
+        QueryPlan {
+            projections: match self.transform {
+                ValueTransform::Identity => vec![Projection::Key, Projection::Value],
+                ValueTransform::KeyOnly => vec![Projection::Key],
+                ValueTransform::PrefixBytes(n) => vec![Projection::Key, Projection::PrefixBytes(n)],
+            },
+            predicates: match &self.matcher {
+                KeyMatcher::All => Vec::new(),
+                KeyMatcher::Prefix(prefix) => vec![KeyPredicate::Prefix(prefix.clone())],
+            },
+            fragments: fragment.map(|fragment| vec![fragment]),
+            limit: Some(self.effective_limit()),
+            offset: self.offset,
+        }
+    }
+
     /// The effective result bound: the explicit limit, or the server-side
     /// default when the caller passed `0`.
     pub fn effective_limit(&self) -> u64 {
@@ -249,7 +266,8 @@ mod tests {
         let state = state_with(&[("zebra", b"1"), ("apple", b"2"), ("mango", b"3")]);
         let out = state
             .scan(&spec(KeyMatcher::All, ValueTransform::Identity, 0, 0))
-            .await;
+            .await
+            .unwrap();
         let keys: Vec<&str> = out.iter().map(|m| m.key.as_str()).collect();
         assert_eq!(keys, vec!["apple", "mango", "zebra"]);
         assert_eq!(out[0].value, b"2".to_vec());
@@ -268,7 +286,8 @@ mod tests {
         let state = test_state(cache);
         let out = state
             .scan(&spec(KeyMatcher::All, ValueTransform::Identity, 0, 0))
-            .await;
+            .await
+            .unwrap();
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].key, "here");
         // Point read agrees: the tombstoned key is invisible.
@@ -291,7 +310,8 @@ mod tests {
         let state = test_state(cache);
         let out = state
             .scan(&spec(KeyMatcher::All, ValueTransform::Identity, 0, 0))
-            .await;
+            .await
+            .unwrap();
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].key, "fresh");
         assert!(state.get("stale").await.is_none());
@@ -312,7 +332,8 @@ mod tests {
                 0,
                 0,
             ))
-            .await;
+            .await
+            .unwrap();
         let keys: Vec<&str> = out.iter().map(|m| m.key.as_str()).collect();
         assert_eq!(keys, vec!["user:1", "user:10", "user:2"]);
     }
@@ -322,7 +343,8 @@ mod tests {
         let state = state_with(&[("a", b"1"), ("b", b"2"), ("c", b"3")]);
         let out = state
             .scan(&spec(KeyMatcher::All, ValueTransform::Identity, 2, 0))
-            .await;
+            .await
+            .unwrap();
         assert_eq!(out.len(), 2);
 
         let spec_default = spec(KeyMatcher::All, ValueTransform::Identity, 0, 0);
@@ -349,6 +371,7 @@ mod tests {
                 state
                     .scan(&spec(KeyMatcher::All, ValueTransform::KeyOnly, 2, offset))
                     .await
+                    .unwrap()
             }
         };
         let p0: Vec<String> = page(0).await.into_iter().map(|m| m.key).collect();
@@ -367,18 +390,21 @@ mod tests {
 
         let identity = state
             .scan(&spec(KeyMatcher::All, ValueTransform::Identity, 0, 0))
-            .await;
+            .await
+            .unwrap();
         assert_eq!(identity[0].value, b"hello-world".to_vec());
 
         let key_only = state
             .scan(&spec(KeyMatcher::All, ValueTransform::KeyOnly, 0, 0))
-            .await;
+            .await
+            .unwrap();
         assert_eq!(key_only[0].key, "k");
         assert!(key_only[0].value.is_empty());
 
         let head = state
             .scan(&spec(KeyMatcher::All, ValueTransform::PrefixBytes(5), 0, 0))
-            .await;
+            .await
+            .unwrap();
         assert_eq!(head[0].value, b"hello".to_vec());
 
         // Prefix longer than the value returns the whole value, not a panic.
@@ -389,7 +415,8 @@ mod tests {
                 0,
                 0,
             ))
-            .await;
+            .await
+            .unwrap();
         assert_eq!(overlong[0].value, b"hello-world".to_vec());
     }
 
@@ -401,7 +428,8 @@ mod tests {
         let state = state_with(&[("a", b"0123456789"), ("b", b"0123456789")]);
         let out = state
             .scan(&spec(KeyMatcher::All, ValueTransform::PrefixBytes(0), 0, 0))
-            .await;
+            .await
+            .unwrap();
         assert_eq!(out.len(), 2);
         assert!(out.iter().all(|m| m.value.is_empty()));
     }
@@ -632,5 +660,45 @@ mod tests {
         };
         let proto = m.to_proto();
         assert_eq!(ScanMatch::from_proto(&proto), m);
+    }
+}
+
+#[cfg(test)]
+mod bounded_scan_tests {
+    use super::*;
+    use crate::actor::{FragmentState, VersionedValue};
+    use std::collections::HashMap;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn compatibility_scan_rejects_wide_reply_before_full_materialization() {
+        let state = FragmentState::new(
+            (0..40)
+                .map(|i| {
+                    (
+                        format!("key:{i:03}"),
+                        VersionedValue::new(vec![7; 600_000], 1, "n".into()),
+                    )
+                })
+                .collect::<HashMap<_, _>>(),
+            None,
+            100,
+            Duration::from_secs(1),
+        );
+        let mut spec = ScanSpec {
+            matcher: KeyMatcher::All,
+            transform: ValueTransform::Identity,
+            limit: 40,
+            offset: 0,
+        };
+        assert!(state.scan(&spec).await.unwrap_err().contains("budget"));
+        spec.transform = ValueTransform::PrefixBytes(3);
+        spec.offset = 38;
+        let rows = state.scan(&spec).await.unwrap();
+        assert_eq!(
+            rows.iter().map(|row| row.key.as_str()).collect::<Vec<_>>(),
+            vec!["key:038", "key:039"]
+        );
+        assert!(rows.iter().all(|row| row.value == vec![7; 3]));
     }
 }
