@@ -140,6 +140,8 @@ pub const CAPABILITY_QUERY_PAGES: u64 = 1 << 8;
 pub const CAPABILITY_WRITE_CONCERNS: u64 = 1 << 9;
 /// Summaries carry content digests and reject equal-version divergent contents.
 pub const CAPABILITY_RECORD_CONTENT_DIGEST: u64 = 1 << 10;
+/// Mutation replies preserve uncertain outcomes instead of definite rejection.
+pub const CAPABILITY_TYPED_UNKNOWN_MUTATION: u64 = 1 << 11;
 /// Capabilities required by this binary before it installs a peer connection.
 pub const REQUIRED_WIRE_CAPABILITIES: u64 = CAPABILITY_MUTATION_RESULTS
     | CAPABILITY_DURABILITY_ACKS
@@ -149,7 +151,8 @@ pub const REQUIRED_WIRE_CAPABILITIES: u64 = CAPABILITY_MUTATION_RESULTS
     | CAPABILITY_BYTE_BOUNDED_BATCHES
     | CAPABILITY_STABLE_DURABILITY_ACKS
     | CAPABILITY_WRITE_CONCERNS
-    | CAPABILITY_RECORD_CONTENT_DIGEST;
+    | CAPABILITY_RECORD_CONTENT_DIGEST
+    | CAPABILITY_TYPED_UNKNOWN_MUTATION;
 
 /// Outbound queue depth per peer connection.
 const PEER_CHANNEL_DEPTH: usize = 256;
@@ -13399,6 +13402,24 @@ mod tests {
         };
         assert_eq!(validate_peer_hello("local", Some("peer"), &hello), Ok(()));
         hello.capabilities &= !CAPABILITY_RECORD_CONTENT_DIGEST;
+        assert_eq!(
+            validate_peer_hello("local", Some("peer"), &hello),
+            Err("peer omitted required wire capabilities")
+        );
+    }
+
+    #[test]
+    fn v4_peer_without_typed_unknown_outcomes_is_rejected_at_hello() {
+        let mut hello = Hello {
+            node_id: "peer".into(),
+            auth_tag: Vec::new(),
+            min_protocol_version: WIRE_PROTOCOL_VERSION,
+            max_protocol_version: WIRE_PROTOCOL_VERSION,
+            capabilities: REQUIRED_WIRE_CAPABILITIES,
+            challenge: vec![1; HANDSHAKE_CHALLENGE_BYTES],
+        };
+        assert_eq!(validate_peer_hello("local", Some("peer"), &hello), Ok(()));
+        hello.capabilities &= !CAPABILITY_TYPED_UNKNOWN_MUTATION;
         assert_eq!(
             validate_peer_hello("local", Some("peer"), &hello),
             Err("peer omitted required wire capabilities")

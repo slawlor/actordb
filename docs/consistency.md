@@ -185,3 +185,11 @@ A v4 peer from the earlier clock-only implementation is rejected during Hello
 negotiation if it cannot advertise and compare the 32-byte content digest.
 The capability is part of the authenticated Hello transcript; independent
 authentication test vectors remain unchanged.
+
+## Typed mutation outcome compatibility
+
+Peer protocol v4 requires `CAPABILITY_TYPED_UNKNOWN_MUTATION` (bit 11) to
+interpret `MutationStatus::UnknownOutcome`. Nodes reject v4 peers missing this
+capability during Hello negotiation, before sending a status the peer cannot
+classify. The capability is authenticated with the Hello transcript; the
+existing independent authentication vectors are unchanged.
