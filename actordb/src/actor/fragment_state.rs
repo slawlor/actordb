@@ -70,6 +70,9 @@ struct FragmentCache {
     ordered_keys: BTreeSet<String>,
     /// Hash wide payloads once before mutation locks; summaries only copy hashes.
     content_digests: HashMap<String, CachedDigests>,
+    // Exactly one deadline per live TTL winner. Replacements remove the old
+    // entry eagerly, so hot-key updates cannot accumulate stale heap entries.
+    expiry_deadlines: BTreeSet<(u64, String)>,
 }
 
 #[derive(Clone, Copy)]
@@ -92,14 +95,13 @@ impl CachedDigests {
 pub(crate) const EXPIRY_PAGE_VISIT_LIMIT: usize = 256;
 pub(crate) const EXPIRY_PAGE_WORK_BYTES: usize = 1024 * 1024;
 
-/// A weakly consistent, finite periodic pass. The first page captures its
-/// ordered high-water key and cardinality under the same cache write lock.
+/// A weakly consistent, finite pass over deadlines due at a pinned time.
+/// The initial index cardinality bounds insert churn without scanning keys.
 pub(crate) struct ExpiryPass {
     now_ms: u64,
     initialized: bool,
     remaining: usize,
-    after_key: Option<String>,
-    high_water: Option<String>,
+    after_deadline: Option<(u64, String)>,
 }
 
 impl ExpiryPass {
@@ -108,8 +110,7 @@ impl ExpiryPass {
             now_ms,
             initialized: false,
             remaining: 0,
-            after_key: None,
-            high_water: None,
+            after_deadline: None,
         }
     }
 }
@@ -120,6 +121,7 @@ pub(crate) struct ExpiryPage {
     pub(crate) converted: usize,
     pub(crate) work_bytes: usize,
     pub(crate) done: bool,
+    saturated: bool,
 }
 
 fn expiry_record_work_bytes(
@@ -186,11 +188,21 @@ impl FragmentState {
             .iter()
             .map(|(key, value)| (key.clone(), CachedDigests::new(value)))
             .collect();
+        let expiry_deadlines = cache
+            .iter()
+            .filter_map(|(key, value)| {
+                (!value.is_tombstone)
+                    .then_some(value.expires_at_ms)
+                    .flatten()
+                    .map(|deadline| (deadline, key.clone()))
+            })
+            .collect();
         Self {
             cache: RwLock::new(FragmentCache {
                 values: cache,
                 ordered_keys,
                 content_digests,
+                expiry_deadlines,
             }),
             kvstore,
             revision: AtomicU64::new(0),
@@ -403,6 +415,16 @@ impl FragmentState {
                     is_tombstone: existing.is_tombstone,
                 });
             }
+            if !existing.is_tombstone {
+                if let Some(deadline) = existing.expires_at_ms {
+                    cache.expiry_deadlines.remove(&(deadline, key.to_owned()));
+                }
+            }
+            if !value.is_tombstone {
+                if let Some(deadline) = value.expires_at_ms {
+                    cache.expiry_deadlines.insert((deadline, key.to_owned()));
+                }
+            }
             *existing = value.clone();
             cache.content_digests.insert(key.to_string(), digests);
             Ok(ApplyOutcome::Applied)
@@ -410,6 +432,11 @@ impl FragmentState {
             let key = key.to_string();
             cache.ordered_keys.insert(key.clone());
             cache.content_digests.insert(key.clone(), digests);
+            if !value.is_tombstone {
+                if let Some(deadline) = value.expires_at_ms {
+                    cache.expiry_deadlines.insert((deadline, key.clone()));
+                }
+            }
             cache.values.insert(key, value.clone());
             Ok(ApplyOutcome::Applied)
         }
@@ -1078,91 +1105,23 @@ impl FragmentState {
         0
     }
 
-    /// Convert all expired live values to durable expiry tombstones. Returns
-    /// the number converted. Cache replacement and persistence enqueueing use
-    /// the same lock order as normal writes, preserving their shared order.
+    /// Convert all due live values to durable expiry tombstones using the
+    /// deadline index. Non-TTL values and retained tombstones are never visited.
+    /// Locks are released between bounded pages; concurrent writes may change
+    /// the finite pass. Persistence admission failure keeps the deadline indexed
+    /// and returns an error so shutdown can retry its final expiry fence.
     pub async fn expire_values(&self, now_ms: u64) -> Result<usize, ActorProcessingErr> {
-        if self.kvstore.is_none() {
-            let mut cache = self.cache.write().await;
-            let mut converted = 0;
-            let FragmentCache {
-                values,
-                content_digests,
-                ..
-            } = &mut *cache;
-            for (key, value) in values.iter_mut() {
-                if value.is_expired(now_ms) {
-                    content_digests
-                        .get_mut(key)
-                        .expect("cache digest exists")
-                        .expire();
-                    let tombstone = value.expiry_tombstone();
-                    if self.expiry_publisher.is_some() {
-                        let previous_value = std::mem::replace(value, tombstone);
-                        // Nonwaiting admission under the mutation lock preserves
-                        // fragment order. User code runs in a separate task.
-                        self.publish_expiry(key, previous_value);
-                    } else {
-                        *value = tombstone;
-                    }
-                    converted += 1;
-                }
+        let mut pass = ExpiryPass::new(now_ms);
+        let mut converted = 0usize;
+        let mut saturated = false;
+        loop {
+            let page = self.expire_values_page(&mut pass).await?;
+            converted = converted.saturating_add(page.converted);
+            saturated |= page.saturated;
+            if page.done {
+                break;
             }
-            if converted != 0 {
-                self.revision.fetch_add(
-                    u64::try_from(converted).unwrap_or(u64::MAX),
-                    Ordering::Release,
-                );
-            }
-            return Ok(converted);
-        }
-
-        let (converted, should_flush, saturated) = {
-            let mut flush = self.flush.lock().await;
-            let mut cache = self.cache.write().await;
-            let mut converted = 0;
-            let mut saturated = false;
-            let FragmentCache {
-                values,
-                content_digests,
-                ..
-            } = &mut *cache;
-            for (key, value) in values.iter_mut() {
-                if value.is_expired(now_ms) {
-                    let tombstone = value.expiry_tombstone();
-                    if !flush.enqueue(key, &tombstone) {
-                        saturated = true;
-                        continue;
-                    }
-                    content_digests
-                        .get_mut(key)
-                        .expect("cache digest exists")
-                        .expire();
-                    let previous_value = if self.expiry_publisher.is_some() {
-                        Some(std::mem::replace(value, tombstone.clone()))
-                    } else {
-                        *value = tombstone.clone();
-                        None
-                    };
-                    if let Some(previous_value) = previous_value {
-                        self.publish_expiry(key, previous_value);
-                    }
-                    converted += 1;
-                }
-            }
-            if converted != 0 {
-                self.revision.fetch_add(
-                    u64::try_from(converted).unwrap_or(u64::MAX),
-                    Ordering::Release,
-                );
-            }
-            let should_flush =
-                converted > 0 && flush.should_flush(self.flush_batch_size, self.flush_interval);
-            (converted, should_flush || saturated, saturated)
-        };
-
-        if should_flush {
-            self.flush().await?;
+            tokio::task::yield_now().await;
         }
         if saturated {
             return Err(ActorProcessingErr::from(
@@ -1172,31 +1131,25 @@ impl FragmentState {
         Ok(converted)
     }
 
-    /// Periodic maintenance only; authoritative shutdown still uses the full
-    /// public sweep. Every visited current value counts, including non-TTL
-    /// records. One terminal record may cross the soft work-byte target.
+    /// Visit at most 256 due deadlines under one cache write lock. One terminal
+    /// record may cross the soft work-byte target. Successful conversion removes
+    /// the deadline while retaining the tombstone's key/version floor forever.
     pub(crate) async fn expire_values_page(
         &self,
         pass: &mut ExpiryPass,
     ) -> Result<ExpiryPage, ActorProcessingErr> {
+        use std::ops::Bound::{Excluded, Unbounded};
         let (page, should_flush) = {
-            // Preserve normal apply's lock order and adjacent cache/enqueue/
-            // revision publication. No await occurs after the cache is locked.
+            // Shared ordering with apply: reserve persistence before installing
+            // a tombstone, then publish its revision/callback without an await.
             let mut flush = if self.kvstore.is_some() {
                 Some(self.flush.lock().await)
             } else {
                 None
             };
             let mut cache = self.cache.write().await;
-            let mut initial_work = 0usize;
             if !pass.initialized {
-                pass.remaining = cache.ordered_keys.len();
-                pass.high_water = cache.ordered_keys.last().cloned();
-                if let Some(high_water) = &pass.high_water {
-                    // Charge this single pass-metadata clone to the first
-                    // visited record, including an oversized first record.
-                    initial_work = std::mem::size_of::<String>().saturating_add(high_water.len());
-                }
+                pass.remaining = cache.expiry_deadlines.len();
                 pass.initialized = true;
             }
             let mut page = ExpiryPage {
@@ -1204,61 +1157,68 @@ impl FragmentState {
                 converted: 0,
                 work_bytes: 0,
                 done: pass.remaining == 0,
+                saturated: false,
             };
-            let mut next_cursor = None;
-            let mut exhausted = false;
-            if let Some(high_water) = pass.high_water.as_deref().filter(|_| !page.done) {
-                use std::ops::Bound::{Excluded, Included, Unbounded};
-                let lower = pass.after_key.as_deref().map_or(Unbounded, Excluded);
-                let FragmentCache {
-                    values,
-                    ordered_keys,
-                    content_digests,
-                } = &mut *cache;
-                let mut keys = ordered_keys.range::<str, _>((lower, Included(high_water)));
-                let limit = pass.remaining.min(EXPIRY_PAGE_VISIT_LIMIT);
-                while page.visited < limit
-                    && (page.visited == 0 || page.work_bytes < EXPIRY_PAGE_WORK_BYTES)
+            let limit = pass.remaining.min(EXPIRY_PAGE_VISIT_LIMIT);
+            while page.visited < limit
+                && (page.visited == 0 || page.work_bytes < EXPIRY_PAGE_WORK_BYTES)
+            {
+                let lower = pass.after_deadline.as_ref().map_or(Unbounded, Excluded);
+                let Some(entry) = cache
+                    .expiry_deadlines
+                    .range((lower, Unbounded))
+                    .next()
+                    .filter(|(deadline, _)| *deadline <= pass.now_ms)
+                    .cloned()
+                else {
+                    page.done = true;
+                    break;
+                };
+                let (deadline, key) = &entry;
+                let value = cache
+                    .values
+                    .get_mut(key)
+                    .expect("indexed deadline has a value");
+                debug_assert_eq!(value.expires_at_ms, Some(*deadline));
+                debug_assert!(value.is_expired(pass.now_ms));
+                let charge = expiry_record_work_bytes(key, value, true, flush.is_some())
+                    .saturating_add(std::mem::size_of::<(u64, String)>());
+                page.work_bytes = page.work_bytes.saturating_add(charge);
+                page.visited += 1;
+                let tombstone = value.expiry_tombstone();
+                if flush
+                    .as_mut()
+                    .is_some_and(|flush| !flush.enqueue(key, &tombstone))
                 {
-                    let Some(key) = keys.next() else {
-                        exhausted = true;
-                        break;
-                    };
-                    let value = values.get_mut(key).expect("ordered cache key has a value");
-                    let expired = value.is_expired(pass.now_ms);
-                    let charge = expiry_record_work_bytes(key, value, expired, flush.is_some())
-                        .saturating_add(std::mem::take(&mut initial_work));
-                    page.work_bytes = page.work_bytes.saturating_add(charge);
-                    page.visited += 1;
-                    next_cursor = Some(key.clone());
-                    if expired {
-                        let tombstone = value.expiry_tombstone();
-                        let previous_value = if let Some(flush) = &mut flush {
-                            if !flush.enqueue(key, &tombstone) {
-                                continue;
-                            }
-                            self.install_expiry(value, tombstone)
-                        } else {
-                            self.install_expiry(value, tombstone)
-                        };
-                        content_digests
-                            .get_mut(key)
-                            .expect("cache digest exists")
-                            .expire();
-                        if let Some(previous_value) = previous_value {
-                            self.publish_expiry(key, previous_value);
-                        }
-                        page.converted += 1;
-                    }
+                    page.saturated = true;
+                    pass.after_deadline = Some(entry);
+                    continue;
                 }
+                let previous_value = self.install_expiry(value, tombstone);
+                cache
+                    .content_digests
+                    .get_mut(key)
+                    .expect("cache digest exists")
+                    .expire();
+                if let Some(previous_value) = previous_value {
+                    self.publish_expiry(key, previous_value);
+                }
+                cache.expiry_deadlines.remove(&entry);
+                pass.after_deadline = Some(entry);
+                page.converted += 1;
             }
             pass.remaining -= page.visited;
-            if let Some(cursor) = next_cursor {
-                pass.after_key = Some(cursor);
+            page.done |= pass.remaining == 0;
+            // A quota larger than the due set must finish on this page, even
+            // when the page ends exactly at a visit/work boundary.
+            if !page.done {
+                let lower = pass.after_deadline.as_ref().map_or(Unbounded, Excluded);
+                page.done = cache
+                    .expiry_deadlines
+                    .range((lower, Unbounded))
+                    .next()
+                    .is_none_or(|(deadline, _)| *deadline > pass.now_ms);
             }
-            page.done |= exhausted
-                || pass.remaining == 0
-                || pass.after_key.as_deref() == pass.high_water.as_deref();
             if page.done {
                 pass.remaining = 0;
             }
@@ -1268,10 +1228,11 @@ impl FragmentState {
                     Ordering::Release,
                 );
             }
-            let should_flush = page.converted > 0
-                && flush.as_ref().is_some_and(|flush| {
-                    flush.should_flush(self.flush_batch_size, self.flush_interval)
-                });
+            let should_flush = page.saturated
+                || (page.converted > 0
+                    && flush.as_ref().is_some_and(|flush| {
+                        flush.should_flush(self.flush_batch_size, self.flush_interval)
+                    }));
             (page, should_flush)
         };
         if should_flush {
@@ -2363,7 +2324,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn expiry_pages_bound_visits_even_for_sparse_non_ttl_cache_and_empty_key() {
+    async fn expiry_pages_ignore_non_ttl_tombstones_and_future_deadlines() {
         let mut values = HashMap::with_capacity(100_000);
         values.insert(String::new(), VersionedValue::new(vec![], 1, "n".into()));
         for i in 0..600 {
@@ -2376,20 +2337,41 @@ mod tests {
         let mut pass = ExpiryPass::new(100);
         let first = state.expire_values_page(&mut pass).await.unwrap();
         assert_eq!(
-            (first.visited, first.converted, first.done),
-            (256, 0, false)
+            (first.visited, first.converted, first.work_bytes, first.done),
+            (0, 0, 0, true)
         );
-        assert_eq!(pass.after_key.as_deref(), Some("k0254"));
-        let second = state.expire_values_page(&mut pass).await.unwrap();
-        assert_eq!(
-            (second.visited, second.converted, second.done),
-            (256, 0, false)
-        );
-        let third = state.expire_values_page(&mut pass).await.unwrap();
-        assert_eq!((third.visited, third.converted, third.done), (89, 0, true));
         assert_eq!(state.revision.load(Ordering::Acquire), 0);
         assert_eq!(
             state.expire_values_page(&mut pass).await.unwrap().visited,
+            0
+        );
+        let tombstones = (0..10_000)
+            .map(|i| {
+                (
+                    format!("deleted:{i}"),
+                    VersionedValue::tombstone(1, "n".into()),
+                )
+            })
+            .collect();
+        let state = test_state(tombstones);
+        assert_eq!(
+            state
+                .expire_values_page(&mut ExpiryPass::new(u64::MAX))
+                .await
+                .unwrap()
+                .visited,
+            0
+        );
+        let state = test_state(HashMap::from([(
+            "future".into(),
+            expiring_value(vec![1], 101),
+        )]));
+        assert_eq!(
+            state
+                .expire_values_page(&mut ExpiryPass::new(100))
+                .await
+                .unwrap()
+                .visited,
             0
         );
 
@@ -2409,7 +2391,10 @@ mod tests {
         let mut pass = ExpiryPass::new(100);
         let page = empty_key.expire_values_page(&mut pass).await.unwrap();
         assert_eq!((page.visited, page.converted, page.done), (1, 1, true));
-        assert_eq!(pass.after_key.as_deref(), Some(""));
+        assert_eq!(
+            pass.after_deadline.as_ref().map(|(_, key)| key.as_str()),
+            Some("")
+        );
     }
 
     #[tokio::test]
@@ -2427,7 +2412,7 @@ mod tests {
         assert_eq!((page.visited, page.converted, page.done), (1, 1, false));
         assert_eq!(
             page.work_bytes,
-            oversized_charge + std::mem::size_of::<String>() + 1
+            oversized_charge + std::mem::size_of::<(u64, String)>()
         );
         assert!(page.work_bytes >= EXPIRY_PAGE_WORK_BYTES);
         assert_eq!(
@@ -2444,7 +2429,10 @@ mod tests {
         let mut pass = ExpiryPass::new(100);
         let page = state.expire_values_page(&mut pass).await.unwrap();
         assert_eq!((page.visited, page.converted, page.done), (2, 2, false));
-        assert_eq!(pass.after_key.as_deref(), Some("b"));
+        assert_eq!(
+            pass.after_deadline.as_ref().map(|(_, key)| key.as_str()),
+            Some("b")
+        );
         assert_eq!(
             state.expire_values_page(&mut pass).await.unwrap().visited,
             1
@@ -2481,8 +2469,8 @@ mod tests {
         assert_eq!(apply_future.await.unwrap(), ApplyOutcome::Applied);
         let before_second = state.revision.load(Ordering::Acquire);
         let second = next_page.await.unwrap();
-        assert_eq!((second.visited, second.converted), (256, 254));
-        assert_eq!(state.revision.load(Ordering::Acquire), before_second + 254);
+        assert_eq!((second.visited, second.converted), (256, 256));
+        assert_eq!(state.revision.load(Ordering::Acquire), before_second + 256);
         assert_eq!(state.cache.read().await.values.get("k0256"), Some(&winner));
         assert!(!state.cache.read().await.values["k0257"].is_tombstone);
         let summary = state
@@ -2510,14 +2498,12 @@ mod tests {
                 .apply(&test_op(key, expiring_value(vec![2], u64::MAX)))
                 .await
                 .unwrap();
-            state
-                .cache
-                .write()
-                .await
-                .values
-                .get_mut(key)
-                .unwrap()
-                .expires_at_ms = Some(100);
+            let mut cache = state.cache.write().await;
+            cache.expiry_deadlines.remove(&(u64::MAX, key.to_owned()));
+            cache.values.get_mut(key).unwrap().expires_at_ms = Some(100);
+            let digests = CachedDigests::new(&cache.values[key]);
+            cache.content_digests.insert(key.to_owned(), digests);
+            cache.expiry_deadlines.insert((100, key.to_owned()));
         }
         let page = state.expire_values_page(&mut pass).await.unwrap();
         assert_eq!((page.visited, page.converted, page.done), (44, 44, true));
@@ -2554,7 +2540,10 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("injected failure"));
-        assert_eq!(pass.after_key.as_deref(), Some("key"));
+        assert_eq!(
+            pass.after_deadline.as_ref().map(|(_, key)| key.as_str()),
+            Some("key")
+        );
         assert_eq!(
             state.cache.read().await.values["key"],
             value.expiry_tombstone()
@@ -2608,7 +2597,7 @@ mod tests {
             .expire_values_page(&mut ExpiryPass::new(100))
             .await
             .unwrap();
-        assert_eq!((page.visited, page.converted, page.done), (1, 0, true));
+        assert_eq!((page.visited, page.converted, page.done), (0, 0, true));
         let winner = VersionedValue::new(vec![2], 11, "writer".into());
         state.apply(&test_op("key", winner.clone())).await.unwrap();
         assert_eq!(
@@ -3474,5 +3463,67 @@ mod apply_expiry_contention_tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod expiry_index_tests {
+    use super::*;
+    use crate::actor::test_support::test_op;
+
+    #[tokio::test]
+    async fn deadline_index_tracks_only_live_winners_without_hot_key_growth() {
+        let state = FragmentState::new(HashMap::new(), None, 100, Duration::from_secs(1));
+        for version in 1..=500 {
+            let mut value = VersionedValue::new(vec![1], version, "n".into());
+            value.expires_at_ms = Some(u64::MAX - version);
+            state.apply(&test_op("hot", value)).await.unwrap();
+            assert_eq!(state.cache.read().await.expiry_deadlines.len(), 1);
+        }
+        let older = VersionedValue::new(vec![2], 1, "n".into());
+        assert!(matches!(
+            state.apply(&test_op("hot", older)).await.unwrap(),
+            ApplyOutcome::Superseded { .. }
+        ));
+        assert_eq!(state.cache.read().await.expiry_deadlines.len(), 1);
+        let deleted = VersionedValue::tombstone(501, "n".into());
+        state.apply(&test_op("hot", deleted)).await.unwrap();
+        assert!(state.cache.read().await.expiry_deadlines.is_empty());
+        assert_eq!(state.expire_values(u64::MAX).await.unwrap(), 0);
+        assert!(state.cache.read().await.values["hot"].is_tombstone);
+    }
+
+    #[tokio::test]
+    async fn persistence_saturation_retains_due_deadline_for_retry() {
+        use super::flush_tests::FlakyStore;
+        use crate::store::PersistenceConfig;
+        use std::sync::Mutex as StdMutex;
+        let store = Arc::new(FlakyStore {
+            failures_left: StdMutex::new(0),
+            written: StdMutex::new(Vec::new()),
+        });
+        let mut due = VersionedValue::new(vec![1], 1, "n".into());
+        due.expires_at_ms = Some(100);
+        let state = FragmentState::new(
+            HashMap::from([("due".into(), due)]),
+            Some(store),
+            usize::MAX,
+            Duration::from_secs(3600),
+        )
+        .with_persistence_config(PersistenceConfig::builder().max_records(1).build())
+        .unwrap();
+        state
+            .apply(&test_op(
+                "live",
+                VersionedValue::new(vec![2], 2, "n".into()),
+            ))
+            .await
+            .unwrap();
+        assert!(state.expire_values(100).await.is_err());
+        assert_eq!(state.cache.read().await.expiry_deadlines.len(), 1);
+        assert!(!state.cache.read().await.values["due"].is_tombstone);
+        assert_eq!(state.expire_values(100).await.unwrap(), 1);
+        assert!(state.cache.read().await.expiry_deadlines.is_empty());
+        assert!(state.cache.read().await.values["due"].is_tombstone);
     }
 }
