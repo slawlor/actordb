@@ -85,6 +85,8 @@ type QueueFailureHandler = Arc<dyn Fn(mpsc::Sender<Vec<u8>>) + Send + Sync>;
 pub struct SenderRuntimeOptions {
     #[builder(default = Duration::from_secs(30))]
     ack_timeout: Duration,
+    #[builder(default = Duration::from_secs(30))]
+    local_work_timeout: Duration,
     #[builder(default = Duration::from_secs(5))]
     queue_admission_timeout: Duration,
     #[builder(skip = 64)]
@@ -135,6 +137,8 @@ pub enum SenderOptionsError {
     ZeroReconcileTimeout,
     /// An ordinary batch would expire immediately.
     ZeroAckTimeout,
+    /// A local actor-work waiter must have a usable deadline.
+    InvalidLocalWorkTimeout,
     /// An outbound queue reservation would expire immediately.
     ZeroQueueAdmissionTimeout,
     /// The ordinary ACK timeout cannot be represented by Tokio's clock.
@@ -173,6 +177,9 @@ impl std::fmt::Display for SenderOptionsError {
             }
             Self::ZeroReconcileTimeout => {
                 write!(f, "replication reconcile timeout must be non-zero")
+            }
+            Self::InvalidLocalWorkTimeout => {
+                write!(f, "local work timeout must be positive and representable")
             }
             Self::ZeroAckTimeout => write!(f, "replication ack timeout must be non-zero"),
             Self::ZeroQueueAdmissionTimeout => {
@@ -245,6 +252,15 @@ impl SenderRuntimeOptions {
         self
     }
 
+    /// Bound one phase of local actor work; submitted storage calls retain ownership.
+    pub fn with_local_work_timeout(mut self, timeout: Duration) -> Self {
+        self.local_work_timeout = timeout;
+        self
+    }
+    pub fn local_work_timeout(&self) -> Duration {
+        self.local_work_timeout
+    }
+
     pub(crate) fn with_aggregate_retention(mut self, budget: Arc<ByteBudget>) -> Self {
         self.aggregate_retention = budget;
         self
@@ -256,6 +272,13 @@ impl SenderRuntimeOptions {
     }
 
     fn validate(&self) -> Result<(), SenderOptionsError> {
+        if self.local_work_timeout.is_zero()
+            || Instant::now()
+                .checked_add(self.local_work_timeout)
+                .is_none()
+        {
+            return Err(SenderOptionsError::InvalidLocalWorkTimeout);
+        }
         if self.ack_timeout.is_zero() {
             return Err(SenderOptionsError::ZeroAckTimeout);
         }
@@ -1089,6 +1112,7 @@ struct SenderPeer {
     tx: mpsc::Sender<Vec<u8>>,
     budgeted: Option<BudgetedPeerTx>,
     queue_admission_timeout: Duration,
+    local_work_timeout: Duration,
     queue_failure_handler: Option<QueueFailureHandler>,
 }
 
@@ -1105,6 +1129,7 @@ impl SenderPeer {
             tx,
             budgeted,
             queue_admission_timeout: options.queue_admission_timeout,
+            local_work_timeout: options.local_work_timeout,
             queue_failure_handler: options.queue_failure_handler.clone(),
         }
     }
@@ -2109,7 +2134,7 @@ async fn sender_task(
                                 ReconcilePurpose::Routine | ReconcilePurpose::Drain { .. } => {
                                     let snapshot_is_current = match (
                                         round.snapshot_revision,
-                                        fragment_revision(fragment, &deps.router).await,
+                                        fragment_revision(fragment, &deps.router, runtime.local_work_timeout).await,
                                     ) {
                                         (Some(expected), Ok(current)) => expected == current,
                                         _ => false,
@@ -2264,7 +2289,7 @@ async fn sender_task(
 
                                     let snapshot_is_current = match (
                                         round.snapshot_revision,
-                                        fragment_revision(fragment, &deps.router).await,
+                                        fragment_revision(fragment, &deps.router, runtime.local_work_timeout).await,
                                     ) {
                                         (Some(expected), Ok(current)) => expected == current,
                                         _ => false,
@@ -2796,7 +2821,7 @@ async fn sender_task(
                             local_reconcile_flush_pending = true;
                         }
                         received_keys.extend(entries.iter().map(|entry| entry.key.clone()));
-                        if apply_reconcile_entries(fragment, &deps.router, entries)
+                        if apply_reconcile_entries(fragment, &deps.router, entries, runtime.local_work_timeout)
                             .await
                             .is_err()
                         {
@@ -3494,6 +3519,7 @@ async fn ensure_local_summary(
     fragment: FragmentId,
     router: &FragmentRouter,
     local: &mut ReconcileLocalCursor,
+    deadline: Instant,
 ) -> Result<(), ReconcileError> {
     while local.current.is_none() {
         if let Some(summary) = local.buffered.pop_front() {
@@ -3519,7 +3545,7 @@ async fn ensure_local_summary(
                     limit: RECONCILE_LOCAL_READ_CHUNK,
                     reply,
                 },
-                None,
+                Some(deadline.saturating_duration_since(Instant::now())),
             )
             .await
         {
@@ -3572,6 +3598,7 @@ async fn send_repair_keys(
     connection: &ActiveConnection,
     keys: Vec<String>,
     snapshot_time_ms: u64,
+    deadline: Instant,
 ) -> Result<(), ReconcileError> {
     let actor = router
         .route_for_fragment(fragment)
@@ -3598,7 +3625,7 @@ async fn send_repair_keys(
                     snapshot_time_ms: Some(snapshot_time_ms),
                     reply,
                 },
-                None,
+                Some(deadline.saturating_duration_since(Instant::now())),
             )
             .await
         {
@@ -3763,11 +3790,12 @@ async fn reconcile_summary_page(
     summaries: &[KeySummary],
     done: bool,
 ) -> Result<VecDeque<Vec<String>>, ReconcileError> {
+    let deadline = deadline_after(connection.peer_tx.local_work_timeout);
     let mut fetch_keys = Vec::new();
     let mut repair_keys = Vec::new();
     for remote in summaries {
         loop {
-            ensure_local_summary(fragment, router, &mut summary.local).await?;
+            ensure_local_summary(fragment, router, &mut summary.local, deadline).await?;
             match summary.local.current.as_ref() {
                 Some(local) if local.key < remote.key => {
                     let local = take_local_summary(&mut summary.local).expect("matched Some");
@@ -3784,6 +3812,7 @@ async fn reconcile_summary_page(
                             connection,
                             std::mem::take(&mut repair_keys),
                             snapshot_time_ms,
+                            deadline,
                         )
                         .await?;
                     }
@@ -3822,13 +3851,14 @@ async fn reconcile_summary_page(
             connection,
             std::mem::take(&mut repair_keys),
             snapshot_time_ms,
+            deadline,
         )
         .await?;
     }
 
     if done {
         loop {
-            ensure_local_summary(fragment, router, &mut summary.local).await?;
+            ensure_local_summary(fragment, router, &mut summary.local, deadline).await?;
             let Some(local) = take_local_summary(&mut summary.local) else {
                 break;
             };
@@ -3845,6 +3875,7 @@ async fn reconcile_summary_page(
                     connection,
                     std::mem::take(&mut repair_keys),
                     snapshot_time_ms,
+                    deadline,
                 )
                 .await?;
             }
@@ -3855,7 +3886,15 @@ async fn reconcile_summary_page(
                 .local
                 .snapshot_time_ms
                 .ok_or(ReconcileError::Local)?;
-            send_repair_keys(fragment, router, connection, repair_keys, snapshot_time_ms).await?;
+            send_repair_keys(
+                fragment,
+                router,
+                connection,
+                repair_keys,
+                snapshot_time_ms,
+                deadline,
+            )
+            .await?;
         }
     }
 
@@ -3866,7 +3905,9 @@ async fn apply_reconcile_entries(
     fragment: FragmentId,
     router: &FragmentRouter,
     entries: Vec<SyncEntry>,
+    timeout: Duration,
 ) -> Result<(), ReconcileError> {
+    let deadline = deadline_after(timeout);
     let actor = router
         .route_for_fragment(fragment)
         .ok_or(ReconcileError::Local)?;
@@ -3896,7 +3937,7 @@ async fn apply_reconcile_entries(
                     is_replication: true,
                     reply: Some(reply),
                 },
-                None,
+                Some(deadline.saturating_duration_since(Instant::now())),
             )
             .await
         {
@@ -3922,7 +3963,7 @@ async fn enter_reconcile_barrier(
     local_reconcile_flush_pending: &mut bool,
 ) -> Result<(), ReconcileError> {
     if *local_reconcile_flush_pending {
-        flush_reconcile(fragment, router).await?;
+        flush_reconcile(fragment, router, connection.peer_tx.local_work_timeout).await?;
         *local_reconcile_flush_pending = false;
     }
     let required_ack_durability = round
@@ -3939,12 +3980,13 @@ async fn enter_reconcile_barrier(
 async fn fragment_revision(
     fragment: FragmentId,
     router: &FragmentRouter,
+    timeout: Duration,
 ) -> Result<u64, ReconcileError> {
     let actor = router
         .route_for_fragment(fragment)
         .ok_or(ReconcileError::Local)?;
     match actor
-        .call(|reply| KvMessage::GetRevision { reply }, None)
+        .call(|reply| KvMessage::GetRevision { reply }, Some(timeout))
         .await
     {
         Ok(CallResult::Success(revision)) => Ok(revision),
@@ -3955,11 +3997,15 @@ async fn fragment_revision(
 async fn flush_reconcile(
     fragment: FragmentId,
     router: &FragmentRouter,
+    timeout: Duration,
 ) -> Result<(), ReconcileError> {
     let actor = router
         .route_for_fragment(fragment)
         .ok_or(ReconcileError::Local)?;
-    match actor.call(|reply| KvMessage::Flush { reply }, None).await {
+    match actor
+        .call(|reply| KvMessage::Flush { reply }, Some(timeout))
+        .await
+    {
         Ok(CallResult::Success(Ok(
             ApplyDurability::StableCommitted
             | ApplyDurability::StoreCommitted

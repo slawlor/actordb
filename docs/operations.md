@@ -377,3 +377,30 @@ Standalone callers should use `replication::spawn_bounded_sender`. Legacy
 `spawn_sender`/`spawn_sender_with_options` still return unbounded channels for
 compatibility: their consumed payloads are byte-bounded, but callers must
 externally bound the preceding legacy channel.
+
+## Storage execution and local deadlines
+
+Synchronous `KvStore` bind, load, write, stable-fence and lifecycle prefix-delete
+calls run on Tokio blocking threads behind the node's shared storage executor.
+`PersistenceConfig::storage_concurrency` defaults to four submitted jobs.
+Queued flushes retain their authoritative backlog charge while waiting for
+an execution slot. `Node::active_storage_jobs()` reports submitted work;
+`Node::persistence_retained_bytes()` reports the node-wide persistence charge.
+
+`NodeRuntimeOptions::local_work_timeout` and
+`SenderRuntimeOptions::local_work_timeout` default to 30 seconds. Local point
+read waiters and each local reconciliation phase use explicit deadlines,
+including summary/value reads, replicated applies, revisions and flushes.
+A timed-out reconciliation waiter retries its idempotent round; an accepted
+apply or flush may still finish in its actor or storage owner.
+
+A storage deadline bounds the waiter, not the backend operation: synchronous
+backend calls cannot be safely interrupted. Submitted flushes retain their
+immutable batch and fragment ordering guard until the actual call and stable
+fence finish. Caller cancellation does not release those guards or discard
+the authoritative retry batch. Explicit shutdown joins fragment work and drains
+submitted storage jobs before releasing the exclusive store binding. A backend
+that never returns can therefore prevent safe final teardown, while unrelated
+async tasks continue running. Cancellation/best-effort Drop retains the existing
+fail-closed store lease policy. Configure backend I/O limits for a finite storage
+completion bound; lower waiter limits do not create one.

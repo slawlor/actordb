@@ -200,6 +200,7 @@ impl SupervisorState {
         store: &Option<Arc<dyn KvStore>>,
         fragment: FragmentId,
         publisher: &Option<ExpiryPublisher>,
+        executor: &Arc<crate::store::executor::StorageExecutor>,
     ) -> Result<LoadedCache, ActorProcessingErr> {
         match store {
             Some(kvstore) => {
@@ -207,13 +208,13 @@ impl SupervisorState {
                 let mut expiry_updates = Vec::new();
                 let mut expirations = HashMap::new();
                 let mut high_water: Option<actordb_protocol::RecordVersion> = None;
+                let backend = kvstore.clone();
+                let loaded = executor
+                    .run(move || backend.load())
+                    .await
+                    .map_err(FragmentStartupStorageError::boxed)?;
                 let now = now_ms();
-                for (index, (k, v)) in kvstore
-                    .load()
-                    .map_err(FragmentStartupStorageError::boxed)?
-                    .into_iter()
-                    .enumerate()
-                {
+                for (index, (k, v)) in loaded.into_iter().enumerate() {
                     high_water = Some(
                         high_water
                             .map(|current| current.max(v.version()))
@@ -257,8 +258,10 @@ impl SupervisorState {
                 // serves reads or sync. Otherwise a crash could reload the
                 // live value and later resurrect an older replica's data.
                 if !expiry_updates.is_empty() {
-                    kvstore
-                        .write_batch(&expiry_updates)
+                    let backend = kvstore.clone();
+                    executor
+                        .run(move || backend.write_batch(&expiry_updates))
+                        .await
                         .map_err(FragmentStartupStorageError::boxed)?;
                 }
                 let mut expirations: Vec<_> = expirations.into_values().collect();
@@ -422,8 +425,13 @@ impl FragmentSupervisor {
         args: SupervisorArgs,
         children: &mut SupervisorStartupChildren,
     ) -> Result<SupervisorState, ActorProcessingErr> {
-        let loaded =
-            SupervisorState::load_cache(&args.store, args.fragment, &args.expiry_publisher).await?;
+        let loaded = SupervisorState::load_cache(
+            &args.store,
+            args.fragment,
+            &args.expiry_publisher,
+            &args.persistence.executor(),
+        )
+        .await?;
         if let Some(timestamp_ms) = loaded.high_water {
             args.hlc
                 .lock()

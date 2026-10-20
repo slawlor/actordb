@@ -52,11 +52,12 @@ pub struct FragmentState {
     revision: AtomicU64,
     query_incarnation: u64,
     /// Buffered writes awaiting flush.
-    flush: Mutex<FlushBuffer>,
+    flush: Arc<Mutex<FlushBuffer>>,
+    executor: Arc<crate::store::executor::StorageExecutor>,
     /// Allows exactly one store write at a time for this fragment. The
     /// buffered batch remains recorded while the write is in progress, so a
     /// cancelled or failed flush can be retried without losing it.
-    flush_in_progress: Mutex<()>,
+    flush_in_progress: Arc<Mutex<()>>,
     flush_batch_size: usize,
     flush_interval: Duration,
     expiry_publisher: Option<(FragmentId, ExpiryPublisher)>,
@@ -194,7 +195,7 @@ impl FragmentState {
             kvstore,
             revision: AtomicU64::new(0),
             query_incarnation: NEXT_QUERY_INCARNATION.fetch_add(1, Ordering::Relaxed),
-            flush: Mutex::new(FlushBuffer {
+            flush: Arc::new(Mutex::new(FlushBuffer {
                 pending: HashMap::new(),
                 in_flight: None,
                 local_budget: ByteBudget::new(PersistenceConfig::default().max_bytes()),
@@ -202,8 +203,9 @@ impl FragmentState {
                 max_records: PersistenceConfig::default().max_records(),
                 last_flush: Instant::now(),
                 failed: false,
-            }),
-            flush_in_progress: Mutex::new(()),
+            })),
+            executor: crate::store::executor::StorageExecutor::new(4),
+            flush_in_progress: Arc::new(Mutex::new(())),
             flush_batch_size,
             flush_interval,
             expiry_publisher: None,
@@ -213,10 +215,13 @@ impl FragmentState {
     /// Configure retained persistence admission before sharing this state.
     /// Rejections return [`ApplyError::Backpressure`] before cache mutation.
     pub fn with_persistence_config(mut self, config: PersistenceConfig) -> Self {
-        let flush = self.flush.get_mut();
+        let flush = Arc::get_mut(&mut self.flush)
+            .expect("state is not shared during configuration")
+            .get_mut();
         flush.local_budget = ByteBudget::new(config.max_bytes());
         flush.max_records = config.max_records();
-        flush.aggregate_budget = config.aggregate;
+        flush.aggregate_budget = config.aggregate();
+        self.executor = config.executor();
         self
     }
 
@@ -419,64 +424,88 @@ impl FragmentState {
     /// it. Writes that arrive during the store call remain pending for the
     /// next flush.
     pub async fn flush(&self) -> Result<(), ActorProcessingErr> {
-        let _single_flight = self.flush_in_progress.lock().await;
-        let batch = {
-            let mut flush = self.flush.lock().await;
-            match flush.begin_batch() {
-                Some(batch) => batch,
-                None => return Ok(()),
-            }
-        };
-
-        let result = self.write_batch(&batch);
-        drop(batch);
-        let mut flush = self.flush.lock().await;
-        if result.is_ok() {
-            flush.commit_batch();
-        } else {
-            flush.restore_batch();
-            flush.failed = true;
-            tracing::warn!(
-                records = flush.record_count(),
-                retained_bytes = flush.local_budget.used(),
-                "retaining coalesced persistence winners after failed flush"
-            );
-        }
-        result
+        self.flush_owned(false).await.map(|_| ())
     }
 
-    /// Flush the fragment's ordered persistence buffer, then ask the backend
-    /// for its strongest explicit stable-storage fence.
-    ///
-    /// Storeless fragments remain memory-only. A backend which reports a
-    /// buffered fence preserves the ordinary [`ApplyDurability::StoreCommitted`]
-    /// result; only an explicit stable fence yields
-    /// [`ApplyDurability::StableCommitted`].
+    /// Flush and complete the backend's strongest stable-storage fence under
+    /// the same ordering guard. The accepted operation remains owned when its
+    /// waiter is canceled; safe teardown still waits for backend completion.
     pub async fn flush_stable(&self) -> Result<ApplyDurability, ActorProcessingErr> {
-        self.flush().await?;
-        let Some(kvstore) = &self.kvstore else {
+        self.flush_owned(true).await
+    }
+
+    async fn flush_owned(&self, stable: bool) -> Result<ApplyDurability, ActorProcessingErr> {
+        let guard = self.flush_in_progress.clone().lock_owned().await;
+        let Some(kvstore) = self.kvstore.clone() else {
             return Ok(ApplyDurability::MemoryApplied);
         };
-        kvstore
-            .stable_fence()
-            .map(|durability| match durability {
-                StoreCommitDurability::Buffered => ApplyDurability::StoreCommitted,
-                StoreCommitDurability::Stable => ApplyDurability::StableCommitted,
-            })
-            .map_err(|error| ActorProcessingErr::from(error.to_string()))
-    }
-
-    fn write_batch(&self, batch: &HashMap<String, PendingWrite>) -> Result<(), ActorProcessingErr> {
-        if let Some(kvstore) = &self.kvstore {
-            let encoded: Vec<_> = batch
-                .iter()
-                .map(|(key, write)| (key.as_bytes().to_vec(), write.value.clone()))
-                .collect();
-            kvstore
-                .write_batch(&encoded)
-                .map_err(|e| ActorProcessingErr::from(e.to_string()))?;
+        let batch = self.flush.lock().await.begin_batch();
+        if batch.is_none() && !stable {
+            return Ok(ApplyDurability::StoreCommitted);
         }
-        Ok(())
+        let flush = self.flush.clone();
+        let executor = self.executor.clone();
+        let (reply, completion) = tokio::sync::oneshot::channel();
+        // Registration is synchronous after taking the authoritative batch.
+        // This owner has no external abort handle. The ordering guard is
+        // captured by the blocking call itself, including runtime teardown.
+        drop(tokio::spawn(async move {
+            let completed = executor
+                .run(move || {
+                    let result = (|| {
+                        if let Some(batch) = &batch {
+                            let encoded: Vec<_> = batch
+                                .iter()
+                                .map(|(key, write)| (key.as_bytes().to_vec(), write.value.clone()))
+                                .collect();
+                            kvstore.write_batch(&encoded)?;
+                        }
+                        if stable {
+                            Ok(match kvstore.stable_fence()? {
+                                StoreCommitDurability::Buffered => ApplyDurability::StoreCommitted,
+                                StoreCommitDurability::Stable => ApplyDurability::StableCommitted,
+                            })
+                        } else {
+                            Ok(ApplyDurability::StoreCommitted)
+                        }
+                    })();
+                    drop(batch);
+                    Ok((result, guard))
+                })
+                .await;
+            let result = match completed {
+                Ok((result, _ordering_guard)) => {
+                    let mut flush = flush.lock().await;
+                    if result.is_ok() {
+                        flush.commit_batch();
+                    } else {
+                        flush.restore_batch();
+                        flush.failed = true;
+                        tracing::warn!(
+                            records = flush.record_count(),
+                            retained_bytes = flush.local_budget.used(),
+                            "retaining persistence winners after storage failure"
+                        );
+                    }
+                    result
+                }
+                Err(error) => {
+                    // Panic/completion failure still ends the synchronous job;
+                    // keep the authoritative batch retryable under its lock.
+                    let mut flush = flush.lock().await;
+                    flush.restore_batch();
+                    flush.failed = true;
+                    Err(error)
+                }
+            };
+            let _ = reply.send(result);
+        }));
+        completion
+            .await
+            .map_err(|error| {
+                ActorProcessingErr::from(format!("storage completion owner stopped: {error}"))
+            })?
+            .map_err(|error| ActorProcessingErr::from(error.to_string()))
     }
 
     /// Read a key, treating expired values and tombstones as absent.
@@ -1705,6 +1734,60 @@ mod flush_tests {
         }
     }
 
+    #[tokio::test]
+    async fn blocked_storage_keeps_current_thread_live_and_cancelled_flush_ordered() {
+        let store = Arc::new(GatedStore {
+            calls: AtomicUsize::new(0),
+            release_first: (StdMutex::new(false), Condvar::new()),
+            stored: StdMutex::new(HashMap::new()),
+        });
+        let config = PersistenceConfig::builder().storage_concurrency(1).build();
+        let state = Arc::new(
+            FragmentState::new(
+                HashMap::new(),
+                Some(store.clone()),
+                100,
+                Duration::from_secs(3600),
+            )
+            .with_persistence_config(config.clone()),
+        );
+        let old = VersionedValue::new(vec![1], 100, "node".into());
+        let winner = VersionedValue::new(vec![2], 200, "node".into());
+        state.apply(&op("key", old)).await.unwrap();
+        let first_state = state.clone();
+        let waiter = tokio::spawn(async move { first_state.flush().await });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while store.calls.load(AtomicOrdering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        waiter.abort();
+        let _ = waiter.await;
+        assert_eq!(config.active_storage_jobs(), 1);
+        // This coroutine runs on the same current-thread runtime while the
+        // synchronous store call is blocked on a separate executor thread.
+        state.apply(&op("key", winner.clone())).await.unwrap();
+        let next_state = state.clone();
+        let next = tokio::spawn(async move { next_state.flush_stable().await });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(store.calls.load(AtomicOrdering::SeqCst), 1);
+        assert!(!next.is_finished());
+        store.release_first();
+        tokio::time::timeout(Duration::from_secs(2), next)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.persistence_backlog().await, (0, 0));
+        assert_eq!(
+            store.stored.lock().unwrap().get(b"key".as_slice()),
+            Some(&winner)
+        );
+        assert_eq!(config.active_storage_jobs(), 0);
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn overlapping_flushes_are_serialized_and_preserve_latest_version() {
         let store = Arc::new(GatedStore {
@@ -2247,9 +2330,10 @@ mod tests {
             value.expiry_tombstone()
         );
         assert_eq!(state.revision.load(Ordering::Acquire), 1);
-        assert!(state.flush.lock().await.in_flight.is_some());
+        assert!(state.flush.lock().await.pending.contains_key("key"));
         let winner = VersionedValue::new(vec![2], 11, "writer".into());
         state.apply(&test_op("key", winner.clone())).await.unwrap();
+        state.flush().await.unwrap();
         assert_eq!(
             store.written.lock().unwrap().as_slice(),
             &[(b"key".to_vec(), winner)]

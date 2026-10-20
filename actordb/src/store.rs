@@ -88,6 +88,7 @@ use std::fmt;
 
 use crate::actor::VersionedValue;
 
+pub(crate) mod executor;
 #[cfg(feature = "memory")]
 pub mod memory;
 pub mod prefixed;
@@ -116,8 +117,17 @@ pub struct PersistenceConfig {
     /// Maximum charged retained bytes across this node's fragments.
     #[builder(default = 256 * 1024 * 1024)]
     node_max_bytes: usize,
-    #[builder(skip = crate::retained::ByteBudget::new(256 * 1024 * 1024))]
-    pub(crate) aggregate: std::sync::Arc<crate::retained::ByteBudget>,
+
+    /// Maximum concurrent synchronous storage jobs across the node.
+    #[builder(default = 4)]
+    storage_concurrency: usize,
+    #[builder(skip = std::sync::Arc::new(std::sync::OnceLock::new()))]
+    resources: std::sync::Arc<std::sync::OnceLock<PersistenceResources>>,
+}
+#[derive(Debug)]
+struct PersistenceResources {
+    aggregate: std::sync::Arc<crate::retained::ByteBudget>,
+    executor: std::sync::Arc<executor::StorageExecutor>,
 }
 impl Default for PersistenceConfig {
     fn default() -> Self {
@@ -125,6 +135,26 @@ impl Default for PersistenceConfig {
     }
 }
 impl PersistenceConfig {
+    fn resources(&self) -> &PersistenceResources {
+        self.resources.get_or_init(|| PersistenceResources {
+            aggregate: crate::retained::ByteBudget::new(self.node_max_bytes),
+            executor: executor::StorageExecutor::new(self.storage_concurrency),
+        })
+    }
+    pub(crate) fn aggregate(&self) -> std::sync::Arc<crate::retained::ByteBudget> {
+        self.resources().aggregate.clone()
+    }
+    pub(crate) fn executor(&self) -> std::sync::Arc<executor::StorageExecutor> {
+        self.resources().executor.clone()
+    }
+
+    pub fn storage_concurrency(&self) -> usize {
+        self.storage_concurrency
+    }
+    /// Submitted storage jobs still owning backend execution slots.
+    pub fn active_storage_jobs(&self) -> usize {
+        self.resources().executor.active()
+    }
     pub fn max_records(&self) -> usize {
         self.max_records
     }
@@ -136,14 +166,17 @@ impl PersistenceConfig {
     }
     /// Current charged bytes for this runtime's persistence work.
     pub fn retained_bytes(&self) -> usize {
-        self.aggregate.used()
+        self.resources().aggregate.used()
     }
     pub(crate) fn for_runtime(&self) -> Result<Self, String> {
+        if self.storage_concurrency == 0 || self.storage_concurrency > u32::MAX as usize {
+            return Err("storage concurrency must fit a positive u32".into());
+        }
         if self.max_records == 0 || self.max_bytes == 0 || self.node_max_bytes == 0 {
             return Err("persistence admission limits must be nonzero".to_string());
         }
         let mut runtime = self.clone();
-        runtime.aggregate = crate::retained::ByteBudget::new(self.node_max_bytes);
+        runtime.resources = std::sync::Arc::new(std::sync::OnceLock::new());
         Ok(runtime)
     }
 }
