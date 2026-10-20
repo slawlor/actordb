@@ -3446,7 +3446,15 @@ mod apply_expiry_contention_tests {
                     state.get_versioned("ttl", None).await,
                     Some(value.expiry_tombstone())
                 );
-                assert!(state.cache.read().await.values["ttl"].is_tombstone);
+                {
+                    let cache = state.cache.read().await;
+                    assert!(cache.values["ttl"].is_tombstone);
+                    assert!(cache.expiry_deadlines.is_empty());
+                    assert_eq!(
+                        cache.content_digests["ttl"].live,
+                        value.expiry_tombstone().content_digest()
+                    );
+                }
                 assert_eq!(state.expire_values(now_ms()).await.unwrap(), 0);
                 if durable {
                     state.flush().await.unwrap();
@@ -3456,6 +3464,55 @@ mod apply_expiry_contention_tests {
                     );
                 }
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn conflicting_ttl_crossing_cache_wait_leaves_cache_index_and_backlog_unchanged() {
+        for durable in [false, true] {
+            let store = Arc::new(FlakyStore {
+                failures_left: StdMutex::new(0),
+                written: StdMutex::new(Vec::new()),
+            });
+            let mut original = VersionedValue::new(b"original".to_vec(), now_ms(), "n1".into());
+            let deadline = now_ms() + 30;
+            original.expires_at_ms = Some(deadline);
+            let state = FragmentState::new(
+                HashMap::from([("ttl".into(), original.clone())]),
+                durable.then(|| store.clone() as Arc<dyn KvStore>),
+                usize::MAX,
+                Duration::from_secs(3600),
+            );
+            let cache_guard = state.cache.write().await;
+            let mut conflicting = original.clone();
+            conflicting.value = b"conflicting".to_vec();
+            let op = ReplicatedOp {
+                key: "ttl".into(),
+                value: conflicting,
+                seq: 0,
+                boot_id: 0,
+            };
+            let apply = state.apply(&op);
+            tokio::pin!(apply);
+            assert!(futures::poll!(&mut apply).is_pending());
+            while now_ms() < deadline {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+            drop(cache_guard);
+            assert!(matches!(
+                apply.await,
+                Err(ApplyError::VersionConflict { .. })
+            ));
+            assert_eq!(state.persistence_backlog().await, (0, 0));
+            let cache = state.cache.read().await;
+            assert_eq!(cache.values["ttl"], original);
+            assert_eq!(cache.content_digests["ttl"].live, original.content_digest());
+            assert_eq!(cache.expiry_deadlines.len(), 1);
+            assert!(cache
+                .expiry_deadlines
+                .contains(&(deadline, "ttl".to_owned())));
+            assert_eq!(state.revision.load(Ordering::Acquire), 0);
+            assert!(store.written.lock().unwrap().is_empty());
         }
     }
 }
@@ -3498,6 +3555,7 @@ mod expiry_index_tests {
         });
         let mut due = VersionedValue::new(vec![1], 1, "n".into());
         due.expires_at_ms = Some(100);
+        let initial_digest = due.content_digest();
         let state = FragmentState::new(
             HashMap::from([("due".into(), due)]),
             Some(store),
@@ -3516,8 +3574,17 @@ mod expiry_index_tests {
         assert!(state.expire_values(100).await.is_err());
         assert_eq!(state.cache.read().await.expiry_deadlines.len(), 1);
         assert!(!state.cache.read().await.values["due"].is_tombstone);
+        assert_eq!(
+            state.cache.read().await.content_digests["due"].live,
+            initial_digest
+        );
         assert_eq!(state.expire_values(100).await.unwrap(), 1);
         assert!(state.cache.read().await.expiry_deadlines.is_empty());
         assert!(state.cache.read().await.values["due"].is_tombstone);
+        let cache = state.cache.read().await;
+        assert_eq!(
+            cache.content_digests["due"].live,
+            cache.values["due"].content_digest()
+        );
     }
 }
