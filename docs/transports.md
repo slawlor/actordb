@@ -1,9 +1,9 @@
 # Custom transports and TLS
 
 ActorDB accepts caller-supplied async byte streams for both peer connections and
-application connections. Plain TCP remains the default. TLS libraries are only
-development dependencies for the example and tests; applications choose their
-own TLS library, certificates, trust roots, and validation policy.
+application connections. Plain TCP remains the default. Enable the optional
+`actordb/tls` feature to use the built-in rustls `TlsNetwork`, or implement
+`Network` with another TLS library or transport policy.
 
 The application extension points are available in `0.6.0`. Update the database,
 protocol, query, and SDK dependency requirements to the `0.6` series together.
@@ -25,6 +25,34 @@ A stream implements `AsyncRead + AsyncWrite + Send + Unpin + 'static`.
 `PeerStream` is blanket-implemented, so TLS streams do not require a separate
 implementation. Framing, ActorDB handshakes, gossip, replication, and Node-owned
 reconnects continue to run above the transport.
+
+### Built-in rustls transport
+
+The optional `actordb/tls` feature provides `actordb::network::TlsNetwork`.
+It accepts caller-owned rustls `ServerConfig` and `ClientConfig` values, an
+outbound `ServerName`, and a nonzero handshake timeout:
+
+```rust,ignore
+use actordb::network::TlsNetwork;
+use tokio_rustls::rustls::pki_types::ServerName;
+
+let network = TlsNetwork::new(
+    server_config,
+    client_config,
+    ServerName::try_from("db.example.test")?,
+    std::time::Duration::from_secs(5),
+)?;
+let config = actordb::node::NodeConfig::builder()
+    .network(std::sync::Arc::new(network))
+    .build();
+```
+
+Certificate roots, client authentication, protocol versions, and cipher policy
+remain under the supplied rustls configurations. Inbound handshakes are lazy
+per accepted stream, so one stalled client does not block the listener; the
+configured timeout still bounds each handshake. A single `TlsNetwork` uses one
+outbound server name for all destinations. Deployments that need a different
+name per address can implement `Network` and select names in their adapter.
 
 ## Application listener
 

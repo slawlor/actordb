@@ -83,7 +83,7 @@ below before using the default plain-TCP transport in production.
 | Field | Type | Default | Guidance |
 |---|---|---|---|
 | `store` | `Option<Arc<dyn KvStore>>` | `None` | `None` = purely in-memory node using its fragment cache, with no backend feature required. Set to a base `RocksDbStore` (`rocksdb` feature) or custom store; Node applies the per-fragment `PrefixedStore` views itself. The opt-in `MemoryStore` is a no-op test double, not persistence. |
-| `network` | `Arc<dyn Network>` | `TcpNetwork` | Plain TCP. Implement `Network` for TLS or custom transports; see the [transport guide](transports.md). |
+| `network` | `Arc<dyn Network>` | `TcpNetwork` | Plain TCP. Enable `actordb/tls` for the built-in rustls `TlsNetwork`, or implement `Network` for another TLS/custom transport; see the [transport guide](transports.md). |
 | `ttl_expiry_handler` | `Option<Arc<dyn TtlExpiryHandler>>` | `None` | Caller-owned local TTL batch handler, outside mutation workers. Disabled registration retains no callback payloads. See [TTL expiry callbacks](ttl-expiry-callbacks.md). |
 | `ttl_expiry_options` | `TtlExpiryOptions` | 1024 events, 8 MiB, batches of 64, 20 ms delay, 5 s handler/drain deadlines | Bounds include staged and in-flight events. Saturation drops notifications without stopping cleanup. Validated only when a handler is registered. |
 | `flush_batch_size` | `usize` | `1000` | Ops buffered before a store flush. Ignored when `store` is `None`. Larger = fewer, bigger RocksDB write batches. |

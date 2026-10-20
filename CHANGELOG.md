@@ -2,6 +2,8 @@
 
 ## 0.7.0
 
+- Add an optional `actordb/tls` rustls transport with caller-supplied client/server certificate policies, server-name validation, and bounded per-connection handshakes. Plain TCP and custom `Network` implementations remain available.
+
 - Use physical/logical record versions to prevent high throughput from creating
   future clock skew and blocking replication or immediate restart. Peer protocol
   v4 and application protocol v2 carry the logical counter; upgrade participants
