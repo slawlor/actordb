@@ -183,7 +183,9 @@ impl Node {
                 let _retention = retention;
                 let _operation = operation;
                 let result = async {
-                    let outcome = call_apply(&actor, op.clone(), priority, false).await?;
+                    let outcome = call_apply(&actor, op.clone(), priority, false)
+                        .await
+                        .map_err(owned_apply_error)?;
                     match outcome {
                         ApplyOutcome::Applied | ApplyOutcome::AlreadyPresent => {}
                         ApplyOutcome::Superseded {
@@ -352,6 +354,24 @@ impl Node {
     }
 }
 
+/// Once completion ownership is accepted, an actor/transport failure can lose
+/// a reply after apply. Preserve that ambiguity for embedded callers as well.
+fn owned_apply_error(error: NodeError) -> WriteConcernError {
+    if matches!(
+        &error,
+        NodeError::Actor(_)
+            | NodeError::Io(_)
+            | NodeError::Network(_)
+            | NodeError::UnknownOutcome(_)
+    ) {
+        WriteConcernError::UnknownOutcome(format!(
+            "accepted local mutation may have applied: {error}"
+        ))
+    } else {
+        error.into()
+    }
+}
+
 fn resolve_concern_attempt(
     outcome: Result<WriteConcernReceipt, WriteConcernError>,
     ambiguous_attempt: bool,
@@ -395,6 +415,18 @@ fn decode_forwarded_concern(
 mod tests {
     use super::*;
     use crate::write_concern::WriteConcernOutcome;
+
+    #[test]
+    fn accepted_local_reply_loss_is_unknown_and_admission_rejection_remains_definite() {
+        assert!(matches!(
+            owned_apply_error(NodeError::Actor("reply channel dropped".into())),
+            WriteConcernError::UnknownOutcome(_)
+        ));
+        assert!(matches!(
+            owned_apply_error(NodeError::Backpressure("not admitted".into())),
+            WriteConcernError::Operation(NodeError::Backpressure(_))
+        ));
+    }
 
     #[test]
     fn forwarded_receipt_requires_local_application_status() {
