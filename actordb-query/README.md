@@ -1,5 +1,9 @@
 # actordb-query
 
+<p align="center">
+  <img src="https://raw.githubusercontent.com/slawlor/actordb/main/docs/assets/actordb-logo-draft.svg" alt="ActorDB distributed Ferris graph" width="360">
+</p>
+
 Portable query plans, a bounded SQL subset, and exact integer reduction for
 [actordb](https://github.com/slawlor/actordb). This crate has no runtime or
 storage dependencies. Database and client crates execute the plans.

@@ -5,6 +5,7 @@ edition = "2021"
 rust-version = "1.88"
 license = "MIT"
 description = "Language-neutral peer and application wire contracts for ActorDB"
+readme = "README.md"
 
 [features]
 codegen = ["dep:prost-build", "dep:protobuf-src"]

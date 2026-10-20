@@ -1,5 +1,9 @@
 # ActorDB Rust client
 
+<p align="center">
+  <img src="https://raw.githubusercontent.com/slawlor/actordb/main/docs/assets/actordb-logo-draft.svg" alt="ActorDB distributed Ferris graph" width="360">
+</p>
+
 Connect to the **application listener**, using `Client::connect(address,
 ClientOptions::default())`. A server explicitly binds
 `actordb::client_server::ClientServer` around an existing `Arc<Node>`.

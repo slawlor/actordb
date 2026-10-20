@@ -1,5 +1,9 @@
 # ActorDB protocol
 
+<p align="center">
+  <img src="https://raw.githubusercontent.com/slawlor/actordb/main/docs/assets/actordb-logo-draft.svg" alt="ActorDB distributed Ferris graph" width="360">
+</p>
+
 `proto/meta.proto` is the canonical peer schema, preserving all existing message
 numbers and `actordb::proto` reexports. Peer protocol v3 remains separate from
 `proto/client.proto`, application protocol v1. Rust bindings are committed so
