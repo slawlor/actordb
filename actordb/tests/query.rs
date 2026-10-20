@@ -278,11 +278,10 @@ async fn query_budgets_and_bad_numeric_values_fail_explicitly() {
 async fn selected_key_ranges_charge_only_selected_index_work() {
     let node = start(
         "query-seek",
-        NodeConfig {
-            fragment_count: 1,
-            store: Some(loaded_store(10_000, 1)),
-            ..NodeConfig::default()
-        },
+        NodeConfig::builder()
+            .fragment_count(1)
+            .store(loaded_store(10_000, 1))
+            .build(),
     )
     .await;
     for (sql, expected) in [
@@ -363,11 +362,10 @@ async fn selected_key_ranges_charge_only_selected_index_work() {
 async fn many_fragment_heads_merge_in_global_key_order() {
     let node = start(
         "query-heap",
-        NodeConfig {
-            fragment_count: 32,
-            store: Some(loaded_store(200, 32)),
-            ..Default::default()
-        },
+        NodeConfig::builder()
+            .fragment_count(32)
+            .store(loaded_store(200, 32))
+            .build(),
     )
     .await;
     let result = node

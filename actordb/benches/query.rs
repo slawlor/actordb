@@ -45,11 +45,10 @@ fn bench_query(c: &mut Criterion) {
             .block_on(Node::start(
                 format!("query-bench-{fragments}"),
                 "127.0.0.1:0".parse().unwrap(),
-                NodeConfig {
-                    fragment_count: fragments,
-                    store: Some(Arc::new(FixtureStore(values))),
-                    ..Default::default()
-                },
+                NodeConfig::builder()
+                    .fragment_count(fragments)
+                    .store(Arc::new(FixtureStore(values)))
+                    .build(),
             ))
             .unwrap();
         for (label, sql) in [
