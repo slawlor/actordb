@@ -4213,6 +4213,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn public_bounded_sender_charges_wide_ingress_before_task_selection() {
+        let mut wide = op("wide");
+        wide.value.value = vec![7; 1024 * 1024];
+        let charge = retained_borrowed_op_bytes(&wide);
+        let sender = spawn_bounded_sender(
+            FragmentId(0),
+            "peer".into(),
+            SenderConfig {
+                retained_byte_capacity: charge,
+                buffer_capacity: 100,
+                ..Default::default()
+            },
+            SenderDeps {
+                router: FragmentRouter::new(1, 0),
+                hlc: Arc::new(Mutex::new(HlcClock::new())),
+                reset_senders: Arc::new(Mutex::new(HashMap::new())),
+                state_report: state_report(),
+            },
+            SenderRuntimeOptions::default(),
+        )
+        .unwrap();
+        // No await occurs before these assertions on a current-thread
+        // runtime, so the receiver has not selected either queued mutation.
+        sender.send(SenderMsg::Enqueue(wide.clone())).unwrap();
+        assert_eq!(sender.retained_bytes(), charge);
+        assert_eq!(sender.inner.data_tx.capacity(), 99);
+        sender.send(SenderMsg::Enqueue(wide)).unwrap();
+        assert_eq!(sender.retained_bytes(), charge);
+        assert_eq!(sender.inner.data_tx.capacity(), 99);
+        assert_eq!(sender.inner.signals_tx.borrow().overflow_generation, 1);
+        assert_eq!(sender.inner.ingress.pending_data.load(Ordering::Acquire), 1);
+        sender.stop().await;
+        assert_eq!(sender.retained_bytes(), 0);
+    }
+
+    #[tokio::test]
     async fn retained_bytes_reset_before_count_saturation_and_release_on_stop() {
         let mut wide = op("wide");
         wide.value.value = vec![7; 128 * 1024];
