@@ -10,10 +10,19 @@ pub mod client {
     include!("generated/client.rs");
 }
 
+mod version;
 /// Per-write acknowledgement policy and progress receipts.
 pub mod write_concern;
+pub use version::RecordVersion;
 
-pub const CLIENT_PROTOCOL_VERSION: u32 = 1;
+impl client::Value {
+    /// Physical/logical timestamp; compare writer identity after this pair.
+    pub fn version(&self) -> RecordVersion {
+        RecordVersion::new(self.timestamp_ms, self.logical_counter)
+    }
+}
+
+pub const CLIENT_PROTOCOL_VERSION: u32 = 2;
 pub const CLIENT_CAPABILITY_QUERY: u64 = 1;
 pub const CLIENT_CAPABILITY_SCAN: u64 = 2;
 pub const CLIENT_CAPABILITY_WRITE_CONCERNS: u64 = 4;

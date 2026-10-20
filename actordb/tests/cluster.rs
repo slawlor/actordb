@@ -477,6 +477,7 @@ fn batch_put_response(
                 status: *status as i32,
                 error: String::new(),
                 winner_timestamp_ms: 0,
+                winner_logical_counter: 0,
                 winner_node_id: String::new(),
                 winner_is_tombstone: false,
                 request_index: request_index as u32,
@@ -568,6 +569,7 @@ async fn recv_reconcile_repairs_and_barrier(
                 summaries.extend(batch.ops.into_iter().map(|op| actordb::proto::KeySummary {
                     key: op.key,
                     timestamp_ms: op.timestamp_ms,
+                    logical_counter: op.logical_counter,
                     node_id: op.node_id,
                     is_tombstone: op.is_tombstone,
                 }));
@@ -1262,6 +1264,7 @@ async fn drain_ignores_stale_old_session_ack_after_rotation() {
         .map(|op| KeySummary {
             key: op.key.clone(),
             timestamp_ms: op.timestamp_ms,
+            logical_counter: op.logical_counter,
             node_id: op.node_id.clone(),
             is_tombstone: op.is_tombstone,
         })
@@ -3235,6 +3238,7 @@ async fn failed_immediate_reconciliation_is_not_counted_and_retries() {
     let summary = KeySummary {
         key: "failed-reconcile".to_string(),
         timestamp_ms: now_ms(),
+        logical_counter: 0,
         node_id: "raw-sync-source".to_string(),
         is_tombstone: false,
     };
@@ -3262,6 +3266,7 @@ async fn failed_immediate_reconciliation_is_not_counted_and_retries() {
                     key: summary.key,
                     value: b"value".to_vec(),
                     timestamp_ms: summary.timestamp_ms,
+                    logical_counter: summary.logical_counter,
                     node_id: "raw-sync-source".to_string(),
                     expires_at_ms: 0,
                     is_tombstone: false,
@@ -4030,21 +4035,25 @@ async fn persisted_version_seeds_clock_before_first_write() {
     let persisted_timestamp = now_ms() + 60_000;
     store.insert_fragment_zero(
         "key",
-        VersionedValue::new(
+        VersionedValue::new_version(
             b"persisted".to_vec(),
-            persisted_timestamp,
+            actordb::actor::RecordVersion::new(persisted_timestamp, 1_000_000),
             "previous-boot".to_string(),
         ),
     );
     let config = NodeConfig {
-        store: Some(store),
+        store: Some(store.clone()),
         flush_batch_size: 1,
         ..NodeConfig::default()
     };
 
-    let node = Node::start("node".to_string(), "127.0.0.1:0".parse().unwrap(), config)
-        .await
-        .expect("node failed to start from an in-policy durable timestamp");
+    let node = Node::start(
+        "node".to_string(),
+        "127.0.0.1:0".parse().unwrap(),
+        config.clone(),
+    )
+    .await
+    .expect("node failed to start from an in-policy durable timestamp");
     node.put("key".to_string(), b"new".to_vec())
         .await
         .expect("first post-restart write was not applied");
@@ -4055,8 +4064,22 @@ async fn persisted_version_seeds_clock_before_first_write() {
         .unwrap()
         .expect("key missing");
     assert_eq!(current.value, b"new");
-    assert!(current.timestamp_ms > persisted_timestamp);
+    assert_eq!(
+        current.version(),
+        actordb::actor::RecordVersion::new(persisted_timestamp, 1_000_001)
+    );
     node.shutdown().await.unwrap();
+    let restarted = Node::start("node".into(), "127.0.0.1:0".parse().unwrap(), config)
+        .await
+        .unwrap();
+    restarted
+        .put("key".into(), b"after-restart".to_vec())
+        .await
+        .unwrap();
+    let next = restarted.get("key".into()).await.unwrap().unwrap();
+    assert!(next.version() > current.version());
+    assert_eq!(next.timestamp_ms, persisted_timestamp);
+    restarted.shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -4934,6 +4957,7 @@ async fn stale_reconcile_round_cannot_complete_live_reset() {
                     // A stale frame must be discarded before HLC validation;
                     // this value would close the connection if observed.
                     timestamp_ms: u64::MAX,
+                    logical_counter: 0,
                     node_id: "raw-reset-peer".to_string(),
                     is_tombstone: false,
                 }];
@@ -5126,6 +5150,7 @@ async fn placement_bootstrap_fetch_requires_verification_round() {
     let summary = KeySummary {
         key: "bootstrap-fetched".to_string(),
         timestamp_ms: now_ms(),
+        logical_counter: 0,
         node_id: "raw-bootstrap-source".to_string(),
         is_tombstone: false,
     };
@@ -5154,6 +5179,7 @@ async fn placement_bootstrap_fetch_requires_verification_round() {
                     key: summary.key.clone(),
                     value: b"fetched".to_vec(),
                     timestamp_ms: summary.timestamp_ms,
+                    logical_counter: summary.logical_counter,
                     node_id: summary.node_id.clone(),
                     expires_at_ms: 0,
                     is_tombstone: false,
@@ -5433,6 +5459,7 @@ async fn inbound_mutation_after_snapshot_invalidates_reset_completion() {
                     key: "inbound-race".to_string(),
                     value: b"new".to_vec(),
                     timestamp_ms: now_ms(),
+                    logical_counter: 0,
                     node_id: "raw-revision-peer".to_string(),
                     seq: 1,
                     boot_id: 1,
@@ -5536,6 +5563,7 @@ async fn malformed_reconcile_data_is_rejected_without_partial_apply() {
     let summary = KeySummary {
         key: "remote-fetch".to_string(),
         timestamp_ms: remote_timestamp,
+        logical_counter: 0,
         node_id: "raw-data-peer".to_string(),
         is_tombstone: false,
     };
@@ -5607,6 +5635,7 @@ async fn malformed_reconcile_data_is_rejected_without_partial_apply() {
                     // observation, so it cannot poison or tear down the live
                     // connection with an otherwise invalid timestamp.
                     timestamp_ms: u64::MAX,
+                    logical_counter: 0,
                     node_id: "raw-data-peer".to_string(),
                     expires_at_ms: 0,
                     is_tombstone: false,
@@ -5666,6 +5695,7 @@ async fn stale_session_batches_discarded() {
                     key: "evil".to_string(),
                     value: b"bad".to_vec(),
                     timestamp_ms: u64::MAX, // would win any LWW...
+                    logical_counter: 0,
                     node_id: "raw-stale-peer".to_string(),
                     seq: 999,
                     boot_id: 1,
@@ -5723,6 +5753,7 @@ async fn session_start_for_out_of_range_fragment_is_not_admitted() {
                     key: "never-admitted".to_string(),
                     value: b"bad".to_vec(),
                     timestamp_ms: now_ms(),
+                    logical_counter: 0,
                     node_id: "unhosted-session-peer".to_string(),
                     seq: 1,
                     boot_id: 1,
@@ -5797,6 +5828,7 @@ async fn session_started_before_actor_installation_survives_placement_race() {
             key: "early-session-key".to_string(),
             value: b"accepted-after-install".to_vec(),
             timestamp_ms: now_ms(),
+            logical_counter: 0,
             node_id: "early-session-peer".to_string(),
             seq: 1,
             boot_id: 1,
@@ -5890,6 +5922,7 @@ async fn current_session_rejects_far_future_timestamp() {
                     key: "poisoned".to_string(),
                     value: b"bad".to_vec(),
                     timestamp_ms: u64::MAX,
+                    logical_counter: 0,
                     node_id: "raw-peer".to_string(),
                     seq: 1,
                     boot_id: 1,
@@ -6450,6 +6483,7 @@ async fn mixed_batch_put_retries_only_unavailable_positions_with_exact_stamps() 
         &results[3],
         Err(NodeError::Superseded {
             timestamp_ms,
+            logical_counter,
             node_id,
             is_tombstone: true,
         }) if *timestamp_ms == winner_timestamp_ms && node_id == "newer-writer"
@@ -6609,6 +6643,7 @@ async fn timed_out_single_put_retries_the_exact_stamped_operation() {
                         status: MutationStatus::Applied as i32,
                         error: String::new(),
                         winner_timestamp_ms: 0,
+                        winner_logical_counter: 0,
                         winner_node_id: String::new(),
                         winner_is_tombstone: false,
                         request_index: 0,
@@ -6692,6 +6727,7 @@ async fn timed_out_single_get_tries_the_next_holder() {
                     found: false,
                     value: Vec::new(),
                     timestamp_ms: 0,
+                    logical_counter: 0,
                     node_id: String::new(),
                     expires_at_ms: 0,
                     is_tombstone: false,
@@ -6708,6 +6744,7 @@ async fn timed_out_single_get_tries_the_next_holder() {
                     found: true,
                     value: b"value".to_vec(),
                     timestamp_ms: 7,
+                    logical_counter: 0,
                     node_id: "responding-reader".to_string(),
                     expires_at_ms: 0,
                     is_tombstone: false,
@@ -6751,6 +6788,7 @@ async fn timed_out_single_get_tries_the_next_holder() {
                     found: false,
                     value: Vec::new(),
                     timestamp_ms: 0,
+                    logical_counter: 0,
                     node_id: String::new(),
                     expires_at_ms: 0,
                     is_tombstone: false,
@@ -8696,6 +8734,7 @@ async fn pre_handshake_forwarded_put_ignored() {
                 key: "evil".to_string(),
                 value: b"evil-val".to_vec(),
                 timestamp_ms: 1,
+                logical_counter: 0,
                 node_id: "attacker".to_string(),
                 expires_at_ms: 0,
                 is_tombstone: false,
@@ -8989,6 +9028,7 @@ async fn same_session_replay_does_not_clear_reconcile_failure() {
                     key: "failed-repair".to_string(),
                     value: b"value".to_vec(),
                     timestamp_ms: now_ms(),
+                    logical_counter: 0,
                     node_id: "raw-poison-sender".to_string(),
                     seq: 1,
                     boot_id: 1,
@@ -10047,6 +10087,7 @@ async fn fetched_reconcile_value_retries_failed_local_store_fence() {
     let summary = KeySummary {
         key: "fetched-durable".to_string(),
         timestamp_ms: remote_timestamp,
+        logical_counter: 0,
         node_id: "raw-fetch-peer".to_string(),
         is_tombstone: false,
     };
@@ -10075,6 +10116,7 @@ async fn fetched_reconcile_value_retries_failed_local_store_fence() {
                 remote_summaries.extend(batch.ops.into_iter().map(|op| KeySummary {
                     key: op.key,
                     timestamp_ms: op.timestamp_ms,
+                    logical_counter: op.logical_counter,
                     node_id: op.node_id,
                     is_tombstone: op.is_tombstone,
                 }));
@@ -10092,6 +10134,7 @@ async fn fetched_reconcile_value_retries_failed_local_store_fence() {
                     key: summary.key.clone(),
                     value: b"durable".to_vec(),
                     timestamp_ms: summary.timestamp_ms,
+                    logical_counter: summary.logical_counter,
                     node_id: summary.node_id.clone(),
                     expires_at_ms: 0,
                     is_tombstone: false,

@@ -41,7 +41,9 @@ mod protocol;
 mod scan;
 mod snapshotter;
 
+pub use actordb_protocol::RecordVersion;
 pub use cleaner::{Cleaner, CleanerArgs, CleanerArgsBuilder, CleanerMessage, CleanerState};
+pub use clock::ClockError;
 pub use clock::{now_ms, ClockSkewError, HlcClock};
 pub use fragment::{
     FragmentHealth, FragmentShutdownError, FragmentSupervisor, SupervisorArgs,

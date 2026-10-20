@@ -681,6 +681,7 @@ fn read_result(key: String, result: Result<Option<VersionedValue>, NodeError>) -
             value: value.map(|value| wire::Value {
                 bytes: value.value,
                 timestamp_ms: value.timestamp_ms,
+                logical_counter: value.logical_counter,
                 node_id: value.node_id,
                 expires_at_ms: value.expires_at_ms,
             }),
@@ -765,11 +766,13 @@ fn node_error(failure: NodeError) -> wire::Error {
     let mut result = error(code, &failure.to_string());
     if let NodeError::Superseded {
         timestamp_ms,
+        logical_counter,
         node_id,
         is_tombstone,
     } = failure
     {
         result.winner_timestamp_ms = timestamp_ms;
+        result.winner_logical_counter = logical_counter;
         result.winner_node_id = node_id;
         result.winner_is_tombstone = is_tombstone;
     }

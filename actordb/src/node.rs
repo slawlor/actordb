@@ -96,10 +96,10 @@ pub mod scan;
 pub use scan::{ScanError, MAX_SCAN_TOTAL_MATCHES};
 
 /// Current peer wire protocol version. Hello ranges must include this value.
-/// Version 3 replaces monolithic full-state sync with byte-bounded,
-/// cursor-correlated reconciliation pages. Required capabilities additionally
-/// gate ordered-prefix batch-get semantics within v3.
-pub const WIRE_PROTOCOL_VERSION: u32 = 3;
+/// Version 4 carries independent physical/logical record timestamps. Older
+/// peers cannot preserve their ordering and are rejected during negotiation.
+/// It retains v3 byte-bounded, cursor-correlated reconciliation.
+pub const WIRE_PROTOCOL_VERSION: u32 = 4;
 /// The peer returns exact forwarded-mutation outcomes.
 pub const CAPABILITY_MUTATION_RESULTS: u64 = 1 << 0;
 /// Replication ACKs carry an explicit receiver durability fence.
@@ -1238,6 +1238,7 @@ pub enum NodeError {
     /// was not applied and is never reported as successful.
     Superseded {
         timestamp_ms: u64,
+        logical_counter: u64,
         node_id: String,
         is_tombstone: bool,
     },
@@ -1260,11 +1261,12 @@ impl std::fmt::Display for NodeError {
             NodeError::Storage(e) => write!(f, "storage error: {e}"),
             NodeError::Superseded {
                 timestamp_ms,
+                logical_counter,
                 node_id,
                 is_tombstone,
             } => write!(
                 f,
-                "write was superseded by timestamp={timestamp_ms} node_id={node_id} tombstone={is_tombstone}"
+                "write was superseded by timestamp={timestamp_ms}:{logical_counter} node_id={node_id} tombstone={is_tombstone}"
             ),
             NodeError::Expired => write!(f, "write expired before it could be applied"),
             NodeError::ShuttingDown => write!(f, "node is shutting down"),
@@ -1311,10 +1313,10 @@ fn priority_from_proto(v: i32) -> OpPriority {
 /// while retaining the raw value would leave the key permanently poisoned.
 async fn observe_remote_timestamp(
     hlc: &Arc<Mutex<HlcClock>>,
-    timestamp_ms: u64,
+    version: actordb_protocol::RecordVersion,
     message: &str,
 ) -> bool {
-    match hlc.lock().await.observe(timestamp_ms) {
+    match hlc.lock().await.observe_version(version) {
         Ok(()) => true,
         Err(error) => {
             tracing::warn!("rejecting {message} with invalid timestamp: {error}");
@@ -1517,6 +1519,7 @@ fn mutation_result(
         status: MutationStatus::Applied as i32,
         error: String::new(),
         winner_timestamp_ms: 0,
+        winner_logical_counter: 0,
         winner_node_id: String::new(),
         winner_is_tombstone: false,
         request_index: request_index as u32,
@@ -1530,11 +1533,13 @@ fn mutation_result(
         }
         Ok(ApplyOutcome::Superseded {
             timestamp_ms,
+            logical_counter,
             node_id,
             is_tombstone,
         }) => {
             wire.status = MutationStatus::Superseded as i32;
             wire.winner_timestamp_ms = timestamp_ms;
+            wire.winner_logical_counter = logical_counter;
             wire.winner_node_id = node_id;
             wire.winner_is_tombstone = is_tombstone;
         }
@@ -1551,11 +1556,13 @@ fn mutation_result(
         }
         Err(NodeError::Superseded {
             timestamp_ms,
+            logical_counter,
             node_id,
             is_tombstone,
         }) => {
             wire.status = MutationStatus::Superseded as i32;
             wire.winner_timestamp_ms = timestamp_ms;
+            wire.winner_logical_counter = logical_counter;
             wire.winner_node_id = node_id;
             wire.winner_is_tombstone = is_tombstone;
         }
@@ -1577,6 +1584,7 @@ fn decode_mutation_result(result: MutationResult) -> Result<(), NodeError> {
         Ok(MutationStatus::Applied | MutationStatus::AlreadyPresent) => Ok(()),
         Ok(MutationStatus::Superseded) => Err(NodeError::Superseded {
             timestamp_ms: result.winner_timestamp_ms,
+            logical_counter: result.winner_logical_counter,
             node_id: result.winner_node_id,
             is_tombstone: result.winner_is_tombstone,
         }),
@@ -1644,6 +1652,7 @@ fn validate_mutation_results(
                 | MutationStatus::Unavailable,
             ) => {
                 if result.winner_timestamp_ms != 0
+                    || result.winner_logical_counter != 0
                     || !result.winner_node_id.is_empty()
                     || result.winner_is_tombstone
                 {
@@ -1657,6 +1666,7 @@ fn validate_mutation_results(
             ) => {
                 if !result.error.is_empty()
                     || result.winner_timestamp_ms != 0
+                    || result.winner_logical_counter != 0
                     || !result.winner_node_id.is_empty()
                     || result.winner_is_tombstone
                 {
@@ -1692,6 +1702,7 @@ fn validate_batch_get_results(
             if result.found
                 || !result.value.is_empty()
                 || result.timestamp_ms != 0
+                || result.logical_counter != 0
                 || !result.node_id.is_empty()
                 || result.expires_at_ms != 0
                 || result.is_tombstone
@@ -1704,6 +1715,7 @@ fn validate_batch_get_results(
             validate_record_wire_budget(&result.key, result.value.len(), &result.node_id)?;
         } else if !result.value.is_empty()
             || result.timestamp_ms != 0
+            || result.logical_counter != 0
             || !result.node_id.is_empty()
             || result.expires_at_ms != 0
             || result.is_tombstone
@@ -1724,6 +1736,7 @@ fn validate_legacy_get_response(
         if response.found
             || !response.value.is_empty()
             || response.timestamp_ms != 0
+            || response.logical_counter != 0
             || !response.node_id.is_empty()
             || response.expires_at_ms != 0
             || response.is_tombstone
@@ -1741,6 +1754,7 @@ fn validate_legacy_get_response(
         validate_record_wire_budget(expected_key, response.value.len(), &response.node_id)?;
     } else if !response.value.is_empty()
         || response.timestamp_ms != 0
+        || response.logical_counter != 0
         || !response.node_id.is_empty()
         || response.expires_at_ms != 0
         || response.is_tombstone
@@ -4378,8 +4392,13 @@ impl Node {
             *guard += 1;
             *guard
         };
-        let now = self.hlc.lock().await.tick();
-        let mut vv = VersionedValue::new(value, now, self.node_id.clone());
+        let now = self
+            .hlc
+            .lock()
+            .await
+            .tick()
+            .map_err(|error| NodeError::Codec(error.to_string()))?;
+        let mut vv = VersionedValue::new_version(value, now, self.node_id.clone());
         vv.expires_at_ms = expires_at_ms;
         let op = ReplicatedOp {
             key,
@@ -4442,10 +4461,15 @@ impl Node {
             *guard += 1;
             *guard
         };
-        let now = self.hlc.lock().await.tick();
+        let now = self
+            .hlc
+            .lock()
+            .await
+            .tick()
+            .map_err(|error| NodeError::Codec(error.to_string()))?;
         let op = ReplicatedOp {
             key: key.clone(),
-            value: VersionedValue::tombstone(now, self.node_id.clone()),
+            value: VersionedValue::tombstone_version(now, self.node_id.clone()),
             seq,
             boot_id: self.boot_id,
         };
@@ -4697,13 +4721,20 @@ impl Node {
                     *guard += 1;
                     *guard
                 };
-                let timestamp_ms = self.hlc.lock().await.tick();
+                let version = match self.hlc.lock().await.tick() {
+                    Ok(version) => version,
+                    Err(error) => {
+                        results[index] = Some(Err(NodeError::Codec(error.to_string())));
+                        continue;
+                    }
+                };
                 remaining.push_back((
                     index,
                     ForwardedPut {
                         key,
                         value,
-                        timestamp_ms,
+                        timestamp_ms: version.timestamp_ms,
+                        logical_counter: version.logical_counter,
                         node_id: self.node_id.clone(),
                         seq,
                         boot_id: self.boot_id,
@@ -5049,8 +5080,14 @@ impl Node {
                                     "batch get for key {key} shed by remote"
                                 )))
                             } else if kv.found {
-                                let mut value =
-                                    VersionedValue::new(kv.value, kv.timestamp_ms, kv.node_id);
+                                let mut value = VersionedValue::new_version(
+                                    kv.value,
+                                    actordb_protocol::RecordVersion::new(
+                                        kv.timestamp_ms,
+                                        kv.logical_counter,
+                                    ),
+                                    kv.node_id,
+                                );
                                 value.expires_at_ms =
                                     (kv.expires_at_ms != 0).then_some(kv.expires_at_ms);
                                 value.is_tombstone = kv.is_tombstone;
@@ -7323,6 +7360,7 @@ async fn send_reconcile_data_pages(
                 key,
                 value: value.value,
                 timestamp_ms: value.timestamp_ms,
+                logical_counter: value.logical_counter,
                 node_id: value.node_id,
                 expires_at_ms: value.expires_at_ms.unwrap_or(0),
                 is_tombstone: value.is_tombstone,
@@ -8120,7 +8158,17 @@ async fn handle_connection(
                 }
 
                 if failure.is_none() {
-                    if let Some(timestamp_ms) = b.ops.iter().map(|op| op.timestamp_ms).max() {
+                    if let Some(timestamp_ms) = b
+                        .ops
+                        .iter()
+                        .map(|op| {
+                            actordb_protocol::RecordVersion::new(
+                                op.timestamp_ms,
+                                op.logical_counter,
+                            )
+                        })
+                        .max()
+                    {
                         if !observe_remote_timestamp(&hlc, timestamp_ms, "ReplicateBatch").await {
                             break;
                         }
@@ -8133,8 +8181,14 @@ async fn handle_connection(
                         let replicated = ReplicatedOp {
                             key: op.key,
                             value: {
-                                let mut v =
-                                    VersionedValue::new(op.value, op.timestamp_ms, op.node_id);
+                                let mut v = VersionedValue::new_version(
+                                    op.value,
+                                    actordb_protocol::RecordVersion::new(
+                                        op.timestamp_ms,
+                                        op.logical_counter,
+                                    ),
+                                    op.node_id,
+                                );
                                 v.expires_at_ms = if op.expires_at_ms == 0 {
                                     None
                                 } else {
@@ -8428,6 +8482,7 @@ async fn handle_connection(
                             .map(|summary| KeySummary {
                                 key: summary.key,
                                 timestamp_ms: summary.timestamp_ms,
+                                logical_counter: summary.logical_counter,
                                 node_id: summary.node_id,
                                 is_tombstone: summary.is_tombstone,
                             })
@@ -8840,7 +8895,13 @@ async fn handle_connection(
                     tracing::warn!(%error, "rejecting irreducible forwarded mutation");
                     break;
                 }
-                if !observe_remote_timestamp(&hlc, p.timestamp_ms, "ForwardedPut").await {
+                if !observe_remote_timestamp(
+                    &hlc,
+                    actordb_protocol::RecordVersion::new(p.timestamp_ms, p.logical_counter),
+                    "ForwardedPut",
+                )
+                .await
+                {
                     break;
                 }
                 let frag = fragment_of(&p.key, router.fragment_count);
@@ -8999,7 +9060,14 @@ async fn handle_connection(
                     }
                     break;
                 }
-                if r.found && !observe_remote_timestamp(&hlc, r.timestamp_ms, "GetResponse").await {
+                if r.found
+                    && !observe_remote_timestamp(
+                        &hlc,
+                        actordb_protocol::RecordVersion::new(r.timestamp_ms, r.logical_counter),
+                        "GetResponse",
+                    )
+                    .await
+                {
                     break;
                 }
                 // A relayed read completing: forward the response to the
@@ -9035,7 +9103,11 @@ async fn handle_connection(
                     } else if !r.found || r.is_tombstone {
                         let _ = pending.reply.send(Ok(None));
                     } else {
-                        let mut value = VersionedValue::new(r.value, r.timestamp_ms, r.node_id);
+                        let mut value = VersionedValue::new_version(
+                            r.value,
+                            actordb_protocol::RecordVersion::new(r.timestamp_ms, r.logical_counter),
+                            r.node_id,
+                        );
                         value.expires_at_ms = (r.expires_at_ms != 0).then_some(r.expires_at_ms);
                         let _ = pending.reply.send(Ok(Some(value)));
                     }
@@ -9097,7 +9169,12 @@ async fn handle_connection(
                     .filter(|result| {
                         MutationStatus::try_from(result.status) == Ok(MutationStatus::Superseded)
                     })
-                    .map(|result| result.winner_timestamp_ms)
+                    .map(|result| {
+                        actordb_protocol::RecordVersion::new(
+                            result.winner_timestamp_ms,
+                            result.winner_logical_counter,
+                        )
+                    })
                     .max()
                 {
                     if !observe_remote_timestamp(&hlc, timestamp_ms, "MutationResponse").await {
@@ -9162,7 +9239,14 @@ async fn handle_connection(
                     tracing::warn!(%error, "rejecting irreducible item in batch put");
                     break;
                 }
-                if let Some(timestamp_ms) = bp.puts.iter().map(|p| p.timestamp_ms).max() {
+                if let Some(timestamp_ms) = bp
+                    .puts
+                    .iter()
+                    .map(|p| {
+                        actordb_protocol::RecordVersion::new(p.timestamp_ms, p.logical_counter)
+                    })
+                    .max()
+                {
                     if !observe_remote_timestamp(&hlc, timestamp_ms, "BatchPut").await {
                         break;
                     }
@@ -9345,7 +9429,12 @@ async fn handle_connection(
                     .results
                     .iter()
                     .filter(|result| result.found)
-                    .map(|result| result.timestamp_ms)
+                    .map(|result| {
+                        actordb_protocol::RecordVersion::new(
+                            result.timestamp_ms,
+                            result.logical_counter,
+                        )
+                    })
                     .max()
                 {
                     if !observe_remote_timestamp(&hlc, timestamp_ms, "BatchGetResponse").await {
@@ -10981,7 +11070,7 @@ mod tests {
             ));
         }
         assert_eq!(*sequence, 0);
-        assert_eq!(clock.tick(), future + 1);
+        assert!(clock.tick().unwrap() > actordb_protocol::RecordVersion::from(future));
         assert_eq!(node.next_req_id.load(Ordering::Relaxed), next_request);
         drop(clock);
         drop(sequence);
@@ -11019,7 +11108,10 @@ mod tests {
             .await
             .unwrap();
         let permanent = node.get("permanent".into()).await.unwrap().unwrap();
-        assert_eq!(permanent.timestamp_ms, future + 1);
+        assert_eq!(
+            permanent.version(),
+            actordb_protocol::RecordVersion::new(future, 1)
+        );
         assert_eq!(permanent.expires_at_ms, None);
 
         let before = crate::actor::now_ms();
@@ -11032,7 +11124,10 @@ mod tests {
         .unwrap();
         let after = crate::actor::now_ms();
         let expiring = node.get("expiring".into()).await.unwrap().unwrap();
-        assert_eq!(expiring.timestamp_ms, future + 2);
+        assert_eq!(
+            expiring.version(),
+            actordb_protocol::RecordVersion::new(future, 2)
+        );
         assert!((before + 60_000..=after + 60_000).contains(&expiring.expires_at_ms.unwrap()));
         assert!(expiring.expires_at_ms.unwrap() < expiring.timestamp_ms);
 
@@ -11052,7 +11147,10 @@ mod tests {
             assert!(node.get(key.clone()).await.unwrap().is_none());
             let marker = node.router.get_all().await.unwrap().remove(&key).unwrap();
             assert!(marker.is_tombstone);
-            assert_eq!(marker.timestamp_ms, future + 3 + index as u64);
+            assert_eq!(
+                marker.version(),
+                actordb_protocol::RecordVersion::new(future, 3 + index as u64)
+            );
             assert_eq!(marker.node_id, "ttl-local");
             assert!((before..=after).contains(&marker.expires_at_ms.unwrap()));
             markers.push((key, marker));
@@ -11142,7 +11240,10 @@ mod tests {
             .unwrap();
         let after = crate::actor::now_ms();
         let value = owner.get("forwarded".into()).await.unwrap().unwrap();
-        assert_eq!(value.timestamp_ms, future + 1);
+        assert_eq!(
+            value.version(),
+            actordb_protocol::RecordVersion::new(future, 1)
+        );
         assert_eq!(value.node_id, "ttl-caller");
         assert!((before + 60_000..=after + 60_000).contains(&value.expires_at_ms.unwrap()));
         assert!(value.expires_at_ms.unwrap() < value.timestamp_ms);
@@ -11168,7 +11269,10 @@ mod tests {
             .unwrap();
         assert!(marker.is_tombstone);
         assert_eq!(marker.node_id, "ttl-caller");
-        assert_eq!(marker.timestamp_ms, future + 2);
+        assert_eq!(
+            marker.version(),
+            actordb_protocol::RecordVersion::new(future, 2)
+        );
         assert!((before..=after).contains(&marker.expires_at_ms.unwrap()));
         caller.shutdown().await.unwrap();
         owner.shutdown().await.unwrap();
@@ -11508,6 +11612,7 @@ mod tests {
             status: MutationStatus::Applied as i32,
             error: String::new(),
             winner_timestamp_ms: 0,
+            winner_logical_counter: 0,
             winner_node_id: String::new(),
             winner_is_tombstone: false,
             request_index,
@@ -11696,6 +11801,7 @@ mod tests {
                 found: false,
                 value: Vec::new(),
                 timestamp_ms: 0,
+                logical_counter: 0,
                 node_id: String::new(),
                 expires_at_ms: 0,
                 is_tombstone: false,
@@ -11730,6 +11836,7 @@ mod tests {
                 key: String::new(),
                 value: Vec::new(),
                 timestamp_ms: 1,
+                logical_counter: 0,
                 node_id: "node".to_string(),
                 seq: 1,
                 boot_id: 1,
@@ -11745,6 +11852,7 @@ mod tests {
                 key: "k".repeat(127),
                 value: vec![7; 128],
                 timestamp_ms: u64::MAX,
+                logical_counter: 0,
                 node_id: "node".to_string(),
                 seq: u64::MAX,
                 boot_id: u64::MAX,
@@ -11798,6 +11906,7 @@ mod tests {
             found: false,
             value: Vec::new(),
             timestamp_ms: 0,
+            logical_counter: 0,
             node_id: String::new(),
             expires_at_ms: 0,
             is_tombstone: false,
@@ -11826,6 +11935,7 @@ mod tests {
             status: MutationStatus::Unavailable as i32,
             error: "e".repeat(MAX_WIRE_ERROR_BYTES),
             winner_timestamp_ms: u64::MAX,
+            winner_logical_counter: 0,
             winner_node_id: "n".repeat(MAX_WIRE_NODE_ID_BYTES),
             winner_is_tombstone: true,
             request_index: u32::MAX,
@@ -11922,6 +12032,7 @@ mod tests {
         let summary = |key: String| KeySummary {
             key,
             timestamp_ms: u64::MAX,
+            logical_counter: 0,
             node_id: "node".to_string(),
             is_tombstone: true,
         };
@@ -12009,6 +12120,7 @@ mod tests {
                     key: format!("key-{value_len}"),
                     value: vec![7; value_len],
                     timestamp_ms: u64::MAX,
+                    logical_counter: 0,
                     node_id: "node".to_string(),
                     expires_at_ms: u64::MAX,
                     is_tombstone: true,
@@ -12677,15 +12789,15 @@ mod tests {
         };
         assert_eq!(
             hex(&authenticated),
-            "bf1f1d4d7d3f00cdb1779c3b07e6d2423e277edf4299f97d76b12a009e30a789"
+            "c8481f4b79b30974a6593ea01a69abe9c06cf2612456898d08361d612e14ad1f"
         );
         assert_eq!(
             hex(&handshake_auth_tag(b"secret", false, &dialer, &listener)),
-            "2c559f59039bfd7b1fcff6a3a2485436ceafe30e54dda01976f0ae1064624388"
+            "caebe45abdee3c01b2f91d9b572d014bf7179368e5ebe5a66dc3a8a1bd162b4c"
         );
         assert_eq!(
             hex(&connection_rank(&dialer, &listener).transcript_id),
-            "9727cd8af4115a169d5a56bde17a0903425baae9bca3664ca830f3b4cc06728b"
+            "51fb4b81d53d2ea3fec5121c3ac214123af25fab134cc4b50013b28cfbf39d5e"
         );
         assert!(verify_handshake_auth(
             Some(b"secret"),
@@ -13582,6 +13694,7 @@ mod tests {
                     key: "hop-limit".to_string(),
                     value: b"value".to_vec(),
                     timestamp_ms: 1,
+                    logical_counter: 0,
                     node_id: "peer".to_string(),
                     seq: 1,
                     boot_id: 1,
@@ -13616,6 +13729,7 @@ mod tests {
                         key: "missing-actor".to_string(),
                         value: b"value".to_vec(),
                         timestamp_ms: 2,
+                        logical_counter: 0,
                         node_id: "peer".to_string(),
                         seq: 2,
                         boot_id: 1,
@@ -13649,6 +13763,7 @@ mod tests {
                     key: "missing-single-actor".to_string(),
                     value: b"value".to_vec(),
                     timestamp_ms: 3,
+                    logical_counter: 0,
                     node_id: "peer".to_string(),
                     seq: 3,
                     boot_id: 1,
@@ -14651,6 +14766,7 @@ mod tests {
             found: false,
             value: Vec::new(),
             timestamp_ms: 0,
+            logical_counter: 0,
             node_id: String::new(),
             expires_at_ms: 0,
             is_tombstone: false,
@@ -14662,6 +14778,7 @@ mod tests {
             found: true,
             value: b"value".to_vec(),
             timestamp_ms: 7,
+            logical_counter: 0,
             node_id: "owner".to_string(),
             ..not_found.clone()
         };
@@ -14776,6 +14893,7 @@ mod tests {
                 found: false,
                 value: Vec::new(),
                 timestamp_ms: 0,
+                logical_counter: 0,
                 node_id: String::new(),
                 expires_at_ms: 0,
                 is_tombstone: false,
@@ -14987,6 +15105,7 @@ mod tests {
                     found: true,
                     value: vec![7; MAX_FRAME_BYTES - 128],
                     timestamp_ms: u64::MAX,
+                    logical_counter: 0,
                     node_id: "node".to_string(),
                     expires_at_ms: u64::MAX,
                     is_tombstone: false,
@@ -15889,6 +16008,7 @@ mod tests {
                 found: false,
                 value: vec![],
                 timestamp_ms: 0,
+                logical_counter: 0,
                 node_id: String::new(),
                 expires_at_ms: 0,
                 is_tombstone: false,
@@ -16273,6 +16393,7 @@ mod tests {
                         vec![index as u8]
                     },
                     timestamp_ms: index as u64 + 1,
+                    logical_counter: 0,
                     node_id: format!("origin-{index}"),
                     seq: index as u64 + 11,
                     boot_id: index as u64 + 21,
@@ -16406,6 +16527,7 @@ mod tests {
                     key: "key".to_string(),
                     value: b"value".to_vec(),
                     timestamp_ms: 1,
+                    logical_counter: 0,
                     node_id: "origin".to_string(),
                     seq: req_id,
                     boot_id: 1,
@@ -16452,6 +16574,7 @@ mod tests {
                 key: "key".to_string(),
                 value: b"value".to_vec(),
                 timestamp_ms: 2,
+                logical_counter: 0,
                 node_id: "origin".to_string(),
                 seq: 400,
                 boot_id: 1,

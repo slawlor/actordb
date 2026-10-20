@@ -59,8 +59,15 @@ impl Node {
             *seq += 1;
             *seq
         };
-        let mut value =
-            VersionedValue::new(value, self.hlc.lock().await.tick(), self.node_id.clone());
+        let mut value = VersionedValue::new_version(
+            value,
+            self.hlc
+                .lock()
+                .await
+                .tick()
+                .map_err(|error| NodeError::Codec(error.to_string()))?,
+            self.node_id.clone(),
+        );
         value.expires_at_ms = expires_at_ms;
         let op = ReplicatedOp {
             key,
@@ -102,7 +109,14 @@ impl Node {
         };
         let op = ReplicatedOp {
             key,
-            value: VersionedValue::tombstone(self.hlc.lock().await.tick(), self.node_id.clone()),
+            value: VersionedValue::tombstone_version(
+                self.hlc
+                    .lock()
+                    .await
+                    .tick()
+                    .map_err(|error| NodeError::Codec(error.to_string()))?,
+                self.node_id.clone(),
+            ),
             seq,
             boot_id: self.boot_id,
         };
@@ -139,11 +153,13 @@ impl Node {
                 ApplyOutcome::Applied | ApplyOutcome::AlreadyPresent => {}
                 ApplyOutcome::Superseded {
                     timestamp_ms,
+                    logical_counter,
                     node_id,
                     is_tombstone,
                 } => {
                     return Err(NodeError::Superseded {
                         timestamp_ms,
+                        logical_counter,
                         node_id,
                         is_tombstone,
                     }
@@ -214,6 +230,7 @@ impl Node {
                     key: op.key.clone(),
                     value: op.value.value.clone(),
                     timestamp_ms: op.value.timestamp_ms,
+                    logical_counter: op.value.logical_counter,
                     node_id: op.value.node_id.clone(),
                     seq: op.seq,
                     boot_id: op.boot_id,

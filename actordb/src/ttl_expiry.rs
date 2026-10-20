@@ -46,11 +46,12 @@ impl ExpiryEventId {
 
     fn for_record(fragment: FragmentId, key: &str, value: &VersionedValue) -> Self {
         let mut hash = Sha256::new();
-        hash.update(b"actordb-ttl-expiry-v1\0");
+        hash.update(b"actordb-ttl-expiry-v2\0");
         hash.update(fragment.0.to_be_bytes());
         hash.update((key.len() as u64).to_be_bytes());
         hash.update(key.as_bytes());
         hash.update(value.timestamp_ms.to_be_bytes());
+        hash.update(value.logical_counter.to_be_bytes());
         hash.update((value.node_id.len() as u64).to_be_bytes());
         hash.update(value.node_id.as_bytes());
         Self(hash.finalize().into())
@@ -86,12 +87,9 @@ pub struct ExpiryEvent {
 }
 
 impl ExpiryEvent {
-    /// Original `(timestamp_ms, node_id)` LWW version, using the existing types.
-    pub fn original_version(&self) -> (u64, &str) {
-        (
-            self.previous_value.timestamp_ms,
-            &self.previous_value.node_id,
-        )
+    /// Original physical/logical timestamp and writer identity.
+    pub fn original_version(&self) -> (actordb_protocol::RecordVersion, &str) {
+        (self.previous_value.version(), &self.previous_value.node_id)
     }
 }
 
@@ -1021,7 +1019,7 @@ mod tests {
         let id = ExpiryEventId::for_record(FragmentId(7), "key\0x", &original);
         assert_eq!(
             id.to_string(),
-            "15def029ebc6affe08fed6e4cd8413c21752d704bb258c45ec0edfa60d5746c8"
+            "76a3579fce13a879d3347ce9d72eb68b79fbe67f838ad26338498b76c8c05aed"
         );
         original.value = b"another opaque format".to_vec();
         original.expires_at_ms = Some(200);
@@ -1096,7 +1094,10 @@ mod tests {
         settle().await;
         let last = output.try_recv().unwrap();
         assert_eq!(last.events[0].key, "c");
-        assert_eq!(last.events[0].original_version(), (3, "writer"));
+        assert_eq!(
+            last.events[0].original_version(),
+            (actordb_protocol::RecordVersion::from(3u64), "writer")
+        );
         assert_eq!(last.events[0].previous_value.value, [0xff, 0, 1]);
         assert_eq!(last.events[0].observed_at_ms, 1000);
         assert_eq!(last.dispatched_at_ms, 1010);

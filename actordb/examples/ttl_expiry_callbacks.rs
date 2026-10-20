@@ -14,7 +14,10 @@ use tokio::task::JoinSet;
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // This index is application state; the database chooses no recipients,
     // ownership policy, fanout mechanism, or application payload encoding.
-    let index = Arc::new(Mutex::new(HashMap::<String, (u64, String)>::new()));
+    let index = Arc::new(Mutex::new(HashMap::<
+        String,
+        (actordb::actor::RecordVersion, String),
+    >::new()));
     let (sender, mut receiver) = mpsc::channel::<ExpiryBatch>(8);
     let (expired, observed_expiry) = oneshot::channel();
     let worker_index = index.clone();
@@ -73,7 +76,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     index
         .lock()
         .await
-        .insert("item".into(), (value.timestamp_ms, value.node_id));
+        .insert("item".into(), (value.version(), value.node_id));
     tokio::time::timeout(Duration::from_secs(5), observed_expiry).await??;
     assert!(index.lock().await.is_empty());
     node.shutdown().await?;

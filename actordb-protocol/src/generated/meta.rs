@@ -60,6 +60,8 @@ pub struct ReplicateOp {
     /// True if this is a deletion tombstone.
     #[prost(bool, tag = "8")]
     pub is_tombstone: bool,
+    #[prost(uint64, tag = "9")]
+    pub logical_counter: u64,
 }
 /// A client-routed write: "you own this key's fragment — apply it as
 /// coordinator and replicate to the other holders." One network hop.
@@ -98,6 +100,8 @@ pub struct ForwardedPut {
     /// Optional encoded WriteConcernPolicy. Absence preserves local acknowledgement.
     #[prost(bytes = "vec", optional, tag = "12")]
     pub write_concern: ::core::option::Option<::prost::alloc::vec::Vec<u8>>,
+    #[prost(uint64, tag = "13")]
+    pub logical_counter: u64,
 }
 /// A single-key routed read. The origin tries configured holders in order; a
 /// non-serving holder may relay it under a fresh request id while placement
@@ -139,6 +143,8 @@ pub struct GetResponse {
     /// from not-found).
     #[prost(bool, tag = "8")]
     pub shed: bool,
+    #[prost(uint64, tag = "9")]
+    pub logical_counter: u64,
 }
 /// Retired protocol-v1/v2 full-state frames. They remain generated for source
 /// compatibility, but a protocol-v3 connection closes if either is received.
@@ -169,6 +175,8 @@ pub struct SyncEntry {
     /// True if this is a deletion tombstone.
     #[prost(bool, tag = "6")]
     pub is_tombstone: bool,
+    #[prost(uint64, tag = "7")]
+    pub logical_counter: u64,
 }
 /// Top-level wire envelope, length-delimited on the wire
 /// Phase 5: async sender/receiver replication. The sender batches ops per
@@ -238,6 +246,8 @@ pub struct KeySummary {
     pub node_id: ::prost::alloc::string::String,
     #[prost(bool, tag = "4")]
     pub is_tombstone: bool,
+    #[prost(uint64, tag = "5")]
+    pub logical_counter: u64,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ReconcileRequest {
@@ -351,6 +361,8 @@ pub struct MutationResult {
     /// Encoded WriteConcernResult, present only when a policy was requested.
     #[prost(bytes = "vec", optional, tag = "8")]
     pub write_concern: ::core::option::Option<::prost::alloc::vec::Vec<u8>>,
+    #[prost(uint64, tag = "9")]
+    pub winner_logical_counter: u64,
 }
 #[non_exhaustive]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
@@ -437,6 +449,8 @@ pub mod batch_get_response {
         /// from not-found).
         #[prost(bool, tag = "8")]
         pub shed: bool,
+        #[prost(uint64, tag = "9")]
+        pub logical_counter: u64,
     }
 }
 #[derive(Clone, PartialEq, ::prost::Message)]

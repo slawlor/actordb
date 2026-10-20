@@ -145,6 +145,8 @@ pub struct Error {
     pub winner_node_id: ::prost::alloc::string::String,
     #[prost(bool, tag = "5")]
     pub winner_is_tombstone: bool,
+    #[prost(uint64, tag = "6")]
+    pub winner_logical_counter: u64,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct Value {
@@ -156,6 +158,8 @@ pub struct Value {
     pub node_id: ::prost::alloc::string::String,
     #[prost(uint64, optional, tag = "4")]
     pub expires_at_ms: ::core::option::Option<u64>,
+    #[prost(uint64, tag = "5")]
+    pub logical_counter: u64,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ReadResult {

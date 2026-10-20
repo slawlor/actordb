@@ -186,7 +186,7 @@ enum SupervisorLifecycle {
 
 struct LoadedCache {
     values: HashMap<String, VersionedValue>,
-    high_water: Option<u64>,
+    high_water: Option<actordb_protocol::RecordVersion>,
     expirations: Vec<PreparedExpiry>,
 }
 
@@ -203,7 +203,7 @@ impl SupervisorState {
                 let mut map = HashMap::new();
                 let mut expiry_updates = Vec::new();
                 let mut expirations = HashMap::new();
-                let mut high_water: Option<u64> = None;
+                let mut high_water: Option<actordb_protocol::RecordVersion> = None;
                 let now = now_ms();
                 for (index, (k, v)) in kvstore
                     .load()
@@ -213,8 +213,8 @@ impl SupervisorState {
                 {
                     high_water = Some(
                         high_water
-                            .map(|current| current.max(v.timestamp_ms))
-                            .unwrap_or(v.timestamp_ms),
+                            .map(|current| current.max(v.version()))
+                            .unwrap_or(v.version()),
                     );
                     let key =
                         String::from_utf8(k.clone()).map_err(FragmentStartupStorageError::boxed)?;
@@ -419,7 +419,7 @@ impl FragmentSupervisor {
             args.hlc
                 .lock()
                 .await
-                .seed_persisted(timestamp_ms)
+                .seed_version(timestamp_ms)
                 .map_err(FragmentStartupStorageError::boxed)?;
         }
         let shared = Arc::new(

@@ -12,6 +12,7 @@ use ractor::{ActorRef, RpcReplyPort};
 
 use super::scan::{ScanMatch, ScanSpec};
 use crate::wire::{batch_get_result_encoded_len, RepeatedFieldSizer};
+use actordb_protocol::RecordVersion;
 /// Priority for an operation. The dispatcher routes to separate worker
 /// pools by priority, so bulk/background work cannot occupy the workers or
 /// worker-queue capacity reserved for latency-sensitive ops. Dispatcher
@@ -29,8 +30,8 @@ pub enum OpPriority {
 
 /// A value stamped with its last-writer-wins version.
 ///
-/// Versions are totally ordered by `(timestamp_ms, node_id)`: the higher
-/// wall-clock timestamp wins, and the node id breaks ties deterministically
+/// Versions are totally ordered by `(timestamp_ms, logical_counter, node_id)`: the higher
+/// physical/logical timestamp wins, and the node id breaks ties deterministically
 /// so every replica picks the same winner. `expires_at_ms` is an optional
 /// wall-clock deadline (set via `put_with_ttl`); expired values are
 /// invisible to reads and converted to versioned tombstones by the fragment's
@@ -43,13 +44,15 @@ pub enum OpPriority {
 /// A tombstone (`is_tombstone`) marks a deleted key. Tombstones participate
 /// in LWW like writes: a tombstone with a higher timestamp shadows a live
 /// value, and a live write with a higher timestamp resurrects the key.
-/// On exact `(timestamp, node_id)` ties the tombstone wins (deletes are
+/// On exact `(timestamp, logical_counter, node_id)` ties the tombstone wins (deletes are
 /// explicit). Tombstones are shipped by sync and retained until a future
 /// causally safe garbage collector can prove that no replica needs them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VersionedValue {
     pub value: Vec<u8>,
     pub timestamp_ms: u64,
+    /// Logical component; independent of physical clock skew and TTL deadlines.
+    pub logical_counter: u64,
     pub node_id: String,
     /// Wall-clock expiry in ms since epoch. `None` = no expiry.
     pub expires_at_ms: Option<u64>,
@@ -59,9 +62,15 @@ pub struct VersionedValue {
 
 impl VersionedValue {
     pub fn new(value: Vec<u8>, timestamp_ms: u64, node_id: String) -> Self {
+        Self::new_version(value, RecordVersion::from(timestamp_ms), node_id)
+    }
+
+    /// Construct a live value with a physical/logical timestamp.
+    pub fn new_version(value: Vec<u8>, version: RecordVersion, node_id: String) -> Self {
         Self {
             value,
-            timestamp_ms,
+            timestamp_ms: version.timestamp_ms,
+            logical_counter: version.logical_counter,
             node_id,
             expires_at_ms: None,
             is_tombstone: false,
@@ -70,9 +79,15 @@ impl VersionedValue {
 
     /// A tombstone for `node_id` at `timestamp_ms`.
     pub fn tombstone(timestamp_ms: u64, node_id: String) -> Self {
+        Self::tombstone_version(RecordVersion::from(timestamp_ms), node_id)
+    }
+
+    /// Construct a deletion marker with a physical/logical timestamp.
+    pub fn tombstone_version(version: RecordVersion, node_id: String) -> Self {
         Self {
             value: Vec::new(),
-            timestamp_ms,
+            timestamp_ms: version.timestamp_ms,
+            logical_counter: version.logical_counter,
             node_id,
             expires_at_ms: None,
             is_tombstone: true,
@@ -91,6 +106,7 @@ impl VersionedValue {
         Self {
             value: Vec::new(),
             timestamp_ms: self.timestamp_ms,
+            logical_counter: self.logical_counter,
             node_id: self.node_id.clone(),
             expires_at_ms: self.expires_at_ms,
             is_tombstone: true,
@@ -98,10 +114,15 @@ impl VersionedValue {
     }
 
     /// Returns `true` if `self` wins over `other` under last-writer-wins.
-    /// Tombstones win exact `(timestamp, node_id)` ties.
+    /// Tombstones win exact `(timestamp, logical_counter, node_id)` ties.
     pub fn wins_over(&self, other: &VersionedValue) -> bool {
-        (self.timestamp_ms, &self.node_id, self.is_tombstone)
-            > (other.timestamp_ms, &other.node_id, other.is_tombstone)
+        (self.version(), &self.node_id, self.is_tombstone)
+            > (other.version(), &other.node_id, other.is_tombstone)
+    }
+
+    /// Original physical/logical timestamp, before the writer/tombstone tie-break.
+    pub const fn version(&self) -> RecordVersion {
+        RecordVersion::new(self.timestamp_ms, self.logical_counter)
     }
 
     /// Returns `true` if this value is past its expiry at `now_ms`.
@@ -135,6 +156,7 @@ pub struct ReplicatedOp {
 pub struct SnapshotSummary {
     pub key: String,
     pub timestamp_ms: u64,
+    pub logical_counter: u64,
     pub node_id: String,
     pub is_tombstone: bool,
 }
@@ -252,6 +274,7 @@ pub enum ApplyOutcome {
     /// A different version already wins the LWW merge.
     Superseded {
         timestamp_ms: u64,
+        logical_counter: u64,
         node_id: String,
         is_tombstone: bool,
     },

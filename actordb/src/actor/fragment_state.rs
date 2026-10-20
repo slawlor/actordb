@@ -266,6 +266,7 @@ impl FragmentState {
             if !value.wins_over(existing) {
                 return ApplyOutcome::Superseded {
                     timestamp_ms: existing.timestamp_ms,
+                    logical_counter: existing.logical_counter,
                     node_id: existing.node_id.clone(),
                     is_tombstone: existing.is_tombstone,
                 };
@@ -829,6 +830,7 @@ impl FragmentState {
         SnapshotSummary {
             key: key.to_string(),
             timestamp_ms: value.timestamp_ms,
+            logical_counter: value.logical_counter,
             node_id: value.node_id.clone(),
             is_tombstone: value.is_tombstone || value.is_expired(snapshot_time_ms),
         }
@@ -1258,6 +1260,7 @@ mod flush_tests {
             state.apply(&op("key", stale)).await.unwrap(),
             ApplyOutcome::Superseded {
                 timestamp_ms: winner.timestamp_ms,
+                logical_counter: winner.logical_counter,
                 node_id: winner.node_id,
                 is_tombstone: winner.is_tombstone,
             }
@@ -2514,7 +2517,10 @@ mod expiry_callback_tests {
         assert_eq!(event.previous_value.value, [0xff, 0, 0x80]);
         assert_eq!(event.previous_value.value.as_ptr() as usize, pointer);
         assert!(!event.previous_value.is_tombstone);
-        assert_eq!(event.original_version(), (1, "writer"));
+        assert_eq!(
+            event.original_version(),
+            (actordb_protocol::RecordVersion::from(1u64), "writer")
+        );
         assert_eq!(event.expires_at_ms, 100);
         assert_eq!(event.observed_at_ms, 200);
         assert_eq!(
@@ -2578,7 +2584,7 @@ mod expiry_callback_tests {
             if kind == 3 {
                 assert_eq!(
                     output.try_recv().unwrap().events[0].original_version(),
-                    (1, "writer")
+                    (actordb_protocol::RecordVersion::from(1u64), "writer")
                 );
             } else {
                 assert!(output.try_recv().is_err());
@@ -2632,7 +2638,10 @@ mod expiry_callback_tests {
                     );
                     if cleanup_first {
                         let event = output.try_recv().unwrap().events.remove(0);
-                        assert_eq!(event.original_version(), (1, "writer"));
+                        assert_eq!(
+                            event.original_version(),
+                            (actordb_protocol::RecordVersion::from(1u64), "writer")
+                        );
                         // Callback delivery occurs after the newer version was
                         // installed. A consumer must compare versions first.
                         assert!(newer.wins_over(&event.previous_value));
@@ -2723,7 +2732,7 @@ mod expiry_callback_tests {
         runtime.shutdown().await;
         assert_eq!(
             output.try_recv().unwrap().events[0].original_version(),
-            (1, "writer")
+            (actordb_protocol::RecordVersion::from(1u64), "writer")
         );
         assert_eq!(runtime.diagnostics().delivered_events, 1);
         assert_eq!(

@@ -357,6 +357,7 @@ impl ReadReply {
                     response.found = true;
                     response.value = value.value;
                     response.timestamp_ms = value.timestamp_ms;
+                    response.logical_counter = value.logical_counter;
                     response.node_id = value.node_id;
                     response.expires_at_ms = value.expires_at_ms.unwrap_or(0);
                     response.is_tombstone = value.is_tombstone;
@@ -382,6 +383,7 @@ impl ReadReply {
                         result.found = true;
                         result.value = value.value;
                         result.timestamp_ms = value.timestamp_ms;
+                        result.logical_counter = value.logical_counter;
                         result.node_id = value.node_id;
                         result.expires_at_ms = value.expires_at_ms.unwrap_or(0);
                         result.is_tombstone = value.is_tombstone;

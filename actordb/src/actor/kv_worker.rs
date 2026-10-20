@@ -307,6 +307,7 @@ mod tests {
             found: true,
             value: value.value.clone(),
             timestamp_ms: value.timestamp_ms,
+            logical_counter: value.logical_counter,
             node_id: value.node_id.clone(),
             ..BatchKeyValue::default()
         });

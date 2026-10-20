@@ -2,6 +2,15 @@
 
 ## 0.7.0
 
+- Use physical/logical record versions to prevent high throughput from creating
+  future clock skew and blocking replication or immediate restart. Peer protocol
+  v4 and application protocol v2 carry the logical counter; upgrade participants
+  together. RocksDB data format v2 reads legacy counters as zero and upgrades
+  validated v1 manifests before writing new records. Back up stores before upgrade.
+- Expose `RecordVersion` and version-aware constructors; `HlcClock::tick` now
+  returns a fallible physical/logical timestamp. Expiry event identities include
+  both components, and application state must compare the complete version.
+
 - Add optional best-effort local TTL expiry callbacks with owned opaque values,
   original LWW versions, stable replica-deduplication identities and batch context.
 - Add an async closure adapter and bounded serial dispatcher with batching,
