@@ -149,7 +149,10 @@ It registers an async closure that forwards batches through a bounded applicatio
 channel. The worker conditionally clears its own versioned index under its own
 lock, making duplicate and delayed events harmless to newer state.
 
-The pending `0.7.0` release includes this API. Full `NodeConfig` struct literals
-need the new fields; prefer its builder or `..Default::default()`. Low-level
-`SupervisorArgs` literals add `expiry_publisher: None`; the builder omits this
-opaque Node-owned ingress by default.
+The pending `0.7.0` release includes this API. Construct `NodeConfig` and
+low-level `SupervisorArgs` through their Bon builders. Node-owned callback
+attachment is private: `ExpiryPublisher` and its supervisor field/builder setter
+are implementation details. Applications configure `ttl_expiry_handler` and
+`ttl_expiry_options` on `NodeConfig`; standalone supervisors default to disabled
+notifications. Fragment identity, worker prefix, and the shared HLC remain
+explicit low-level supervisor inputs.

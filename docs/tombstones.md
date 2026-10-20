@@ -21,21 +21,20 @@ serving the old value forever.
    explicitly include tombstones —
    anti-entropy must ship tombstones so deletes propagate.
 4. **TTL expiry**: an expired live value becomes an expiry tombstone with the
-   same `(timestamp_ms, node_id)` and a winning `is_tombstone` tie-break bit.
+   same `(timestamp_ms, logical_counter, node_id)` and a winning `is_tombstone` tie-break bit.
    It beats the TTL value and every older version without deleting a genuinely
    later put. The marker retains `expires_at_ms`. Reads synthesize this marker
    immediately; the cleaner persists it, and boot rewrites expired durable
    values before serving.
-5. **Retention**: tombstones are retained indefinitely. The
-   `tombstone_gc_age` compatibility field must be `None`; `Node::start`
-   rejects every `Some(age)` setting.
+5. **Retention**: tombstones are retained indefinitely. Obsolete time-based
+   collection options have been removed; no age can certify convergence.
 
 ## Conflict rules
 
-`VersionedValue::wins_over` compares `(timestamp_ms, node_id, is_tombstone)`:
+`VersionedValue::wins_over` compares `(timestamp_ms, logical_counter, node_id, is_tombstone)`:
 
-- Higher timestamp wins (last-writer-wins).
-- On an exact `(timestamp, node_id)` tie, **the tombstone wins** — deletes are
+- Higher physical timestamp wins; its logical counter orders events in the same millisecond.
+- On an exact `(timestamp, logical_counter, node_id)` tie, **the tombstone wins** — deletes are
   explicit.
 - A later put with a higher timestamp resurrects the key normally.
 
@@ -48,20 +47,18 @@ delay, replication progress is not persisted across restart, and the default
 Collecting the source tombstone in any of those states can allow an older
 value to reappear.
 
-For that reason `Node::start` rejects every
-`tombstone_gc_age: Some(..)` configuration before binding its listener or
-spawning actors. Safe reclamation needs durable per-replica convergence
+For that reason the obsolete `tombstone_gc_age` and `reset_senders` settings
+have been removed. Safe reclamation needs durable per-replica convergence
 evidence scoped to each key; those persisted watermarks do not exist yet.
 Dynamic placement's whole-fragment prefix retirement is different: it has a
 closed replica set, exact full-state handoff, and quiesced namespace, so it
 does not authorize arbitrary tombstone collection.
-The field remains temporarily for source compatibility and must be `None`.
 The public `FragmentState::gc_tombstones` method likewise remains as a
 source-compatible no-op that retains every tombstone and returns zero.
 
 ## On-disk encoding
 
-Tombstones persist with the `is_tombstone` byte set in the 21-byte value
+Tombstones persist with the `is_tombstone` byte set in the 29-byte value
 header (see [Persistence](persistence.md)). Expiry tombstones additionally
 retain the original TTL deadline. They are durable across restarts — which is
 why delete state survives a node restart.

@@ -5,10 +5,8 @@
 
 //! Automatic paged TTL materialization and explicit manual sweeps.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::Mutex;
 
 use ractor::{Actor, ActorProcessingErr, ActorRef, ActorStatus};
 
@@ -34,20 +32,14 @@ pub enum CleanerMessage {
 pub struct Cleaner;
 
 /// The fragment and shared state are required; the default sweep interval is
-/// 30 seconds. Legacy compatibility fields may be omitted.
+/// 30 seconds. Tombstones retain their immutable version floors.
 #[derive(Clone, bon::Builder)]
 pub struct CleanerArgs {
-    /// Legacy compatibility field. The cleaner no longer uses fragment ids.
+    /// Fragment identity supplied by the owning subtree.
     pub fragment: FragmentId,
     pub shared: Arc<FragmentState>,
     #[builder(default = DEFAULT_CLEAN_INTERVAL)]
     pub interval: Duration,
-    /// Legacy compatibility field. Ignored; tombstones are retained.
-    pub tombstone_gc_age: Option<Duration>,
-    /// Legacy compatibility field. Ignored because time-based collection was
-    /// removed rather than guarded by transient sender state.
-    #[builder(default = Arc::new(Mutex::new(HashMap::new())))]
-    pub reset_senders: Arc<Mutex<HashMap<(FragmentId, String), u64>>>,
 }
 
 pub struct CleanerState {
@@ -165,8 +157,6 @@ mod tests {
                 fragment: FragmentId(0),
                 shared: shared.clone(),
                 interval: Duration::from_secs(3600),
-                tombstone_gc_age: None,
-                reset_senders: Arc::new(Mutex::new(HashMap::new())),
             },
         )
         .await

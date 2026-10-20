@@ -786,7 +786,6 @@ mod tests {
             SenderDeps {
                 router,
                 hlc: Arc::new(Mutex::new(HlcClock::new())),
-                reset_senders: Arc::new(Mutex::new(HashMap::new())),
                 state_report: report.clone(),
             },
             SenderRuntimeOptions::default(),

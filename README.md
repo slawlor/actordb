@@ -330,7 +330,6 @@ Key `NodeConfig` knobs:
 | `flush_batch_size` / `flush_interval` | 1000 / 100ms | Persistence batching |
 | `clean_interval` | 30s | TTL-expiry tombstone materialization cadence |
 | `snapshot_interval` | 60s | Periodic durable flush |
-| `tombstone_gc_age` | None | Compatibility field; every `Some(age)` is rejected because safe distributed GC is not implemented |
 | `replication` | defaults | `SenderConfig`: batching, in-flight/buffer bounds, reconcile cadence/timeout, required ACK durability |
 | `placement_controller` | None | Phase 8: `Some(Arc<dyn PlacementController>)` opts into dynamic placement |
 | `placement_poll_interval` | 1s | Phase 8: how often the driver re-evaluates desired placement |
@@ -633,8 +632,8 @@ as issues in the [issue tracker](https://github.com/slawlor/actordb/issues):
   generated `ReplicationAckLevel`, or the advanced `SupervisorMessage` API
   must include their new variants (`StableCommitted` and `FlushStable` where
   applicable).
-- **Tombstones are retained** — `Node::start` rejects every
-  `tombstone_gc_age: Some(..)` setting. Safe reclamation needs durable
+- **Tombstones are retained** — obsolete time-based collection settings have
+  been removed. Safe reclamation needs durable
   per-replica convergence evidence; elapsed wall-clock time cannot prove that
   condition. Whole retired fragment namespaces are a separate lifecycle case.
 - **Revoked RocksDB prefixes retire after a stable revision-pinned handoff** — placement

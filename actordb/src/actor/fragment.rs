@@ -112,14 +112,16 @@ impl std::error::Error for FragmentStartupStorageError {}
 
 /// Arguments to spawn a [`FragmentSupervisor`].
 /// The fragment, worker prefix and Node-wide HLC remain required. Omitted
-/// tuning settings match [`crate::node::NodeConfig`] defaults.
+/// tuning settings match [`crate::node::NodeConfig`] defaults. Use
+/// [`SupervisorArgs::builder`] for construction: Node-owned callback attachment
+/// is private, while fragment, worker prefix, and clock remain caller inputs.
 #[derive(Clone, bon::Builder)]
 pub struct SupervisorArgs {
     /// Which fragment this supervisor owns.
     pub fragment: FragmentId,
-    /// Opaque Node-owned callback ingress; disabled by default.
-    #[doc(hidden)]
-    pub expiry_publisher: Option<ExpiryPublisher>,
+    /// Node-owned callback ingress; deliberately absent from the public builder.
+    #[builder(skip = None)]
+    expiry_publisher: Option<ExpiryPublisher>,
     /// Prefix for worker actor names (unique per supervisor).
     #[builder(into)]
     pub worker_prefix: String,
@@ -151,12 +153,14 @@ pub struct SupervisorArgs {
     /// How often the snapshotter flushes to the store.
     #[builder(default = DEFAULT_SNAPSHOT_INTERVAL)]
     pub snapshot_interval: Duration,
-    /// Legacy compatibility field. Ignored; node startup rejects `Some`.
-    pub tombstone_gc_age: Option<Duration>,
-    /// Legacy compatibility field. The removed collector no longer consults
-    /// replication reset state.
-    #[builder(default = Arc::new(Mutex::new(HashMap::new())))]
-    pub reset_senders: Arc<Mutex<HashMap<(FragmentId, String), u64>>>,
+}
+
+impl SupervisorArgs {
+    /// Attach the Node-owned ingress after public builder construction.
+    pub(crate) fn with_expiry_publisher(mut self, publisher: Option<ExpiryPublisher>) -> Self {
+        self.expiry_publisher = publisher;
+        self
+    }
 }
 
 pub(crate) const DEFAULT_FLUSH_BATCH_SIZE: usize = 1000;
@@ -485,8 +489,6 @@ impl FragmentSupervisor {
                 .fragment(args.fragment)
                 .shared(shared.clone())
                 .interval(args.clean_interval)
-                .maybe_tombstone_gc_age(args.tombstone_gc_age)
-                .reset_senders(args.reset_senders.clone())
                 .build(),
             cell.clone(),
         )
@@ -643,8 +645,6 @@ impl Actor for FragmentSupervisor {
                         .fragment(state.args.fragment)
                         .shared(state.shared.clone())
                         .interval(state.args.clean_interval)
-                        .maybe_tombstone_gc_age(state.args.tombstone_gc_age)
-                        .reset_senders(state.args.reset_senders.clone())
                         .build(),
                     myself_cell,
                 )
@@ -1106,8 +1106,6 @@ mod tests {
                 flush_interval: Duration::from_secs(3600),
                 clean_interval: Duration::from_secs(3600),
                 snapshot_interval: Duration::from_secs(3600),
-                tombstone_gc_age: None,
-                reset_senders: Arc::new(Mutex::new(HashMap::new())),
             }
         }
 
@@ -1366,8 +1364,6 @@ mod tests {
                 flush_interval: Duration::from_secs(3600),
                 clean_interval: Duration::from_millis(2),
                 snapshot_interval: Duration::from_secs(3600),
-                tombstone_gc_age: None,
-                reset_senders: Arc::new(Mutex::new(HashMap::new())),
             };
             let (dispatcher, _) = KvActor::spawn(
                 None,
@@ -1390,8 +1386,6 @@ mod tests {
                     fragment: args.fragment,
                     shared: shared.clone(),
                     interval: args.clean_interval,
-                    tombstone_gc_age: None,
-                    reset_senders: args.reset_senders.clone(),
                 },
             )
             .await
@@ -1500,8 +1494,6 @@ mod tests {
                     flush_interval: Duration::from_secs(3600),
                     clean_interval: Duration::from_secs(3600),
                     snapshot_interval: Duration::from_secs(3600),
-                    tombstone_gc_age: None,
-                    reset_senders: Arc::new(Mutex::new(HashMap::new())),
                 },
             )
             .await;
@@ -1545,8 +1537,6 @@ mod tests {
                     flush_interval: Duration::from_secs(3600),
                     clean_interval: Duration::from_secs(3600),
                     snapshot_interval: Duration::ZERO,
-                    tombstone_gc_age: None,
-                    reset_senders: Arc::new(Mutex::new(HashMap::new())),
                 },
             )
             .await;
@@ -1590,8 +1580,6 @@ mod tests {
                     flush_interval: Duration::from_secs(3600),
                     clean_interval: Duration::from_secs(3600),
                     snapshot_interval: Duration::from_secs(3600),
-                    tombstone_gc_age: None,
-                    reset_senders: Arc::new(Mutex::new(HashMap::new())),
                 },
             )
             .await

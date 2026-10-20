@@ -350,11 +350,10 @@ impl Control {
     }
 }
 
-/// Opaque transport into the Node-owned dispatcher, threaded through public actor
-/// arguments. Applications register handlers with NodeConfig rather than minting events.
-#[doc(hidden)]
+/// Internal transport into the Node-owned dispatcher. Applications register
+/// handlers through NodeConfig; they cannot mint or attach maintenance events.
 #[derive(Clone)]
-pub struct ExpiryPublisher {
+pub(crate) struct ExpiryPublisher {
     sender: mpsc::Sender<QueuedExpiry>,
     control: Arc<Control>,
 }

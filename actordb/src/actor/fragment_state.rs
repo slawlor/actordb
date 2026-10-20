@@ -2214,8 +2214,6 @@ mod maintenance_diagnostics {
                             fragment: FragmentId(0),
                             shared: shared.clone(),
                             interval: Duration::from_secs(3600),
-                            tombstone_gc_age: None,
-                            reset_senders: Arc::new(Mutex::new(HashMap::new())),
                         },
                     )
                     .await

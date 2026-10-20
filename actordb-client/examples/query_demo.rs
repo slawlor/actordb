@@ -12,10 +12,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Node::start(
             "query-demo".into(),
             "127.0.0.1:0".parse()?,
-            NodeConfig {
-                fragment_count: 4,
-                ..NodeConfig::default()
-            },
+            NodeConfig::builder().fragment_count(4).build(),
         )
         .await?,
     );

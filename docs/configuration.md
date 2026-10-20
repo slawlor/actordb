@@ -96,7 +96,6 @@ below before using the default plain-TCP transport in production.
 | `background_pool` | `PoolConfig` | `2` workers, cap `5_000`, `1000`/s | Bulk traffic; rate-limited by default. |
 | `clean_interval` | `Duration` | `30 s` | How often each fragment's cleaner materializes TTL-expiry tombstones. |
 | `snapshot_interval` | `Duration` | `60 s` | Snapshotter flush cadence (periodic durable flush, not a checkpoint). |
-| `tombstone_gc_age` | `Option<Duration>` | `None` | Compatibility field for the removed collector. Must remain `None`; `Node::start` rejects every `Some(age)` because elapsed time cannot prove replica convergence. |
 | `replication` | `SenderConfig` | see below | Per-fragment×peer sender tuning. |
 | `placement_controller` | `Option<Arc<dyn PlacementController>>` | `None` | `None` = static placement. Set to `ManualPlacement` (or your own controller) for dynamic migration. |
 | `placement_poll_interval` | `Duration` | `1 s` | Driver re-evaluation cadence. Ignored in static mode. |
@@ -308,3 +307,40 @@ required single-record envelope; an oversized legacy record, or one whose
 provenance node id is empty or exceeds 255 UTF-8 bytes, fails startup rather
 than loading data that can never replicate or be returned remotely. Repair or
 remove that record offline before restarting.
+
+## Extensible public options
+
+`NodeConfig` and `SenderConfig` are non-exhaustive. Use their Bon builders to
+select settings; omitted fields keep their documented defaults. Public fields
+remain available for inspecting or adjusting a configuration created through a
+builder or `Default`. This replaces external struct literals in the unpublished
+0.7 API and allows future optional settings to be added compatibly.
+
+```rust
+use actordb::{node::NodeConfig, replication::SenderConfig};
+use std::time::Duration;
+
+let mut config = NodeConfig::builder()
+    .fragment_count(4)
+    .replication(SenderConfig::builder().batch_size(256).build())
+    .build();
+config.flush_interval = Duration::from_millis(50);
+```
+
+### Removed collection options
+
+The obsolete `tombstone_gc_age` and `reset_senders` options have been removed
+from Node/actor configuration and sender dependencies. Remove those builder
+calls or literal fields when migrating. TTL materialization still installs
+retained tombstones; this cleanup does not enable tombstone reclamation.
+
+### Internal expiry publisher attachment
+
+`SupervisorArgs` now has a private, skipped publisher field. Replace external
+supervisor literals with `SupervisorArgs::builder()` and omit any
+`expiry_publisher`/`maybe_expiry_publisher` call. Fragment identity, worker prefix,
+store, shared HLC, and supported tuning settings remain public builder inputs.
+TTL notifications are configured through `NodeConfig::ttl_expiry_handler` and
+`ttl_expiry_options`; ActorDB attaches its crate-private publisher after builder
+construction. Maintenance message trigger types remain opaque public types
+because their messages are public; this does not grant event-publishing access.

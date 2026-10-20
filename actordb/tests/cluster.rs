@@ -695,14 +695,13 @@ async fn raw_replication_drain_source(
     let source = Arc::new(
         test_node_with_config(
             source_id,
-            NodeConfig {
-                fragment_map: HashMap::from([(
+            NodeConfig::builder()
+                .fragment_map(HashMap::from([(
                     FragmentId(0),
                     vec![source_id.to_string(), peer_id.to_string()],
-                )]),
-                replication,
-                ..NodeConfig::default()
-            },
+                )]))
+                .replication(replication)
+                .build(),
         )
         .await,
     );
@@ -800,14 +799,12 @@ async fn invalid_zero_sized_replication_and_placement_config_is_rejected() {
     in_flight_zero.replication.max_in_flight = 0;
     let mut reconcile_zero = NodeConfig::default();
     reconcile_zero.replication.reconcile_timeout = Duration::ZERO;
-    let empty_cluster_secret = NodeConfig {
-        cluster_secret: Some(Vec::new()),
-        ..NodeConfig::default()
-    };
-    let weak_cluster_secret = NodeConfig {
-        cluster_secret: Some(vec![7; 31]),
-        ..NodeConfig::default()
-    };
+    let empty_cluster_secret = NodeConfig::builder()
+        .maybe_cluster_secret(Some(Vec::new()))
+        .build();
+    let weak_cluster_secret = NodeConfig::builder()
+        .maybe_cluster_secret(Some(vec![7; 31]))
+        .build();
 
     for (id, config) in [
         ("invalid-batch", batch_zero),
@@ -826,11 +823,10 @@ async fn invalid_zero_sized_replication_and_placement_config_is_rejected() {
         FragmentId(0),
         vec!["invalid-placement".to_string()],
     )])));
-    let placement_zero = NodeConfig {
-        placement_controller: Some(controller),
-        placement_poll_interval: Duration::ZERO,
-        ..NodeConfig::default()
-    };
+    let placement_zero = NodeConfig::builder()
+        .maybe_placement_controller(Some(controller))
+        .placement_poll_interval(Duration::ZERO)
+        .build();
     assert!(matches!(
         Node::start(
             "invalid-placement".to_string(),
@@ -843,10 +839,9 @@ async fn invalid_zero_sized_replication_and_placement_config_is_rejected() {
 
     #[cfg(target_pointer_width = "64")]
     {
-        let too_many_fragments = NodeConfig {
-            fragment_count: u32::MAX as usize + 1,
-            ..NodeConfig::default()
-        };
+        let too_many_fragments = NodeConfig::builder()
+            .fragment_count(u32::MAX as usize + 1)
+            .build();
         assert!(matches!(
             Node::start(
                 "invalid-fragment-count".to_string(),
@@ -874,10 +869,12 @@ async fn invalid_zero_sized_replication_and_placement_config_is_rejected() {
             Node::start(
                 "invalid-member-id".to_string(),
                 occupied_addr,
-                NodeConfig {
-                    members: HashMap::from([(invalid_member, "127.0.0.1:9".parse().unwrap())]),
-                    ..NodeConfig::default()
-                },
+                NodeConfig::builder()
+                    .members(HashMap::from([(
+                        invalid_member,
+                        "127.0.0.1:9".parse().unwrap()
+                    )]))
+                    .build(),
             )
             .await,
             Err(NodeError::Actor(_))
@@ -887,13 +884,12 @@ async fn invalid_zero_sized_replication_and_placement_config_is_rejected() {
         Node::start(
             "invalid-static-placement-id".to_string(),
             occupied_addr,
-            NodeConfig {
-                fragment_map: HashMap::from([(
+            NodeConfig::builder()
+                .fragment_map(HashMap::from([(
                     FragmentId(0),
                     vec!["invalid-static-placement-id".to_string(), String::new()],
-                )]),
-                ..NodeConfig::default()
-            },
+                )]))
+                .build(),
         )
         .await,
         Err(NodeError::Actor(_))
@@ -995,11 +991,10 @@ async fn static_placement_ignores_unused_placement_intervals() {
     let node = Node::start(
         "static-unused-intervals".to_string(),
         "127.0.0.1:0".parse().unwrap(),
-        NodeConfig {
-            placement_poll_interval: Duration::ZERO,
-            placement_drain_warn_interval: Duration::MAX,
-            ..NodeConfig::default()
-        },
+        NodeConfig::builder()
+            .placement_poll_interval(Duration::ZERO)
+            .placement_drain_warn_interval(Duration::MAX)
+            .build(),
     )
     .await
     .unwrap();
@@ -1012,32 +1007,12 @@ async fn static_placement_ignores_unused_placement_intervals() {
 }
 
 #[tokio::test]
-async fn time_based_tombstone_gc_is_rejected_before_binding() {
-    use actordb::node::NodeError;
-
-    let occupied = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = occupied.local_addr().unwrap();
-    let config = NodeConfig {
-        tombstone_gc_age: Some(Duration::from_secs(24 * 60 * 60)),
-        ..NodeConfig::default()
-    };
-
-    assert!(matches!(
-        Node::start("unsafe-gc".to_string(), addr, config).await,
-        Err(NodeError::Actor(message))
-            if message
-                == "tombstone_gc_age is unsupported because time alone cannot prove replica convergence; it must be None"
-    ));
-}
-
-#[tokio::test]
-async fn legacy_tombstone_gc_api_remains_source_compatible_and_safe() {
+async fn maintenance_builders_retain_tombstone_version_floors() {
     use actordb::actor::{FragmentState, HlcClock, PoolConfig};
     use actordb::shard::FragmentId;
     use actordb::supervision::{CleanerArgs, FragmentHealth, SupervisorArgs};
     use tokio::sync::Mutex;
 
-    let reset_senders = Arc::new(Mutex::new(HashMap::new()));
     let shared = Arc::new(FragmentState::new(
         HashMap::from([(
             "deleted".to_string(),
@@ -1047,30 +1022,23 @@ async fn legacy_tombstone_gc_api_remains_source_compatible_and_safe() {
         100,
         Duration::from_secs(1),
     ));
-    let cleaner = CleanerArgs {
-        fragment: FragmentId(0),
-        shared: shared.clone(),
-        interval: Duration::from_secs(1),
-        tombstone_gc_age: Some(Duration::ZERO),
-        reset_senders: reset_senders.clone(),
-    };
-    let supervisor = SupervisorArgs {
-        expiry_publisher: None,
-        fragment: FragmentId(0),
-        worker_prefix: "compat".to_string(),
-        store: None,
-        hlc: Arc::new(Mutex::new(HlcClock::new())),
-        default_pool: PoolConfig::default(),
-        high_pool: PoolConfig::default(),
-        background_pool: PoolConfig::default(),
-        flush_batch_size: 100,
-        persistence: Default::default(),
-        flush_interval: Duration::from_secs(1),
-        clean_interval: Duration::from_secs(1),
-        snapshot_interval: Duration::from_secs(1),
-        tombstone_gc_age: None,
-        reset_senders,
-    };
+    let cleaner = CleanerArgs::builder()
+        .fragment(FragmentId(0))
+        .shared(shared.clone())
+        .interval(Duration::from_secs(1))
+        .build();
+    let supervisor = SupervisorArgs::builder()
+        .fragment(FragmentId(0))
+        .worker_prefix("compat")
+        .hlc(Arc::new(Mutex::new(HlcClock::new())))
+        .default_pool(PoolConfig::default())
+        .high_pool(PoolConfig::default())
+        .background_pool(PoolConfig::default())
+        .flush_batch_size(100)
+        .flush_interval(Duration::from_secs(1))
+        .clean_interval(Duration::from_secs(1))
+        .snapshot_interval(Duration::from_secs(1))
+        .build();
     let health = FragmentHealth {
         fragment: FragmentId(0),
         worker_count: 0,
@@ -1161,12 +1129,11 @@ async fn drain_requires_no_change_verification_round() {
     let (source, mut stream, initial_session_id) = raw_replication_drain_source(
         "stable-drain-source",
         peer_id,
-        SenderConfig {
-            batch_interval: Duration::from_secs(3600),
-            consistency_interval: Duration::from_secs(3600),
-            reconcile_timeout: Duration::from_secs(5),
-            ..SenderConfig::default()
-        },
+        SenderConfig::builder()
+            .batch_interval(Duration::from_secs(3600))
+            .consistency_interval(Duration::from_secs(3600))
+            .reconcile_timeout(Duration::from_secs(5))
+            .build(),
     )
     .await;
     source
@@ -1239,14 +1206,13 @@ async fn drain_ignores_stale_old_session_ack_after_rotation() {
     let (source, mut stream, old_session_id) = raw_replication_drain_source(
         "stale-drain-source",
         peer_id,
-        SenderConfig {
-            batch_size: 1,
-            batch_interval: Duration::from_millis(10),
-            consistency_interval: Duration::from_secs(3600),
-            reconcile_timeout: Duration::from_secs(5),
-            required_ack_durability: ReplicationAckDurability::StoreCommitted,
-            ..SenderConfig::default()
-        },
+        SenderConfig::builder()
+            .batch_size(1)
+            .batch_interval(Duration::from_millis(10))
+            .consistency_interval(Duration::from_secs(3600))
+            .reconcile_timeout(Duration::from_secs(5))
+            .required_ack_durability(ReplicationAckDurability::StoreCommitted)
+            .build(),
     )
     .await;
     source
@@ -1372,12 +1338,11 @@ async fn drain_disconnect_reconnect_retries_same_generation() {
     let (source, mut first_stream, initial_session_id) = raw_replication_drain_source(
         "reconnect-drain-source",
         peer_id,
-        SenderConfig {
-            batch_interval: Duration::from_secs(3600),
-            consistency_interval: Duration::from_secs(3600),
-            reconcile_timeout: Duration::from_secs(5),
-            ..SenderConfig::default()
-        },
+        SenderConfig::builder()
+            .batch_interval(Duration::from_secs(3600))
+            .consistency_interval(Duration::from_secs(3600))
+            .reconcile_timeout(Duration::from_secs(5))
+            .build(),
     )
     .await;
     source
@@ -1473,17 +1438,17 @@ async fn manual_placement_drain_freezes_target_and_keeps_replication_runtime_ali
     let source = Arc::new(
         test_node_with_config(
             source_id,
-            NodeConfig {
-                placement_controller: Some(controller.clone()),
-                placement_poll_interval: Duration::from_millis(10),
-                replication: SenderConfig {
-                    batch_interval: Duration::from_secs(3600),
-                    consistency_interval: Duration::from_secs(3600),
-                    reconcile_timeout: Duration::from_secs(5),
-                    ..SenderConfig::default()
-                },
-                ..NodeConfig::default()
-            },
+            NodeConfig::builder()
+                .maybe_placement_controller(Some(controller.clone()))
+                .placement_poll_interval(Duration::from_millis(10))
+                .replication(
+                    SenderConfig::builder()
+                        .batch_interval(Duration::from_secs(3600))
+                        .consistency_interval(Duration::from_secs(3600))
+                        .reconcile_timeout(Duration::from_secs(5))
+                        .build(),
+                )
+                .build(),
         )
         .await,
     );
@@ -1597,10 +1562,12 @@ async fn single_replica_drain_reports_no_remote_targets() {
 
     let node = test_node_with_config(
         "single-replica",
-        NodeConfig {
-            fragment_map: HashMap::from([(FragmentId(0), vec!["single-replica".to_string()])]),
-            ..NodeConfig::default()
-        },
+        NodeConfig::builder()
+            .fragment_map(HashMap::from([(
+                FragmentId(0),
+                vec!["single-replica".to_string()],
+            )]))
+            .build(),
     )
     .await;
     assert!(matches!(
@@ -1632,15 +1599,17 @@ async fn replication_drain_timeout_retries_the_fenced_overflow_snapshot() {
         FragmentId(0),
         vec!["overflow-source".to_string(), "overflow-target".to_string()],
     )]);
-    let config = || NodeConfig {
-        fragment_map: placement.clone(),
-        replication: SenderConfig {
-            buffer_capacity: 1,
-            batch_interval: Duration::from_secs(3600),
-            consistency_interval: Duration::from_secs(3600),
-            ..SenderConfig::default()
-        },
-        ..NodeConfig::default()
+    let config = || {
+        NodeConfig::builder()
+            .fragment_map(placement.clone())
+            .replication(
+                SenderConfig::builder()
+                    .buffer_capacity(1)
+                    .batch_interval(Duration::from_secs(3600))
+                    .consistency_interval(Duration::from_secs(3600))
+                    .build(),
+            )
+            .build()
     };
     let a = test_node_with_config("overflow-source", config()).await;
     let b = test_node_with_config("overflow-target", config()).await;
@@ -1705,13 +1674,12 @@ async fn local_shutdown_abandons_a_timed_out_replication_drain() {
 
     let node = test_node_with_config(
         "local-escape",
-        NodeConfig {
-            fragment_map: HashMap::from([(
+        NodeConfig::builder()
+            .fragment_map(HashMap::from([(
                 FragmentId(0),
                 vec!["local-escape".to_string(), "absent-peer".to_string()],
-            )]),
-            ..NodeConfig::default()
-        },
+            )]))
+            .build(),
     )
     .await;
     node.put("local-only".to_string(), b"value".to_vec())
@@ -1744,19 +1712,15 @@ async fn concurrent_replication_drain_callers_keep_independent_deadlines() {
     let source = Arc::new(
         test_node_with_config(
             "concurrent-source",
-            NodeConfig {
-                fragment_map: placement.clone(),
-                ..NodeConfig::default()
-            },
+            NodeConfig::builder()
+                .fragment_map(placement.clone())
+                .build(),
         )
         .await,
     );
     let target = test_node_with_config(
         "concurrent-target",
-        NodeConfig {
-            fragment_map: placement,
-            ..NodeConfig::default()
-        },
+        NodeConfig::builder().fragment_map(placement).build(),
     )
     .await;
     source
@@ -1829,22 +1793,21 @@ async fn replication_drain_honors_store_committed_receiver_fence() {
     let target_store = Arc::new(PreloadedStore::default());
     let source = test_node_with_config(
         "durable-source",
-        NodeConfig {
-            replication: SenderConfig {
-                required_ack_durability: ReplicationAckDurability::StoreCommitted,
-                ..SenderConfig::default()
-            },
-            ..NodeConfig::default()
-        },
+        NodeConfig::builder()
+            .replication(
+                SenderConfig::builder()
+                    .required_ack_durability(ReplicationAckDurability::StoreCommitted)
+                    .build(),
+            )
+            .build(),
     )
     .await;
     let target = test_node_with_config(
         "durable-target",
-        NodeConfig {
-            store: Some(target_store.clone()),
-            flush_interval: Duration::from_secs(3600),
-            ..NodeConfig::default()
-        },
+        NodeConfig::builder()
+            .maybe_store(Some(target_store.clone()))
+            .flush_interval(Duration::from_secs(3600))
+            .build(),
     )
     .await;
     target.connect(source.addr()).await.unwrap();
@@ -1894,22 +1857,19 @@ async fn store_committed_drain_rejects_a_storeless_receiver_ack() {
     )]);
     let source = test_node_with_config(
         "strict-source",
-        NodeConfig {
-            fragment_map: placement.clone(),
-            replication: SenderConfig {
-                required_ack_durability: ReplicationAckDurability::StoreCommitted,
-                ..SenderConfig::default()
-            },
-            ..NodeConfig::default()
-        },
+        NodeConfig::builder()
+            .fragment_map(placement.clone())
+            .replication(
+                SenderConfig::builder()
+                    .required_ack_durability(ReplicationAckDurability::StoreCommitted)
+                    .build(),
+            )
+            .build(),
     )
     .await;
     let target = test_node_with_config(
         "storeless-target",
-        NodeConfig {
-            fragment_map: placement,
-            ..NodeConfig::default()
-        },
+        NodeConfig::builder().fragment_map(placement).build(),
     )
     .await;
     target.connect(source.addr()).await.unwrap();
@@ -1956,23 +1916,22 @@ async fn store_committed_drain_persists_to_the_offered_rocksdb_backend() {
     )]);
     let source = test_node_with_config(
         "rocks-source",
-        NodeConfig {
-            fragment_map: placement.clone(),
-            replication: SenderConfig {
-                required_ack_durability: ReplicationAckDurability::StoreCommitted,
-                ..SenderConfig::default()
-            },
-            ..NodeConfig::default()
-        },
+        NodeConfig::builder()
+            .fragment_map(placement.clone())
+            .replication(
+                SenderConfig::builder()
+                    .required_ack_durability(ReplicationAckDurability::StoreCommitted)
+                    .build(),
+            )
+            .build(),
     )
     .await;
     let target_store = Arc::new(RocksDbStore::open(&database).unwrap());
-    let target_config = NodeConfig {
-        store: Some(target_store.clone()),
-        fragment_map: placement.clone(),
-        flush_interval: Duration::from_secs(3600),
-        ..NodeConfig::default()
-    };
+    let target_config = NodeConfig::builder()
+        .maybe_store(Some(target_store.clone()))
+        .fragment_map(placement.clone())
+        .flush_interval(Duration::from_secs(3600))
+        .build();
     let target = test_node_with_config("rocks-target", target_config).await;
     target.connect(source.addr()).await.unwrap();
     wait_for_peers(&source, &target).await;
@@ -2026,24 +1985,20 @@ async fn replication_report_survives_a_later_local_flush_failure() {
     let source_store = Arc::new(ToggleFailStore::default());
     let source = test_node_with_config(
         "flush-source",
-        NodeConfig {
-            fragment_map: placement.clone(),
-            store: Some(source_store.clone()),
-            flush_batch_size: usize::MAX,
-            persistence: Default::default(),
-            flush_interval: Duration::from_secs(3600),
-            snapshot_interval: Duration::from_secs(3600),
-            clean_interval: Duration::from_secs(3600),
-            ..NodeConfig::default()
-        },
+        NodeConfig::builder()
+            .fragment_map(placement.clone())
+            .maybe_store(Some(source_store.clone()))
+            .flush_batch_size(usize::MAX)
+            .persistence(Default::default())
+            .flush_interval(Duration::from_secs(3600))
+            .snapshot_interval(Duration::from_secs(3600))
+            .clean_interval(Duration::from_secs(3600))
+            .build(),
     )
     .await;
     let target = test_node_with_config(
         "flush-target",
-        NodeConfig {
-            fragment_map: placement,
-            ..NodeConfig::default()
-        },
+        NodeConfig::builder().fragment_map(placement).build(),
     )
     .await;
     target.connect(source.addr()).await.unwrap();
@@ -2319,10 +2274,9 @@ async fn configured_member_retries_initial_failure_and_rejects_wrong_identity() 
     let node = Node::start(
         "configured-dialer".to_string(),
         "127.0.0.1:0".parse().unwrap(),
-        NodeConfig {
-            members: HashMap::from([("expected-peer".to_string(), peer_addr)]),
-            ..NodeConfig::default()
-        },
+        NodeConfig::builder()
+            .members(HashMap::from([("expected-peer".to_string(), peer_addr)]))
+            .build(),
     )
     .await
     .unwrap();
@@ -2453,24 +2407,22 @@ async fn simultaneous_dials_elect_one_stable_connection_without_redial_churn() {
     let a = Node::start(
         "a".to_string(),
         "127.0.0.1:0".parse().unwrap(),
-        NodeConfig {
-            network: Arc::new(CountingNetwork {
+        NodeConfig::builder()
+            .network(Arc::new(CountingNetwork {
                 connect_attempts: attempts_a.clone(),
-            }),
-            ..NodeConfig::default()
-        },
+            }))
+            .build(),
     )
     .await
     .unwrap();
     let b = Node::start(
         "b".to_string(),
         "127.0.0.1:0".parse().unwrap(),
-        NodeConfig {
-            network: Arc::new(CountingNetwork {
+        NodeConfig::builder()
+            .network(Arc::new(CountingNetwork {
                 connect_attempts: attempts_b.clone(),
-            }),
-            ..NodeConfig::default()
-        },
+            }))
+            .build(),
     )
     .await
     .unwrap();
@@ -2512,12 +2464,11 @@ async fn concurrent_connect_calls_share_one_transport_dial_intent() {
     let node = Node::start(
         "single-dial-intent".to_string(),
         "127.0.0.1:0".parse().unwrap(),
-        NodeConfig {
-            network: Arc::new(CountingNetwork {
+        NodeConfig::builder()
+            .network(Arc::new(CountingNetwork {
                 connect_attempts: attempts.clone(),
-            }),
-            ..NodeConfig::default()
-        },
+            }))
+            .build(),
     )
     .await
     .unwrap();
@@ -2556,14 +2507,13 @@ async fn concurrent_connect_waiter_never_reports_false_success_after_owner_failu
         Node::start(
             "failed-single-dial".to_string(),
             "127.0.0.1:0".parse().unwrap(),
-            NodeConfig {
-                network: Arc::new(GatedFailNetwork {
+            NodeConfig::builder()
+                .network(Arc::new(GatedFailNetwork {
                     connect_attempts: attempts.clone(),
                     first_entered: first_entered.clone(),
                     release_first: release_first.clone(),
-                }),
-                ..NodeConfig::default()
-            },
+                }))
+                .build(),
         )
         .await
         .unwrap(),
@@ -2602,14 +2552,13 @@ async fn cancelled_connect_owner_releases_pending_intent_to_waiter() {
         Node::start(
             "cancelled-single-dial".to_string(),
             "127.0.0.1:0".parse().unwrap(),
-            NodeConfig {
-                network: Arc::new(GatedFailNetwork {
+            NodeConfig::builder()
+                .network(Arc::new(GatedFailNetwork {
                     connect_attempts: attempts.clone(),
                     first_entered: first_entered.clone(),
                     release_first,
-                }),
-                ..NodeConfig::default()
-            },
+                }))
+                .build(),
         )
         .await
         .unwrap(),
@@ -2852,11 +2801,10 @@ async fn bidirectional_large_reconciliation_keeps_connection_reader_live() {
             )
         })
         .collect();
-    let replication = SenderConfig {
-        consistency_interval: Duration::from_secs(3600),
-        reconcile_timeout: Duration::from_secs(20),
-        ..SenderConfig::default()
-    };
+    let replication = SenderConfig::builder()
+        .consistency_interval(Duration::from_secs(3600))
+        .reconcile_timeout(Duration::from_secs(20))
+        .build();
     let runtime = NodeRuntimeOptions::default()
         .with_peer_queue_byte_capacity(MIN_WRITER_BYTES)
         .with_reconcile_data_admission_timeout(Duration::from_secs(20));
@@ -2864,13 +2812,12 @@ async fn bidirectional_large_reconciliation_keeps_connection_reader_live() {
     let a = Node::start_with_options(
         "large-a".to_string(),
         "127.0.0.1:0".parse().unwrap(),
-        NodeConfig {
-            store: Some(store_a),
-            fragment_count: FRAGMENT_COUNT,
-            fragment_map: fragment_map.clone(),
-            replication: replication.clone(),
-            ..NodeConfig::default()
-        },
+        NodeConfig::builder()
+            .maybe_store(Some(store_a))
+            .fragment_count(FRAGMENT_COUNT)
+            .fragment_map(fragment_map.clone())
+            .replication(replication.clone())
+            .build(),
         runtime.clone(),
     )
     .await
@@ -2878,13 +2825,12 @@ async fn bidirectional_large_reconciliation_keeps_connection_reader_live() {
     let b = Node::start_with_options(
         "large-b".to_string(),
         "127.0.0.1:0".parse().unwrap(),
-        NodeConfig {
-            store: Some(store_b),
-            fragment_count: FRAGMENT_COUNT,
-            fragment_map,
-            replication,
-            ..NodeConfig::default()
-        },
+        NodeConfig::builder()
+            .maybe_store(Some(store_b))
+            .fragment_count(FRAGMENT_COUNT)
+            .fragment_map(fragment_map)
+            .replication(replication)
+            .build(),
         runtime,
     )
     .await
@@ -3161,12 +3107,11 @@ async fn reconcile_barrier_rejects_a_replaced_fragment_incarnation() {
     )])));
     let node = test_node_with_config(
         "incarnation-node",
-        NodeConfig {
-            placement_controller: Some(controller.clone()),
-            placement_poll_interval: Duration::from_millis(10),
-            placement_drain_warn_interval: Duration::from_millis(10),
-            ..NodeConfig::default()
-        },
+        NodeConfig::builder()
+            .maybe_placement_controller(Some(controller.clone()))
+            .placement_poll_interval(Duration::from_millis(10))
+            .placement_drain_warn_interval(Duration::from_millis(10))
+            .build(),
     )
     .await;
     common::wait_for(
@@ -3280,12 +3225,11 @@ async fn failed_immediate_reconciliation_is_not_counted_and_retries() {
     let node = Node::start(
         "sync-failure-receiver".to_string(),
         "127.0.0.1:0".parse().unwrap(),
-        NodeConfig {
-            store: Some(Arc::new(AlwaysFailStore)),
-            flush_batch_size: 1,
-            persistence: Default::default(),
-            ..NodeConfig::default()
-        },
+        NodeConfig::builder()
+            .maybe_store(Some(Arc::new(AlwaysFailStore)))
+            .flush_batch_size(1)
+            .persistence(Default::default())
+            .build(),
     )
     .await
     .unwrap();
@@ -3457,9 +3401,10 @@ async fn rocksdb_store_allows_only_one_live_node_attachment() {
 
     let dir = tempfile::tempdir().unwrap();
     let store = Arc::new(RocksDbStore::open(dir.path()).unwrap());
-    let config = || NodeConfig {
-        store: Some(store.clone()),
-        ..NodeConfig::default()
+    let config = || {
+        NodeConfig::builder()
+            .maybe_store(Some(store.clone()))
+            .build()
     };
     let first = Node::start(
         "shared-store".to_string(),
@@ -3594,15 +3539,16 @@ async fn shutdown_flush_failure_is_retryable_across_all_fragments() {
     use actordb::shard::{fragment_of, FragmentId};
 
     let store = Arc::new(ToggleFailStore::default());
-    let config = || NodeConfig {
-        fragment_count: 2,
-        store: Some(store.clone()),
-        flush_batch_size: usize::MAX,
-        persistence: Default::default(),
-        flush_interval: Duration::from_secs(3600),
-        snapshot_interval: Duration::from_secs(3600),
-        clean_interval: Duration::from_secs(3600),
-        ..NodeConfig::default()
+    let config = || {
+        NodeConfig::builder()
+            .fragment_count(2)
+            .maybe_store(Some(store.clone()))
+            .flush_batch_size(usize::MAX)
+            .persistence(Default::default())
+            .flush_interval(Duration::from_secs(3600))
+            .snapshot_interval(Duration::from_secs(3600))
+            .clean_interval(Duration::from_secs(3600))
+            .build()
     };
     let node = Node::start(
         "retry-shutdown".to_string(),
@@ -3660,15 +3606,16 @@ async fn shutdown_retry_skips_fragments_that_already_reached_the_durability_fenc
     use actordb::shard::{fragment_of, FragmentId};
 
     let store = Arc::new(SelectiveFailStore::new(0));
-    let config = || NodeConfig {
-        fragment_count: 2,
-        store: Some(store.clone()),
-        flush_batch_size: usize::MAX,
-        persistence: Default::default(),
-        flush_interval: Duration::from_secs(3600),
-        snapshot_interval: Duration::from_secs(3600),
-        clean_interval: Duration::from_secs(3600),
-        ..NodeConfig::default()
+    let config = || {
+        NodeConfig::builder()
+            .fragment_count(2)
+            .maybe_store(Some(store.clone()))
+            .flush_batch_size(usize::MAX)
+            .persistence(Default::default())
+            .flush_interval(Duration::from_secs(3600))
+            .snapshot_interval(Duration::from_secs(3600))
+            .clean_interval(Duration::from_secs(3600))
+            .build()
     };
     let node = Node::start(
         "partial-retry-shutdown".to_string(),
@@ -3737,15 +3684,14 @@ async fn cancelled_shutdown_waiter_resumes_retained_final_flush() {
         Node::start(
             "cancelled-shutdown".to_string(),
             "127.0.0.1:0".parse().unwrap(),
-            NodeConfig {
-                store: Some(store.clone()),
-                flush_batch_size: usize::MAX,
-                persistence: Default::default(),
-                flush_interval: Duration::from_secs(3600),
-                snapshot_interval: Duration::from_secs(3600),
-                clean_interval: Duration::from_secs(3600),
-                ..NodeConfig::default()
-            },
+            NodeConfig::builder()
+                .maybe_store(Some(store.clone()))
+                .flush_batch_size(usize::MAX)
+                .persistence(Default::default())
+                .flush_interval(Duration::from_secs(3600))
+                .snapshot_interval(Duration::from_secs(3600))
+                .clean_interval(Duration::from_secs(3600))
+                .build(),
         )
         .await
         .unwrap(),
@@ -3794,15 +3740,14 @@ async fn shutdown_rejects_new_calls_and_waits_for_an_admitted_put() {
         Node::start(
             "operation-fence".to_string(),
             "127.0.0.1:0".parse().unwrap(),
-            NodeConfig {
-                store: Some(store.clone()),
-                flush_batch_size: 1,
-                persistence: Default::default(),
-                flush_interval: Duration::from_secs(3600),
-                snapshot_interval: Duration::from_secs(3600),
-                clean_interval: Duration::from_secs(3600),
-                ..NodeConfig::default()
-            },
+            NodeConfig::builder()
+                .maybe_store(Some(store.clone()))
+                .flush_batch_size(1)
+                .persistence(Default::default())
+                .flush_interval(Duration::from_secs(3600))
+                .snapshot_interval(Duration::from_secs(3600))
+                .clean_interval(Duration::from_secs(3600))
+                .build(),
         )
         .await
         .unwrap(),
@@ -3922,15 +3867,14 @@ async fn shutdown_materializes_expiry_before_the_final_flush() {
     let node = Node::start(
         "shutdown-expiry".to_string(),
         "127.0.0.1:0".parse().unwrap(),
-        NodeConfig {
-            store: Some(store.clone()),
-            flush_batch_size: usize::MAX,
-            persistence: Default::default(),
-            flush_interval: Duration::from_secs(3600),
-            clean_interval: Duration::from_secs(3600),
-            snapshot_interval: Duration::from_secs(3600),
-            ..NodeConfig::default()
-        },
+        NodeConfig::builder()
+            .maybe_store(Some(store.clone()))
+            .flush_batch_size(usize::MAX)
+            .persistence(Default::default())
+            .flush_interval(Duration::from_secs(3600))
+            .clean_interval(Duration::from_secs(3600))
+            .snapshot_interval(Duration::from_secs(3600))
+            .build(),
     )
     .await
     .unwrap();
@@ -3959,12 +3903,11 @@ async fn memory_store_exercises_persistence_plumbing() {
     use actordb::store::MemoryStore;
     use std::sync::Arc;
 
-    let config = NodeConfig {
-        store: Some(Arc::new(MemoryStore)),
-        flush_batch_size: 1,
-        persistence: Default::default(),
-        ..NodeConfig::default()
-    };
+    let config = NodeConfig::builder()
+        .maybe_store(Some(Arc::new(MemoryStore)))
+        .flush_batch_size(1)
+        .persistence(Default::default())
+        .build();
     let a = Node::start("a".to_string(), "127.0.0.1:0".parse().unwrap(), config)
         .await
         .expect("node failed to start");
@@ -3977,13 +3920,12 @@ async fn memory_store_exercises_persistence_plumbing() {
 #[tokio::test]
 async fn ttl_expiry_is_persisted_as_a_versioned_tombstone() {
     let store = Arc::new(PreloadedStore::default());
-    let config = NodeConfig {
-        store: Some(store.clone()),
-        flush_batch_size: 1,
-        persistence: Default::default(),
-        clean_interval: Duration::from_millis(10),
-        ..NodeConfig::default()
-    };
+    let config = NodeConfig::builder()
+        .maybe_store(Some(store.clone()))
+        .flush_batch_size(1)
+        .persistence(Default::default())
+        .clean_interval(Duration::from_millis(10))
+        .build();
     let node = Node::start(
         "ttl-durable".to_string(),
         "127.0.0.1:0".parse().unwrap(),
@@ -4018,10 +3960,9 @@ async fn ttl_expiry_is_persisted_as_a_versioned_tombstone() {
 
 #[tokio::test]
 async fn ttl_expiry_does_not_resurrect_an_older_partitioned_value() {
-    let config = NodeConfig {
-        clean_interval: Duration::from_millis(10),
-        ..NodeConfig::default()
-    };
+    let config = NodeConfig::builder()
+        .clean_interval(Duration::from_millis(10))
+        .build();
     let a = Node::start("ttl-a".to_string(), "127.0.0.1:0".parse().unwrap(), config)
         .await
         .expect("node a failed to start");
@@ -4076,10 +4017,9 @@ async fn startup_rewrites_expired_durable_values_as_tombstones() {
     let mut expired = VersionedValue::new(b"stale".to_vec(), timestamp, "old".to_string());
     expired.expires_at_ms = Some(now_ms().saturating_sub(1));
     store.insert_fragment_zero("expired-at-boot", expired.clone());
-    let config = NodeConfig {
-        store: Some(store.clone()),
-        ..NodeConfig::default()
-    };
+    let config = NodeConfig::builder()
+        .maybe_store(Some(store.clone()))
+        .build();
 
     let node = Node::start(
         "ttl-restart".to_string(),
@@ -4112,12 +4052,11 @@ async fn persisted_version_seeds_clock_before_first_write() {
             "previous-boot".to_string(),
         ),
     );
-    let config = NodeConfig {
-        store: Some(store.clone()),
-        flush_batch_size: 1,
-        persistence: Default::default(),
-        ..NodeConfig::default()
-    };
+    let config = NodeConfig::builder()
+        .maybe_store(Some(store.clone()))
+        .flush_batch_size(1)
+        .persistence(Default::default())
+        .build();
 
     let node = Node::start(
         "node".to_string(),
@@ -4161,10 +4100,7 @@ async fn startup_rejects_out_of_policy_persisted_timestamp() {
         "poisoned",
         VersionedValue::new(b"bad".to_vec(), u64::MAX, "old-peer".to_string()),
     );
-    let config = NodeConfig {
-        store: Some(store),
-        ..NodeConfig::default()
-    };
+    let config = NodeConfig::builder().maybe_store(Some(store)).build();
 
     match Node::start("node".to_string(), "127.0.0.1:0".parse().unwrap(), config).await {
         Ok(node) => {
@@ -4184,10 +4120,7 @@ async fn startup_rejects_invalid_persisted_provenance() {
     for node_id in [String::new(), "x".repeat(256)] {
         let store = Arc::new(PreloadedStore::default());
         store.insert_fragment_zero("poisoned", VersionedValue::new(b"bad".to_vec(), 1, node_id));
-        let config = NodeConfig {
-            store: Some(store),
-            ..NodeConfig::default()
-        };
+        let config = NodeConfig::builder().maybe_store(Some(store)).build();
 
         match Node::start("node".to_string(), "127.0.0.1:0".parse().unwrap(), config).await {
             Ok(node) => {
@@ -4212,10 +4145,7 @@ async fn fragments_route_and_isolate() {
     use actordb::shard::fragment_of;
     use std::collections::HashSet;
 
-    let config = NodeConfig {
-        fragment_count: 4,
-        ..NodeConfig::default()
-    };
+    let config = NodeConfig::builder().fragment_count(4).build();
     let a = Node::start("a".to_string(), "127.0.0.1:0".parse().unwrap(), config)
         .await
         .expect("node failed to start");
@@ -4261,10 +4191,11 @@ async fn disjoint_fragments_route_to_owner() {
         fmap.insert(FragmentId(i as u32), vec![owner.to_string()]);
     }
 
-    let mk = || NodeConfig {
-        fragment_count: frag_count,
-        fragment_map: fmap.clone(),
-        ..NodeConfig::default()
+    let mk = || {
+        NodeConfig::builder()
+            .fragment_count(frag_count)
+            .fragment_map(fmap.clone())
+            .build()
     };
     let a = Node::start("a".to_string(), "127.0.0.1:0".parse().unwrap(), mk())
         .await
@@ -4329,10 +4260,11 @@ async fn replica_fanout_reaches_other_holder() {
     fmap.insert(FragmentId(2), vec!["b".to_string()]);
     fmap.insert(FragmentId(3), vec!["c".to_string()]);
 
-    let mk = || NodeConfig {
-        fragment_count: frag_count,
-        fragment_map: fmap.clone(),
-        ..NodeConfig::default()
+    let mk = || {
+        NodeConfig::builder()
+            .fragment_count(frag_count)
+            .fragment_map(fmap.clone())
+            .build()
     };
     let a = Node::start("a".to_string(), "127.0.0.1:0".parse().unwrap(), mk())
         .await
@@ -4369,13 +4301,12 @@ async fn replica_fanout_reaches_other_holder() {
 async fn worker_pool_concurrent_keys_and_ordering() {
     use std::sync::Arc;
 
-    let config = NodeConfig {
-        default_pool: actordb::actor::PoolConfig {
+    let config = NodeConfig::builder()
+        .default_pool(actordb::actor::PoolConfig {
             workers: 8,
             ..Default::default()
-        },
-        ..NodeConfig::default()
-    };
+        })
+        .build();
     let a = Arc::new(
         Node::start("a".to_string(), "127.0.0.1:0".parse().unwrap(), config)
             .await
@@ -4420,13 +4351,12 @@ async fn worker_pool_concurrent_keys_and_ordering() {
 #[tokio::test]
 async fn ttl_expiry_removes_key() {
     let store = Arc::new(PreloadedStore::default());
-    let config = NodeConfig {
-        store: Some(store.clone()),
-        flush_batch_size: 1,
-        persistence: Default::default(),
-        clean_interval: Duration::from_millis(50),
-        ..NodeConfig::default()
-    };
+    let config = NodeConfig::builder()
+        .maybe_store(Some(store.clone()))
+        .flush_batch_size(1)
+        .persistence(Default::default())
+        .clean_interval(Duration::from_millis(50))
+        .build();
     let a = Node::start("a".to_string(), "127.0.0.1:0".parse().unwrap(), config)
         .await
         .unwrap();
@@ -4476,14 +4406,13 @@ async fn ttl_expiry_removes_key() {
 async fn worker_kill_triggers_supervised_restart() {
     use ractor::registry::where_is;
 
-    let config = NodeConfig {
-        fragment_count: 2,
-        default_pool: actordb::actor::PoolConfig {
+    let config = NodeConfig::builder()
+        .fragment_count(2)
+        .default_pool(actordb::actor::PoolConfig {
             workers: 2,
             ..Default::default()
-        },
-        ..NodeConfig::default()
-    };
+        })
+        .build();
     let a = Node::start("a".to_string(), "127.0.0.1:0".parse().unwrap(), config)
         .await
         .unwrap();
@@ -4638,10 +4567,7 @@ async fn delete_survives_restart_and_rejoin() {
 /// node's write would win forever.
 #[tokio::test]
 async fn hlc_orders_writes_under_clock_skew() {
-    let skewed_config = NodeConfig {
-        clock_skew_ms: 300_000, // +5 minutes
-        ..NodeConfig::default()
-    };
+    let skewed_config = NodeConfig::builder().clock_skew_ms(300_000).build();
     let fast = Node::start(
         "fast".to_string(),
         "127.0.0.1:0".parse().unwrap(),
@@ -4706,30 +4632,34 @@ async fn sender_buffer_reset_and_reconcile() {
     use actordb::shard::FragmentId;
 
     let fragment_map = HashMap::from([(FragmentId(0), vec!["a".to_string(), "b".to_string()])]);
-    let config = NodeConfig {
-        fragment_map: fragment_map.clone(),
-        replication: SenderConfig {
-            retained_byte_capacity: SenderConfig::default().retained_byte_capacity,
-            batch_size: 5,
-            batch_interval: Duration::from_millis(50),
-            max_in_flight: 2,
-            buffer_capacity: 10, // small: overflow quickly
-            consistency_interval: Duration::from_secs(3600), // disable periodic
-            reconcile_timeout: Duration::from_secs(30),
-            required_ack_durability: actordb::replication::ReplicationAckDurability::MemoryApplied,
-        },
-        ..NodeConfig::default()
-    };
+    let config = NodeConfig::builder()
+        .fragment_map(fragment_map.clone())
+        .replication(
+            SenderConfig::builder()
+                .retained_byte_capacity(SenderConfig::default().retained_byte_capacity)
+                .batch_size(5)
+                .batch_interval(Duration::from_millis(50))
+                .max_in_flight(2)
+                .buffer_capacity(10)
+                // small: overflow quickly
+                .consistency_interval(Duration::from_secs(3600))
+                // disable periodic
+                .reconcile_timeout(Duration::from_secs(30))
+                .required_ack_durability(
+                    actordb::replication::ReplicationAckDurability::MemoryApplied,
+                )
+                .build(),
+        )
+        .build();
     let a = Node::start("a".to_string(), "127.0.0.1:0".parse().unwrap(), config)
         .await
         .unwrap();
     let b = Node::start(
         "b".to_string(),
         "127.0.0.1:0".parse().unwrap(),
-        NodeConfig {
-            fragment_map: fragment_map.clone(),
-            ..NodeConfig::default()
-        },
+        NodeConfig::builder()
+            .fragment_map(fragment_map.clone())
+            .build(),
     )
     .await
     .unwrap();
@@ -4769,10 +4699,7 @@ async fn sender_buffer_reset_and_reconcile() {
     let b2 = Node::start(
         "b".to_string(),
         "127.0.0.1:0".parse().unwrap(),
-        NodeConfig {
-            fragment_map,
-            ..NodeConfig::default()
-        },
+        NodeConfig::builder().fragment_map(fragment_map).build(),
     )
     .await
     .unwrap();
@@ -4802,19 +4729,22 @@ async fn live_connected_overflow_reconciles_without_reconnect() {
     use actordb::replication::SenderConfig;
     use actordb::shard::FragmentId;
 
-    let config = NodeConfig {
-        replication: SenderConfig {
-            retained_byte_capacity: SenderConfig::default().retained_byte_capacity,
-            batch_size: 100,
-            batch_interval: Duration::from_secs(3600),
-            max_in_flight: 1,
-            buffer_capacity: 2,
-            consistency_interval: Duration::from_secs(3600),
-            reconcile_timeout: Duration::from_secs(30),
-            required_ack_durability: actordb::replication::ReplicationAckDurability::MemoryApplied,
-        },
-        ..NodeConfig::default()
-    };
+    let config = NodeConfig::builder()
+        .replication(
+            SenderConfig::builder()
+                .retained_byte_capacity(SenderConfig::default().retained_byte_capacity)
+                .batch_size(100)
+                .batch_interval(Duration::from_secs(3600))
+                .max_in_flight(1)
+                .buffer_capacity(2)
+                .consistency_interval(Duration::from_secs(3600))
+                .reconcile_timeout(Duration::from_secs(30))
+                .required_ack_durability(
+                    actordb::replication::ReplicationAckDurability::MemoryApplied,
+                )
+                .build(),
+        )
+        .build();
     let a = Node::start(
         "live-reset-a".to_string(),
         "127.0.0.1:0".parse().unwrap(),
@@ -4877,14 +4807,16 @@ async fn unchanged_placement_polls_preserve_sender_session() {
     let mut placement = HashMap::new();
     placement.insert(FragmentId(0), vec!["stable-a".to_string()]);
     let controller = Arc::new(ManualPlacement::new(placement));
-    let make_config = || NodeConfig {
-        placement_controller: Some(controller.clone()),
-        placement_poll_interval: Duration::from_millis(25),
-        replication: SenderConfig {
-            consistency_interval: Duration::from_secs(3600),
-            ..SenderConfig::default()
-        },
-        ..NodeConfig::default()
+    let make_config = || {
+        NodeConfig::builder()
+            .maybe_placement_controller(Some(controller.clone()))
+            .placement_poll_interval(Duration::from_millis(25))
+            .replication(
+                SenderConfig::builder()
+                    .consistency_interval(Duration::from_secs(3600))
+                    .build(),
+            )
+            .build()
     };
     let a = Node::start(
         "stable-a".to_string(),
@@ -4969,21 +4901,23 @@ async fn stale_reconcile_round_cannot_complete_live_reset() {
     let node = Node::start(
         "reset-sender".to_string(),
         "127.0.0.1:0".parse().unwrap(),
-        NodeConfig {
-            fragment_map,
-            replication: SenderConfig {
-                retained_byte_capacity: SenderConfig::default().retained_byte_capacity,
-                batch_size: 100,
-                batch_interval: Duration::from_secs(3600),
-                max_in_flight: 1,
-                buffer_capacity: 1,
-                consistency_interval: Duration::from_secs(3600),
-                reconcile_timeout: Duration::from_secs(30),
-                required_ack_durability:
-                    actordb::replication::ReplicationAckDurability::MemoryApplied,
-            },
-            ..NodeConfig::default()
-        },
+        NodeConfig::builder()
+            .fragment_map(fragment_map)
+            .replication(
+                SenderConfig::builder()
+                    .retained_byte_capacity(SenderConfig::default().retained_byte_capacity)
+                    .batch_size(100)
+                    .batch_interval(Duration::from_secs(3600))
+                    .max_in_flight(1)
+                    .buffer_capacity(1)
+                    .consistency_interval(Duration::from_secs(3600))
+                    .reconcile_timeout(Duration::from_secs(30))
+                    .required_ack_durability(
+                        actordb::replication::ReplicationAckDurability::MemoryApplied,
+                    )
+                    .build(),
+            )
+            .build(),
     )
     .await
     .unwrap();
@@ -5180,20 +5114,20 @@ async fn placement_bootstrap_fetch_requires_verification_round() {
     let node = Node::start(
         "bootstrap-target".to_string(),
         "127.0.0.1:0".parse().unwrap(),
-        NodeConfig {
-            placement_controller: Some(controller.clone()),
-            placement_poll_interval: Duration::from_millis(25),
-            replication: SenderConfig {
-                consistency_interval: Duration::from_secs(3600),
-                reconcile_timeout: Duration::from_secs(5),
-                // This node is deliberately storeless. StoreCommitted is a
-                // requirement on remote batch receivers; fetching a winner
-                // locally must remain a valid in-memory bootstrap.
-                required_ack_durability: ReplicationAckDurability::StoreCommitted,
-                ..SenderConfig::default()
-            },
-            ..NodeConfig::default()
-        },
+        NodeConfig::builder()
+            .maybe_placement_controller(Some(controller.clone()))
+            .placement_poll_interval(Duration::from_millis(25))
+            .replication(
+                SenderConfig::builder()
+                    .consistency_interval(Duration::from_secs(3600))
+                    .reconcile_timeout(Duration::from_secs(5))
+                    // This node is deliberately storeless. StoreCommitted is a
+                    // requirement on remote batch receivers; fetching a winner
+                    // locally must remain a valid in-memory bootstrap.
+                    .required_ack_durability(ReplicationAckDurability::StoreCommitted)
+                    .build(),
+            )
+            .build(),
     )
     .await
     .unwrap();
@@ -5368,21 +5302,23 @@ async fn silent_reconcile_phase_times_out_and_retries() {
     let node = Node::start(
         "timeout-sender".to_string(),
         "127.0.0.1:0".parse().unwrap(),
-        NodeConfig {
-            fragment_map,
-            replication: SenderConfig {
-                retained_byte_capacity: SenderConfig::default().retained_byte_capacity,
-                batch_size: 100,
-                batch_interval: Duration::from_secs(3600),
-                max_in_flight: 1,
-                buffer_capacity: 1,
-                consistency_interval: Duration::from_secs(3600),
-                reconcile_timeout: Duration::from_millis(100),
-                required_ack_durability:
-                    actordb::replication::ReplicationAckDurability::MemoryApplied,
-            },
-            ..NodeConfig::default()
-        },
+        NodeConfig::builder()
+            .fragment_map(fragment_map)
+            .replication(
+                SenderConfig::builder()
+                    .retained_byte_capacity(SenderConfig::default().retained_byte_capacity)
+                    .batch_size(100)
+                    .batch_interval(Duration::from_secs(3600))
+                    .max_in_flight(1)
+                    .buffer_capacity(1)
+                    .consistency_interval(Duration::from_secs(3600))
+                    .reconcile_timeout(Duration::from_millis(100))
+                    .required_ack_durability(
+                        actordb::replication::ReplicationAckDurability::MemoryApplied,
+                    )
+                    .build(),
+            )
+            .build(),
     )
     .await
     .unwrap();
@@ -5457,21 +5393,23 @@ async fn inbound_mutation_after_snapshot_invalidates_reset_completion() {
     let node = Node::start(
         "revision-sender".to_string(),
         "127.0.0.1:0".parse().unwrap(),
-        NodeConfig {
-            fragment_map,
-            replication: SenderConfig {
-                retained_byte_capacity: SenderConfig::default().retained_byte_capacity,
-                batch_size: 100,
-                batch_interval: Duration::from_secs(3600),
-                max_in_flight: 1,
-                buffer_capacity: 1,
-                consistency_interval: Duration::from_secs(3600),
-                reconcile_timeout: Duration::from_secs(5),
-                required_ack_durability:
-                    actordb::replication::ReplicationAckDurability::MemoryApplied,
-            },
-            ..NodeConfig::default()
-        },
+        NodeConfig::builder()
+            .fragment_map(fragment_map)
+            .replication(
+                SenderConfig::builder()
+                    .retained_byte_capacity(SenderConfig::default().retained_byte_capacity)
+                    .batch_size(100)
+                    .batch_interval(Duration::from_secs(3600))
+                    .max_in_flight(1)
+                    .buffer_capacity(1)
+                    .consistency_interval(Duration::from_secs(3600))
+                    .reconcile_timeout(Duration::from_secs(5))
+                    .required_ack_durability(
+                        actordb::replication::ReplicationAckDurability::MemoryApplied,
+                    )
+                    .build(),
+            )
+            .build(),
     )
     .await
     .unwrap();
@@ -5612,21 +5550,23 @@ async fn malformed_reconcile_data_is_rejected_without_partial_apply() {
     let node = Node::start(
         "data-sender".to_string(),
         "127.0.0.1:0".parse().unwrap(),
-        NodeConfig {
-            fragment_map,
-            replication: SenderConfig {
-                retained_byte_capacity: SenderConfig::default().retained_byte_capacity,
-                batch_size: 100,
-                batch_interval: Duration::from_secs(3600),
-                max_in_flight: 1,
-                buffer_capacity: 1,
-                consistency_interval: Duration::from_secs(3600),
-                reconcile_timeout: Duration::from_secs(5),
-                required_ack_durability:
-                    actordb::replication::ReplicationAckDurability::MemoryApplied,
-            },
-            ..NodeConfig::default()
-        },
+        NodeConfig::builder()
+            .fragment_map(fragment_map)
+            .replication(
+                SenderConfig::builder()
+                    .retained_byte_capacity(SenderConfig::default().retained_byte_capacity)
+                    .batch_size(100)
+                    .batch_interval(Duration::from_secs(3600))
+                    .max_in_flight(1)
+                    .buffer_capacity(1)
+                    .consistency_interval(Duration::from_secs(3600))
+                    .reconcile_timeout(Duration::from_secs(5))
+                    .required_ack_durability(
+                        actordb::replication::ReplicationAckDurability::MemoryApplied,
+                    )
+                    .build(),
+            )
+            .build(),
     )
     .await
     .unwrap();
@@ -5875,11 +5815,10 @@ async fn session_started_before_actor_installation_survives_placement_race() {
     let node = Node::start(
         "early-session-target".to_string(),
         "127.0.0.1:0".parse().unwrap(),
-        NodeConfig {
-            placement_controller: Some(controller.clone()),
-            placement_poll_interval: Duration::from_millis(25),
-            ..NodeConfig::default()
-        },
+        NodeConfig::builder()
+            .maybe_placement_controller(Some(controller.clone()))
+            .placement_poll_interval(Duration::from_millis(25))
+            .build(),
     )
     .await
     .unwrap();
@@ -6075,10 +6014,11 @@ async fn remote_batches_split_at_wire_item_limit_without_dropping_connection() {
 
     const ITEM_COUNT: usize = 4097;
     let fragment_map = HashMap::from([(FragmentId(0), vec!["batch-owner".to_string()])]);
-    let config = || NodeConfig {
-        fragment_count: 1,
-        fragment_map: fragment_map.clone(),
-        ..NodeConfig::default()
+    let config = || {
+        NodeConfig::builder()
+            .fragment_count(1)
+            .fragment_map(fragment_map.clone())
+            .build()
     };
     let owner = test_node_with_config("batch-owner", config()).await;
     let client = Node::start_with_options(
@@ -6131,10 +6071,11 @@ async fn remote_batches_split_at_encoded_byte_limits_without_false_misses() {
     use actordb::shard::FragmentId;
 
     let fragment_map = HashMap::from([(FragmentId(0), vec!["byte-owner".to_string()])]);
-    let config = || NodeConfig {
-        fragment_count: 1,
-        fragment_map: fragment_map.clone(),
-        ..NodeConfig::default()
+    let config = || {
+        NodeConfig::builder()
+            .fragment_count(1)
+            .fragment_map(fragment_map.clone())
+            .build()
     };
     let owner = test_node_with_config("byte-owner", config()).await;
     let client = Node::start_with_options(
@@ -6210,10 +6151,11 @@ async fn multi_key_partial_failure() {
     let mut fragment_map = std::collections::HashMap::new();
     fragment_map.insert(FragmentId(0), vec!["a".to_string()]);
     fragment_map.insert(FragmentId(1), vec!["b".to_string(), "c".to_string()]);
-    let mk_config = |map: std::collections::HashMap<FragmentId, Vec<String>>| NodeConfig {
-        fragment_count: 2,
-        fragment_map: map,
-        ..NodeConfig::default()
+    let mk_config = |map: std::collections::HashMap<FragmentId, Vec<String>>| {
+        NodeConfig::builder()
+            .fragment_count(2)
+            .fragment_map(map)
+            .build()
     };
     let a = Node::start(
         "a".to_string(),
@@ -6351,10 +6293,7 @@ async fn batch_operations_fail_over_after_a_stale_owner_returns_unavailable() {
             owners.iter().map(|owner| (*owner).to_string()).collect(),
         )])
     };
-    let config = |fragment_map| NodeConfig {
-        fragment_map,
-        ..NodeConfig::default()
-    };
+    let config = |fragment_map| NodeConfig::builder().fragment_map(fragment_map).build();
     let a = Node::start_with_options(
         "stale-a".to_string(),
         "127.0.0.1:0".parse().unwrap(),
@@ -6437,17 +6376,16 @@ async fn mixed_batch_put_retries_only_unavailable_positions_with_exact_stamps() 
     use actordb::proto::{MutationStatus, Priority};
     use actordb::shard::FragmentId;
 
-    let config = NodeConfig {
-        fragment_map: HashMap::from([(
+    let config = NodeConfig::builder()
+        .fragment_map(HashMap::from([(
             FragmentId(0),
             vec![
                 "subset-first".to_string(),
                 "subset-second".to_string(),
                 "subset-third".to_string(),
             ],
-        )]),
-        ..NodeConfig::default()
-    };
+        )]))
+        .build();
     let client = Node::start_with_options(
         "subset-client".to_string(),
         "127.0.0.1:0".parse().unwrap(),
@@ -6586,13 +6524,12 @@ async fn mixed_batch_put_malformed_subset_exhaustion_preserves_terminal_results(
     use actordb::proto::MutationStatus;
     use actordb::shard::FragmentId;
 
-    let config = NodeConfig {
-        fragment_map: HashMap::from([(
+    let config = NodeConfig::builder()
+        .fragment_map(HashMap::from([(
             FragmentId(0),
             vec!["partial-first".to_string(), "partial-second".to_string()],
-        )]),
-        ..NodeConfig::default()
-    };
+        )]))
+        .build();
     let client = Node::start_with_options(
         "partial-client".to_string(),
         "127.0.0.1:0".parse().unwrap(),
@@ -6676,13 +6613,12 @@ async fn timed_out_single_put_retries_the_exact_stamped_operation() {
     use actordb::proto::{MutationResponse, MutationResult, MutationStatus};
     use actordb::shard::FragmentId;
 
-    let config = NodeConfig {
-        fragment_map: HashMap::from([(
+    let config = NodeConfig::builder()
+        .fragment_map(HashMap::from([(
             FragmentId(0),
             vec!["silent-first".to_string(), "responding-second".to_string()],
-        )]),
-        ..NodeConfig::default()
-    };
+        )]))
+        .build();
     let client = Node::start_with_options(
         "retry-client".to_string(),
         "127.0.0.1:0".parse().unwrap(),
@@ -6764,13 +6700,12 @@ async fn timed_out_single_get_tries_the_next_holder() {
     use actordb::proto::{GetResponse, Priority};
     use actordb::shard::FragmentId;
 
-    let config = NodeConfig {
-        fragment_map: HashMap::from([(
+    let config = NodeConfig::builder()
+        .fragment_map(HashMap::from([(
             FragmentId(0),
             vec!["silent-reader".to_string(), "responding-reader".to_string()],
-        )]),
-        ..NodeConfig::default()
-    };
+        )]))
+        .build();
     let client = Node::start_with_options(
         "read-retry-client".to_string(),
         "127.0.0.1:0".parse().unwrap(),
@@ -6913,10 +6848,7 @@ async fn mutation_relay_scans_past_the_origin_to_a_connected_owner() {
             owners.iter().map(|owner| (*owner).to_string()).collect(),
         )])
     };
-    let config = |fragment_map| NodeConfig {
-        fragment_map,
-        ..NodeConfig::default()
-    };
+    let config = |fragment_map| NodeConfig::builder().fragment_map(fragment_map).build();
     let a = Node::start(
         "relay-a".to_string(),
         "127.0.0.1:0".parse().unwrap(),
@@ -6978,19 +6910,18 @@ async fn background_bulk_writes_preserve_high_priority_reads() {
     use actordb::actor::{OpPriority, PoolConfig};
     use std::sync::Arc;
 
-    let config = NodeConfig {
-        background_pool: PoolConfig {
+    let config = NodeConfig::builder()
+        .background_pool(PoolConfig {
             workers: 1,
             queue_cap: 100_000,
             rate_limit_per_sec: None,
-        },
-        high_pool: PoolConfig {
+        })
+        .high_pool(PoolConfig {
             workers: 1,
             queue_cap: 100_000,
             rate_limit_per_sec: None,
-        },
-        ..NodeConfig::default()
-    };
+        })
+        .build();
     let n = Arc::new(
         Node::start("sat".to_string(), "127.0.0.1:0".parse().unwrap(), config)
             .await
@@ -7036,14 +6967,13 @@ async fn queue_cap_shed_is_explicit_and_counted() {
 
     // Degenerate config: the default pool sheds everything (cap 0), so
     // every op deterministically exercises the shed path.
-    let config = NodeConfig {
-        default_pool: PoolConfig {
+    let config = NodeConfig::builder()
+        .default_pool(PoolConfig {
             workers: 1,
             queue_cap: 0,
             rate_limit_per_sec: None,
-        },
-        ..NodeConfig::default()
-    };
+        })
+        .build();
     let n = Node::start("shed".to_string(), "127.0.0.1:0".parse().unwrap(), config)
         .await
         .unwrap();
@@ -7093,14 +7023,13 @@ async fn forwarded_priority_preserved_end_to_end() {
         cfg.fragment_map = map;
         cfg
     };
-    let config_b = NodeConfig {
-        background_pool: PoolConfig {
+    let config_b = NodeConfig::builder()
+        .background_pool(PoolConfig {
             workers: 1,
             queue_cap: 0,
             rate_limit_per_sec: None,
-        },
-        ..NodeConfig::default()
-    };
+        })
+        .build();
     let a = Node::start(
         "a".to_string(),
         "127.0.0.1:0".parse().unwrap(),
@@ -7180,15 +7109,17 @@ async fn remote_batch_read_reports_per_key_shed_and_preserves_high_priority_pool
     use actordb::actor::{OpPriority, PoolConfig};
     use actordb::shard::FragmentId;
 
-    let config = NodeConfig {
-        fragment_map: HashMap::from([(FragmentId(0), vec!["batch-read-owner".to_string()])]),
-        background_pool: PoolConfig {
+    let config = NodeConfig::builder()
+        .fragment_map(HashMap::from([(
+            FragmentId(0),
+            vec!["batch-read-owner".to_string()],
+        )]))
+        .background_pool(PoolConfig {
             workers: 1,
             queue_cap: 1,
             rate_limit_per_sec: Some(1),
-        },
-        ..NodeConfig::default()
-    };
+        })
+        .build();
     let origin = Node::start(
         "batch-read-origin".to_string(),
         "127.0.0.1:0".parse().unwrap(),
@@ -7253,18 +7184,18 @@ async fn forwarded_single_put_returns_remote_backpressure() {
     let mut fragment_map = HashMap::new();
     fragment_map.insert(FragmentId(0), vec!["a".to_string()]);
     fragment_map.insert(FragmentId(1), vec!["b".to_string()]);
-    let config_a = NodeConfig {
-        fragment_count: 2,
-        fragment_map: fragment_map.clone(),
-        ..NodeConfig::default()
-    };
-    let config_b = NodeConfig {
-        default_pool: PoolConfig {
+    let config_a = NodeConfig::builder()
+        .fragment_count(2)
+        .fragment_map(fragment_map.clone())
+        .build();
+    let config_b = {
+        let mut configured = config_a.clone();
+        configured.default_pool = PoolConfig {
             workers: 1,
             queue_cap: 0,
             rate_limit_per_sec: None,
-        },
-        ..config_a.clone()
+        };
+        configured
     };
 
     let a = Node::start("a".to_string(), "127.0.0.1:0".parse().unwrap(), config_a)
@@ -7299,16 +7230,16 @@ async fn forwarded_put_returns_remote_storage_failure() {
     let mut fragment_map = HashMap::new();
     fragment_map.insert(FragmentId(0), vec!["a".to_string()]);
     fragment_map.insert(FragmentId(1), vec!["b".to_string()]);
-    let config_a = NodeConfig {
-        fragment_count: 2,
-        fragment_map: fragment_map.clone(),
-        ..NodeConfig::default()
-    };
-    let config_b = NodeConfig {
-        store: Some(Arc::new(AlwaysFailStore)),
-        flush_batch_size: 1,
-        persistence: Default::default(),
-        ..config_a.clone()
+    let config_a = NodeConfig::builder()
+        .fragment_count(2)
+        .fragment_map(fragment_map.clone())
+        .build();
+    let config_b = {
+        let mut configured = config_a.clone();
+        configured.store = Some(Arc::new(AlwaysFailStore));
+        configured.flush_batch_size = 1;
+        configured.persistence = Default::default();
+        configured
     };
 
     let a = Node::start("a".to_string(), "127.0.0.1:0".parse().unwrap(), config_a)
@@ -7343,10 +7274,11 @@ async fn simultaneous_fragment_gains_bootstrap_only_from_serving_source() {
         FragmentId(0),
         vec!["source-a".to_string()],
     )])));
-    let config = || NodeConfig {
-        placement_controller: Some(controller.clone()),
-        placement_poll_interval: Duration::from_millis(25),
-        ..NodeConfig::default()
+    let config = || {
+        NodeConfig::builder()
+            .maybe_placement_controller(Some(controller.clone()))
+            .placement_poll_interval(Duration::from_millis(25))
+            .build()
     };
     let a = test_node_with_config("source-a", config()).await;
     let b = test_node_with_config("joining-b", config()).await;
@@ -7416,15 +7348,17 @@ async fn placement_migration_no_lost_writes() {
     initial.insert(FragmentId(1), vec!["a".to_string()]);
     let controller = Arc::new(ManualPlacement::new(initial));
 
-    let mk = || NodeConfig {
-        fragment_count: frag_count,
-        placement_controller: Some(controller.clone()),
-        placement_poll_interval: Duration::from_millis(100),
-        replication: SenderConfig {
-            consistency_interval: Duration::from_millis(200),
-            ..SenderConfig::default()
-        },
-        ..NodeConfig::default()
+    let mk = || {
+        NodeConfig::builder()
+            .fragment_count(frag_count)
+            .maybe_placement_controller(Some(controller.clone()))
+            .placement_poll_interval(Duration::from_millis(100))
+            .replication(
+                SenderConfig::builder()
+                    .consistency_interval(Duration::from_millis(200))
+                    .build(),
+            )
+            .build()
     };
     let a = Arc::new(
         Node::start("a".to_string(), "127.0.0.1:0".parse().unwrap(), mk())
@@ -7658,11 +7592,10 @@ async fn placement_retires_rocksdb_prefix_after_stable_handoff() {
         config.placement_drain_warn_interval = Duration::from_millis(100);
         config.snapshot_interval = Duration::from_secs(3600);
         config.clean_interval = Duration::from_secs(3600);
-        config.replication = SenderConfig {
-            batch_interval: Duration::from_millis(10),
-            consistency_interval: Duration::from_millis(100),
-            ..SenderConfig::default()
-        };
+        config.replication = SenderConfig::builder()
+            .batch_interval(Duration::from_millis(10))
+            .consistency_interval(Duration::from_millis(100))
+            .build();
         config
     };
 
@@ -7778,19 +7711,21 @@ async fn placement_prefix_delete_failure_retries_before_stopped() {
     let source_store = Arc::new(RetirementStore::default());
     source_store.fail_delete.store(true, Ordering::SeqCst);
     let target_store = Arc::new(RetirementStore::default());
-    let config = |store: Arc<RetirementStore>| NodeConfig {
-        store: Some(store),
-        placement_controller: Some(controller.clone()),
-        placement_poll_interval: Duration::from_millis(25),
-        placement_drain_warn_interval: Duration::from_millis(50),
-        snapshot_interval: Duration::from_secs(3600),
-        clean_interval: Duration::from_secs(3600),
-        replication: SenderConfig {
-            batch_interval: Duration::from_millis(10),
-            consistency_interval: Duration::from_millis(100),
-            ..SenderConfig::default()
-        },
-        ..NodeConfig::default()
+    let config = |store: Arc<RetirementStore>| {
+        NodeConfig::builder()
+            .maybe_store(Some(store))
+            .maybe_placement_controller(Some(controller.clone()))
+            .placement_poll_interval(Duration::from_millis(25))
+            .placement_drain_warn_interval(Duration::from_millis(50))
+            .snapshot_interval(Duration::from_secs(3600))
+            .clean_interval(Duration::from_secs(3600))
+            .replication(
+                SenderConfig::builder()
+                    .batch_interval(Duration::from_millis(10))
+                    .consistency_interval(Duration::from_millis(100))
+                    .build(),
+            )
+            .build()
     };
     let source = Node::start(
         "delete-source".to_string(),
@@ -7913,23 +7848,25 @@ async fn placement_drain_waits_for_buffer_reset() {
     let node = Node::start(
         "drain-a".to_string(),
         "127.0.0.1:0".parse().unwrap(),
-        NodeConfig {
-            placement_controller: Some(controller.clone()),
-            placement_poll_interval: Duration::from_millis(25),
-            placement_drain_warn_interval: Duration::from_millis(100),
-            replication: SenderConfig {
-                retained_byte_capacity: SenderConfig::default().retained_byte_capacity,
-                batch_size: 100,
-                batch_interval: Duration::from_secs(3600),
-                max_in_flight: 1,
-                buffer_capacity: 1,
-                consistency_interval: Duration::from_secs(3600),
-                reconcile_timeout: Duration::from_secs(30),
-                required_ack_durability:
-                    actordb::replication::ReplicationAckDurability::MemoryApplied,
-            },
-            ..NodeConfig::default()
-        },
+        NodeConfig::builder()
+            .maybe_placement_controller(Some(controller.clone()))
+            .placement_poll_interval(Duration::from_millis(25))
+            .placement_drain_warn_interval(Duration::from_millis(100))
+            .replication(
+                SenderConfig::builder()
+                    .retained_byte_capacity(SenderConfig::default().retained_byte_capacity)
+                    .batch_size(100)
+                    .batch_interval(Duration::from_secs(3600))
+                    .max_in_flight(1)
+                    .buffer_capacity(1)
+                    .consistency_interval(Duration::from_secs(3600))
+                    .reconcile_timeout(Duration::from_secs(30))
+                    .required_ack_durability(
+                        actordb::replication::ReplicationAckDurability::MemoryApplied,
+                    )
+                    .build(),
+            )
+            .build(),
     )
     .await
     .unwrap();
@@ -8096,19 +8033,18 @@ async fn placement_readd_waits_for_failed_final_flush_and_reloads() {
     let node = Node::start(
         "flush-readd-a".to_string(),
         "127.0.0.1:0".parse().unwrap(),
-        NodeConfig {
-            fragment_count: 1,
-            placement_controller: Some(controller.clone()),
-            placement_poll_interval: Duration::from_millis(200),
-            placement_drain_warn_interval: Duration::from_millis(50),
-            store: Some(store.clone()),
-            flush_batch_size: usize::MAX,
-            persistence: Default::default(),
-            flush_interval: Duration::from_secs(3600),
-            snapshot_interval: Duration::from_secs(3600),
-            clean_interval: Duration::from_secs(3600),
-            ..NodeConfig::default()
-        },
+        NodeConfig::builder()
+            .fragment_count(1)
+            .maybe_placement_controller(Some(controller.clone()))
+            .placement_poll_interval(Duration::from_millis(200))
+            .placement_drain_warn_interval(Duration::from_millis(50))
+            .maybe_store(Some(store.clone()))
+            .flush_batch_size(usize::MAX)
+            .persistence(Default::default())
+            .flush_interval(Duration::from_secs(3600))
+            .snapshot_interval(Duration::from_secs(3600))
+            .clean_interval(Duration::from_secs(3600))
+            .build(),
     )
     .await
     .unwrap();
@@ -8201,24 +8137,26 @@ async fn placement_readd_while_draining_cancels_teardown() {
     let node = Node::start(
         "readd-a".to_string(),
         "127.0.0.1:0".parse().unwrap(),
-        NodeConfig {
-            placement_controller: Some(controller.clone()),
-            store: Some(retirement_store),
-            placement_poll_interval: Duration::from_millis(25),
-            placement_drain_warn_interval: Duration::from_millis(100),
-            replication: SenderConfig {
-                retained_byte_capacity: SenderConfig::default().retained_byte_capacity,
-                batch_size: 100,
-                batch_interval: Duration::from_secs(3600),
-                max_in_flight: 1,
-                buffer_capacity: 1,
-                consistency_interval: Duration::from_secs(3600),
-                reconcile_timeout: Duration::from_secs(5),
-                required_ack_durability:
-                    actordb::replication::ReplicationAckDurability::MemoryApplied,
-            },
-            ..NodeConfig::default()
-        },
+        NodeConfig::builder()
+            .maybe_placement_controller(Some(controller.clone()))
+            .maybe_store(Some(retirement_store))
+            .placement_poll_interval(Duration::from_millis(25))
+            .placement_drain_warn_interval(Duration::from_millis(100))
+            .replication(
+                SenderConfig::builder()
+                    .retained_byte_capacity(SenderConfig::default().retained_byte_capacity)
+                    .batch_size(100)
+                    .batch_interval(Duration::from_secs(3600))
+                    .max_in_flight(1)
+                    .buffer_capacity(1)
+                    .consistency_interval(Duration::from_secs(3600))
+                    .reconcile_timeout(Duration::from_secs(5))
+                    .required_ack_durability(
+                        actordb::replication::ReplicationAckDurability::MemoryApplied,
+                    )
+                    .build(),
+            )
+            .build(),
     )
     .await
     .unwrap();
@@ -8394,15 +8332,17 @@ async fn placement_rolling_restart_delta_reconcile_only() {
     map.insert(FragmentId(1), vec!["a".to_string()]);
     let controller = Arc::new(ManualPlacement::new(map));
 
-    let mk = || NodeConfig {
-        fragment_count: frag_count,
-        placement_controller: Some(controller.clone()),
-        placement_poll_interval: Duration::from_millis(100),
-        replication: SenderConfig {
-            consistency_interval: Duration::from_millis(200),
-            ..SenderConfig::default()
-        },
-        ..NodeConfig::default()
+    let mk = || {
+        NodeConfig::builder()
+            .fragment_count(frag_count)
+            .maybe_placement_controller(Some(controller.clone()))
+            .placement_poll_interval(Duration::from_millis(100))
+            .replication(
+                SenderConfig::builder()
+                    .consistency_interval(Duration::from_millis(200))
+                    .build(),
+            )
+            .build()
     };
 
     let a = Node::start("a".to_string(), "127.0.0.1:0".parse().unwrap(), mk())
@@ -8552,14 +8492,13 @@ async fn shed_write_never_acked_ok() {
     use actordb::node::NodeError;
 
     // Degenerate: cap 0 sheds every op deterministically.
-    let config = NodeConfig {
-        default_pool: PoolConfig {
+    let config = NodeConfig::builder()
+        .default_pool(PoolConfig {
             workers: 1,
             queue_cap: 0,
             rate_limit_per_sec: None,
-        },
-        ..NodeConfig::default()
-    };
+        })
+        .build();
     let n = Node::start(
         "shed-ok".to_string(),
         "127.0.0.1:0".parse().unwrap(),
@@ -8596,14 +8535,13 @@ async fn shed_delete_never_acked_ok() {
     use actordb::node::NodeError;
 
     // Degenerate: cap 0 sheds every op deterministically.
-    let config = NodeConfig {
-        default_pool: PoolConfig {
+    let config = NodeConfig::builder()
+        .default_pool(PoolConfig {
             workers: 1,
             queue_cap: 0,
             rate_limit_per_sec: None,
-        },
-        ..NodeConfig::default()
-    };
+        })
+        .build();
     let n = Node::start(
         "shed-del".to_string(),
         "127.0.0.1:0".parse().unwrap(),
@@ -8854,10 +8792,9 @@ async fn pre_handshake_forwarded_put_ignored() {
 /// challenge-bound proof must drop the connection before peer publication.
 #[tokio::test]
 async fn hello_auth_mismatch_drops_connection() {
-    let config = NodeConfig {
-        cluster_secret: Some(vec![0x91; 32]),
-        ..NodeConfig::default()
-    };
+    let config = NodeConfig::builder()
+        .maybe_cluster_secret(Some(vec![0x91; 32]))
+        .build();
     let a = Node::start("a".to_string(), "127.0.0.1:0".parse().unwrap(), config)
         .await
         .unwrap();
@@ -9082,14 +9019,13 @@ async fn same_session_replay_does_not_clear_reconcile_failure() {
     let node = Node::start(
         "poison-receiver".to_string(),
         "127.0.0.1:0".parse().unwrap(),
-        NodeConfig {
-            store: Some(Arc::new(AlwaysFailStore)),
-            flush_batch_size: 1,
-            persistence: Default::default(),
-            flush_interval: Duration::from_secs(3600),
-            snapshot_interval: Duration::from_secs(3600),
-            ..NodeConfig::default()
-        },
+        NodeConfig::builder()
+            .maybe_store(Some(Arc::new(AlwaysFailStore)))
+            .flush_batch_size(1)
+            .persistence(Default::default())
+            .flush_interval(Duration::from_secs(3600))
+            .snapshot_interval(Duration::from_secs(3600))
+            .build(),
     )
     .await
     .unwrap();
@@ -9160,14 +9096,12 @@ async fn same_session_replay_does_not_clear_reconcile_failure() {
 #[tokio::test]
 async fn cluster_secret_handshake_succeeds() {
     let secret = vec![0xa5; 32];
-    let config_a = NodeConfig {
-        cluster_secret: Some(secret.clone()),
-        ..NodeConfig::default()
-    };
-    let config_b = NodeConfig {
-        cluster_secret: Some(secret),
-        ..NodeConfig::default()
-    };
+    let config_a = NodeConfig::builder()
+        .maybe_cluster_secret(Some(secret.clone()))
+        .build();
+    let config_b = NodeConfig::builder()
+        .maybe_cluster_secret(Some(secret))
+        .build();
     let a = Node::start("a".to_string(), "127.0.0.1:0".parse().unwrap(), config_a)
         .await
         .unwrap();
@@ -9196,14 +9130,13 @@ async fn replication_not_shed_under_backpressure() {
 
     let a = test_node("a").await;
     // B sheds every local op (cap 0), but replication must still land.
-    let config_b = NodeConfig {
-        default_pool: PoolConfig {
+    let config_b = NodeConfig::builder()
+        .default_pool(PoolConfig {
             workers: 1,
             queue_cap: 0,
             rate_limit_per_sec: None,
-        },
-        ..NodeConfig::default()
-    };
+        })
+        .build();
     let b = Node::start("b".to_string(), "127.0.0.1:0".parse().unwrap(), config_b)
         .await
         .unwrap();
@@ -9250,23 +9183,22 @@ async fn memory_applied_ack_does_not_force_a_receiver_store_flush() {
 
     let store = Arc::new(GatedStore::default());
     let _release_on_drop = store.release_on_drop();
-    let config_a = NodeConfig {
-        replication: SenderConfig {
-            batch_size: 1,
-            batch_interval: Duration::from_millis(10),
-            required_ack_durability: ReplicationAckDurability::MemoryApplied,
-            ..SenderConfig::default()
-        },
-        ..NodeConfig::default()
-    };
-    let config_b = NodeConfig {
-        store: Some(store.clone()),
-        flush_batch_size: usize::MAX,
-        persistence: Default::default(),
-        flush_interval: Duration::from_secs(3600),
-        snapshot_interval: Duration::from_secs(3600),
-        ..NodeConfig::default()
-    };
+    let config_a = NodeConfig::builder()
+        .replication(
+            SenderConfig::builder()
+                .batch_size(1)
+                .batch_interval(Duration::from_millis(10))
+                .required_ack_durability(ReplicationAckDurability::MemoryApplied)
+                .build(),
+        )
+        .build();
+    let config_b = NodeConfig::builder()
+        .maybe_store(Some(store.clone()))
+        .flush_batch_size(usize::MAX)
+        .persistence(Default::default())
+        .flush_interval(Duration::from_secs(3600))
+        .snapshot_interval(Duration::from_secs(3600))
+        .build();
     let a = Node::start(
         "memory-ack-a".to_string(),
         "127.0.0.1:0".parse().unwrap(),
@@ -9338,25 +9270,24 @@ async fn replication_ack_waits_for_the_receiver_store_fence() {
 
     let store = Arc::new(GatedStore::default());
     let _release_on_drop = store.release_on_drop();
-    let config_a = NodeConfig {
-        replication: SenderConfig {
-            batch_size: 1,
-            batch_interval: Duration::from_millis(10),
-            required_ack_durability: ReplicationAckDurability::StoreCommitted,
-            ..SenderConfig::default()
-        },
-        ..NodeConfig::default()
-    };
-    let config_b = NodeConfig {
-        store: Some(store.clone()),
-        flush_batch_size: 1_000_000,
-        persistence: Default::default(),
+    let config_a = NodeConfig::builder()
+        .replication(
+            SenderConfig::builder()
+                .batch_size(1)
+                .batch_interval(Duration::from_millis(10))
+                .required_ack_durability(ReplicationAckDurability::StoreCommitted)
+                .build(),
+        )
+        .build();
+    let config_b = NodeConfig::builder()
+        .maybe_store(Some(store.clone()))
+        .flush_batch_size(1_000_000)
+        .persistence(Default::default())
         // Observe the explicit replication ACK fence rather than an apply's
         // age-triggered flush after a slow handshake under parallel load.
-        flush_interval: Duration::from_secs(3600),
-        snapshot_interval: Duration::from_secs(3600),
-        ..NodeConfig::default()
-    };
+        .flush_interval(Duration::from_secs(3600))
+        .snapshot_interval(Duration::from_secs(3600))
+        .build();
     let a = Node::start(
         "ack-a".to_string(),
         "127.0.0.1:0".parse().unwrap(),
@@ -9435,15 +9366,15 @@ async fn replication_rejects_an_ack_below_the_configured_durability() {
     use actordb::replication::{ReplicationAckDurability, SenderConfig};
     use actordb::shard::FragmentId;
 
-    let config_a = NodeConfig {
-        replication: SenderConfig {
-            batch_size: 1,
-            batch_interval: Duration::from_millis(10),
-            required_ack_durability: ReplicationAckDurability::StoreCommitted,
-            ..SenderConfig::default()
-        },
-        ..NodeConfig::default()
-    };
+    let config_a = NodeConfig::builder()
+        .replication(
+            SenderConfig::builder()
+                .batch_size(1)
+                .batch_interval(Duration::from_millis(10))
+                .required_ack_durability(ReplicationAckDurability::StoreCommitted)
+                .build(),
+        )
+        .build();
     let a = Node::start(
         "durability-a".to_string(),
         "127.0.0.1:0".parse().unwrap(),
@@ -9508,20 +9439,21 @@ async fn ordinary_ack_timeout_rotates_session_and_replays_exact_batch() {
     let node = Node::start_with_options(
         "ack-timeout-sender".to_string(),
         "127.0.0.1:0".parse().unwrap(),
-        NodeConfig {
-            fragment_map,
-            replication: SenderConfig {
-                retained_byte_capacity: SenderConfig::default().retained_byte_capacity,
-                batch_size: 1,
-                batch_interval: Duration::from_millis(10),
-                max_in_flight: 1,
-                buffer_capacity: 100,
-                consistency_interval: Duration::from_secs(3600),
-                reconcile_timeout: Duration::from_secs(5),
-                required_ack_durability: ReplicationAckDurability::MemoryApplied,
-            },
-            ..NodeConfig::default()
-        },
+        NodeConfig::builder()
+            .fragment_map(fragment_map)
+            .replication(
+                SenderConfig::builder()
+                    .retained_byte_capacity(SenderConfig::default().retained_byte_capacity)
+                    .batch_size(1)
+                    .batch_interval(Duration::from_millis(10))
+                    .max_in_flight(1)
+                    .buffer_capacity(100)
+                    .consistency_interval(Duration::from_secs(3600))
+                    .reconcile_timeout(Duration::from_secs(5))
+                    .required_ack_durability(ReplicationAckDurability::MemoryApplied)
+                    .build(),
+            )
+            .build(),
         NodeRuntimeOptions::default()
             .with_replication_ack_timeout(ack_timeout)
             .with_queue_admission_timeout(Duration::from_millis(100)),
@@ -9661,20 +9593,21 @@ async fn older_batch_timeout_replays_only_the_unacknowledged_batch() {
     let node = Node::start_with_options(
         "out-of-order-ack-sender".to_string(),
         "127.0.0.1:0".parse().unwrap(),
-        NodeConfig {
-            fragment_map,
-            replication: SenderConfig {
-                retained_byte_capacity: SenderConfig::default().retained_byte_capacity,
-                batch_size: 1,
-                batch_interval: Duration::from_millis(10),
-                max_in_flight: 2,
-                buffer_capacity: 100,
-                consistency_interval: Duration::from_secs(3600),
-                reconcile_timeout: Duration::from_secs(5),
-                required_ack_durability: ReplicationAckDurability::MemoryApplied,
-            },
-            ..NodeConfig::default()
-        },
+        NodeConfig::builder()
+            .fragment_map(fragment_map)
+            .replication(
+                SenderConfig::builder()
+                    .retained_byte_capacity(SenderConfig::default().retained_byte_capacity)
+                    .batch_size(1)
+                    .batch_interval(Duration::from_millis(10))
+                    .max_in_flight(2)
+                    .buffer_capacity(100)
+                    .consistency_interval(Duration::from_secs(3600))
+                    .reconcile_timeout(Duration::from_secs(5))
+                    .required_ack_durability(ReplicationAckDurability::MemoryApplied)
+                    .build(),
+            )
+            .build(),
         NodeRuntimeOptions::default()
             .with_replication_ack_timeout(Duration::from_secs(2))
             .with_queue_admission_timeout(Duration::from_millis(100)),
@@ -9830,20 +9763,21 @@ async fn weak_ack_does_not_prevent_timeout_and_exact_replay() {
     let node = Node::start_with_options(
         "weak-ack-sender".to_string(),
         "127.0.0.1:0".parse().unwrap(),
-        NodeConfig {
-            fragment_map,
-            replication: SenderConfig {
-                retained_byte_capacity: SenderConfig::default().retained_byte_capacity,
-                batch_size: 1,
-                batch_interval: Duration::from_millis(10),
-                max_in_flight: 1,
-                buffer_capacity: 100,
-                consistency_interval: Duration::from_secs(3600),
-                reconcile_timeout: Duration::from_secs(5),
-                required_ack_durability: ReplicationAckDurability::StoreCommitted,
-            },
-            ..NodeConfig::default()
-        },
+        NodeConfig::builder()
+            .fragment_map(fragment_map)
+            .replication(
+                SenderConfig::builder()
+                    .retained_byte_capacity(SenderConfig::default().retained_byte_capacity)
+                    .batch_size(1)
+                    .batch_interval(Duration::from_millis(10))
+                    .max_in_flight(1)
+                    .buffer_capacity(100)
+                    .consistency_interval(Duration::from_secs(3600))
+                    .reconcile_timeout(Duration::from_secs(5))
+                    .required_ack_durability(ReplicationAckDurability::StoreCommitted)
+                    .build(),
+            )
+            .build(),
         NodeRuntimeOptions::default()
             .with_replication_ack_timeout(ack_timeout)
             .with_queue_admission_timeout(Duration::from_millis(100)),
@@ -9973,21 +9907,20 @@ async fn replication_nack_retries_the_exact_batch_after_store_failure() {
     use actordb::shard::FragmentId;
 
     let store = Arc::new(FailOnceStore::default());
-    let config_a = NodeConfig {
-        replication: SenderConfig {
-            batch_size: 1,
-            batch_interval: Duration::from_millis(10),
-            required_ack_durability: ReplicationAckDurability::StoreCommitted,
-            ..SenderConfig::default()
-        },
-        ..NodeConfig::default()
-    };
-    let config_b = NodeConfig {
-        store: Some(store.clone()),
-        flush_batch_size: 1_000_000,
-        persistence: Default::default(),
-        ..NodeConfig::default()
-    };
+    let config_a = NodeConfig::builder()
+        .replication(
+            SenderConfig::builder()
+                .batch_size(1)
+                .batch_interval(Duration::from_millis(10))
+                .required_ack_durability(ReplicationAckDurability::StoreCommitted)
+                .build(),
+        )
+        .build();
+    let config_b = NodeConfig::builder()
+        .maybe_store(Some(store.clone()))
+        .flush_batch_size(1_000_000)
+        .persistence(Default::default())
+        .build();
     let a = Node::start(
         "retry-a".to_string(),
         "127.0.0.1:0".parse().unwrap(),
@@ -10050,29 +9983,29 @@ async fn failed_reconcile_repair_cannot_be_hidden_by_barrier_ack() {
     use actordb::shard::FragmentId;
 
     let store = Arc::new(FailOnceStore::default());
-    let sender_config = NodeConfig {
-        replication: SenderConfig {
-            retained_byte_capacity: SenderConfig::default().retained_byte_capacity,
-            batch_size: 100,
-            batch_interval: Duration::from_secs(3600),
-            max_in_flight: 1,
-            buffer_capacity: 1,
-            consistency_interval: Duration::from_secs(3600),
-            reconcile_timeout: Duration::from_secs(5),
-            required_ack_durability: ReplicationAckDurability::StoreCommitted,
-        },
-        ..NodeConfig::default()
-    };
-    let receiver_config = NodeConfig {
-        store: Some(store.clone()),
+    let sender_config = NodeConfig::builder()
+        .replication(
+            SenderConfig::builder()
+                .retained_byte_capacity(SenderConfig::default().retained_byte_capacity)
+                .batch_size(100)
+                .batch_interval(Duration::from_secs(3600))
+                .max_in_flight(1)
+                .buffer_capacity(1)
+                .consistency_interval(Duration::from_secs(3600))
+                .reconcile_timeout(Duration::from_secs(5))
+                .required_ack_durability(ReplicationAckDurability::StoreCommitted)
+                .build(),
+        )
+        .build();
+    let receiver_config = NodeConfig::builder()
+        .maybe_store(Some(store.clone()))
         // Force the first repair op to encounter the injected store failure
         // before the rest of that untracked repair batch can be applied.
-        flush_batch_size: 1,
-        persistence: Default::default(),
-        flush_interval: Duration::from_secs(3600),
-        snapshot_interval: Duration::from_secs(3600),
-        ..NodeConfig::default()
-    };
+        .flush_batch_size(1)
+        .persistence(Default::default())
+        .flush_interval(Duration::from_secs(3600))
+        .snapshot_interval(Duration::from_secs(3600))
+        .build();
     let a = Node::start(
         "repair-sender".to_string(),
         "127.0.0.1:0".parse().unwrap(),
@@ -10144,25 +10077,26 @@ async fn fetched_reconcile_value_retries_failed_local_store_fence() {
     let node = Node::start(
         "fetch-store".to_string(),
         "127.0.0.1:0".parse().unwrap(),
-        NodeConfig {
-            store: Some(store.clone()),
-            flush_batch_size: usize::MAX,
-            persistence: Default::default(),
-            flush_interval: Duration::from_secs(3600),
-            snapshot_interval: Duration::from_secs(3600),
-            fragment_map,
-            replication: SenderConfig {
-                retained_byte_capacity: SenderConfig::default().retained_byte_capacity,
-                batch_size: 100,
-                batch_interval: Duration::from_secs(3600),
-                max_in_flight: 1,
-                buffer_capacity: 1,
-                consistency_interval: Duration::from_secs(3600),
-                reconcile_timeout: Duration::from_secs(5),
-                required_ack_durability: ReplicationAckDurability::StoreCommitted,
-            },
-            ..NodeConfig::default()
-        },
+        NodeConfig::builder()
+            .maybe_store(Some(store.clone()))
+            .flush_batch_size(usize::MAX)
+            .persistence(Default::default())
+            .flush_interval(Duration::from_secs(3600))
+            .snapshot_interval(Duration::from_secs(3600))
+            .fragment_map(fragment_map)
+            .replication(
+                SenderConfig::builder()
+                    .retained_byte_capacity(SenderConfig::default().retained_byte_capacity)
+                    .batch_size(100)
+                    .batch_interval(Duration::from_secs(3600))
+                    .max_in_flight(1)
+                    .buffer_capacity(1)
+                    .consistency_interval(Duration::from_secs(3600))
+                    .reconcile_timeout(Duration::from_secs(5))
+                    .required_ack_durability(ReplicationAckDurability::StoreCommitted)
+                    .build(),
+            )
+            .build(),
     )
     .await
     .unwrap();

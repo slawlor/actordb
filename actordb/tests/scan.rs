@@ -31,10 +31,7 @@ fn scan_all() -> ScanSpec {
 async fn node_scan_finds_all_keys_across_fragments() {
     let node = test_node(
         "scan-basic",
-        NodeConfig {
-            fragment_count: 4,
-            ..NodeConfig::default()
-        },
+        NodeConfig::builder().fragment_count(4).build(),
     )
     .await;
 
@@ -144,11 +141,10 @@ async fn node_scan_sharded_placement_errors_on_uncovered_fragments() {
     ]);
     let node = test_node(
         "shard-a",
-        NodeConfig {
-            fragment_count: 2,
-            fragment_map: placement,
-            ..NodeConfig::default()
-        },
+        NodeConfig::builder()
+            .fragment_count(2)
+            .fragment_map(placement)
+            .build(),
     )
     .await;
 
@@ -183,11 +179,10 @@ async fn node_scan_sharded_placement_succeeds_when_fully_held() {
     ]);
     let node = test_node(
         "shard-full",
-        NodeConfig {
-            fragment_count: 2,
-            fragment_map: placement,
-            ..NodeConfig::default()
-        },
+        NodeConfig::builder()
+            .fragment_count(2)
+            .fragment_map(placement)
+            .build(),
     )
     .await;
 
@@ -232,10 +227,11 @@ async fn two_node_cluster() -> (Node, Node) {
         (FragmentId(2), vec!["scan-b".to_string()]),
         (FragmentId(3), vec!["scan-b".to_string()]),
     ]);
-    let config = || NodeConfig {
-        fragment_count: 4,
-        fragment_map: placement.clone(),
-        ..NodeConfig::default()
+    let config = || {
+        NodeConfig::builder()
+            .fragment_count(4)
+            .fragment_map(placement.clone())
+            .build()
     };
     let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
     let a = Node::start("scan-a".to_string(), addr, config())
@@ -304,10 +300,11 @@ async fn node_scan_fails_over_to_next_holder() {
         ),
         (FragmentId(1), vec!["fail-c".to_string()]),
     ]);
-    let config = || NodeConfig {
-        fragment_count: 2,
-        fragment_map: placement.clone(),
-        ..NodeConfig::default()
+    let config = || {
+        NodeConfig::builder()
+            .fragment_count(2)
+            .fragment_map(placement.clone())
+            .build()
     };
     let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
     // Note: fail-a is never started; fail-b holds fragment 0's replica.
