@@ -21,7 +21,7 @@ use super::{
     Cleaner, CleanerArgs, CleanerMessage, Snapshotter, SnapshotterArgs, SnapshotterMessage,
 };
 use crate::actor::{
-    now_ms, FragmentState, HlcClock, KvActor, KvArgs, KvMessage, PoolConfig, VersionedValue,
+    FragmentState, HlcClock, KvActor, KvArgs, KvMessage, PoolConfig, VersionedValue, now_ms,
 };
 use crate::shard::FragmentId;
 use crate::store::KvStore;
@@ -681,8 +681,8 @@ mod tests {
     use crate::actor::{ApplyOutcome, KvWorker, KvWorkerArgs, ReplicatedOp};
     use crate::store::StoreError;
     use ractor::registry::where_is;
-    use std::sync::atomic::Ordering;
     use std::sync::Mutex as StdMutex;
+    use std::sync::atomic::Ordering;
 
     async fn wait_until_running(actors: &[ActorCell]) {
         // ractor spawn completes pre_start and linking, not the background
@@ -1192,13 +1192,15 @@ mod tests {
             .await
             .unwrap();
             wait_until_running(&[blocked.get_cell()]).await;
-            assert!(tokio::time::timeout(
-                Duration::from_secs(1),
-                probe_health(&blocked, &args, &restarts, Duration::from_millis(20)),
-            )
-            .await
-            .unwrap()
-            .is_none());
+            assert!(
+                tokio::time::timeout(
+                    Duration::from_secs(1),
+                    probe_health(&blocked, &args, &restarts, Duration::from_millis(20)),
+                )
+                .await
+                .unwrap()
+                .is_none()
+            );
             release.notify_one();
             blocked.stop(None);
             blocked.wait(None).await.unwrap();

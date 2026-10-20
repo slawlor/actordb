@@ -168,13 +168,22 @@ impl PersistenceConfig {
     pub fn retained_bytes(&self) -> usize {
         self.resources().aggregate.used()
     }
-    pub(crate) fn for_runtime(&self) -> Result<Self, String> {
-        if self.storage_concurrency == 0 || self.storage_concurrency > u32::MAX as usize {
+    /// Validate nonzero admission and supported executor concurrency limits.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.storage_concurrency == 0
+            || self.storage_concurrency > u32::MAX as usize
+            || self.storage_concurrency > tokio::sync::Semaphore::MAX_PERMITS
+        {
             return Err("storage concurrency must fit a positive u32".into());
         }
         if self.max_records == 0 || self.max_bytes == 0 || self.node_max_bytes == 0 {
             return Err("persistence admission limits must be nonzero".to_string());
         }
+        Ok(())
+    }
+
+    pub(crate) fn for_runtime(&self) -> Result<Self, String> {
+        self.validate()?;
         let mut runtime = self.clone();
         runtime.resources = std::sync::Arc::new(std::sync::OnceLock::new());
         Ok(runtime)
@@ -472,6 +481,18 @@ impl RocksDbOptions {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn persistence_admission_rejects_zero_executor_slots() {
+        assert!(
+            PersistenceConfig::builder()
+                .storage_concurrency(0)
+                .build()
+                .validate()
+                .is_err()
+        );
+        assert!(PersistenceConfig::default().validate().is_ok());
+    }
 
     #[test]
     fn custom_store_capabilities_default_to_retention_and_buffering() {

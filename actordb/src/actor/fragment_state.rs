@@ -6,8 +6,8 @@
 //! Shared cache, ordered persistence, expiry, and snapshot state.
 
 use std::collections::{BTreeSet, HashMap};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use ractor::ActorProcessingErr;
@@ -214,7 +214,14 @@ impl FragmentState {
 
     /// Configure retained persistence admission before sharing this state.
     /// Rejections return [`ApplyError::Backpressure`] before cache mutation.
+    ///
+    /// # Panics
+    ///
+    /// Panics if [`PersistenceConfig::validate`] rejects the configuration.
     pub fn with_persistence_config(mut self, config: PersistenceConfig) -> Self {
+        config
+            .validate()
+            .expect("invalid persistence configuration");
         let flush = Arc::get_mut(&mut self.flush)
             .expect("state is not shared during configuration")
             .get_mut();
@@ -591,8 +598,8 @@ impl FragmentState {
     ) -> crate::proto::QueryPageResponse {
         use crate::proto::{QueryPageRow, QueryPageStatus};
         use crate::query::{
-            page_encoded_len, page_error, value_to_cell, MAX_QUERY_PAGE_BYTES, QUERY_PAGE_VISITS,
-            QUERY_WORK_BYTES,
+            MAX_QUERY_PAGE_BYTES, QUERY_PAGE_VISITS, QUERY_WORK_BYTES, page_encoded_len,
+            page_error, value_to_cell,
         };
         use actordb_query::{AggregateInput, Projection, QueryAccumulator};
         use std::ops::Bound::{Excluded, Unbounded};
@@ -754,7 +761,7 @@ impl FragmentState {
                 let cells = match plan.project(key, &value.value, req.fragment) {
                     Ok(values) => values.into_iter().map(value_to_cell).collect(),
                     Err(error) => {
-                        return page_error(req, QueryPageStatus::Invalid, error.to_string())
+                        return page_error(req, QueryPageStatus::Invalid, error.to_string());
                     }
                 };
                 page.rows.push(QueryPageRow {
@@ -1315,7 +1322,7 @@ mod flush_tests {
     use crate::actor::{KvActor, KvArgs, KvMessage, OpPriority, PoolConfig};
     use crate::shard::FragmentId;
     use crate::store::{KvStore, StoreError};
-    use ractor::{rpc::CallResult, Actor};
+    use ractor::{Actor, rpc::CallResult};
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use std::sync::{Condvar, Mutex as StdMutex};
@@ -1477,9 +1484,18 @@ mod flush_tests {
         assert_eq!(state.persistence_backlog().await, (0, 0));
         let written = store.written.lock().unwrap();
         assert_eq!(written.len(), 2);
-        assert!(written
-            .iter()
-            .any(|(key, value)| key == b"hot" && value.timestamp_ms == 100));
+        assert!(
+            written
+                .iter()
+                .any(|(key, value)| key == b"hot" && value.timestamp_ms == 100)
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid persistence configuration")]
+    fn low_level_state_rejects_zero_storage_slots_before_async_work() {
+        FragmentState::new(HashMap::new(), None, 1, Duration::from_secs(1))
+            .with_persistence_config(PersistenceConfig::builder().storage_concurrency(0).build());
     }
 
     #[tokio::test]
@@ -1854,8 +1870,8 @@ mod maintenance_diagnostics {
         Cleaner, CleanerArgs, KvActor, KvArgs, KvMessage, OpPriority, PoolConfig, ReplicatedOp,
     };
     use crate::shard::FragmentId;
-    use ractor::rpc::CallResult;
     use ractor::Actor;
+    use ractor::rpc::CallResult;
     use tokio::sync::Barrier;
 
     const MAX_SAMPLES_PER_CLASS: usize = 20_000;
@@ -1869,7 +1885,9 @@ mod maintenance_diagnostics {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[ignore = "manual release diagnostic; no shared-runner latency threshold"]
     async fn maintenance_foreground_latency_distribution() {
-        eprintln!("mode,keys,map_capacity,ttl_percent,materialization_us,total_through_drain_us,class,operations,stored_samples,p50_us,p95_us,p99_us,max_us");
+        eprintln!(
+            "mode,keys,map_capacity,ttl_percent,materialization_us,total_through_drain_us,class,operations,stored_samples,p50_us,p95_us,p99_us,max_us"
+        );
         for cardinality in [10_000usize, 100_000] {
             for capacity_multiple in [1usize, 8] {
                 for ttl_percent in [0usize, 1, 100] {
@@ -2083,8 +2101,16 @@ mod maintenance_diagnostics {
                     .map(|ns| format!("{:.3}", *ns as f64 / 1000.0))
                     .unwrap_or_else(|| "na".into())
             };
-            eprintln!("{mode:?},{cardinality},{map_capacity},{ttl_percent},{},{},{label},{operations},{},{},{},{},{}",
-                materialization.as_micros(), total.as_micros(), samples.len(), quantile(50), quantile(95), quantile(99), quantile(100));
+            eprintln!(
+                "{mode:?},{cardinality},{map_capacity},{ttl_percent},{},{},{label},{operations},{},{},{},{},{}",
+                materialization.as_micros(),
+                total.as_micros(),
+                samples.len(),
+                quantile(50),
+                quantile(95),
+                quantile(99),
+                quantile(100)
+            );
         }
     }
 }
@@ -2318,12 +2344,14 @@ mod tests {
             Duration::from_secs(3600),
         );
         let mut pass = ExpiryPass::new(100);
-        assert!(state
-            .expire_values_page(&mut pass)
-            .await
-            .unwrap_err()
-            .to_string()
-            .contains("injected failure"));
+        assert!(
+            state
+                .expire_values_page(&mut pass)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("injected failure")
+        );
         assert_eq!(pass.after_key.as_deref(), Some("key"));
         assert_eq!(
             state.cache.read().await.values["key"],
@@ -2848,10 +2876,10 @@ mod expiry_callback_tests {
     use super::*;
     use crate::actor::test_support::test_op;
     use crate::ttl_expiry::{
-        expiry_handler_fn, ExpiryBatch, ExpiryCallbackError, ExpiryRuntime, TtlExpiryOptions,
+        ExpiryBatch, ExpiryCallbackError, ExpiryRuntime, TtlExpiryOptions, expiry_handler_fn,
     };
     use std::sync::Mutex as StdMutex;
-    use tokio::sync::{mpsc, Notify};
+    use tokio::sync::{Notify, mpsc};
 
     fn expiring(version: u64) -> VersionedValue {
         let mut value = VersionedValue::new(vec![0xff, 0, 0x80], version, "writer".into());
