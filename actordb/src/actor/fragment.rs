@@ -425,6 +425,9 @@ impl FragmentSupervisor {
         args: SupervisorArgs,
         children: &mut SupervisorStartupChildren,
     ) -> Result<SupervisorState, ActorProcessingErr> {
+        args.persistence
+            .validate()
+            .map_err(FragmentStartupStorageError::boxed)?;
         let loaded = SupervisorState::load_cache(
             &args.store,
             args.fragment,
@@ -1700,5 +1703,54 @@ mod tests {
             supervisor.stop(None);
             supervisor.wait(None).await.unwrap();
         }
+    }
+}
+
+#[cfg(test)]
+mod persistence_validation_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct StartupStore(AtomicUsize);
+    impl KvStore for StartupStore {
+        fn load(&self) -> Result<Vec<(Vec<u8>, VersionedValue)>, crate::store::StoreError> {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Ok(Vec::new())
+        }
+        fn write_batch(
+            &self,
+            _: &[(Vec<u8>, VersionedValue)],
+        ) -> Result<(), crate::store::StoreError> {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_storage_slots_fail_before_supervisor_store_operations() {
+        let store = Arc::new(StartupStore(AtomicUsize::new(0)));
+        let args = SupervisorArgs::builder()
+            .fragment(FragmentId(0))
+            .worker_prefix("invalid-storage-slots")
+            .hlc(Arc::new(Mutex::new(HlcClock::new())))
+            .store(store.clone() as Arc<dyn KvStore>)
+            .persistence(
+                crate::store::PersistenceConfig::builder()
+                    .storage_concurrency(0)
+                    .build(),
+            )
+            .build();
+        let started = tokio::time::timeout(
+            Duration::from_secs(1),
+            FragmentSupervisor::spawn(None, FragmentSupervisor, args),
+        )
+        .await
+        .expect("invalid startup waited for an unusable storage executor");
+        if let Ok((actor, handle)) = started {
+            actor.stop(None);
+            let _ = handle.await;
+            panic!("zero storage slots were accepted");
+        }
+        assert_eq!(store.0.load(Ordering::Relaxed), 0);
     }
 }
