@@ -370,9 +370,20 @@ impl std::fmt::Display for ApplyError {
 
 impl std::error::Error for ApplyError {}
 
+/// Opaque admission ownership attached to an actor message.
+/// Public only because [`KvMessage`] is public. Only crate code constructs it.
+#[doc(hidden)]
+pub struct RetainedActorMessage {
+    message: Box<KvMessage>,
+    retention: Arc<dyn Send + Sync>,
+}
+
 /// Messages handled by [`crate::actor::KvActor`].
 #[non_exhaustive]
 pub enum KvMessage {
+    /// Internal admission lease retained through dispatcher/worker completion.
+    #[doc(hidden)]
+    Retained(RetainedActorMessage),
     /// Apply a write — local or replicated. Merged with last-writer-wins,
     /// so applying the same op twice is harmless (idempotent).
     ///
@@ -503,6 +514,33 @@ pub enum KvMessage {
     },
 }
 
+impl KvMessage {
+    pub(crate) fn with_retention(self, retention: Arc<dyn Send + Sync>) -> Self {
+        Self::Retained(RetainedActorMessage {
+            message: Box::new(self),
+            retention,
+        })
+    }
+    pub(crate) fn with_optional_retention(self, retention: Option<Arc<dyn Send + Sync>>) -> Self {
+        match retention {
+            Some(retention) => self.with_retention(retention),
+            None => self,
+        }
+    }
+    pub(crate) fn into_retained_parts(self) -> (Self, Option<Arc<dyn Send + Sync>>) {
+        let mut message = self;
+        let mut combined: Option<Arc<dyn Send + Sync>> = None;
+        while let Self::Retained(retained) = message {
+            combined = Some(match combined {
+                Some(previous) => Arc::new((previous, retained.retention)),
+                None => retained.retention,
+            });
+            message = *retained.message;
+        }
+        (message, combined)
+    }
+}
+
 impl BatchReadContinuation {
     pub(super) fn new(
         keys: Vec<String>,
@@ -524,6 +562,19 @@ impl BatchReadContinuation {
             dispatcher,
             _retention: None,
         }
+    }
+
+    pub(super) fn with_optional_retention(
+        mut self,
+        retention: Option<Arc<dyn Send + Sync>>,
+    ) -> Self {
+        if let Some(retention) = retention {
+            self._retention = Some(match self._retention.take() {
+                Some(existing) => Arc::new((existing, retention)),
+                None => retention,
+            });
+        }
+        self
     }
 
     pub(super) fn with_retention(mut self, retention: Arc<dyn Send + Sync>) -> Self {

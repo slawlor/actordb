@@ -107,6 +107,7 @@ impl Actor for PoolWorker {
         message: Self::Msg,
         state: &mut Self::State,
     ) -> Result<(), ActorProcessingErr> {
+        let (message, _retention) = message.into_retained_parts();
         match message {
             KvMessage::ApplyOp {
                 op,

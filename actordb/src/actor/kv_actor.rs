@@ -197,6 +197,7 @@ impl Actor for KvActor {
         message: Self::Msg,
         state: &mut Self::State,
     ) -> Result<(), ActorProcessingErr> {
+        let (message, admission_retention) = message.into_retained_parts();
         match message {
             KvMessage::ApplyOp {
                 op,
@@ -230,12 +231,15 @@ impl Actor for KvActor {
                     }
                     return Ok(());
                 };
-                reservation.send(KvMessage::ApplyOp {
-                    op,
-                    priority,
-                    is_replication,
-                    reply,
-                });
+                reservation.send(
+                    KvMessage::ApplyOp {
+                        op,
+                        priority,
+                        is_replication,
+                        reply,
+                    }
+                    .with_optional_retention(admission_retention.clone()),
+                );
                 Ok(())
             }
             KvMessage::Get {
@@ -263,11 +267,14 @@ impl Actor for KvActor {
                 // Hand the caller's reply port directly to the worker. The
                 // dispatcher remains free to serve other pools, health, and
                 // supervision while this read waits behind sticky-key work.
-                reservation.send(KvMessage::Get {
-                    key,
-                    reply,
-                    priority,
-                });
+                reservation.send(
+                    KvMessage::Get {
+                        key,
+                        reply,
+                        priority,
+                    }
+                    .with_optional_retention(admission_retention.clone()),
+                );
                 Ok(())
             }
             KvMessage::Scan { spec, reply } => {
@@ -281,7 +288,10 @@ impl Actor for KvActor {
                     let _ = reply.send(Err("shed: pool at queue cap or rate limit".to_string()));
                     return Ok(());
                 };
-                reservation.send(KvMessage::Scan { spec, reply });
+                reservation.send(
+                    KvMessage::Scan { spec, reply }
+                        .with_optional_retention(admission_retention.clone()),
+                );
                 Ok(())
             }
             KvMessage::ScanRetained {
@@ -297,11 +307,14 @@ impl Actor for KvActor {
                     let _ = reply.send(Err("shed: pool at queue cap or rate limit".into()));
                     return Ok(());
                 };
-                reservation.send(KvMessage::ScanRetained {
-                    spec,
-                    retention,
-                    reply,
-                });
+                reservation.send(
+                    KvMessage::ScanRetained {
+                        spec,
+                        retention,
+                        reply,
+                    }
+                    .with_optional_retention(admission_retention.clone()),
+                );
                 Ok(())
             }
             KvMessage::QueryPage { work, reply } => {
@@ -317,7 +330,10 @@ impl Actor for KvActor {
                     ));
                     return Ok(());
                 };
-                reservation.send(KvMessage::QueryPage { work, reply });
+                reservation.send(
+                    KvMessage::QueryPage { work, reply }
+                        .with_optional_retention(admission_retention.clone()),
+                );
                 Ok(())
             }
             KvMessage::GetBatch {
@@ -335,14 +351,19 @@ impl Actor for KvActor {
                         priority,
                         reply,
                         myself,
-                    ),
+                    )
+                    .with_optional_retention(admission_retention.clone()),
                     state,
                 )
                 .await;
                 Ok(())
             }
             KvMessage::ContinueBatchRead(work) => {
-                route_batch_read(work, state).await;
+                route_batch_read(
+                    work.with_optional_retention(admission_retention.clone()),
+                    state,
+                )
+                .await;
                 Ok(())
             }
             KvMessage::GetBatchRetained(request) => {
@@ -355,7 +376,8 @@ impl Actor for KvActor {
                         request.reply,
                         myself,
                     )
-                    .with_retention(request.retention),
+                    .with_retention(request.retention)
+                    .with_optional_retention(admission_retention.clone()),
                     state,
                 )
                 .await;
@@ -438,6 +460,7 @@ impl Actor for KvActor {
                 let _ = reply.send(state.shared.current_revision().await);
                 Ok(())
             }
+            KvMessage::Retained(_) => unreachable!("retained message was unwrapped"),
             KvMessage::GetShedCounts { reply } => {
                 let counts = (
                     state.high_pool.shed_count(),
@@ -515,5 +538,86 @@ impl Actor for KvActor {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod retention_tests {
+    use std::future::Future;
+    use std::task::Poll;
+    use std::time::Duration;
+
+    use super::*;
+    use crate::actor::test_support::test_state;
+    use tokio::sync::Semaphore;
+
+    #[tokio::test]
+    async fn cancelled_waiters_retain_admission_until_dispatcher_or_worker_work_finishes() {
+        for summary in [false, true] {
+            let shared = Arc::new(test_state(Default::default()));
+            let (actor, handle) = KvActor::spawn(
+                None,
+                KvActor,
+                KvArgs::builder()
+                    .shared(shared.clone())
+                    .fragment(FragmentId(0))
+                    .worker_prefix(format!("retained-{}", summary))
+                    .build(),
+            )
+            .await
+            .unwrap();
+            let cache = shared.lock_cache_for_test().await;
+            let admission = Arc::new(Semaphore::new(1));
+            let retention: Arc<dyn Send + Sync> =
+                Arc::new(admission.clone().acquire_owned().await.unwrap());
+            if summary {
+                let mut pending = Box::pin(actor.call(
+                    move |reply| {
+                        KvMessage::GetSummaryPage {
+                            after_key: None,
+                            expected_revision: None,
+                            snapshot_time_ms: None,
+                            limit: 1,
+                            reply,
+                        }
+                        .with_retention(retention)
+                    },
+                    None,
+                ));
+                std::future::poll_fn(|cx| {
+                    assert!(pending.as_mut().poll(cx).is_pending());
+                    Poll::Ready(())
+                })
+                .await;
+                drop(pending);
+            } else {
+                let mut pending = Box::pin(actor.call(
+                    move |reply| {
+                        KvMessage::Get {
+                            key: "key".into(),
+                            priority: OpPriority::Default,
+                            reply,
+                        }
+                        .with_retention(retention)
+                    },
+                    None,
+                ));
+                std::future::poll_fn(|cx| {
+                    assert!(pending.as_mut().poll(cx).is_pending());
+                    Poll::Ready(())
+                })
+                .await;
+                drop(pending);
+            }
+            assert_eq!(admission.available_permits(), 0);
+            drop(cache);
+            let permit = tokio::time::timeout(Duration::from_secs(2), admission.acquire())
+                .await
+                .expect("actor-owned admission was not released")
+                .unwrap();
+            drop(permit);
+            actor.stop(None);
+            handle.await.unwrap();
+        }
     }
 }

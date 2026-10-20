@@ -88,7 +88,9 @@ pub(super) async fn handle_worker_message(
     shared: &Arc<FragmentState>,
     message: KvMessage,
 ) -> Result<(), ActorProcessingErr> {
+    let (message, _retention) = message.into_retained_parts();
     match message {
+        KvMessage::Retained(_) => unreachable!("retained message was unwrapped"),
         KvMessage::ApplyOp {
             op,
             priority: _,
