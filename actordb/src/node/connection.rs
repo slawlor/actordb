@@ -650,7 +650,10 @@ pub(super) async fn handle_connection(
         cancel: cancel.clone(),
         queue_admission_timeout: runtime_options.queue_admission_timeout,
         rank: None,
-        capabilities: REQUIRED_WIRE_CAPABILITIES | CAPABILITY_SCAN | CAPABILITY_QUERY_PAGES,
+        capabilities: REQUIRED_WIRE_CAPABILITIES
+            | CAPABILITY_SCAN
+            | CAPABILITY_QUERY_PAGES
+            | CAPABILITY_QUERY_METADATA,
     };
     let writer_cancel = cancel.subscribe();
     // Abort/early-return must cancel jobs bound to this exact physical socket.
@@ -2776,7 +2779,10 @@ pub(super) fn fresh_hello(node_id: &str) -> Result<Hello, getrandom::Error> {
         auth_tag: Vec::new(),
         min_protocol_version: WIRE_PROTOCOL_VERSION,
         max_protocol_version: WIRE_PROTOCOL_VERSION,
-        capabilities: REQUIRED_WIRE_CAPABILITIES | CAPABILITY_SCAN | CAPABILITY_QUERY_PAGES,
+        capabilities: REQUIRED_WIRE_CAPABILITIES
+            | CAPABILITY_SCAN
+            | CAPABILITY_QUERY_PAGES
+            | CAPABILITY_QUERY_METADATA,
         challenge,
     })
 }

@@ -9,7 +9,10 @@ use ractor::{rpc::CallResult, ActorRef};
 use tokio::sync::oneshot;
 use tokio::time::Instant;
 
-use super::{try_send_envelope_until, FragmentRouter, Node, PeerChannel, CAPABILITY_QUERY_PAGES};
+use super::{
+    try_send_envelope_until, FragmentRouter, Node, PeerChannel, CAPABILITY_QUERY_METADATA,
+    CAPABILITY_QUERY_PAGES,
+};
 use crate::actor::KvMessage;
 use crate::proto::{Envelope, EnvelopeMsg, QueryPageRequest, QueryPageResponse, QueryPageStatus};
 use crate::query::{
@@ -49,6 +52,10 @@ struct FragmentCursor {
     initialized: bool,
     done: bool,
     rows: VecDeque<crate::proto::QueryPageRow>,
+}
+
+fn query_requires_metadata(plan: &QueryPlan) -> bool {
+    plan.include_tombstones || plan.needs_metadata()
 }
 impl FragmentCursor {
     fn new(fragment: u32) -> Self {
@@ -494,7 +501,10 @@ impl Node {
                     continue;
                 }
                 if let Some(channel) = self.peers.lock().await.get(&owner).cloned() {
-                    if channel.capabilities & CAPABILITY_QUERY_PAGES != 0 {
+                    if channel.capabilities & CAPABILITY_QUERY_PAGES != 0
+                        && (!query_requires_metadata(plan)
+                            || channel.capabilities & CAPABILITY_QUERY_METADATA != 0)
+                    {
                         holders.push(Holder::Remote(channel));
                     }
                 }
@@ -758,6 +768,23 @@ fn validate_page(
                 }
                 (Projection::Fragment, Some(Value::Integer(value))) => {
                     value == &req.fragment.to_string()
+                }
+                (
+                    Projection::TimestampMs | Projection::LogicalCounter,
+                    Some(Value::Integer(value)),
+                ) => value.parse::<u64>().is_ok(),
+                (Projection::NodeId, Some(Value::Text(value))) => {
+                    !value.is_empty() && value.len() <= 255
+                }
+                (Projection::ExpiresAtMs, Some(Value::Null(true) | Value::Integer(_))) => {
+                    match &cell.value {
+                        Some(Value::Null(true)) => true,
+                        Some(Value::Integer(value)) => value.parse::<u64>().is_ok(),
+                        _ => false,
+                    }
+                }
+                (Projection::Tombstone, Some(Value::Integer(value))) => {
+                    value == "0" || value == "1"
                 }
                 (Projection::OctetLength, Some(Value::Integer(value))) => {
                     value.parse::<u64>().is_ok()

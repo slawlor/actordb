@@ -1,7 +1,7 @@
 use crate::{
-    check_len, AggregateFunction, AggregateInput, KeyPredicate, Projection, QueryError, QueryPlan,
-    QueryValue, MAX_QUERY_EXPRESSIONS, MAX_QUERY_FRAGMENTS, MAX_QUERY_LITERAL_BYTES,
-    MAX_QUERY_TOKENS, MAX_SQL_BYTES,
+    check_len, AggregateFunction, AggregateInput, KeyPredicate, MetadataOp, MetadataPredicate,
+    Projection, QueryError, QueryPlan, QueryValue, MAX_QUERY_EXPRESSIONS, MAX_QUERY_FRAGMENTS,
+    MAX_QUERY_LITERAL_BYTES, MAX_QUERY_TOKENS, MAX_SQL_BYTES,
 };
 
 /// Parse one literal SQL statement. An optional terminal semicolon is accepted;
@@ -234,10 +234,16 @@ impl Parser<'_> {
         let mut plan = QueryPlan {
             projections,
             predicates: Vec::new(),
+            metadata_predicates: Vec::new(),
             fragments: None,
             limit: None,
             offset: 0,
+            include_tombstones: false,
         };
+        if self.eat_word("INCLUDING") {
+            self.expect_word("TOMBSTONES")?;
+            plan.include_tombstones = true;
+        }
         if self.eat_word("WHERE") {
             let mut expressions = 0;
             loop {
@@ -287,6 +293,21 @@ impl Parser<'_> {
         }
         if self.eat_word("FRAG") {
             return Ok(Projection::Fragment);
+        }
+        if self.eat_word("TIMESTAMP_MS") {
+            return Ok(Projection::TimestampMs);
+        }
+        if self.eat_word("LOGICAL_COUNTER") {
+            return Ok(Projection::LogicalCounter);
+        }
+        if self.eat_word("NODE_ID") {
+            return Ok(Projection::NodeId);
+        }
+        if self.eat_word("EXPIRES_AT_MS") {
+            return Ok(Projection::ExpiresAtMs);
+        }
+        if self.eat_word("IS_TOMBSTONE") {
+            return Ok(Projection::Tombstone);
         }
         if self.eat_word("PREFIX_BYTES") {
             self.expect(&Kind::Left)?;
@@ -417,7 +438,81 @@ impl Parser<'_> {
             });
             return Ok(());
         }
-        Err(self.error("expected key comparison, STARTS_WITH, or fragment scope"))
+        self.metadata_predicate(plan)
+    }
+
+    fn metadata_predicate(&mut self, plan: &mut QueryPlan) -> Result<(), QueryError> {
+        let field = if self.eat_word("TIMESTAMP_MS") {
+            0
+        } else if self.eat_word("LOGICAL_COUNTER") {
+            1
+        } else if self.eat_word("NODE_ID") {
+            2
+        } else if self.eat_word("EXPIRES_AT_MS") {
+            3
+        } else if self.eat_word("IS_TOMBSTONE") {
+            4
+        } else {
+            return Err(self.error(
+                "expected key comparison, STARTS_WITH, fragment scope, or metadata predicate",
+            ));
+        };
+        if field == 3 && self.eat_word("IS") {
+            let not = self.eat_word("NOT");
+            self.expect_word("NULL")?;
+            plan.metadata_predicates
+                .push(MetadataPredicate::ExpiresAtMsNull(!not));
+            return Ok(());
+        }
+        let op = self.metadata_op()?;
+        let value = self.literal()?;
+        let predicate = match field {
+            0 => MetadataPredicate::TimestampMs(op, self.metadata_unsigned(value, "timestamp_ms")?),
+            1 => MetadataPredicate::LogicalCounter(
+                op,
+                self.metadata_unsigned(value, "logical_counter")?,
+            ),
+            2 => MetadataPredicate::NodeId(
+                op,
+                match value {
+                    QueryValue::Text(value) => value,
+                    _ => return Err(self.error("node_id comparisons require text literals")),
+                },
+            ),
+            3 => {
+                MetadataPredicate::ExpiresAtMs(op, self.metadata_unsigned(value, "expires_at_ms")?)
+            }
+            4 => MetadataPredicate::Tombstone(
+                op,
+                match value {
+                    QueryValue::Integer(0) => false,
+                    QueryValue::Integer(1) => true,
+                    _ => return Err(self.error("is_tombstone comparisons require 0 or 1")),
+                },
+            ),
+            _ => unreachable!(),
+        };
+        plan.metadata_predicates.push(predicate);
+        Ok(())
+    }
+
+    fn metadata_op(&mut self) -> Result<MetadataOp, QueryError> {
+        match self.next_kind() {
+            Some(Kind::Equal) => Ok(MetadataOp::Equal),
+            Some(Kind::Less) => Ok(MetadataOp::LessThan),
+            Some(Kind::LessEqual) => Ok(MetadataOp::LessOrEqual),
+            Some(Kind::Greater) => Ok(MetadataOp::GreaterThan),
+            Some(Kind::GreaterEqual) => Ok(MetadataOp::GreaterOrEqual),
+            _ => Err(self.error("metadata comparisons support =, <, <=, >, >=")),
+        }
+    }
+
+    fn metadata_unsigned(&self, value: QueryValue, name: &str) -> Result<u64, QueryError> {
+        match value {
+            QueryValue::Integer(value) => u64::try_from(value)
+                .map_err(|_| self.error(format!("{name} requires an unsigned 64-bit integer"))),
+            _ => Err(self.error(format!("{name} comparisons require integer literals"))),
+        }
     }
 
     fn fragment(&mut self) -> Result<u32, QueryError> {

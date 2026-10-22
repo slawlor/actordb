@@ -314,6 +314,7 @@ pub(crate) fn projected_row_wire_bytes(
     key: &str,
     value_len: usize,
     fragment: u32,
+    metadata: &actordb_query::RecordMetadata,
 ) -> usize {
     use crate::wire::{bytes_field_len, message_field_len};
     use actordb_query::Projection;
@@ -325,6 +326,15 @@ pub(crate) fn projected_row_wire_bytes(
             Projection::PrefixBytes(n) => bytes_field_len(3, value_len.min(*n as usize)),
             Projection::Fragment => bytes_field_len(4, fragment.to_string().len()),
             Projection::OctetLength => bytes_field_len(4, value_len.to_string().len()),
+            Projection::TimestampMs => bytes_field_len(4, metadata.timestamp_ms.to_string().len()),
+            Projection::LogicalCounter => {
+                bytes_field_len(4, metadata.logical_counter.to_string().len())
+            }
+            Projection::NodeId => bytes_field_len(2, metadata.node_id.len()),
+            Projection::ExpiresAtMs => metadata
+                .expires_at_ms
+                .map_or(2, |value| bytes_field_len(4, value.to_string().len())),
+            Projection::Tombstone => bytes_field_len(4, 1),
             Projection::Aggregate { .. } => 0,
         };
         bytes = bytes.saturating_add(message_field_len(2, cell));
@@ -493,9 +503,11 @@ mod key_bound_tests {
             let plan = QueryPlan {
                 projections: vec![Projection::Key],
                 predicates,
+                metadata_predicates: Vec::new(),
                 fragments: None,
                 limit: None,
                 offset: 0,
+                include_tombstones: false,
             };
             for after in [None, Some(""), Some("aa"), Some("雪"), Some("\u{10ffff}")] {
                 let expected: Vec<_> = keys

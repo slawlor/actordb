@@ -36,6 +36,57 @@ fn parameters_are_typed_literals_and_fragment_scopes_intersect() {
 }
 
 #[test]
+fn durable_metadata_projects_without_decoding_application_bytes() {
+    let plan =
+        parse("SELECT timestamp_ms, logical_counter, node_id, expires_at_ms, is_tombstone FROM kv")
+            .unwrap();
+    let metadata = RecordMetadata {
+        timestamp_ms: 42,
+        logical_counter: 7,
+        node_id: "writer-a".into(),
+        expires_at_ms: Some(99),
+        is_tombstone: false,
+    };
+    assert_eq!(
+        plan.project_with_metadata("k", b"arbitrary bytes", 0, &metadata)
+            .unwrap(),
+        vec![
+            QueryValue::Integer(42),
+            QueryValue::Integer(7),
+            QueryValue::Text("writer-a".into()),
+            QueryValue::Integer(99),
+            QueryValue::Integer(0),
+        ]
+    );
+    assert_eq!(parse(&plan.to_sql()).unwrap(), plan);
+}
+
+#[test]
+fn including_tombstones_and_metadata_predicates_round_trip() {
+    let plan = parse(
+        "SELECT key, is_tombstone FROM kv INCLUDING TOMBSTONES \
+         WHERE timestamp_ms >= 10 AND node_id = 'writer-a' \
+         AND expires_at_ms IS NULL AND is_tombstone = 1",
+    )
+    .unwrap();
+    assert!(plan.include_tombstones);
+    assert_eq!(plan.metadata_predicates.len(), 4);
+    assert_eq!(parse(&plan.to_sql()).unwrap(), plan);
+    assert!(plan.matches_metadata(&RecordMetadata {
+        timestamp_ms: 10,
+        node_id: "writer-a".into(),
+        is_tombstone: true,
+        ..Default::default()
+    }));
+    assert!(!plan.matches_metadata(&RecordMetadata {
+        timestamp_ms: 10,
+        node_id: "writer-a".into(),
+        is_tombstone: false,
+        ..Default::default()
+    }));
+}
+
+#[test]
 fn literal_escaping_preserves_unicode_empty_keys_and_injection_text() {
     let key = "雪'; DELETE FROM kv; --";
     let plan = parse_with_params(

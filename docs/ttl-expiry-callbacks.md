@@ -149,7 +149,7 @@ It registers an async closure that forwards batches through a bounded applicatio
 channel. The worker conditionally clears its own versioned index under its own
 lock, making duplicate and delayed events harmless to newer state.
 
-The pending `0.7.0` release includes this API. Construct `NodeConfig` and
+The `0.7.1` release includes this API. Construct `NodeConfig` and
 low-level `SupervisorArgs` through their Bon builders. Node-owned callback
 attachment is private: `ExpiryPublisher` and its supervisor field/builder setter
 are implementation details. Applications configure `ttl_expiry_handler` and

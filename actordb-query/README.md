@@ -25,11 +25,16 @@ let portable_sql = plan.to_sql();
 
 - One `SELECT ... FROM kv` statement with an optional terminal semicolon.
 - Columns: `key`, `value`, `frag`, `PREFIX_BYTES(value, N)`,
-  `OCTET_LENGTH(value)`.
+  `OCTET_LENGTH(value)`, and durable-record metadata `timestamp_ms`,
+  `logical_counter`, `node_id`, `expires_at_ms`, and `is_tombstone`.
 - Aggregates: `COUNT(*)`; `SUM`, `MIN`, and `MAX` of
   `OCTET_LENGTH(value)` or `CAST(value AS BIGINT)`.
 - Conjunctive predicates: `key =`, `<`, `<=`, `>`, `>=` text;
   `STARTS_WITH(key, prefix)`; `frag = N`; `frag IN (N, ...)`.
+- Durable metadata predicates compare `timestamp_ms`, `logical_counter`,
+  `node_id`, `expires_at_ms`, and `is_tombstone`; TTL presence checks use
+  `IS NULL`/`IS NOT NULL`. Add `INCLUDING TOMBSTONES` after `FROM kv` to
+  include retained tombstones.
 - Prefixes can use text or byte literals, for example `X'e99b'`.
 - Global row ordering is ascending by key. `ORDER BY key ASC` is optional.
   Row queries support `LIMIT N` and `OFFSET N`. `LIMIT 0` returns no rows.
@@ -44,7 +49,9 @@ rejected.
 
 ## Values and completion
 
-Keys are UTF-8 text; values are opaque bytes. BIGINT conversion accepts up to
+Keys are UTF-8 text; values are opaque bytes. Durable metadata describes the
+ActorDB record envelope and does not impose a schema on application values.
+BIGINT conversion accepts up to
 20 ASCII decimal bytes with an optional sign, checked against the signed
 64-bit range. Numeric aggregation uses checked signed 128-bit arithmetic.
 `QueryValue::Integer` must use decimal strings on language-neutral wires to

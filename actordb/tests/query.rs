@@ -95,6 +95,71 @@ async fn aggregate_exhausts_input_beyond_both_legacy_scan_caps() {
 }
 
 #[tokio::test]
+async fn sql_projects_durable_record_metadata() {
+    let node = start(
+        "query-metadata",
+        NodeConfig::builder().fragment_count(1).build(),
+    )
+    .await;
+    node.put("metadata-key".into(), b"opaque payload".to_vec())
+        .await
+        .unwrap();
+    let result = node
+        .query(
+            "SELECT timestamp_ms, logical_counter, node_id, expires_at_ms, is_tombstone \
+             FROM kv WHERE key = 'metadata-key'",
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.rows.len(), 1);
+    assert!(matches!(result.rows[0][0], QueryValue::Integer(value) if value > 0));
+    assert!(matches!(result.rows[0][1], QueryValue::Integer(value) if value >= 0));
+    assert!(matches!(result.rows[0][2], QueryValue::Text(ref value) if value == "query-metadata"));
+    assert_eq!(result.rows[0][3], QueryValue::Null);
+    assert_eq!(result.rows[0][4], QueryValue::Integer(0));
+    node.put("live-key".into(), b"still live".to_vec())
+        .await
+        .unwrap();
+    assert_eq!(
+        node.query("SELECT key FROM kv WHERE is_tombstone = 1")
+            .await
+            .unwrap()
+            .rows,
+        Vec::<Vec<QueryValue>>::new()
+    );
+    node.delete("metadata-key".into()).await.unwrap();
+    let tombstones = node
+        .query(
+            "SELECT key, is_tombstone, node_id FROM kv INCLUDING TOMBSTONES \
+             WHERE is_tombstone = 1 AND node_id = 'query-metadata'",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        tombstones.rows,
+        vec![vec![
+            QueryValue::Text("metadata-key".into()),
+            QueryValue::Integer(1),
+            QueryValue::Text("query-metadata".into()),
+        ]]
+    );
+    assert_eq!(
+        node.query("SELECT key, is_tombstone FROM kv INCLUDING TOMBSTONES")
+            .await
+            .unwrap()
+            .rows,
+        vec![
+            vec![QueryValue::Text("live-key".into()), QueryValue::Integer(0)],
+            vec![
+                QueryValue::Text("metadata-key".into()),
+                QueryValue::Integer(1)
+            ],
+        ]
+    );
+    node.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn fragment_scope_and_key_equality_do_not_contact_unavailable_fragments() {
     let node = start(
         "query-scoped",
@@ -177,6 +242,20 @@ async fn query_merges_local_and_remote_fragment_views_in_global_key_order() {
         .collect::<Vec<_>>();
     assert_eq!(a.query(query).await.unwrap().rows, expected);
     assert_eq!(b.query(query).await.unwrap().rows, expected);
+    let metadata = a
+        .query("SELECT key, node_id FROM kv WHERE STARTS_WITH(key, 'user:')")
+        .await
+        .unwrap();
+    assert_eq!(metadata.rows.len(), keys.len());
+    for (row, key) in metadata.rows.iter().zip(&keys) {
+        let expected_owner = if fragment_of(key, 4).0.is_multiple_of(2) {
+            "query-a"
+        } else {
+            "query-b"
+        };
+        assert_eq!(row[0], QueryValue::Text(key.clone()));
+        assert_eq!(row[1], QueryValue::Text(expected_owner.into()));
+    }
     assert_eq!(
         a.query("SELECT COUNT(*), SUM(CAST(value AS BIGINT)) FROM kv")
             .await
