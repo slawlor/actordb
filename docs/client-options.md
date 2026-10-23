@@ -33,11 +33,22 @@ Optional fields also provide `maybe_credential(Option<Vec<u8>>)` and
 `maybe_ttl(Option<Duration>)` setters. For incremental configuration, start with
 `ClientOptions::default()` or `PutOptions::default()` and assign public fields.
 
-In 0.8.0, set `ClientOptions::table` to bind one application connection to a
-named logical table. A table name is required:
+In 0.8.0, `ClientOptions::table` selects the initial table view and remains
+required:
 
 ```rust,ignore
 let users = ClientOptions::builder().table("users").build();
+```
+
+Additional table views can share that same authenticated connection. They do
+not open another network socket:
+
+```rust,ignore
+let client = Client::connect(addr, ClientOptions::default()).await?;
+let users = client.table("users")?;
+let events = client.table("events")?;
+users.put("u:1", value).await?;
+events.put("e:1", other_value).await?;
 ```
 
 Connection validation still occurs at `connect`/`from_stream`: identities,

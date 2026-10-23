@@ -140,6 +140,7 @@ struct Inner {
 #[derive(Clone)]
 pub struct Client {
     inner: Arc<Inner>,
+    table: String,
 }
 
 impl Client {
@@ -205,6 +206,7 @@ impl Client {
         options: ClientOptions,
         deadline: Instant,
     ) -> Result<Self, ClientError> {
+        let table = options.table.clone();
         let (stream, capabilities) = timeout_at(deadline, async {
             let mut challenge = vec![0; 32];
             getrandom::fill(&mut challenge).map_err(|e| ClientError::Protocol(e.to_string()))?;
@@ -273,6 +275,21 @@ impl Client {
                 capabilities,
                 closing: watch::channel(false).0,
             }),
+            table,
+        })
+    }
+
+    /// Return a table-scoped view sharing this client's authenticated
+    /// connection, request budget, and transport. Creating views does not
+    /// open another network connection.
+    pub fn table(&self, table: impl Into<String>) -> Result<Self, ClientError> {
+        let table = table.into();
+        if table.is_empty() || table.len() > 255 {
+            return Err(ClientError::Invalid("table name length".into()));
+        }
+        Ok(Self {
+            inner: self.inner.clone(),
+            table,
         })
     }
 
@@ -314,7 +331,7 @@ impl Client {
             message: Some(wire::frame::Message::Request(wire::Request {
                 id,
                 operation: Some(operation),
-                table: self.inner.options.table.clone(),
+                table: self.table.clone(),
             })),
         };
         let length = frame.encoded_len();

@@ -112,12 +112,9 @@ async fn full_application_catalog_preserves_peer_membership_and_node_lifecycle()
     assert_eq!(inspection.peer_count, 0);
     assert_eq!(inspection.health.len(), 1);
 
-    let users = Client::connect(
-        server.addr(),
-        ClientOptions::builder().table("users").build(),
-    )
-    .await
-    .unwrap();
+    // Table views share the authenticated connection; no second socket is
+    // opened for the users table.
+    let users = client.table("users").unwrap();
     users.put("item:1", b"table-value".to_vec()).await.unwrap();
     assert_eq!(
         users.get("item:1").await.unwrap().unwrap().bytes,
@@ -132,8 +129,6 @@ async fn full_application_catalog_preserves_peer_membership_and_node_lifecycle()
             .rows,
         vec![vec![QueryValue::Integer(1)]]
     );
-    users.close().await;
-
     client.close().await;
     assert_eq!(node.peer_count().await, 0);
     server.shutdown().await;
