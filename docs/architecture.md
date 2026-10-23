@@ -22,8 +22,9 @@ and the `PrefixedStore` wrapper are available without either feature.
   `seahash(key) % fragment_count` (see [Routing & Placement](routing-placement.md)).
   Each fragment is served by one or more replica nodes listed in a placement map.
 - **Actor-per-fragment**: every fragment on a node runs its own supervision
-  subtree — a dispatcher actor plus three worker pools — so fragments are
-  isolated from each other's failures.
+  subtree — a shared control-plane dispatcher plus independently scheduled
+  CRUD pools for each named table — so fragments and tables are isolated from
+  each other's query/write load.
 - **Async replication**: each fragment keeps one sender per replica peer;
   batches remain in flight until an apply/flush-aware ACK, retry on NACK or
   disconnect, and are repaired by periodic delta reconciliation
@@ -102,10 +103,10 @@ Node
 ├── peer mesh (TCP, redial supervisor)
 └── per fragment (served locally):
     └── FragmentSupervisor (ractor supervisor)
-        ├── KvActor dispatcher            (routes by priority, sticky-routes by key)
-        │   ├── high_pool      (N workers)
-        │   ├── default_pool   (N workers)
-        │   └── background_pool(N workers)
+        ├── KvActor dispatcher            (shared ingress/supervision)
+        │   ├── base pools                 (internal namespace-free messages)
+        │   └── table "USERS" CRUD pools   (high/default/background workers)
+        │       └── table "ORDERS" CRUD pools (created on first use)
         ├── Cleaner                        (TTL markers, every clean_interval)
         └── Snapshotter                    (periodic durable flush, every snapshot_interval)
     └── ReplicationSender × replica peers  (one sender task per fragment×target)
@@ -113,13 +114,14 @@ Node
 
 Key design points:
 
-- **Shared state, isolated execution.** All workers of a fragment share one
-  `Arc<FragmentState>` (the in-memory cache), but operations execute in three
-  independent worker pools keyed by `OpPriority`. Workers and admitted
-  backlogs are isolated; the dispatcher mailbox, fragment cache locks, and
-  peer connection reader remain shared. Accepted reads are handed directly to
-  their sticky worker, so one blocked background worker does not hold the
-  dispatcher behind a nested RPC.
+- **Shared control plane, isolated table execution.** Each named table owns an
+  `Arc<FragmentState>` (cache, ordered index, flush buffer, and durable store
+  namespace) and three independent worker pools keyed by `OpPriority`. Workers,
+  admission budgets, and shed counters are therefore table-local: adding a
+  busy table does not divide another table's CRUD throughput. The fragment
+  dispatcher, replication, placement, and maintenance remain shared. Accepted
+  reads are handed directly to their sticky table worker, so one blocked
+  background worker does not hold the dispatcher behind a nested RPC.
 - **Owned forwarded completion.** A separate private node-owned service admits
   serving forwarded single puts and whole batches with aggregate count/payload
   limits and eight workers per priority. It retains operation/placement leases

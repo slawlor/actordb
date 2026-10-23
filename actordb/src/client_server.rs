@@ -417,7 +417,6 @@ fn response_counts_valid(response: &wire::Response) -> bool {
 }
 
 enum DispatchTarget<'a> {
-    Legacy(&'a Node),
     Table(Table<'a>),
 }
 
@@ -427,10 +426,8 @@ impl DispatchTarget<'_> {
         key: String,
         priority: crate::actor::OpPriority,
     ) -> Result<Option<VersionedValue>, NodeError> {
-        match self {
-            Self::Legacy(node) => node.get_with_priority(key, priority).await,
-            Self::Table(table) => table.get_with_priority(key, priority).await,
-        }
+        let Self::Table(table) = self;
+        table.get_with_priority(key, priority).await
     }
 
     async fn put(
@@ -440,10 +437,8 @@ impl DispatchTarget<'_> {
         ttl: Option<Duration>,
         priority: crate::actor::OpPriority,
     ) -> Result<(), NodeError> {
-        match self {
-            Self::Legacy(node) => node.put_with_options(key, value, ttl, priority).await,
-            Self::Table(table) => table.put_with_options(key, value, ttl, priority).await,
-        }
+        let Self::Table(table) = self;
+        table.put_with_options(key, value, ttl, priority).await
     }
 
     async fn put_with_concern(
@@ -455,17 +450,10 @@ impl DispatchTarget<'_> {
         options: crate::write_concern::WriteConcernOptions,
     ) -> Result<crate::write_concern::WriteConcernReceipt, crate::write_concern::WriteConcernError>
     {
-        match self {
-            Self::Legacy(node) => {
-                node.put_with_write_concern_options(key, value, ttl, priority, options)
-                    .await
-            }
-            Self::Table(table) => {
-                table
-                    .put_with_write_concern_options(key, value, ttl, priority, options)
-                    .await
-            }
-        }
+        let Self::Table(table) = self;
+        table
+            .put_with_write_concern_options(key, value, ttl, priority, options)
+            .await
     }
 
     async fn delete(
@@ -473,10 +461,8 @@ impl DispatchTarget<'_> {
         key: String,
         priority: crate::actor::OpPriority,
     ) -> Result<(), NodeError> {
-        match self {
-            Self::Legacy(node) => node.delete_with_priority(key, priority).await,
-            Self::Table(table) => table.delete_with_priority(key, priority).await,
-        }
+        let Self::Table(table) = self;
+        table.delete_with_priority(key, priority).await
     }
 
     async fn delete_with_concern(
@@ -486,17 +472,10 @@ impl DispatchTarget<'_> {
         options: crate::write_concern::WriteConcernOptions,
     ) -> Result<crate::write_concern::WriteConcernReceipt, crate::write_concern::WriteConcernError>
     {
-        match self {
-            Self::Legacy(node) => {
-                node.delete_with_write_concern_options(key, priority, options)
-                    .await
-            }
-            Self::Table(table) => {
-                table
-                    .delete_with_write_concern_options(key, priority, options)
-                    .await
-            }
-        }
+        let Self::Table(table) = self;
+        table
+            .delete_with_write_concern_options(key, priority, options)
+            .await
     }
 
     async fn query(
@@ -504,20 +483,16 @@ impl DispatchTarget<'_> {
         sql: &str,
         params: &[actordb_query::QueryValue],
     ) -> Result<actordb_query::QueryResult, crate::query::QueryExecutionError> {
-        match self {
-            Self::Legacy(node) => node.query_with_params(sql, params).await,
-            Self::Table(table) => table.query_with_params(sql, params).await,
-        }
+        let Self::Table(table) = self;
+        table.query_with_params(sql, params).await
     }
 
     async fn scan(
         &self,
         spec: &crate::actor::ScanSpec,
     ) -> Result<Vec<crate::actor::ScanMatch>, crate::node::ScanError> {
-        match self {
-            Self::Legacy(node) => node.scan(spec).await,
-            Self::Table(table) => table.scan(spec).await,
-        }
+        let Self::Table(table) = self;
+        table.scan(spec).await
     }
 }
 
@@ -527,15 +502,11 @@ async fn dispatch(node: &Node, request: wire::Request) -> wire::Response {
         id: request.id,
         ..Default::default()
     };
-    let target = if request.table.is_empty() {
-        DispatchTarget::Legacy(node)
-    } else {
-        match node.table(request.table.clone()) {
-            Ok(table) => DispatchTarget::Table(table),
-            Err(failure) => {
-                response.error = Some(error(wire::ErrorCode::Invalid, &failure.to_string()));
-                return response;
-            }
+    let target = match node.table(request.table.clone()) {
+        Ok(table) => DispatchTarget::Table(table),
+        Err(failure) => {
+            response.error = Some(error(wire::ErrorCode::Invalid, &failure.to_string()));
+            return response;
         }
     };
     let priority_is_valid = match &request.operation {

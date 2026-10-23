@@ -231,10 +231,19 @@ impl<'a> Table<'a> {
         &self,
         plan: &QueryPlan,
     ) -> Result<actordb_query::QueryResult, QueryExecutionError> {
+        self.query_plan_with_options(plan, crate::query::QueryOptions::default())
+            .await
+    }
+
+    pub(crate) async fn query_plan_with_options(
+        &self,
+        plan: &QueryPlan,
+        options: crate::query::QueryOptions,
+    ) -> Result<actordb_query::QueryResult, QueryExecutionError> {
         let scoped = self.namespace_plan(plan)?;
         let mut result = self
             .node
-            .query_plan_scoped(&scoped, crate::query::QueryOptions::default())
+            .query_plan_with_options_scoped(&scoped, options)
             .await?;
         for (projection_index, projection) in scoped.projections.iter().enumerate() {
             if !matches!(projection, Projection::Key) {
@@ -261,10 +270,12 @@ impl<'a> Table<'a> {
         };
         let mut rows = self.node.scan(&scoped).await?;
         for row in &mut rows {
-            row.key = self
-                .id
-                .decode_key(&row.key)
-                .map_err(|error| crate::node::ScanError::Actor(error.to_string()))?;
+            if crate::table_key::table_name(&row.key).is_some() {
+                row.key = self
+                    .id
+                    .decode_key(&row.key)
+                    .map_err(|error| crate::node::ScanError::Actor(error.to_string()))?;
+            }
         }
         Ok(rows)
     }

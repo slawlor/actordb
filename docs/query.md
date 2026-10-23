@@ -1,8 +1,8 @@
 # SQL queries
 
 ActorDB queries use a virtual key/value table with UTF-8 `key`, opaque byte
-`value`, numeric `frag`, and durable-record metadata columns. `FROM kv` selects
-the legacy unnamed keyspace; named logical tables use `FROM table_name`. No
+`value`, numeric `frag`, and durable-record metadata columns. Every query uses
+`FROM table_name` to select its named logical table. No
 application schema registration or secondary index is required. Queries read
 visible records: deletes and expired values are hidden.
 

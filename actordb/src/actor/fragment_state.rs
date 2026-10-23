@@ -61,9 +61,8 @@ pub struct FragmentState {
     flush_batch_size: usize,
     flush_interval: Duration,
     expiry_publisher: Option<(FragmentId, ExpiryPublisher)>,
-    /// Independently cached and persisted table partitions. The legacy
-    /// fields above remain the unnamed KV partition; table children are
-    /// created lazily and share only the backend handle and node executor.
+    /// Independently cached and persisted table partitions. Table children
+    /// are created lazily and share only the backend handle and node executor.
     table_children: Arc<RwLock<HashMap<String, Arc<FragmentState>>>>,
     partitioned: bool,
     persistence_template: Option<PersistenceConfig>,
@@ -189,16 +188,21 @@ impl FragmentState {
         flush_batch_size: usize,
         flush_interval: Duration,
     ) -> Self {
-        let mut legacy = HashMap::new();
+        let mut unqualified = HashMap::new();
         let mut table_caches: HashMap<String, HashMap<String, VersionedValue>> = HashMap::new();
         for (key, value) in cache {
             if let Some(table) = crate::table_key::table_name(&key) {
                 table_caches.entry(table).or_default().insert(key, value);
             } else {
-                legacy.insert(key, value);
+                unqualified.insert(key, value);
             }
         }
-        let mut state = Self::new_local(legacy, kvstore.clone(), flush_batch_size, flush_interval);
+        let mut state = Self::new_local(
+            unqualified,
+            kvstore.clone(),
+            flush_batch_size,
+            flush_interval,
+        );
         let children = table_caches
             .into_iter()
             .map(|(table, cache)| {
@@ -347,10 +351,56 @@ impl FragmentState {
         self
     }
 
-    /// Enable the table-partition router for a live node fragment. Unit-level
-    /// states remain legacy-only unless explicitly promoted, preserving the
-    /// single-cache semantics used by actor tests and standalone workers.
+    /// Enable the table-partition router for a live node fragment.
     pub(crate) fn enable_partitions(mut self) -> Result<Self, String> {
+        // Boot loads the backend before the actor tree exists. Move already
+        // loaded named records into their child caches now, otherwise the
+        // first query would correctly route to an empty child while the
+        // parent still held the durable records.
+        let mut grouped = HashMap::<String, HashMap<String, VersionedValue>>::new();
+        {
+            let cache = self.cache.get_mut();
+            let mut retained: HashMap<String, VersionedValue> = HashMap::new();
+            for (key, value) in std::mem::take(&mut cache.values) {
+                if let Some(table) = crate::table_key::table_name(&key) {
+                    grouped.entry(table).or_default().insert(key, value);
+                } else {
+                    retained.insert(key, value);
+                }
+            }
+            cache.ordered_keys = retained.keys().cloned().collect();
+            cache.content_digests = retained
+                .iter()
+                .map(|(key, value)| (key.clone(), CachedDigests::new(value)))
+                .collect();
+            cache.expiry_deadlines = retained
+                .iter()
+                .filter_map(|(key, value)| {
+                    (!value.is_tombstone)
+                        .then_some(value.expires_at_ms)
+                        .flatten()
+                        .map(|deadline| (deadline, key.clone()))
+                })
+                .collect();
+            cache.values = retained;
+        }
+        {
+            let children = Arc::get_mut(&mut self.table_children)
+                .expect("table partitions are not concurrently shared during startup")
+                .get_mut();
+            for (table, values) in grouped {
+                let store = self.kvstore.as_ref().map(|inner| {
+                    Arc::new(TableStore::new(inner.clone(), &table)) as Arc<dyn KvStore>
+                });
+                let mut child =
+                    Self::new_local(values, store, self.flush_batch_size, self.flush_interval);
+                child.expiry_publisher = self.expiry_publisher.clone();
+                if let Some(config) = &self.persistence_template {
+                    child = child.with_persistence_config(config.clone())?;
+                }
+                children.insert(table, Arc::new(child));
+            }
+        }
         self.partitioned = true;
         if let Some(config) = self.persistence_template.clone() {
             let children = Arc::get_mut(&mut self.table_children)
@@ -393,6 +443,15 @@ impl FragmentState {
         let state = Arc::new(state);
         children.insert(table.to_string(), state.clone());
         state
+    }
+
+    /// Return the independently scheduled state for a named table.
+    ///
+    /// The fragment dispatcher uses this hook to attach a table's CRUD worker
+    /// actors to the same logical partition while keeping their cache, index,
+    /// durable queue, and admission budget isolated from sibling tables.
+    pub(crate) async fn table_state_for_actor(&self, table: &str) -> Arc<FragmentState> {
+        self.table_state(table).await
     }
 
     async fn child_for_key(&self, key: &str) -> Option<Arc<FragmentState>> {
@@ -879,7 +938,7 @@ impl FragmentState {
         &self,
         work: &crate::query::QueryPageWork,
     ) -> crate::proto::QueryPageResponse {
-        if self.partitioned && !work.plan.table.eq_ignore_ascii_case("KV") {
+        if self.partitioned {
             return self
                 .table_state(&work.plan.table.to_ascii_uppercase())
                 .await

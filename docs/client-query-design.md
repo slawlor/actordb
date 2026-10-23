@@ -209,7 +209,8 @@ SELECT SUM(CAST(value AS BIGINT))
 FROM kv WHERE STARTS_WITH(key, ?);
 ```
 
-The initial relation is `kv(key TEXT, value BYTES, frag INT)` plus explicit
+The initial relation is a required named table with columns
+`key TEXT, value BYTES, frag INT` plus explicit
 durable-envelope metadata (`timestamp_ms`, `logical_counter`, `node_id`,
 `expires_at_ms`, and `is_tombstone`). Support key equality, prefix matching,
 metadata predicates, key/value/prefix/length/metadata projections, and

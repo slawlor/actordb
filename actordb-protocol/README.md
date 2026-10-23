@@ -24,9 +24,9 @@ strings, preserving i128 precision. Keys are UTF-8 strings; values are arbitrary
 bytes. Framing is a four-byte big-endian body length, capped at 16 MiB.
 
 Application Hello/Auth negotiate version and optional capabilities before requests.
-Application requests may carry a logical `table` name; an empty value selects
-the legacy unnamed keyspace. Named tables reuse the same listener while
-isolating their key namespaces.
+Application requests must carry a logical `table` name. Named tables reuse the
+same listener while isolating their key, cache, query, and durable namespaces;
+an empty table is rejected as an invalid request.
 Challenge proofs use `actordb-client-proof-v1\0`, proving role, and both ordered
 Hello offers; they are independent of peer credentials and membership. Byte
 lengths are u64 big-endian, versions u32 big-endian, capabilities u64 big-endian.

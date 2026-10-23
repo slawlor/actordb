@@ -314,7 +314,7 @@ remove that record offline before restarting.
 select settings; omitted fields keep their documented defaults. Public fields
 remain available for inspecting or adjusting a configuration created through a
 builder or `Default`. This replaces external struct literals in the unpublished
-0.7 API and allows future optional settings to be added compatibly.
+pre-0.8 API and allows future optional settings to be added compatibly.
 
 ```rust
 use actordb::{node::NodeConfig, replication::SenderConfig};

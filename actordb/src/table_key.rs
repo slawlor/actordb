@@ -92,3 +92,14 @@ pub(crate) fn routing_hash(key: &str) -> u64 {
     };
     seahash::hash(&bytes)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn table_name_round_trips_encoded_key() {
+        let key = encode_table_key("KV", "ephemeral");
+        assert_eq!(table_name(&key).as_deref(), Some("KV"));
+    }
+}

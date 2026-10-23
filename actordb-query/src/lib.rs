@@ -2,8 +2,8 @@
 // Licensed under the MIT license in the repository root.
 
 //! Portable query plans for named key/value relations: UTF-8 keys, opaque
-//! values, and explicit durable-record metadata. `FROM kv` addresses the
-//! legacy unnamed keyspace; named tables use `FROM table_name`.
+//! values, and explicit durable-record metadata. Every query names its
+//! logical table with `FROM table_name`.
 //!
 //! SQL is a deliberately bounded subset, with key predicates, fragment scopes,
 //! projections, and mergeable integer aggregates. It does not execute Rust code
@@ -155,8 +155,7 @@ pub enum KeyPredicate {
 /// TOMBSTONES` modifier enables retained tombstone inspection.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QueryPlan {
-    /// SQL relation name. `KV` is the legacy unnamed keyspace; named tables
-    /// are case-insensitive SQL identifiers.
+    /// SQL relation name. Table names are case-insensitive SQL identifiers.
     pub table: String,
     pub projections: Vec<Projection>,
     pub predicates: Vec<KeyPredicate>,

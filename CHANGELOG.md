@@ -8,8 +8,8 @@
   the same fragment across tables for future local key joins.
 - Bump the peer protocol to v5 and the application protocol to v3 for the
   multi-table rollout.
-- SQL now names its relation explicitly (`FROM users`); `FROM kv` remains the
-  legacy unnamed keyspace and named table handles reject mismatched SQL.
+- SQL now names its relation explicitly (`FROM users`), and named table
+  handles reject mismatched SQL.
 
 ## 0.7.1
 

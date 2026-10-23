@@ -55,9 +55,9 @@ pub struct ClientOptions {
     /// Application authentication identity, 1 to 255 UTF-8 bytes.
     #[builder(default = "rust-client".to_string(), into)]
     pub identity: String,
-    /// Logical table selected for requests. Empty preserves the legacy
-    /// unnamed keyspace; named tables share the same application connection.
-    #[builder(default, into)]
+    /// Logical table selected for requests. Every connection must select a
+    /// named table; table views share the same application connection.
+    #[builder(default = "KV".to_string(), into)]
     pub table: String,
     /// Optional application credential, independent of the peer cluster secret.
     pub credential: Option<Vec<u8>>,
@@ -178,6 +178,7 @@ impl Client {
     fn validate_options(options: &ClientOptions) -> Result<Instant, ClientError> {
         if options.identity.is_empty()
             || options.identity.len() > 255
+            || options.table.is_empty()
             || options.table.len() > 255
             || options.timeout.is_zero()
             || options.max_queued_requests == 0

@@ -34,7 +34,7 @@ Optional fields also provide `maybe_credential(Option<Vec<u8>>)` and
 `ClientOptions::default()` or `PutOptions::default()` and assign public fields.
 
 In 0.8.0, set `ClientOptions::table` to bind one application connection to a
-named logical table. Leave it empty for the legacy unnamed keyspace:
+named logical table. A table name is required:
 
 ```rust,ignore
 let users = ClientOptions::builder().table("users").build();

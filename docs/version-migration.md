@@ -5,12 +5,10 @@ RocksDB data format **2**. Update every peer and application client together;
 older binaries are rejected during negotiation. The crate version is 0.8.0.
 
 Logical table views are namespaced within one node and reuse its peer listener.
-The default node API remains the legacy unnamed keyspace; named tables use
-independent per-table cache, flush, and iteration partitions over the shared
-durable backend. Their physical keys retain a deterministic table namespace,
-while fragment routing hashes only the unqualified user key so equal keys
-co-partition across tables. SQL must use `FROM table_name` for a named table;
-`FROM kv` selects only the legacy unnamed keyspace.
+Every operation selects a named table; each table uses independent cache,
+flush, and iteration partitions over the shared durable backend. Physical keys
+retain a deterministic table namespace, while fragment routing hashes only the
+unqualified user key so equal keys co-partition across tables.
 
 Record order is `(timestamp_ms, logical_counter, node_id, is_tombstone)`.
 `timestamp_ms` is physical Unix time. The counter orders same-time events without

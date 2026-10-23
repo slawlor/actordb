@@ -108,8 +108,8 @@ pub struct Scan {
 pub struct Request {
     #[prost(uint64, tag = "1")]
     pub id: u64,
-    /// Empty selects the legacy unnamed keyspace. Named tables are logical
-    /// namespaces hosted by the same node and peer listener.
+    /// Required logical table namespace. Tables share the node and peer listener
+    /// while isolating their key, cache, query, and durable storage state.
     #[prost(string, tag = "10")]
     pub table: ::prost::alloc::string::String,
     #[prost(oneof = "request::Operation", tags = "2, 3, 4, 5, 6, 7, 8, 9")]

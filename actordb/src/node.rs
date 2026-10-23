@@ -2124,6 +2124,19 @@ impl NodeConfig {
 }
 
 impl Node {
+    /// Normalize direct node operations into the built-in `KV` named table.
+    /// Table views pass already-qualified logical keys through unchanged.
+    fn qualify_key(key: String) -> String {
+        if crate::table_key::table_name(&key).is_some() {
+            key
+        } else {
+            let original_capacity = key.capacity();
+            let mut encoded = crate::table_key::encode_table_key("KV", &key);
+            encoded.reserve(original_capacity);
+            encoded
+        }
+    }
+
     /// Aggregate encoded-body reservations and saturation across all peers.
     /// Includes queued and active socket writes; excludes unencoded payloads,
     /// frame/task/allocator overhead, cache/storage, and kernel socket buffers.
@@ -2237,6 +2250,7 @@ impl Node {
     /// supersession are typed errors. `Ok` does not force a persistence flush
     /// or await asynchronous fan-out to the other replicas.
     pub async fn put(&self, key: String, value: Vec<u8>) -> Result<(), NodeError> {
+        let key = Self::qualify_key(key);
         let _operation = self.admit_operation()?;
         let retention =
             self.embedded_operations
@@ -2262,6 +2276,7 @@ impl Node {
         value: Vec<u8>,
         priority: OpPriority,
     ) -> Result<(), NodeError> {
+        let key = Self::qualify_key(key);
         let _operation = self.admit_operation()?;
         let retention =
             self.embedded_operations
@@ -2281,6 +2296,7 @@ impl Node {
         ttl: Option<Duration>,
         priority: OpPriority,
     ) -> Result<(), NodeError> {
+        let key = Self::qualify_key(key);
         let _operation = self.admit_operation()?;
         let retention =
             self.embedded_operations
@@ -2361,6 +2377,7 @@ impl Node {
         value: Vec<u8>,
         ttl: Option<Duration>,
     ) -> Result<(), NodeError> {
+        let key = Self::qualify_key(key);
         let _operation = self.admit_operation()?;
         let retention =
             self.embedded_operations
@@ -2377,6 +2394,7 @@ impl Node {
     /// tombstones so deletes survive node restarts and re-joins. A later
     /// `put` with a higher timestamp resurrects the key.
     pub async fn delete(&self, key: String) -> Result<(), NodeError> {
+        let key = Self::qualify_key(key);
         self.delete_with_priority(key, OpPriority::Default).await
     }
 
@@ -2386,6 +2404,7 @@ impl Node {
         key: String,
         priority: OpPriority,
     ) -> Result<(), NodeError> {
+        let key = Self::qualify_key(key);
         let _operation = self.admit_operation()?;
         let retention = self
             .embedded_operations
@@ -2427,6 +2446,7 @@ impl Node {
     /// the configured replica holders in placement order. An unavailable
     /// holder is distinct from a valid not-found response.
     pub async fn get(&self, key: String) -> Result<Option<VersionedValue>, NodeError> {
+        let key = Self::qualify_key(key);
         let _operation = self.admit_operation()?;
         let retention = self
             .embedded_operations
@@ -2447,6 +2467,7 @@ impl Node {
         key: String,
         priority: OpPriority,
     ) -> Result<Option<VersionedValue>, NodeError> {
+        let key = Self::qualify_key(key);
         let _operation = self.admit_operation()?;
         let retention = self
             .embedded_operations
@@ -2571,8 +2592,8 @@ impl Node {
     }
 
     /// Read the full local copy across all fragments (debugging / tests).
-    /// Request count admission is bounded, but this legacy debug API clones the
-    /// whole local dataset. Use bounded queries/scans for production reads.
+    /// Request count admission is bounded; use bounded queries/scans for
+    /// production reads.
     pub async fn get_all(&self) -> Result<HashMap<String, VersionedValue>, NodeError> {
         let _operation = self.admit_operation()?;
         let retention = self
@@ -2585,8 +2606,16 @@ impl Node {
         )
         .await
         .map_err(|_| NodeError::Actor("get_all local work timed out".into()))??;
-        // Hide tombstones from user reads (sync needs them, users don't).
-        Ok(all.into_iter().filter(|(_, v)| !v.is_tombstone).collect())
+        // Hide tombstones from user reads (sync needs them, users don't), and
+        // present the built-in KV table's keys in its user-facing form.
+        Ok(all
+            .into_iter()
+            .filter(|(_, v)| !v.is_tombstone)
+            .map(|(key, value)| {
+                let key = crate::table_key::decode_table_key("KV", &key).unwrap_or(key);
+                (key, value)
+            })
+            .collect())
     }
 
     /// Put multiple keys with an explicit priority (Phase 7). Bulk
@@ -2609,6 +2638,10 @@ impl Node {
         kvs: Vec<(String, Vec<u8>)>,
         priority: OpPriority,
     ) -> Vec<Result<(), NodeError>> {
+        let kvs: Vec<(String, Vec<u8>)> = kvs
+            .into_iter()
+            .map(|(key, value)| (Self::qualify_key(key), value))
+            .collect();
         let _operation = match self.admit_operation() {
             Ok(operation) => operation,
             Err(_) => {
@@ -2858,6 +2891,10 @@ impl Node {
     /// explicit priority. Local and remote keys both return exact per-key
     /// outcomes from the serving fragment.
     pub async fn put_multi(&self, kvs: Vec<(String, Vec<u8>)>) -> Vec<Result<(), NodeError>> {
+        let kvs: Vec<(String, Vec<u8>)> = kvs
+            .into_iter()
+            .map(|(key, value)| (Self::qualify_key(key), value))
+            .collect();
         let _operation = match self.admit_operation() {
             Ok(operation) => operation,
             Err(_) => {
@@ -2902,6 +2939,7 @@ impl Node {
         keys: Vec<String>,
         priority: OpPriority,
     ) -> Vec<Result<Option<VersionedValue>, NodeError>> {
+        let keys: Vec<String> = keys.into_iter().map(Self::qualify_key).collect();
         let _operation = match self.admit_operation() {
             Ok(operation) => operation,
             Err(_) => {
@@ -3128,6 +3166,7 @@ impl Node {
         &self,
         keys: Vec<String>,
     ) -> Vec<Result<Option<VersionedValue>, NodeError>> {
+        let keys: Vec<String> = keys.into_iter().map(Self::qualify_key).collect();
         let _operation = match self.admit_operation() {
             Ok(operation) => operation,
             Err(_) => {
@@ -3389,7 +3428,14 @@ mod tests {
             ));
             let after = crate::actor::now_ms();
             assert!(node.get(key.clone()).await.unwrap().is_none());
-            let marker = node.router.get_all().await.unwrap().remove(&key).unwrap();
+            let marker_key = crate::table_key::encode_table_key("KV", &key);
+            let marker = node
+                .router
+                .get_all()
+                .await
+                .unwrap()
+                .remove(&marker_key)
+                .unwrap();
             assert!(marker.is_tombstone);
             assert_eq!(
                 marker.version(),
@@ -3404,10 +3450,17 @@ mod tests {
             .await
             .unwrap();
         let values = restarted.router.get_all().await.unwrap();
-        assert_eq!(values["permanent"], permanent);
-        assert_eq!(values["expiring"], expiring);
+        assert_eq!(
+            values[&crate::table_key::encode_table_key("KV", "permanent")],
+            permanent
+        );
+        assert_eq!(
+            values[&crate::table_key::encode_table_key("KV", "expiring")],
+            expiring
+        );
         for (key, marker) in markers {
-            assert_eq!(values[&key], marker);
+            let qualified = crate::table_key::encode_table_key("KV", &key);
+            assert_eq!(values[&qualified], marker);
             assert!(restarted.get(key).await.unwrap().is_none());
         }
         restarted.shutdown().await.unwrap();
@@ -3504,12 +3557,13 @@ mod tests {
             Err(NodeError::Expired)
         ));
         let after = crate::actor::now_ms();
+        let marker_key = crate::table_key::encode_table_key("KV", "immediate-remote");
         let marker = owner
             .router
             .get_all()
             .await
             .unwrap()
-            .remove("immediate-remote")
+            .remove(&marker_key)
             .unwrap();
         assert!(marker.is_tombstone);
         assert_eq!(marker.node_id, "ttl-caller");
@@ -3547,12 +3601,13 @@ mod tests {
         drop(clock);
         assert!(matches!(request.await, Err(NodeError::Expired)));
         assert!(node.get("waited".into()).await.unwrap().is_none());
+        let marker_key = crate::table_key::encode_table_key("KV", "waited");
         let marker = node
             .router
             .get_all()
             .await
             .unwrap()
-            .remove("waited")
+            .remove(&marker_key)
             .unwrap();
         assert!(marker.is_tombstone);
         assert!(marker.expires_at_ms.unwrap() < marker.timestamp_ms);

@@ -538,9 +538,13 @@ async fn incomplete_application_prefix_is_timed_out_and_idle_client_survives() {
         },
     )
     .await;
-    assert!(
-        matches!(receive(&mut stream).await.message, Some(wire::frame::Message::Response(wire::Response { error: None, reads, .. })) if reads.len() == 1 && reads[0].value.is_none())
-    );
+    assert!(matches!(
+        receive(&mut stream).await.message,
+        Some(wire::frame::Message::Response(wire::Response {
+            error: Some(error),
+            ..
+        })) if error.code == wire::ErrorCode::Invalid as i32
+    ));
     let idle = Client::connect(server.addr(), ClientOptions::default())
         .await
         .unwrap();

@@ -2419,7 +2419,7 @@ mod tests {
         let health = node.health().await.unwrap();
         let fragment = &health[&FragmentId(0)];
         assert_eq!(fragment.worker_count, fragment.worker_names.len());
-        assert_eq!(fragment.worker_count, 8);
+        assert_eq!(fragment.worker_count, 16);
         assert_eq!(fragment.shed_counts, (0, 0, 0));
         node.shutdown().await.unwrap();
     }
@@ -2492,7 +2492,7 @@ mod tests {
         ));
         let recovered = recovered.unwrap().unwrap();
         assert_eq!(recovered.len(), 2);
-        assert_eq!(recovered[&fragment].worker_count, 8);
+        assert_eq!(recovered[&fragment].worker_count, 16);
         assert_eq!(recovered[&fragment].shed_counts, (0, 0, 0));
         assert!(query.unwrap().unwrap().is_none());
         shutdown.unwrap().unwrap();

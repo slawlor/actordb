@@ -10,7 +10,7 @@ feature to use the offered durable backend:
 
 ```toml
 [dependencies]
-actordb = { version = "0.7", features = ["rocksdb"] }
+actordb = { version = "0.8.0", features = ["rocksdb"] }
 ```
 
 The independent `memory` feature exposes only the no-op `MemoryStore` test
@@ -179,8 +179,10 @@ future, or mismatched manifest. Subsequent opens should remove the flag.
 ## On-disk format
 
 Keys in the offered RocksDB data CF are always a 4-byte big-endian fragment id
-followed by either the legacy UTF-8 logical key or a table-store partition
-prefix and logical table key. Values are encoded as:
+followed by a table-store partition prefix and logical table key. Every
+0.8.0 record therefore belongs to an explicit named table; pre-0.8 unnamed
+records require an application-managed migration before opening this format.
+Values are encoded as:
 
 ```
 [timestamp_ms: u64 BE][expires_at_ms: u64 BE, 0 = none][is_tombstone: u8]

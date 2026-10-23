@@ -251,17 +251,18 @@ node.put_multi_with_priority(batch, OpPriority::Background).await;
 ```
 
 `OpPriority` is `High` / `Default` / `Background` (`Default` is the
-`#[default]`). Priorities map to three isolated worker pools per fragment; a
-shed operation surfaces as `NodeError::Backpressure` — never as a silent
+`#[default]`). Each named table has three isolated worker pools per fragment;
+a shed operation surfaces as `NodeError::Backpressure` — never as a silent
 success or `Ok(None)`. Local and forwarded puts wait for the serving worker's
 exact apply outcome; once it returns `Ok`, reads at that owner observe that
 version or a newer winner. The priority travels in the request and selects the
-remote actor pool, but it does not schedule the per-peer socket's ordinary
-data lane. Pool capacity counts active-plus-queued worker jobs. It does not
-bound the shared dispatcher mailbox or replicated ingress. The dispatcher
-hands admitted reads directly to their sticky worker rather than awaiting a
-nested worker RPC; worker execution is priority-isolated, while dispatcher
-ingress, fragment cache locks, and each peer reader remain shared.
+remote table's actor pool, but it does not schedule the per-peer socket's
+ordinary data lane. Pool capacity counts active-plus-queued worker jobs for
+that table. It does not bound the shared dispatcher mailbox or replicated
+ingress. The dispatcher hands admitted reads directly to their sticky table
+worker rather than awaiting a nested worker RPC; worker execution and
+backpressure are table-isolated, while dispatcher ingress, placement,
+replication, and maintenance remain shared.
 See
 [Consistency](consistency.md) and [Traffic classes & backpressure](backpressure.md).
 
