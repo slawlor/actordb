@@ -815,7 +815,11 @@ impl FragmentState {
             } else {
                 0
             };
-            let metadata_work = if needs_metadata { value.node_id.len() } else { 0 };
+            let metadata_work = if needs_metadata {
+                value.node_id.len()
+            } else {
+                0
+            };
             let record_work = key
                 .len()
                 .saturating_mul(2)
