@@ -230,8 +230,12 @@ impl Parser<'_> {
             }
         }
         self.expect_word("FROM")?;
-        self.expect_word("KV")?;
+        let table = match self.next_kind() {
+            Some(Kind::Word(table)) => table,
+            _ => return Err(self.error("expected a table name after FROM")),
+        };
         let mut plan = QueryPlan {
+            table,
             projections,
             predicates: Vec::new(),
             metadata_predicates: Vec::new(),

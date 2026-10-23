@@ -193,7 +193,7 @@ async fn healthy(clients: &[Client], records: &[(String, Vec<u8>, u32)]) -> Resu
         .await?;
     check(
         duplicates.len() == 4 && duplicates.iter().all(|result| result.is_ok()),
-        "multifragment duplicate batch write outcomes",
+        &format!("multifragment duplicate batch write outcomes: {duplicates:?}"),
     )?;
     for peer in clients {
         wait_value(peer, &batch_local, Some(b"local")).await;

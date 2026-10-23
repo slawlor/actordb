@@ -55,6 +55,10 @@ pub struct ClientOptions {
     /// Application authentication identity, 1 to 255 UTF-8 bytes.
     #[builder(default = "rust-client".to_string(), into)]
     pub identity: String,
+    /// Logical table selected for requests. Every connection must select a
+    /// named table; table views share the same application connection.
+    #[builder(default = "KV".to_string(), into)]
+    pub table: String,
     /// Optional application credential, independent of the peer cluster secret.
     pub credential: Option<Vec<u8>>,
     /// Total request/authentication deadline and default graceful close budget.
@@ -136,6 +140,7 @@ struct Inner {
 #[derive(Clone)]
 pub struct Client {
     inner: Arc<Inner>,
+    table: String,
 }
 
 impl Client {
@@ -174,6 +179,8 @@ impl Client {
     fn validate_options(options: &ClientOptions) -> Result<Instant, ClientError> {
         if options.identity.is_empty()
             || options.identity.len() > 255
+            || options.table.is_empty()
+            || options.table.len() > 255
             || options.timeout.is_zero()
             || options.max_queued_requests == 0
             || options.max_queued_requests > Semaphore::MAX_PERMITS
@@ -199,6 +206,7 @@ impl Client {
         options: ClientOptions,
         deadline: Instant,
     ) -> Result<Self, ClientError> {
+        let table = options.table.clone();
         let (stream, capabilities) = timeout_at(deadline, async {
             let mut challenge = vec![0; 32];
             getrandom::fill(&mut challenge).map_err(|e| ClientError::Protocol(e.to_string()))?;
@@ -267,6 +275,21 @@ impl Client {
                 capabilities,
                 closing: watch::channel(false).0,
             }),
+            table,
+        })
+    }
+
+    /// Return a table-scoped view sharing this client's authenticated
+    /// connection, request budget, and transport. Creating views does not
+    /// open another network connection.
+    pub fn table(&self, table: impl Into<String>) -> Result<Self, ClientError> {
+        let table = table.into();
+        if table.is_empty() || table.len() > 255 {
+            return Err(ClientError::Invalid("table name length".into()));
+        }
+        Ok(Self {
+            inner: self.inner.clone(),
+            table,
         })
     }
 
@@ -308,6 +331,7 @@ impl Client {
             message: Some(wire::frame::Message::Request(wire::Request {
                 id,
                 operation: Some(operation),
+                table: self.table.clone(),
             })),
         };
         let length = frame.encoded_len();

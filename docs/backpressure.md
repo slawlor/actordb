@@ -1,10 +1,12 @@
 # Traffic classes & backpressure (Phase 7)
 
-Every fragment runs **three isolated worker pools** instead of one shared pool.
-Operations are classified by `OpPriority` and each pool has its own workers,
-worker backlog, rate limiter, and shed counter. Bulk work cannot consume the
-workers or queue capacity reserved for latency-sensitive traffic. The
-dispatcher mailbox and peer framing/writer lanes remain shared, so this is
+Every named table on a fragment runs **three isolated worker pools** instead of
+sharing one CRUD pool with its neighbors. Operations are classified by
+`OpPriority` and each table-local pool has its own workers, worker backlog, rate
+limiter, and shed counter. Bulk work cannot consume the workers or queue
+capacity reserved for latency-sensitive traffic, and a busy table cannot
+fractionally consume another table's CRUD throughput. The dispatcher mailbox,
+replication, placement, and peer framing/writer lanes remain shared, so this is
 worker isolation rather than a strict end-to-end priority scheduler.
 
 ## Priorities
@@ -71,13 +73,13 @@ Omitting `background_pool` keeps the original profile unchanged. See
 
 ## Admission and shedding
 
-The dispatcher's internal pool reservation checks the token bucket first, then
-the queue cap. `queue_cap` counts jobs handed from the dispatcher to one
-priority pool, including active and worker-mailbox jobs; it does not bound the
-shared dispatcher mailbox. Admission increments a pool total and the exact
-sticky worker's generation counter. Completion or immediate send failure
-releases both, while supervision reclaims the exact terminated generation's
-remaining reservations before publishing its replacement. When rate or
+The dispatcher's internal table-pool reservation checks the token bucket first,
+then the queue cap. `queue_cap` counts jobs handed from the dispatcher to one
+priority pool for one table, including active and worker-mailbox jobs; it does
+not bound the shared dispatcher mailbox. Admission increments a pool total and
+the exact sticky worker's generation counter. Completion or immediate send
+failure releases both, while supervision reclaims the exact terminated
+generation's remaining reservations before publishing its replacement. When rate or
 capacity admission fails, the op is **shed**: dropped, **counted** in the
 pool's shed counter, never silent. Worker unavailability instead drops the
 reply port for reply-bearing calls and is surfaced as an actor/network

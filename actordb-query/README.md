@@ -23,7 +23,9 @@ let portable_sql = plan.to_sql();
 
 ## Supported syntax
 
-- One `SELECT ... FROM kv` statement with an optional terminal semicolon.
+- One `SELECT ... FROM table_name` statement with an optional terminal
+  semicolon. The relation name is required; `kv` is simply the conventional
+  default table used by low-level examples.
 - Columns: `key`, `value`, `frag`, `PREFIX_BYTES(value, N)`,
   `OCTET_LENGTH(value)`, and durable-record metadata `timestamp_ms`,
   `logical_counter`, `node_id`, `expires_at_ms`, and `is_tombstone`.
@@ -33,7 +35,7 @@ let portable_sql = plan.to_sql();
   `STARTS_WITH(key, prefix)`; `frag = N`; `frag IN (N, ...)`.
 - Durable metadata predicates compare `timestamp_ms`, `logical_counter`,
   `node_id`, `expires_at_ms`, and `is_tombstone`; TTL presence checks use
-  `IS NULL`/`IS NOT NULL`. Add `INCLUDING TOMBSTONES` after `FROM kv` to
+  `IS NULL`/`IS NOT NULL`. Add `INCLUDING TOMBSTONES` after `FROM table_name` to
   include retained tombstones.
 - Prefixes can use text or byte literals, for example `X'e99b'`.
 - Global row ordering is ascending by key. `ORDER BY key ASC` is optional.

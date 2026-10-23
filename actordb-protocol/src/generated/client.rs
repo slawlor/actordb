@@ -108,6 +108,10 @@ pub struct Scan {
 pub struct Request {
     #[prost(uint64, tag = "1")]
     pub id: u64,
+    /// Required logical table namespace. Tables share the node and peer listener
+    /// while isolating their key, cache, query, and durable storage state.
+    #[prost(string, tag = "10")]
+    pub table: ::prost::alloc::string::String,
     #[prost(oneof = "request::Operation", tags = "2, 3, 4, 5, 6, 7, 8, 9")]
     pub operation: ::core::option::Option<request::Operation>,
 }

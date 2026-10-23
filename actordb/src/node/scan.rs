@@ -238,14 +238,44 @@ impl Node {
     /// ```
     pub async fn scan(&self, spec: &ScanSpec) -> Result<Vec<ScanMatch>, ScanError> {
         use crate::query::QueryExecutionError;
-        self.scan_bounded(spec).await.map_err(|error| match error {
-            QueryExecutionError::FragmentsUnavailable(ids) => {
-                ScanError::FragmentsUnavailable(ids.into_iter().map(FragmentId).collect())
+        let mut scoped = spec.clone();
+        scoped.matcher = match &spec.matcher {
+            crate::actor::KeyMatcher::All => {
+                crate::actor::KeyMatcher::Prefix(crate::table_key::table_prefix("KV").into_bytes())
             }
-            QueryExecutionError::Backpressure(reason) => ScanError::Backpressure(reason),
-            QueryExecutionError::ShuttingDown => ScanError::ShuttingDown,
-            other => ScanError::Actor(other.to_string()),
-        })
+            crate::actor::KeyMatcher::Prefix(prefix)
+                if std::str::from_utf8(prefix)
+                    .ok()
+                    .and_then(crate::table_key::table_name)
+                    .is_some() =>
+            {
+                crate::actor::KeyMatcher::Prefix(prefix.clone())
+            }
+            crate::actor::KeyMatcher::Prefix(prefix) => crate::actor::KeyMatcher::Prefix(
+                crate::table_key::encode_table_prefix("KV", prefix),
+            ),
+        };
+        let mut rows = self
+            .scan_bounded(&scoped)
+            .await
+            .map_err(|error| match error {
+                QueryExecutionError::FragmentsUnavailable(ids) => {
+                    ScanError::FragmentsUnavailable(ids.into_iter().map(FragmentId).collect())
+                }
+                QueryExecutionError::Backpressure(reason) => ScanError::Backpressure(reason),
+                QueryExecutionError::ShuttingDown => ScanError::ShuttingDown,
+                other => ScanError::Actor(other.to_string()),
+            })?;
+        // The unqualified Node API is the named `KV` table view. Keep its
+        // public scan keys in user-key form; other named tables remain
+        // encoded until their `Table` handle decodes them.
+        for row in &mut rows {
+            if crate::table_key::table_name(&row.key).as_deref() == Some("KV") {
+                row.key = crate::table_key::decode_table_key("KV", &row.key)
+                    .ok_or_else(|| ScanError::Actor("invalid KV table key namespace".into()))?;
+            }
+        }
+        Ok(rows)
     }
 }
 

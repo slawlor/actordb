@@ -52,6 +52,9 @@ message Request {
     Inspect inspect = 8;
     Scan scan = 9;
   }
+  // Required logical table namespace. Tables share the node and peer listener
+  // while isolating their key, cache, query, and durable storage state.
+  string table = 10;
 }
 enum ErrorCode {
   ERROR_CODE_UNKNOWN = 0;

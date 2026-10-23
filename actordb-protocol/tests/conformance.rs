@@ -71,6 +71,7 @@ fn application_get_golden_frame_and_unknown_fields() {
                 key: "x".into(),
                 priority: 0,
             })),
+            table: String::new(),
         })),
     };
     let mut bytes = frame.encode_to_vec();
@@ -89,6 +90,7 @@ fn preflight_rejects_repeated_amplification_and_duplicate_structured_messages() 
                 keys: vec![String::new(); MAX_BATCH_ITEMS + 1],
                 priority: 0,
             })),
+            table: String::new(),
         })),
     };
     assert!(preflight_client_frame(&request.encode_to_vec()).is_err());

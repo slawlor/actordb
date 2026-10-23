@@ -31,6 +31,7 @@ struct ReplyProxy {
 
 impl ReplyProxy {
     async fn start(receiver: SocketAddr, key: &'static str, drop_reply: bool) -> Self {
+        let key = kv_key(key);
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let observed = Arc::new(Notify::new());
@@ -93,6 +94,17 @@ impl ReplyProxy {
             .await
             .unwrap();
     }
+}
+
+fn kv_key(key: &str) -> String {
+    let digits = b"0123456789abcdef";
+    let encoded: String = key
+        .as_bytes()
+        .iter()
+        .flat_map(|byte| [digits[(byte >> 4) as usize], digits[(byte & 0x0f) as usize]])
+        .map(char::from)
+        .collect();
+    format!("\u{001e}actordb.table.v1:4b56:{encoded}")
 }
 
 impl Drop for ReplyProxy {

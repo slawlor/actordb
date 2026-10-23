@@ -5,6 +5,7 @@
 
 //! Per-fragment dispatcher and supervision of priority worker pools.
 
+use std::collections::HashMap;
 use std::panic::AssertUnwindSafe;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
@@ -55,21 +56,193 @@ pub struct KvState {
     high_pool: WorkerPool,
     default_pool: WorkerPool,
     background_pool: WorkerPool,
+    table_pools: HashMap<String, TablePools>,
     shared: Arc<FragmentState>,
     worker_prefix: String,
+    high_config: PoolConfig,
+    default_config: PoolConfig,
+    background_config: PoolConfig,
+}
+
+struct TablePools {
+    high_pool: WorkerPool,
+    default_pool: WorkerPool,
+    background_pool: WorkerPool,
+    shared: Arc<FragmentState>,
 }
 
 impl KvState {
-    fn pool(&self, priority: OpPriority) -> &WorkerPool {
+    fn base_pool(&self, priority: OpPriority) -> &WorkerPool {
         match priority {
             OpPriority::High => &self.high_pool,
             OpPriority::Default => &self.default_pool,
             OpPriority::Background => &self.background_pool,
         }
     }
+
+    fn base_pool_mut(&mut self, priority: OpPriority) -> &mut WorkerPool {
+        match priority {
+            OpPriority::High => &mut self.high_pool,
+            OpPriority::Default => &mut self.default_pool,
+            OpPriority::Background => &mut self.background_pool,
+        }
+    }
+
+    fn table_pool(&self, table: &str, priority: OpPriority) -> &WorkerPool {
+        let pools = self
+            .table_pools
+            .get(table)
+            .expect("table CRUD pools must be initialized before routing");
+        match priority {
+            OpPriority::High => &pools.high_pool,
+            OpPriority::Default => &pools.default_pool,
+            OpPriority::Background => &pools.background_pool,
+        }
+    }
+
+    fn table_pool_mut(&mut self, table: &str, priority: OpPriority) -> &mut WorkerPool {
+        let pools = self
+            .table_pools
+            .get_mut(table)
+            .expect("table CRUD pools must be initialized before routing");
+        match priority {
+            OpPriority::High => &mut pools.high_pool,
+            OpPriority::Default => &mut pools.default_pool,
+            OpPriority::Background => &mut pools.background_pool,
+        }
+    }
+
+    fn pool(&self, table: Option<&str>, priority: OpPriority) -> &WorkerPool {
+        table.map_or_else(
+            || self.base_pool(priority),
+            |table| self.table_pool(table, priority),
+        )
+    }
+
+    fn pool_mut(&mut self, table: Option<&str>, priority: OpPriority) -> &mut WorkerPool {
+        match table {
+            Some(table) => self.table_pool_mut(table, priority),
+            None => self.base_pool_mut(priority),
+        }
+    }
+
+    async fn ensure_table_pools(
+        &mut self,
+        table: &str,
+        myself: &ActorRef<KvMessage>,
+    ) -> Result<(), ActorProcessingErr> {
+        if self.table_pools.contains_key(table) {
+            return Ok(());
+        }
+        let shared = self.shared.table_state_for_actor(table).await;
+        let prefix = format!("{}-table-{}", self.worker_prefix, table);
+        let pools = spawn_pools(
+            self.high_config.clone(),
+            self.default_config.clone(),
+            self.background_config.clone(),
+            shared.clone(),
+            myself,
+            &prefix,
+        )
+        .await?;
+        self.table_pools.insert(
+            table.to_string(),
+            TablePools {
+                high_pool: pools.0,
+                default_pool: pools.1,
+                background_pool: pools.2,
+                shared,
+            },
+        );
+        Ok(())
+    }
 }
 
-async fn route_batch_read(mut work: BatchReadContinuation, state: &KvState) {
+fn table_for_key(key: &str) -> Option<String> {
+    crate::table_key::table_name(key)
+}
+
+fn table_for_scan(spec: &crate::actor::ScanSpec) -> Option<String> {
+    match &spec.matcher {
+        crate::actor::KeyMatcher::Prefix(prefix) => std::str::from_utf8(prefix)
+            .ok()
+            .and_then(crate::table_key::table_name),
+        crate::actor::KeyMatcher::All => None,
+    }
+}
+
+async fn spawn_pools(
+    high_config: PoolConfig,
+    default_config: PoolConfig,
+    background_config: PoolConfig,
+    shared: Arc<FragmentState>,
+    supervisor: &ActorRef<KvMessage>,
+    worker_prefix: &str,
+) -> Result<(WorkerPool, WorkerPool, WorkerPool), ActorProcessingErr> {
+    let mut pools = Vec::with_capacity(3);
+    let startup = AssertUnwindSafe(async {
+        pools.push(
+            WorkerPool::spawn_linked(
+                high_config,
+                shared.clone(),
+                supervisor.get_cell(),
+                &format!("{worker_prefix}-high"),
+            )
+            .await?,
+        );
+        pools.push(
+            WorkerPool::spawn_linked(
+                default_config,
+                shared.clone(),
+                supervisor.get_cell(),
+                &format!("{worker_prefix}-default"),
+            )
+            .await?,
+        );
+        pools.push(
+            WorkerPool::spawn_linked(
+                background_config,
+                shared,
+                supervisor.get_cell(),
+                &format!("{worker_prefix}-bg"),
+            )
+            .await?,
+        );
+        Ok::<(), ActorProcessingErr>(())
+    })
+    .catch_unwind()
+    .await;
+    match startup {
+        Ok(Ok(())) => {
+            let mut pools = pools.into_iter();
+            Ok((
+                pools.next().expect("high pool was started"),
+                pools.next().expect("default pool was started"),
+                pools.next().expect("background pool was started"),
+            ))
+        }
+        Ok(Err(error)) => {
+            for pool in &pools {
+                pool.begin_shutdown();
+            }
+            for pool in &pools {
+                pool.join().await;
+            }
+            Err(error)
+        }
+        Err(panic) => {
+            for pool in &pools {
+                pool.begin_shutdown();
+            }
+            for pool in &pools {
+                pool.join().await;
+            }
+            std::panic::resume_unwind(panic);
+        }
+    }
+}
+
+async fn route_batch_read(mut work: BatchReadContinuation, state: &mut KvState) {
     loop {
         if work.reply.is_closed() {
             return;
@@ -80,7 +253,18 @@ async fn route_batch_read(mut work: BatchReadContinuation, state: &KvState) {
             work.finish();
             return;
         }
-        let pool = state.pool(work.priority);
+        let table = work.current_key().and_then(table_for_key);
+        if let Some(table) = table.as_deref() {
+            if state
+                .ensure_table_pools(table, &work.dispatcher)
+                .await
+                .is_err()
+            {
+                work.push(Err("table CRUD pool unavailable".to_string()));
+                continue;
+            }
+        }
+        let pool = state.pool(table.as_deref(), work.priority);
         let reservation = {
             let key = work
                 .current_key()
@@ -107,72 +291,52 @@ impl Actor for KvActor {
         args: Self::Arguments,
     ) -> Result<Self::State, ActorProcessingErr> {
         // Workers are linked to the dispatcher: a dead worker raises a
-        // supervision event here and gets replaced in-place.
-        // Phase 7: three isolated pools by priority.
-        let mut pools = Vec::with_capacity(3);
-        let startup = AssertUnwindSafe(async {
-            pools.push(
-                WorkerPool::spawn_linked(
-                    args.high_pool.clone(),
-                    args.shared.clone(),
-                    myself.get_cell(),
-                    &format!("{}-high", args.worker_prefix),
-                )
-                .await?,
-            );
-            pools.push(
-                WorkerPool::spawn_linked(
-                    args.default_pool.clone(),
-                    args.shared.clone(),
-                    myself.get_cell(),
-                    &format!("{}-default", args.worker_prefix),
-                )
-                .await?,
-            );
-            pools.push(
-                WorkerPool::spawn_linked(
-                    args.background_pool.clone(),
-                    args.shared.clone(),
-                    myself.get_cell(),
-                    &format!("{}-bg", args.worker_prefix),
-                )
-                .await?,
-            );
-            Ok::<(), ActorProcessingErr>(())
-        })
-        .catch_unwind()
-        .await;
-        match startup {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => {
-                for pool in &pools {
-                    pool.begin_shutdown();
-                }
-                for pool in &pools {
-                    pool.join().await;
-                }
-                return Err(error);
-            }
-            Err(panic) => {
-                for pool in &pools {
-                    pool.begin_shutdown();
-                }
-                for pool in &pools {
-                    pool.join().await;
-                }
-                std::panic::resume_unwind(panic);
-            }
-        }
-        let mut pools = pools.into_iter();
-        let high_pool = pools.next().expect("high pool was started");
-        let default_pool = pools.next().expect("default pool was started");
-        let background_pool = pools.next().expect("background pool was started");
+        // supervision event here and gets replaced in-place. Named tables get
+        // independent pool sets; the base pools remain only for internal
+        // messages that do not carry a table namespace.
+        let (high_pool, default_pool, background_pool) = spawn_pools(
+            args.high_pool.clone(),
+            args.default_pool.clone(),
+            args.background_pool.clone(),
+            args.shared.clone(),
+            &myself,
+            &args.worker_prefix,
+        )
+        .await?;
+        // `KV` is the public default table for the Node API. Start
+        // its CRUD pools with the fragment so the first application request
+        // does not pay dynamic actor-creation latency (custom tables remain
+        // lazy and are created on first use).
+        let kv_shared = args.shared.table_state_for_actor("KV").await;
+        let (kv_high_pool, kv_default_pool, kv_background_pool) = spawn_pools(
+            args.high_pool.clone(),
+            args.default_pool.clone(),
+            args.background_pool.clone(),
+            kv_shared.clone(),
+            &myself,
+            &format!("{}-table-KV", args.worker_prefix),
+        )
+        .await?;
+        let mut table_pools = HashMap::new();
+        table_pools.insert(
+            "KV".to_string(),
+            TablePools {
+                high_pool: kv_high_pool,
+                default_pool: kv_default_pool,
+                background_pool: kv_background_pool,
+                shared: kv_shared,
+            },
+        );
         Ok(KvState {
             high_pool,
             default_pool,
             background_pool,
+            table_pools,
             shared: args.shared,
             worker_prefix: args.worker_prefix.clone(),
+            high_config: args.high_pool,
+            default_config: args.default_pool,
+            background_config: args.background_pool,
         })
     }
 
@@ -188,6 +352,11 @@ impl Actor for KvActor {
         state.high_pool.shutdown().await;
         state.default_pool.shutdown().await;
         state.background_pool.shutdown().await;
+        for pools in state.table_pools.values_mut() {
+            pools.high_pool.shutdown().await;
+            pools.default_pool.shutdown().await;
+            pools.background_pool.shutdown().await;
+        }
         state.shared.flush().await
     }
 
@@ -205,11 +374,11 @@ impl Actor for KvActor {
                 is_replication,
                 reply,
             } => {
-                let pool = match priority {
-                    OpPriority::High => &state.high_pool,
-                    OpPriority::Default => &state.default_pool,
-                    OpPriority::Background => &state.background_pool,
-                };
+                let table = table_for_key(&op.key);
+                if let Some(table_name) = table.as_deref() {
+                    state.ensure_table_pools(table_name, &myself).await?;
+                }
+                let pool = state.pool(table.as_deref(), priority);
                 // Phase 7: admission control. Shed explicitly if the
                 // pool is over its queue cap or rate limit — unless this
                 // is a replicated op: the replication sender is already
@@ -253,11 +422,11 @@ impl Actor for KvActor {
                 // through the caller's channel directly; on worker
                 // timeout/error it is dropped and the caller sees a
                 // SenderError.
-                let pool = match priority {
-                    OpPriority::High => &state.high_pool,
-                    OpPriority::Default => &state.default_pool,
-                    OpPriority::Background => &state.background_pool,
-                };
+                let table = table_for_key(&key);
+                if let Some(table_name) = table.as_deref() {
+                    state.ensure_table_pools(table_name, &myself).await?;
+                }
+                let pool = state.pool(table.as_deref(), priority);
                 let Some(reservation) = pool.try_reserve(&key).await else {
                     // Shed: explicit error, not "not found". The caller
                     // sees NodeError::Backpressure, distinct from Ok(None).
@@ -283,7 +452,11 @@ impl Actor for KvActor {
                 // routing: a scan has no key, so spread concurrent scans
                 // round-robin across background workers. Shed explicitly
                 // under backpressure — never confused with "no matches".
-                let pool = &state.background_pool;
+                let table = table_for_scan(&spec);
+                if let Some(table_name) = table.as_deref() {
+                    state.ensure_table_pools(table_name, &myself).await?;
+                }
+                let pool = state.pool(table.as_deref(), OpPriority::Background);
                 let Some(reservation) = pool.try_reserve_round_robin().await else {
                     let _ = reply.send(Err("shed: pool at queue cap or rate limit".to_string()));
                     return Ok(());
@@ -302,8 +475,12 @@ impl Actor for KvActor {
                 if reply.is_closed() {
                     return Ok(());
                 }
-                let Some(reservation) = state.background_pool.try_reserve_round_robin().await
-                else {
+                let table = table_for_scan(&spec);
+                if let Some(table_name) = table.as_deref() {
+                    state.ensure_table_pools(table_name, &myself).await?;
+                }
+                let pool = state.pool(table.as_deref(), OpPriority::Background);
+                let Some(reservation) = pool.try_reserve_round_robin().await else {
                     let _ = reply.send(Err("shed: pool at queue cap or rate limit".into()));
                     return Ok(());
                 };
@@ -321,8 +498,12 @@ impl Actor for KvActor {
                 if reply.is_closed() {
                     return Ok(());
                 }
-                let Some(reservation) = state.background_pool.try_reserve_round_robin().await
-                else {
+                let table = Some(work.plan.table.to_ascii_uppercase());
+                state
+                    .ensure_table_pools(table.as_deref().unwrap(), &myself)
+                    .await?;
+                let pool = state.pool(table.as_deref(), OpPriority::Background);
+                let Some(reservation) = pool.try_reserve_round_robin().await else {
                     let _ = reply.send(crate::query::page_error(
                         &work.request,
                         crate::proto::QueryPageStatus::Backpressure,
@@ -462,11 +643,16 @@ impl Actor for KvActor {
             }
             KvMessage::Retained(_) => unreachable!("retained message was unwrapped"),
             KvMessage::GetShedCounts { reply } => {
-                let counts = (
+                let mut counts = (
                     state.high_pool.shed_count(),
                     state.default_pool.shed_count(),
                     state.background_pool.shed_count(),
                 );
+                for pools in state.table_pools.values() {
+                    counts.0 += pools.high_pool.shed_count();
+                    counts.1 += pools.default_pool.shed_count();
+                    counts.2 += pools.background_pool.shed_count();
+                }
                 let _ = reply.send(counts);
                 Ok(())
             }
@@ -487,27 +673,59 @@ impl Actor for KvActor {
             _ => None,
         };
         if let Some(cell) = dead {
-            // Check all three pools for the dead worker.
+            // Locate the owning pool without holding a mutable borrow across
+            // the replacement actor's async startup.
             let mut found = None;
-            for (pool, suffix) in [
-                (&mut state.high_pool, "high"),
-                (&mut state.default_pool, "default"),
-                (&mut state.background_pool, "bg"),
+            for (priority, suffix) in [
+                (OpPriority::High, "high"),
+                (OpPriority::Default, "default"),
+                (OpPriority::Background, "bg"),
             ] {
-                if let Some(slot) = pool.slot_of(&cell) {
-                    found = Some((pool, slot, suffix));
+                if let Some(slot) = state.base_pool(priority).slot_of(&cell) {
+                    found = Some((None, priority, slot, suffix.to_string()));
                     break;
                 }
             }
-            if let Some((pool, slot, suffix)) = found {
-                pool.reclaim_slot(slot);
+            if found.is_none() {
+                for table in state.table_pools.keys() {
+                    for (priority, suffix) in [
+                        (OpPriority::High, "high"),
+                        (OpPriority::Default, "default"),
+                        (OpPriority::Background, "bg"),
+                    ] {
+                        if let Some(slot) = state.table_pool(table, priority).slot_of(&cell) {
+                            found = Some((Some(table.clone()), priority, slot, suffix.to_string()));
+                            break;
+                        }
+                    }
+                    if found.is_some() {
+                        break;
+                    }
+                }
+            }
+            if let Some((table, priority, slot, suffix)) = found {
+                let shared = table
+                    .as_deref()
+                    .and_then(|name| state.table_pools.get(name).map(|p| p.shared.clone()))
+                    .unwrap_or_else(|| state.shared.clone());
+                let (shared, pending) = {
+                    let pool = state.pool_mut(table.as_deref(), priority);
+                    pool.reclaim_slot(slot);
+                    (shared, pool.pending.clone())
+                };
                 // Planned worker drains emit the same termination events as
                 // failures. Retire any remaining accounting above, but do not
                 // link a replacement to a draining parent.
                 if myself.get_status() >= ActorStatus::Draining {
                     return Ok(());
                 }
-                let name = format!("{}-{suffix}-worker-{slot}", state.worker_prefix);
+                let name = match table.as_deref() {
+                    Some(table) => format!(
+                        "{}-table-{table}-{suffix}-worker-{slot}",
+                        state.worker_prefix
+                    ),
+                    None => format!("{}-{suffix}-worker-{slot}", state.worker_prefix),
+                };
                 let slot_pending = Arc::new(AtomicU64::new(0));
                 #[cfg(test)]
                 let startup_gate = take_worker_startup_gate(&name);
@@ -515,8 +733,8 @@ impl Actor for KvActor {
                     Some(name),
                     PoolWorker,
                     PoolWorkerArgs {
-                        shared: state.shared.clone(),
-                        pool_pending: pool.pending.clone(),
+                        shared,
+                        pool_pending: pending,
                         slot_pending: slot_pending.clone(),
                         #[cfg(test)]
                         startup_gate,
@@ -525,7 +743,11 @@ impl Actor for KvActor {
                 )
                 .await;
                 match replacement {
-                    Ok((worker, _handle)) => pool.replace(slot, worker, slot_pending),
+                    Ok((worker, _handle)) => state.pool_mut(table.as_deref(), priority).replace(
+                        slot,
+                        worker,
+                        slot_pending,
+                    ),
                     // `drain()` changes the parent status immediately. It can
                     // race the await above, causing ractor to reject the new
                     // link after the earlier status check. That is an orderly
@@ -548,8 +770,50 @@ mod retention_tests {
     use std::time::Duration;
 
     use super::*;
-    use crate::actor::test_support::test_state;
+    use crate::actor::test_support::{test_op, test_state};
+    use crate::actor::VersionedValue;
     use tokio::sync::Semaphore;
+
+    #[tokio::test]
+    async fn named_tables_get_independent_crud_worker_sets() {
+        let shared = Arc::new(test_state(Default::default()));
+        let (actor, handle) = KvActor::spawn(
+            None,
+            KvActor,
+            KvArgs::builder()
+                .shared(shared)
+                .fragment(FragmentId(0))
+                .worker_prefix("table-pools".to_string())
+                .build(),
+        )
+        .await
+        .unwrap();
+
+        let key = crate::table_key::encode_table_key("USERS", "id");
+        let outcome = actor
+            .call(
+                move |reply| KvMessage::ApplyOp {
+                    op: test_op(
+                        &key,
+                        VersionedValue::new(b"value".to_vec(), 1, "writer".into()),
+                    ),
+                    priority: OpPriority::Default,
+                    is_replication: false,
+                    reply: Some(reply),
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(outcome, ractor::rpc::CallResult::Success(Ok(_))));
+
+        // The default config starts 2 high + 4 default + 2 background
+        // workers for the eagerly prepared KV table. USERS adds a second
+        // complete set under the same lightweight dispatcher/control plane.
+        assert_eq!(actor.get_children().len(), 24);
+        actor.stop(None);
+        handle.await.unwrap();
+    }
 
     #[tokio::test]
     async fn cancelled_waiters_retain_admission_until_dispatcher_or_worker_work_finishes() {

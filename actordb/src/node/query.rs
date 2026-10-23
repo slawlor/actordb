@@ -112,11 +112,25 @@ impl Node {
     }
     /// Execute a validated structured query plan using default limits.
     pub async fn query_plan(&self, plan: &QueryPlan) -> Result<QueryResult, QueryExecutionError> {
-        self.query_plan_with_options(plan, QueryOptions::default())
-            .await
+        let table = self
+            .table(plan.table.clone())
+            .map_err(|error| QueryExecutionError::InvalidQuery(error.to_string()))?;
+        table.query_plan(plan).await
     }
+
     /// Execute a query under one absolute deadline and explicit memory/work limits.
     pub async fn query_plan_with_options(
+        &self,
+        plan: &QueryPlan,
+        options: QueryOptions,
+    ) -> Result<QueryResult, QueryExecutionError> {
+        let table = self
+            .table(plan.table.clone())
+            .map_err(|error| QueryExecutionError::InvalidQuery(error.to_string()))?;
+        table.query_plan_with_options(plan, options).await
+    }
+
+    pub(super) async fn query_plan_with_options_scoped(
         &self,
         plan: &QueryPlan,
         options: QueryOptions,

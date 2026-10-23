@@ -40,7 +40,7 @@ pub fn hash_key(key: &[u8]) -> u64 {
 /// Panics if `frag_count` is 0.
 pub fn fragment_of(key: &str, frag_count: usize) -> FragmentId {
     assert!(frag_count > 0, "fragment count must be non-zero");
-    FragmentId((hash_key(key.as_bytes()) % frag_count as u64) as u32)
+    FragmentId((crate::table_key::routing_hash(key) % frag_count as u64) as u32)
 }
 
 #[cfg(test)]
@@ -64,6 +64,13 @@ mod tests {
         for _ in 0..100 {
             assert_eq!(fragment_of("hello", 8), fragment_of("hello", 8));
         }
+    }
+
+    #[test]
+    fn logical_tables_co_partition_equal_user_keys() {
+        let users = crate::table_key::encode_table_key("USERS", "same");
+        let events = crate::table_key::encode_table_key("EVENTS", "same");
+        assert_eq!(fragment_of(&users, 16), fragment_of(&events, 16));
     }
 
     #[test]

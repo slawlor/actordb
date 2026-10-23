@@ -47,10 +47,22 @@ fn populate(store: Arc<Store>, records: Vec<(&str, VersionedValue)>) {
         .write_batch(
             &records
                 .into_iter()
-                .map(|(key, value)| (key.as_bytes().to_vec(), value))
+                .map(|(key, value)| (kv_storage_key(key), value))
                 .collect::<Vec<_>>(),
         )
         .unwrap();
+}
+
+fn kv_storage_key(key: &str) -> Vec<u8> {
+    let digits = b"0123456789abcdef";
+    let encoded: String = key
+        .as_bytes()
+        .iter()
+        .flat_map(|byte| [digits[(byte >> 4) as usize], digits[(byte & 0x0f) as usize]])
+        .map(char::from)
+        .collect();
+    format!("\u{001d}actordb.table.store.v1:4b56:\u{001e}actordb.table.v1:4b56:{encoded}")
+        .into_bytes()
 }
 
 #[tokio::test]
@@ -113,7 +125,10 @@ async fn startup_reports_expired_live_values_once_and_retains_original_versions(
                 .iter()
                 .map(|event| event.key.as_str())
                 .collect::<Vec<_>>(),
-            ["a", "b"]
+            [
+                "\u{001e}actordb.table.v1:4b56:61",
+                "\u{001e}actordb.table.v1:4b56:62"
+            ]
         );
         assert_eq!(batch.events[0].previous_value, a);
         assert_eq!(batch.events[1].previous_value, b);
@@ -126,9 +141,9 @@ async fn startup_reports_expired_live_values_once_and_retains_original_versions(
             .load()
             .unwrap();
         let stored: BTreeMap<_, _> = stored.into_iter().collect();
-        assert_eq!(stored[b"a".as_slice()], a.expiry_tombstone());
-        assert_eq!(stored[b"b".as_slice()], b.expiry_tombstone());
-        assert_eq!(stored[b"future".as_slice()], future);
+        assert_eq!(stored[kv_storage_key("a").as_slice()], a.expiry_tombstone());
+        assert_eq!(stored[kv_storage_key("b").as_slice()], b.expiry_tombstone());
+        assert_eq!(stored[kv_storage_key("future").as_slice()], future);
         // Persisted tombstones no longer have the original payload. Restart is
         // not notification replay; the future live record also stays silent.
         let restarted = Node::start(

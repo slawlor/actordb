@@ -97,7 +97,7 @@ pub mod rocksdb;
 
 #[cfg(feature = "memory")]
 pub use memory::MemoryStore;
-pub use prefixed::PrefixedStore;
+pub use prefixed::{PrefixedStore, TableStore};
 #[cfg(feature = "rocksdb")]
 pub use rocksdb::RocksDbStore;
 

@@ -10,7 +10,7 @@ feature to use the offered durable backend:
 
 ```toml
 [dependencies]
-actordb = { version = "0.7", features = ["rocksdb"] }
+actordb = { version = "0.8.0", features = ["rocksdb"] }
 ```
 
 The independent `memory` feature exposes only the no-op `MemoryStore` test
@@ -81,6 +81,7 @@ The contract is deliberately narrow:
 | `MemoryStore` | `actordb::store::memory` | `memory` (opt-in) | Test double. `load` returns empty, `write_batch` is a no-op. Never for production. |
 | `RocksDbStore` | `actordb::store::rocksdb` | `rocksdb` (opt-in) | Offered durable backend; not a declaration of production readiness. |
 | `PrefixedStore` | `actordb::store::prefixed` | None | Namespace wrapper: prepends a 4-byte big-endian fragment id to every key so N fragment actors can share one store without collisions. |
+| `TableStore` | `actordb::store::prefixed` | None | Table-local durable view: adds a disjoint table prefix over a fragment store so each table has an independent cache/flush/iteration partition while retaining the shared backend. |
 
 The `store` parent module owns the shared `KvStore` contract, errors, identity
 and capability types, and backend options. Backend code and its unit tests live
@@ -178,7 +179,10 @@ future, or mismatched manifest. Subsequent opens should remove the flag.
 ## On-disk format
 
 Keys in the offered RocksDB data CF are always a 4-byte big-endian fragment id
-followed by the UTF-8 logical key. Values are encoded as:
+followed by a table-store partition prefix and logical table key. Every
+0.8.0 record therefore belongs to an explicit named table; pre-0.8 unnamed
+records require an application-managed migration before opening this format.
+Values are encoded as:
 
 ```
 [timestamp_ms: u64 BE][expires_at_ms: u64 BE, 0 = none][is_tombstone: u8]

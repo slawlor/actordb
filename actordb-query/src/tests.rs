@@ -159,7 +159,6 @@ fn unsupported_sql_is_rejected_in_full() {
     for sql in [
         "",
         "SELECT * FROM kv",
-        "SELECT key FROM other",
         "SELECT key FROM kv; SELECT value FROM kv",
         "SELECT key FROM kv UNION SELECT key FROM kv",
         "SELECT key FROM kv JOIN other ON key = key",
@@ -421,4 +420,11 @@ fn canonical_fragment_scopes_are_sets_for_structured_plans() {
         "SELECT COUNT(*) FROM kv WHERE frag IN (1, 3)"
     );
     assert_eq!(parse(&plan.to_sql()).unwrap().fragments, Some(vec![1, 3]));
+}
+
+#[test]
+fn named_tables_are_preserved_in_the_portable_plan() {
+    let plan = parse("SELECT key FROM users WHERE key = 'id'").unwrap();
+    assert_eq!(plan.table, "USERS");
+    assert_eq!(parse(&plan.to_sql()).unwrap().table, "USERS");
 }

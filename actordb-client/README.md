@@ -9,7 +9,7 @@ ClientOptions::default())`. A server explicitly binds
 `actordb::client_server::ClientServer` around an existing `Arc<Node>`.
 
 Construct `ClientOptions` and `PutOptions` with their Bon builders, or start
-with `Default` and modify public fields. In 0.7.1 these structs are
+with `Default` and modify public fields. In 0.8.0 these structs are
 `non_exhaustive`, allowing future optional settings without another literal
 construction break. Replace struct literals with builder chains; see the
 [option migration guide](../docs/client-options.md).
@@ -24,6 +24,9 @@ TTL and priority options, value version/expiry metadata, bounded distributed
 scans, SQL queries with typed positional parameters, and local node health and
 placement inspection. SQL is the ActorDB key/value dialect, not arbitrary SQL.
 `ScanOptions` and `ScanMatch` are reexported for callers using the scan API.
+Set `ClientOptions::table` (or use the Bon builder) to bind requests to a
+named logical table. Table clients reuse the same application listener and
+isolate keys and SQL results by table.
 Inspection describes the contacted node; it is not a readiness or durability
 check. Batches are individual operations, not transactions.
 
@@ -65,7 +68,7 @@ real application listener.
 
 Per-write acknowledgement counts and region requirements are available through
 `put_with_write_concern` and `delete_with_write_concern`. Install
-`actordb-client = "0.7.1"` for region support; the compatible dependency minimums
+`actordb-client = "0.8.0"` for region support; the compatible dependency minimums
 also select the required protocol and query revisions. See the
 [region guide](../docs/write-concern-regions.md) for configuration and receipt
 semantics. Local acknowledgement remains the default.

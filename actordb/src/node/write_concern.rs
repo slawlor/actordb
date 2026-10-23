@@ -44,6 +44,7 @@ impl Node {
         priority: OpPriority,
         options: WriteConcernOptions,
     ) -> Result<WriteConcernReceipt, WriteConcernError> {
+        let key = Self::qualify_key(key);
         let _operation = self.admit_operation()?;
         let retention =
             self.embedded_operations
@@ -101,6 +102,7 @@ impl Node {
         priority: OpPriority,
         options: WriteConcernOptions,
     ) -> Result<WriteConcernReceipt, WriteConcernError> {
+        let key = Self::qualify_key(key);
         let _operation = self.admit_operation()?;
         let retention = self
             .embedded_operations

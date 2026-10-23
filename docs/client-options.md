@@ -1,8 +1,8 @@
-# Rust client option construction in 0.7.1
+# Rust client option construction in 0.8.0
 
 `ClientOptions` and `PutOptions` now expose Bon builders and are
 `non_exhaustive`. This changes external struct-literal construction in the
-0.7.1 release; adding optional settings in later releases can keep
+0.8.0 release; adding optional settings in later releases can keep
 existing builder calls source compatible. Defaults and public field access are
 preserved.
 
@@ -32,6 +32,24 @@ let put = PutOptions::builder()
 Optional fields also provide `maybe_credential(Option<Vec<u8>>)` and
 `maybe_ttl(Option<Duration>)` setters. For incremental configuration, start with
 `ClientOptions::default()` or `PutOptions::default()` and assign public fields.
+
+In 0.8.0, `ClientOptions::table` selects the initial table view and remains
+required:
+
+```rust,ignore
+let users = ClientOptions::builder().table("users").build();
+```
+
+Additional table views can share that same authenticated connection. They do
+not open another network socket:
+
+```rust,ignore
+let client = Client::connect(addr, ClientOptions::default()).await?;
+let users = client.table("users")?;
+let events = client.table("events")?;
+users.put("u:1", value).await?;
+events.put("e:1", other_value).await?;
+```
 
 Connection validation still occurs at `connect`/`from_stream`: identities,
 credentials, timeouts, and queue capacities retain their existing constraints.

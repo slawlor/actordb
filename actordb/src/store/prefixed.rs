@@ -31,6 +31,80 @@ pub struct PrefixedStore {
     prefix: [u8; 4],
 }
 
+/// A table-local durable view over a fragment store.
+///
+/// Each table receives its own physical prefix and therefore its own cache,
+/// flush buffer, and ordered iteration group while retaining the node's
+/// shared backend handle and replication transport.
+pub struct TableStore {
+    inner: Arc<dyn KvStore>,
+    prefix: Vec<u8>,
+}
+
+impl TableStore {
+    /// Create a table partition over an already fragment-scoped store.
+    pub fn new(inner: Arc<dyn KvStore>, table: &str) -> Self {
+        Self {
+            inner,
+            prefix: crate::table_key::table_storage_prefix(table),
+        }
+    }
+
+    fn prefixed(&self, key: &[u8]) -> Vec<u8> {
+        let mut prefixed = Vec::with_capacity(self.prefix.len() + key.len());
+        prefixed.extend_from_slice(&self.prefix);
+        prefixed.extend_from_slice(key);
+        prefixed
+    }
+}
+
+impl KvStore for TableStore {
+    fn bind(&self, _identity: &StoreIdentity) -> Result<StoreBinding, StoreError> {
+        Err(StoreError(
+            "TableStore is a table view and cannot be attached as a Node base store".to_string(),
+        ))
+    }
+
+    fn load(&self) -> Result<Vec<(Vec<u8>, VersionedValue)>, StoreError> {
+        self.load_prefix(&[])
+    }
+
+    fn load_prefix(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, VersionedValue)>, StoreError> {
+        let physical_prefix = self.prefixed(prefix);
+        let mut out = Vec::new();
+        for (key, value) in self.inner.load_prefix(&physical_prefix)? {
+            if let Some(stripped) = key.strip_prefix(self.prefix.as_slice()) {
+                out.push((stripped.to_vec(), value));
+            }
+        }
+        Ok(out)
+    }
+
+    fn commit_durability(&self) -> StoreCommitDurability {
+        self.inner.commit_durability()
+    }
+
+    fn stable_fence(&self) -> Result<StoreCommitDurability, StoreError> {
+        self.inner.stable_fence()
+    }
+
+    fn write_batch(&self, writes: &[(Vec<u8>, VersionedValue)]) -> Result<(), StoreError> {
+        let prefixed: Vec<_> = writes
+            .iter()
+            .map(|(key, value)| (self.prefixed(key), value.clone()))
+            .collect();
+        self.inner.write_batch(&prefixed)
+    }
+
+    fn prefix_delete_support(&self) -> PrefixDeleteSupport {
+        self.inner.prefix_delete_support()
+    }
+
+    fn delete_prefix(&self, prefix: &[u8]) -> Result<PrefixDeleteOutcome, StoreError> {
+        self.inner.delete_prefix(&self.prefixed(prefix))
+    }
+}
+
 impl PrefixedStore {
     /// Wrap `inner`, namespacing all keys to `fragment`.
     pub fn new(inner: Arc<dyn KvStore>, fragment: FragmentId) -> Self {
@@ -171,5 +245,55 @@ mod tests {
             .expect("a PrefixedStore was accepted as a Node base store")
             .to_string()
             .contains("cannot be attached as a Node base store"));
+    }
+
+    #[test]
+    fn table_store_partitions_physical_iteration() {
+        use std::sync::Mutex;
+
+        struct Rec {
+            written: Mutex<Vec<(Vec<u8>, VersionedValue)>>,
+        }
+        impl KvStore for Rec {
+            fn load(&self) -> Result<Vec<(Vec<u8>, VersionedValue)>, StoreError> {
+                Ok(self.written.lock().unwrap().clone())
+            }
+            fn load_prefix(
+                &self,
+                prefix: &[u8],
+            ) -> Result<Vec<(Vec<u8>, VersionedValue)>, StoreError> {
+                Ok(self
+                    .written
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|(key, _)| key.starts_with(prefix))
+                    .cloned()
+                    .collect())
+            }
+            fn write_batch(&self, writes: &[(Vec<u8>, VersionedValue)]) -> Result<(), StoreError> {
+                self.written.lock().unwrap().extend_from_slice(writes);
+                Ok(())
+            }
+        }
+
+        let inner = Arc::new(Rec {
+            written: Mutex::new(Vec::new()),
+        });
+        let users = TableStore::new(inner.clone(), "USERS");
+        let events = TableStore::new(inner.clone(), "EVENTS");
+        let value = VersionedValue::new(b"value".to_vec(), 1, "node".to_string());
+        users
+            .write_batch(&[(b"physical-user-key".to_vec(), value.clone())])
+            .unwrap();
+        events
+            .write_batch(&[(b"physical-event-key".to_vec(), value)])
+            .unwrap();
+
+        assert_eq!(users.load().unwrap().len(), 1);
+        assert_eq!(users.load().unwrap()[0].0, b"physical-user-key");
+        assert_eq!(events.load().unwrap().len(), 1);
+        assert_eq!(events.load().unwrap()[0].0, b"physical-event-key");
+        assert_eq!(inner.load().unwrap().len(), 2);
     }
 }

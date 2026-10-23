@@ -218,7 +218,13 @@ impl SupervisorState {
                     .await
                     .map_err(FragmentStartupStorageError::boxed)?;
                 let now = now_ms();
-                for (index, (k, v)) in loaded.into_iter().enumerate() {
+                for (index, (raw_key, v)) in loaded.into_iter().enumerate() {
+                    // Table partitions add a durable-only prefix around the
+                    // logical namespace. The actor cache and replication
+                    // protocol retain the logical key so table routing and
+                    // co-partitioned fragment hashing remain deterministic.
+                    let k = crate::table_key::strip_storage_prefix(&raw_key)
+                        .unwrap_or_else(|| raw_key.clone());
                     high_water = Some(
                         high_water
                             .map(|current| current.max(v.version()))
@@ -237,7 +243,7 @@ impl SupervisorState {
                         .map_err(FragmentStartupStorageError::boxed)?;
                     let (value, previous_value) = if v.is_expired(now) {
                         let tombstone = v.expiry_tombstone();
-                        expiry_updates.push((k, tombstone.clone()));
+                        expiry_updates.push((raw_key, tombstone.clone()));
                         (tombstone, if publisher.is_some() { Some(v) } else { None })
                     } else {
                         (v, None)
@@ -378,6 +384,15 @@ async fn probe_health(
             }
         }
     }
+    // Named tables have lazily-created CRUD pools. They remain linked
+    // children of this dispatcher, so include their live workers in health
+    // without imposing a fixed table list on the fragment supervisor.
+    let table_prefix = format!("{}-table-", args.worker_prefix);
+    worker_names.extend(
+        live_names
+            .into_iter()
+            .filter(|name| name.starts_with(&table_prefix) && name.contains("-worker-")),
+    );
     Some(FragmentHealth {
         fragment: args.fragment,
         worker_count: worker_names.len(),
@@ -454,6 +469,8 @@ impl FragmentSupervisor {
                 args.flush_interval,
             )
             .with_persistence_config(args.persistence.clone())
+            .map_err(FragmentStartupStorageError::boxed)?
+            .enable_partitions()
             .map_err(FragmentStartupStorageError::boxed)?
             .with_expiry_publisher(args.fragment, args.expiry_publisher.clone()),
         );
@@ -754,7 +771,7 @@ mod tests {
             )
             .await
             .unwrap();
-            let _dispatcher = running_dispatcher(&supervisor, 8).await;
+            let _dispatcher = running_dispatcher(&supervisor, 16).await;
             let CallResult::Success(health) = supervisor
                 .call(
                     |reply| SupervisorMessage::GetHealth { reply },
@@ -766,7 +783,7 @@ mod tests {
                 panic!("builder defaults failed health probe")
             };
             assert_eq!(health.fragment, FragmentId(0));
-            assert_eq!(health.worker_count, 8);
+            assert_eq!(health.worker_count, 16);
             assert_eq!(health.shed_counts, (0, 0, 0));
             assert!(matches!(
                 supervisor
@@ -889,7 +906,7 @@ mod tests {
             .await
             .unwrap();
             let _stop = StopRestartSupervisor(supervisor.get_cell());
-            let dispatcher = running_dispatcher(&supervisor, 8).await;
+            let dispatcher = running_dispatcher(&supervisor, 16).await;
             let ordinary = VersionedValue::new(b"retained".to_vec(), 10, "writer".into());
             let apply = |key: &str, value: VersionedValue| ReplicatedOp {
                 key: key.into(),
@@ -998,8 +1015,8 @@ mod tests {
                 panic!("restart health probe failed")
             };
             assert_eq!(health.fragment, FragmentId(7));
-            assert_eq!(health.worker_count, 8);
-            for (suffix, expected) in [("high", 3), ("default", 3), ("bg", 2)] {
+            assert_eq!(health.worker_count, 16);
+            for (suffix, expected) in [("high", 6), ("default", 6), ("bg", 4)] {
                 assert_eq!(
                     health
                         .worker_names
@@ -1216,7 +1233,7 @@ mod tests {
             let (supervisor, _) = FragmentSupervisor::spawn(None, FragmentSupervisor, args)
                 .await
                 .unwrap();
-            let dispatcher = running_dispatcher(&supervisor, 3).await;
+            let dispatcher = running_dispatcher(&supervisor, 6).await;
             let (applied, mut apply_result) = tokio::sync::oneshot::channel();
             dispatcher
                 .send_message(KvMessage::ApplyOp {
@@ -1584,7 +1601,7 @@ mod tests {
             )
             .await
             .unwrap();
-            let dispatcher = running_dispatcher(&supervisor, 3).await;
+            let dispatcher = running_dispatcher(&supervisor, 6).await;
             let health = match supervisor
                 .call(|reply| SupervisorMessage::GetHealth { reply }, None)
                 .await
@@ -1593,7 +1610,7 @@ mod tests {
                 CallResult::Success(health) => health,
                 other => panic!("running health failed: {other:?}"),
             };
-            assert_eq!(health.worker_count, 3);
+            assert_eq!(health.worker_count, 6);
             assert!(health.restarts.is_empty());
 
             let (first_tx, first_rx) = tokio::sync::oneshot::channel();

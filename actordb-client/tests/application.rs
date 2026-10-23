@@ -111,6 +111,24 @@ async fn full_application_catalog_preserves_peer_membership_and_node_lifecycle()
     assert_eq!(inspection.node_id, "sdk-node");
     assert_eq!(inspection.peer_count, 0);
     assert_eq!(inspection.health.len(), 1);
+
+    // Table views share the authenticated connection; no second socket is
+    // opened for the users table.
+    let users = client.table("users").unwrap();
+    users.put("item:1", b"table-value".to_vec()).await.unwrap();
+    assert_eq!(
+        users.get("item:1").await.unwrap().unwrap().bytes,
+        b"table-value"
+    );
+    assert_eq!(client.get("item:1").await.unwrap().unwrap().bytes, b"123");
+    assert_eq!(
+        users
+            .query("SELECT COUNT(*) FROM users")
+            .await
+            .unwrap()
+            .rows,
+        vec![vec![QueryValue::Integer(1)]]
+    );
     client.close().await;
     assert_eq!(node.peer_count().await, 0);
     server.shutdown().await;
@@ -493,6 +511,7 @@ async fn incomplete_application_prefix_is_timed_out_and_idle_client_survives() {
                     sql: "SELECT COUNT(*) FROM kv".into(),
                     params: Vec::new(),
                 })),
+                table: String::new(),
             })),
         },
     )
@@ -509,13 +528,18 @@ async fn incomplete_application_prefix_is_timed_out_and_idle_client_survives() {
                     key: "missing".into(),
                     priority: 0,
                 })),
+                table: String::new(),
             })),
         },
     )
     .await;
-    assert!(
-        matches!(receive(&mut stream).await.message, Some(wire::frame::Message::Response(wire::Response { error: None, reads, .. })) if reads.len() == 1 && reads[0].value.is_none())
-    );
+    assert!(matches!(
+        receive(&mut stream).await.message,
+        Some(wire::frame::Message::Response(wire::Response {
+            error: Some(error),
+            ..
+        })) if error.code == wire::ErrorCode::Invalid as i32
+    ));
     let idle = Client::connect(server.addr(), ClientOptions::default())
         .await
         .unwrap();
