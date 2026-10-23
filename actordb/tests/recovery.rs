@@ -18,7 +18,18 @@ struct StableFixture(
 );
 impl StableFixture {
     fn insert(&self, key: &str, value: VersionedValue) {
-        let key = [0u32.to_be_bytes().as_slice(), key.as_bytes()].concat();
+        let encoded: String = key
+            .as_bytes()
+            .iter()
+            .flat_map(|byte| {
+                let digits = b"0123456789abcdef";
+                [digits[(byte >> 4) as usize], digits[(byte & 0x0f) as usize]]
+            })
+            .map(char::from)
+            .collect();
+        let logical = format!("\u{001e}actordb.table.v1:4b56:{encoded}");
+        let physical = format!("\u{001d}actordb.table.store.v1:4b56:{logical}");
+        let key = [0u32.to_be_bytes().as_slice(), physical.as_bytes()].concat();
         self.0.lock().unwrap().insert(key, value);
     }
 }
@@ -147,9 +158,11 @@ async fn all_restarted_replicas_recover_union_and_tombstones_before_serving() {
     for store in [a_store, b_store] {
         let durable = store.load().unwrap();
         assert_eq!(durable.len(), 4);
-        assert!(durable.iter().any(|(key, value)| key.ends_with(b"deleted")
-            && value.is_tombstone
-            && value.timestamp_ms == 200));
+        assert!(durable
+            .iter()
+            .any(|(key, value)| key.ends_with(b"64656c65746564")
+                && value.is_tombstone
+                && value.timestamp_ms == 200));
     }
     a.shutdown().await.unwrap();
     b.shutdown().await.unwrap();

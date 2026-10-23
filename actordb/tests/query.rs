@@ -40,7 +40,18 @@ fn loaded_store(count: usize, fragments: usize) -> Arc<dyn KvStore> {
     Arc::new(LoadedStore(
         (0..count)
             .map(|index| {
-                let key = format!("record:{index:06}");
+                let user_key = format!("record:{index:06}");
+                let encoded_key = user_key
+                    .bytes()
+                    .flat_map(|byte| {
+                        [
+                            b"0123456789abcdef"[(byte >> 4) as usize],
+                            b"0123456789abcdef"[(byte & 0x0f) as usize],
+                        ]
+                    })
+                    .map(char::from)
+                    .collect::<String>();
+                let key = format!("\u{1e}actordb.table.v1:4b56:{encoded_key}");
                 let mut stored_key = fragment_of(&key, fragments).0.to_be_bytes().to_vec();
                 stored_key.extend_from_slice(key.as_bytes());
                 (

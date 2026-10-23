@@ -26,6 +26,27 @@ use actordb::store::{
 use prost::Message;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+fn kv_key(key: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let encoded: String = key
+        .bytes()
+        .flat_map(|byte| {
+            [
+                HEX[(byte >> 4) as usize] as char,
+                HEX[(byte & 0x0f) as usize] as char,
+            ]
+        })
+        .collect();
+    format!("\u{1e}actordb.table.v1:4b56:{encoded}")
+}
+
+fn kv_storage_key(fragment: u32, key: &str) -> Vec<u8> {
+    let mut prefixed = fragment.to_be_bytes().to_vec();
+    prefixed.extend_from_slice(b"\x1dactordb.table.store.v1:4b56:");
+    prefixed.extend_from_slice(kv_key(key).as_bytes());
+    prefixed
+}
+
 #[derive(Clone)]
 struct CountingNetwork {
     connect_attempts: Arc<AtomicUsize>,
@@ -84,8 +105,7 @@ struct PreloadedStore {
 
 impl PreloadedStore {
     fn insert_fragment(&self, fragment: u32, key: &str, value: VersionedValue) {
-        let mut prefixed = fragment.to_be_bytes().to_vec();
-        prefixed.extend_from_slice(key.as_bytes());
+        let prefixed = kv_storage_key(fragment, key);
         self.entries.lock().unwrap().insert(prefixed, value);
     }
 
@@ -94,9 +114,19 @@ impl PreloadedStore {
     }
 
     fn get_fragment_zero(&self, key: &str) -> Option<VersionedValue> {
+        let logical_key = key.to_string();
+        let key = if key.starts_with('\u{1e}') {
+            key.to_string()
+        } else {
+            kv_key(key)
+        };
         let mut prefixed = 0u32.to_be_bytes().to_vec();
         prefixed.extend_from_slice(key.as_bytes());
-        self.entries.lock().unwrap().get(&prefixed).cloned()
+        let entries = self.entries.lock().unwrap();
+        entries
+            .get(&kv_storage_key(0, &logical_key))
+            .or_else(|| entries.get(&prefixed))
+            .cloned()
     }
 }
 
@@ -1156,7 +1186,7 @@ async fn drain_requires_no_change_verification_round() {
     send_reconcile_response(&mut stream, &first_request, Vec::new()).await;
     let (repaired_summaries, first_barrier) = recv_reconcile_repairs_and_barrier(&mut stream).await;
     assert_eq!(repaired_summaries.len(), 1);
-    assert_eq!(repaired_summaries[0].key, "stable-drain-key");
+    assert_eq!(repaired_summaries[0].key, kv_key("stable-drain-key"));
     ack_replication_batch(
         &mut stream,
         &first_barrier,
@@ -1386,7 +1416,7 @@ async fn drain_disconnect_reconnect_retries_same_generation() {
     let (repaired_summaries, first_barrier) =
         recv_reconcile_repairs_and_barrier(&mut replacement_stream).await;
     assert_eq!(repaired_summaries.len(), 1);
-    assert_eq!(repaired_summaries[0].key, "reconnect-drain-key");
+    assert_eq!(repaired_summaries[0].key, kv_key("reconnect-drain-key"));
     ack_replication_batch(
         &mut replacement_stream,
         &first_barrier,
@@ -1524,7 +1554,7 @@ async fn manual_placement_drain_freezes_target_and_keeps_replication_runtime_ali
     send_reconcile_response(&mut stream, &first_request, Vec::new()).await;
     let (repaired_summaries, first_barrier) = recv_reconcile_repairs_and_barrier(&mut stream).await;
     assert_eq!(repaired_summaries.len(), 1);
-    assert_eq!(repaired_summaries[0].key, "dynamic-drain-key");
+    assert_eq!(repaired_summaries[0].key, kv_key("dynamic-drain-key"));
     ack_replication_batch(
         &mut stream,
         &first_barrier,
@@ -3716,8 +3746,7 @@ async fn cancelled_shutdown_waiter_resumes_retained_final_flush() {
 
     store.release();
     node.shutdown().await.unwrap();
-    let mut persisted_key = 0u32.to_be_bytes().to_vec();
-    persisted_key.extend_from_slice(b"cancelled-flush");
+    let persisted_key = kv_storage_key(0, "cancelled-flush");
     assert_eq!(
         store
             .entries
@@ -5846,7 +5875,7 @@ async fn session_started_before_actor_installation_survives_placement_race() {
         batch_seq: 1,
         fragment: 0,
         ops: vec![ReplicateOp {
-            key: "early-session-key".to_string(),
+            key: kv_key("early-session-key"),
             value: b"accepted-after-install".to_vec(),
             timestamp_ms: now_ms(),
             logical_counter: 0,
@@ -9494,7 +9523,7 @@ async fn ordinary_ack_timeout_rotates_session_and_replays_exact_batch() {
     };
     assert_eq!(first.session_id, initial_session);
     assert_eq!(first.ops.len(), 1);
-    assert_eq!(first.ops[0].key, "ack-timeout-key");
+    assert_eq!(first.ops[0].key, kv_key("ack-timeout-key"));
 
     // Withhold the ACK. The timeout invalidates the whole old session before
     // any replay, so a delayed old-session ACK can never certify the retry.
@@ -9657,8 +9686,8 @@ async fn older_batch_timeout_replays_only_the_unacknowledged_batch() {
     assert_eq!(second.session_id, initial_session);
     assert_eq!(first.ops.len(), 1);
     assert_eq!(second.ops.len(), 1);
-    assert_eq!(first.ops[0].key, "older-unacked");
-    assert_eq!(second.ops[0].key, "newer-acked");
+    assert_eq!(first.ops[0].key, kv_key("older-unacked"));
+    assert_eq!(second.ops[0].key, kv_key("newer-acked"));
 
     // Retire only the newer batch and synchronize on the sender report before
     // allowing the older batch's original admission deadline to expire.
@@ -9957,8 +9986,7 @@ async fn replication_nack_retries_the_exact_batch_after_store_failure() {
         Duration::from_secs(5),
     )
     .await;
-    let mut prefixed_key = 0u32.to_be_bytes().to_vec();
-    prefixed_key.extend_from_slice(b"retry-key");
+    let prefixed_key = kv_storage_key(0, "retry-key");
     assert_eq!(
         store
             .entries
