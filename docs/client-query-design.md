@@ -100,7 +100,9 @@ flowchart LR
 
 - **`actordb-protocol`**: canonical peer and application protobuf schemas,
   generated Rust messages, neutral value/query contracts, pure validation,
-  and language-independent fixtures. Preserve `actordb::proto` reexports.
+  and language-independent fixtures. Preserve the standalone
+  `actordb-protocol` bindings; `actordb::proto` remains only as a hidden
+  compatibility reexport.
 - **`actordb-client`**: Tokio stream SDK with a TCP convenience API, bounded serialized requests,
   operation methods, and structured errors. No normal
   dependency on ActorDB actors, RocksDB, or native protobuf compilation.

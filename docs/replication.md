@@ -159,7 +159,8 @@ before destructive RocksDB prefix retirement. Peers missing either contract
 are rejected. V3 is
 wire-incompatible with v2, so upgrades require mutually compatible binaries
 rather than a mixed v2/v3 rolling deployment. It is also a Rust source break
-for advanced users of the public generated `actordb::proto` types:
+for protocol implementations that use the hidden generated `actordb::proto`
+compatibility types:
 `ReconcileRequest`, `ReconcileResponse`, and `ReconcileData` gained pagination
 and snapshot-correlation fields, and `ReplicationAckLevel` gained
 `StableCommitted`. Struct literals, exhaustive matches, and protocol

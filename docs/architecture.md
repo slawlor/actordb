@@ -60,7 +60,7 @@ Node without creating peer membership or replication senders.
 | `actordb::store::rocksdb` | Fail-closed `RocksDbStore` durable backend; opt-in `rocksdb` feature |
 | `actordb::shard` | `FragmentId`, `hash_key` (seahash), `fragment_of` |
 | `actordb::network` | Transport abstraction: `Network`, `TcpNetwork`, `PeerStream`; 4-byte length-prefixed `Envelope` framing |
-| `actordb::proto` | Compatibility reexports of shared generated peer messages, priorities, mutation outcomes, handshake, replication, reconciliation, scans, and query pages |
+| `actordb::proto` | Hidden compatibility reexports of shared generated peer messages, priorities, mutation outcomes, handshake, replication, reconciliation, scans, and query pages; supported wire bindings live in `actordb-protocol` |
 
 ### Actor implementation files
 

@@ -5,7 +5,9 @@
 </p>
 
 `proto/meta.proto` is the canonical peer schema, preserving all existing message
-numbers and `actordb::proto` reexports. Peer protocol v5 remains separate from
+numbers. The standalone `actordb-protocol` crate is the supported public Rust
+binding for compatible peers and SDKs; `actordb::proto` is only a hidden
+compatibility reexport. Peer protocol v5 remains separate from
 `proto/client.proto`, application protocol v3. Rust bindings are committed so
 normal client builds do not compile protobuf or RocksDB.
 

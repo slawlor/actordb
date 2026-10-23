@@ -30,7 +30,13 @@ pub mod query;
 /// TCP; implement `Network` for TLS or other transports.
 pub mod network;
 
-/// Protobuf wire protocol (generated via [prost])
+/// Raw generated protobuf wire bindings.
+///
+/// This module remains available only as a compatibility escape hatch for
+/// protocol and integration testing. It is not part of the supported
+/// `actordb` application API; use the high-level node/client APIs or the
+/// language-independent `actordb-protocol` crate instead.
+#[doc(hidden)]
 pub mod proto;
 
 /// Pluggable durable storage for a node's local copy. The default crate ships

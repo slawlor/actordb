@@ -19,6 +19,20 @@ Builders require actual dependencies for low-level actor arguments; they do not
 invent node identities, shared state, HLCs, or routers. See the
 [13-type builder reference](configuration.md#configuration-builders).
 
+## API stability boundary
+
+The supported `actordb` API is the documented node, client-server, query,
+storage, replication, configuration, and write-concern surface described in
+this guide. The crate follows pre-1.0 semver policy: breaking Rust API or wire
+protocol changes use a new minor version, while patch releases are reserved
+for compatible fixes and documentation.
+
+The raw generated `actordb::proto` module is hidden from generated
+documentation and is retained only for protocol and integration-test
+compatibility. It is not a supported application API. Consumers that need
+language-independent wire bindings should depend directly on
+`actordb-protocol`; ordinary applications should use the high-level APIs.
+
 ## Starting a node
 
 ```rust
@@ -382,7 +396,7 @@ worker or roll back failed delivery. Direct actor embedders should send the
 same public `KvMessage` variants to `KvActor`, which owns admission, routing,
 supervision, and exact per-worker accounting.
 
-Advanced users of public `actordb::proto` types must upgrade in lockstep with
+Protocol implementations using hidden `actordb::proto` compatibility types must upgrade in lockstep with
 the cluster: wire v3 requires the paged-anti-entropy, byte-bounded-batches, and
 stable-durability-ACK capabilities and adds cursor, revision, page-sequence,
 completion, and restart fields to reconciliation messages. The generated
