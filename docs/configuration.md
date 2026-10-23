@@ -288,7 +288,7 @@ These are `const`s, documented here so they don't surprise you:
 
 | Constant | Value | Meaning |
 |---|---|---|
-| `WIRE_PROTOCOL_VERSION` | `3` | The current binary accepts only wire v3. V3 requires paged-anti-entropy, byte-bounded-batches, and stable-durability-ACK capabilities. Byte-bounded batches change `BatchGetResponse` to ordered-prefix semantics; stable durability ACKs gate destructive RocksDB prefix retirement. Binaries missing either contract are rejected, so upgrades must be coordinated. |
+| `WIRE_PROTOCOL_VERSION` | `5` | The current binary accepts only wire v5. V5 requires paged anti-entropy, byte-bounded batches, stable-durability ACKs, and logical-table namespace capabilities. Binaries missing these contracts are rejected, so upgrades must be coordinated. |
 | `MAX_FORWARD_HOPS` | `4` | Bounds re-forward chains during placement disagreement. |
 | `NACK_RETRY_DELAY` | `1 s` | Minimum delay before retrying a receiver-rejected replication batch. |
 | `BOOTSTRAP_TIMEOUT` | `30 s` | Max wait for one of the connected, already-serving source candidates to complete bootstrap. Timeout leaves the gained fragment non-authoritative and eligible for retry. |

@@ -189,6 +189,9 @@ pub const CAPABILITY_WRITE_CONCERNS: u64 = 1 << 9;
 pub const CAPABILITY_RECORD_CONTENT_DIGEST: u64 = 1 << 10;
 /// Mutation replies preserve uncertain outcomes instead of definite rejection.
 pub const CAPABILITY_TYPED_UNKNOWN_MUTATION: u64 = 1 << 11;
+/// Replicated records carry the deterministic logical-table namespace used by
+/// the 0.8 shared-node table views.
+pub const CAPABILITY_TABLE_NAMESPACES: u64 = 1 << 13;
 /// Capabilities required by this binary before it installs a peer connection.
 pub const REQUIRED_WIRE_CAPABILITIES: u64 = CAPABILITY_MUTATION_RESULTS
     | CAPABILITY_DURABILITY_ACKS
@@ -199,7 +202,8 @@ pub const REQUIRED_WIRE_CAPABILITIES: u64 = CAPABILITY_MUTATION_RESULTS
     | CAPABILITY_STABLE_DURABILITY_ACKS
     | CAPABILITY_WRITE_CONCERNS
     | CAPABILITY_RECORD_CONTENT_DIGEST
-    | CAPABILITY_TYPED_UNKNOWN_MUTATION;
+    | CAPABILITY_TYPED_UNKNOWN_MUTATION
+    | CAPABILITY_TABLE_NAMESPACES;
 
 /// Outbound queue depth per peer connection.
 const PEER_CHANNEL_DEPTH: usize = 256;
