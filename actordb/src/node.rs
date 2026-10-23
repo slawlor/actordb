@@ -146,6 +146,8 @@ use mutation_service::{
     FORWARDED_MUTATION_CAPACITY,
 };
 mod query;
+mod table;
+pub use table::{Table, TableId};
 pub(crate) mod recovery;
 use recovery::RecoveryContext;
 pub use recovery::RecoveryOptions;
@@ -156,7 +158,7 @@ pub use scan::{ScanError, MAX_SCAN_TOTAL_MATCHES};
 /// Version 4 carries independent physical/logical record timestamps. Older
 /// peers cannot preserve their ordering and are rejected during negotiation.
 /// It retains v3 byte-bounded, cursor-correlated reconciliation.
-pub const WIRE_PROTOCOL_VERSION: u32 = 4;
+pub const WIRE_PROTOCOL_VERSION: u32 = 5;
 /// The peer returns exact forwarded-mutation outcomes.
 pub const CAPABILITY_MUTATION_RESULTS: u64 = 1 << 0;
 /// Replication ACKs carry an explicit receiver durability fence.
