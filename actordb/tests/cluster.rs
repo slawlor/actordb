@@ -1936,7 +1936,7 @@ async fn store_committed_drain_rejects_a_storeless_receiver_ack() {
 async fn store_committed_drain_persists_to_the_offered_rocksdb_backend() {
     use actordb::replication::{ReplicationAckDurability, SenderConfig};
     use actordb::shard::FragmentId;
-    use actordb::store::{PrefixedStore, RocksDbStore};
+    use actordb::store::{PrefixedStore, RocksDbStore, TableStore};
 
     let directory = tempfile::tempdir().unwrap();
     let database = directory.path().join("drain-target");
@@ -1980,11 +1980,14 @@ async fn store_committed_drain_persists_to_the_offered_rocksdb_backend() {
         report.durability(),
         ReplicationAckDurability::StoreCommitted
     );
-    let persisted = PrefixedStore::new(target_store.clone(), FragmentId(0))
-        .load()
-        .unwrap();
+    let persisted = TableStore::new(
+        Arc::new(PrefixedStore::new(target_store.clone(), FragmentId(0))),
+        "KV",
+    )
+    .load()
+    .unwrap();
     assert!(persisted.iter().any(|(key, value)| {
-        key == b"rocks-drain" && value.value == b"durable" && !value.is_tombstone
+        key == kv_key("rocks-drain").as_bytes() && value.value == b"durable" && !value.is_tombstone
     }));
     target.shutdown().await.unwrap();
     drop(target);
@@ -7604,7 +7607,7 @@ async fn placement_retires_rocksdb_prefix_after_stable_handoff() {
     use actordb::placement::{FragmentPlacementState, ManualPlacement};
     use actordb::replication::SenderConfig;
     use actordb::shard::FragmentId;
-    use actordb::store::{PrefixedStore, RocksDbStore, StoreIdentity};
+    use actordb::store::{PrefixedStore, RocksDbStore, StoreIdentity, TableStore};
 
     let fragment = FragmentId(0);
     let controller = Arc::new(ManualPlacement::new(HashMap::from([(
@@ -7710,13 +7713,16 @@ async fn placement_retires_rocksdb_prefix_after_stable_handoff() {
     let _target_binding = reopened_target
         .bind(&StoreIdentity::new("rocks-target".to_string(), 1))
         .unwrap();
-    let durable_target = PrefixedStore::new(reopened_target, fragment);
+    let durable_target = TableStore::new(
+        Arc::new(PrefixedStore::new(reopened_target, fragment)),
+        "KV",
+    );
     assert_eq!(
         durable_target
             .load()
             .unwrap()
             .into_iter()
-            .find(|(key, _)| key == b"durable-migration-key")
+            .find(|(key, _)| key == kv_key("durable-migration-key").as_bytes())
             .map(|(_, value)| value.value),
         Some(b"value".to_vec())
     );
