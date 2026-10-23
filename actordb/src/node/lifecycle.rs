@@ -1114,6 +1114,45 @@ impl Node {
     ) -> Result<Self, NodeError> {
         Self::start_with_options(node_id, listen_addr, config, NodeRuntimeOptions::default()).await
     }
+
+    /// Resolve an asynchronous configuration provider and start the node with
+    /// the resulting settings. Providers are resolved once before any socket
+    /// or actor is created, so a failed dynamic lookup leaves no partial node.
+    pub async fn start_with_provider<P>(
+        node_id: String,
+        listen_addr: SocketAddr,
+        provider: &P,
+    ) -> Result<Self, NodeError>
+    where
+        P: crate::configuration::ConfigurationProvider + ?Sized,
+    {
+        Self::start_with_provider_and_options(
+            node_id,
+            listen_addr,
+            provider,
+            NodeRuntimeOptions::default(),
+        )
+        .await
+    }
+
+    /// Resolve an asynchronous configuration provider with explicit runtime
+    /// liveness and outbound-queue policy.
+    pub async fn start_with_provider_and_options<P>(
+        node_id: String,
+        listen_addr: SocketAddr,
+        provider: &P,
+        runtime_options: NodeRuntimeOptions,
+    ) -> Result<Self, NodeError>
+    where
+        P: crate::configuration::ConfigurationProvider + ?Sized,
+    {
+        let config = provider
+            .resolve()
+            .await
+            .map_err(|error| NodeError::Actor(format!("configuration provider: {error}")))?;
+        Self::start_with_options(node_id, listen_addr, config, runtime_options).await
+    }
+
     /// Start a node with explicit runtime liveness and outbound-queue policy.
     /// Existing callers can continue using [`Node::start`] for the defaults.
     pub async fn start_with_options(
