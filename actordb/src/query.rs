@@ -501,6 +501,7 @@ mod key_bound_tests {
         ];
         for predicates in cases {
             let plan = QueryPlan {
+                table: "KV".into(),
                 projections: vec![Projection::Key],
                 predicates,
                 metadata_predicates: Vec::new(),

@@ -1,8 +1,9 @@
 // Copyright (c) Sean Lawlor
 // Licensed under the MIT license in the repository root.
 
-//! Portable query plans for the `kv` relation: UTF-8 keys, opaque values, and
-//! explicit durable-record metadata.
+//! Portable query plans for named key/value relations: UTF-8 keys, opaque
+//! values, and explicit durable-record metadata. `FROM kv` addresses the
+//! legacy unnamed keyspace; named tables use `FROM table_name`.
 //!
 //! SQL is a deliberately bounded subset, with key predicates, fragment scopes,
 //! projections, and mergeable integer aggregates. It does not execute Rust code
@@ -154,6 +155,9 @@ pub enum KeyPredicate {
 /// TOMBSTONES` modifier enables retained tombstone inspection.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QueryPlan {
+    /// SQL relation name. `KV` is the legacy unnamed keyspace; named tables
+    /// are case-insensitive SQL identifiers.
+    pub table: String,
     pub projections: Vec<Projection>,
     pub predicates: Vec<KeyPredicate>,
     pub metadata_predicates: Vec<MetadataPredicate>,
@@ -200,6 +204,11 @@ impl std::error::Error for QueryError {}
 impl QueryPlan {
     /// Validate a programmatically constructed plan before executing it.
     pub fn validate(&self) -> Result<(), QueryError> {
+        if !valid_table_name(&self.table) {
+            return Err(QueryError::InvalidPlan(
+                "table must be a non-empty SQL identifier".into(),
+            ));
+        }
         if self.projections.is_empty() {
             return Err(QueryError::InvalidPlan(
                 "at least one projection is required".into(),
@@ -404,7 +413,11 @@ impl QueryPlan {
     /// Canonical literal SQL for transmission without another serialization
     /// dependency. Validate manually constructed plans before calling this.
     pub fn to_sql(&self) -> String {
-        let mut sql = format!("SELECT {} FROM kv", self.columns().join(", "));
+        let mut sql = format!(
+            "SELECT {} FROM {}",
+            self.columns().join(", "),
+            self.table.to_ascii_lowercase()
+        );
         if self.include_tombstones {
             sql.push_str(" INCLUDING TOMBSTONES");
         }
@@ -756,6 +769,16 @@ fn parse_bigint(value: &[u8]) -> Result<i128, QueryError> {
     text.parse::<i64>().map(i128::from).map_err(|_| {
         QueryError::InvalidValue("CAST(value AS BIGINT) is outside the signed 64-bit range".into())
     })
+}
+
+fn valid_table_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first == '_' || first.is_ascii_alphabetic())
+        && chars.all(|character| character == '_' || character.is_ascii_alphanumeric())
+        && name.len() <= 255
 }
 
 fn check_len(resource: &'static str, len: usize, limit: usize) -> Result<(), QueryError> {

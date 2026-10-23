@@ -1,9 +1,10 @@
 # SQL queries
 
-ActorDB queries use one virtual table, `kv`, with UTF-8 `key`, opaque byte
-`value`, numeric `frag`, and durable-record metadata columns. No application
-schema registration or secondary index is required. Queries read visible
-records: deletes and expired values are hidden.
+ActorDB queries use a virtual key/value table with UTF-8 `key`, opaque byte
+`value`, numeric `frag`, and durable-record metadata columns. `FROM kv` selects
+the legacy unnamed keyspace; named logical tables use `FROM table_name`. No
+application schema registration or secondary index is required. Queries read
+visible records: deletes and expired values are hidden.
 
 ```sql
 SELECT key, PREFIX_BYTES(value, 32) FROM kv
@@ -12,6 +13,7 @@ SELECT COUNT(*), SUM(OCTET_LENGTH(value)) FROM kv WHERE frag IN (0, 3);
 SELECT SUM(CAST(value AS BIGINT)) FROM kv WHERE frag = 2;
 SELECT key, timestamp_ms, node_id FROM kv INCLUDING TOMBSTONES
 WHERE is_tombstone = 1;
+SELECT key, value FROM users WHERE STARTS_WITH(key, 'user:');
 ```
 
 ## Supported subset

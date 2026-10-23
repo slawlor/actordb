@@ -26,10 +26,15 @@ impl TableId {
     /// Validate and construct a table identity. Names are UTF-8 and are
     /// length-bounded like peer-visible identities.
     pub fn new(name: impl Into<String>) -> Result<Self, NodeError> {
-        let name = name.into();
-        if name.is_empty() || name.len() > super::MAX_WIRE_NODE_ID_BYTES {
+        let name = name.into().to_ascii_uppercase();
+        let mut chars = name.chars();
+        let valid_identifier = chars
+            .next()
+            .is_some_and(|first| first == '_' || first.is_ascii_alphabetic())
+            && chars.all(|character| character == '_' || character.is_ascii_alphanumeric());
+        if !valid_identifier || name.len() > super::MAX_WIRE_NODE_ID_BYTES {
             return Err(NodeError::Actor(format!(
-                "table name must contain 1 to {} bytes",
+                "table name must be a SQL identifier of 1 to {} bytes",
                 super::MAX_WIRE_NODE_ID_BYTES
             )));
         }
@@ -235,7 +240,10 @@ impl<'a> Table<'a> {
         plan: &QueryPlan,
     ) -> Result<actordb_query::QueryResult, QueryExecutionError> {
         let scoped = self.namespace_plan(plan)?;
-        let mut result = self.node.query_plan(&scoped).await?;
+        let mut result = self
+            .node
+            .query_plan_scoped(&scoped, crate::query::QueryOptions::default())
+            .await?;
         for (projection_index, projection) in scoped.projections.iter().enumerate() {
             if !matches!(projection, Projection::Key) {
                 continue;
@@ -271,6 +279,13 @@ impl<'a> Table<'a> {
 
     fn namespace_plan(&self, plan: &QueryPlan) -> Result<QueryPlan, QueryExecutionError> {
         let mut scoped = plan.clone();
+        if scoped.table != self.id.name() {
+            return Err(QueryExecutionError::InvalidQuery(format!(
+                "SQL table {} does not match table handle {}",
+                scoped.table,
+                self.id.name()
+            )));
+        }
         scoped.predicates = plan
             .predicates
             .iter()

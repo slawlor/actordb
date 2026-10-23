@@ -86,6 +86,7 @@ impl ScanSpec {
     pub(crate) fn query_plan(&self, fragment: Option<u32>) -> actordb_query::QueryPlan {
         use actordb_query::{KeyPredicate, Projection, QueryPlan};
         QueryPlan {
+            table: "KV".into(),
             projections: match self.transform {
                 ValueTransform::Identity => vec![Projection::Key, Projection::Value],
                 ValueTransform::KeyOnly => vec![Projection::Key],

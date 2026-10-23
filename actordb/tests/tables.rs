@@ -28,7 +28,7 @@ async fn logical_tables_share_a_node_but_isolate_keys_and_queries() {
         b"event-value"
     );
 
-    let users_result = users.query("SELECT key, value FROM kv").await.unwrap();
+    let users_result = users.query("SELECT key, value FROM users").await.unwrap();
     assert_eq!(users_result.rows.len(), 1);
     assert_eq!(
         users_result.rows[0][0],
@@ -40,7 +40,7 @@ async fn logical_tables_share_a_node_but_isolate_keys_and_queries() {
     );
 
     let events_result = events
-        .query("SELECT value FROM kv WHERE key = 'same'")
+        .query("SELECT value FROM events WHERE key = 'same'")
         .await
         .unwrap();
     assert_eq!(events_result.rows.len(), 1);

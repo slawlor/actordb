@@ -112,8 +112,21 @@ impl Node {
     }
     /// Execute a validated structured query plan using default limits.
     pub async fn query_plan(&self, plan: &QueryPlan) -> Result<QueryResult, QueryExecutionError> {
-        self.query_plan_with_options(plan, QueryOptions::default())
-            .await
+        if plan.table != "KV" {
+            return Err(QueryExecutionError::InvalidQuery(
+                "Node::query_plan targets the legacy unnamed KV table; use Node::table for named tables"
+                    .into(),
+            ));
+        }
+        self.query_plan_scoped(plan, QueryOptions::default()).await
+    }
+
+    pub(super) async fn query_plan_scoped(
+        &self,
+        plan: &QueryPlan,
+        options: QueryOptions,
+    ) -> Result<QueryResult, QueryExecutionError> {
+        self.query_plan_with_options(plan, options).await
     }
     /// Execute a query under one absolute deadline and explicit memory/work limits.
     pub async fn query_plan_with_options(

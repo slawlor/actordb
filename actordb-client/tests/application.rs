@@ -125,7 +125,11 @@ async fn full_application_catalog_preserves_peer_membership_and_node_lifecycle()
     );
     assert_eq!(client.get("item:1").await.unwrap().unwrap().bytes, b"123");
     assert_eq!(
-        users.query("SELECT COUNT(*) FROM kv").await.unwrap().rows,
+        users
+            .query("SELECT COUNT(*) FROM users")
+            .await
+            .unwrap()
+            .rows,
         vec![vec![QueryValue::Integer(1)]]
     );
     users.close().await;
