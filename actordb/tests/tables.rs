@@ -19,12 +19,21 @@ async fn logical_tables_share_a_node_but_isolate_keys_and_queries() {
     users.put("same", b"user-value".to_vec()).await.unwrap();
     events.put("same", b"event-value".to_vec()).await.unwrap();
 
-    assert_eq!(users.get("same").await.unwrap().unwrap().value, b"user-value");
-    assert_eq!(events.get("same").await.unwrap().unwrap().value, b"event-value");
+    assert_eq!(
+        users.get("same").await.unwrap().unwrap().value,
+        b"user-value"
+    );
+    assert_eq!(
+        events.get("same").await.unwrap().unwrap().value,
+        b"event-value"
+    );
 
     let users_result = users.query("SELECT key, value FROM kv").await.unwrap();
     assert_eq!(users_result.rows.len(), 1);
-    assert_eq!(users_result.rows[0][0], actordb_query::QueryValue::Text("same".into()));
+    assert_eq!(
+        users_result.rows[0][0],
+        actordb_query::QueryValue::Text("same".into())
+    );
     assert_eq!(
         users_result.rows[0][1],
         actordb_query::QueryValue::Bytes(b"user-value".to_vec())
