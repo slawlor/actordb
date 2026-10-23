@@ -1,5 +1,13 @@
 # Release notes
 
+## 0.8.0 (draft)
+
+- Add shared-node logical table views. Tables reuse the node listener and peer
+  channels while isolating keys, scans, and SQL queries in deterministic
+  namespaces.
+- Bump the peer protocol to v5 and the application protocol to v3 for the
+  multi-table rollout.
+
 ## 0.7.1
 
 - Extend bounded SQL inspection with durable-record metadata projections and

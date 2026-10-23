@@ -1,8 +1,13 @@
 # Physical/logical version migration
 
-The 0.7.1 release uses peer protocol **4**, application protocol **2**, and
+The 0.8.0 release uses peer protocol **5**, application protocol **3**, and
 RocksDB data format **2**. Update every peer and application client together;
-older binaries are rejected during negotiation. The crate version is 0.7.1.
+older binaries are rejected during negotiation. The crate version is 0.8.0.
+
+Logical table views are namespaced within one node and reuse its peer listener.
+The default node API remains the legacy unnamed keyspace; named tables use
+their own deterministic key namespace. Table-aware client and peer framing is
+being added incrementally in the 0.8.0 rollout.
 
 Record order is `(timestamp_ms, logical_counter, node_id, is_tombstone)`.
 `timestamp_ms` is physical Unix time. The counter orders same-time events without

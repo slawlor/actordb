@@ -22,7 +22,7 @@ impl client::Value {
     }
 }
 
-pub const CLIENT_PROTOCOL_VERSION: u32 = 2;
+pub const CLIENT_PROTOCOL_VERSION: u32 = 3;
 pub const CLIENT_CAPABILITY_QUERY: u64 = 1;
 pub const CLIENT_CAPABILITY_SCAN: u64 = 2;
 pub const CLIENT_CAPABILITY_WRITE_CONCERNS: u64 = 4;

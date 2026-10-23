@@ -1,8 +1,8 @@
-# Rust client option construction in 0.7.1
+# Rust client option construction in 0.8.0
 
 `ClientOptions` and `PutOptions` now expose Bon builders and are
 `non_exhaustive`. This changes external struct-literal construction in the
-0.7.1 release; adding optional settings in later releases can keep
+0.8.0 release; adding optional settings in later releases can keep
 existing builder calls source compatible. Defaults and public field access are
 preserved.
 

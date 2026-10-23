@@ -155,7 +155,8 @@ pub mod scan;
 pub use scan::{ScanError, MAX_SCAN_TOTAL_MATCHES};
 
 /// Current peer wire protocol version. Hello ranges must include this value.
-/// Version 4 carries independent physical/logical record timestamps. Older
+/// Version 5 carries independent physical/logical record timestamps and the
+/// 0.8 logical-table rollout. Older
 /// peers cannot preserve their ordering and are rejected during negotiation.
 /// It retains v3 byte-bounded, cursor-correlated reconciliation.
 pub const WIRE_PROTOCOL_VERSION: u32 = 5;
