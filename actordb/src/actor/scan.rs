@@ -95,9 +95,11 @@ impl ScanSpec {
                 KeyMatcher::All => Vec::new(),
                 KeyMatcher::Prefix(prefix) => vec![KeyPredicate::Prefix(prefix.clone())],
             },
+            metadata_predicates: Vec::new(),
             fragments: fragment.map(|fragment| vec![fragment]),
             limit: Some(self.effective_limit()),
             offset: self.offset,
+            include_tombstones: false,
         }
     }
 

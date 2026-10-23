@@ -1,7 +1,8 @@
 // Copyright (c) Sean Lawlor
 // Licensed under the MIT license in the repository root.
 
-//! Portable query plans for the `kv` relation: UTF-8 keys and opaque values.
+//! Portable query plans for the `kv` relation: UTF-8 keys, opaque values, and
+//! explicit durable-record metadata.
 //!
 //! SQL is a deliberately bounded subset, with key predicates, fragment scopes,
 //! projections, and mergeable integer aggregates. It does not execute Rust code
@@ -79,12 +80,57 @@ pub enum Projection {
     Key,
     Value,
     Fragment,
+    /// Last-writer physical timestamp from the durable record envelope.
+    TimestampMs,
+    /// Last-writer logical counter from the durable record envelope.
+    LogicalCounter,
+    /// Writer/provenance identity from the durable record envelope.
+    NodeId,
+    /// Optional absolute TTL deadline from the durable record envelope.
+    ExpiresAtMs,
+    /// Tombstone bit from the durable record envelope, represented as 0/1.
+    Tombstone,
     PrefixBytes(u32),
     OctetLength,
     Aggregate {
         function: AggregateFunction,
         input: AggregateInput,
     },
+}
+
+/// Metadata carried by ActorDB's durable/replicated record envelope.
+///
+/// The application payload remains opaque bytes; these fields are exposed so
+/// SQL can inspect the database's own record metadata without decoding the
+/// payload format.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RecordMetadata {
+    pub timestamp_ms: u64,
+    pub logical_counter: u64,
+    pub node_id: String,
+    pub expires_at_ms: Option<u64>,
+    pub is_tombstone: bool,
+}
+
+/// Comparison operators available for durable-record metadata predicates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MetadataOp {
+    Equal,
+    LessThan,
+    LessOrEqual,
+    GreaterThan,
+    GreaterOrEqual,
+}
+
+/// Predicate over a field in ActorDB's durable record envelope.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MetadataPredicate {
+    TimestampMs(MetadataOp, u64),
+    LogicalCounter(MetadataOp, u64),
+    NodeId(MetadataOp, String),
+    ExpiresAtMs(MetadataOp, u64),
+    ExpiresAtMsNull(bool),
+    Tombstone(MetadataOp, bool),
 }
 
 /// Conjunctive key filters. Ordering is lexicographic UTF-8 byte ordering.
@@ -104,13 +150,17 @@ pub enum KeyPredicate {
 /// `limit: None` requests complete results, subject to explicit executor errors
 /// on resource exhaustion. `Some(0)` requests no rows. Aggregates reject LIMIT,
 /// OFFSET, and ORDER BY and consume every qualifying row.
+/// `include_tombstones` is false for ordinary reads; the SQL `INCLUDING
+/// TOMBSTONES` modifier enables retained tombstone inspection.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QueryPlan {
     pub projections: Vec<Projection>,
     pub predicates: Vec<KeyPredicate>,
+    pub metadata_predicates: Vec<MetadataPredicate>,
     pub fragments: Option<Vec<u32>>,
     pub limit: Option<u64>,
     pub offset: u64,
+    pub include_tombstones: bool,
 }
 
 /// Parsing, validation, conversion, or aggregate failure.
@@ -161,6 +211,18 @@ impl QueryPlan {
             self.predicates.len(),
             MAX_QUERY_EXPRESSIONS,
         )?;
+        check_len(
+            "metadata predicates",
+            self.metadata_predicates.len(),
+            MAX_QUERY_EXPRESSIONS,
+        )?;
+        check_len(
+            "predicates",
+            self.predicates
+                .len()
+                .saturating_add(self.metadata_predicates.len()),
+            MAX_QUERY_EXPRESSIONS,
+        )?;
         if let Some(fragments) = &self.fragments {
             check_len("fragments", fragments.len(), MAX_QUERY_FRAGMENTS)?;
         }
@@ -174,6 +236,11 @@ impl QueryPlan {
                 | KeyPredicate::GreaterOrEqual(key) => key.len(),
             };
             check_len("literal bytes", len, MAX_QUERY_LITERAL_BYTES)?;
+        }
+        for predicate in &self.metadata_predicates {
+            if let MetadataPredicate::NodeId(_, node_id) = predicate {
+                check_len("literal bytes", node_id.len(), MAX_QUERY_LITERAL_BYTES)?;
+            }
         }
         let aggregate_count = self
             .projections
@@ -228,6 +295,21 @@ impl QueryPlan {
             .any(|p| matches!(p, Projection::Aggregate { .. }))
     }
 
+    /// Whether execution needs to materialize durable-record metadata.
+    pub fn needs_metadata(&self) -> bool {
+        !self.metadata_predicates.is_empty()
+            || self.projections.iter().any(|projection| {
+                matches!(
+                    projection,
+                    Projection::TimestampMs
+                        | Projection::LogicalCounter
+                        | Projection::NodeId
+                        | Projection::ExpiresAtMs
+                        | Projection::Tombstone
+                )
+            })
+    }
+
     pub fn matches_key(&self, key: &str) -> bool {
         self.predicates.iter().all(|predicate| match predicate {
             KeyPredicate::Equal(other) => key == other,
@@ -237,6 +319,14 @@ impl QueryPlan {
             KeyPredicate::GreaterThan(other) => key > other.as_str(),
             KeyPredicate::GreaterOrEqual(other) => key >= other.as_str(),
         })
+    }
+
+    /// Evaluate durable-record metadata predicates for one visible or
+    /// tombstone record.
+    pub fn matches_metadata(&self, metadata: &RecordMetadata) -> bool {
+        self.metadata_predicates
+            .iter()
+            .all(|predicate| predicate.matches(metadata))
     }
 
     pub fn matches_fragment(&self, fragment: u32) -> bool {
@@ -268,12 +358,38 @@ impl QueryPlan {
         value: &[u8],
         fragment: u32,
     ) -> Result<Vec<QueryValue>, QueryError> {
+        self.project_with_metadata(key, value, fragment, &RecordMetadata::default())
+    }
+
+    /// Project one qualifying row, including durable-record metadata.
+    pub fn project_with_metadata(
+        &self,
+        key: &str,
+        value: &[u8],
+        fragment: u32,
+        metadata: &RecordMetadata,
+    ) -> Result<Vec<QueryValue>, QueryError> {
         self.projections
             .iter()
             .map(|projection| match projection {
                 Projection::Key => Ok(QueryValue::Text(key.into())),
                 Projection::Value => Ok(QueryValue::Bytes(value.into())),
                 Projection::Fragment => Ok(QueryValue::Integer(i128::from(fragment))),
+                Projection::TimestampMs => {
+                    Ok(QueryValue::Integer(i128::from(metadata.timestamp_ms)))
+                }
+                Projection::LogicalCounter => {
+                    Ok(QueryValue::Integer(i128::from(metadata.logical_counter)))
+                }
+                Projection::NodeId => Ok(QueryValue::Text(metadata.node_id.clone())),
+                Projection::ExpiresAtMs => {
+                    Ok(metadata.expires_at_ms.map_or(QueryValue::Null, |value| {
+                        QueryValue::Integer(i128::from(value))
+                    }))
+                }
+                Projection::Tombstone => {
+                    Ok(QueryValue::Integer(i128::from(metadata.is_tombstone as u8)))
+                }
                 Projection::PrefixBytes(count) => Ok(QueryValue::Bytes(
                     value[..value.len().min(*count as usize)].into(),
                 )),
@@ -289,6 +405,9 @@ impl QueryPlan {
     /// dependency. Validate manually constructed plans before calling this.
     pub fn to_sql(&self) -> String {
         let mut sql = format!("SELECT {} FROM kv", self.columns().join(", "));
+        if self.include_tombstones {
+            sql.push_str(" INCLUDING TOMBSTONES");
+        }
         let mut predicates: Vec<String> = self
             .predicates
             .iter()
@@ -303,6 +422,7 @@ impl QueryPlan {
                 KeyPredicate::GreaterOrEqual(key) => format!("key >= {}", quote(key)),
             })
             .collect();
+        predicates.extend(self.metadata_predicates.iter().map(MetadataPredicate::sql));
         if let Some(fragments) = &self.fragments {
             let mut fragments = fragments.clone();
             fragments.sort_unstable();
@@ -339,6 +459,11 @@ impl Projection {
             Self::Key => "key".into(),
             Self::Value => "value".into(),
             Self::Fragment => "frag".into(),
+            Self::TimestampMs => "timestamp_ms".into(),
+            Self::LogicalCounter => "logical_counter".into(),
+            Self::NodeId => "node_id".into(),
+            Self::ExpiresAtMs => "expires_at_ms".into(),
+            Self::Tombstone => "is_tombstone".into(),
             Self::PrefixBytes(count) => format!("PREFIX_BYTES(value, {count})"),
             Self::OctetLength => "OCTET_LENGTH(value)".into(),
             Self::Aggregate { function, input } => {
@@ -355,6 +480,61 @@ impl Projection {
                 };
                 format!("{function}({input})")
             }
+        }
+    }
+}
+
+impl MetadataPredicate {
+    fn matches(&self, metadata: &RecordMetadata) -> bool {
+        match self {
+            Self::TimestampMs(op, value) => op.matches(metadata.timestamp_ms, *value),
+            Self::LogicalCounter(op, value) => op.matches(metadata.logical_counter, *value),
+            Self::NodeId(op, value) => op.matches_text(&metadata.node_id, value),
+            Self::ExpiresAtMs(op, value) => metadata
+                .expires_at_ms
+                .is_some_and(|actual| op.matches(actual, *value)),
+            Self::ExpiresAtMsNull(expected) => metadata.expires_at_ms.is_none() == *expected,
+            Self::Tombstone(op, value) => op.matches(metadata.is_tombstone, *value),
+        }
+    }
+
+    fn sql(&self) -> String {
+        match self {
+            Self::TimestampMs(op, value) => format!("timestamp_ms {} {value}", op.sql()),
+            Self::LogicalCounter(op, value) => format!("logical_counter {} {value}", op.sql()),
+            Self::NodeId(op, value) => format!("node_id {} {}", op.sql(), quote(value)),
+            Self::ExpiresAtMs(op, value) => format!("expires_at_ms {} {value}", op.sql()),
+            Self::ExpiresAtMsNull(true) => "expires_at_ms IS NULL".into(),
+            Self::ExpiresAtMsNull(false) => "expires_at_ms IS NOT NULL".into(),
+            Self::Tombstone(op, value) => {
+                format!("is_tombstone {} {}", op.sql(), u8::from(*value))
+            }
+        }
+    }
+}
+
+impl MetadataOp {
+    fn matches<T: Ord>(self, left: T, right: T) -> bool {
+        match self {
+            Self::Equal => left == right,
+            Self::LessThan => left < right,
+            Self::LessOrEqual => left <= right,
+            Self::GreaterThan => left > right,
+            Self::GreaterOrEqual => left >= right,
+        }
+    }
+
+    fn matches_text(self, left: &str, right: &str) -> bool {
+        self.matches(left, right)
+    }
+
+    fn sql(self) -> &'static str {
+        match self {
+            Self::Equal => "=",
+            Self::LessThan => "<",
+            Self::LessOrEqual => "<=",
+            Self::GreaterThan => ">",
+            Self::GreaterOrEqual => ">=",
         }
     }
 }
@@ -405,8 +585,22 @@ impl QueryAccumulator {
 
     /// Add one raw row, applying the plan's key and fragment filters.
     pub fn push(&mut self, key: &str, value: &[u8], fragment: u32) -> Result<(), QueryError> {
+        self.push_with_metadata(key, value, fragment, &RecordMetadata::default())
+    }
+
+    /// Add one raw row with durable-record metadata, applying all predicates.
+    pub fn push_with_metadata(
+        &mut self,
+        key: &str,
+        value: &[u8],
+        fragment: u32,
+        metadata: &RecordMetadata,
+    ) -> Result<(), QueryError> {
         self.ensure_aggregate()?;
-        if !self.plan.matches_fragment(fragment) || !self.plan.matches_key(key) {
+        if !self.plan.matches_fragment(fragment)
+            || !self.plan.matches_key(key)
+            || !self.plan.matches_metadata(metadata)
+        {
             return Ok(());
         }
         // Compute all conversions and updates before changing any state. A

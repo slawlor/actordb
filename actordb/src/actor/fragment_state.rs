@@ -770,6 +770,8 @@ impl FragmentState {
         });
         let mut keys = cache.ordered_keys.range(bounds).peekable();
         let mut accumulator = QueryAccumulator::new(plan);
+        let empty_metadata = actordb_query::RecordMetadata::default();
+        let needs_metadata = plan.needs_metadata();
         while let Some(key) = keys.peek().copied() {
             if page.visited as usize == max_visits
                 || (!plan.is_aggregate() && page.rows.len() == max_rows)
@@ -781,8 +783,18 @@ impl FragmentState {
                 keys.next();
                 continue;
             };
-            let matched =
-                !value.is_tombstone && !value.is_expired(snapshot_time_ms) && plan.matches_key(key);
+            let metadata = needs_metadata.then(|| actordb_query::RecordMetadata {
+                timestamp_ms: value.timestamp_ms,
+                logical_counter: value.logical_counter,
+                node_id: value.node_id.clone(),
+                expires_at_ms: value.expires_at_ms,
+                is_tombstone: value.is_tombstone,
+            });
+            let metadata_ref = metadata.as_ref().unwrap_or(&empty_metadata);
+            let matched = (!value.is_tombstone || plan.include_tombstones)
+                && (!value.is_expired(snapshot_time_ms) || value.is_tombstone)
+                && plan.matches_key(key)
+                && plan.matches_metadata(metadata_ref);
             // Charge actual projected/parsed work, not an untouched full value
             // for COUNT or OCTET_LENGTH. A wide parsed BIGINT/projection still
             // has a strict per-turn work cap.
@@ -796,9 +808,15 @@ impl FragmentState {
                             input: AggregateInput::BigInt,
                             ..
                         } => value.value.len(),
+                        Projection::NodeId => value.node_id.len(),
                         _ => 0,
                     })
                     .sum::<usize>()
+            } else {
+                0
+            };
+            let metadata_work = if needs_metadata {
+                value.node_id.len()
             } else {
                 0
             };
@@ -806,6 +824,7 @@ impl FragmentState {
                 .len()
                 .saturating_mul(2)
                 .saturating_add(value_work)
+                .saturating_add(metadata_work)
                 .saturating_add(128);
             if record_work > QUERY_WORK_BYTES {
                 return page_error(
@@ -824,6 +843,7 @@ impl FragmentState {
                     key,
                     value.value.len(),
                     req.fragment,
+                    metadata_ref,
                 );
                 let predicted = page_encoded_len(&page)
                     .saturating_add(crate::wire::message_field_len(3, row_wire_bytes))
@@ -840,12 +860,14 @@ impl FragmentState {
                     page.done = false;
                     break;
                 }
-                let cells = match plan.project(key, &value.value, req.fragment) {
-                    Ok(values) => values.into_iter().map(value_to_cell).collect(),
-                    Err(error) => {
-                        return page_error(req, QueryPageStatus::Invalid, error.to_string());
-                    }
-                };
+                let cells =
+                    match plan.project_with_metadata(key, &value.value, req.fragment, metadata_ref)
+                    {
+                        Ok(values) => values.into_iter().map(value_to_cell).collect(),
+                        Err(error) => {
+                            return page_error(req, QueryPageStatus::Invalid, error.to_string());
+                        }
+                    };
                 page.rows.push(QueryPageRow {
                     key: key.clone(),
                     cells,
@@ -867,7 +889,12 @@ impl FragmentState {
             } else {
                 page.next_after_key = key.clone();
                 if matched {
-                    if let Err(error) = accumulator.push(key, &value.value, req.fragment) {
+                    if let Err(error) = accumulator.push_with_metadata(
+                        key,
+                        &value.value,
+                        req.fragment,
+                        metadata_ref,
+                    ) {
                         return page_error(req, QueryPageStatus::Invalid, error.to_string());
                     }
                 }

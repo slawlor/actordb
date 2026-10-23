@@ -1,15 +1,17 @@
 # SQL queries
 
 ActorDB queries use one virtual table, `kv`, with UTF-8 `key`, opaque byte
-`value`, and numeric `frag` columns. No schema registration or secondary
-index is required. Queries read visible records: deletes and expired values
-are hidden.
+`value`, numeric `frag`, and durable-record metadata columns. No application
+schema registration or secondary index is required. Queries read visible
+records: deletes and expired values are hidden.
 
 ```sql
 SELECT key, PREFIX_BYTES(value, 32) FROM kv
 WHERE STARTS_WITH(key, 'user:') ORDER BY key ASC LIMIT 100;
 SELECT COUNT(*), SUM(OCTET_LENGTH(value)) FROM kv WHERE frag IN (0, 3);
 SELECT SUM(CAST(value AS BIGINT)) FROM kv WHERE frag = 2;
+SELECT key, timestamp_ms, node_id FROM kv INCLUDING TOMBSTONES
+WHERE is_tombstone = 1;
 ```
 
 ## Supported subset
@@ -17,10 +19,15 @@ SELECT SUM(CAST(value AS BIGINT)) FROM kv WHERE frag = 2;
 Use one `SELECT` statement with:
 
 - Projections: `key`, `value`, `frag`, `PREFIX_BYTES(value, n)`, and
-  `OCTET_LENGTH(value)`.
+  `OCTET_LENGTH(value)`, plus `timestamp_ms`, `logical_counter`, `node_id`,
+  `expires_at_ms`, and `is_tombstone` from ActorDB's durable record envelope.
 - Predicates: key comparisons (`=`, `<`, `<=`, `>`, `>=`),
   `STARTS_WITH(key, prefix)`, and `frag = n` or
-  `frag IN (...)`, combined with `AND`.
+  `frag IN (...)`, plus durable metadata comparisons on
+  `timestamp_ms`, `logical_counter`, `node_id`, `expires_at_ms`, and
+  `is_tombstone`, combined with `AND`.
+- Visibility modifier: `INCLUDING TOMBSTONES` includes retained tombstone
+  records. Without it, tombstones remain hidden.
 - Row pagination: `ORDER BY key ASC`, `LIMIT`, and `OFFSET`.
 - Aggregates: `COUNT(*)` and `SUM`, `MIN`, or `MAX` over
   `OCTET_LENGTH(value)` or `CAST(value AS BIGINT)`.
@@ -34,6 +41,19 @@ Numeric conversion is explicit. `CAST(value AS BIGINT)` accepts signed decimal
 64-bit integers; invalid bytes fail the query. Aggregate arithmetic uses
 checked wide integers. Empty `COUNT(*)` is zero; empty `SUM`, `MIN`, and `MAX`
 are null. Query cells preserve text, bytes, integer, and null types.
+
+Durable metadata is returned without decoding the opaque application payload.
+`timestamp_ms`, `logical_counter`, and `expires_at_ms` are unsigned integer
+values; `expires_at_ms` is `NULL` when no TTL is set. `node_id` is text and
+`is_tombstone` is an integer flag (`0` or `1`). Without
+`INCLUDING TOMBSTONES`, `is_tombstone` is always `0`; with the modifier it can
+identify retained tombstones.
+
+Metadata comparisons use typed literals: timestamp, logical-counter, and TTL
+comparisons require unsigned integers; `node_id` requires text; and
+`is_tombstone` accepts `0` or `1`. `expires_at_ms IS NULL` and
+`expires_at_ms IS NOT NULL` test whether a TTL is present. Metadata predicates
+do not create a secondary index, so they scan the selected key ranges.
 
 ## Fragment filtering and unindexed work
 

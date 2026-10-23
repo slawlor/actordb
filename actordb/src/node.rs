@@ -178,6 +178,8 @@ pub const CAPABILITY_STABLE_DURABILITY_ACKS: u64 = 1 << 6;
 pub const CAPABILITY_SCAN: u64 = 1 << 7;
 /// Optional revision-guarded, bounded SQL query pages.
 pub const CAPABILITY_QUERY_PAGES: u64 = 1 << 8;
+/// Optional durable-record metadata columns in SQL query pages.
+pub const CAPABILITY_QUERY_METADATA: u64 = 1 << 12;
 /// Forwarded writes carry explicit acknowledgement policy and progress.
 pub const CAPABILITY_WRITE_CONCERNS: u64 = 1 << 9;
 /// Summaries carry content digests and reject equal-version divergent contents.

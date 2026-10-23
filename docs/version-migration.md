@@ -1,8 +1,8 @@
 # Physical/logical version migration
 
-The unpublished 0.7 release uses peer protocol **4**, application protocol **2**,
-and RocksDB data format **2**. Update every peer and application client together;
-older binaries are rejected during negotiation. The crate version remains 0.7.0.
+The 0.7.1 release uses peer protocol **4**, application protocol **2**, and
+RocksDB data format **2**. Update every peer and application client together;
+older binaries are rejected during negotiation. The crate version is 0.7.1.
 
 Record order is `(timestamp_ms, logical_counter, node_id, is_tombstone)`.
 `timestamp_ms` is physical Unix time. The counter orders same-time events without

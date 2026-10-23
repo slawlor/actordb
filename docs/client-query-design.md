@@ -209,14 +209,18 @@ SELECT SUM(CAST(value AS BIGINT))
 FROM kv WHERE STARTS_WITH(key, ?);
 ```
 
-The initial relation is `kv(key TEXT, value BYTES)`. Support key equality,
-prefix matching, key/value/prefix/length projections, and COUNT/SUM/MIN/MAX
-over supported explicit expressions. Bind parameters as typed data. Numeric
-casts use strict decimal signed-64 parsing; invalid bytes produce typed errors.
-Use checked wide partial sums and a lossless integer result encoding. COUNT
-of an empty set is zero; SUM/MIN/MAX are null. Reject mixed aggregate and row
-projections without grouping. Defer joins, grouping, implicit JSON schemas,
-arbitrary functions, and unrestricted ordering expressions.
+The initial relation is `kv(key TEXT, value BYTES, frag INT)` plus explicit
+durable-envelope metadata (`timestamp_ms`, `logical_counter`, `node_id`,
+`expires_at_ms`, and `is_tombstone`). Support key equality, prefix matching,
+metadata predicates, key/value/prefix/length/metadata projections, and
+COUNT/SUM/MIN/MAX over supported explicit expressions. Bind parameters as typed
+data. Numeric casts use strict decimal signed-64 parsing; invalid bytes produce
+typed errors. Use checked wide partial sums and a lossless integer result
+encoding. COUNT of an empty set is zero; SUM/MIN/MAX are null. Retained
+tombstones require the explicit `INCLUDING TOMBSTONES` modifier. Reject mixed
+aggregate and row projections without grouping. Defer joins, grouping,
+implicit JSON schemas, arbitrary functions, and unrestricted ordering
+expressions.
 
 Row queries default to global key ascending order. Apply OFFSET/LIMIT once
 after filtering and global merge. SQL LIMIT zero means zero rows. Aggregate

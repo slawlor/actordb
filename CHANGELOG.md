@@ -1,5 +1,15 @@
 # Release notes
 
+## 0.7.1
+
+- Extend bounded SQL inspection with durable-record metadata projections and
+  typed metadata predicates.
+- Add `INCLUDING TOMBSTONES` for explicitly querying retained tombstones;
+  ordinary SQL visibility remains live-record-only.
+- Negotiate the metadata-aware query capability before selecting remote holders.
+- Update the four public crates and their workspace dependency minimums to
+  `0.7.1`.
+
 ## 0.7.0
 
 - Add an optional `actordb/tls` rustls transport with caller-supplied client/server certificate policies, server-name validation, and bounded per-connection handshakes. Plain TCP and custom `Network` implementations remain available.
