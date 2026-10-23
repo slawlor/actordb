@@ -3,8 +3,9 @@
 ## 0.8.0 (draft)
 
 - Add shared-node logical table views. Tables reuse the node listener and peer
-  channels while isolating keys, scans, and SQL queries in deterministic
-  namespaces.
+  channels while isolating keys, scans, SQL queries, cache/flush state, and
+  durable iteration groups in per-table partitions. Equal user keys hash to
+  the same fragment across tables for future local key joins.
 - Bump the peer protocol to v5 and the application protocol to v3 for the
   multi-table rollout.
 - SQL now names its relation explicitly (`FROM users`); `FROM kv` remains the

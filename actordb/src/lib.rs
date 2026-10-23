@@ -62,6 +62,7 @@ pub mod placement;
 
 mod retained;
 mod runtime_tasks;
+pub(crate) mod table_key;
 
 // Shared protobuf framing limits and encoding helpers. Node and replication
 // consume this module as part of the v3 paginated anti-entropy protocol.

@@ -1287,9 +1287,10 @@ impl Node {
         };
         let mut store_binding = StoreBindingStartupGuard::new(store_binding);
 
-        // One actor per fragment. With persistence, each fragment gets
-        // its own key namespace via PrefixedStore, sharing the one
-        // underlying store.
+        // One actor per fragment. With persistence, each fragment gets its
+        // own namespace via PrefixedStore; named tables add independent
+        // cache/flush/iteration partitions over that fragment store while
+        // retaining one backend handle and one replication channel set.
         // Fragments this node serves: from the placement map, or all of
         // them when no map is configured (single-node / legacy).
         let my_fragments: Vec<FragmentId> = if !dynamic && config.fragment_map.is_empty() {
@@ -1317,8 +1318,8 @@ impl Node {
             .map_err(|e| NodeError::Network(e.to_string()))?;
 
         // One supervised subtree per served fragment. With persistence,
-        // each fragment gets its own key namespace via PrefixedStore,
-        // sharing the one underlying store. The supervisor owns the
+        // each fragment gets its own key namespace via PrefixedStore and
+        // named tables receive independent logical store partitions. The supervisor owns the
         // dispatcher, cleaner and snapshotter; the router talks to the
         // dispatcher through the supervisor.
         let hlc = Arc::new(Mutex::new(

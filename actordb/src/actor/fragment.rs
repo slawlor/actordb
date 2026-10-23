@@ -218,7 +218,13 @@ impl SupervisorState {
                     .await
                     .map_err(FragmentStartupStorageError::boxed)?;
                 let now = now_ms();
-                for (index, (k, v)) in loaded.into_iter().enumerate() {
+                for (index, (raw_key, v)) in loaded.into_iter().enumerate() {
+                    // Table partitions add a durable-only prefix around the
+                    // logical namespace. The actor cache and replication
+                    // protocol retain the logical key so table routing and
+                    // co-partitioned fragment hashing remain deterministic.
+                    let k = crate::table_key::strip_storage_prefix(&raw_key)
+                        .unwrap_or_else(|| raw_key.clone());
                     high_water = Some(
                         high_water
                             .map(|current| current.max(v.version()))
@@ -237,7 +243,7 @@ impl SupervisorState {
                         .map_err(FragmentStartupStorageError::boxed)?;
                     let (value, previous_value) = if v.is_expired(now) {
                         let tombstone = v.expiry_tombstone();
-                        expiry_updates.push((k, tombstone.clone()));
+                        expiry_updates.push((raw_key, tombstone.clone()));
                         (tombstone, if publisher.is_some() { Some(v) } else { None })
                     } else {
                         (v, None)
@@ -454,6 +460,8 @@ impl FragmentSupervisor {
                 args.flush_interval,
             )
             .with_persistence_config(args.persistence.clone())
+            .map_err(FragmentStartupStorageError::boxed)?
+            .enable_partitions()
             .map_err(FragmentStartupStorageError::boxed)?
             .with_expiry_publisher(args.fragment, args.expiry_publisher.clone()),
         );

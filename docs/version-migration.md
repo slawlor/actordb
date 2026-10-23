@@ -6,9 +6,11 @@ older binaries are rejected during negotiation. The crate version is 0.8.0.
 
 Logical table views are namespaced within one node and reuse its peer listener.
 The default node API remains the legacy unnamed keyspace; named tables use
-their own deterministic key namespace. Table-aware client and peer framing is
-being added incrementally in the 0.8.0 rollout. SQL must use `FROM table_name`
-for a named table; `FROM kv` selects only the legacy unnamed keyspace.
+independent per-table cache, flush, and iteration partitions over the shared
+durable backend. Their physical keys retain a deterministic table namespace,
+while fragment routing hashes only the unqualified user key so equal keys
+co-partition across tables. SQL must use `FROM table_name` for a named table;
+`FROM kv` selects only the legacy unnamed keyspace.
 
 Record order is `(timestamp_ms, logical_counter, node_id, is_tombstone)`.
 `timestamp_ms` is physical Unix time. The counter orders same-time events without

@@ -18,10 +18,10 @@ use super::protocol::{
     ApplyDurability, ApplyError, ApplyOutcome, ReplicatedOp, SnapshotSummary, SummaryPage,
     VersionedPage, VersionedValue,
 };
-use super::scan::{ScanMatch, ScanSpec};
+use super::scan::{KeyMatcher, ScanMatch, ScanSpec};
 use crate::retained::{ByteBudget, BytePermit};
 use crate::shard::FragmentId;
-use crate::store::{KvStore, PersistenceConfig, StoreCommitDurability};
+use crate::store::{KvStore, PersistenceConfig, StoreCommitDurability, TableStore};
 use crate::ttl_expiry::ExpiryPublisher;
 use crate::wire::check_versioned_value_budget;
 
@@ -61,6 +61,12 @@ pub struct FragmentState {
     flush_batch_size: usize,
     flush_interval: Duration,
     expiry_publisher: Option<(FragmentId, ExpiryPublisher)>,
+    /// Independently cached and persisted table partitions. The legacy
+    /// fields above remain the unnamed KV partition; table children are
+    /// created lazily and share only the backend handle and node executor.
+    table_children: Arc<RwLock<HashMap<String, Arc<FragmentState>>>>,
+    partitioned: bool,
+    persistence_template: Option<PersistenceConfig>,
 }
 
 /// Values and their ordered key index. Both live under one lock so every
@@ -183,6 +189,43 @@ impl FragmentState {
         flush_batch_size: usize,
         flush_interval: Duration,
     ) -> Self {
+        let mut legacy = HashMap::new();
+        let mut table_caches: HashMap<String, HashMap<String, VersionedValue>> = HashMap::new();
+        for (key, value) in cache {
+            if let Some(table) = crate::table_key::table_name(&key) {
+                table_caches.entry(table).or_default().insert(key, value);
+            } else {
+                legacy.insert(key, value);
+            }
+        }
+        let mut state = Self::new_local(legacy, kvstore.clone(), flush_batch_size, flush_interval);
+        let children = table_caches
+            .into_iter()
+            .map(|(table, cache)| {
+                let store = kvstore.as_ref().map(|inner| {
+                    Arc::new(TableStore::new(inner.clone(), &table)) as Arc<dyn KvStore>
+                });
+                (
+                    table,
+                    Arc::new(Self::new_local(
+                        cache,
+                        store,
+                        flush_batch_size,
+                        flush_interval,
+                    )),
+                )
+            })
+            .collect();
+        state.table_children = Arc::new(RwLock::new(children));
+        state
+    }
+
+    fn new_local(
+        cache: HashMap<String, VersionedValue>,
+        kvstore: Option<Arc<dyn KvStore>>,
+        flush_batch_size: usize,
+        flush_interval: Duration,
+    ) -> Self {
         let ordered_keys = cache.keys().cloned().collect();
         let content_digests = cache
             .iter()
@@ -221,6 +264,9 @@ impl FragmentState {
             flush_batch_size,
             flush_interval,
             expiry_publisher: None,
+            table_children: Arc::new(RwLock::new(HashMap::new())),
+            partitioned: false,
+            persistence_template: None,
         }
     }
 
@@ -233,6 +279,23 @@ impl FragmentState {
     /// Returns an error for invalid limits, shared work, or a retained backlog.
     pub fn with_persistence_config(mut self, config: PersistenceConfig) -> Result<Self, String> {
         config.validate()?;
+        self.configure_persistence(&config)?;
+        self.persistence_template = Some(config.clone());
+        if self.partitioned {
+            let children = Arc::get_mut(&mut self.table_children)
+                .ok_or_else(|| "table partitions are already shared".to_string())?
+                .get_mut();
+            for child in children.values_mut() {
+                let child = Arc::get_mut(child)
+                    .ok_or_else(|| "table partition is already shared".to_string())?;
+                child.configure_persistence(&config)?;
+                child.persistence_template = Some(config.clone());
+            }
+        }
+        Ok(self)
+    }
+
+    fn configure_persistence(&mut self, config: &PersistenceConfig) -> Result<(), String> {
         let flush = Arc::get_mut(&mut self.flush)
             .ok_or_else(|| "persistence work is already shared".to_string())?
             .get_mut();
@@ -243,11 +306,25 @@ impl FragmentState {
         flush.max_records = config.max_records();
         flush.aggregate_budget = config.aggregate();
         self.executor = config.executor();
-        Ok(self)
+        Ok(())
     }
 
     /// Charged authoritative pending/active bytes and retained records.
     pub async fn persistence_backlog(&self) -> (usize, usize) {
+        if self.partitioned {
+            let (mut records, mut bytes) = self.persistence_backlog_local().await;
+            let children = self.table_children.read().await.clone();
+            for child in children.values() {
+                let (child_records, child_bytes) = child.persistence_backlog_local().await;
+                records = records.saturating_add(child_records);
+                bytes = bytes.saturating_add(child_bytes);
+            }
+            return (records, bytes);
+        }
+        self.persistence_backlog_local().await
+    }
+
+    async fn persistence_backlog_local(&self) -> (usize, usize) {
         let flush = self.flush.lock().await;
         (flush.record_count(), flush.local_budget.used())
     }
@@ -257,8 +334,73 @@ impl FragmentState {
         fragment: FragmentId,
         publisher: Option<ExpiryPublisher>,
     ) -> Self {
-        self.expiry_publisher = publisher.map(|publisher| (fragment, publisher));
+        self.expiry_publisher = publisher.clone().map(|publisher| (fragment, publisher));
+        if self.partitioned {
+            let children = Arc::get_mut(&mut self.table_children)
+                .expect("table partitions are not concurrently shared during startup")
+                .get_mut();
+            for child in children.values_mut() {
+                let child = Arc::get_mut(child).expect("table partition is already shared");
+                child.expiry_publisher = publisher.clone().map(|publisher| (fragment, publisher));
+            }
+        }
         self
+    }
+
+    /// Enable the table-partition router for a live node fragment. Unit-level
+    /// states remain legacy-only unless explicitly promoted, preserving the
+    /// single-cache semantics used by actor tests and standalone workers.
+    pub(crate) fn enable_partitions(mut self) -> Result<Self, String> {
+        self.partitioned = true;
+        if let Some(config) = self.persistence_template.clone() {
+            let children = Arc::get_mut(&mut self.table_children)
+                .ok_or_else(|| "table partitions are already shared".to_string())?
+                .get_mut();
+            for child in children.values_mut() {
+                let child = Arc::get_mut(child)
+                    .ok_or_else(|| "table partition is already shared".to_string())?;
+                child.configure_persistence(&config)?;
+                child.persistence_template = Some(config.clone());
+            }
+        }
+        Ok(self)
+    }
+
+    async fn table_state(&self, table: &str) -> Arc<FragmentState> {
+        if let Some(state) = self.table_children.read().await.get(table).cloned() {
+            return state;
+        }
+        let mut children = self.table_children.write().await;
+        if let Some(state) = children.get(table).cloned() {
+            return state;
+        }
+        let store = self
+            .kvstore
+            .as_ref()
+            .map(|inner| Arc::new(TableStore::new(inner.clone(), table)) as Arc<dyn KvStore>);
+        let mut state = Self::new_local(
+            HashMap::new(),
+            store,
+            self.flush_batch_size,
+            self.flush_interval,
+        );
+        state.expiry_publisher = self.expiry_publisher.clone();
+        if let Some(config) = &self.persistence_template {
+            state = state
+                .with_persistence_config(config.clone())
+                .expect("validated persistence configuration");
+        }
+        let state = Arc::new(state);
+        children.insert(table.to_string(), state.clone());
+        state
+    }
+
+    async fn child_for_key(&self, key: &str) -> Option<Arc<FragmentState>> {
+        if !self.partitioned {
+            return None;
+        }
+        let table = crate::table_key::table_name(key)?;
+        Some(self.table_state(&table).await)
     }
 
     fn publish_expiry(&self, key: &str, previous_value: VersionedValue) {
@@ -306,6 +448,17 @@ impl FragmentState {
     /// arrival order. Custom writers must preserve [`VersionedValue`]'s unique
     /// version invariant.
     pub async fn apply(&self, op: &ReplicatedOp) -> Result<ApplyOutcome, ApplyError> {
+        if let Some(child) = self.child_for_key(&op.key).await {
+            let result = child.apply_local(op).await;
+            if matches!(result, Ok(ApplyOutcome::Applied | ApplyOutcome::Expired)) {
+                self.revision.fetch_add(1, Ordering::Release);
+            }
+            return result;
+        }
+        self.apply_local(op).await
+    }
+
+    async fn apply_local(&self, op: &ReplicatedOp) -> Result<ApplyOutcome, ApplyError> {
         check_versioned_value_budget(&op.key, &op.value).map_err(|error| {
             ApplyError::InvalidInput(format!(
                 "key/value cannot fit every required peer frame: {error}"
@@ -463,6 +616,18 @@ impl FragmentState {
     /// it. Writes that arrive during the store call remain pending for the
     /// next flush.
     pub async fn flush(&self) -> Result<(), ActorProcessingErr> {
+        if self.partitioned {
+            self.flush_local().await?;
+            let children = self.table_children.read().await.clone();
+            for child in children.values() {
+                child.flush_local().await?;
+            }
+            return Ok(());
+        }
+        self.flush_local().await
+    }
+
+    async fn flush_local(&self) -> Result<(), ActorProcessingErr> {
         self.flush_owned(false).await.map(|_| ())
     }
 
@@ -470,6 +635,23 @@ impl FragmentState {
     /// the same ordering guard. The accepted operation remains owned when its
     /// waiter is canceled; safe teardown still waits for backend completion.
     pub async fn flush_stable(&self) -> Result<ApplyDurability, ActorProcessingErr> {
+        if self.partitioned {
+            let mut durability = self.flush_stable_local().await?;
+            let children = self.table_children.read().await.clone();
+            for child in children.values() {
+                durability = match (durability, child.flush_stable_local().await?) {
+                    (ApplyDurability::StableCommitted, ApplyDurability::StableCommitted) => {
+                        ApplyDurability::StableCommitted
+                    }
+                    _ => ApplyDurability::StoreCommitted,
+                };
+            }
+            return Ok(durability);
+        }
+        self.flush_stable_local().await
+    }
+
+    async fn flush_stable_local(&self) -> Result<ApplyDurability, ActorProcessingErr> {
         self.flush_owned(true).await
     }
 
@@ -559,6 +741,13 @@ impl FragmentState {
 
     /// Read a key, treating expired values and tombstones as absent.
     pub async fn get(&self, key: &str) -> Option<VersionedValue> {
+        if let Some(child) = self.child_for_key(key).await {
+            return child.get_local(key).await;
+        }
+        self.get_local(key).await
+    }
+
+    async fn get_local(&self, key: &str) -> Option<VersionedValue> {
         let now = now_ms();
         self.cache
             .read()
@@ -577,6 +766,21 @@ impl FragmentState {
     /// partial results are never returned. Use key/prefix transforms for wide
     /// values. Already expired values and tombstones remain invisible.
     pub async fn scan(&self, spec: &ScanSpec) -> Result<Vec<ScanMatch>, String> {
+        if self.partitioned && matches!(spec.matcher, KeyMatcher::Prefix(_)) {
+            // A table-scoped scan carries the table namespace in its
+            // prefix. Route it to that table's independent cache/index.
+            if let KeyMatcher::Prefix(prefix) = &spec.matcher {
+                if let Ok(prefix) = std::str::from_utf8(prefix) {
+                    if let Some(table) = crate::table_key::table_name(prefix) {
+                        return self.table_state(&table).await.scan_local(spec).await;
+                    }
+                }
+            }
+        }
+        self.scan_local(spec).await
+    }
+
+    async fn scan_local(&self, spec: &ScanSpec) -> Result<Vec<ScanMatch>, String> {
         use crate::proto::{QueryPageRequest, QueryPageStatus};
         use crate::query::{cell_to_value, QueryOptions, QueryPageWork};
         use actordb_query::QueryValue;
@@ -672,6 +876,20 @@ impl FragmentState {
     /// Cursor progression includes filtered and invisible records, so sparse
     /// predicates cannot turn a page into an unbounded cache-lock pass.
     pub async fn query_page(
+        &self,
+        work: &crate::query::QueryPageWork,
+    ) -> crate::proto::QueryPageResponse {
+        if self.partitioned && !work.plan.table.eq_ignore_ascii_case("KV") {
+            return self
+                .table_state(&work.plan.table.to_ascii_uppercase())
+                .await
+                .query_page_local(work)
+                .await;
+        }
+        self.query_page_local(work).await
+    }
+
+    async fn query_page_local(
         &self,
         work: &crate::query::QueryPageWork,
     ) -> crate::proto::QueryPageResponse {
@@ -935,9 +1153,28 @@ impl FragmentState {
     /// Read a cache snapshot and its mutation revision atomically with
     /// respect to winning cache updates.
     pub async fn snapshot_with_revision(&self) -> (HashMap<String, VersionedValue>, u64) {
+        if self.partitioned {
+            let mut snapshot = self.snapshot_local().await;
+            let children = self.table_children.read().await.clone();
+            let mut revision = self.revision.load(Ordering::Acquire);
+            for child in children.values() {
+                let child_snapshot = child.snapshot_local().await;
+                let child_revision = child.revision.load(Ordering::Acquire);
+                snapshot.extend(child_snapshot);
+                revision = revision.saturating_add(child_revision);
+            }
+            return (snapshot, revision);
+        }
+        (
+            self.snapshot_local().await,
+            self.revision.load(Ordering::Acquire),
+        )
+    }
+
+    async fn snapshot_local(&self) -> HashMap<String, VersionedValue> {
         let now = now_ms();
         let cache = self.cache.read().await;
-        let snapshot = cache
+        cache
             .values
             .iter()
             .map(|(key, value)| {
@@ -948,9 +1185,7 @@ impl FragmentState {
                 };
                 (key.clone(), value)
             })
-            .collect();
-        let revision = self.revision.load(Ordering::Acquire);
-        (snapshot, revision)
+            .collect()
     }
 
     /// Read one lexicographically ordered page of version summaries.
@@ -960,6 +1195,82 @@ impl FragmentState {
     /// the revision mismatch returns an empty restart page instead of mixing
     /// two logical snapshots.
     pub async fn summary_page(
+        &self,
+        after_key: Option<&str>,
+        expected_revision: Option<u64>,
+        snapshot_time_ms: Option<u64>,
+        limit: usize,
+    ) -> SummaryPage {
+        if self.partitioned {
+            return self
+                .summary_page_partitioned(after_key, expected_revision, snapshot_time_ms, limit)
+                .await;
+        }
+        self.summary_page_local(after_key, expected_revision, snapshot_time_ms, limit)
+            .await
+    }
+
+    async fn summary_page_partitioned(
+        &self,
+        after_key: Option<&str>,
+        expected_revision: Option<u64>,
+        snapshot_time_ms: Option<u64>,
+        limit: usize,
+    ) -> SummaryPage {
+        let (snapshot, revision) = self.snapshot_with_revision().await;
+        let snapshot_time_ms = snapshot_time_ms.unwrap_or_else(now_ms);
+        if expected_revision.is_some_and(|expected| expected != revision) {
+            return SummaryPage {
+                summaries: Vec::new(),
+                revision,
+                snapshot_time_ms,
+                done: false,
+                restart: true,
+            };
+        }
+        let mut keys: Vec<_> = snapshot.keys().cloned().collect();
+        keys.sort();
+        let start = after_key
+            .map(|after| keys.partition_point(|key| key.as_str() <= after))
+            .unwrap_or(0);
+        let limit = limit.max(1);
+        let mut summaries = Vec::with_capacity(limit.min(256));
+        let mut payload_bytes = 0usize;
+        let mut done = true;
+        for key in keys.into_iter().skip(start) {
+            if summaries.len() == limit {
+                done = false;
+                break;
+            }
+            let value = &snapshot[&key];
+            let summary_bytes = key
+                .len()
+                .saturating_add(value.node_id.len())
+                .saturating_add(32);
+            if !summaries.is_empty()
+                && payload_bytes.saturating_add(summary_bytes) > SUMMARY_PAGE_TARGET_BYTES
+            {
+                done = false;
+                break;
+            }
+            summaries.push(Self::snapshot_summary(
+                &key,
+                value,
+                CachedDigests::new(value),
+                snapshot_time_ms,
+            ));
+            payload_bytes = payload_bytes.saturating_add(summary_bytes);
+        }
+        SummaryPage {
+            summaries,
+            revision,
+            snapshot_time_ms,
+            done,
+            restart: false,
+        }
+    }
+
+    async fn summary_page_local(
         &self,
         after_key: Option<&str>,
         expected_revision: Option<u64>,
@@ -1033,6 +1344,17 @@ impl FragmentState {
         key: &str,
         snapshot_time_ms: Option<u64>,
     ) -> Option<VersionedValue> {
+        if let Some(child) = self.child_for_key(key).await {
+            return child.get_versioned_local(key, snapshot_time_ms).await;
+        }
+        self.get_versioned_local(key, snapshot_time_ms).await
+    }
+
+    async fn get_versioned_local(
+        &self,
+        key: &str,
+        snapshot_time_ms: Option<u64>,
+    ) -> Option<VersionedValue> {
         let cache = self.cache.read().await;
         let snapshot_time_ms = snapshot_time_ms.unwrap_or_else(now_ms);
         cache.values.get(key).map(|value| {
@@ -1048,6 +1370,50 @@ impl FragmentState {
     /// chunk at once. Pages target 1 MiB of key/value metadata; one individually
     /// valid value may exceed that soft target but is returned alone.
     pub async fn get_versioned_page(
+        &self,
+        keys: &[String],
+        start_index: usize,
+        snapshot_time_ms: Option<u64>,
+    ) -> VersionedPage {
+        if self.partitioned {
+            let snapshot_time_ms = snapshot_time_ms.unwrap_or_else(now_ms);
+            let mut next_index = start_index.min(keys.len());
+            let mut payload_bytes = 0usize;
+            let mut entries = Vec::new();
+            let mut missing = false;
+            while let Some(key) = keys.get(next_index) {
+                let Some(value) = self.get_versioned(key, Some(snapshot_time_ms)).await else {
+                    missing = true;
+                    next_index += 1;
+                    continue;
+                };
+                let entry_bytes = key
+                    .len()
+                    .saturating_add(value.value.len())
+                    .saturating_add(value.node_id.len());
+                if !entries.is_empty()
+                    && payload_bytes.saturating_add(entry_bytes) > VERSIONED_PAGE_TARGET_BYTES
+                {
+                    break;
+                }
+                entries.push((key.clone(), value));
+                payload_bytes = payload_bytes.saturating_add(entry_bytes);
+                next_index += 1;
+                if payload_bytes > VERSIONED_PAGE_TARGET_BYTES {
+                    break;
+                }
+            }
+            return VersionedPage {
+                entries,
+                next_index,
+                missing,
+            };
+        }
+        self.get_versioned_page_local(keys, start_index, snapshot_time_ms)
+            .await
+    }
+
+    async fn get_versioned_page_local(
         &self,
         keys: &[String],
         start_index: usize,
@@ -1119,6 +1485,18 @@ impl FragmentState {
     /// taking the corresponding read lock makes this a fence against an
     /// in-progress winning mutation rather than a merely atomic observation.
     pub async fn current_revision(&self) -> u64 {
+        if self.partitioned {
+            let mut revision = self.current_revision_local().await;
+            let children = self.table_children.read().await.clone();
+            for child in children.values() {
+                revision = revision.saturating_add(child.current_revision_local().await);
+            }
+            return revision;
+        }
+        self.current_revision_local().await
+    }
+
+    async fn current_revision_local(&self) -> u64 {
         let _cache = self.cache.read().await;
         self.revision.load(Ordering::Acquire)
     }
@@ -1138,11 +1516,23 @@ impl FragmentState {
     /// the finite pass. Persistence admission failure keeps the deadline indexed
     /// and returns an error so shutdown can retry its final expiry fence.
     pub async fn expire_values(&self, now_ms: u64) -> Result<usize, ActorProcessingErr> {
+        if self.partitioned {
+            let mut converted = self.expire_values_local(now_ms).await?;
+            let children = self.table_children.read().await.clone();
+            for child in children.values() {
+                converted = converted.saturating_add(child.expire_values_local(now_ms).await?);
+            }
+            return Ok(converted);
+        }
+        self.expire_values_local(now_ms).await
+    }
+
+    async fn expire_values_local(&self, now_ms: u64) -> Result<usize, ActorProcessingErr> {
         let mut pass = ExpiryPass::new(now_ms);
         let mut converted = 0usize;
         let mut saturated = false;
         loop {
-            let page = self.expire_values_page(&mut pass).await?;
+            let page = self.expire_values_page_local(&mut pass).await?;
             converted = converted.saturating_add(page.converted);
             saturated |= page.saturated;
             if page.done {
@@ -1162,6 +1552,32 @@ impl FragmentState {
     /// record may cross the soft work-byte target. Successful conversion removes
     /// the deadline while retaining the tombstone's key/version floor forever.
     pub(crate) async fn expire_values_page(
+        &self,
+        pass: &mut ExpiryPass,
+    ) -> Result<ExpiryPage, ActorProcessingErr> {
+        if self.partitioned {
+            let page = self.expire_values_page_local(pass).await?;
+            if page.done {
+                let children = self.table_children.read().await.clone();
+                let mut converted = page.converted;
+                for child in children.values() {
+                    converted =
+                        converted.saturating_add(child.expire_values_local(now_ms()).await?);
+                }
+                return Ok(ExpiryPage {
+                    converted,
+                    visited: page.visited,
+                    work_bytes: page.work_bytes,
+                    done: true,
+                    saturated: page.saturated,
+                });
+            }
+            return Ok(page);
+        }
+        self.expire_values_page_local(pass).await
+    }
+
+    async fn expire_values_page_local(
         &self,
         pass: &mut ExpiryPass,
     ) -> Result<ExpiryPage, ActorProcessingErr> {

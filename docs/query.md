@@ -35,7 +35,9 @@ Use one `SELECT` statement with:
   `OCTET_LENGTH(value)` or `CAST(value AS BIGINT)`.
 
 Joins, subqueries, unions, multiple statements, grouping, and user-defined
-functions are unsupported. Aggregate and ordinary row projections cannot be
+functions are unsupported. Named tables are co-partitioned by their user key,
+which is the storage prerequisite for a future local key-join implementation,
+but SQL join planning is not enabled yet. Aggregate and ordinary row projections cannot be
 mixed. Aggregate queries reject row pagination clauses. `LIMIT 0` returns
 zero rows, unlike the legacy scan default-limit convention.
 

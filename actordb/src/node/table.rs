@@ -1,11 +1,10 @@
 //! Logical table views over one node.
 //!
 //! A table view keeps the existing node, peer listener, and replication
-//! channels. Its keys are encoded into a reserved, deterministic namespace so
-//! the ordinary fragment actors and replication protocol can carry records for
-//! multiple tables without opening another socket. This is the first 0.8
-//! namespace layer; the wire protocol will grow an explicit table identity in
-//! the follow-up protocol PR.
+//! channels while using an independent per-table fragment cache and durable
+//! store partition. Physical replication keys retain a deterministic table
+//! namespace, but fragment routing hashes only the user key so equal join keys
+//! co-partition across tables.
 
 use std::time::Duration;
 
@@ -15,8 +14,6 @@ use super::{Node, NodeError};
 use crate::actor::{KeyMatcher, OpPriority, ScanMatch, ScanSpec, VersionedValue};
 use crate::query::QueryExecutionError;
 use crate::write_concern::{WriteConcernError, WriteConcernOptions, WriteConcernReceipt};
-
-const TABLE_PREFIX_MARKER: &str = "\u{001e}actordb.table.v1:";
 
 /// Stable logical table identity.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -47,25 +44,20 @@ impl TableId {
     }
 
     fn key_prefix(&self) -> String {
-        format!("{TABLE_PREFIX_MARKER}{}:", hex(self.0.as_bytes()))
+        crate::table_key::table_prefix(self.name())
     }
 
     fn encode_key(&self, key: &str) -> String {
-        format!("{}{}", self.key_prefix(), hex(key.as_bytes()))
+        crate::table_key::encode_table_key(self.name(), key)
     }
 
     fn encode_prefix(&self, prefix: &[u8]) -> Vec<u8> {
-        format!("{}{}", self.key_prefix(), hex(prefix)).into_bytes()
+        crate::table_key::encode_table_prefix(self.name(), prefix)
     }
 
     fn decode_key(&self, key: &str) -> Result<String, QueryExecutionError> {
-        let prefix = self.key_prefix();
-        let encoded = key
-            .strip_prefix(&prefix)
-            .ok_or_else(|| QueryExecutionError::Protocol("table key namespace mismatch".into()))?;
-        let bytes = decode_hex(encoded).map_err(QueryExecutionError::Protocol)?;
-        String::from_utf8(bytes)
-            .map_err(|_| QueryExecutionError::Protocol("table key is not UTF-8".into()))
+        crate::table_key::decode_table_key(self.name(), key)
+            .ok_or_else(|| QueryExecutionError::Protocol("table key namespace mismatch".into()))
     }
 }
 
@@ -314,46 +306,11 @@ impl<'a> Table<'a> {
 }
 
 impl Node {
-    /// Open a logical table view over this node. All table views share this
-    /// node's listener, peer connections, budgets, and durable backend.
+    /// Open a logical table view over this node. Table views share this node's
+    /// listener, peer connections, and placement map, but use independent
+    /// per-table cache/flush/iteration partitions over the backend.
     pub fn table(&self, name: impl Into<String>) -> Result<Table<'_>, NodeError> {
         Ok(Table::new(self, TableId::new(name)?))
-    }
-}
-
-fn hex(bytes: &[u8]) -> String {
-    const DIGITS: &[u8; 16] = b"0123456789abcdef";
-    let mut output = String::with_capacity(bytes.len().saturating_mul(2));
-    for byte in bytes {
-        output.push(DIGITS[(byte >> 4) as usize] as char);
-        output.push(DIGITS[(byte & 0x0f) as usize] as char);
-    }
-    output
-}
-
-fn decode_hex(encoded: &str) -> Result<Vec<u8>, String> {
-    let bytes = encoded.as_bytes();
-    if !bytes.len().is_multiple_of(2) {
-        return Err("table key namespace has odd-length hex".into());
-    }
-    bytes
-        .as_chunks::<2>()
-        .0
-        .iter()
-        .map(|pair| {
-            let high = hex_digit(pair[0])?;
-            let low = hex_digit(pair[1])?;
-            Ok((high << 4) | low)
-        })
-        .collect()
-}
-
-fn hex_digit(byte: u8) -> Result<u8, String> {
-    match byte {
-        b'0'..=b'9' => Ok(byte - b'0'),
-        b'a'..=b'f' => Ok(byte - b'a' + 10),
-        b'A'..=b'F' => Ok(byte - b'A' + 10),
-        _ => Err("table key namespace has invalid hex".into()),
     }
 }
 
