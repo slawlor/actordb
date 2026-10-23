@@ -102,12 +102,13 @@ async fn table_partitions_reload_from_disjoint_durable_prefixes() {
         .unwrap();
     node.shutdown().await.unwrap();
 
-    let records = store.records.lock().unwrap();
-    assert_eq!(records.len(), 2);
-    assert!(records
-        .keys()
-        .all(|key| key[4..].starts_with(b"\x1dactordb.table.store.v1:")));
-    drop(records);
+    {
+        let records = store.records.lock().unwrap();
+        assert_eq!(records.len(), 2);
+        assert!(records
+            .keys()
+            .all(|key| key[4..].starts_with(b"\x1dactordb.table.store.v1:")));
+    }
 
     let mut config = NodeConfig::default();
     config.store = Some(store);
