@@ -60,6 +60,9 @@ pub mod ttl_expiry;
 /// chunked bootstrap, and controller-sequenced migration.
 pub mod placement;
 
+/// Async configuration-provider boundary with an optional TOML adapter.
+pub mod configuration;
+
 mod retained;
 mod runtime_tasks;
 pub(crate) mod table_key;

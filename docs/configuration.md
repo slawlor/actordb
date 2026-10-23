@@ -9,6 +9,55 @@ the defaults using synchronous WAL commits. Use
 `NodeConfig::with_rocksdb_options(path, RocksDbOptions)` for an explicit
 durability or one-time legacy-manifest adoption policy.
 
+## Async configuration providers
+
+`ConfigurationProvider` is the format-independent startup boundary. Its
+`async fn resolve` can return a static `NodeConfig` or retrieve live values
+from a configuration service without blocking the runtime. Resolve it through
+`Node::start_with_provider`; the provider is read once before sockets or
+actors are created.
+
+```rust,ignore
+use actordb::configuration::{ConfigurationError, ConfigurationProvider};
+use actordb::node::{Node, NodeConfig};
+
+struct ControlPlane;
+impl ConfigurationProvider for ControlPlane {
+    async fn resolve(&self) -> Result<NodeConfig, ConfigurationError> {
+        // Fetch and validate the current value from your control plane.
+        Ok(NodeConfig::default())
+    }
+}
+
+let provider = ControlPlane;
+let node = Node::start_with_provider("node-a".into(), addr, &provider).await?;
+```
+
+The optional `actordb/toml` feature provides `TomlConfigProvider`, which reads
+`actordb.toml` with `TomlConfigProvider::default_path()` or a caller-selected
+path with `from_path`. It overlays scalar `NodeConfig` settings while stores,
+networks, callbacks, secrets, and other runtime-owned dependencies remain
+programmatic:
+
+```toml
+fragment_count = 4
+flush_interval_ms = 250
+
+[default_pool]
+workers = 7
+queue_cap = 10000
+
+[replication]
+batch_size = 200
+batch_interval_ms = 100
+
+[members]
+node-b = "127.0.0.1:7447"
+```
+
+The TOML adapter is intentionally static; implement `ConfigurationProvider`
+directly when configuration must be fetched or refreshed dynamically.
+
 The independent `memory` feature only exposes the no-op `MemoryStore` test
 double, not an in-memory database backend or durable storage. Custom `KvStore`
 implementations and the `PrefixedStore` wrapper remain available without
