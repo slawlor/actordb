@@ -44,6 +44,18 @@ does not upload anything. GitHub prereleases are intentionally excluded.
    and full-feature tests, Rust 1.88, Docker, and the `Verify release package`
    check. Merge into `main`.
 
+## API stability boundary
+
+The documented high-level APIs are the supported `actordb` surface. Before
+1.0, a breaking Rust API or wire-protocol change requires a new minor version;
+patch releases contain compatible fixes and documentation changes.
+
+The raw generated `actordb::proto` compatibility module is hidden from
+generated documentation and is not a supported application API. The public
+wire-schema boundary is the standalone `actordb-protocol` crate, which carries
+the committed Prost bindings and protocol constants used by compatible peers
+and SDKs.
+
 The package workflow uploads an `actordb-workspace-VERSION` artifact containing
 the verified library `.crate` files for inspection. An explicit, verified `cargo package` produces
 the artifact under `$package_target_dir/package`: recent Cargo versions stage

@@ -10,6 +10,9 @@
   multi-table rollout.
 - SQL now names its relation explicitly (`FROM users`), and named table
   handles reject mismatched SQL.
+- Hide the raw generated `actordb::proto` compatibility module from generated
+  documentation and establish `actordb-protocol` as the supported wire-schema
+  boundary.
 
 ## 0.7.1
 

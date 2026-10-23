@@ -3,8 +3,11 @@
 // This source code is licensed under both the MIT license found in the
 // LICENSE-MIT file in the root directory of this source tree.
 
-//! Protobuf specifications for over-the-wire intercommuncation
-//! between nodes. Generated via [prost]
+//! Raw generated protobuf specifications for over-the-wire communication.
+//!
+//! This compatibility module is intentionally hidden from generated
+//! documentation. The supported schema surface is the `actordb-protocol`
+//! crate; application code should use the high-level `actordb` APIs.
 
 /// Meta types which include all base network protocol message types
 pub mod meta {

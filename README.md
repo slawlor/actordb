@@ -514,7 +514,7 @@ controller.set_placement(final_map);
 - Assumes the peer mesh is established (`members` or manual
   `connect()`); the driver does not dial.
 
-### `actordb::proto` — wire protocol
+### `actordb::proto` — hidden wire compatibility module
 
 Prost-generated protobuf types (`Envelope`, `Hello`, `HelloAuth`, `ReplicateOp`,
 `ForwardedPut`, `ForwardedGet`, `GetResponse`, `ReconcileRequest`,
@@ -522,8 +522,12 @@ Prost-generated protobuf types (`Envelope`, `Hello`, `HelloAuth`, `ReplicateOp`,
 `BatchGet`, `BatchGetResponse`, `MutationResponse`, `BatchAck`, `BatchNack`),
 sent as 4-byte length-prefixed frames over TCP. `SyncRequest` and `SyncResponse`
 remain generated for source compatibility but are retired; a negotiated v3
-peer that sends either is rejected. These types are mostly of interest when
-implementing a compatible peer.
+peer that sends either is rejected. These bindings are hidden from generated
+`actordb` documentation and retained only for protocol and integration-test
+compatibility. They are not a supported application API. For
+language-independent wire bindings, depend directly on the
+[`actordb-protocol`](actordb-protocol/README.md) crate; ordinary applications
+should use the high-level node and client APIs.
 
 ### Current limitations
 
@@ -604,7 +608,7 @@ as issues in the [issue tracker](https://github.com/slawlor/actordb/issues):
   binaries missing either contract are rejected. It is
   incompatible with v2, so deploy compatible binaries together rather than
   performing a mixed v2/v3 rolling upgrade. This transition is also a Rust
-  source break for advanced users of the public generated `actordb::proto` API
+  source break for callers of the hidden generated `actordb::proto` compatibility API
   and the public `replication::SenderMsg`: reconciliation messages gained
   cursor, revision, page, and completion fields, so struct literals and
   exhaustive assumptions must be updated.
