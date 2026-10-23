@@ -82,6 +82,14 @@ pub(crate) fn strip_storage_prefix(key: &[u8]) -> Option<Vec<u8>> {
 /// Hash table records by the unqualified user key so equal join keys
 /// co-partition even though their physical storage namespaces differ.
 pub(crate) fn routing_hash(key: &str) -> u64 {
+    // Durable table stores add a binary-safe physical prefix after the
+    // fragment prefix. RocksDB validates that physical key by asking for its
+    // routing fragment, so hash the logical table key rather than the storage
+    // partition marker.
+    let key = key
+        .strip_prefix(TABLE_STORAGE_MARKER)
+        .and_then(|remainder| remainder.split_once(':').map(|(_, logical)| logical))
+        .unwrap_or(key);
     let bytes = if let Some(name) = table_name(key) {
         let prefix = table_prefix(&name);
         key.strip_prefix(&prefix)
@@ -101,5 +109,16 @@ mod tests {
     fn table_name_round_trips_encoded_key() {
         let key = encode_table_key("KV", "ephemeral");
         assert_eq!(table_name(&key).as_deref(), Some("KV"));
+    }
+
+    #[test]
+    fn durable_table_key_routes_like_its_logical_key() {
+        let logical = encode_table_key("KV", "durable");
+        let physical = format!(
+            "{}{}",
+            String::from_utf8(table_storage_prefix("KV")).unwrap(),
+            logical
+        );
+        assert_eq!(routing_hash(&logical), routing_hash(&physical));
     }
 }
