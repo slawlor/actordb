@@ -333,15 +333,17 @@ fn hex(bytes: &[u8]) -> String {
 
 fn decode_hex(encoded: &str) -> Result<Vec<u8>, String> {
     let bytes = encoded.as_bytes();
-    if bytes.len() % 2 != 0 {
+    if !bytes.len().is_multiple_of(2) {
         return Err("table key namespace has odd-length hex".into());
     }
     bytes
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| {
             let high = hex_digit(pair[0])?;
             let low = hex_digit(pair[1])?;
-            Ok(((high << 4) | low) as u8)
+            Ok((high << 4) | low)
         })
         .collect()
 }
@@ -373,7 +375,7 @@ mod tests {
     #[test]
     fn table_prefix_encoding_preserves_binary_prefix_matching() {
         let table = TableId::new("binary").unwrap();
-        let encoded = table.encode_prefix(&[0, 0xff]);
+        let encoded = table.encode_prefix("\0\u{ff}".as_bytes());
         assert!(table
             .encode_key("\0\u{ff}")
             .as_bytes()

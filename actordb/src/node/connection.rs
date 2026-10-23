@@ -3532,15 +3532,15 @@ mod tests {
         };
         assert_eq!(
             hex(&authenticated),
-            "c8481f4b79b30974a6593ea01a69abe9c06cf2612456898d08361d612e14ad1f"
+            "c7814c60b1eb8fd3506cb944b143b2670e89df06c0aaffed72fa094136c4f753"
         );
         assert_eq!(
             hex(&handshake_auth_tag(b"secret", false, &dialer, &listener)),
-            "caebe45abdee3c01b2f91d9b572d014bf7179368e5ebe5a66dc3a8a1bd162b4c"
+            "e086e2e89582a35687e688ac90359ab853127b60fc870b3384c325600f08513a"
         );
         assert_eq!(
             hex(&connection_rank(&dialer, &listener).transcript_id),
-            "51fb4b81d53d2ea3fec5121c3ac214123af25fab134cc4b50013b28cfbf39d5e"
+            "aedafa6cf5d455e9979aaafc83a80ce5a402aad2c3e101c7314943898d5d7039"
         );
         assert!(verify_handshake_auth(
             Some(b"secret"),
