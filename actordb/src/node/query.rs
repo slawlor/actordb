@@ -112,7 +112,7 @@ impl Node {
     }
     /// Execute a validated structured query plan using default limits.
     pub async fn query_plan(&self, plan: &QueryPlan) -> Result<QueryResult, QueryExecutionError> {
-        if plan.table != "KV" {
+        if !plan.table.eq_ignore_ascii_case("KV") {
             return Err(QueryExecutionError::InvalidQuery(
                 "Node::query_plan targets the legacy unnamed KV table; use Node::table for named tables"
                     .into(),

@@ -279,13 +279,14 @@ impl<'a> Table<'a> {
 
     fn namespace_plan(&self, plan: &QueryPlan) -> Result<QueryPlan, QueryExecutionError> {
         let mut scoped = plan.clone();
-        if scoped.table != self.id.name() {
+        if !scoped.table.eq_ignore_ascii_case(self.id.name()) {
             return Err(QueryExecutionError::InvalidQuery(format!(
                 "SQL table {} does not match table handle {}",
                 scoped.table,
                 self.id.name()
             )));
         }
+        scoped.table = self.id.name().into();
         scoped.predicates = plan
             .predicates
             .iter()
