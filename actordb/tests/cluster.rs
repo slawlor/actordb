@@ -2773,6 +2773,7 @@ async fn bidirectional_large_reconciliation_keeps_connection_reader_live() {
     const VALUE_BYTES: usize = 8 * 1024 * 1024;
     const MIN_WRITER_BYTES: usize = 32 * 1024 * 1024;
     const FRAGMENT_COUNT: usize = 10;
+    const RECONCILE_TIMEOUT: Duration = Duration::from_secs(20);
 
     fn key_for_fragment(prefix: &str, fragment: FragmentId) -> String {
         for nonce in 0u64.. {
@@ -2836,11 +2837,11 @@ async fn bidirectional_large_reconciliation_keeps_connection_reader_live() {
         .collect();
     let replication = SenderConfig::builder()
         .consistency_interval(Duration::from_secs(3600))
-        .reconcile_timeout(Duration::from_secs(20))
+        .reconcile_timeout(RECONCILE_TIMEOUT)
         .build();
     let runtime = NodeRuntimeOptions::default()
         .with_peer_queue_byte_capacity(MIN_WRITER_BYTES)
-        .with_reconcile_data_admission_timeout(Duration::from_secs(20));
+        .with_reconcile_data_admission_timeout(RECONCILE_TIMEOUT);
 
     let a = Node::start_with_options(
         "large-a".to_string(),
@@ -2889,7 +2890,10 @@ async fn bidirectional_large_reconciliation_keeps_connection_reader_live() {
             }
             true
         },
-        Duration::from_secs(10),
+        // Reconciliation itself may use the full configured timeout under
+        // CI contention; keep a separate grace period for startup and report
+        // publication rather than failing before the protocol can time out.
+        RECONCILE_TIMEOUT + Duration::from_secs(10),
     )
     .await;
 
