@@ -24,6 +24,9 @@ TTL and priority options, value version/expiry metadata, bounded distributed
 scans, SQL queries with typed positional parameters, and local node health and
 placement inspection. SQL is the ActorDB key/value dialect, not arbitrary SQL.
 `ScanOptions` and `ScanMatch` are reexported for callers using the scan API.
+Set `ClientOptions::table` (or use the Bon builder) to bind requests to a
+named logical table. Table clients reuse the same application listener and
+isolate keys and SQL results from the legacy unnamed keyspace.
 Inspection describes the contacted node; it is not a readiness or durability
 check. Batches are individual operations, not transactions.
 

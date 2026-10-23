@@ -52,6 +52,9 @@ message Request {
     Inspect inspect = 8;
     Scan scan = 9;
   }
+  // Empty selects the legacy unnamed keyspace. Named tables are logical
+  // namespaces hosted by the same node and peer listener.
+  string table = 10;
 }
 enum ErrorCode {
   ERROR_CODE_UNKNOWN = 0;

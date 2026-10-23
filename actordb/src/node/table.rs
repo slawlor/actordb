@@ -14,6 +14,7 @@ use actordb_query::{KeyPredicate, Projection, QueryPlan, QueryValue};
 use super::{Node, NodeError};
 use crate::actor::{KeyMatcher, OpPriority, ScanMatch, ScanSpec, VersionedValue};
 use crate::query::QueryExecutionError;
+use crate::write_concern::{WriteConcernError, WriteConcernOptions, WriteConcernReceipt};
 
 const TABLE_PREFIX_MARKER: &str = "\u{001e}actordb.table.v1:";
 
@@ -97,24 +98,89 @@ impl<'a> Table<'a> {
             .await
     }
 
+    /// Write with a replicated acknowledgement policy.
+    pub async fn put_with_write_concern_options(
+        &self,
+        key: impl Into<String>,
+        value: Vec<u8>,
+        ttl: Option<Duration>,
+        priority: OpPriority,
+        options: WriteConcernOptions,
+    ) -> Result<WriteConcernReceipt, WriteConcernError> {
+        self.node
+            .put_with_write_concern_options(
+                self.id.encode_key(&key.into()),
+                value,
+                ttl,
+                priority,
+                options,
+            )
+            .await
+    }
+
     /// Delete a key from this table.
     pub async fn delete(&self, key: impl Into<String>) -> Result<(), NodeError> {
-        self.node.delete(self.id.encode_key(&key.into())).await
+        self.delete_with_priority(key, OpPriority::Default).await
+    }
+
+    /// Delete at an explicit scheduling priority.
+    pub async fn delete_with_priority(
+        &self,
+        key: impl Into<String>,
+        priority: OpPriority,
+    ) -> Result<(), NodeError> {
+        self.node
+            .delete_with_priority(self.id.encode_key(&key.into()), priority)
+            .await
+    }
+
+    /// Delete with a replicated acknowledgement policy.
+    pub async fn delete_with_write_concern_options(
+        &self,
+        key: impl Into<String>,
+        priority: OpPriority,
+        options: WriteConcernOptions,
+    ) -> Result<WriteConcernReceipt, WriteConcernError> {
+        self.node
+            .delete_with_write_concern_options(self.id.encode_key(&key.into()), priority, options)
+            .await
     }
 
     /// Read a key from this table.
     pub async fn get(&self, key: impl Into<String>) -> Result<Option<VersionedValue>, NodeError> {
-        self.node.get(self.id.encode_key(&key.into())).await
+        self.get_with_priority(key, OpPriority::Default).await
+    }
+
+    /// Read at an explicit scheduling priority.
+    pub async fn get_with_priority(
+        &self,
+        key: impl Into<String>,
+        priority: OpPriority,
+    ) -> Result<Option<VersionedValue>, NodeError> {
+        self.node
+            .get_with_priority(self.id.encode_key(&key.into()), priority)
+            .await
     }
 
     /// Apply multiple writes while retaining input order in the result.
     pub async fn put_multi(&self, values: Vec<(String, Vec<u8>)>) -> Vec<Result<(), NodeError>> {
+        self.put_multi_with_priority(values, OpPriority::Background)
+            .await
+    }
+
+    /// Apply multiple writes at an explicit scheduling priority.
+    pub async fn put_multi_with_priority(
+        &self,
+        values: Vec<(String, Vec<u8>)>,
+        priority: OpPriority,
+    ) -> Vec<Result<(), NodeError>> {
         self.node
-            .put_multi(
+            .put_multi_with_priority(
                 values
                     .into_iter()
                     .map(|(key, value)| (self.id.encode_key(&key), value))
                     .collect(),
+                priority,
             )
             .await
     }
@@ -124,11 +190,22 @@ impl<'a> Table<'a> {
         &self,
         keys: Vec<String>,
     ) -> Vec<Result<Option<VersionedValue>, NodeError>> {
+        self.get_multi_with_priority(keys, OpPriority::Background)
+            .await
+    }
+
+    /// Read multiple keys at an explicit scheduling priority.
+    pub async fn get_multi_with_priority(
+        &self,
+        keys: Vec<String>,
+        priority: OpPriority,
+    ) -> Vec<Result<Option<VersionedValue>, NodeError>> {
         self.node
-            .get_multi(
+            .get_multi_with_priority(
                 keys.into_iter()
                     .map(|key| self.id.encode_key(&key))
                     .collect(),
+                priority,
             )
             .await
     }

@@ -33,6 +33,13 @@ Optional fields also provide `maybe_credential(Option<Vec<u8>>)` and
 `maybe_ttl(Option<Duration>)` setters. For incremental configuration, start with
 `ClientOptions::default()` or `PutOptions::default()` and assign public fields.
 
+In 0.8.0, set `ClientOptions::table` to bind one application connection to a
+named logical table. Leave it empty for the legacy unnamed keyspace:
+
+```rust,ignore
+let users = ClientOptions::builder().table("users").build();
+```
+
 Connection validation still occurs at `connect`/`from_stream`: identities,
 credentials, timeouts, and queue capacities retain their existing constraints.
 The request timeout remains the default total graceful close budget;

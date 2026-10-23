@@ -55,6 +55,10 @@ pub struct ClientOptions {
     /// Application authentication identity, 1 to 255 UTF-8 bytes.
     #[builder(default = "rust-client".to_string(), into)]
     pub identity: String,
+    /// Logical table selected for requests. Empty preserves the legacy
+    /// unnamed keyspace; named tables share the same application connection.
+    #[builder(default, into)]
+    pub table: String,
     /// Optional application credential, independent of the peer cluster secret.
     pub credential: Option<Vec<u8>>,
     /// Total request/authentication deadline and default graceful close budget.
@@ -174,6 +178,7 @@ impl Client {
     fn validate_options(options: &ClientOptions) -> Result<Instant, ClientError> {
         if options.identity.is_empty()
             || options.identity.len() > 255
+            || options.table.len() > 255
             || options.timeout.is_zero()
             || options.max_queued_requests == 0
             || options.max_queued_requests > Semaphore::MAX_PERMITS
@@ -308,6 +313,7 @@ impl Client {
             message: Some(wire::frame::Message::Request(wire::Request {
                 id,
                 operation: Some(operation),
+                table: self.inner.options.table.clone(),
             })),
         };
         let length = frame.encoded_len();

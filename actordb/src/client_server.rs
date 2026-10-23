@@ -8,7 +8,7 @@
 
 use crate::actor::{OpPriority, VersionedValue};
 use crate::network::{Acceptor, BoxStream, Network};
-use crate::node::{Node, NodeError};
+use crate::node::{Node, NodeError, Table};
 use actordb_protocol::{
     client as wire, CLIENT_CAPABILITIES, CLIENT_PROTOCOL_VERSION, MAX_FRAME_BYTES,
 };
@@ -416,11 +416,127 @@ fn response_counts_valid(response: &wire::Response) -> bool {
         })
 }
 
+enum DispatchTarget<'a> {
+    Legacy(&'a Node),
+    Table(Table<'a>),
+}
+
+impl DispatchTarget<'_> {
+    async fn get(
+        &self,
+        key: String,
+        priority: crate::actor::OpPriority,
+    ) -> Result<Option<VersionedValue>, NodeError> {
+        match self {
+            Self::Legacy(node) => node.get_with_priority(key, priority).await,
+            Self::Table(table) => table.get_with_priority(key, priority).await,
+        }
+    }
+
+    async fn put(
+        &self,
+        key: String,
+        value: Vec<u8>,
+        ttl: Option<Duration>,
+        priority: crate::actor::OpPriority,
+    ) -> Result<(), NodeError> {
+        match self {
+            Self::Legacy(node) => node.put_with_options(key, value, ttl, priority).await,
+            Self::Table(table) => table.put_with_options(key, value, ttl, priority).await,
+        }
+    }
+
+    async fn put_with_concern(
+        &self,
+        key: String,
+        value: Vec<u8>,
+        ttl: Option<Duration>,
+        priority: crate::actor::OpPriority,
+        options: crate::write_concern::WriteConcernOptions,
+    ) -> Result<crate::write_concern::WriteConcernReceipt, crate::write_concern::WriteConcernError>
+    {
+        match self {
+            Self::Legacy(node) => {
+                node.put_with_write_concern_options(key, value, ttl, priority, options)
+                    .await
+            }
+            Self::Table(table) => {
+                table
+                    .put_with_write_concern_options(key, value, ttl, priority, options)
+                    .await
+            }
+        }
+    }
+
+    async fn delete(
+        &self,
+        key: String,
+        priority: crate::actor::OpPriority,
+    ) -> Result<(), NodeError> {
+        match self {
+            Self::Legacy(node) => node.delete_with_priority(key, priority).await,
+            Self::Table(table) => table.delete_with_priority(key, priority).await,
+        }
+    }
+
+    async fn delete_with_concern(
+        &self,
+        key: String,
+        priority: crate::actor::OpPriority,
+        options: crate::write_concern::WriteConcernOptions,
+    ) -> Result<crate::write_concern::WriteConcernReceipt, crate::write_concern::WriteConcernError>
+    {
+        match self {
+            Self::Legacy(node) => {
+                node.delete_with_write_concern_options(key, priority, options)
+                    .await
+            }
+            Self::Table(table) => {
+                table
+                    .delete_with_write_concern_options(key, priority, options)
+                    .await
+            }
+        }
+    }
+
+    async fn query(
+        &self,
+        sql: &str,
+        params: &[actordb_query::QueryValue],
+    ) -> Result<actordb_query::QueryResult, crate::query::QueryExecutionError> {
+        match self {
+            Self::Legacy(node) => node.query_with_params(sql, params).await,
+            Self::Table(table) => table.query_with_params(sql, params).await,
+        }
+    }
+
+    async fn scan(
+        &self,
+        spec: &crate::actor::ScanSpec,
+    ) -> Result<Vec<crate::actor::ScanMatch>, crate::node::ScanError> {
+        match self {
+            Self::Legacy(node) => node.scan(spec).await,
+            Self::Table(table) => table.scan(spec).await,
+        }
+    }
+}
+
 async fn dispatch(node: &Node, request: wire::Request) -> wire::Response {
     use wire::request::Operation;
     let mut response = wire::Response {
         id: request.id,
         ..Default::default()
+    };
+    let target = if request.table.is_empty() {
+        DispatchTarget::Legacy(node)
+    } else {
+        match node.table(request.table.clone()) {
+            Ok(table) => DispatchTarget::Table(table),
+            Err(failure) => {
+                response.error = Some(error(wire::ErrorCode::Invalid, &failure.to_string()));
+                return response;
+            }
+        }
     };
     let priority_is_valid = match &request.operation {
         Some(wire::request::Operation::Get(get)) => {
@@ -450,23 +566,22 @@ async fn dispatch(node: &Node, request: wire::Request) -> wire::Response {
     }
     match request.operation {
         Some(Operation::Get(get)) => {
-            let result = node
-                .get_with_priority(get.key.clone(), priority(get.priority))
-                .await;
+            let result = target.get(get.key.clone(), priority(get.priority)).await;
             response.reads.push(read_result(get.key, result));
         }
         Some(Operation::Put(put)) => {
             if let Some(encoded) = put.write_concern.as_deref() {
                 let result = match crate::write_concern::WriteConcernOptions::decode(encoded) {
                     Ok(options) => {
-                        node.put_with_write_concern_options(
-                            put.key.clone(),
-                            put.value,
-                            put.ttl_ms.map(Duration::from_millis),
-                            priority(put.priority),
-                            options,
-                        )
-                        .await
+                        target
+                            .put_with_concern(
+                                put.key.clone(),
+                                put.value,
+                                put.ttl_ms.map(Duration::from_millis),
+                                priority(put.priority),
+                                options,
+                            )
+                            .await
                     }
                     Err(error) => Err(error.into()),
                 };
@@ -475,8 +590,8 @@ async fn dispatch(node: &Node, request: wire::Request) -> wire::Response {
                     .push(concern_mutation_result(put.key, result));
                 return response;
             }
-            let result = node
-                .put_with_options(
+            let result = target
+                .put(
                     put.key.clone(),
                     put.value,
                     put.ttl_ms.map(Duration::from_millis),
@@ -489,12 +604,13 @@ async fn dispatch(node: &Node, request: wire::Request) -> wire::Response {
             if let Some(encoded) = delete.write_concern.as_deref() {
                 let result = match crate::write_concern::WriteConcernOptions::decode(encoded) {
                     Ok(options) => {
-                        node.delete_with_write_concern_options(
-                            delete.key.clone(),
-                            priority(delete.priority),
-                            options,
-                        )
-                        .await
+                        target
+                            .delete_with_concern(
+                                delete.key.clone(),
+                                priority(delete.priority),
+                                options,
+                            )
+                            .await
                     }
                     Err(error) => Err(error.into()),
                 };
@@ -503,8 +619,8 @@ async fn dispatch(node: &Node, request: wire::Request) -> wire::Response {
                     .push(concern_mutation_result(delete.key, result));
                 return response;
             }
-            let result = node
-                .delete_with_priority(delete.key.clone(), priority(delete.priority))
+            let result = target
+                .delete(delete.key.clone(), priority(delete.priority))
                 .await;
             response.mutations.push(mutation_result(delete.key, result));
         }
@@ -513,9 +629,7 @@ async fn dispatch(node: &Node, request: wire::Request) -> wire::Response {
                 response.error = Some(error(wire::ErrorCode::ResourceLimit, "too many batch keys"));
             } else {
                 for key in batch.keys {
-                    let result = node
-                        .get_with_priority(key.clone(), priority(batch.priority))
-                        .await;
+                    let result = target.get(key.clone(), priority(batch.priority)).await;
                     response.reads.push(read_result(key, result));
                     if response.encoded_len() + 16 > MAX_FRAME_BYTES {
                         response.reads.clear();
@@ -542,8 +656,8 @@ async fn dispatch(node: &Node, request: wire::Request) -> wire::Response {
                 // Apply in input order, retaining duplicate positions. The batch
                 // is not a transaction: results describe each individual write.
                 for put in batch.puts {
-                    let result = node
-                        .put_with_options(
+                    let result = target
+                        .put(
                             put.key.clone(),
                             put.value,
                             put.ttl_ms.map(Duration::from_millis),
@@ -562,7 +676,7 @@ async fn dispatch(node: &Node, request: wire::Request) -> wire::Response {
                 .collect::<Result<Vec<_>, _>>();
             match params {
                 Err(message) => response.error = Some(error(wire::ErrorCode::Invalid, message)),
-                Ok(params) => match node.query_with_params(&query.sql, &params).await {
+                Ok(params) => match target.query(&query.sql, &params).await {
                     Ok(result) => {
                         response.query = Some(wire::QueryResult {
                             columns: result.columns,
@@ -650,11 +764,14 @@ async fn dispatch(node: &Node, request: wire::Request) -> wire::Response {
             };
             match crate::actor::ScanSpec::from_scan_request(&request) {
                 Err(message) => response.error = Some(error(wire::ErrorCode::Invalid, &message)),
-                Ok(spec) => match node.scan_bounded(&spec).await {
+                Ok(spec) => match target.scan(&spec).await {
                     Ok(matches) => {
                         response.scans = matches.into_iter().map(|item| item.to_proto()).collect()
                     }
-                    Err(failure) => response.error = Some(query_error(failure)),
+                    Err(failure) => {
+                        response.error =
+                            Some(error(wire::ErrorCode::Unavailable, &failure.to_string()))
+                    }
                 },
             }
         }
