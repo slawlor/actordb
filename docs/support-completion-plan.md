@@ -1,50 +1,40 @@
-# Full support API completion
+# Support completion gates
 
-The first stage merged in PRs #137 and #138. The requested scope is all six
-support feature contracts; those initial merges were not full completion.
-Release target: **0.9.0**, due to public protocol/actor schema additions and
-configured persistence becoming the default request-drain boundary.
+The full six-contract scope follows the initial PRs #137 and #138. Release
+target **0.9.0** accounts for public protocol/actor changes and the configured
+local persistence drain default. Three isolated implementation streams supplied
+peer security, checkpoint/membership and write certificates; integration also
+completed lifecycle, scoped observations and durable draining.
 
-## Active work and integration ownership
+## Implemented acceptance coverage
 
-- Root branch `feat/complete-support-090`: #130 durable draining/acceptance
-  coverage, #131 complete metrics, #132 lifecycle/status, release integration.
-- Peer agent: #133, `/tmp/actordb-peer-fencing.j3YzgV`, branch
-  `feat/peer-epoch-fencing-090`. Ed25519 process signing credentials and
-  public verifier registry; hot change waits retained old frame/storage leases.
-- Checkpoint agent: #134, `/tmp/actordb-checkpoints.oQk2dY`, branch
-  `feat/stable-checkpoints-090`. Frozen bounded store snapshot and durable
-  resumable import metadata; exact source/target/authority transition receipts.
-- Evidence agent: #135, `/tmp/actordb-durability-evidence.JTLKuN`, branch
-  `feat/durability-evidence-090`. Actual local and remote durability evidence,
-  frozen replica sets, certified mutation floor and timeout/failure receipts.
+- [x] Real persistence blocking and failure, cancellation-safe fence tickets,
+  exact retry, SDK admission races, queued/cancelled reads/writes, forwarded and
+  client response ownership, concurrent/repeated shutdown and store binding.
+- [x] Typed node/table/fragment/peer observations, bounded detailed pool/worker
+  metrics, actual storage/concern/request timing and errors, explicit resets,
+  freshness, omissions and callback safety.
+- [x] Owned startup, initial readiness publication, healthy Serving during
+  background gain, missing-peer/recovery blockers and live shutdown stages.
+- [x] Ed25519 process identity plus per-frame session/direction/sequence integrity,
+  never-reused historical keys, decoded old work, reconnect/tamper/replay and
+  historical provenance.
+- [x] Immutable stable checkpoint paging, authenticated bounded chunks and durable
+  cursor, torn append recovery, partial transfer/import restart, ordinary-store
+  exclusion and guarded native replacement/shrink.
+- [x] Actual memory/store/stable evidence, frozen replica identity, certified
+  operation floor, cap rejection, buffering/fence failures, uncertain outcomes,
+  supersession and retained execution after caller deadlines.
 
-Agents commit isolated changes; root integrates and resolves shared Node,
-protocol, replication and storage changes before publishing PRs. All published
-manifests and internal minimums remain synchronized at 0.9.0.
+## Delivery gates
 
-## Remaining acceptance gates
+- [ ] Backend-free, memory-only and all-feature workspace suites.
+- [ ] Rust 1.88/current Clippy, protocol regeneration agreement and examples.
+- [ ] Verified package artifacts and all repository CI/Docker checks.
+- [ ] Complete PRs merged only after all ten check families succeed.
+- [ ] Component issues/tracking updated and the workspace synchronized to main.
 
-- [ ] Local drain waits real persistence, retained cancellation/retry tickets,
-  queued/read/forwarded/table/client coverage and concurrent/repeated shutdown.
-- [ ] Bounded table/fragment/peer instrumentation, actual request/storage/wait
-  timing, errors, concern outcomes and outstanding-work consistency.
-- [ ] Starting/recovering/serving/draining/stopping/stopped/blocked/failed view,
-  component placement progress, last successful ACK/reconcile and freshness.
-- [ ] Old authenticated process cannot mutate clocks/data after a completed
-  hot fence; queued apply, reconnect and historical provenance regressions.
-- [ ] Stable checkpoint bounded export/import, hash/cursor validation, restart
-  and interruption ownership; staged shrink/replacement and qualified sources.
-- [ ] Actual durability plus replica-set and operation/version-floor evidence,
-  buffered/stable failures, timeout, supersession and captured membership.
-- [ ] Full feature matrix, Rust 1.88/current lint, generated protocol agreement,
-  package validation, examples and Docker scenarios.
-- [ ] PRs merge after all ten repository check families succeed. Repository
-  auto-merge is disabled; existing branch policy requires admin squash only
-  after all checks pass. User has explicitly authorized these merges.
-- [ ] Close each issue only when its requested contract and acceptance are met;
-  update tracking #136 and sync main. No further partial-wave stopping point.
-
-Core remains independent of hosting/discovery/metrics backends. These APIs do
-not introduce consensus, writer leases, host-death proofs or membership policy.
-Unknown progress/evidence remains unknown; it is never silently zero-filled.
+Core APIs remain independent of hosting/discovery/monitoring backends. No
+consensus, membership allocator or writer lease is claimed. External authority
+and permanently unavailable source decisions remain explicit application
+decisions, distinct from native SDK evidence.

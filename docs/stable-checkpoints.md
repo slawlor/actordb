@@ -98,6 +98,14 @@ durability remain separate historical evidence. It does not assert that later
 offline edits or all subsequently copied records were acknowledged, prove
 cluster convergence, authorize a writer, or invent a handoff for a failed member.
 
+`CheckpointReplicaCertificate::collect` provides separate **actual stable target
+floor evidence**: pass the complete expected target identity set and live
+`CheckpointReplicaObservation`s with their returned import receipts. The
+collector verifies manifest/root/count identity and rereads each target backend's
+retained import evidence before returning. Missing, changed, or physically
+retired target floors fail certification. Its scope is the imported checkpoint
+floor, not exact latest payload equality or writer authority.
+
 The SHA-256 chain detects corruption and changed chunks. It is not a signature:
 the application must authenticate the manifest/source through its control plane.
 Storage operators capable of changing native metadata or externally certified

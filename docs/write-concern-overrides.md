@@ -84,5 +84,5 @@ active.
 ## Version requirements
 
 This additive API was introduced in `0.5.0`. The current release uses compatible
-`0.8.1` dependency minimums across all four public crates so an upgrade resolves
+`0.9.0` dependency minimums across all four public crates so an upgrade resolves
 the matching database, protocol, query, and SDK revisions.

@@ -23,8 +23,12 @@ node.finish_shutdown(DrainOptions::default()).await?;
 `drain_requests` (also available as `drain`) waits for admitted request work,
 including actor requests and mutation completion owned after a caller timeout
 or cancellation. It leaves fragment actors and peer transport alive. Incoming
-replication, expiry and other maintenance can still change records. A successful
-request drain establishes neither a local persistence fence nor peer ACKs.
+replication, expiry and other maintenance can still change records. The default
+`DrainDurability::ConfiguredStore` also flushes every local fragment after
+cutoff work completes. `StableCommitted` requires an explicit stable fence;
+`Applied` selects execution only. `DrainReport::local_fences` exposes actual
+memory/store/stable outcomes, observed actor generations and revision floors.
+No local request drain certifies peer ACKs or remote execution/convergence.
 
 `finish_shutdown` bounds the existing local shutdown with one absolute timeout.
 Success closes incoming replication admission, joins receive/apply ownership,
@@ -36,10 +40,13 @@ storage. `shutdown_with_replication_drain` separately establishes the configured
 ACK durability for its exact frozen fragment/peer targets and finishes shutdown.
 
 Both bounded calls reject zero or unrepresentable timeouts before changing
-admission. Timeout or cancellation leaves admission closed and preserves
-completion ownership and shutdown progress. Retry with a fresh timeout. A store
-failure returns `DrainError::Local`; fragment state remains available for the
-existing shutdown retry. Dropping the node remains best effort.
+admission. Timeout/cancellation retains exact local fence tickets and storage
+ownership. Retry with a fresh timeout and the same selected durability;
+weakening/changing that drain is rejected. Store-fence failure returns
+`DrainError::Persistence` with its fragment/reason, preserving the actor's
+retryable batch. Full shutdown failures return `Local`. A later retry reissues
+only failed persistence work, not the application write. Dropping the node
+remains best effort.
 
 ## Receive and apply boundary
 
@@ -62,7 +69,12 @@ shutdown coordinator lock. Counts are approximate ownership slots rather than
 unique user requests: a batch can own several request slots, and replication
 counts describe retained frames. SQL page admission stays in the request count
 while actor work owns its resources, including after coordinator cancellation.
-The drain additionally checks actor-owned storage. `Drained` means the request boundary, and `Stopped` means
+Outstanding persistence fences, actual storage jobs and awaiting response slots
+are explicit. Queued forwarded replies retain their lease through the real
+socket write or terminal drop, including relays on routing-only nodes. A caller
+deadline cannot make an issued actor/store operation finish. `cutoff()` identifies
+the same node admission boundary across retries. `Drained` means the selected
+local boundary, and `Stopped` means
 the full local shutdown boundary.
 
 An application `ClientServer` calls the same Node/Table APIs, so new requests
@@ -74,8 +86,11 @@ The server owns its listener independently; call `ClientServer::shutdown` to
 release it. Response bytes already queued to a socket may be lost, including
 after a mutation completed; clients must retry stamped writes idempotently.
 
-All public API additions are additive. The receive ownership wait strengthens
-the existing shutdown/persistence contract without changing wire negotiation.
+These stronger defaults and owned evidence are part of 0.9.0. Existing
+generation-zero wire negotiation remains compatible. The separate
+[peer authority](peer-authority.md) API supports an authenticated hot
+receive/apply fence without stopping the node; application request admission
+itself stays one-way and has no resume operation.
 
 `drain_diagnostics()` reports cumulative accepted/completed/rejected admission
 slots and started/completed/timed-out/failed/cancelled bounded drain calls.

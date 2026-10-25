@@ -148,7 +148,11 @@ Comprehensive guides live in [`docs/`](docs/):
 - [Request draining](docs/draining.md), [typed status](docs/status.md), and
   [metrics](docs/metrics.md) — bounded lifecycle controls and backend-neutral observations
 - [Lifecycle migration](docs/support-api-migration.md) and
-  [replacement safety](docs/replacement-safety.md) — 0.8.1 compatibility and membership boundaries
+  [replacement safety](docs/replacement-safety.md) — 0.9.0 migration and membership boundaries
+- [Peer process authority](docs/peer-authority.md), [stable checkpoints](docs/stable-checkpoints.md),
+  and [staged membership](docs/staged-membership.md) — authenticated retirement and recovery
+- [Complete observations](docs/observability.md) and [write durability evidence](docs/write-concerns.md)
+  — lifecycle, bounded detailed metrics, and certified write floors
 - [Test strategy](docs/testing.md) — unit vs integration vs Docker scenarios
 - [Releases](docs/releases.md) — package checks, version tags, and crates.io publication
 

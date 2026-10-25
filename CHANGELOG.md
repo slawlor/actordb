@@ -25,8 +25,8 @@
 - Add opt-in strict write-concern acknowledgement requirements. Operational
   caps that would lower the requested threshold fail before apply; embedded,
   forwarded and client receipt validation preserves the constraint.
-- Document replacement authentication and staged membership requirements;
-  hot epoch fencing and portable recovery checkpoints remain tracked backlog.
+- Include authenticated hot fencing, stable checkpoints and native staged
+  membership validation with actual source/target and receiver evidence.
 - Bump all four published crates and compatible dependency minimums to
   `0.9.0`. Existing default wire encodings retain their meaning; enabled new
   requirements fail closed on older peers. Public schema/actor literals and
@@ -34,7 +34,9 @@
 
 See [migration](docs/support-api-migration.md),
 [draining](docs/draining.md), [metrics](docs/metrics.md), and
-[status](docs/status.md). Follow-up scope remains in the
+[status](docs/status.md), [peer authority](docs/peer-authority.md),
+[checkpoints](docs/stable-checkpoints.md), [membership](docs/staged-membership.md),
+and [write durability](docs/write-concerns.md). Acceptance coverage is mapped in the
 [support API roadmap](docs/support-api-roadmap.md).
 
 ## 0.8.0

@@ -66,11 +66,12 @@ set and stable reconciliation; removing a missing source to clear a timeout
 is not an authorized recovery decision. If every durable source of an update
 is gone, the SDK cannot reconstruct it.
 
-Portable stable export/import with hashes, chunk retry/resume and preserved
-table/version/tombstone/expiry metadata remains tracked in
-[#134](https://github.com/slawlor/actordb/issues/134). Until supported, arrange
-the required backend checkpoint before removal, under the backend's stable
-snapshot contract and after completed shutdown when necessary. Do not use a
+Use [stable checkpoints](stable-checkpoints.md) for bounded export/import with
+hashes, exact retry/resume and preserved table/version/tombstone/expiry metadata.
+The [staged membership workflow](staged-membership.md) requires actual stable
+source/target floors, exact joint/final peer authority and live serving evidence
+before removal. Keep an unavailable member's disposition explicitly separate;
+source selection never fabricates its handoff or grants writer authority. Do not use a
 live `get_all`, ordinary scan or SQL projection as a recovery checkpoint:
 those APIs do not certify a complete stable record image. Preserve values as
 opaque data; application journals and paired-table consistency need their own
