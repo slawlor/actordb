@@ -26,13 +26,13 @@ completed lifecycle, scoped observations and durable draining.
   operation floor, cap rejection, buffering/fence failures, uncertain outcomes,
   supersession and retained execution after caller deadlines.
 
-## Delivery gates
+## Required delivery gates
 
-- [ ] Backend-free, memory-only and all-feature workspace suites.
-- [ ] Rust 1.88/current Clippy, protocol regeneration agreement and examples.
-- [ ] Verified package artifacts and all repository CI/Docker checks.
-- [ ] Complete PRs merged only after all ten check families succeed.
-- [ ] Component issues/tracking updated and the workspace synchronized to main.
+- Backend-free, memory-only and all-feature workspace suites.
+- Rust 1.88/current Clippy, protocol regeneration agreement and examples.
+- Verified package artifacts and all repository CI/Docker checks.
+- Complete PRs merged only after all ten check families succeed.
+- Component issues/tracking updated and the workspace synchronized to main.
 
 Core APIs remain independent of hosting/discovery/monitoring backends. No
 consensus, membership allocator or writer lease is claimed. External authority
