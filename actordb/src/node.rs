@@ -133,8 +133,8 @@ pub use drain::{
     DrainCutoff, DrainDiagnostics, DrainDurability, DrainError, DrainOptions, DrainPhase,
     DrainReport, DrainStatus, FragmentDrainFence, LocalDurability,
 };
-mod membership;
 mod detailed_status;
+mod membership;
 pub mod metrics;
 pub mod observability;
 pub mod status;

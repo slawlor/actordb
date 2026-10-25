@@ -252,11 +252,7 @@ pub(super) struct ConnContext {
 /// not a practical concern (and a collision would only risk a dropped
 /// duplicate, never corruption — LWW still guards the merge).
 pub(super) fn fresh_boot_id() -> u64 {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0);
-    nanos ^ ((std::process::id() as u64) << 32)
+    super::observability::fresh_incarnation()
 }
 
 #[cfg(test)]

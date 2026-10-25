@@ -9,7 +9,6 @@ use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::{oneshot, Mutex, Notify, Semaphore};
 use tokio::task::JoinSet;
 
-static NEXT_STORAGE_SCOPE: AtomicU64 = AtomicU64::new(1);
 struct StorageMetrics {
     scope_id: u64,
     queued: AtomicUsize,
@@ -69,7 +68,7 @@ impl StorageExecutor {
             owner_changes: Notify::new(),
             drain_lock: Mutex::new(()),
             metrics: Arc::new(StorageMetrics {
-                scope_id: NEXT_STORAGE_SCOPE.fetch_add(1, Ordering::Relaxed),
+                scope_id: crate::node::observability::fresh_incarnation(),
                 queued: AtomicUsize::new(0),
                 completed: AtomicU64::new(0),
                 failed: AtomicU64::new(0),

@@ -5,7 +5,6 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-static NEXT_INSTANCE: AtomicU64 = AtomicU64::new(1);
 const MAX_TIMED_QUEUED_JOBS: usize = 256;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -74,7 +73,7 @@ pub(super) struct WorkCounters {
 impl Default for WorkCounters {
     fn default() -> Self {
         Self {
-            incarnation: NEXT_INSTANCE.fetch_add(1, Ordering::Relaxed),
+            incarnation: crate::node::observability::fresh_incarnation(),
             accepted: AtomicU64::new(0),
             completed: AtomicU64::new(0),
             abandoned: AtomicU64::new(0),

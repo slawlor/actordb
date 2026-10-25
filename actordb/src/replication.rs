@@ -38,7 +38,6 @@ use std::collections::{HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
-static NEXT_SENDER_OBSERVATION: AtomicU64 = AtomicU64::new(1);
 
 use prost::Message as ProstMessage;
 use ractor::rpc::CallResult;
@@ -1831,7 +1830,7 @@ async fn sender_task(
     let mut last_successful_ack_at = None;
     let mut last_successful_ack_durability = None;
     let mut last_successful_reconcile_at = None;
-    let observation_incarnation = NEXT_SENDER_OBSERVATION.fetch_add(1, Ordering::Relaxed);
+    let observation_incarnation = crate::node::observability::fresh_incarnation();
     let mut retry_not_before: Option<Instant> = None;
     let mut session_retry: Option<Instant> = None;
     let mut reconcile_retry: Option<(Instant, ReconcilePurpose)> = None;

@@ -5,10 +5,33 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, OnceLock, RwLock};
 use std::time::Instant;
 
 use super::{Node, NodeError, TableId};
+
+static INCARNATION_SALT: OnceLock<u64> = OnceLock::new();
+static NEXT_INCARNATION: AtomicU64 = AtomicU64::new(1);
+/// Process-scoped random prefix plus sequence avoids counter/reset collisions
+/// across SDK restarts. This is observation metadata, never authentication.
+pub(crate) fn fresh_incarnation() -> u64 {
+    let salt = *INCARNATION_SALT.get_or_init(|| {
+        let mut bytes = [0; 8];
+        if getrandom::fill(&mut bytes).is_ok() {
+            u64::from_be_bytes(bytes)
+        } else {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |time| time.as_nanos() as u64)
+                ^ ((std::process::id() as u64) << 32)
+        }
+    });
+    let mut identity = salt.wrapping_add(NEXT_INCARNATION.fetch_add(1, Ordering::Relaxed));
+    if identity == 0 {
+        identity = salt.wrapping_add(NEXT_INCARNATION.fetch_add(1, Ordering::Relaxed));
+    }
+    identity
+}
 
 /// Cumulative monotonic duration observations; no quantiles are inferred.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

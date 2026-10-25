@@ -984,7 +984,11 @@ impl Node {
         let mut points = Vec::new();
         let mut node_point = |descriptor: &'static MetricDescriptor, value| {
             points.push(MetricPoint {
-                source_incarnation: None,
+                source_incarnation: match descriptor.lifetime {
+                    MetricLifetime::NodeIncarnation => Some(status.boot_id),
+                    MetricLifetime::PersistenceResources => Some(status.storage.scope_id),
+                    _ => None,
+                },
                 descriptor,
                 scope: MetricScope::Node,
                 value,
