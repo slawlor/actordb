@@ -219,12 +219,16 @@ pub enum PeerFenceStage {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PeerAuthoritySnapshot {
     receiver_id: String,
+    node_boot_id: u64,
     revision: u64,
     phase: PeerFencePhase,
     local: PeerIdentity,
     peers: HashMap<String, PeerIdentity>,
 }
 impl PeerAuthoritySnapshot {
+    pub fn node_boot_id(&self) -> u64 {
+        self.node_boot_id
+    }
     pub fn receiver_id(&self) -> &str {
         &self.receiver_id
     }
@@ -475,10 +479,12 @@ impl AuthorityEra {
     fn public_snapshot(
         &self,
         receiver_id: &str,
+        node_boot_id: u64,
         phase: PeerFencePhase,
     ) -> Option<PeerAuthoritySnapshot> {
         self.options.as_ref().map(|options| PeerAuthoritySnapshot {
             receiver_id: receiver_id.to_string(),
+            node_boot_id,
             revision: self.revision,
             phase,
             local: options.local.public_identity(),
@@ -875,7 +881,9 @@ impl Node {
         } else {
             PeerFencePhase::Ready
         };
-        state.era.public_snapshot(&self.node_id, phase)
+        state
+            .era
+            .public_snapshot(&self.node_id, self.boot_id, phase)
     }
     /// Atomically retire all current peer sessions. Validates before mutation.
     /// A retry must provide the exact pending authority; admission remains
@@ -989,6 +997,7 @@ impl Node {
                 authorized_peers: pending.next.peer_generations(),
                 public_authority: PeerAuthoritySnapshot {
                     receiver_id: self.node_id.clone(),
+                    node_boot_id: self.boot_id,
                     revision,
                     phase: PeerFencePhase::Ready,
                     local: pending.next.local.public_identity(),

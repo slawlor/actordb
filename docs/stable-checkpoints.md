@@ -105,6 +105,14 @@ decisions remain responsible for their authority. Prefix retirement atomically
 advances a provenance generation, invalidating prior full-floor import evidence
 without scanning or collecting all old receipts.
 
+`CheckpointReplicaCertificate::collect` validates actual target backends and
+their stable `ImportReceipt`s against the exact checkpoint digest, source,
+target identities, record count and root, then rechecks retained evidence. Every
+requested target must be present; a missing or retired floor fails collection.
+This certifies explicit stable checkpoint copies, independently of a manifest's
+historical pre-checkpoint replication ACK report. It does not grant process
+authority or claim that later application writes reached those targets.
+
 Use [staged-membership.md](staged-membership.md) to require qualified source
 floors and target evidence before replacement or shrink. Checkpoints do not
 recover writes absent from every source or make permanent source loss safe by

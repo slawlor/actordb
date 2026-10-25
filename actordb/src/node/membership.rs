@@ -11,6 +11,7 @@ use crate::membership::{
 };
 
 use super::drain::DrainPhase;
+use super::peer_authority::PeerFencePhase;
 use super::status::{Readiness, SnapshotLimits};
 use super::*;
 
@@ -95,6 +96,44 @@ impl Node {
                 "node is not a final target in an active joint transition".into(),
             ));
         }
+        let authority = transition
+            .final_authority()
+            .or(transition.joint_authority())
+            .ok_or_else(|| {
+                MembershipError::InsufficientEvidence(
+                    "membership has no explicit authority decision".into(),
+                )
+            })?;
+        let captured_authority = self.peer_authority_snapshot();
+        if let Some(snapshot) = &captured_authority {
+            if snapshot.receiver_id() != self.node_id
+                || snapshot.node_boot_id() != self.boot_id
+                || snapshot.phase() != PeerFencePhase::Ready
+                || !crate::membership::native::matches_snapshot(authority, snapshot)
+            {
+                return Err(MembershipError::InsufficientEvidence(
+                    "current native public authority does not match the exact transition policy"
+                        .into(),
+                ));
+            }
+            if authority.is_native()
+                && authority
+                    .native_receivers()
+                    .get(&self.node_id)
+                    .is_none_or(|receiver| {
+                        receiver.node_boot_id != self.boot_id
+                            || receiver.authority_revision != snapshot.revision()
+                    })
+            {
+                return Err(MembershipError::InsufficientEvidence(
+                    "native transition fence belongs to another boot/revision".into(),
+                ));
+            }
+        } else if authority.is_native() {
+            return Err(MembershipError::InsufficientEvidence(
+                "native evidence cannot authorize a legacy unconfigured receiver".into(),
+            ));
+        }
         let store = self.checkpoint_store.as_ref().ok_or_else(|| {
             MembershipError::InsufficientEvidence(
                 "target has no durable checkpoint-capable store".into(),
@@ -135,6 +174,16 @@ impl Node {
                 "joint placement is not completely observed and serving".into(),
             ));
         }
+        if status.fragments.iter().any(|fragment| {
+            fragment.assigned_locally
+                && (fragment.placement_state != Some(FragmentPlacementState::Serving)
+                    || !fragment.serving
+                    || !fragment.route_available)
+        }) {
+            return Err(MembershipError::InsufficientEvidence(
+                "every assigned joint fragment must have completed Serving placement".into(),
+            ));
+        }
         let observed = status
             .fragments
             .iter()
@@ -152,6 +201,14 @@ impl Node {
                 ));
             }
         }
+        if self.placement_generation.load(Ordering::Acquire)
+            != status.placement_generation.unwrap_or(u64::MAX)
+            || self.peer_authority_snapshot() != captured_authority
+        {
+            return Err(MembershipError::InsufficientEvidence(
+                "placement or native authority changed during certification".into(),
+            ));
+        }
         Ok(MembershipReady {
             node_id: self.node_id.clone(),
             boot_id: self.boot_id,
@@ -165,6 +222,7 @@ impl Node {
                     "readiness requires an explicitly fenced authority".into(),
                 )
             })?,
+            native_revision: captured_authority.map(|snapshot| snapshot.revision()),
         })
     }
 }

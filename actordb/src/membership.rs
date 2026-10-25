@@ -17,6 +17,8 @@ use crate::placement::{validate_placement, ManualPlacement, PlacementController}
 use crate::shard::FragmentId;
 
 const MAX_STATE_BYTES: usize = 32 * 1024 * 1024;
+pub(crate) mod native;
+pub use native::{MembershipFenceObservation, MembershipShutdownObservation};
 pub type MembershipMap = HashMap<FragmentId, Vec<String>>;
 
 #[derive(Debug)]
@@ -63,6 +65,7 @@ pub struct MembershipReady {
     pub(crate) joint_digest: [u8; 32],
     pub(crate) epoch: [u8; 32],
     pub(crate) authority_digest: [u8; 32],
+    pub(crate) native_revision: Option<u64>,
 }
 impl MembershipReady {
     pub fn node_id(&self) -> &str {
@@ -79,6 +82,9 @@ impl MembershipReady {
     }
     pub fn authority_digest(&self) -> &[u8; 32] {
         &self.authority_digest
+    }
+    pub fn native_authority_revision(&self) -> Option<u64> {
+        self.native_revision
     }
 }
 
@@ -155,6 +161,20 @@ pub struct MembershipAuthority {
     epoch: [u8; 32],
     identities: BTreeMap<String, MembershipPeerIdentity>,
     decision_id: [u8; 32],
+    pub(crate) native_receivers: BTreeMap<String, NativeMembershipReceiver>,
+    pub(crate) native_retired: BTreeMap<String, NativeRetiredReceiver>,
+}
+/// Exact local SDK receiver fence evidence. Revisions are process-local.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeMembershipReceiver {
+    pub node_boot_id: u64,
+    pub authority_revision: u64,
+}
+/// Full local SDK shutdown, distinct from remote receiver authority revocation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeRetiredReceiver {
+    pub node_boot_id: u64,
+    pub local_fence_count: u32,
 }
 impl MembershipAuthority {
     pub fn digest(&self) -> [u8; 32] {
@@ -186,6 +206,8 @@ impl MembershipAuthority {
             epoch,
             identities,
             decision_id,
+            native_receivers: BTreeMap::new(),
+            native_retired: BTreeMap::new(),
         })
     }
     pub fn identities(&self) -> &BTreeMap<String, MembershipPeerIdentity> {
@@ -193,6 +215,15 @@ impl MembershipAuthority {
     }
     pub fn decision_id(&self) -> &[u8; 32] {
         &self.decision_id
+    }
+    pub fn native_receivers(&self) -> &BTreeMap<String, NativeMembershipReceiver> {
+        &self.native_receivers
+    }
+    pub fn retired_sdk_shutdowns(&self) -> &BTreeMap<String, NativeRetiredReceiver> {
+        &self.native_retired
+    }
+    pub fn is_native(&self) -> bool {
+        !self.native_receivers.is_empty()
     }
     fn matches(&self, epoch: &[u8; 32], map: &MembershipMap) -> bool {
         &self.epoch == epoch
@@ -265,7 +296,8 @@ impl MembershipTransition {
             ));
         }
         let mut input = Decoder::new(body);
-        if input.take(8)? != b"ACTMEM02" {
+        let version = input.take(8)?;
+        if version != b"ACTMEM02" && version != b"ACTMEM03" {
             return Err(MembershipError::Invalid(
                 "unsupported transition state".into(),
             ));
@@ -335,8 +367,8 @@ impl MembershipTransition {
             }
             _ => return Err(MembershipError::Invalid("invalid source-loss flag".into())),
         };
-        let joint_authority = decode_authority(&mut input, epoch)?;
-        let final_authority = decode_authority(&mut input, epoch)?;
+        let joint_authority = decode_authority(&mut input, epoch, version == b"ACTMEM03")?;
+        let final_authority = decode_authority(&mut input, epoch, version == b"ACTMEM03")?;
         input.finish()?;
         let mut result = Self {
             path,
@@ -610,6 +642,32 @@ impl MembershipTransition {
             return Err(MembershipError::Invalid("final authority decision is immutable; use a fresh transition epoch for changed process authority".into()));
         }
         let previous_authority = joint;
+        if joint.is_native() && authority.is_native() {
+            let retired = joint
+                .identities
+                .keys()
+                .filter(|id| !authority.identities.contains_key(*id))
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            if authority
+                .native_retired
+                .keys()
+                .cloned()
+                .collect::<BTreeSet<_>>()
+                != retired
+                || authority.native_retired.iter().any(|(id, receiver)| {
+                    joint
+                        .native_receivers
+                        .get(id)
+                        .is_none_or(|previous| previous.node_boot_id != receiver.node_boot_id)
+                })
+            {
+                return Err(MembershipError::InsufficientEvidence(
+                    "retired shutdowns do not match the SDK processes certified in joint authority"
+                        .into(),
+                ));
+            }
+        }
         for (id, next) in &authority.identities {
             let previous = previous_authority.identities.get(id).ok_or_else(|| {
                 MembershipError::Invalid(
@@ -666,6 +724,20 @@ impl MembershipTransition {
             || evidence.joint_digest != self.joint_digest()
             || evidence.epoch != self.epoch
             || Some(evidence.authority_digest) != self.readiness_authority_digest()
+            || self
+                .final_authority
+                .as_ref()
+                .or(self.joint_authority.as_ref())
+                .is_some_and(|authority| {
+                    authority.is_native()
+                        && authority
+                            .native_receivers
+                            .get(&evidence.node_id)
+                            .is_none_or(|receiver| {
+                                receiver.node_boot_id != evidence.boot_id
+                                    || Some(receiver.authority_revision) != evidence.native_revision
+                            })
+                })
         {
             return Err(MembershipError::Invalid(
                 "live readiness belongs to another joint proposal or target".into(),
@@ -792,7 +864,7 @@ impl MembershipTransition {
             ));
         }
         let mut out = Encoder::default();
-        out.0.extend(b"ACTMEM02");
+        out.0.extend(b"ACTMEM03");
         out.digest(&self.epoch);
         out.u32(self.minimum_replicas as u32);
         out.u8(match self.stage {
@@ -850,18 +922,14 @@ impl MembershipTransition {
                 .map(|receipt| receipt.encode().len() + 4)
                 .sum::<usize>()
             + self.joint_authority.as_ref().map_or(0, |authority| {
-                authority
-                    .identities
-                    .keys()
-                    .map(|id| id.len() + 48)
-                    .sum::<usize>()
+                let mut out = Encoder::default();
+                encode_authority(&mut out, Some(authority));
+                out.0.len()
             })
             + self.final_authority.as_ref().map_or(0, |authority| {
-                authority
-                    .identities
-                    .keys()
-                    .map(|id| id.len() + 48)
-                    .sum::<usize>()
+                let mut out = Encoder::default();
+                encode_authority(&mut out, Some(authority));
+                out.0.len()
             })
             + self.loss.as_ref().map_or(0, |loss| {
                 loss.missing.iter().map(|id| id.len() + 4).sum::<usize>()
@@ -888,12 +956,25 @@ fn encode_authority(out: &mut Encoder, authority: Option<&MembershipAuthority>) 
                 out.u64(identity.generation);
                 out.digest(&identity.public_key);
             }
+            out.u32(authority.native_receivers.len() as u32);
+            for (id, receiver) in &authority.native_receivers {
+                out.string(id);
+                out.u64(receiver.node_boot_id);
+                out.u64(receiver.authority_revision);
+            }
+            out.u32(authority.native_retired.len() as u32);
+            for (id, receiver) in &authority.native_retired {
+                out.string(id);
+                out.u64(receiver.node_boot_id);
+                out.u32(receiver.local_fence_count);
+            }
         }
     }
 }
 fn decode_authority(
     input: &mut Decoder<'_>,
     epoch: [u8; 32],
+    native_format: bool,
 ) -> Result<Option<MembershipAuthority>, MembershipError> {
     match input.u8()? {
         0 => Ok(None),
@@ -915,9 +996,50 @@ fn decode_authority(
                     ));
                 }
             }
-            Ok(Some(MembershipAuthority::certify_external(
-                epoch, identities, decision,
-            )?))
+            let mut authority = MembershipAuthority::certify_external(epoch, identities, decision)?;
+            if native_format {
+                let count = input.u32()? as usize;
+                if count > 256 {
+                    return Err(MembershipError::Invalid("too many native receivers".into()));
+                }
+                for _ in 0..count {
+                    let id = input.string(255)?;
+                    let receiver = NativeMembershipReceiver {
+                        node_boot_id: input.u64()?,
+                        authority_revision: input.u64()?,
+                    };
+                    if authority.native_receivers.insert(id, receiver).is_some() {
+                        return Err(MembershipError::Invalid("duplicate native receiver".into()));
+                    }
+                }
+                let count = input.u32()? as usize;
+                if count > 256 {
+                    return Err(MembershipError::Invalid(
+                        "too many retired receivers".into(),
+                    ));
+                }
+                for _ in 0..count {
+                    let id = input.string(255)?;
+                    let receiver = NativeRetiredReceiver {
+                        node_boot_id: input.u64()?,
+                        local_fence_count: input.u32()?,
+                    };
+                    if authority.native_retired.insert(id, receiver).is_some() {
+                        return Err(MembershipError::Invalid(
+                            "duplicate retired receiver".into(),
+                        ));
+                    }
+                }
+                if !authority.native_receivers.is_empty()
+                    && authority.native_receivers.keys().collect::<BTreeSet<_>>()
+                        != authority.identities.keys().collect()
+                {
+                    return Err(MembershipError::Invalid(
+                        "native evidence does not cover exact registry".into(),
+                    ));
+                }
+            }
+            Ok(Some(authority))
         }
         _ => Err(MembershipError::Invalid(
             "invalid persisted authority flag".into(),
@@ -1063,6 +1185,7 @@ mod tests {
             joint_digest: transition.joint_digest(),
             epoch,
             authority_digest: joint.digest(),
+            native_revision: None,
         };
         transition.record_ready(old_ready.clone()).unwrap();
         assert!(transition.record_final_authority_fence(joint).is_err());

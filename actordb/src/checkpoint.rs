@@ -343,6 +343,80 @@ pub struct ImportReceipt {
     root_hash: [u8; 32],
     records: u64,
 }
+/// An actual target backend and its returned stable import receipt.
+pub struct CheckpointReplicaObservation<'a> {
+    pub store: &'a dyn KvStore,
+    pub receipt: &'a ImportReceipt,
+}
+/// Verified stable copies of this exact checkpoint at every requested target.
+/// This is separate from historical replication ACKs and process authority.
+#[derive(Debug, Clone)]
+pub struct CheckpointReplicaCertificate {
+    manifest_digest: [u8; 32],
+    targets: Vec<ImportReceipt>,
+}
+impl CheckpointReplicaCertificate {
+    pub fn manifest_digest(&self) -> &[u8; 32] {
+        &self.manifest_digest
+    }
+    pub fn targets(&self) -> &[ImportReceipt] {
+        &self.targets
+    }
+    pub fn collect(
+        manifest: &CheckpointManifest,
+        expected: &[StoreIdentity],
+        observations: &[CheckpointReplicaObservation<'_>],
+    ) -> Result<Self, CheckpointError> {
+        if expected.is_empty() || expected.len() > 256 || expected.len() != observations.len() {
+            return Err(CheckpointError::Invalid(
+                "replica certificate needs every bounded expected target".into(),
+            ));
+        }
+        let mut targets = Vec::new();
+        let mut seen = std::collections::BTreeSet::new();
+        for observation in observations {
+            let receipt = observation.receipt;
+            if !expected.contains(receipt.target())
+                || !seen.insert(receipt.target().node_id())
+                || receipt.source() != manifest.source()
+                || receipt.manifest_digest() != &manifest.digest()
+                || receipt.root_hash() != manifest.root_hash()
+                || receipt.records() != manifest.records()
+                || observation
+                    .store
+                    .checkpoint_backend()
+                    .ok_or(CheckpointError::Unsupported)?
+                    .import_evidence(receipt.manifest_digest())?
+                    .as_ref()
+                    != Some(receipt)
+            {
+                return Err(CheckpointError::Invalid(
+                    "target does not retain this exact stable checkpoint floor".into(),
+                ));
+            }
+            targets.push(receipt.clone());
+        }
+        for observation in observations {
+            if observation
+                .store
+                .checkpoint_backend()
+                .ok_or(CheckpointError::Unsupported)?
+                .import_evidence(observation.receipt.manifest_digest())?
+                .as_ref()
+                != Some(observation.receipt)
+            {
+                return Err(CheckpointError::Invalid(
+                    "target floor changed during certificate collection".into(),
+                ));
+            }
+        }
+        targets.sort_by(|a, b| a.target().node_id().cmp(b.target().node_id()));
+        Ok(Self {
+            manifest_digest: manifest.digest(),
+            targets,
+        })
+    }
+}
 impl ImportReceipt {
     pub fn target(&self) -> &StoreIdentity {
         &self.target

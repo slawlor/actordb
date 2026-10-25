@@ -9,6 +9,17 @@ decisions and authentication of supplied evidence.
 
 ## Workflow
 
+Run the native SDK workflow with a fresh directory:
+
+```sh
+cargo run -p actordb --features rocksdb --example staged_membership -- /tmp/actordb-replacement replace
+cargo run -p actordb --features rocksdb --example staged_membership -- /tmp/actordb-shrink shrink
+```
+
+The example uses real hot peer fences, checkpoint import receipts and separate
+full shutdown reports for retired SDK nodes. Its application chooses the epoch
+and distributed decision IDs; those are not inferred from local revisions.
+
 1. Capture the complete old and desired maps, a fresh nonzero transition epoch,
    and an explicit minimum replica count. `MembershipTransition::create` validates
    full coverage, IDs, the unchanged fragment layout and bounded membership.
@@ -56,6 +67,25 @@ asserts that this external decision/evidence exists; ActorDB does not turn that
 declaration into consensus, verify a control-plane signature, or automatically
 distribute process credentials. Historical imported writer IDs are independent
 of current authenticated process identities.
+
+`MembershipAuthority::certify_native_joint` requires a `MembershipFenceObservation`
+for every exact joint receiver. Each genuine `PeerFenceReport::public_authority()`
+must equal that live Node's current `Ready` snapshot, including receiver boot,
+local public key/generation, peer registry and process-local revision. Receivers
+must agree on the whole public registry. The final collector also requires a
+`MembershipShutdownObservation` for every retiring SDK process; full receive/apply
+shutdown and cutoff boot are verified separately from surviving receivers' peer
+revocation. The transition checks retired boots against its captured joint cohort.
+
+`Node::certify_membership_ready` independently matches configured native policy
+against the selected joint/final certificate, verifies every assigned joint
+fragment is `Serving`, and rechecks placement generation, public authority and
+retained import receipts. A fencing phase, changed key, old report/boot, or
+incomplete assigned gain fails certification even when ordinary local readiness
+remains usable for established fragments. Native boot/revision evidence survives
+coordinator restart; fresh process authority needs a new transition decision.
+Unconfigured legacy receivers can use only the explicitly external route; they
+cannot contribute a native SDK fence certificate.
 
 ## Restarts and bounds
 
