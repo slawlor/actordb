@@ -368,6 +368,55 @@ impl Actor for KvActor {
     ) -> Result<(), ActorProcessingErr> {
         let (message, admission_retention) = message.into_retained_parts();
         match message {
+            KvMessage::ObservedWorker(_) => unreachable!("worker ownership routed to dispatcher"),
+            KvMessage::ObservePools { request, reply } => {
+                if reply.is_closed() {
+                    return Ok(());
+                }
+                let _retention = request.retention;
+                let mut page = super::observations::PoolObservationPage {
+                    observed_at: Some(std::time::SystemTime::now()),
+                    ..Default::default()
+                };
+                let mut workers = request.max_workers;
+                let mut append = |table: Option<String>, priority, pool: &WorkerPool| {
+                    if page.pools.len() >= request.max_pools {
+                        page.pools_truncated = true;
+                        return;
+                    }
+                    let observation = pool.observation(table, priority, workers);
+                    workers = workers.saturating_sub(observation.workers.len());
+                    page.pools.push(observation);
+                };
+                if request.include_internal {
+                    for priority in [
+                        OpPriority::High,
+                        OpPriority::Default,
+                        OpPriority::Background,
+                    ] {
+                        append(None, priority, state.base_pool(priority));
+                    }
+                }
+                for table in request.tables {
+                    if !state.table_pools.contains_key(&table) {
+                        page.missing_tables.push(table);
+                        continue;
+                    }
+                    for priority in [
+                        OpPriority::High,
+                        OpPriority::Default,
+                        OpPriority::Background,
+                    ] {
+                        append(
+                            Some(table.clone()),
+                            priority,
+                            state.table_pool(&table, priority),
+                        );
+                    }
+                }
+                let _ = reply.send(page);
+                Ok(())
+            }
             KvMessage::ApplyOp {
                 op,
                 priority,

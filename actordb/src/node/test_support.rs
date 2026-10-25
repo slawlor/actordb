@@ -95,6 +95,7 @@ pub(super) fn test_sender_report() -> Arc<Mutex<SenderStateReport>> {
         last_ack_durability: None,
         ack_durability_mismatch: false,
         reconcile_rounds: 0,
+        progress: Default::default(),
     }))
 }
 

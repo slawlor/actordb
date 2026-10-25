@@ -883,6 +883,7 @@ mod tests {
             last_ack_durability: None,
             ack_durability_mismatch: false,
             reconcile_rounds: 0,
+            progress: Default::default(),
         }));
         let sender = spawn_node_sender(
             FragmentId(0),

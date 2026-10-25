@@ -131,9 +131,14 @@ pub use drain::{
     DrainReport, DrainStatus, FragmentDrainFence, LocalDurability,
 };
 mod membership;
+mod detailed_status;
 pub mod metrics;
 pub mod observability;
 pub mod status;
+pub use detailed_status::{
+    DetailedObservation, DetailedSnapshotOptions, FragmentPoolObservation, PoolObservationFailure,
+};
+mod startup;
 #[cfg(test)]
 use lifecycle::spawn_fragment_subtree;
 pub use lifecycle::FragmentRouter;
@@ -143,6 +148,7 @@ use lifecycle::{
     RouteMonitorRegistrationGuard, SenderEntryDeps, SenderFinalizationRegistry, SenderMap,
     SenderReportMap, ShutdownProgress, SupervisorRegistry,
 };
+pub use startup::{NodeStartup, NodeStartupSnapshot, StartupStage};
 
 mod read_service;
 use read_service::{
@@ -1285,6 +1291,9 @@ pub struct Node {
     table_metrics: observability::TableRegistry,
     peer_authority: Arc<PeerAuthority>,
     shutdown_state: Mutex<ShutdownProgress>,
+    lifecycle_observation: Arc<startup::LifecycleObservation>,
+    detail_admission: Arc<Semaphore>,
+    pool_timing_enabled: Arc<std::sync::atomic::AtomicBool>,
     replication_drain_report: StdMutex<Option<ReplicationDrainReport>>,
     network: Arc<dyn Network>,
     ttl_expiry: Option<ExpiryRuntime>,
@@ -1306,6 +1315,8 @@ pub struct Node {
 #[derive(Clone, Debug, bon::Builder)]
 pub struct NodeRuntimeOptions {
     peer_authority: Option<PeerAuthorityOptions>,
+    #[builder(skip = Arc::new(std::sync::atomic::AtomicBool::new(false)))]
+    observation_timing: Arc<std::sync::atomic::AtomicBool>,
     #[builder(default = 256 * 1024 * 1024)]
     replication_retained_byte_capacity: usize,
     #[builder(default = Duration::from_secs(30))]
@@ -1769,6 +1780,7 @@ impl NodeRuntimeOptions {
 
     fn sender_options(&self) -> SenderRuntimeOptions {
         SenderRuntimeOptions::default()
+            .with_observation_timing(self.observation_timing.clone())
             .with_aggregate_retention(self.replication_retention.clone())
             .with_reconciliation_result_budget(self.reconciliation_retention.clone())
             .with_local_work_timeout(self.local_work_timeout)
@@ -2017,6 +2029,8 @@ impl NodeRuntimeOptions {
 #[derive(Clone, bon::Builder)]
 #[non_exhaustive]
 pub struct NodeConfig {
+    #[builder(skip = Arc::new(std::sync::atomic::AtomicBool::new(false)))]
+    pool_timing: Arc<std::sync::atomic::AtomicBool>,
     /// Explicit full-outage recovery authority for a complete durable dynamic
     /// replica set. Default None requires an already-serving bootstrap source.
     pub recovery: Option<RecoveryOptions>,

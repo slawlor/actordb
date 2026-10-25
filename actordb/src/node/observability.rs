@@ -194,6 +194,7 @@ impl Node {
     /// Enable request/storage timing for future work. Existing cheap lifecycle
     /// counters are always available; enabling does not invent earlier samples.
     pub fn enable_metrics(&self) {
+        self.pool_timing_enabled.store(true, Ordering::Release);
         self.operation_gate
             .timing_enabled
             .store(true, Ordering::Release);

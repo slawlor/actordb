@@ -117,6 +117,8 @@ impl std::error::Error for FragmentStartupStorageError {}
 /// is private, while fragment, worker prefix, and clock remain caller inputs.
 #[derive(Clone, bon::Builder)]
 pub struct SupervisorArgs {
+    #[builder(skip = Arc::new(std::sync::atomic::AtomicBool::new(false)))]
+    pool_timing: Arc<std::sync::atomic::AtomicBool>,
     /// Which fragment this supervisor owns.
     pub fragment: FragmentId,
     /// Node-owned callback ingress; deliberately absent from the public builder.
@@ -156,6 +158,10 @@ pub struct SupervisorArgs {
 }
 
 impl SupervisorArgs {
+    pub(crate) fn with_pool_timing(mut self, timing: Arc<std::sync::atomic::AtomicBool>) -> Self {
+        self.pool_timing = timing;
+        self
+    }
     /// Attach the Node-owned ingress after public builder construction.
     pub(crate) fn with_expiry_publisher(mut self, publisher: Option<ExpiryPublisher>) -> Self {
         self.expiry_publisher = publisher;
@@ -470,6 +476,7 @@ impl FragmentSupervisor {
             )
             .with_persistence_config(args.persistence.clone())
             .map_err(FragmentStartupStorageError::boxed)?
+            .with_pool_timing(args.pool_timing.clone())
             .enable_partitions()
             .map_err(FragmentStartupStorageError::boxed)?
             .with_expiry_publisher(args.fragment, args.expiry_publisher.clone()),
@@ -1111,6 +1118,7 @@ mod tests {
             };
             SupervisorArgs {
                 expiry_publisher: None,
+                pool_timing: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 fragment: FragmentId(0),
                 worker_prefix: prefix.to_string(),
                 store: None,
@@ -1369,6 +1377,7 @@ mod tests {
             };
             let args = SupervisorArgs {
                 expiry_publisher: None,
+                pool_timing: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 fragment: FragmentId(0),
                 worker_prefix: "paged-final-quiesce".into(),
                 store: Some(store.clone()),
@@ -1499,6 +1508,7 @@ mod tests {
                 FragmentSupervisor,
                 SupervisorArgs {
                     expiry_publisher: None,
+                    pool_timing: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                     fragment: FragmentId(0),
                     worker_prefix: "failed-supervisor".to_string(),
                     store: None,
@@ -1542,6 +1552,7 @@ mod tests {
                 FragmentSupervisor,
                 SupervisorArgs {
                     expiry_publisher: None,
+                    pool_timing: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                     fragment: FragmentId(0),
                     worker_prefix: "failed-snapshotter".to_string(),
                     store: Some(Arc::new(DropSignalStore(Some(store_dropped)))),
@@ -1585,6 +1596,7 @@ mod tests {
                 FragmentSupervisor,
                 SupervisorArgs {
                     expiry_publisher: None,
+                    pool_timing: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                     fragment: FragmentId(0),
                     worker_prefix: "quiesce-drain-test".to_string(),
                     store: Some(store.clone()),

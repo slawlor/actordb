@@ -739,6 +739,7 @@ mod tests {
                     last_ack_durability: None,
                     ack_durability_mismatch: false,
                     reconcile_rounds: 0,
+                    progress: Default::default(),
                 })))
                 .build(),
             SenderRuntimeOptions::default(),

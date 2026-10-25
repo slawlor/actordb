@@ -90,7 +90,13 @@ pub(super) async fn handle_worker_message(
 ) -> Result<(), ActorProcessingErr> {
     let (message, _retention) = message.into_retained_parts();
     match message {
-        KvMessage::Retained(_) => unreachable!("retained message was unwrapped"),
+        KvMessage::Retained(_) | KvMessage::ObservedWorker(_) => {
+            unreachable!("ownership message was unwrapped")
+        }
+        KvMessage::ObservePools { reply, .. } => {
+            let _ = reply.send(Default::default());
+            Ok(())
+        }
         KvMessage::ApplyOp {
             op,
             priority: _,

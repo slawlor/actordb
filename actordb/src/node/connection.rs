@@ -5181,6 +5181,7 @@ mod tests {
             last_ack_durability: None,
             ack_durability_mismatch: false,
             reconcile_rounds: 0,
+            progress: Default::default(),
         }));
         let sender = crate::replication::spawn_sender(
             FragmentId(0),
@@ -5251,6 +5252,7 @@ mod tests {
             last_ack_durability: None,
             ack_durability_mismatch: false,
             reconcile_rounds: 0,
+            progress: Default::default(),
         }));
         let sender = spawn_sender_with_options(
             FragmentId(0),
@@ -5338,6 +5340,7 @@ mod tests {
             last_ack_durability: None,
             ack_durability_mismatch: false,
             reconcile_rounds: 0,
+            progress: Default::default(),
         }));
         let sender = spawn_sender_with_options(
             FragmentId(0),
@@ -5465,6 +5468,7 @@ mod tests {
             last_ack_durability: None,
             ack_durability_mismatch: false,
             reconcile_rounds: 0,
+            progress: Default::default(),
         }));
         let sender = spawn_sender_with_options(
             FragmentId(0),
@@ -5606,6 +5610,7 @@ mod tests {
             last_ack_durability: None,
             ack_durability_mismatch: false,
             reconcile_rounds: 0,
+            progress: Default::default(),
         }));
         let sender = spawn_sender_with_options(
             FragmentId(0),
@@ -5718,6 +5723,7 @@ mod tests {
             last_ack_durability: None,
             ack_durability_mismatch: false,
             reconcile_rounds: 0,
+            progress: Default::default(),
         }));
         let sender = spawn_sender_with_options(
             FragmentId(0),
@@ -5844,6 +5850,7 @@ mod tests {
             last_ack_durability: None,
             ack_durability_mismatch: false,
             reconcile_rounds: 0,
+            progress: Default::default(),
         }));
         let required_ack_durability = match trigger {
             FreshPauseRequeue::Nack => ReplicationAckDurability::MemoryApplied,

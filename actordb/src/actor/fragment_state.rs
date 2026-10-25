@@ -66,6 +66,7 @@ pub struct FragmentState {
     table_children: Arc<RwLock<HashMap<String, Arc<FragmentState>>>>,
     partitioned: bool,
     persistence_template: Option<PersistenceConfig>,
+    pool_timing: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Values and their ordered key index. Both live under one lock so every
@@ -271,6 +272,7 @@ impl FragmentState {
             table_children: Arc::new(RwLock::new(HashMap::new())),
             partitioned: false,
             persistence_template: None,
+            pool_timing: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -299,6 +301,22 @@ impl FragmentState {
         Ok(self)
     }
 
+    pub(crate) fn with_pool_timing(mut self, timing: Arc<std::sync::atomic::AtomicBool>) -> Self {
+        self.pool_timing = timing.clone();
+        for child in Arc::get_mut(&mut self.table_children)
+            .expect("unshared startup table registry")
+            .get_mut()
+            .values_mut()
+        {
+            Arc::get_mut(child)
+                .expect("unshared startup table state")
+                .pool_timing = timing.clone();
+        }
+        self
+    }
+    pub(crate) fn pool_timing_enabled(&self) -> Arc<std::sync::atomic::AtomicBool> {
+        self.pool_timing.clone()
+    }
     fn configure_persistence(&mut self, config: &PersistenceConfig) -> Result<(), String> {
         let flush = Arc::get_mut(&mut self.flush)
             .ok_or_else(|| "persistence work is already shared".to_string())?
@@ -394,6 +412,7 @@ impl FragmentState {
                 });
                 let mut child =
                     Self::new_local(values, store, self.flush_batch_size, self.flush_interval);
+                child.pool_timing = self.pool_timing.clone();
                 child.expiry_publisher = self.expiry_publisher.clone();
                 if let Some(config) = &self.persistence_template {
                     child = child.with_persistence_config(config.clone())?;
@@ -435,6 +454,7 @@ impl FragmentState {
             self.flush_interval,
         );
         state.expiry_publisher = self.expiry_publisher.clone();
+        state.pool_timing = self.pool_timing.clone();
         if let Some(config) = &self.persistence_template {
             state = state
                 .with_persistence_config(config.clone())
