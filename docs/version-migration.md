@@ -1,8 +1,10 @@
 # Physical/logical version migration
 
-The 0.8.0 release uses peer protocol **5**, application protocol **3**, and
-RocksDB data format **2**. Update every peer and application client together;
-older binaries are rejected during negotiation. The crate version is 0.8.0.
+The 0.8 release line uses peer protocol **5**, application protocol **3**, and
+RocksDB data format **2**. Update every peer and application client together
+when migrating from older protocol versions; they are rejected during
+negotiation. The current crate version is 0.8.1, which remains compatible with
+0.8.0 defaults. See [lifecycle support migration](support-api-migration.md).
 
 Logical table views are namespaced within one node and reuse its peer listener.
 Every operation selects a named table; each table uses independent cache,

@@ -124,6 +124,7 @@ pub struct QueryRetention {
     _job: OwnedSemaphorePermit,
     _bytes: OwnedSemaphorePermit,
     _runtime: BytePermit,
+    _operation: Option<Arc<dyn Send + Sync>>,
 }
 impl QueryAdmission {
     #[cfg(test)]
@@ -146,10 +147,22 @@ impl QueryAdmission {
             admission_rejections: self.rejected.load(Ordering::Relaxed),
         }
     }
+    #[cfg(test)]
     pub(crate) fn reserve_work(
         &self,
         bytes: usize,
         runtime_bytes: usize,
+    ) -> Result<Arc<QueryRetention>, QueryExecutionError> {
+        self.reserve_work_retained(bytes, runtime_bytes, None)
+    }
+
+    /// Keep application admission ownership with actor page work even when
+    /// the query coordinator or its caller is cancelled.
+    pub(crate) fn reserve_work_retained(
+        &self,
+        bytes: usize,
+        runtime_bytes: usize,
+        operation: Option<Arc<dyn Send + Sync>>,
     ) -> Result<Arc<QueryRetention>, QueryExecutionError> {
         // Try-acquire only: blocked callers never accumulate owning request
         // payloads behind an unbounded semaphore waiter list.
@@ -178,6 +191,7 @@ impl QueryAdmission {
                 _job: job,
                 _bytes: bytes,
                 _runtime: runtime,
+                _operation: operation,
             }))
         })();
         if result.is_err() {

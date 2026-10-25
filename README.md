@@ -145,6 +145,10 @@ Comprehensive guides live in [`docs/`](docs/):
   field with defaults and guidance
 - [Operations](docs/operations.md) — crash/restart, rolling restart,
   partitions, overload, what to monitor
+- [Request draining](docs/draining.md), [typed status](docs/status.md), and
+  [metrics](docs/metrics.md) — bounded lifecycle controls and backend-neutral observations
+- [Lifecycle migration](docs/support-api-migration.md) and
+  [replacement safety](docs/replacement-safety.md) — 0.8.1 compatibility and membership boundaries
 - [Test strategy](docs/testing.md) — unit vs integration vs Docker scenarios
 - [Releases](docs/releases.md) — package checks, version tags, and crates.io publication
 

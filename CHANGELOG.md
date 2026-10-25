@@ -2,21 +2,28 @@
 
 ## 0.8.1 (draft)
 
+- Add explicit application admission/draining APIs with bounded retryable
+  waits, status and outstanding-work reporting. Accepted work retains
+  completion ownership after request waiter cancellation.
+- Retain already dispatched peer replication/reconciliation applies through
+  execution and join them during full shutdown before releasing storage.
+  Application drain and full receive/apply shutdown are separate barriers.
+- Add bounded typed node/fragment/replication snapshots and backend-neutral
+  metrics collection without exporter dependencies. Partial observations and
+  unmeasured progress remain explicit.
 - Add opt-in strict write-concern acknowledgement requirements. Operational
   caps that would lower the requested threshold fail before apply; embedded,
   forwarded and client receipt validation preserves the constraint.
-- Document ordinary local apply, configured remote durability, frozen
-  eligibility, LWW supersession, and timeout/unknown-outcome boundaries.
+- Document replacement authentication and staged membership requirements;
+  hot epoch fencing and portable recovery checkpoints remain tracked backlog.
 - Bump all four published crates and compatible dependency minimums to
-  `0.8.1`. The policy is additive on an already non-exhaustive wire type;
-  default encodings and protocol versions remain compatible. Older nodes
-  reject the required strict constraint before apply.
-- Preserve the existing reconciliation startup grace fix from this checkout
-  so large reconvergence tests measure completion after peer readiness.
+  `0.8.1`. New APIs are additive; default wire encodings and protocol versions
+  remain compatible. Strict policies sent to older nodes fail closed.
 
-See [write concern overrides](docs/write-concern-overrides.md).
-Further per-operation durability and replica-set receipt evidence remains
-tracked in [#135](https://github.com/slawlor/actordb/issues/135).
+See [migration](docs/support-api-migration.md),
+[draining](docs/draining.md), [metrics](docs/metrics.md), and
+[status](docs/status.md). Follow-up scope remains in the
+[support API roadmap](docs/support-api-roadmap.md).
 
 ## 0.8.0
 

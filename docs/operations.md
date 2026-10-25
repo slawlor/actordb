@@ -178,6 +178,14 @@ keys against the captured transcript and HMAC.
 
 ### Graceful shutdown
 
+For explicit application admission cutoff and bounded retryable waiting, use
+`begin_drain`, `drain_requests(DrainOptions)` and `finish_shutdown(DrainOptions)`.
+Request drain keeps replication and maintenance alive; full shutdown joins
+received actor applies and releases the store. Status and metrics snapshots
+remain readable throughout. See [request draining](draining.md),
+[lifecycle migration](support-api-migration.md), and
+[replacement safety](replacement-safety.md).
+
 Call `node.shutdown().await` and handle its `Result`. The first call atomically
 closes public-operation admission; later data calls receive
 `NodeError::ShuttingDown`. Shutdown aborts and joins listener, connection,

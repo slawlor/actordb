@@ -133,6 +133,7 @@ pub(super) async fn test_connection_context(
             tasks: Arc::downgrade(&tasks),
             read_service,
             operation_gate: OperationGate::new(),
+            receive_apply_gate: OperationGate::new(),
             peer_changes,
             hlc: Arc::new(Mutex::new(HlcClock::new())),
             senders,

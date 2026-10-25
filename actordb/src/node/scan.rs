@@ -105,9 +105,10 @@ impl Node {
     ) -> Result<Vec<ScanMatch>, crate::query::QueryExecutionError> {
         use crate::query::{QueryExecutionError, QueryOptions};
         use actordb_query::QueryValue;
-        let _operation = self
-            .admit_operation()
-            .map_err(|_| QueryExecutionError::ShuttingDown)?;
+        let operation = Arc::new(
+            self.admit_operation()
+                .map_err(|_| QueryExecutionError::ShuttingDown)?,
+        );
         // Covers previously merged rows while each fragment owns its own
         // page reservation; holding both is deliberately conservative.
         let request_bytes = match &spec.matcher {
@@ -116,9 +117,10 @@ impl Node {
                 prefix.capacity().saturating_mul(2).saturating_add(1024)
             }
         };
-        let _runtime = self.query_admission.reserve_work(
+        let _runtime = self.query_admission.reserve_work_retained(
             request_bytes,
             QueryOptions::default().max_result_bytes + QueryOptions::default().max_buffer_bytes,
+            Some(operation),
         )?;
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
         tokio::time::timeout_at(deadline, async {

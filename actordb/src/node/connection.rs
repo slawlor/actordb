@@ -205,6 +205,7 @@ pub(super) struct ConnContext {
     pub(super) tasks: Weak<RuntimeTasks>,
     pub(super) read_service: Arc<ReadService>,
     pub(super) operation_gate: Arc<OperationGate>,
+    pub(super) receive_apply_gate: Arc<OperationGate>,
     /// Monotonic wake-up signal for dial supervisors waiting behind another
     /// physical connection to the same authenticated peer.
     pub(super) peer_changes: watch::Sender<u64>,
@@ -575,6 +576,7 @@ pub(super) async fn handle_connection(
         tasks,
         read_service,
         operation_gate,
+        receive_apply_gate,
         peer_changes,
         hlc,
         senders,
@@ -1017,6 +1019,10 @@ pub(super) async fn handle_connection(
                 }
             }
             Some(EnvelopeMsg::ReplicateBatch(b)) => {
+                let apply_retention: Arc<dyn Send + Sync> = match receive_apply_gate.try_enter() {
+                    Ok(permit) => Arc::new(permit),
+                    Err(_) => break,
+                };
                 if b.ops.len() > MAX_WIRE_BATCH_ITEMS {
                     tracing::warn!(item_count = b.ops.len(), "replication batch is too large");
                     break;
@@ -1161,8 +1167,14 @@ pub(super) async fn handle_connection(
                             failure = Some(error.to_string());
                             break;
                         }
-                        if let Err(error) =
-                            call_apply(actor, replicated, OpPriority::Default, true).await
+                        if let Err(error) = call_apply_retained(
+                            actor,
+                            replicated,
+                            OpPriority::Default,
+                            true,
+                            Some(apply_retention.clone()),
+                        )
+                        .await
                         {
                             failure = Some(error.to_string());
                             break;
@@ -1182,8 +1194,12 @@ pub(super) async fn handle_connection(
                                 | ReplicationAckDurability::StableCommitted),
                             ),
                         ) => {
-                            match flush_fence(actor.as_ref().expect("validated actor"), required)
-                                .await
+                            match flush_fence_retained(
+                                actor.as_ref().expect("validated actor"),
+                                required,
+                                Some(apply_retention.clone()),
+                            )
+                            .await
                             {
                                 Ok(durability) => Some(durability),
                                 Err(error) => {
@@ -1772,6 +1788,10 @@ pub(super) async fn handle_connection(
                 }
             }
             Some(EnvelopeMsg::ReconcileData(d)) => {
+                let apply_retention: Arc<dyn Send + Sync> = match receive_apply_gate.try_enter() {
+                    Ok(permit) => Arc::new(permit),
+                    Err(_) => break,
+                };
                 if d.entries.len() > MAX_RECONCILE_PAGE_ITEMS {
                     tracing::warn!(
                         item_count = d.entries.len(),
@@ -1801,15 +1821,18 @@ pub(super) async fn handle_connection(
                     }
                     if let Some(tx) = sender {
                         let (connection_valid, validation) = oneshot::channel();
-                        match tx.send(SenderMsg::ReconcileData {
-                            session_id: d.session_id,
-                            round_id: d.round_id,
-                            chunk_seq: d.chunk_seq,
-                            page_seq: d.page_seq,
-                            done: d.done,
-                            entries: d.entries,
-                            connection_valid,
-                        }) {
+                        match tx.send_retained(
+                            SenderMsg::ReconcileData {
+                                session_id: d.session_id,
+                                round_id: d.round_id,
+                                chunk_seq: d.chunk_seq,
+                                page_seq: d.page_seq,
+                                done: d.done,
+                                entries: d.entries,
+                                connection_valid,
+                            },
+                            apply_retention,
+                        ) {
                             Ok(()) => {}
                             Err(NodeSenderSendError::Closed) => {
                                 let still_current =
@@ -2451,23 +2474,6 @@ pub(super) async fn handle_connection(
                 if tx.capabilities & CAPABILITY_QUERY_PAGES == 0 {
                     break;
                 }
-                let retention = match query::reserve_inbound(&query_admission, &req) {
-                    Ok(retention) => retention,
-                    Err(error) => {
-                        let page = crate::query::page_error(
-                            &req,
-                            crate::proto::QueryPageStatus::Backpressure,
-                            error.to_string(),
-                        );
-                        let _ = try_send_envelope_until(
-                            &tx,
-                            crate::query::page_envelope(page),
-                            deadline_after(runtime_options.queue_admission_timeout),
-                        )
-                        .await;
-                        continue;
-                    }
-                };
                 let operation = match operation_gate.try_enter() {
                     Ok(operation) => operation,
                     Err(_) => {
@@ -2485,6 +2491,27 @@ pub(super) async fn handle_connection(
                         continue;
                     }
                 };
+                // Rejected post-cutoff traffic must not retain query runtime
+                // reservations while its unavailable reply waits on a socket.
+                let operation = Arc::new(operation);
+                let retention =
+                    match query::reserve_inbound(&query_admission, &req, operation.clone()) {
+                        Ok(retention) => retention,
+                        Err(error) => {
+                            let page = crate::query::page_error(
+                                &req,
+                                crate::proto::QueryPageStatus::Backpressure,
+                                error.to_string(),
+                            );
+                            let _ = try_send_envelope_until(
+                                &tx,
+                                crate::query::page_envelope(page),
+                                deadline_after(runtime_options.queue_admission_timeout),
+                            )
+                            .await;
+                            continue;
+                        }
+                    };
                 let Some(tasks) = tasks.upgrade() else {
                     break;
                 };
@@ -2532,16 +2559,6 @@ pub(super) async fn handle_connection(
                 if tx.capabilities & CAPABILITY_SCAN == 0 {
                     break;
                 }
-                let retention = match query_admission
-                    .reserve_work(req.encoded_len().saturating_add(1024), 48 * 1024 * 1024)
-                {
-                    Ok(retention) => retention,
-                    Err(error) => {
-                        scan::send_scan_response(&tx, req.req_id, Vec::new(), error.to_string())
-                            .await;
-                        continue;
-                    }
-                };
                 let operation = match operation_gate.try_enter() {
                     Ok(operation) => operation,
                     Err(_) => {
@@ -2552,6 +2569,19 @@ pub(super) async fn handle_connection(
                             "node is shutting down".into(),
                         )
                         .await;
+                        continue;
+                    }
+                };
+                let operation = Arc::new(operation);
+                let retention = match query_admission.reserve_work_retained(
+                    req.encoded_len().saturating_add(1024),
+                    48 * 1024 * 1024,
+                    Some(operation.clone()),
+                ) {
+                    Ok(retention) => retention,
+                    Err(error) => {
+                        scan::send_scan_response(&tx, req.req_id, Vec::new(), error.to_string())
+                            .await;
                         continue;
                     }
                 };
@@ -3174,6 +3204,7 @@ impl Node {
             tasks: Arc::downgrade(&self.tasks),
             read_service: self.read_service.clone(),
             operation_gate: self.operation_gate.clone(),
+            receive_apply_gate: self.receive_apply_gate.clone(),
             peer_changes: self.peer_changes.clone(),
             hlc: self.hlc.clone(),
             senders: self.senders.clone(),

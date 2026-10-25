@@ -348,7 +348,16 @@ async fn serve_connection(
                     | wire::request::Operation::BatchPut(_)
             )
         );
-        let mut response = if mutation {
+        // Node admission includes the response's ownership on this independent
+        // application listener, including a write blocked on the client socket.
+        let response_ownership = node.admit_client_request();
+        let mut response = if response_ownership.is_err() {
+            wire::Response {
+                id: request.id,
+                error: Some(error(wire::ErrorCode::Unavailable, "node is shutting down")),
+                ..Default::default()
+            }
+        } else if mutation {
             // This session is tracked by the listener and never aborted while
             // it owns an accepted mutation. Client deadlines may expire, but
             // apply/outcome/fan-out completion remains owned and gets joined.
@@ -386,6 +395,7 @@ async fn serve_connection(
             ),
         )
         .await;
+        drop(response_ownership);
         drop(permit);
         if !matches!(result, Ok(Some(()))) {
             return;
@@ -947,5 +957,174 @@ mod outcome_mapping_tests {
             result.error.unwrap().code,
             wire::ErrorCode::UnknownOutcome as i32
         );
+    }
+
+    async fn application_session(
+        node: Arc<Node>,
+    ) -> (BoxStream, JoinHandle<()>, watch::Sender<bool>) {
+        let (server, client) = tokio::io::duplex(256);
+        let (cancel, mut cancelled) = watch::channel(false);
+        let task = tokio::spawn(async move {
+            serve_connection(
+                node,
+                Box::pin(server),
+                ClientServerOptions::default(),
+                Arc::new(Semaphore::new(MAX_FRAME_BYTES)),
+                Arc::new(Semaphore::new(8)),
+                &mut cancelled,
+            )
+            .await;
+        });
+        let mut client: BoxStream = Box::pin(client);
+        let bytes = Arc::new(Semaphore::new(MAX_FRAME_BYTES));
+        send(
+            &mut client,
+            wire::Frame {
+                message: Some(wire::frame::Message::Hello(wire::Hello {
+                    identity: "drain-client".into(),
+                    challenge: vec![1; 32],
+                    min_version: CLIENT_PROTOCOL_VERSION,
+                    max_version: CLIENT_PROTOCOL_VERSION,
+                    capabilities: CLIENT_CAPABILITIES,
+                })),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            receive(&mut client, MAX_FRAME_BYTES, &bytes)
+                .await
+                .unwrap()
+                .0
+                .message,
+            Some(wire::frame::Message::Hello(_))
+        ));
+        send(
+            &mut client,
+            wire::Frame {
+                message: Some(wire::frame::Message::Auth(wire::Auth { proof: Vec::new() })),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            receive(&mut client, MAX_FRAME_BYTES, &bytes)
+                .await
+                .unwrap()
+                .0
+                .message,
+            Some(wire::frame::Message::Auth(_))
+        ));
+        (client, task, cancel)
+    }
+
+    #[tokio::test]
+    async fn request_drain_waits_for_accepted_application_response_socket_failure() {
+        use crate::node::{DrainError, DrainOptions, NodeConfig};
+        let node = Arc::new(
+            Node::start(
+                "response-drain".into(),
+                "127.0.0.1:0".parse().unwrap(),
+                NodeConfig::default(),
+            )
+            .await
+            .unwrap(),
+        );
+        node.table("kv")
+            .unwrap()
+            .put("wide", vec![3; 4096])
+            .await
+            .unwrap();
+        let (mut client, session, _cancel) = application_session(node.clone()).await;
+        send(
+            &mut client,
+            wire::Frame {
+                message: Some(wire::frame::Message::Request(wire::Request {
+                    id: 1,
+                    table: "kv".into(),
+                    operation: Some(wire::request::Operation::Get(wire::Get {
+                        key: "wide".into(),
+                        ..Default::default()
+                    })),
+                })),
+            },
+        )
+        .await
+        .unwrap();
+        // The complete value cannot fit in the unconsumed socket. Wait until
+        // the Node/table/actor read slots leave only response ownership.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let diagnostics = node.drain_diagnostics();
+                if diagnostics.accepted_requests() >= 4
+                    && node.drain_status().active_requests() == 1
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(matches!(
+            node.drain_requests(DrainOptions::default().with_timeout(Duration::from_millis(20)))
+                .await,
+            Err(DrainError::Timeout { .. })
+        ));
+        drop(client);
+        tokio::time::timeout(Duration::from_secs(2), session)
+            .await
+            .unwrap()
+            .unwrap();
+        node.drain_requests(DrainOptions::default()).await.unwrap();
+        assert_eq!(node.drain_status().active_requests(), 0);
+        node.finish_shutdown(DrainOptions::default()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn post_cutoff_application_request_returns_unavailable_without_admission() {
+        use crate::node::{DrainOptions, NodeConfig};
+        let node = Arc::new(
+            Node::start(
+                "rejected-drain".into(),
+                "127.0.0.1:0".parse().unwrap(),
+                NodeConfig::default(),
+            )
+            .await
+            .unwrap(),
+        );
+        let (mut client, session, _cancel) = application_session(node.clone()).await;
+        node.begin_drain();
+        send(
+            &mut client,
+            wire::Frame {
+                message: Some(wire::frame::Message::Request(wire::Request {
+                    id: 2,
+                    table: "kv".into(),
+                    operation: Some(wire::request::Operation::Get(wire::Get {
+                        key: "late".into(),
+                        ..Default::default()
+                    })),
+                })),
+            },
+        )
+        .await
+        .unwrap();
+        let bytes = Arc::new(Semaphore::new(MAX_FRAME_BYTES));
+        let response = receive(&mut client, MAX_FRAME_BYTES, &bytes)
+            .await
+            .unwrap()
+            .0;
+        assert!(
+            matches!(response.message, Some(wire::frame::Message::Response(wire::Response {
+            error: Some(wire::Error { code, .. }), ..
+        })) if code == wire::ErrorCode::Unavailable as i32)
+        );
+        assert_eq!(node.drain_status().active_requests(), 0);
+        assert!(node.drain_diagnostics().rejected_requests() > 0);
+        node.drain_requests(DrainOptions::default()).await.unwrap();
+        drop(client);
+        session.await.unwrap();
+        node.finish_shutdown(DrainOptions::default()).await.unwrap();
     }
 }
