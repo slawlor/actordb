@@ -12,7 +12,7 @@
 //! their separate per-connection limits.
 
 use std::collections::HashSet;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex as StdMutex, RwLock};
 
 use ractor::{rpc::CallResult, ActorRef};
 use tokio::sync::{mpsc, watch, Mutex, OwnedSemaphorePermit, Semaphore};
@@ -26,8 +26,8 @@ use prost::Message;
 
 use super::{
     batch_get_response_base_encoded_len, batch_get_response_envelope_encoded_len,
-    send_batch_get_response, send_envelope, FragmentId, FragmentRouter, PeerChannel,
-    WIRE_BATCH_PAGE_BYTES,
+    send_batch_get_response, send_envelope, FragmentId, FragmentRouter, OperationGate,
+    OperationPermit, PeerChannel, WIRE_BATCH_PAGE_BYTES,
 };
 
 pub(super) const READ_WORKERS_PER_PRIORITY: usize = 8;
@@ -37,6 +37,7 @@ pub(super) const READ_KEY_BYTE_CAPACITY: usize = 64 * 1024 * 1024;
 struct ReadRetention {
     _count: OwnedSemaphorePermit,
     _key_bytes: OwnedSemaphorePermit,
+    _operation: Option<OperationPermit>,
 }
 
 struct ReadLane {
@@ -47,6 +48,7 @@ struct ReadLane {
 
 pub(super) struct ReadService {
     lanes: [ReadLane; 3],
+    operation_gate: StdMutex<Option<Arc<OperationGate>>>,
 }
 
 pub(super) struct ReadRoute {
@@ -190,6 +192,9 @@ impl ReadJob {
 }
 
 impl ReadService {
+    pub(super) fn bind_operation_gate(&self, gate: Arc<OperationGate>) {
+        *self.operation_gate.lock().unwrap() = Some(gate);
+    }
     pub(super) async fn start(
         tasks: &RuntimeTasks,
         queue_capacity: usize,
@@ -217,12 +222,20 @@ impl ReadService {
         }
         Some(Arc::new(Self {
             lanes: lanes.try_into().ok().expect("three read lanes"),
+            operation_gate: StdMutex::new(None),
         }))
     }
 
     /// Never wait on the socket reader. Only genuine capacity exhaustion
     /// reports shed; closed services and already-expired jobs are unavailable.
     pub(super) fn try_submit(&self, mut job: ReadJob) -> bool {
+        let operation = match self.operation_gate.lock().unwrap().as_ref() {
+            Some(gate) => match gate.try_enter() {
+                Ok(operation) => Some(operation),
+                Err(_) => return job.reject(false),
+            },
+            None => None,
+        };
         if Instant::now() >= job.deadline {
             return job.reject(false);
         }
@@ -248,6 +261,7 @@ impl ReadService {
         job.retention = Some(Arc::new(ReadRetention {
             _count: count,
             _key_bytes: key_bytes,
+            _operation: operation,
         }));
         match lane.jobs.try_send(job) {
             Ok(()) => true,
@@ -559,7 +573,13 @@ mod tests {
             .try_into()
             .ok()
             .unwrap();
-        (ReadService { lanes }, receivers)
+        (
+            ReadService {
+                lanes,
+                operation_gate: StdMutex::new(None),
+            },
+            receivers,
+        )
     }
 
     async fn response(rx: &mut mpsc::Receiver<crate::wire::BudgetedFrame>) -> Envelope {

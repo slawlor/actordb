@@ -234,6 +234,7 @@ pub(super) const NODE_RUNNING: u8 = 0;
 pub(super) const NODE_QUIESCING: u8 = 1;
 
 pub(super) const NODE_STOPPED: u8 = 2;
+pub(super) const NODE_DRAINED: u8 = 3;
 
 /// One-way admission fence for public Node operations. Admission is a
 /// lock-free check/increment/recheck sequence, so shutdown cannot miss a
@@ -242,6 +243,15 @@ pub(super) struct OperationGate {
     pub(super) phase: AtomicU8,
     pub(super) active: AtomicUsize,
     pub(super) drained: Notify,
+    pub(super) accepted: AtomicU64,
+    pub(super) completed: AtomicU64,
+    pub(super) rejected: AtomicU64,
+    pub(super) drain_started: AtomicU64,
+    pub(super) drain_completed: AtomicU64,
+    pub(super) drain_timed_out: AtomicU64,
+    pub(super) drain_failed: AtomicU64,
+    pub(super) drain_cancelled: AtomicU64,
+    pub(super) drain_duration_nanos: AtomicU64,
 }
 
 impl OperationGate {
@@ -250,11 +260,21 @@ impl OperationGate {
             phase: AtomicU8::new(NODE_RUNNING),
             active: AtomicUsize::new(0),
             drained: Notify::new(),
+            accepted: AtomicU64::new(0),
+            completed: AtomicU64::new(0),
+            rejected: AtomicU64::new(0),
+            drain_started: AtomicU64::new(0),
+            drain_completed: AtomicU64::new(0),
+            drain_timed_out: AtomicU64::new(0),
+            drain_failed: AtomicU64::new(0),
+            drain_cancelled: AtomicU64::new(0),
+            drain_duration_nanos: AtomicU64::new(0),
         })
     }
 
     pub(super) fn try_enter(self: &Arc<Self>) -> Result<OperationPermit, NodeError> {
         if self.phase.load(Ordering::SeqCst) != NODE_RUNNING {
+            self.rejected.fetch_add(1, Ordering::Relaxed);
             return Err(NodeError::ShuttingDown);
         }
         self.finish_enter_after_running_check()
@@ -272,9 +292,11 @@ impl OperationGate {
     ) -> Result<OperationPermit, NodeError> {
         self.active.fetch_add(1, Ordering::SeqCst);
         if self.phase.load(Ordering::SeqCst) == NODE_RUNNING {
+            self.accepted.fetch_add(1, Ordering::Relaxed);
             return Ok(OperationPermit { gate: self.clone() });
         }
         self.release();
+        self.rejected.fetch_add(1, Ordering::Relaxed);
         Err(NodeError::ShuttingDown)
     }
 
@@ -311,12 +333,13 @@ impl OperationGate {
     }
 }
 
-pub(super) struct OperationPermit {
+pub(crate) struct OperationPermit {
     pub(super) gate: Arc<OperationGate>,
 }
 
 impl Drop for OperationPermit {
     fn drop(&mut self) {
+        self.gate.completed.fetch_add(1, Ordering::Relaxed);
         self.gate.release();
     }
 }
@@ -559,6 +582,7 @@ impl Drop for Node {
         // Async cleanup still belongs to `shutdown`, but never leave task
         // admission open merely because a caller dropped the handle.
         self.operation_gate.begin_shutdown();
+        self.receive_apply_gate.begin_shutdown();
         self.mutation_service.request_shutdown();
         self.embedded_operations.request_shutdown();
         self.placement_tasks.request_shutdown();
@@ -1503,6 +1527,7 @@ impl Node {
             supervisor_stops: supervisor_stops.clone(),
             fragment_map: fragment_map.clone(),
             placement_states: placement_states.clone(),
+            placement_generation: Arc::new(AtomicU64::new(0)),
             placement_controller: config.placement_controller.clone(),
             placement_poll_interval: config.placement_poll_interval,
             members: config.members.clone(),
@@ -1560,12 +1585,15 @@ impl Node {
             dial_intent_changes,
             peer_changes,
             operation_gate: OperationGate::new(),
+            receive_apply_gate: OperationGate::new(),
             shutdown_state: Mutex::new(ShutdownProgress::Running),
             replication_drain_report: StdMutex::new(None),
             network: config.network.clone(),
             ttl_expiry,
             store_binding: StdMutex::new(store_binding.transfer_to_node()),
         };
+        node.read_service
+            .bind_operation_gate(node.operation_gate.clone());
 
         if !node
             .tasks
@@ -1614,7 +1642,7 @@ impl Node {
                 supervisor_stops: supervisor_stops.clone(),
                 placement_states: placement_states.clone(),
                 preloaded_fragments,
-                placement_generation: Arc::new(AtomicU64::new(0)),
+                placement_generation: node.placement_generation.clone(),
                 senders: node.senders.clone(),
                 finalizing_senders: node.finalizing_senders.clone(),
                 retiring_senders: node.retiring_senders.clone(),
@@ -1875,6 +1903,9 @@ impl Node {
         progress: &mut ShutdownProgress,
     ) -> Result<(), NodeError> {
         if matches!(progress, ShutdownProgress::StoppingTransport) {
+            // Admission and actor-owned completion are separate from socket
+            // lifetime: a decoded page may still be queued inside a sender.
+            self.receive_apply_gate.begin_shutdown();
             self.mutation_service.request_shutdown();
             self.embedded_operations.request_shutdown();
             // Placement owns fragment and sender topology. Join it before the
@@ -1887,6 +1918,9 @@ impl Node {
             // fragment actor is still alive. A canceled caller may resume this.
             self.mutation_service.shutdown().await;
             self.embedded_operations.shutdown().await;
+            while self.query_admission.diagnostics().reserved_runtime_bytes != 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
 
             // Release every request/relay waiter retained by a cancelled
             // handler. Admitted remote operations then leave the public gate
@@ -1924,6 +1958,7 @@ impl Node {
             });
 
             self.operation_gate.wait_for_drain().await;
+            self.receive_apply_gate.wait_for_drain().await;
 
             let senders: Vec<NodeSender> = self.senders.lock().await.values().cloned().collect();
             for sender in senders {
@@ -2031,6 +2066,7 @@ impl Node {
             let store_binding = self.store_binding.lock().unwrap().take();
             drop(store_binding);
             self.operation_gate.finish_shutdown();
+            self.receive_apply_gate.finish_shutdown();
             *progress = ShutdownProgress::Stopped;
         }
         Ok(())
@@ -2040,7 +2076,9 @@ impl Node {
     ///
     /// Shutdown is one-way: it first rejects new public operations, closes and
     /// joins Node-owned runtime tasks, waits for already-admitted public work,
-    /// and stops replication senders. It then quiesces every fragment before
+    /// and joins decoded replication receive/apply work (including actor RPCs
+    /// whose waiter was cancelled) before stopping replication senders. It
+    /// then quiesces every fragment before
     /// stopping any supervisor. A failed store flush leaves the fragment state
     /// and retryable batch owned by its supervisor; this method returns the
     /// error and a later call resumes shutdown. Only a successful return drops
@@ -2052,6 +2090,7 @@ impl Node {
     /// a timed-out or cancelled replication drain explicitly abandons that
     /// remote guarantee and completes the local-only shutdown.
     pub async fn shutdown(&self) -> Result<(), NodeError> {
+        self.begin_drain();
         let mut progress = self.shutdown_state.lock().await;
         if matches!(*progress, ShutdownProgress::Stopped) {
             return Ok(());

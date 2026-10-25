@@ -116,7 +116,11 @@ use relay::{relay_key_storage_bytes, GetRelay};
 mod placement;
 use placement::{placement_driver, PlacementDriverDeps, BOOTSTRAP_TIMEOUT};
 
+pub mod drain;
 mod lifecycle;
+pub use drain::{DrainDiagnostics, DrainError, DrainOptions, DrainPhase, DrainReport, DrainStatus};
+pub mod metrics;
+pub mod status;
 #[cfg(test)]
 use lifecycle::spawn_fragment_subtree;
 pub use lifecycle::FragmentRouter;
@@ -461,13 +465,26 @@ async fn call_apply(
     priority: OpPriority,
     is_replication: bool,
 ) -> Result<ApplyOutcome, NodeError> {
+    call_apply_retained(actor, op, priority, is_replication, None).await
+}
+
+async fn call_apply_retained(
+    actor: &ActorRef<KvMessage>,
+    op: ReplicatedOp,
+    priority: OpPriority,
+    is_replication: bool,
+    retention: Option<Arc<dyn Send + Sync>>,
+) -> Result<ApplyOutcome, NodeError> {
     match actor
         .call(
-            |reply| KvMessage::ApplyOp {
-                op,
-                priority,
-                is_replication,
-                reply: Some(reply),
+            |reply| {
+                KvMessage::ApplyOp {
+                    op,
+                    priority,
+                    is_replication,
+                    reply: Some(reply),
+                }
+                .with_optional_retention(retention)
             },
             None,
         )
@@ -488,15 +505,16 @@ async fn call_apply(
     }
 }
 
-async fn flush_fence(
+async fn flush_fence_retained(
     actor: &ActorRef<KvMessage>,
     required: ReplicationAckDurability,
+    retention: Option<Arc<dyn Send + Sync>>,
 ) -> Result<ApplyDurability, NodeError> {
     let result = match required {
         ReplicationAckDurability::StableCommitted => {
             actor
                 .call(
-                    |reply| KvMessage::FlushStable { reply },
+                    |reply| KvMessage::FlushStable { reply }.with_optional_retention(retention),
                     Some(Duration::from_secs(30)),
                 )
                 .await
@@ -504,7 +522,7 @@ async fn flush_fence(
         ReplicationAckDurability::MemoryApplied | ReplicationAckDurability::StoreCommitted => {
             actor
                 .call(
-                    |reply| KvMessage::Flush { reply },
+                    |reply| KvMessage::Flush { reply }.with_optional_retention(retention),
                     Some(Duration::from_secs(30)),
                 )
                 .await
@@ -1176,6 +1194,8 @@ pub struct Node {
     /// Per-fragment placement lifecycle (Phase 8; all Serving in
     /// static mode).
     placement_states: Arc<Mutex<HashMap<FragmentId, FragmentPlacementState>>>,
+    /// Shared generation of the authoritative placement map.
+    placement_generation: Arc<AtomicU64>,
     /// Placement controller (Phase 8). `None` = static placement.
     placement_controller: Option<Arc<dyn PlacementController>>,
     /// How often the placement driver re-evaluates (Phase 8).
@@ -1244,6 +1264,7 @@ pub struct Node {
     dial_intent_changes: watch::Sender<u64>,
     peer_changes: watch::Sender<u64>,
     operation_gate: Arc<OperationGate>,
+    receive_apply_gate: Arc<OperationGate>,
     shutdown_state: Mutex<ShutdownProgress>,
     replication_drain_report: StdMutex<Option<ReplicationDrainReport>>,
     network: Arc<dyn Network>,

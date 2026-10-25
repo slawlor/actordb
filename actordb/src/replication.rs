@@ -502,6 +502,7 @@ impl std::ops::DerefMut for RetainedOp {
 struct RetainedControl {
     msg: SenderMsg,
     lease: RetentionLease,
+    apply_retention: Option<Arc<dyn Send + Sync>>,
 }
 fn retained_control_bytes(msg: &SenderMsg) -> usize {
     let owned = match msg {
@@ -849,6 +850,26 @@ impl NodeSender {
     }
 
     fn send_control(&self, control: SenderMsg) -> Result<(), NodeSenderSendError> {
+        self.send_control_retained(control, None)
+    }
+
+    /// Retain decoded receive ownership through queueing and actual actor apply.
+    pub(crate) fn send_retained(
+        &self,
+        control: SenderMsg,
+        retention: Arc<dyn Send + Sync>,
+    ) -> Result<(), NodeSenderSendError> {
+        if self.is_closed() {
+            return Err(NodeSenderSendError::Closed);
+        }
+        self.send_control_retained(control, Some(retention))
+    }
+
+    fn send_control_retained(
+        &self,
+        control: SenderMsg,
+        apply_retention: Option<Arc<dyn Send + Sync>>,
+    ) -> Result<(), NodeSenderSendError> {
         let Some(lease) = self
             .ingress
             .retention
@@ -860,6 +881,7 @@ impl NodeSender {
         match self.control_tx.try_send(RetainedControl {
             msg: control,
             lease,
+            apply_retention,
         }) {
             Ok(()) => Ok(()),
             Err(mpsc::error::TrySendError::Full(_)) => Err(NodeSenderSendError::Full),
@@ -1888,6 +1910,7 @@ async fn sender_task(
                 let mut overflow = None;
                 let mut retained_enqueue = None;
                 let mut control_lease = None;
+                let mut apply_retention = None;
                 let mut byte_overflow = false;
                 let mut budgeted_peer = None;
                 let msg = match input {
@@ -1898,7 +1921,11 @@ async fn sender_task(
                         }
                         Some(msg)
                     },
-                    SenderInput::Control(control) => { control_lease = Some(control.lease); Some(control.msg) },
+                    SenderInput::Control(control) => {
+                        control_lease = Some(control.lease);
+                        apply_retention = control.apply_retention;
+                        Some(control.msg)
+                    },
                     SenderInput::Data(op, ingress) => {
                         publish_data_completion = Some(ingress);
                         retained_enqueue = Some(op);
@@ -2888,7 +2915,7 @@ async fn sender_task(
                             local_reconcile_flush_pending = true;
                         }
                         received_keys.extend(entries.iter().map(|entry| entry.key.clone()));
-                        if apply_reconcile_entries(fragment, &deps.router, entries, runtime.local_work_timeout)
+                        if apply_reconcile_entries(fragment, &deps.router, entries, runtime.local_work_timeout, apply_retention.clone())
                             .await
                             .is_err()
                         {
@@ -4070,6 +4097,7 @@ async fn apply_reconcile_entries(
     router: &FragmentRouter,
     entries: Vec<SyncEntry>,
     timeout: Duration,
+    retention: Option<Arc<dyn Send + Sync>>,
 ) -> Result<(), ReconcileError> {
     let deadline = deadline_after(timeout);
     let actor = router
@@ -4095,11 +4123,14 @@ async fn apply_reconcile_entries(
         }
         match actor
             .call(
-                |reply| KvMessage::ApplyOp {
-                    op,
-                    priority: OpPriority::Default,
-                    is_replication: true,
-                    reply: Some(reply),
+                |reply| {
+                    KvMessage::ApplyOp {
+                        op,
+                        priority: OpPriority::Default,
+                        is_replication: true,
+                        reply: Some(reply),
+                    }
+                    .with_optional_retention(retention.clone())
                 },
                 Some(deadline.saturating_duration_since(Instant::now())),
             )

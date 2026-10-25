@@ -145,9 +145,10 @@ impl Node {
         plan: &QueryPlan,
         options: QueryOptions,
     ) -> Result<(QueryResult, u64), QueryExecutionError> {
-        let _operation = self
-            .admit_operation()
-            .map_err(|_| QueryExecutionError::ShuttingDown)?;
+        let operation = Arc::new(
+            self.admit_operation()
+                .map_err(|_| QueryExecutionError::ShuttingDown)?,
+        );
         plan.validate()?;
         let deadline = Instant::now()
             .checked_add(options.timeout)
@@ -173,7 +174,7 @@ impl Node {
                 "query text exceeds 1 MiB".into(),
             ));
         }
-        let retention = self.query_admission.reserve_work(
+        let retention = self.query_admission.reserve_work_retained(
             sql.len().saturating_mul(4).saturating_add(1024),
             options
                 .max_result_bytes
@@ -181,6 +182,7 @@ impl Node {
                 .ok_or_else(|| {
                     QueryExecutionError::BudgetExceeded("query runtime reservation overflow".into())
                 })?,
+            Some(operation.clone()),
         )?;
         if plan.fragments.as_ref().is_some_and(|ids| {
             ids.iter()
@@ -912,6 +914,7 @@ pub(super) async fn serve_query_page(
 pub(super) fn reserve_inbound(
     admission: &QueryAdmission,
     request: &QueryPageRequest,
+    operation: Arc<dyn Send + Sync>,
 ) -> Result<Arc<QueryRetention>, QueryExecutionError> {
     if request.sql.len() > 1024 * 1024 {
         return Err(QueryExecutionError::BudgetExceeded(
@@ -928,7 +931,7 @@ pub(super) fn reserve_inbound(
             "invalid page byte budget".into(),
         ));
     }
-    admission.reserve_work(
+    admission.reserve_work_retained(
         request
             .sql
             .capacity()
@@ -936,6 +939,7 @@ pub(super) fn reserve_inbound(
             .saturating_add(request.after_key.capacity())
             .saturating_add(1024),
         page_bytes.saturating_mul(32).saturating_add(4096),
+        Some(operation),
     )
 }
 
@@ -987,15 +991,15 @@ mod page_validation_tests {
             sql: "SELECT key FROM kv".into(),
             ..Default::default()
         };
-        let first = reserve_inbound(&admission, &request).unwrap();
-        assert!(reserve_inbound(&admission, &request).is_err());
+        let first = reserve_inbound(&admission, &request, Arc::new(())).unwrap();
+        assert!(reserve_inbound(&admission, &request, Arc::new(())).is_err());
         assert_eq!(
             admission.diagnostics().reserved_runtime_bytes,
             32 * 1024 + 4096
         );
         drop(first);
         assert_eq!(admission.diagnostics().reserved_runtime_bytes, 0);
-        assert!(reserve_inbound(&admission, &request).is_ok());
+        assert!(reserve_inbound(&admission, &request, Arc::new(())).is_ok());
     }
 
     fn page() -> (QueryPageRequest, QueryPlan, QueryPageResponse) {
