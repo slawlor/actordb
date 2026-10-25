@@ -1135,7 +1135,18 @@ mod tests {
         service.submit(job);
         let completion = response.await.unwrap();
         assert_unavailable(&completion.response, 430, &keys, "shutting down");
-        gate.wait_for_drain().await;
+        // Rejected responses retain request ownership through send or drop.
+        // Waiting for that same ownership while keeping the response alive
+        // would make this fixture wait on itself indefinitely.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), gate.wait_for_drain())
+                .await
+                .is_err()
+        );
+        drop(completion);
+        tokio::time::timeout(Duration::from_secs(2), gate.wait_for_drain())
+            .await
+            .unwrap();
         drop(authority.write_owned().await);
         assert!(state.get_all().await.is_empty());
         capacity_restored(&service, 1, 1).await;
@@ -1546,7 +1557,15 @@ mod tests {
             rejected.response.results[0].status,
             MutationStatus::Unavailable as i32
         );
-        gate.wait_for_drain().await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), gate.wait_for_drain())
+                .await
+                .is_err()
+        );
+        drop(rejected);
+        tokio::time::timeout(Duration::from_secs(2), gate.wait_for_drain())
+            .await
+            .unwrap();
         drop(authority.write_owned().await);
         assert!(state.get("key").await.is_none());
         capacity_restored(&service, 1, 4096).await;
