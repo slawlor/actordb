@@ -30,6 +30,9 @@ const FORMAT_MAGIC: &[u8; 8] = b"ACTCP001";
 #[non_exhaustive]
 pub enum CheckpointError {
     Unsupported,
+    /// The stopped Node no longer owns its physical backend. Retain the
+    /// caller's store Arc through post-shutdown export, or open it offline.
+    BackendReleased,
     Invalid(String),
     Store(StoreError),
     Io(std::io::Error),
@@ -41,6 +44,7 @@ impl fmt::Display for CheckpointError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Unsupported => f.write_str("store does not support durable bounded checkpoints"),
+            Self::BackendReleased => f.write_str("checkpoint backend was released by shutdown; retain the store Arc for export or reopen it offline"),
             Self::Invalid(message) => write!(f, "invalid checkpoint: {message}"),
             Self::Store(error) => error.fmt(f),
             Self::Io(error) => error.fmt(f),

@@ -404,7 +404,7 @@ async fn legacy_to_native_pending_fence_never_certifies_external_readiness() {
         "127.0.0.1:0".parse().unwrap(),
         NodeConfig::builder()
             .fragment_count(1)
-            .store(source_store)
+            .store(source_store.clone())
             .build(),
     )
     .await

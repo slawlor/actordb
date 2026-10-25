@@ -19,7 +19,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "127.0.0.1:0".parse()?,
         NodeConfig::builder()
             .fragment_count(1)
-            .store(source)
+            .store(source.clone())
             .build(),
     )
     .await?;

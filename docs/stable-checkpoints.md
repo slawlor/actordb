@@ -15,6 +15,14 @@ stable fence and native immutable snapshot are created. A positive stable fence
 is mandatory even when ordinary store commits are buffered. The exporter releases
 that binding after the durable immutable snapshot exists.
 
+Node keeps only a weak checkpoint handle so `shutdown()` releases its owned
+physical database and permits reopening the path while the stopped Node is still
+alive. Retain the caller's original `Arc<dyn KvStore>` through post-shutdown
+`Node::export_checkpoint`. Without a surviving store owner it returns explicit
+`CheckpointError::BackendReleased`; reopen the store and use the offline exporter
+instead. Once export starts, its blocking job owns the upgraded Arc and exclusive
+binding through snapshot creation even if its caller is cancelled.
+
 ```rust
 use actordb::checkpoint::CheckpointOptions;
 

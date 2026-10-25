@@ -21,6 +21,8 @@ impl Node {
     /// completion alone is not interpreted as stable media. A completed remote
     /// replication fence is attached separately when this node actually has it.
     /// Cancellation leaves the blocking exporter owning its work and leases.
+    /// Retain the caller's store Arc through this call: shutdown releases Node's
+    /// own backend ownership, and an expired handle returns `BackendReleased`.
     pub async fn export_checkpoint(
         &self,
         directory: impl AsRef<Path>,
@@ -34,8 +36,10 @@ impl Node {
         }
         let store = self
             .checkpoint_store
-            .clone()
-            .ok_or(CheckpointError::Unsupported)?;
+            .as_ref()
+            .ok_or(CheckpointError::Unsupported)?
+            .upgrade()
+            .ok_or(CheckpointError::BackendReleased)?;
         let identity = StoreIdentity::new(self.node_id.clone(), self.router.fragment_count as u32);
         let directory = directory.as_ref().to_path_buf();
         let resume = directory.join("export-state").exists();
@@ -139,11 +143,15 @@ impl Node {
                 "legacy external readiness is unavailable during native fencing/shutdown".into(),
             ));
         }
-        let store = self.checkpoint_store.as_ref().ok_or_else(|| {
-            MembershipError::InsufficientEvidence(
-                "target has no durable checkpoint-capable store".into(),
-            )
-        })?;
+        let store = self
+            .checkpoint_store
+            .as_ref()
+            .and_then(Weak::upgrade)
+            .ok_or_else(|| {
+                MembershipError::InsufficientEvidence(
+                    "target has no durable checkpoint-capable store".into(),
+                )
+            })?;
         let backend = store
             .checkpoint_backend()
             .ok_or(CheckpointError::Unsupported)?;

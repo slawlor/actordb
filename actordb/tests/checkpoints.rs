@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use actordb::actor::VersionedValue;
 use actordb::checkpoint::{
-    CheckpointExporter, CheckpointImporter, CheckpointManifest, CheckpointOptions,
+    CheckpointError, CheckpointExporter, CheckpointImporter, CheckpointManifest, CheckpointOptions,
 };
 use actordb::membership::{
     MembershipAuthority, MembershipPeerIdentity, MembershipStage, MembershipTransition,
@@ -23,6 +23,47 @@ use actordb::store::{KvStore, RocksDbStore, StoreIdentity};
 
 fn identity(id: &str) -> StoreIdentity {
     StoreIdentity::new(id.into(), 1)
+}
+
+#[tokio::test]
+async fn shutdown_releases_unretained_backend_while_stopped_node_remains_alive() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("source");
+    let store = Arc::new(RocksDbStore::open(&path).unwrap());
+    let weak = Arc::downgrade(&store);
+    let node = Node::start(
+        "source".into(),
+        "127.0.0.1:0".parse().unwrap(),
+        NodeConfig::builder().fragment_count(1).store(store).build(),
+    )
+    .await
+    .unwrap();
+    node.put("persisted".into(), vec![7]).await.unwrap();
+    node.shutdown().await.unwrap();
+    assert!(weak.upgrade().is_none());
+    assert!(matches!(
+        node.export_checkpoint(
+            directory.path().join("node-export"),
+            CheckpointOptions::default()
+        )
+        .await,
+        Err(CheckpointError::BackendReleased)
+    ));
+    let reopened = Arc::new(RocksDbStore::open(&path).unwrap());
+    let manifest = CheckpointExporter::open(
+        reopened,
+        identity("source"),
+        directory.path().join("offline-export"),
+        CheckpointOptions::default(),
+    )
+    .unwrap()
+    .finish()
+    .unwrap();
+    assert_eq!(manifest.records(), 1);
+    assert_eq!(
+        node.drain_status().phase(),
+        actordb::node::DrainPhase::Stopped
+    );
 }
 fn authority(
     epoch: [u8; 32],
@@ -315,7 +356,7 @@ async fn imported_historical_origins_survive_new_identity_and_node_export_requir
     let source = Arc::new(RocksDbStore::open(directory.path().join("source")).unwrap());
     let config = NodeConfig::builder()
         .fragment_count(1)
-        .store(source)
+        .store(source.clone())
         .build();
     let node = Node::start("old-writer".into(), "127.0.0.1:0".parse().unwrap(), config)
         .await
@@ -749,7 +790,7 @@ async fn export_distinguishes_local_stable_copy_from_exact_remote_ack_evidence()
         NodeConfig::builder()
             .fragment_count(1)
             .fragment_map(map.clone())
-            .store(source_store)
+            .store(source_store.clone())
             .build(),
     )
     .await

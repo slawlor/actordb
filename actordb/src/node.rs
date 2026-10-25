@@ -1307,9 +1307,9 @@ pub struct Node {
     /// releases it only after every fragment actor has stopped; cancellation
     /// and best-effort Drop leave managed backends fail-closed.
     store_binding: StdMutex<Option<StoreBinding>>,
-    /// Root store retained for explicit stopped-node checkpoint export and
-    /// import-floor certification. No additional live binding is created.
-    checkpoint_store: Option<Arc<dyn KvStore>>,
+    /// Observe the root store without extending its physical backend lifetime
+    /// beyond shutdown. Callers retain an Arc for post-shutdown export.
+    checkpoint_store: Option<Weak<dyn KvStore>>,
     recovery: Option<Arc<RecoveryContext>>,
 }
 

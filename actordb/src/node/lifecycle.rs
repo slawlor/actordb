@@ -1711,7 +1711,7 @@ impl Node {
             network: config.network.clone(),
             ttl_expiry,
             store_binding: StdMutex::new(store_binding.transfer_to_node()),
-            checkpoint_store: config.store.clone(),
+            checkpoint_store: config.store.as_ref().map(Arc::downgrade),
         };
         node.read_service
             .bind_operation_gate(node.operation_gate.clone());
