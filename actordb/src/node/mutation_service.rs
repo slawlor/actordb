@@ -573,7 +573,7 @@ async fn complete_job(
                     let fence = super::flush_fence_retained(
                         &actor,
                         pending.minimum_durability().into(),
-                        Some(_operation.clone()),
+                        Some(Arc::new((_operation.clone(), peer_work.clone()))),
                     )
                     .await;
                     let failure = match fence {
@@ -628,7 +628,7 @@ async fn complete_job(
                                 results: vec![result],
                             },
                             _retention: retention,
-                            _operation: Some(_operation.clone()),
+                            _operation: Some(_operation.as_ref().clone()),
                         },
                         _operation,
                     });
@@ -665,7 +665,7 @@ async fn complete_job(
     let _ = reply.send(MutationCompletion {
         response: MutationResponse { req_id, results },
         _retention: retention,
-        _operation: Some(_operation),
+        _operation: Some(_operation.as_ref().clone()),
     });
     None
 }

@@ -2038,6 +2038,10 @@ pub(super) async fn handle_connection(
                 }
             }
             Some(EnvelopeMsg::ForwardedGet(g)) => {
+                let operation = match operation_gate.try_enter() {
+                    Ok(operation) => operation,
+                    Err(_) => continue,
+                };
                 let deadline = deadline_after(runtime_options.forwarded_attempt_timeout);
                 // We serve this fragment: read it and reply on this
                 // connection. (A bootstrapping node is not yet
@@ -2047,7 +2051,7 @@ pub(super) async fn handle_connection(
                 let is_serving = serving.read().unwrap().contains(&frag);
                 if !is_serving {
                     if g.hops < MAX_FORWARD_HOPS {
-                        relay_get(&g, frag, &tx, &peer_node_id, &rfctx).await;
+                        relay_get(&g, frag, &tx, &peer_node_id, &rfctx, operation).await;
                     }
                     continue;
                 }
@@ -2143,7 +2147,7 @@ pub(super) async fn handle_connection(
                 };
                 if let Some(relay) = relay {
                     let _ = relay.timeout_cancel.send(());
-                    let _ = send_envelope(
+                    let _ = send_envelope_retained(
                         &relay.origin_tx,
                         Envelope {
                             msg: Some(EnvelopeMsg::GetResponse(GetResponse {
@@ -2151,6 +2155,7 @@ pub(super) async fn handle_connection(
                                 ..r
                             })),
                         },
+                        Some(Arc::new((relay._operation, relay._admission))),
                     );
                     continue;
                 }
@@ -2254,7 +2259,13 @@ pub(super) async fn handle_connection(
                 if let Some(relay) = relay {
                     let _ = relay.timeout_cancel.send(());
                     response.req_id = relay.origin_req_id;
-                    let _ = send_mutation_response(&relay.origin_tx, response);
+                    let _ = send_envelope_retained(
+                        &relay.origin_tx,
+                        Envelope {
+                            msg: Some(EnvelopeMsg::MutationResponse(response)),
+                        },
+                        Some(Arc::new((relay._operation, relay._admission))),
+                    );
                     continue;
                 }
 
@@ -3011,6 +3022,10 @@ pub(super) fn send_envelope_retained(
     envelope: Envelope,
     retention: Option<Arc<dyn Send + Sync>>,
 ) -> bool {
+    let retention: Option<Arc<dyn Send + Sync>> = match tx.work_retention.clone() {
+        Some(peer_work) => Some(Arc::new((retention, peer_work))),
+        None => retention,
+    };
     let encoded_len = match check_envelope_budget(&envelope, MAX_FRAME_BYTES) {
         Ok(encoded_len) => encoded_len,
         Err(error) => {
@@ -3174,7 +3189,8 @@ pub(super) async fn try_send_envelope_with_deadline(
     };
     frame_permit.send(
         BudgetedFrame::new_producer(frame, byte_permit, producer_byte_permit)
-            .with_global_permits(global_permits),
+            .with_global_permits(global_permits)
+            .with_completion_retention(tx.work_retention.clone()),
     );
     true
 }
@@ -4592,6 +4608,7 @@ mod tests {
             32,
             GetRelay {
                 expected_peer: "owner".to_string(),
+                _operation: None,
                 expected_tx,
                 expected_key: "key".to_string(),
                 origin_tx,

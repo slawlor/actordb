@@ -48,6 +48,7 @@ pub(super) struct GetRelay {
     pub(super) origin_req_id: u64,
     pub(super) timeout_cancel: oneshot::Sender<()>,
     pub(super) _admission: Arc<RelayLease>,
+    pub(super) _operation: Option<OperationPermit>,
 }
 
 pub(super) struct GetRelayRegistration {
@@ -57,6 +58,7 @@ pub(super) struct GetRelayRegistration {
     pub(super) origin_tx: PeerChannel,
     pub(super) origin_req_id: u64,
     pub(super) deadline: Instant,
+    pub(super) operation: Option<OperationPermit>,
 }
 
 pub(super) struct RelayAdmission {
@@ -459,6 +461,7 @@ pub(super) async fn register_get_relay(
         origin_tx,
         origin_req_id,
         deadline,
+        operation,
     } = registration;
     let (timeout_cancel, cancelled) = oneshot::channel();
     let mut owner_cancel = expected_tx.cancel.subscribe();
@@ -488,6 +491,7 @@ pub(super) async fn register_get_relay(
                 origin_req_id,
                 timeout_cancel,
                 _admission: lease.clone(),
+                _operation: operation,
             },
         );
     }
@@ -685,6 +689,7 @@ pub(super) async fn relay_get(
     origin_tx: &PeerChannel,
     peer_node_id: &Option<String>,
     ctx: &ReforwardCtx,
+    operation: OperationPermit,
 ) {
     let Some((owner, owner_tx)) = reforward_target(ctx, peer_node_id, frag).await else {
         return;
@@ -703,6 +708,7 @@ pub(super) async fn relay_get(
             origin_tx: origin_tx.clone(),
             origin_req_id: g.req_id,
             deadline: attempt_deadline,
+            operation: Some(operation),
         },
     )
     .await
@@ -876,6 +882,7 @@ mod tests {
                 expected_key: "key".to_string(),
                 origin_tx,
                 origin_req_id: 11,
+                operation: None,
                 deadline: Instant::now() + Duration::from_millis(10),
             },
         )
@@ -914,6 +921,7 @@ mod tests {
                 expected_key: "key".into(),
                 origin_tx: origin.clone(),
                 origin_req_id: 11,
+                operation: None,
                 deadline,
             },
         )
@@ -988,6 +996,7 @@ mod tests {
                     expected_key: "key".to_string(),
                     origin_tx: origin.clone(),
                     origin_req_id: id + 100,
+                    operation: None,
                     deadline: Instant::now() + Duration::from_secs(10),
                 },
             )
@@ -1048,6 +1057,7 @@ mod tests {
                 expected_key: "old".to_string(),
                 origin_tx: new_origin.clone(),
                 origin_req_id: 104,
+                operation: None,
                 deadline: Instant::now() + Duration::from_secs(10),
             },
         )
@@ -1066,6 +1076,7 @@ mod tests {
                 expected_key: "new".to_string(),
                 origin_tx: new_origin,
                 origin_req_id: 105,
+                operation: None,
                 deadline: Instant::now() + Duration::from_secs(10),
             },
         )
@@ -1129,6 +1140,7 @@ mod tests {
                 expected_key: "key".to_string(),
                 origin_tx: origin.clone(),
                 origin_req_id: 101,
+                operation: None,
                 deadline: Instant::now() + Duration::from_secs(10),
             },
         )
@@ -1295,6 +1307,7 @@ mod tests {
                 expected_key: "key".to_string(),
                 origin_tx: origin.clone(),
                 origin_req_id: 11,
+                operation: None,
                 deadline: Instant::now() + Duration::from_secs(10),
             }
         )
@@ -1353,6 +1366,7 @@ mod tests {
                 expected_key: "key".to_string(),
                 origin_tx: origin.clone(),
                 origin_req_id: 11,
+                operation: None,
                 deadline: Instant::now() + Duration::from_secs(10),
             },
         ));
