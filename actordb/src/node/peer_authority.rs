@@ -11,6 +11,10 @@
 use super::*;
 use ring::signature::{Ed25519KeyPair, KeyPair, UnparsedPublicKey, ED25519};
 
+/// Public-key tombstones are retained for the receiver's whole lifetime.
+/// Exhaustion rejects new keys before closing admission; no entry is evicted.
+pub const MAX_HISTORICAL_PEER_KEYS: usize = 65_536;
+
 /// One externally allocated process generation and its independent random key.
 #[derive(Clone, PartialEq, Eq)]
 pub struct PeerCredential {
@@ -262,6 +266,7 @@ pub struct PeerFenceStatus {
     completed_frames: u64,
     rejected_frames: u64,
     rejected_handshakes: u64,
+    historical_key_count: usize,
 }
 impl PeerFenceStatus {
     pub fn phase(&self) -> PeerFencePhase {
@@ -319,6 +324,12 @@ impl PeerFenceStatus {
     }
     pub fn rejected_handshakes(&self) -> u64 {
         self.rejected_handshakes
+    }
+    pub fn historical_key_count(&self) -> usize {
+        self.historical_key_count
+    }
+    pub fn historical_key_limit(&self) -> usize {
+        MAX_HISTORICAL_PEER_KEYS
     }
 }
 
@@ -542,6 +553,7 @@ struct AuthorityState {
     pending: Option<Arc<PendingFence>>,
     stopped: bool,
     high_water: HashMap<String, PeerIdentity>,
+    seen_public_keys: HashSet<[u8; 32]>,
     last_report: Option<PeerFenceReport>,
 }
 pub(super) struct PeerAuthority {
@@ -569,12 +581,17 @@ impl PeerAuthority {
             peers.insert(node_id.clone(), options.local.public_identity());
             peers
         });
+        let seen_public_keys = high_water
+            .values()
+            .map(|identity| identity.public_key)
+            .collect();
         Arc::new(Self {
             state: StdMutex::new(AuthorityState {
                 era: AuthorityEra::new(1, options),
                 pending: None,
                 stopped: false,
                 high_water,
+                seen_public_keys,
                 last_report: None,
             }),
             coordinator: Mutex::new(()),
@@ -694,6 +711,13 @@ impl PeerAuthority {
                 ));
             }
             let local = next.local.public_identity();
+            let new_keys = std::iter::once(&local)
+                .chain(next.peers.values())
+                .filter(|identity| !state.seen_public_keys.contains(&identity.public_key))
+                .count();
+            if state.seen_public_keys.len().saturating_add(new_keys) > MAX_HISTORICAL_PEER_KEYS {
+                return Err(PeerFenceError::InvalidOptions("peer authority historical public-key limit exhausted; key tombstones cannot be evicted".into()));
+            }
             for (id, credential) in
                 std::iter::once((&self.node_id, &local)).chain(next.peers.iter())
             {
@@ -707,11 +731,19 @@ impl PeerAuthority {
                     if credential == previous && still_present {
                         continue;
                     }
-                    if credential.generation <= previous.generation
-                        || credential.public_key == previous.public_key
-                    {
+                    if credential.generation <= previous.generation {
                         return Err(PeerFenceError::InvalidOptions("replaced or readded processes require a newer generation and a fresh independent key".into()));
                     }
+                }
+                // Any historical key, even one retired several rotations ago
+                // or formerly owned by another ID, grants its old signer the
+                // ability to impersonate this new generation. Only the exact
+                // unchanged current ID/generation exception above is allowed.
+                if state.seen_public_keys.contains(&credential.public_key) {
+                    return Err(PeerFenceError::InvalidOptions(
+                        "a historically admitted peer signing key cannot be reused or reassigned"
+                            .into(),
+                    ));
                 }
             }
             let old = state.era.clone();
@@ -799,6 +831,7 @@ impl PeerAuthority {
             completed_frames: self.completed_frames.load(Ordering::Relaxed),
             rejected_frames: self.rejected_frames.load(Ordering::Relaxed),
             rejected_handshakes: self.rejected_handshakes.load(Ordering::Relaxed),
+            historical_key_count: state.seen_public_keys.len(),
         }
     }
 }
@@ -937,7 +970,11 @@ impl Node {
             };
             for (id, credential) in &pending.next.peers {
                 state.high_water.insert(id.clone(), credential.clone());
+                state.seen_public_keys.insert(credential.public_key);
             }
+            state
+                .seen_public_keys
+                .insert(pending.next.local.public_identity().public_key);
             state
                 .high_water
                 .insert(self.node_id.clone(), pending.next.local.public_identity());
@@ -1799,5 +1836,117 @@ mod tests {
         );
         assert!(shared.validate().is_err());
         assert!(!format!("{:?}", credential(123, 73)).contains("73"));
+    }
+
+    #[tokio::test]
+    async fn signing_key_from_multiple_rotations_ago_cannot_be_reintroduced() {
+        let node = node(local_only()).await;
+        node.advance_peer_authority(
+            authority(Some(credential(2, 3))),
+            PeerFenceOptions::default(),
+        )
+        .await
+        .unwrap();
+        node.advance_peer_authority(
+            authority(Some(credential(3, 4))),
+            PeerFenceOptions::default(),
+        )
+        .await
+        .unwrap();
+        let before = node.peer_authority_snapshot().unwrap();
+        let old_key_with_new_generation = authority(Some(credential(4, 2)));
+        assert!(matches!(
+            node.begin_peer_fence(old_key_with_new_generation),
+            Err(PeerFenceError::InvalidOptions(_))
+        ));
+        assert_eq!(node.peer_authority_snapshot().unwrap(), before);
+        assert_eq!(node.peer_fence_status().phase(), PeerFencePhase::Ready);
+        assert_eq!(node.peer_fence_status().historical_key_count(), 4);
+        // Exact unchanged current identities remain eligible, while keys are
+        // never recycled after either a generation rotation or revocation.
+        let (current, task) = connection(&node, 3, 4).await;
+        established(&node, &task).await;
+        drop(current);
+        task.await.unwrap();
+        node.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn historical_signing_keys_cannot_be_reassigned_to_a_different_identity() {
+        let node = node(local_only()).await;
+        node.advance_peer_authority(
+            authority(Some(credential(2, 3))),
+            PeerFenceOptions::default(),
+        )
+        .await
+        .unwrap();
+        node.advance_peer_authority(authority(None), PeerFenceOptions::default())
+            .await
+            .unwrap();
+        let before = node.peer_authority_snapshot().unwrap();
+        for old_key in [2, 3] {
+            let renamed = PeerAuthorityOptions::new(
+                credential(1, 1),
+                HashMap::from([(
+                    "new-peer-id".into(),
+                    credential(99, old_key).public_identity(),
+                )]),
+            );
+            assert!(matches!(
+                node.begin_peer_fence(renamed),
+                Err(PeerFenceError::InvalidOptions(_))
+            ));
+            assert_eq!(node.peer_authority_snapshot().unwrap(), before);
+        }
+        // A former local signing key cannot become a newly named peer key.
+        let swapped_local = PeerAuthorityOptions::new(
+            credential(2, 5),
+            HashMap::from([("new-peer-id".into(), credential(99, 1).public_identity())]),
+        );
+        assert!(matches!(
+            node.begin_peer_fence(swapped_local),
+            Err(PeerFenceError::InvalidOptions(_))
+        ));
+        assert_eq!(node.peer_authority_snapshot().unwrap(), before);
+        node.shutdown().await.unwrap();
+    }
+
+    #[test]
+    fn historical_key_capacity_exhaustion_rejects_new_keys_without_evicting_tombstones() {
+        let registry = PeerAuthority::new("local".into(), Some(authority(Some(credential(1, 2)))));
+        let initial_key = credential(1, 2).public_identity().public_key;
+        {
+            let mut state = registry.state.lock().unwrap();
+            let mut value = 0u64;
+            while state.seen_public_keys.len() < MAX_HISTORICAL_PEER_KEYS {
+                let mut historical = [0; 32];
+                historical[..8].copy_from_slice(&value.to_be_bytes());
+                state.seen_public_keys.insert(historical);
+                value += 1;
+            }
+        }
+        assert!(matches!(
+            registry.begin(authority(Some(credential(2, 3)))),
+            Err(PeerFenceError::InvalidOptions(_))
+        ));
+        assert_eq!(registry.status().phase(), PeerFencePhase::Ready);
+        assert_eq!(
+            registry.status().historical_key_count(),
+            MAX_HISTORICAL_PEER_KEYS
+        );
+        assert!(registry
+            .state
+            .lock()
+            .unwrap()
+            .seen_public_keys
+            .contains(&initial_key));
+        // Revocation introduces no new trust key and must remain possible at
+        // capacity. It never makes historical keys available for future reuse.
+        registry.begin(authority(None)).unwrap();
+        assert_eq!(registry.status().phase(), PeerFencePhase::Fencing);
+        assert_eq!(
+            registry.status().historical_key_count(),
+            MAX_HISTORICAL_PEER_KEYS
+        );
     }
 }

@@ -64,13 +64,18 @@ Unchanged authorized peers may retain their identity/key; their old physical
 sessions are still retired and they reconnect under the new receiver policy.
 Changing the local signing key also requires a newer local generation.
 Readding a removed identity requires a newer generation and fresh key. The
-receiver remembers retired identities during its process lifetime and rejects
-rollbacks/key reuse. Persist the desired authority externally and supply it
-again on restart; a process-local revision is not a durable membership epoch.
+receiver remembers retired identities and every admitted public key during its
+process lifetime. A historical key can never be recycled, even after several
+rotations or under a different node ID. Only an exactly unchanged current
+identity/generation can retain its current key. Persist the desired authority
+and never-reuse key allocation history externally across receiver restarts;
+a process-local revision is not a durable membership epoch.
 
 The authority allows at most 1024 current peers and remembers at most 65536
-distinct historical identities. Advancing an existing identity's generation
-does not consume another historical identity slot. Policy validation occurs
+distinct historical identities and 65536 admitted public keys. Advancing an
+existing identity consumes a fresh key slot. Exhaustion rejects new keys before
+closing admission, never evicts tombstones, and still permits revocation with
+unchanged surviving keys. Policy validation occurs
 before the admission cutoff. An unchanged initial policy is rejected because
 it would revoke nothing. Repeating an already completed transition returns
 that transition's original report.
