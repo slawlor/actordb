@@ -1,4 +1,11 @@
 //! Per-write processing acknowledgements on the normal asynchronous sender path.
+//!
+//! Strict acknowledgement policies reject an operational cap that would lower
+//! the requested count before local apply admission. Placement, eligibility,
+//! region labels, and the accepted count remain frozen for each waiter.
+//! Acknowledgements describe processing of a mutation and preservation of an
+//! equal-or-newer LWW winner, with configured storage durability. They do not
+//! establish global ordering or guarantee that the submitted value stays live.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt;
@@ -246,6 +253,11 @@ impl WriteConcernTracker {
             requested,
             NonZeroU32::new(self.acknowledgement_cap.load(Ordering::Relaxed)),
         );
+        if options.strict_acknowledgements() && required < requested {
+            return Err(WriteConcernError::InvalidPolicy(format!(
+                "operational acknowledgement cap of {required} cannot satisfy strict requested count of {requested}"
+            )));
+        }
         let eligible: HashSet<_> = replicas
             .cloned()
             .unwrap_or_else(|| vec![self.receiver.clone()])
@@ -604,6 +616,55 @@ mod tests {
             Err(WriteConcernError::InvalidPolicy(_))
         ));
         assert_eq!(tracker.acknowledgement_cap(), Some(1));
+    }
+
+    #[tokio::test]
+    async fn strict_rejection_does_not_consume_waiter_capacity_or_change_captured_policy() {
+        let tracker = tracker();
+        let op = op();
+        let options = WriteConcernOptions::builder()
+            .concern(WriteConcern::Majority)
+            .strict_acknowledgements(true)
+            .build();
+        let pending = tracker.prepare(FragmentId(0), &op, &options).unwrap();
+        tracker.set_acknowledgement_cap(1).unwrap();
+        assert!(matches!(
+            tracker.prepare(FragmentId(0), &op, &options),
+            Err(WriteConcernError::InvalidPolicy(_))
+        ));
+        pending.applied_locally();
+        assert_eq!(pending.ticket.plan.required, 2);
+        tracker.acknowledge("b", FragmentId(0), std::slice::from_ref(&op));
+        let receipt = pending.wait().await.unwrap();
+        assert!(!receipt.was_overridden());
+
+        tracker.clear_acknowledgement_cap();
+        assert!(tracker.prepare(FragmentId(0), &op, &options).is_ok());
+        tracker.set_acknowledgement_cap(2).unwrap();
+        assert!(tracker.plan(FragmentId(0), &options).is_ok());
+    }
+
+    #[tokio::test]
+    async fn eligibility_remains_frozen_after_placement_changes() {
+        let tracker = tracker();
+        let op = op();
+        let options = WriteConcernOptions::builder()
+            .concern(WriteConcern::Majority)
+            .strict_acknowledgements(true)
+            .build();
+        let pending = tracker.prepare(FragmentId(0), &op, &options).unwrap();
+        tracker.placement.write().unwrap().insert(
+            FragmentId(0),
+            vec!["a".into(), "new-b".into(), "new-c".into()],
+        );
+        pending.applied_locally();
+        tracker.acknowledge("new-b", FragmentId(0), std::slice::from_ref(&op));
+        assert!(!pending.ticket.progress.lock().unwrap().complete);
+        tracker.acknowledge("b", FragmentId(0), &[op]);
+        assert_eq!(
+            pending.wait().await.unwrap().acknowledged_nodes(),
+            &["a", "b"]
+        );
     }
 
     #[tokio::test]

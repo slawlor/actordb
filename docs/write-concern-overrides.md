@@ -30,6 +30,39 @@ threshold for subsequent writes.
 
 ## Scope and reporting
 
+### Strict acknowledgement requirements
+
+Starting in `0.8.1`, an individual write can forbid a lowering cap:
+
+```rust
+use actordb::write_concern::{WriteConcern, WriteConcernOptions};
+
+let policy = WriteConcernOptions::builder()
+    .concern(WriteConcern::Majority)
+    .strict_acknowledgements(true)
+    .build();
+```
+
+The receiver rejects the policy before apply if its captured operational cap
+would reduce the requested threshold. A cap equal to or above that threshold
+is allowed. The default remains disclosed cap overrides. Changing a cap after
+a write captures its plan does not weaken that outstanding write.
+
+The strict constraint travels with SDK/client and forwarded requests. Older
+nodes reject its required policy extension before apply; they do not silently
+ignore it. Clients reject a lowered strict receipt, including a timeout
+receipt, as an unknown outcome. A legitimate timeout can still report fewer
+observed acknowledgements than required, while preserving the required count.
+
+Strict acknowledgement count does not request stable storage. Ordinary local
+apply can enqueue persistence before the store flush completes. Remote ACKs
+follow the sender's configured durability fence; receipts do not yet classify
+local/remote stable versus buffered evidence per replica. An acknowledged
+mutation can be superseded by a newer LWW winner. See
+[#135](https://github.com/slawlor/actordb/issues/135) for further receipt evidence.
+
+### Captured policy
+
 - The cap belongs to the receiving node that applies the write. A forwarding
   caller's configuration does not override the receiving node's policy.
 - Each write captures its cap when its acknowledgement plan is prepared.
@@ -51,5 +84,5 @@ active.
 ## Version requirements
 
 This additive API was introduced in `0.5.0`. The current release uses compatible
-`0.8.0` dependency minimums across all four public crates so an upgrade resolves
+`0.8.1` dependency minimums across all four public crates so an upgrade resolves
 the matching database, protocol, query, and SDK revisions.

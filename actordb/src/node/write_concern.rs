@@ -11,6 +11,7 @@ impl Node {
     ///
     /// This explicitly accepts weaker replication assurance during an outage;
     /// peer connectivity never changes the threshold automatically.
+    /// Writes with `strict_acknowledgements` reject a lowering cap before apply.
     pub fn set_write_concern_acknowledgement_cap(&self, cap: u32) -> Result<(), WriteConcernError> {
         self.write_concerns.set_acknowledgement_cap(cap)
     }
@@ -26,6 +27,9 @@ impl Node {
         self.write_concerns.acknowledgement_cap()
     }
 
+    /// Apply a write and collect processing acknowledgements. Strict counts
+    /// reject a lowering operational cap before apply; storage durability still
+    /// follows node configuration. A timeout reports locally applied progress.
     pub async fn put_with_write_concern(
         &self,
         key: String,
@@ -417,6 +421,82 @@ fn decode_forwarded_concern(
 mod tests {
     use super::*;
     use crate::write_concern::WriteConcernOutcome;
+
+    #[tokio::test]
+    async fn strict_policy_preserves_superseded_error_without_counting_local_apply() {
+        let node = Node::start(
+            "strict-outcome".into(),
+            "127.0.0.1:0".parse().unwrap(),
+            NodeConfig::builder()
+                .fragment_map(HashMap::from([(
+                    FragmentId(0),
+                    vec![
+                        "strict-outcome".into(),
+                        "offline-b".into(),
+                        "offline-c".into(),
+                    ],
+                )]))
+                .build(),
+        )
+        .await
+        .unwrap();
+        node.put("winner".into(), vec![1]).await.unwrap();
+        let winner = node.get("winner".into()).await.unwrap().unwrap();
+        let key = Node::qualify_key("winner".into());
+        let value = vec![2];
+        let retention = node
+            .embedded_operations
+            .admit(embedded_operations::single_request_bytes(
+                &key,
+                Some(&value),
+            ))
+            .unwrap();
+        let options = WriteConcernOptions::builder()
+            .concern(crate::write_concern::WriteConcern::Majority)
+            .strict_acknowledgements(true)
+            .build();
+        let op = ReplicatedOp {
+            key,
+            value: VersionedValue::new(value, winner.timestamp_ms - 1, "older".into()),
+            seq: 0,
+            boot_id: 0,
+        };
+        let result = node
+            .apply_routed_with_concern(op, OpPriority::Default, Some(&options), retention)
+            .await;
+        assert!(matches!(
+            result,
+            Err(WriteConcernError::Operation(NodeError::Superseded { .. }))
+        ));
+        assert_eq!(node.get("winner".into()).await.unwrap().unwrap(), winner);
+        node.shutdown().await.unwrap();
+    }
+
+    #[test]
+    fn strict_forwarded_decoder_rejects_lowered_receipts() {
+        let options = WriteConcernOptions::builder()
+            .concern(crate::write_concern::WriteConcern::Majority)
+            .strict_acknowledgements(true)
+            .build();
+        let lowered =
+            WriteConcernReceipt::new("owner".into(), 3, 2, 1, vec!["owner".into()]).unwrap();
+        for concern in [
+            WriteConcernOutcome::Satisfied(lowered.clone()),
+            WriteConcernOutcome::TimedOut(lowered),
+        ] {
+            let bytes = concern.encode();
+            let result = MutationResult {
+                key: "key".into(),
+                status: MutationStatus::Applied as i32,
+                write_concern: Some(bytes.clone()),
+                ..Default::default()
+            };
+            assert!(matches!(
+                decode_forwarded_concern(&result, &bytes, &options),
+                Err(WriteConcernError::UnknownOutcome(_))
+            ));
+        }
+    }
 
     #[test]
     fn accepted_local_reply_loss_is_unknown_and_admission_rejection_remains_definite() {

@@ -383,6 +383,9 @@ pub struct WriteConcernPolicy {
     pub timeout_ms: u64,
     #[prost(bool, tag = "4")]
     pub require_other_region: bool,
+    /// Reject before apply when an operational cap would lower the requested count.
+    #[prost(bool, tag = "5")]
+    pub strict_acknowledgements: bool,
 }
 #[non_exhaustive]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]

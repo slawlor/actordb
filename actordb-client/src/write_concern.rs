@@ -1,4 +1,10 @@
 //! Explicit per-write acknowledgement policy; no automatic mutation retries.
+//!
+//! `WriteConcernOptions::with_strict_acknowledgements(true)` requires the
+//! receiving node to reject a lowering operational cap before apply. Strict
+//! counts do not request stable storage; local and remote processing evidence
+//! follows the node's storage and replication configuration. A timed-out
+//! receipt describes applied local progress, and a lost reply remains uncertain.
 use super::*;
 use actordb_protocol::write_concern::{WriteConcernOutcome, WriteConcernPolicyError};
 
@@ -181,6 +187,30 @@ fn decode_concern_result(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn strict_client_rejects_lowered_success_and_timeout_receipts() {
+        let options = WriteConcernOptions::builder()
+            .concern(WriteConcern::Majority)
+            .strict_acknowledgements(true)
+            .build();
+        let lowered =
+            WriteConcernReceipt::new("owner".into(), 3, 2, 1, vec!["owner".into()]).unwrap();
+        for outcome in [
+            WriteConcernOutcome::Satisfied(lowered.clone()),
+            WriteConcernOutcome::TimedOut(lowered),
+        ] {
+            let result = wire::MutationResult {
+                key: "key".into(),
+                error: None,
+                write_concern: Some(outcome.encode()),
+            };
+            assert!(matches!(
+                decode_concern_result(result, &options),
+                Err(WriteConcernClientError::UnknownOutcome(_))
+            ));
+        }
+    }
 
     #[test]
     fn client_progress_receipts_reject_contradictory_mutation_errors() {

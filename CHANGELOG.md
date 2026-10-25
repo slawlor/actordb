@@ -1,6 +1,24 @@
 # Release notes
 
-## 0.8.0 (draft)
+## 0.8.1 (draft)
+
+- Add opt-in strict write-concern acknowledgement requirements. Operational
+  caps that would lower the requested threshold fail before apply; embedded,
+  forwarded and client receipt validation preserves the constraint.
+- Document ordinary local apply, configured remote durability, frozen
+  eligibility, LWW supersession, and timeout/unknown-outcome boundaries.
+- Bump all four published crates and compatible dependency minimums to
+  `0.8.1`. The policy is additive on an already non-exhaustive wire type;
+  default encodings and protocol versions remain compatible. Older nodes
+  reject the required strict constraint before apply.
+- Preserve the existing reconciliation startup grace fix from this checkout
+  so large reconvergence tests measure completion after peer readiness.
+
+See [write concern overrides](docs/write-concern-overrides.md).
+Further per-operation durability and replica-set receipt evidence remains
+tracked in [#135](https://github.com/slawlor/actordb/issues/135).
+
+## 0.8.0
 
 - Add shared-node logical table views. Tables reuse the node listener and peer
   channels while isolating keys, scans, SQL queries, cache/flush state, and

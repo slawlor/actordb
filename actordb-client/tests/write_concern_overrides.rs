@@ -1,7 +1,9 @@
 use actordb::client_server::{ClientServer, ClientServerOptions};
 use actordb::node::{Node, NodeConfig, NodeRuntimeOptions};
 use actordb::shard::FragmentId;
-use actordb_client::{Client, ClientOptions, WriteConcern, WriteConcernOptions};
+use actordb_client::{
+    Client, ClientOptions, WriteConcern, WriteConcernClientError, WriteConcernOptions,
+};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -49,6 +51,23 @@ async fn sdk_receipt_discloses_receiving_node_acknowledgement_override() {
     assert_eq!(receipt.required_acknowledgements(), 1);
     assert_eq!(receipt.acknowledged_nodes(), &["sdk-receiver"]);
     assert!(receipt.was_overridden());
+
+    let strict = options.clone().with_strict_acknowledgements(true);
+    assert!(matches!(
+        client
+            .put_with_write_concern("strict-rejected", vec![9], strict.clone())
+            .await,
+        Err(WriteConcernClientError::InvalidPolicy(_))
+    ));
+    assert!(client.get("strict-rejected").await.unwrap().is_none());
+    assert!(matches!(
+        client.delete_with_write_concern("overridden", strict).await,
+        Err(WriteConcernClientError::InvalidPolicy(_))
+    ));
+    assert_eq!(
+        client.get("overridden").await.unwrap().unwrap().bytes,
+        vec![1]
+    );
 
     let receipt = client
         .delete_with_write_concern("overridden", options)
