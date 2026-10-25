@@ -832,6 +832,7 @@ fn concern_mutation_result(
                     wire::ErrorCode::UnknownOutcome
                 }
                 WriteConcernError::Backpressure => wire::ErrorCode::Backpressure,
+                WriteConcernError::DurabilityFailed { .. } => wire::ErrorCode::Storage,
                 WriteConcernError::Unsupported(_) => wire::ErrorCode::Unsupported,
                 _ => wire::ErrorCode::Invalid,
             };

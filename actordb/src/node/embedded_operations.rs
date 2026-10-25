@@ -230,6 +230,14 @@ pub(super) fn single_request_bytes(key: &String, value: Option<&Vec<u8>>) -> usi
         .saturating_add(value.map_or(0, |value| value.capacity().saturating_mul(2)))
         .saturating_add(2 * super::MAX_WIRE_NODE_ID_BYTES)
 }
+/// Concern tickets retain one additional exact operation for reset recovery.
+pub(super) fn single_concern_request_bytes(key: &String, value: Option<&Vec<u8>>) -> usize {
+    single_request_bytes(key, value)
+        .saturating_add(std::mem::size_of::<crate::actor::ReplicatedOp>())
+        .saturating_add(key.capacity())
+        .saturating_add(value.map_or(0, Vec::capacity))
+        .saturating_add(super::MAX_WIRE_NODE_ID_BYTES)
+}
 pub(super) fn batch_put_request_bytes(values: &Vec<(String, Vec<u8>)>) -> usize {
     std::mem::size_of::<Vec<(String, Vec<u8>)>>()
         .saturating_add(

@@ -99,12 +99,17 @@ fn put_buffer_bytes(put: &ForwardedPut) -> usize {
 }
 
 fn apply_clone_bytes(put: &ForwardedPut) -> usize {
-    std::mem::size_of::<ReplicatedOp>()
+    let bytes = std::mem::size_of::<ReplicatedOp>()
         .saturating_add(put.key.len())
         .saturating_add(put.value.len())
         .saturating_add(put.node_id.len())
         .saturating_add(std::mem::size_of::<String>())
-        .saturating_add(put.key.len())
+        .saturating_add(put.key.len());
+    if put.write_concern.is_some() {
+        bytes.saturating_mul(2)
+    } else {
+        bytes
+    }
 }
 
 pub(super) struct MutationJob {
@@ -358,7 +363,7 @@ struct ConcernCompletionJob {
     pending: crate::write_concern::PendingWrite,
     reply: oneshot::Sender<MutationCompletion>,
     completion: MutationCompletion,
-    _operation: OperationPermit,
+    _operation: Arc<OperationPermit>,
 }
 
 impl ConcernCompletionJob {
@@ -450,6 +455,7 @@ async fn complete_job(
         mut retention,
     } = job;
     let req_id = request.req_id();
+    let _operation = Arc::new(_operation);
     let priority = request.priority();
     let batch = matches!(&request, MutationRequest::Batch(_));
     let puts = match request {
@@ -543,6 +549,51 @@ async fn complete_job(
                     | crate::proto::MutationStatus::AlreadyPresent)
             ) {
                 pending.applied_locally();
+                if pending.minimum_durability()
+                    != crate::write_concern::WriteDurability::MemoryApplied
+                {
+                    let fence = super::flush_fence_retained(
+                        &actor,
+                        pending.minimum_durability().into(),
+                        Some(_operation.clone()),
+                    )
+                    .await;
+                    let failure = match fence {
+                        Ok(durability) => {
+                            let durability = durability.into();
+                            pending.reached_local_durability(durability);
+                            (durability < pending.minimum_durability())
+                                .then(|| "local store did not provide requested fence".to_string())
+                        }
+                        Err(
+                            error @ (super::NodeError::Actor(_)
+                            | super::NodeError::UnknownOutcome(_)),
+                        ) => {
+                            result.write_concern = Some(
+                                pending
+                                    .fail_with(
+                                        crate::write_concern::WriteConcernError::UnknownOutcome(
+                                            error.to_string(),
+                                        ),
+                                    )
+                                    .outcome()
+                                    .expect("unknown outcome is encoded")
+                                    .encode(),
+                            );
+                            results.push(result);
+                            continue;
+                        }
+                        Err(error) => Some(error.to_string()),
+                    };
+                    if let Some(error) = failure {
+                        result.write_concern = pending
+                            .fail_durability(error)
+                            .outcome()
+                            .map(|outcome| outcome.encode());
+                        results.push(result);
+                        continue;
+                    }
+                }
                 if pending.requires_wait() {
                     // ACK waiters have their own tracker admission. Release
                     // the apply slot so local-only writes can still enter;
@@ -573,6 +624,22 @@ async fn complete_job(
                         .expect("wait returns receipt timeout")
                         .encode(),
                 });
+            } else {
+                if crate::proto::MutationStatus::try_from(result.status)
+                    == Ok(crate::proto::MutationStatus::StorageError)
+                {
+                    result.write_concern = pending
+                        .fail_with(crate::write_concern::WriteConcernError::UnknownOutcome(
+                            format!(
+                                "storage failed during apply; mutation may have applied: {}",
+                                result.error
+                            ),
+                        ))
+                        .outcome()
+                        .map(|outcome| outcome.encode());
+                } else {
+                    pending.operation_failed();
+                }
             }
         }
         results.push(result);

@@ -386,9 +386,55 @@ pub struct WriteConcernPolicy {
     /// Reject before apply when an operational cap would lower the requested count.
     #[prost(bool, tag = "5")]
     pub strict_acknowledgements: bool,
+    #[prost(enumeration = "WriteDurability", tag = "6")]
+    pub minimum_durability: i32,
+    #[prost(bool, tag = "7")]
+    pub require_evidence: bool,
 }
 #[non_exhaustive]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct WriteOperationEvidence {
+    #[prost(uint32, tag = "1")]
+    pub fragment: u32,
+    #[prost(bytes = "vec", tag = "2")]
+    pub key_digest: ::prost::alloc::vec::Vec<u8>,
+    #[prost(bytes = "vec", tag = "3")]
+    pub value_digest: ::prost::alloc::vec::Vec<u8>,
+    #[prost(uint64, tag = "4")]
+    pub timestamp_ms: u64,
+    #[prost(uint64, tag = "5")]
+    pub logical_counter: u64,
+    #[prost(string, tag = "6")]
+    pub node_id: ::prost::alloc::string::String,
+    #[prost(bool, tag = "7")]
+    pub is_tombstone: bool,
+    #[prost(uint64, optional, tag = "8")]
+    pub expires_at_ms: ::core::option::Option<u64>,
+    #[prost(bytes = "vec", tag = "9")]
+    pub operation_digest: ::prost::alloc::vec::Vec<u8>,
+}
+#[non_exhaustive]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct WriteAcknowledgement {
+    #[prost(uint32, tag = "1")]
+    pub replica_index: u32,
+    #[prost(enumeration = "WriteDurability", tag = "2")]
+    pub durability: i32,
+}
+#[non_exhaustive]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct WriteConcernEvidence {
+    #[prost(message, optional, tag = "1")]
+    pub operation: ::core::option::Option<WriteOperationEvidence>,
+    #[prost(string, repeated, tag = "2")]
+    pub eligible_nodes: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(bytes = "vec", tag = "3")]
+    pub replica_set_digest: ::prost::alloc::vec::Vec<u8>,
+    #[prost(message, repeated, tag = "4")]
+    pub acknowledgements: ::prost::alloc::vec::Vec<WriteAcknowledgement>,
+}
+#[non_exhaustive]
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct WriteConcernResult {
     #[prost(enumeration = "WriteConcernStatus", tag = "1")]
     pub status: i32,
@@ -410,6 +456,10 @@ pub struct WriteConcernResult {
     pub outside_region_acknowledged_nodes: ::prost::alloc::vec::Vec<
         ::prost::alloc::string::String,
     >,
+    #[prost(message, optional, tag = "10")]
+    pub evidence: ::core::option::Option<WriteConcernEvidence>,
+    #[prost(enumeration = "WriteDurability", tag = "11")]
+    pub requested_durability: i32,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct MutationResponse {
@@ -813,12 +863,43 @@ impl WriteConcernLevel {
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
+pub enum WriteDurability {
+    WriteMemoryApplied = 0,
+    WriteStoreCommitted = 1,
+    WriteStableCommitted = 2,
+}
+impl WriteDurability {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::WriteMemoryApplied => "WRITE_MEMORY_APPLIED",
+            Self::WriteStoreCommitted => "WRITE_STORE_COMMITTED",
+            Self::WriteStableCommitted => "WRITE_STABLE_COMMITTED",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "WRITE_MEMORY_APPLIED" => Some(Self::WriteMemoryApplied),
+            "WRITE_STORE_COMMITTED" => Some(Self::WriteStoreCommitted),
+            "WRITE_STABLE_COMMITTED" => Some(Self::WriteStableCommitted),
+            _ => None,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
 pub enum WriteConcernStatus {
     WriteConcernSatisfied = 0,
     WriteConcernTimedOut = 1,
     WriteConcernInvalid = 2,
     WriteConcernBackpressure = 3,
     WriteConcernUnsupported = 4,
+    WriteConcernDurabilityFailed = 5,
+    WriteConcernUnknownOutcome = 6,
 }
 impl WriteConcernStatus {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -832,6 +913,8 @@ impl WriteConcernStatus {
             Self::WriteConcernInvalid => "WRITE_CONCERN_INVALID",
             Self::WriteConcernBackpressure => "WRITE_CONCERN_BACKPRESSURE",
             Self::WriteConcernUnsupported => "WRITE_CONCERN_UNSUPPORTED",
+            Self::WriteConcernDurabilityFailed => "WRITE_CONCERN_DURABILITY_FAILED",
+            Self::WriteConcernUnknownOutcome => "WRITE_CONCERN_UNKNOWN_OUTCOME",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -842,6 +925,8 @@ impl WriteConcernStatus {
             "WRITE_CONCERN_INVALID" => Some(Self::WriteConcernInvalid),
             "WRITE_CONCERN_BACKPRESSURE" => Some(Self::WriteConcernBackpressure),
             "WRITE_CONCERN_UNSUPPORTED" => Some(Self::WriteConcernUnsupported),
+            "WRITE_CONCERN_DURABILITY_FAILED" => Some(Self::WriteConcernDurabilityFailed),
+            "WRITE_CONCERN_UNKNOWN_OUTCOME" => Some(Self::WriteConcernUnknownOutcome),
             _ => None,
         }
     }

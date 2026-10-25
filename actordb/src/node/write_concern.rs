@@ -1,10 +1,14 @@
 //! Routed per-write acknowledgement waits; ordinary writes retain local completion.
 use super::*;
 use crate::write_concern::{
-    decode_outcome, WriteConcernError, WriteConcernOptions, WriteConcernReceipt,
+    decode_outcome, WriteConcernError, WriteConcernOptions, WriteConcernOutcome,
+    WriteConcernReceipt,
 };
 
 impl Node {
+    pub fn write_concern_diagnostics(&self) -> crate::write_concern::WriteConcernDiagnostics {
+        self.write_concerns.diagnostics()
+    }
     /// Cap acknowledgement counts for subsequently received writes. The cap
     /// must be positive and never raises a request's threshold or removes other
     /// write requirements. Existing waiters retain their captured thresholds.
@@ -51,7 +55,7 @@ impl Node {
         let key = Self::qualify_key(key);
         let operation = self.admit_key_operation(&key)?;
         let retention = self.embedded_operations.admit_owned(
-            embedded_operations::single_request_bytes(&key, Some(&value)),
+            embedded_operations::single_concern_request_bytes(&key, Some(&value)),
             Some(operation.clone()),
         )?;
         options.validate()?;
@@ -107,7 +111,7 @@ impl Node {
         let key = Self::qualify_key(key);
         let operation = self.admit_key_operation(&key)?;
         let retention = self.embedded_operations.admit_owned(
-            embedded_operations::single_request_bytes(&key, None),
+            embedded_operations::single_concern_request_bytes(&key, None),
             Some(operation.clone()),
         )?;
         options.validate()?;
@@ -173,7 +177,7 @@ impl Node {
             let pending = options
                 .map(|options| self.write_concerns.prepare(frag, &op, options))
                 .transpose()?;
-            let operation = self.admit_operation()?;
+            let operation = Arc::new(self.admit_operation()?);
             let senders = self.senders.clone();
             let (reply, response) = oneshot::channel();
             let budget = self
@@ -186,11 +190,20 @@ impl Node {
                 // the caller waiter. No accepted ApplyOp is abandoned at its
                 // user deadline; exact outcome and fanout must finish first.
                 let _retention = retention;
-                let _operation = operation;
+                let _operation = operation.clone();
                 let result = async {
-                    let outcome = call_apply(&actor, op.clone(), priority, false)
-                        .await
-                        .map_err(owned_apply_error)?;
+                    let outcome = match call_apply(&actor, op.clone(), priority, false).await {
+                        Ok(outcome) => outcome,
+                        Err(error) => {
+                            let error = if pending.is_some() && matches!(error, NodeError::Storage(_)) {
+                                WriteConcernError::UnknownOutcome(format!("storage failed during apply; mutation may have applied: {error}"))
+                            } else { owned_apply_error(error) };
+                            return Err(match pending {
+                                Some(pending) => pending.fail_with(error),
+                                None => error,
+                            });
+                        }
+                    };
                     match outcome {
                         ApplyOutcome::Applied | ApplyOutcome::AlreadyPresent => {}
                         ApplyOutcome::Superseded {
@@ -199,25 +212,63 @@ impl Node {
                             node_id,
                             is_tombstone,
                         } => {
-                            return Err(NodeError::Superseded {
+                            let error = NodeError::Superseded {
                                 timestamp_ms,
                                 logical_counter,
                                 node_id,
                                 is_tombstone,
                             }
-                            .into());
+                            .into();
+                            return Err(match pending {
+                                Some(pending) => pending.fail_with(error),
+                                None => error,
+                            });
                         }
                         ApplyOutcome::Expired => {
                             let mut expiry = op;
                             expiry.value = expiry.value.expiry_tombstone();
                             enqueue_to_senders(&senders, frag, &expiry).await;
-                            return Err(NodeError::Expired.into());
+                            let error = NodeError::Expired.into();
+                            return Err(match pending {
+                                Some(pending) => pending.fail_with(error),
+                                None => error,
+                            });
                         }
                     }
                     enqueue_to_senders(&senders, frag, &op).await;
                     drop(mutation_lease);
                     if let Some(pending) = pending {
                         pending.applied_locally();
+                        if pending.minimum_durability()
+                            != crate::write_concern::WriteDurability::MemoryApplied
+                        {
+                            match flush_fence_retained(
+                                &actor,
+                                pending.minimum_durability().into(),
+                                Some(operation.clone()),
+                            )
+                            .await
+                            {
+                                Ok(durability) => {
+                                    let durability = durability.into();
+                                    pending.reached_local_durability(durability);
+                                    if durability < pending.minimum_durability() {
+                                        return Err(pending.fail_durability(
+                                            "local store did not provide the requested fence"
+                                                .into(),
+                                        ));
+                                    }
+                                }
+                                Err(
+                                    error @ (NodeError::Actor(_) | NodeError::UnknownOutcome(_)),
+                                ) => {
+                                    return Err(pending.fail_with(owned_apply_error(error)));
+                                }
+                                Err(error) => {
+                                    return Err(pending.fail_durability(error.to_string()))
+                                }
+                            }
+                        }
                         pending.wait().await.map(Some)
                     } else {
                         Ok(None)
@@ -322,6 +373,27 @@ impl Node {
             }
             if let Some(options) = options {
                 if let Some(bytes) = result.write_concern.as_deref() {
+                    if let Ok(outcome) = WriteConcernOutcome::decode(bytes) {
+                        let receipt = match &outcome {
+                            WriteConcernOutcome::Satisfied(receipt)
+                            | WriteConcernOutcome::TimedOut(receipt)
+                            | WriteConcernOutcome::DurabilityFailed { receipt, .. } => {
+                                Some(receipt)
+                            }
+                            _ => None,
+                        };
+                        if receipt
+                            .and_then(WriteConcernReceipt::evidence)
+                            .is_some_and(|evidence| {
+                                evidence.operation()
+                                    != &crate::write_concern::operation_certificate(frag, &op)
+                            })
+                        {
+                            return Err(WriteConcernError::UnknownOutcome(
+                                "forwarded receipt certified another operation".into(),
+                            ));
+                        }
+                    }
                     return resolve_concern_attempt(
                         decode_forwarded_concern(&result, bytes, options),
                         ambiguous_attempt,
@@ -386,7 +458,9 @@ fn resolve_concern_attempt(
             if ambiguous_attempt
                 && !matches!(
                     error,
-                    WriteConcernError::TimedOut(_) | WriteConcernError::UnknownOutcome(_)
+                    WriteConcernError::TimedOut(_)
+                        | WriteConcernError::UnknownOutcome(_)
+                        | WriteConcernError::DurabilityFailed { .. }
                 ) =>
         {
             Err(WriteConcernError::UnknownOutcome(format!(
@@ -403,7 +477,11 @@ fn decode_forwarded_concern(
     options: &WriteConcernOptions,
 ) -> Result<WriteConcernReceipt, WriteConcernError> {
     let outcome = decode_outcome(bytes, options);
-    if (outcome.is_ok() || matches!(outcome, Err(WriteConcernError::TimedOut(_))))
+    if (outcome.is_ok()
+        || matches!(
+            outcome,
+            Err(WriteConcernError::TimedOut(_) | WriteConcernError::DurabilityFailed { .. })
+        ))
         && !matches!(
             MutationStatus::try_from(result.status),
             Ok(MutationStatus::Applied | MutationStatus::AlreadyPresent)
@@ -419,7 +497,6 @@ fn decode_forwarded_concern(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::write_concern::WriteConcernOutcome;
 
     #[tokio::test]
     async fn strict_policy_preserves_superseded_error_without_counting_local_apply() {

@@ -2201,7 +2201,7 @@ async fn sender_task(
                                 }
                                 InflightAckResult::Accepted { kind, ops } => {
                                     if let Some(tracker) = runtime.write_concerns.as_ref() {
-                                        for op in &ops { tracker.acknowledge(&peer_id, fragment, std::slice::from_ref(&op.op)); }
+                                        for op in &ops { tracker.acknowledge_at(&peer_id, fragment, std::slice::from_ref(&op.op), durability.into()); }
                                     }
                                     last_ack_durability = Some(durability);
                                     ack_durability_mismatch = false;
@@ -3036,6 +3036,23 @@ async fn sender_task(
                 if matches!(delivery, DeliveryState::Reset { .. }) {
                     continue;
                 }
+                // Reset recovery may have discarded the original ingress
+                // history. Live concern tickets still own the exact submitted
+                // floor; retry it under its requested fence once streaming is
+                // available. A superseding receiver winner is a valid floor.
+                if connection.as_ref().is_some_and(|conn| conn.session_ready) && active_reconcile.is_none() {
+                    if let Some(tracker) = runtime.write_concerns.as_ref() {
+                        tracker.retry_operations(&peer_id, fragment, |operation| {
+                            if buffer.len() >= config.buffer_capacity { return; }
+                            let present = buffer.iter().any(|queued| queued.key == operation.key && queued.value == operation.value)
+                                || connection.as_ref().is_some_and(|conn| conn.in_flight.iter().flat_map(|batch| &batch.ops)
+                                    .any(|queued| queued.key == operation.key && queued.value == operation.value));
+                            if !present {
+                                if let Some(operation) = retention.borrowed(operation) { buffer.push_back(operation); }
+                            }
+                        });
+                    }
+                }
                 let (sid, tx, tracked_deadline) = match connection.as_ref() {
                     Some(conn)
                         if !buffer.is_empty()
@@ -3060,7 +3077,9 @@ async fn sender_task(
                     Some(conn) => allocate_batch_seq(conn),
                     None => continue,
                 };
-                let required_ack_level = config.required_ack_durability.proto_level() as i32;
+                let required_ack_durability = runtime.write_concerns.as_ref().map_or(config.required_ack_durability,
+                    |tracker| config.required_ack_durability.max(tracker.required_durability(&peer_id, fragment).into()));
+                let required_ack_level = required_ack_durability.proto_level() as i32;
                 let (ops, proto_ops) = match take_streaming_batch(
                     &mut buffer,
                     config.batch_size,
@@ -3100,7 +3119,7 @@ async fn sender_task(
                             kind: InflightKind::Streaming {
                                 ack_deadline: deadline_after(runtime.ack_timeout),
                             },
-                            required_ack_durability: config.required_ack_durability,
+                            required_ack_durability,
                         });
                     }
                 } else {

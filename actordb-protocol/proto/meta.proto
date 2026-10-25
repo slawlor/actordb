@@ -318,6 +318,34 @@ message WriteConcernPolicy {
   bool require_other_region = 4;
   // Reject before apply when an operational cap would lower the requested count.
   bool strict_acknowledgements = 5;
+  WriteDurability minimum_durability = 6;
+  bool require_evidence = 7;
+}
+enum WriteDurability {
+  WRITE_MEMORY_APPLIED = 0;
+  WRITE_STORE_COMMITTED = 1;
+  WRITE_STABLE_COMMITTED = 2;
+}
+message WriteOperationEvidence {
+  uint32 fragment = 1;
+  bytes key_digest = 2;
+  bytes value_digest = 3;
+  uint64 timestamp_ms = 4;
+  uint64 logical_counter = 5;
+  string node_id = 6;
+  bool is_tombstone = 7;
+  optional uint64 expires_at_ms = 8;
+  bytes operation_digest = 9;
+}
+message WriteAcknowledgement {
+  uint32 replica_index = 1;
+  WriteDurability durability = 2;
+}
+message WriteConcernEvidence {
+  WriteOperationEvidence operation = 1;
+  repeated string eligible_nodes = 2;
+  bytes replica_set_digest = 3;
+  repeated WriteAcknowledgement acknowledgements = 4;
 }
 enum WriteConcernStatus {
   WRITE_CONCERN_SATISFIED = 0;
@@ -325,6 +353,8 @@ enum WriteConcernStatus {
   WRITE_CONCERN_INVALID = 2;
   WRITE_CONCERN_BACKPRESSURE = 3;
   WRITE_CONCERN_UNSUPPORTED = 4;
+  WRITE_CONCERN_DURABILITY_FAILED = 5;
+  WRITE_CONCERN_UNKNOWN_OUTCOME = 6;
 }
 message WriteConcernResult {
   WriteConcernStatus status = 1;
@@ -336,6 +366,8 @@ message WriteConcernResult {
   string error = 7;
   optional string receiving_region = 8;
   repeated string outside_region_acknowledged_nodes = 9;
+  WriteConcernEvidence evidence = 10;
+  WriteDurability requested_durability = 11;
 }
 
 message MutationResponse {
