@@ -64,6 +64,7 @@ pub(super) fn test_peer_channel(
         PeerChannel {
             work_retention: None,
             outbound: BudgetedPeerTx {
+                frame_overhead: 0,
                 node_byte_budget: NodePeerByteBudget::new(NODE_PEER_QUEUE_BYTE_CAPACITY),
                 tx,
                 response_tx,

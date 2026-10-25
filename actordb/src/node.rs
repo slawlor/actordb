@@ -76,8 +76,9 @@ use crate::wire::{
     bytes_field_len, check_envelope_budget, check_record_budget, encode_envelope,
     message_field_len, preflight_envelope_decode, varint_field_len, BudgetedFrame, BudgetedPeerTx,
     NodePeerByteBudget, ReconcileGate, RepeatedFieldSizer, ANTI_ENTROPY_PAGE_BYTES,
-    MAX_FRAME_BYTES, MAX_RECONCILE_FETCH_KEYS, MAX_RECONCILE_PAGE_ITEMS, MAX_WIRE_BATCH_ITEMS,
-    MAX_WIRE_ERROR_BYTES, MAX_WIRE_NODE_ID_BYTES, NODE_PEER_QUEUE_BYTE_CAPACITY,
+    MAX_FRAME_BYTES, MAX_RECONCILE_FETCH_KEYS, MAX_RECONCILE_PAGE_ITEMS, MAX_TRANSPORT_FRAME_BYTES,
+    MAX_WIRE_BATCH_ITEMS, MAX_WIRE_ERROR_BYTES, MAX_WIRE_NODE_ID_BYTES,
+    NODE_PEER_QUEUE_BYTE_CAPACITY,
 };
 
 pub use crate::wire::PeerWriterDiagnostics;
@@ -119,12 +120,14 @@ use placement::{placement_driver, PlacementDriverDeps, BOOTSTRAP_TIMEOUT};
 pub mod drain;
 mod drain_persistence;
 pub mod peer_authority;
+mod peer_frame;
 use peer_authority::PeerAuthority;
 pub use peer_authority::{
     AuthorizedPeerGeneration, PeerAuthorityOptions, PeerAuthoritySnapshot, PeerCredential,
     PeerFenceError, PeerFenceOptions, PeerFencePhase, PeerFenceReport, PeerFenceStage,
     PeerFenceStatus, PeerIdentity,
 };
+use peer_frame::{FrameSigningState, FrameVerifier};
 mod lifecycle;
 pub use drain::{
     DrainCutoff, DrainDiagnostics, DrainDurability, DrainError, DrainOptions, DrainPhase,
@@ -215,7 +218,7 @@ pub const CAPABILITY_TYPED_UNKNOWN_MUTATION: u64 = 1 << 11;
 /// Replicated records carry the deterministic logical-table namespace used by
 /// the 0.8 shared-node table views.
 pub const CAPABILITY_TABLE_NAMESPACES: u64 = 1 << 13;
-/// Per-process credentials authenticate generation claims in the transcript.
+/// Per-process credentials authenticate generations and every session frame.
 pub const CAPABILITY_AUTHENTICATED_PEER_GENERATIONS: u64 = 1 << 14;
 /// Capabilities required by this binary before it installs a peer connection.
 pub const REQUIRED_WIRE_CAPABILITIES: u64 = CAPABILITY_MUTATION_RESULTS
@@ -234,7 +237,7 @@ pub const REQUIRED_WIRE_CAPABILITIES: u64 = CAPABILITY_MUTATION_RESULTS
 const PEER_CHANNEL_DEPTH: usize = 256;
 /// Encoded bytes admitted to one peer's writer pipeline, including the frame
 /// currently blocked on the socket.
-const PEER_CHANNEL_BYTE_CAPACITY: usize = 32 * 1024 * 1024;
+const PEER_CHANNEL_BYTE_CAPACITY: usize = 2 * MAX_TRANSPORT_FRAME_BYTES;
 /// Bound control preference so sustained replies cannot starve ordinary RPC
 /// and replication traffic on the shared socket.
 const PEER_RESPONSE_BURST_LIMIT: usize = 16;
@@ -242,8 +245,9 @@ const PEER_RESPONSE_BURST_LIMIT: usize = 16;
 /// response can still enter the priority lane under load. Most aggregate
 /// responses target one MiB, but one individually valid record may approach
 /// the hard frame limit.
-const PEER_RESPONSE_BYTE_RESERVE: usize = MAX_FRAME_BYTES;
-const MIN_PEER_CHANNEL_BYTE_CAPACITY: usize = MAX_FRAME_BYTES + PEER_RESPONSE_BYTE_RESERVE;
+const PEER_RESPONSE_BYTE_RESERVE: usize = MAX_TRANSPORT_FRAME_BYTES;
+const MIN_PEER_CHANNEL_BYTE_CAPACITY: usize =
+    MAX_TRANSPORT_FRAME_BYTES + PEER_RESPONSE_BYTE_RESERVE;
 /// Soft encoded-byte target for aggregate request and response frames. One
 /// individually valid item may exceed this target up to `MAX_FRAME_BYTES`.
 const WIRE_BATCH_PAGE_BYTES: usize = ANTI_ENTROPY_PAGE_BYTES;
@@ -262,7 +266,7 @@ const INBOUND_CONNECTION_CAPACITY: usize = 1024;
 /// Node-wide raw receive bodies, including handshakes and outbound-dialed
 /// connections. Four maximum frames fit without allowing the socket count to
 /// multiply incomplete-body allocations into gigabytes.
-const RECEIVE_BYTE_CAPACITY: usize = 64 * 1024 * 1024;
+const RECEIVE_BYTE_CAPACITY: usize = 4 * MAX_TRANSPORT_FRAME_BYTES;
 const RELAY_CAPACITY: usize = 1024;
 const RELAY_KEY_BYTE_CAPACITY: usize = 64 * 1024 * 1024;
 /// Total budget for both flights of the peer handshake.
@@ -1404,8 +1408,8 @@ impl NodeRuntimeOptions {
         self.peer_authority.as_ref()
     }
     /// Set aggregate encoded-body admission across every physical peer writer.
-    /// Default 256 MiB; minimum 32 MiB. Ordinary producers leave one maximum
-    /// 16 MiB priority response reserved across the Node. This does not include
+    /// Default 256 MiB; minimum 32 MiB + 144 bytes. Ordinary producers leave one maximum
+    /// 16 MiB + 72-byte signed priority response reserved across the Node. This does not include
     /// protobuf objects, frame/task overhead, caches, or kernel socket buffers.
     pub fn with_node_peer_queue_byte_capacity(mut self, capacity: usize) -> Self {
         self.node_peer_queue_byte_capacity = capacity;
@@ -1550,7 +1554,8 @@ impl NodeRuntimeOptions {
     /// Set retained decoded read-key bytes per priority across this Node.
     /// Charges String buffer capacities and Vec/String allocation headers.
     /// This budget is separate from raw receive bodies, returned values, and
-    /// per-connection encoded writer queues. The minimum is 16 MiB.
+    /// per-connection encoded writer queues. The minimum is 16 MiB + 72 bytes
+    /// so one maximum signed physical body always fits.
     pub fn with_serving_read_key_byte_capacity(mut self, capacity: usize) -> Self {
         self.serving_read_key_byte_capacity = capacity;
         self
@@ -1893,7 +1898,7 @@ impl NodeRuntimeOptions {
                 "peer queue frame capacity must be at least 2".to_string(),
             ));
         }
-        if self.node_peer_queue_byte_capacity < 2 * MAX_FRAME_BYTES
+        if self.node_peer_queue_byte_capacity < 2 * MAX_TRANSPORT_FRAME_BYTES
             || self.node_peer_queue_byte_capacity > u32::MAX as usize
             || self.node_peer_queue_byte_capacity > Semaphore::MAX_PERMITS
         {
@@ -1914,9 +1919,9 @@ impl NodeRuntimeOptions {
                 "inbound connection capacity must be non-zero".to_string(),
             ));
         }
-        if self.receive_byte_capacity < MAX_FRAME_BYTES {
+        if self.receive_byte_capacity < MAX_TRANSPORT_FRAME_BYTES {
             return Err(NodeError::Actor(format!(
-                "receive byte capacity must be at least {MAX_FRAME_BYTES}"
+                "receive byte capacity must be at least {MAX_TRANSPORT_FRAME_BYTES}"
             )));
         }
         if self.receive_byte_capacity > tokio::sync::Semaphore::MAX_PERMITS {
@@ -4017,7 +4022,7 @@ mod tests {
                 .is_err());
         }
         assert!(NodeRuntimeOptions::default()
-            .with_receive_byte_capacity(MAX_FRAME_BYTES)
+            .with_receive_byte_capacity(MAX_TRANSPORT_FRAME_BYTES)
             .validate()
             .is_ok());
         assert!(NodeRuntimeOptions::default()

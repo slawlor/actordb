@@ -1362,7 +1362,7 @@ impl Node {
             ));
         }
         if runtime_options.peer_authority.is_some() {
-            tracing::warn!("independent process credentials authenticate peer generations; protect post-handshake frames with an authenticated Network transport when channel integrity or confidentiality is required");
+            tracing::info!("independent process credentials authenticate peer generations and every session frame; use a protected Network transport when payload confidentiality is required");
         } else if config.cluster_secret.is_none() {
             tracing::warn!(
                 "no cluster_secret configured: anyone with TCP reachability can join the peer mesh"

@@ -276,6 +276,7 @@ pub(super) async fn run_peer_writer<W>(
     run_bounded_peer_writer(
         writer,
         PeerWriterPipeline {
+            frame_auth: None,
             data_rx: rx,
             response_rx,
             byte_budget,
@@ -295,6 +296,7 @@ pub(super) struct PeerWriterExitGuard {
 }
 
 pub(super) struct PeerWriterPipeline {
+    pub(super) frame_auth: Option<Arc<FrameSigningState>>,
     pub(super) data_rx: mpsc::Receiver<BudgetedFrame>,
     pub(super) response_rx: mpsc::Receiver<BudgetedFrame>,
     pub(super) byte_budget: Arc<Semaphore>,
@@ -319,6 +321,7 @@ pub(super) async fn run_bounded_peer_writer<W>(
     W: AsyncWrite + Unpin,
 {
     let PeerWriterPipeline {
+        frame_auth,
         data_rx,
         response_rx,
         byte_budget,
@@ -336,6 +339,7 @@ pub(super) async fn run_bounded_peer_writer<W>(
         cancel_rx,
         cancel_tx.clone(),
         socket_write_timeout,
+        frame_auth,
     )
     .await;
     let _ = cancel_tx.send(true);
@@ -348,12 +352,14 @@ pub(super) async fn run_queued_peer_writer<W>(
     mut cancel_rx: watch::Receiver<bool>,
     cancel_tx: watch::Sender<bool>,
     socket_write_timeout: Duration,
+    frame_auth: Option<Arc<FrameSigningState>>,
 ) where
     W: AsyncWrite + Unpin,
 {
     let mut data_open = true;
     let mut response_open = true;
     let mut response_burst = 0usize;
+    let mut next_sequence = Some(1);
     'writer: while data_open || response_open {
         let (frame, is_response) = loop {
             if !data_open && !response_open {
@@ -401,8 +407,29 @@ pub(super) async fn run_queued_peer_writer<W>(
             );
             break;
         }
+        let signature = match frame_auth
+            .as_ref()
+            .map(|auth| auth.header(&mut next_sequence, frame.bytes()))
+            .transpose()
+        {
+            Ok(header) => header.flatten(),
+            Err(error) => {
+                tracing::warn!(%error, "closing peer before frame sequence wrap");
+                break;
+            }
+        };
+        let wire_len = frame.len() + signature.as_ref().map_or(0, |header| header.len());
+        if wire_len > MAX_TRANSPORT_FRAME_BYTES {
+            break;
+        }
+        // Envelope.HelloAuth is field20: canonical protobuf key162 = A2 01.
+        // The activation signal follows its actual write/flush, never enqueue.
+        let auth_flight = signature.is_none() && frame.bytes().starts_with(&[0xa2, 0x01]);
         let write = async {
-            writer.write_u32(frame.len() as u32).await?;
+            writer.write_u32(wire_len as u32).await?;
+            if let Some(header) = &signature {
+                writer.write_all(header).await?;
+            }
             writer.write_all(frame.bytes()).await?;
             writer.flush().await
         };
@@ -415,6 +442,11 @@ pub(super) async fn run_queued_peer_writer<W>(
         };
         if !matches!(result, Some(Ok(Ok(())))) {
             break;
+        }
+        if auth_flight {
+            if let Some(auth) = &frame_auth {
+                auth.publish_auth_written();
+            }
         }
     }
     let _ = cancel_tx.send(true);
@@ -467,6 +499,7 @@ pub(super) async fn read_connection_frame<R>(
     established: bool,
     handshake_deadline: Instant,
     frame_body_timeout: Duration,
+    max_frame_bytes: usize,
 ) -> Option<ReceivedFrame>
 where
     R: tokio::io::AsyncRead + Unpin,
@@ -491,7 +524,7 @@ where
     };
     let len = prefix as usize;
     let max_len = if established {
-        MAX_FRAME_BYTES
+        max_frame_bytes
     } else {
         4 * 1024
     };
@@ -628,6 +661,8 @@ pub(super) async fn handle_connection(
     };
     local_hello.process_generation = authority_era.local_generation();
     let mut authority_session = None;
+    let mut frame_verifier: Option<FrameVerifier> = None;
+    let frame_auth = (local_hello.process_generation != 0).then(FrameSigningState::new);
     // Phase 5: current session per (peer, fragment) on this connection.
     // Sessions are per-connection: a new connection means a new pairing.
     let sessions: InboundSessions = Arc::new(Mutex::new(HashMap::new()));
@@ -665,6 +700,11 @@ pub(super) async fn handle_connection(
     let mut tx = PeerChannel {
         work_retention: None,
         outbound: BudgetedPeerTx {
+            frame_overhead: if frame_auth.is_some() {
+                super::peer_frame::SIGNATURE_HEADER_BYTES
+            } else {
+                0
+            },
             node_byte_budget: node_peer_queue_budget,
             tx: frame_tx,
             response_tx,
@@ -689,6 +729,7 @@ pub(super) async fn handle_connection(
     // observed and leave the read side waiting forever.
     let mut read_cancel = cancel.subscribe();
     let writer_cancel_tx = cancel.clone();
+    let writer_frame_auth = frame_auth.clone();
     // The writer is independently registered with the Node task manager. The
     // context carries only a Weak reference, avoiding a manager→handler→manager
     // ownership cycle while still making shutdown join both halves.
@@ -702,6 +743,7 @@ pub(super) async fn handle_connection(
                     run_bounded_peer_writer(
                         writer,
                         PeerWriterPipeline {
+                            frame_auth: writer_frame_auth,
                             data_rx: rx,
                             response_rx,
                             byte_budget,
@@ -795,18 +837,26 @@ pub(super) async fn handle_connection(
             handshake.is_established(),
             handshake_deadline,
             runtime_options.socket_read_timeout,
+            if frame_verifier.is_some() {
+                MAX_TRANSPORT_FRAME_BYTES
+            } else {
+                MAX_FRAME_BYTES
+            },
         )
         .await
         else {
             break;
         };
-        if let Err(error) = preflight_envelope_decode(&buf.bytes) {
-            tracing::warn!(%error, "rejecting inbound peer frame before protobuf allocation");
-            break;
-        }
-        let envelope = match Envelope::decode(&buf.bytes[..]) {
-            Ok(e) => e,
-            Err(_) => break,
+        let payload = match frame_verifier.as_mut() {
+            Some(verifier) => match verifier.verify(&buf.bytes) {
+                Ok(payload) => payload,
+                Err(error) => {
+                    peer_authority.reject_frame_integrity();
+                    tracing::warn!(%error, "rejecting peer before protobuf decode");
+                    break;
+                }
+            },
+            None => &buf.bytes,
         };
         if let Some(session) = &authority_session {
             // The lease linearizes eligibility before any frame can observe
@@ -816,6 +866,14 @@ pub(super) async fn handle_connection(
                 Err(_) => break,
             };
         }
+        if let Err(error) = preflight_envelope_decode(payload) {
+            tracing::warn!(%error, "rejecting inbound peer frame before protobuf allocation");
+            break;
+        }
+        let envelope = match Envelope::decode(payload) {
+            Ok(e) => e,
+            Err(_) => break,
+        };
         let peer_node_id = handshake.established_peer_id().map(str::to_owned);
 
         // A small, absolute-deadline handshake accepts only its two flights.
@@ -887,6 +945,24 @@ pub(super) async fn handle_connection(
                     break;
                 }
 
+                if let Some(auth) = &frame_auth {
+                    if !auth
+                        .wait_for_auth_written(handshake_deadline, &mut read_cancel)
+                        .await
+                    {
+                        break;
+                    }
+                    auth.install(
+                        authority_era
+                            .frame_signer(we_dialed, dialer, listener)
+                            .expect("configured process signing key"),
+                    );
+                    frame_verifier =
+                        authority_era.frame_verifier(&peer_hello, !we_dialed, dialer, listener);
+                    if frame_verifier.is_none() {
+                        break;
+                    }
+                }
                 let peer = peer_hello.node_id.clone();
                 let Some(session) = peer_authority.register(&authority_era, &peer, tx.clone())
                 else {
@@ -3037,6 +3113,7 @@ pub(super) fn send_envelope_retained(
             return false;
         }
     };
+    let charged_len = encoded_len + tx.outbound.frame_overhead;
     let frame_permit = match tx.outbound.response_tx.try_reserve() {
         Ok(permit) => permit,
         Err(_) => {
@@ -3048,7 +3125,7 @@ pub(super) fn send_envelope_retained(
         .outbound
         .byte_budget
         .clone()
-        .try_acquire_many_owned(encoded_len as u32)
+        .try_acquire_many_owned(charged_len as u32)
     {
         Ok(permit) => permit,
         Err(_) => {
@@ -3060,7 +3137,7 @@ pub(super) fn send_envelope_retained(
     let global_permits = match tx
         .outbound
         .node_byte_budget
-        .try_response(encoded_len as u32)
+        .try_response(charged_len as u32)
     {
         Ok(permits) => permits,
         Err(()) => {
@@ -3123,6 +3200,7 @@ pub(super) async fn try_send_envelope_with_deadline(
             return false;
         }
     };
+    let charged_len = encoded_len + tx.outbound.frame_overhead;
     let queue_deadline = deadline_after(admission_timeout);
     let admission_deadline = attempt_deadline
         .map(|deadline| deadline.min(queue_deadline))
@@ -3144,7 +3222,7 @@ pub(super) async fn try_send_envelope_with_deadline(
         tx.outbound
             .producer_byte_budget
             .clone()
-            .acquire_many_owned(encoded_len as u32),
+            .acquire_many_owned(charged_len as u32),
     )
     .await
     {
@@ -3159,7 +3237,7 @@ pub(super) async fn try_send_envelope_with_deadline(
         tx.outbound
             .byte_budget
             .clone()
-            .acquire_many_owned(encoded_len as u32),
+            .acquire_many_owned(charged_len as u32),
     )
     .await
     {
@@ -3171,7 +3249,7 @@ pub(super) async fn try_send_envelope_with_deadline(
     };
     let global_permits = match tx
         .outbound
-        .acquire_global_producer(encoded_len as u32, admission_deadline)
+        .acquire_global_producer(charged_len as u32, admission_deadline)
         .await
     {
         Ok(permits) => permits,
@@ -3382,6 +3460,7 @@ mod tests {
             true,
             Instant::now(),
             Duration::from_secs(1),
+            MAX_FRAME_BYTES,
         )
         .await
         .unwrap();
@@ -3399,6 +3478,7 @@ mod tests {
             true,
             Instant::now(),
             Duration::from_secs(1),
+            MAX_FRAME_BYTES,
         )
         .await
         .unwrap();
@@ -3416,6 +3496,7 @@ mod tests {
             true,
             Instant::now(),
             Duration::from_secs(1),
+            MAX_FRAME_BYTES,
         )
         .await
         .is_none());
@@ -3443,6 +3524,7 @@ mod tests {
                     } else {
                         Duration::from_secs(10)
                     },
+                    MAX_FRAME_BYTES,
                 )
                 .await
             });
@@ -3470,7 +3552,15 @@ mod tests {
 
     #[tokio::test]
     async fn receive_byte_admission_checks_handshake_and_hard_limits_first() {
-        for (established, len) in [(false, 4097), (true, MAX_FRAME_BYTES + 1)] {
+        for (established, frame_limit, len) in [
+            (false, MAX_FRAME_BYTES, 4097),
+            (true, MAX_FRAME_BYTES, MAX_FRAME_BYTES + 1),
+            (
+                true,
+                MAX_TRANSPORT_FRAME_BYTES,
+                MAX_TRANSPORT_FRAME_BYTES + 1,
+            ),
+        ] {
             let budget = Arc::new(Semaphore::new(8));
             let (_cancel, mut cancelled) = watch::channel(false);
             let (mut client, mut reader) = tokio::io::duplex(64);
@@ -3482,6 +3572,7 @@ mod tests {
                 established,
                 Instant::now() + Duration::from_secs(1),
                 Duration::from_secs(1),
+                frame_limit,
             )
             .await
             .is_none());
@@ -4924,6 +5015,7 @@ mod tests {
         let task = tokio::spawn(run_bounded_peer_writer(
             writer,
             PeerWriterPipeline {
+                frame_auth: None,
                 data_rx: frame_rx,
                 response_rx,
                 byte_budget: byte_budget.clone(),
@@ -4977,6 +5069,7 @@ mod tests {
         let task = tokio::spawn(run_bounded_peer_writer(
             writer,
             PeerWriterPipeline {
+                frame_auth: None,
                 data_rx: frame_rx,
                 response_rx,
                 byte_budget: byte_budget.clone(),
@@ -5100,6 +5193,7 @@ mod tests {
         let peer = PeerChannel {
             work_retention: None,
             outbound: BudgetedPeerTx {
+                frame_overhead: 0,
                 node_byte_budget: NodePeerByteBudget::new(NODE_PEER_QUEUE_BYTE_CAPACITY),
                 tx: frame_tx,
                 response_tx,
@@ -5141,6 +5235,7 @@ mod tests {
         let peer = PeerChannel {
             work_retention: None,
             outbound: BudgetedPeerTx {
+                frame_overhead: 0,
                 node_byte_budget: NodePeerByteBudget::new(NODE_PEER_QUEUE_BYTE_CAPACITY),
                 tx: frame_tx,
                 response_tx,

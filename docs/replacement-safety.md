@@ -30,9 +30,9 @@ For a cohort replacement that must exclude an unreachable old instance:
    replacement, and update each receiver's exact authorized public identities
    through its completed hot fence (or configure them at startup after full
    shutdown). A retired instance cannot sign as a replacement using its old
-   key or the replacement's public verification key. Peer handshake signatures
-   do not encrypt or integrity-protect subsequent frames; use a protected,
-   authenticated `Network` when that is required. Externally coordinated
+   key or the replacement's public verification key. Process sessions sign
+   every frame with fresh-session and sequence binding, including on plain
+   TCP; use a protected `Network` when payload confidentiality is required. Externally coordinated
    legacy protected transport/cluster-secret replacement remains possible.
 4. Recover from qualified durable sources, validate required data and writer
    authority, and then reopen external admission. Local `Serving` does not

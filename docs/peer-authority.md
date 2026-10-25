@@ -90,7 +90,7 @@ authority and joins its old frame/persistence ownership before store release.
 
 ## What the completion report proves
 
-Every authenticated decoded frame acquires a lease before it can observe an
+Every authenticated frame acquires a lease before protobuf decoding or observing an
 HLC timestamp, forward a request, affect a sender ACK, reconcile, or dispatch
 actor work. Cutoff and lease acquisition are coordinated. Work admitted before
 the cutoff may complete during the fence; the new policy cannot open until its
@@ -155,13 +155,70 @@ external membership epoch/decision ID remains application authority, not the
 receiver's process-local revision.
 
 Signing seed Debug output is redacted. Status contains no seed, signature,
-public key, request payload or per-key labels. Peer keys are verified during
-the handshake; post-handshake plaintext TCP still needs a protected
-authenticated `Network` transport to resist channel injection or tampering.
-Provision new signing seeds so the retired instance cannot obtain them.
+public key, request payload or per-key labels. Process sessions authenticate
+every frame, so a proxy that relays a legitimate fresh handshake cannot inject,
+change, reorder or replay post-handshake envelopes. Plain TCP remains readable:
+use a protected `Network` for payload confidentiality. Provision new signing
+seeds so the retired instance cannot obtain them.
 
 `Hello::process_generation` is a new public protobuf struct field. Exhaustive
 Rust `Hello` literals must add it (zero for legacy mode), requiring the 0.9
 release. Legacy generation-zero handshakes retain their existing transcript
 and protocol compatibility; process-signature mode requires both endpoints to
 support the authenticated-generation capability.
+
+## Process frame format and interoperability
+
+Generation-zero sessions retain the original four-byte big-endian length plus
+protobuf body. In process sessions negotiated through capability bit 14, Hello
+and HelloAuth remain unsigned framing flights (HelloAuth itself carries its
+handshake signature). The SDK waits for its actual HelloAuth write to finish
+before publishing the peer or enqueueing signed application responses.
+
+Every later physical body is `sequence_be_u64 || signature_64 || envelope`.
+The four-byte length includes all 72 integrity bytes. Each direction starts at
+sequence 1 and strictly increments in physical writer order across both queue
+lanes. Duplicates, gaps, wrong-direction frames and wrap are rejected. The
+maximum protobuf envelope remains 16 MiB, preserving existing opaque record
+budgets; a signed physical body may be 16 MiB + 72 bytes. Legacy physical bodies
+remain limited to 16 MiB. Signed queues charge all header bytes. Priority byte
+reserves and minimum/default per-connection budgets account for this overhead:
+two maximum bodies require 32 MiB + 144 bytes, and node receive admission must
+fit at least 16 MiB + 72 bytes.
+
+The Ed25519 message is the following unambiguous byte concatenation:
+
+```text
+ASCII "actordb-peer-frame-signature-v1" followed by NUL
+SHA256(canonical ordered Hello transcript)              32 bytes
+direction (0 = dialer, 1 = listener)                    1 byte
+sequence, big-endian                                  8 bytes
+SHA256(exact protobuf envelope bytes)                  32 bytes
+```
+
+The canonical Hello transcript starts with ASCII
+`actordb-handshake-transcript-v2` plus NUL. For dialer then listener, append
+the role length as big-endian u64 and role bytes; node ID length as u64 and
+UTF-8 bytes; min/max wire version as u32 each; offered capabilities as u64;
+challenge length as u64 and exact challenge bytes; and, for a nonzero process
+generation, ASCII `authenticated-process-generation` plus NUL and its u64
+generation. Append the selected wire version as u32 and capability intersection
+as u64. Every integer is big-endian. Generation and both independent fresh
+challenges are therefore bound into each direction's frame signatures.
+
+A deterministic vector uses wire version 5, offered capabilities 32767 on
+both endpoints, IDs `dialer` / `listener`, challenges `[11;32]` / `[22;32]`,
+generations 77 / 88, dialer signing seed `[3;32]`, sequence 1 and payload hex
+`00ff41002a`:
+
+```text
+session digest: 75768063f911128c7dd17a12f81cfae60a10a9b0b9779444062063e452d36b04
+dialer public:  ed4928c628d1c2c6eae90338905995612959273a5c63f93636c14614ac8737d1
+header: 00000000000000016a6cc05039e42ed326ee8ab56055fc70aee21bd0d344d0bb6691192db890a33019bd25c4c61d134d223d3c3edd0ece838913d0fee8761181ce44dd94d2480f0b
+```
+
+Receivers verify physical size, exact sequence and signature before protobuf
+preflight/allocation, admission or HLC observation. Signing hashes the borrowed
+envelope and writes the fixed header separately, without copying large values.
+Integrity supplies neither secrecy nor delivery: a proxy can still drop traffic,
+which is handled by existing retry/reconciliation policies.

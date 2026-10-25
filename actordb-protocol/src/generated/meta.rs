@@ -35,6 +35,8 @@ pub struct Hello {
 /// handshake completion explicit before either peer publishes the connection.
 /// With authenticated process-generation authority, auth_tag instead carries
 /// an Ed25519 signature under that process's configured public identity.
+/// Subsequent process-session frames use the capability-14 signed sequence
+/// header before their protobuf Envelope bodies; see docs/peer-authority.md.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct HelloAuth {
     #[prost(bytes = "vec", tag = "1")]

@@ -311,11 +311,13 @@ impl PeerFenceStatus {
     pub fn blocking_error(&self) -> Option<&str> {
         self.blocking_error.as_deref()
     }
-    /// Cumulative admitted decoded frames in this receiver process.
+    /// Cumulative session frame admissions before protobuf decoding. Process
+    /// sessions first verify integrity; terminal codec errors still release
+    /// their admission ownership and are included in completion counts.
     pub fn accepted_frames(&self) -> u64 {
         self.accepted_frames
     }
-    /// Terminal ownership release, including failed or rejected work.
+    /// Terminal ownership release, including codec failures or rejected work.
     pub fn completed_frames(&self) -> u64 {
         self.completed_frames
     }
@@ -447,6 +449,28 @@ impl AuthorityEra {
         self.options
             .as_ref()
             .map_or(0, |options| options.local.generation)
+    }
+    pub(super) fn frame_signer(
+        &self,
+        role: bool,
+        dialer: &Hello,
+        listener: &Hello,
+    ) -> Option<super::peer_frame::FrameSigner> {
+        self.options.as_ref().map(|options| {
+            super::peer_frame::FrameSigner::new(&options.local.signing_seed, role, dialer, listener)
+        })
+    }
+    pub(super) fn frame_verifier(
+        &self,
+        peer: &Hello,
+        role: bool,
+        dialer: &Hello,
+        listener: &Hello,
+    ) -> Option<FrameVerifier> {
+        self.expected_identity(peer)
+            .ok()
+            .flatten()
+            .map(|identity| FrameVerifier::new(identity.public_key, role, dialer, listener))
     }
     fn public_snapshot(
         &self,
@@ -611,6 +635,9 @@ impl PeerAuthority {
     }
     pub(super) fn reject_handshake(&self) {
         self.rejected_handshakes.fetch_add(1, Ordering::Relaxed);
+    }
+    pub(super) fn reject_frame_integrity(&self) {
+        self.rejected_frames.fetch_add(1, Ordering::Relaxed);
     }
     pub(super) fn register(
         &self,
@@ -1038,22 +1065,58 @@ mod tests {
             ..Default::default()
         }
     }
-    async fn receive(stream: &mut tokio::io::DuplexStream) -> Option<Envelope> {
-        let length = stream.read_u32().await.ok()?;
-        let mut bytes = vec![0; length as usize];
-        stream.read_exact(&mut bytes).await.ok()?;
-        Envelope::decode(bytes.as_slice()).ok()
+    struct TestPeer {
+        stream: tokio::io::DuplexStream,
+        signer: Option<super::super::peer_frame::FrameSigner>,
+        verifier: Option<FrameVerifier>,
+        next: Option<u64>,
+        hellos: Option<(Hello, Hello)>,
     }
-    async fn send(stream: &mut tokio::io::DuplexStream, msg: EnvelopeMsg) -> bool {
+    async fn receive(peer: &mut TestPeer) -> Option<Envelope> {
+        let length = peer.stream.read_u32().await.ok()?;
+        let mut bytes = vec![0; length as usize];
+        peer.stream.read_exact(&mut bytes).await.ok()?;
+        let payload = match peer.verifier.as_mut() {
+            Some(verifier) => verifier.verify(&bytes).ok()?,
+            None => bytes.as_slice(),
+        };
+        Envelope::decode(payload).ok()
+    }
+    async fn send(peer: &mut TestPeer, msg: EnvelopeMsg) -> bool {
         let body = Envelope { msg: Some(msg) }.encode_to_vec();
-        stream.write_u32(body.len() as u32).await.is_ok() && stream.write_all(&body).await.is_ok()
+        let header = peer.signer.as_ref().map(|signer| {
+            let sequence = peer.next.unwrap();
+            peer.next = sequence.checked_add(1);
+            signer.header(sequence, &body)
+        });
+        if peer
+            .stream
+            .write_u32((body.len() + header.as_ref().map_or(0, |_| 72)) as u32)
+            .await
+            .is_err()
+        {
+            return false;
+        }
+        if let Some(header) = header {
+            if peer.stream.write_all(&header).await.is_err() {
+                return false;
+            }
+        }
+        peer.stream.write_all(&body).await.is_ok()
     }
     async fn connection(
         node: &Node,
         generation: u64,
         key: u8,
-    ) -> (tokio::io::DuplexStream, tokio::task::JoinHandle<bool>) {
-        let (mut peer, server) = tokio::io::duplex(64 * 1024);
+    ) -> (TestPeer, tokio::task::JoinHandle<bool>) {
+        let (stream, server) = tokio::io::duplex(64 * 1024);
+        let mut peer = TestPeer {
+            stream,
+            signer: None,
+            verifier: None,
+            next: Some(1),
+            hellos: None,
+        };
         let context = node.connection_context();
         let task = tokio::spawn(async move {
             handle_connection(context, Box::pin(server), false, None, None)
@@ -1090,6 +1153,16 @@ mod tests {
                 )
                 .await
             );
+            peer.signer = Some(super::super::peer_frame::FrameSigner::new(
+                &[key; 32], true, &remote, &local,
+            ));
+            peer.verifier = Some(FrameVerifier::new(
+                *credential(1, 1).public_identity().public_key(),
+                false,
+                &remote,
+                &local,
+            ));
+            peer.hellos = Some((remote, local));
         };
         tokio::time::timeout(Duration::from_secs(2), handshake)
             .await
@@ -1909,6 +1982,168 @@ mod tests {
         ));
         assert_eq!(node.peer_authority_snapshot().unwrap(), before);
         node.shutdown().await.unwrap();
+    }
+
+    async fn write_raw_body(peer: &mut TestPeer, body: &[u8]) {
+        peer.stream.write_u32(body.len() as u32).await.unwrap();
+        peer.stream.write_all(body).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn old_process_proxy_cannot_modify_or_inject_after_current_peer_handshake() {
+        for wrong_signer in [false, true] {
+            let node = node(local_only()).await;
+            // The legitimate current peer supplies its fresh HelloAuth. The
+            // proxy can relay that proof, but does not gain its signing seed.
+            let (mut current, task) = connection(&node, 1, 2).await;
+            established(&node, &task).await;
+            let high = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64
+                + 60_000;
+            let harmless = Envelope {
+                msg: Some(EnvelopeMsg::ForwardedPut(ForwardedPut {
+                    req_id: 1,
+                    key: Node::qualify_key("poison".into()),
+                    value: vec![1],
+                    timestamp_ms: 1,
+                    node_id: "peer".into(),
+                    ..Default::default()
+                })),
+            }
+            .encode_to_vec();
+            let injected = Envelope {
+                msg: Some(EnvelopeMsg::ForwardedPut(ForwardedPut {
+                    req_id: 1,
+                    key: Node::qualify_key("poison".into()),
+                    value: vec![9],
+                    timestamp_ms: high,
+                    node_id: "peer".into(),
+                    ..Default::default()
+                })),
+            }
+            .encode_to_vec();
+            let (dialer, listener) = current.hellos.as_ref().unwrap();
+            let header = if wrong_signer {
+                // Retired process uses its own key, even with the exact fresh
+                // transcript and valid sequence learned through the proxy.
+                super::super::peer_frame::FrameSigner::new(&[9; 32], true, dialer, listener)
+                    .header(1, &injected)
+            } else {
+                // Legitimate signed payload is modified in transit.
+                current.signer.as_ref().unwrap().header(1, &harmless)
+            };
+            let mut body = header.to_vec();
+            body.extend_from_slice(&injected);
+            write_raw_body(&mut current, &body).await;
+            assert!(tokio::time::timeout(Duration::from_secs(2), task)
+                .await
+                .unwrap()
+                .unwrap());
+            assert_eq!(node.peer_fence_status().accepted_frames(), 0);
+            assert_eq!(node.peer_fence_status().rejected_frames(), 1);
+            assert!(node.get("poison".into()).await.unwrap().is_none());
+            assert!(node.hlc.lock().await.tick().unwrap().timestamp_ms < high);
+            node.shutdown().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn proxy_frame_replay_is_rejected_on_same_and_fresh_authenticated_sessions() {
+        let node = node(local_only()).await;
+        let (mut first, first_task) = connection(&node, 1, 2).await;
+        established(&node, &first_task).await;
+        let payload = Envelope {
+            msg: Some(EnvelopeMsg::SessionStart(SessionStart {
+                fragment: 0,
+                session_id: 7,
+            })),
+        }
+        .encode_to_vec();
+        let mut captured = first.signer.as_ref().unwrap().header(1, &payload).to_vec();
+        captured.extend_from_slice(&payload);
+        write_raw_body(&mut first, &captured).await;
+        write_raw_body(&mut first, &captured).await; // Repeated sequence 1.
+        assert!(tokio::time::timeout(Duration::from_secs(2), first_task)
+            .await
+            .unwrap()
+            .unwrap());
+        assert_eq!(node.peer_fence_status().accepted_frames(), 1);
+        let (mut fresh, fresh_task) = connection(&node, 1, 2).await;
+        established(&node, &fresh_task).await;
+        write_raw_body(&mut fresh, &captured).await; // Sequence 1, wrong fresh transcript.
+        assert!(tokio::time::timeout(Duration::from_secs(2), fresh_task)
+            .await
+            .unwrap()
+            .unwrap());
+        assert_eq!(node.peer_fence_status().accepted_frames(), 1);
+        assert_eq!(node.peer_fence_status().rejected_frames(), 2);
+        node.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn ordinary_tcp_nodes_replicate_signed_frames_in_both_directions() {
+        let a_key = credential(1, 1);
+        let b_key = credential(1, 2);
+        let a_policy = PeerAuthorityOptions::new(
+            a_key.clone(),
+            HashMap::from([("b".into(), b_key.public_identity())]),
+        );
+        let b_policy = PeerAuthorityOptions::new(
+            b_key,
+            HashMap::from([("a".into(), a_key.public_identity())]),
+        );
+        let a = Node::start_with_options(
+            "a".into(),
+            "127.0.0.1:0".parse().unwrap(),
+            NodeConfig::default(),
+            NodeRuntimeOptions::default().with_peer_authority(a_policy),
+        )
+        .await
+        .unwrap();
+        let b = Node::start_with_options(
+            "b".into(),
+            "127.0.0.1:0".parse().unwrap(),
+            NodeConfig::default(),
+            NodeRuntimeOptions::default().with_peer_authority(b_policy),
+        )
+        .await
+        .unwrap();
+        a.connect(b.addr()).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while a.peer_count().await != 1 || b.peer_count().await != 1 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        a.put("from-a".into(), vec![1]).await.unwrap();
+        b.put("from-b".into(), vec![2]).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if b.get("from-a".into())
+                    .await
+                    .unwrap()
+                    .is_some_and(|value| value.value == vec![1])
+                    && a.get("from-b".into())
+                        .await
+                        .unwrap()
+                        .is_some_and(|value| value.value == vec![2])
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(a.peer_fence_status().accepted_frames() > 0);
+        assert!(b.peer_fence_status().accepted_frames() > 0);
+        assert_eq!(a.peer_fence_status().rejected_frames(), 0);
+        assert_eq!(b.peer_fence_status().rejected_frames(), 0);
+        a.shutdown().await.unwrap();
+        b.shutdown().await.unwrap();
     }
 
     #[test]

@@ -21,8 +21,12 @@ pub(crate) use peer_budget::{
     GlobalBytePermits, NodePeerByteBudget, NODE_PEER_QUEUE_BYTE_CAPACITY,
 };
 
-/// Hard limit for one length-prefixed protobuf envelope body.
+/// Existing protobuf/record budget, unchanged for opaque persisted values.
 pub(crate) const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
+pub(crate) const PEER_SIGNATURE_HEADER_BYTES: usize = 8 + 64;
+/// Signed physical bodies reserve a fixed integrity header in addition to the
+/// unchanged envelope budget. Legacy physical bodies remain MAX_FRAME_BYTES.
+pub(crate) const MAX_TRANSPORT_FRAME_BYTES: usize = MAX_FRAME_BYTES + PEER_SIGNATURE_HEADER_BYTES;
 
 /// Soft target for one anti-entropy page. A single individually valid entry
 /// may exceed this target, but no encoded envelope may exceed
@@ -120,6 +124,8 @@ impl BudgetedFrame {
 /// frame-count nor encoded-byte budget can be bypassed or mismatched.
 #[derive(Clone)]
 pub(crate) struct BudgetedPeerTx {
+    /// Signed sessions reserve header bytes before queue/encoding admission.
+    pub(crate) frame_overhead: usize,
     /// Ordinary producer traffic. Reader-generated protocol responses have a
     /// separate priority lane so a full data queue cannot make both peers
     /// stop reading while they wait to acknowledge one another.

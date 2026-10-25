@@ -1700,6 +1700,7 @@ async fn send_envelope(
         return false;
     }
     if let Some(outbound) = &peer.budgeted {
+        let charged_len = encoded_len + outbound.frame_overhead;
         let frame_permit =
             match tokio::time::timeout_at(admission_deadline, outbound.tx.reserve()).await {
                 Ok(Ok(permit)) => permit,
@@ -1713,7 +1714,7 @@ async fn send_envelope(
             outbound
                 .producer_byte_budget
                 .clone()
-                .acquire_many_owned(encoded_len as u32),
+                .acquire_many_owned(charged_len as u32),
         )
         .await
         {
@@ -1728,7 +1729,7 @@ async fn send_envelope(
             outbound
                 .byte_budget
                 .clone()
-                .acquire_many_owned(encoded_len as u32),
+                .acquire_many_owned(charged_len as u32),
         )
         .await
         {
@@ -1739,7 +1740,7 @@ async fn send_envelope(
             }
         };
         let global_permits = match outbound
-            .acquire_global_producer(encoded_len as u32, admission_deadline)
+            .acquire_global_producer(charged_len as u32, admission_deadline)
             .await
         {
             Ok(permits) => permits,
@@ -5664,6 +5665,7 @@ mod tests {
         let budget = Arc::new(tokio::sync::Semaphore::new(encoded_len * 2));
         let producer_budget = Arc::new(tokio::sync::Semaphore::new(encoded_len * 2));
         let outbound = BudgetedPeerTx {
+            frame_overhead: 0,
             node_byte_budget: crate::wire::NodePeerByteBudget::new(
                 crate::wire::NODE_PEER_QUEUE_BYTE_CAPACITY,
             ),
@@ -5692,7 +5694,8 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn replication_peers_share_aggregate_encoded_body_admission() {
-        let budget = crate::wire::NodePeerByteBudget::new(2 * MAX_FRAME_BYTES);
+        let physical_max = crate::wire::MAX_TRANSPORT_FRAME_BYTES;
+        let budget = crate::wire::NodePeerByteBudget::new(2 * physical_max);
         let msg = EnvelopeMsg::SessionStart(SessionStart {
             session_id: 7,
             fragment: 0,
@@ -5703,7 +5706,7 @@ mod tests {
         .encoded_len();
         let held = budget
             .acquire_producer(
-                (MAX_FRAME_BYTES - bytes) as u32,
+                (physical_max - bytes) as u32,
                 Instant::now() + Duration::from_secs(1),
             )
             .await
@@ -5713,6 +5716,7 @@ mod tests {
             let (response_tx, _response_rx) = mpsc::channel(4);
             let (identity, _identity_rx) = mpsc::channel(1);
             let outbound = BudgetedPeerTx {
+                frame_overhead: 0,
                 tx,
                 response_tx,
                 identity: identity.clone(),
@@ -5752,6 +5756,7 @@ mod tests {
         let (identity, _identity_rx) = mpsc::channel(1);
         let reconcile_gate = crate::wire::ReconcileGate::new();
         let outbound = BudgetedPeerTx {
+            frame_overhead: 0,
             node_byte_budget: crate::wire::NodePeerByteBudget::new(
                 crate::wire::NODE_PEER_QUEUE_BYTE_CAPACITY,
             ),
