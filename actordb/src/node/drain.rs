@@ -102,11 +102,15 @@ impl Drop for DrainAttempt<'_> {
             self.gate.drain_cancelled.fetch_add(1, Ordering::Relaxed);
         }
         let nanos = self.started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
-        let _ = self.gate.drain_duration_nanos.fetch_update(
+        let mut total = self.gate.drain_duration_nanos.load(Ordering::Relaxed);
+        while let Err(observed) = self.gate.drain_duration_nanos.compare_exchange_weak(
+            total,
+            total.saturating_add(nanos),
             Ordering::Relaxed,
             Ordering::Relaxed,
-            |total| Some(total.saturating_add(nanos)),
-        );
+        ) {
+            total = observed;
+        }
     }
 }
 impl DrainStatus {
@@ -494,7 +498,6 @@ mod tests {
                 msg: Some(EnvelopeMsg::SessionStart(crate::proto::SessionStart {
                     session_id: 7,
                     fragment: 0,
-                    ..Default::default()
                 })),
             },
         )
