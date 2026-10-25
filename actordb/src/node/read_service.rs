@@ -156,6 +156,7 @@ pub(super) struct ReadJob {
     tx: PeerChannel,
     deadline: Instant,
     retention: Option<Arc<ReadRetention>>,
+    operation: Option<OperationPermit>,
 }
 
 impl ReadJob {
@@ -173,12 +174,18 @@ impl ReadJob {
             tx,
             deadline,
             retention: None,
+            operation: None,
         }
     }
 
     fn reject(self, shed: bool) -> bool {
         if *self.tx.cancel.borrow() {
             return false;
+        }
+        if shed || matches!(&self.request, ReadRequest::Batch(_)) {
+            if let Some(operation) = &self.operation {
+                operation.mark_responding();
+            }
         }
         let sent = if shed {
             self.request.shed(&self.tx)
@@ -256,6 +263,11 @@ impl ReadService {
             },
             None => None,
         };
+        job.operation = operation.clone();
+        if operation.is_some() {
+            job.tx.work_retention =
+                Some(Arc::new((job.tx.work_retention.clone(), operation.clone())));
+        }
         if Instant::now() >= job.deadline {
             return job.reject(false);
         }
@@ -325,6 +337,7 @@ async fn serve_read(job: ReadJob, shutdown: &mut watch::Receiver<bool>) {
         tx,
         deadline,
         retention,
+        operation,
     } = job;
     // Keep one copy while result keys are in the reply port or being encoded;
     // the actor's copy survives cancellation until its request really drops.
@@ -363,7 +376,14 @@ async fn serve_read(job: ReadJob, shutdown: &mut watch::Receiver<bool>) {
             }
             reply_kind.send_page_retained(&tx, page, Some(retention))
         }
-        _ => reply_kind.unavailable(&tx),
+        _ => {
+            if matches!(reply_kind, ReadReply::Batch(_)) {
+                if let Some(operation) = &operation {
+                    operation.mark_responding();
+                }
+            }
+            reply_kind.unavailable(&tx)
+        }
     };
     if !sent {
         tx.cancel();

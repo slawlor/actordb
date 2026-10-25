@@ -10,8 +10,8 @@ use tokio::sync::oneshot;
 use tokio::time::Instant;
 
 use super::{
-    try_send_envelope_until, FragmentRouter, Node, PeerChannel, CAPABILITY_QUERY_METADATA,
-    CAPABILITY_QUERY_PAGES,
+    try_send_envelope_until, FragmentRouter, Node, OperationPermit, PeerChannel,
+    CAPABILITY_QUERY_METADATA, CAPABILITY_QUERY_PAGES,
 };
 use crate::actor::KvMessage;
 use crate::proto::{Envelope, EnvelopeMsg, QueryPageRequest, QueryPageResponse, QueryPageStatus};
@@ -876,13 +876,21 @@ async fn actor_page(
 }
 
 pub(super) async fn serve_query_page(
-    channel: PeerChannel,
+    mut channel: PeerChannel,
     router: FragmentRouter,
     serving: Arc<std::sync::RwLock<std::collections::HashSet<FragmentId>>>,
     request: QueryPageRequest,
     retention: Arc<QueryRetention>,
     deadline: Instant,
+    operation: OperationPermit,
 ) {
+    // The exact request/peer leases follow the encoded response through queue
+    // admission and actual writer completion, including error pages.
+    channel.work_retention = Some(Arc::new((
+        channel.work_retention.clone(),
+        retention.clone(),
+        operation.clone(),
+    )));
     let plan = actordb_query::parse(&request.sql);
     let fragment = FragmentId(request.fragment);
     let page = match plan {
@@ -911,6 +919,7 @@ pub(super) async fn serve_query_page(
             }
         }
     };
+    operation.mark_responding();
     let _ = try_send_envelope_until(&channel, page_envelope(page), deadline).await;
 }
 

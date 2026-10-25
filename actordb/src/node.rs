@@ -85,6 +85,8 @@ pub use crate::wire::PeerWriterDiagnostics;
 
 #[cfg(test)]
 mod peer_writer_budget_tests;
+#[cfg(test)]
+mod response_retention_tests;
 
 mod connection;
 use connection::{

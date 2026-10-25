@@ -2638,18 +2638,22 @@ pub(super) async fn handle_connection(
                 };
                 // Rejected post-cutoff traffic must not retain query runtime
                 // reservations while its unavailable reply waits on a socket.
+                let response_operation = operation.clone();
                 let operation = Arc::new((operation, tx.work_retention.clone()));
+                let mut channel = tx.clone();
+                channel.work_retention = Some(operation.clone());
                 let retention =
                     match query::reserve_inbound(&query_admission, &req, operation.clone()) {
                         Ok(retention) => retention,
                         Err(error) => {
+                            response_operation.mark_responding();
                             let page = crate::query::page_error(
                                 &req,
                                 crate::proto::QueryPageStatus::Backpressure,
                                 error.to_string(),
                             );
                             let _ = try_send_envelope_until(
-                                &tx,
+                                &channel,
                                 crate::query::page_envelope(page),
                                 deadline_after(runtime_options.queue_admission_timeout),
                             )
@@ -2660,15 +2664,22 @@ pub(super) async fn handle_connection(
                 let Some(tasks) = tasks.upgrade() else {
                     break;
                 };
-                let channel = tx.clone();
                 let router = router.clone();
                 let serving = serving.clone();
                 let deadline = deadline_after(runtime_options.forwarded_attempt_timeout);
                 if !tasks
                     .spawn(async move {
                         let _operation = operation;
-                        query::serve_query_page(channel, router, serving, req, retention, deadline)
-                            .await;
+                        query::serve_query_page(
+                            channel,
+                            router,
+                            serving,
+                            req,
+                            retention,
+                            deadline,
+                            response_operation,
+                        )
+                        .await;
                     })
                     .await
                 {
@@ -2717,7 +2728,10 @@ pub(super) async fn handle_connection(
                         continue;
                     }
                 };
+                let response_operation = operation.clone();
                 let operation = Arc::new((operation, tx.work_retention.clone()));
+                let mut tx = tx;
+                tx.work_retention = Some(operation.clone());
                 let retention = match query_admission.reserve_work_retained(
                     req.encoded_len().saturating_add(1024),
                     48 * 1024 * 1024,
@@ -2725,6 +2739,7 @@ pub(super) async fn handle_connection(
                 ) {
                     Ok(retention) => retention,
                     Err(error) => {
+                        response_operation.mark_responding();
                         scan::send_scan_response(&tx, req.req_id, Vec::new(), error.to_string())
                             .await;
                         continue;
@@ -2736,7 +2751,15 @@ pub(super) async fn handle_connection(
                 if !tasks
                     .spawn(async move {
                         let _operation = operation;
-                        scan::serve_scan_request(tx, serving, router, req, retention).await;
+                        scan::serve_scan_request(
+                            tx,
+                            serving,
+                            router,
+                            req,
+                            retention,
+                            response_operation,
+                        )
+                        .await;
                     })
                     .await
                 {
