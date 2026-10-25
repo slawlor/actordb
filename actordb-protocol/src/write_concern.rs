@@ -1,4 +1,15 @@
 //! Acknowledgement thresholds do not establish a global mutation order.
+//!
+//! The receiving node freezes replica eligibility, region labels, and the
+//! effective count before apply. A processing acknowledgement means that the
+//! replica processed this mutation and retains its equal-or-newer LWW winner;
+//! it does not promise that the submitted value remains the winner. The local
+//! acknowledgement follows ordinary apply completion, which may only enqueue
+//! persistence and return before a store flush. Remote acknowledgements
+//! satisfy the sender's configured replication durability fence. Neither the
+//! count nor strict count enforcement requests stable storage: memory apply,
+//! buffered store commit, and stable store commit depend on node configuration,
+//! and receipts currently do not classify that evidence per node.
 
 use std::collections::HashSet;
 use std::fmt;
@@ -57,6 +68,10 @@ pub struct WriteConcernOptions {
     /// configured region, including for local and count-one policies.
     #[builder(default)]
     require_other_region: bool,
+    /// Reject before apply if an operational cap would reduce the requested
+    /// acknowledgement count. Defaults to allowing a disclosed reduction.
+    #[builder(default)]
+    strict_acknowledgements: bool,
 }
 
 impl Default for WriteConcernOptions {
@@ -79,6 +94,17 @@ impl WriteConcernOptions {
     /// Add or clear the independent region acknowledgement requirement.
     pub fn with_require_other_region(mut self, required: bool) -> Self {
         self.require_other_region = required;
+        self
+    }
+    /// Whether an operational cap must preserve the requested count. This does
+    /// not change the configured storage durability or LWW winner semantics.
+    pub fn strict_acknowledgements(&self) -> bool {
+        self.strict_acknowledgements
+    }
+    /// Require or relax preservation of the requested acknowledgement count.
+    /// Older peers reject an enabled constraint before applying the mutation.
+    pub fn with_strict_acknowledgements(mut self, strict: bool) -> Self {
+        self.strict_acknowledgements = strict;
         self
     }
     pub fn validate(&self) -> Result<(), WriteConcernPolicyError> {
@@ -106,6 +132,7 @@ impl WriteConcernOptions {
             acknowledgements,
             timeout_ms: self.timeout.as_millis() as u64,
             require_other_region: self.require_other_region,
+            strict_acknowledgements: self.strict_acknowledgements,
         }
         .encode_to_vec())
     }
@@ -131,6 +158,7 @@ impl WriteConcernOptions {
             concern,
             timeout: Duration::from_millis(policy.timeout_ms),
             require_other_region: policy.require_other_region,
+            strict_acknowledgements: policy.strict_acknowledgements,
         };
         options.validate()?;
         Ok(options)
@@ -156,7 +184,9 @@ fn invalid(s: impl Into<String>) -> WriteConcernPolicyError {
     WriteConcernPolicyError::Invalid(s.into())
 }
 
-/// Actual acknowledgement progress. The receiving node always counts as one.
+/// Actual processing acknowledgement progress. The receiving node always
+/// counts as one after ordinary apply completion. Remote acknowledgements meet
+/// configured sender durability; this receipt does not classify crash durability.
 /// An unknown replica count is represented by `None` for local-only writes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WriteConcernReceipt {
@@ -246,6 +276,11 @@ impl WriteConcernReceipt {
         if self.requested != expected {
             return Err(invalid(
                 "write concern reply changed the requested threshold",
+            ));
+        }
+        if options.strict_acknowledgements() && self.required != self.requested {
+            return Err(invalid(
+                "write concern reply lowered a strict acknowledgement threshold",
             ));
         }
         if options.require_other_region()
@@ -412,11 +447,11 @@ pub fn preflight_policy(bytes: &[u8]) -> Result<(), WriteConcernPolicyError> {
         return Err(invalid("write concern policy exceeds byte limit"));
     }
     let mut pos = 0;
-    let mut seen = [false; 5];
+    let mut seen = [false; 6];
     while pos < bytes.len() {
         let tag = varint(bytes, &mut pos)?;
         let field = tag >> 3;
-        if !(1..=4).contains(&field) {
+        if !(1..=5).contains(&field) {
             return Err(WriteConcernPolicyError::Unsupported(
                 "unsupported write concern policy field".into(),
             ));
@@ -428,6 +463,9 @@ pub fn preflight_policy(bytes: &[u8]) -> Result<(), WriteConcernPolicyError> {
         let value = varint(bytes, &mut pos)?;
         if field == 4 && value > 1 {
             return Err(invalid("invalid region requirement boolean"));
+        }
+        if field == 5 && value > 1 {
+            return Err(invalid("invalid strict acknowledgement boolean"));
         }
     }
     Ok(())
@@ -517,9 +555,39 @@ mod tests {
         assert_eq!(WriteConcernOptions::decode(&bytes).unwrap(), options);
         assert!(WriteConcernOptions::decode(&[bytes.clone(), bytes].concat()).is_err());
         assert!(matches!(
-            WriteConcernOptions::decode(&[40, 1]),
+            WriteConcernOptions::decode(&[48, 1]),
             Err(WriteConcernPolicyError::Unsupported(_))
         ));
+    }
+    #[test]
+    fn strict_policy_roundtrips_and_uses_a_required_extension_field() {
+        let legacy = WriteConcernOptions::builder()
+            .concern(WriteConcern::Count(2))
+            .build();
+        assert!(!legacy.strict_acknowledgements());
+        let strict = legacy.clone().with_strict_acknowledgements(true);
+        let mut expected = legacy.encode().unwrap();
+        // Field 5 is omitted when false. Pre-extension peers reject this tag
+        // as unknown instead of silently applying a weaker request.
+        expected.extend([40, 1]);
+        assert_eq!(strict.encode().unwrap(), expected);
+        assert_eq!(WriteConcernOptions::decode(&expected).unwrap(), strict);
+        assert_eq!(strict.with_strict_acknowledgements(false), legacy);
+        assert!(WriteConcernOptions::decode(&[expected, vec![40, 1]].concat()).is_err());
+        assert!(WriteConcernOptions::decode(&[40, 2]).is_err());
+    }
+    #[test]
+    fn strict_receipts_reject_lowered_counts_even_for_timeout() {
+        let options = WriteConcernOptions::builder()
+            .concern(WriteConcern::Majority)
+            .strict_acknowledgements(true)
+            .build();
+        let lowered = WriteConcernReceipt::new("a".into(), 3, 2, 1, vec!["a".into()]).unwrap();
+        assert!(lowered.validate_for(&options, true).is_err());
+        assert!(lowered.validate_for(&options, false).is_err());
+        let preserved = WriteConcernReceipt::new("a".into(), 3, 2, 2, vec!["a".into()]).unwrap();
+        assert!(preserved.validate_for(&options, false).is_ok());
+        assert!(preserved.validate_for(&options, true).is_err());
     }
     #[test]
     fn receipts_require_distinct_acknowledgements_and_receiver() {

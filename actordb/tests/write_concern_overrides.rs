@@ -98,3 +98,100 @@ async fn forwarded_write_uses_receiving_node_cap_and_returns_its_receipt() {
     caller.shutdown().await.unwrap();
     receiver.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn strict_embedded_cap_rejects_put_and_delete_before_apply_and_preserves_timeout_progress() {
+    let receiver = Node::start("receiver".into(), "127.0.0.1:0".parse().unwrap(), config())
+        .await
+        .unwrap();
+    receiver.put("preserved".into(), vec![1]).await.unwrap();
+    receiver.set_write_concern_acknowledgement_cap(1).unwrap();
+    let strict = majority().with_strict_acknowledgements(true);
+    assert!(matches!(
+        receiver
+            .put_with_write_concern("rejected".into(), vec![2], strict.clone())
+            .await,
+        Err(WriteConcernError::InvalidPolicy(_))
+    ));
+    assert!(receiver.get("rejected".into()).await.unwrap().is_none());
+    assert!(matches!(
+        receiver
+            .delete_with_write_concern("preserved".into(), strict.clone())
+            .await,
+        Err(WriteConcernError::InvalidPolicy(_))
+    ));
+    assert_eq!(
+        receiver
+            .get("preserved".into())
+            .await
+            .unwrap()
+            .unwrap()
+            .value,
+        vec![1]
+    );
+
+    receiver.set_write_concern_acknowledgement_cap(2).unwrap();
+    let Err(WriteConcernError::TimedOut(receipt)) = receiver
+        .put_with_write_concern("strict-timeout".into(), vec![3], strict)
+        .await
+    else {
+        panic!("a preserving cap must accept apply and retain strict timeout progress");
+    };
+    assert_eq!(receipt.requested_acknowledgements(), 2);
+    assert_eq!(receipt.required_acknowledgements(), 2);
+    assert_eq!(receipt.acknowledged_nodes(), &["receiver"]);
+    assert!(!receipt.was_overridden());
+    assert_eq!(
+        receiver
+            .get("strict-timeout".into())
+            .await
+            .unwrap()
+            .unwrap()
+            .value,
+        vec![3]
+    );
+    receiver.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn strict_forwarded_policy_rejects_receiving_cap_before_put_and_delete_apply() {
+    let receiver = Node::start("receiver".into(), "127.0.0.1:0".parse().unwrap(), config())
+        .await
+        .unwrap();
+    let caller = Node::start("caller".into(), "127.0.0.1:0".parse().unwrap(), config())
+        .await
+        .unwrap();
+    caller.connect(receiver.addr()).await.unwrap();
+    common::wait_for(
+        || async { caller.peer_count().await == 1 },
+        Duration::from_secs(3),
+    )
+    .await;
+    receiver.put("preserved".into(), vec![1]).await.unwrap();
+    receiver.set_write_concern_acknowledgement_cap(1).unwrap();
+    let strict = majority().with_strict_acknowledgements(true);
+    assert!(matches!(
+        caller
+            .put_with_write_concern("rejected".into(), vec![2], strict.clone())
+            .await,
+        Err(WriteConcernError::InvalidPolicy(_))
+    ));
+    assert!(receiver.get("rejected".into()).await.unwrap().is_none());
+    assert!(matches!(
+        caller
+            .delete_with_write_concern("preserved".into(), strict)
+            .await,
+        Err(WriteConcernError::InvalidPolicy(_))
+    ));
+    assert_eq!(
+        receiver
+            .get("preserved".into())
+            .await
+            .unwrap()
+            .unwrap()
+            .value,
+        vec![1]
+    );
+    caller.shutdown().await.unwrap();
+    receiver.shutdown().await.unwrap();
+}

@@ -316,6 +316,8 @@ message WriteConcernPolicy {
   uint32 acknowledgements = 2;
   uint64 timeout_ms = 3;
   bool require_other_region = 4;
+  // Reject before apply when an operational cap would lower the requested count.
+  bool strict_acknowledgements = 5;
 }
 enum WriteConcernStatus {
   WRITE_CONCERN_SATISFIED = 0;
