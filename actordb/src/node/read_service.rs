@@ -35,6 +35,7 @@ pub(super) const READ_QUEUE_CAPACITY: usize = 64;
 pub(super) const READ_KEY_BYTE_CAPACITY: usize = 64 * 1024 * 1024;
 
 struct ReadRetention {
+    _peer_work: Option<Arc<dyn Send + Sync>>,
     _count: OwnedSemaphorePermit,
     _key_bytes: OwnedSemaphorePermit,
     _operation: Option<OperationPermit>,
@@ -259,6 +260,7 @@ impl ReadService {
             Err(_) => return job.reject(true),
         };
         job.retention = Some(Arc::new(ReadRetention {
+            _peer_work: job.tx.work_retention.clone(),
             _count: count,
             _key_bytes: key_bytes,
             _operation: operation,

@@ -779,6 +779,7 @@ async fn complete_no_secret_handshake(stream: &mut tokio::net::TcpStream, peer_i
                 max_protocol_version: WIRE_PROTOCOL_VERSION,
                 capabilities: REQUIRED_WIRE_CAPABILITIES,
                 challenge: vec![0x5a; 32],
+                process_generation: 0,
             })),
         },
     )
@@ -2334,6 +2335,7 @@ async fn configured_member_retries_initial_failure_and_rejects_wrong_identity() 
                 max_protocol_version: WIRE_PROTOCOL_VERSION,
                 capabilities: REQUIRED_WIRE_CAPABILITIES,
                 challenge: vec![0x31; 32],
+                process_generation: 0,
             })),
         },
     )
@@ -2405,6 +2407,7 @@ async fn address_only_connect_pins_the_first_authenticated_identity() {
                 max_protocol_version: WIRE_PROTOCOL_VERSION,
                 capabilities: REQUIRED_WIRE_CAPABILITIES,
                 challenge: vec![0x42; 32],
+                process_generation: 0,
             })),
         },
     )
@@ -8718,6 +8721,7 @@ async fn hello_auth_second_flight_uses_the_original_handshake_deadline() {
                 max_protocol_version: WIRE_PROTOCOL_VERSION,
                 capabilities: REQUIRED_WIRE_CAPABILITIES,
                 challenge: vec![0x6b; 32],
+                process_generation: 0,
             })),
         },
     )
@@ -8853,6 +8857,7 @@ async fn hello_auth_mismatch_drops_connection() {
                 max_protocol_version: WIRE_PROTOCOL_VERSION,
                 capabilities: REQUIRED_WIRE_CAPABILITIES,
                 challenge: vec![0x6b; 32],
+                process_generation: 0,
             })),
         },
     )
@@ -8989,6 +8994,7 @@ async fn hello_claiming_self_id_rejected() {
                 max_protocol_version: WIRE_PROTOCOL_VERSION,
                 capabilities: REQUIRED_WIRE_CAPABILITIES,
                 challenge: vec![0x7c; 32],
+                process_generation: 0,
             })),
         },
     )
@@ -9027,6 +9033,7 @@ async fn second_hello_closes_established_connection() {
                 max_protocol_version: WIRE_PROTOCOL_VERSION,
                 capabilities: REQUIRED_WIRE_CAPABILITIES,
                 challenge: vec![0x8d; 32],
+                process_generation: 0,
             })),
         },
     )

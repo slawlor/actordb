@@ -614,6 +614,7 @@ impl Drop for Node {
         // admission open merely because a caller dropped the handle.
         self.operation_gate.begin_shutdown();
         self.receive_apply_gate.begin_shutdown();
+        self.peer_authority.close();
         self.mutation_service.request_shutdown();
         self.embedded_operations.request_shutdown();
         self.placement_tasks.request_shutdown();
@@ -1233,6 +1234,20 @@ impl Node {
                 "node_id must contain 1 to {MAX_WIRE_NODE_ID_BYTES} bytes"
             )));
         }
+        if runtime_options
+            .peer_authority
+            .as_ref()
+            .is_some_and(|authority| {
+                authority
+                    .peer_generations()
+                    .iter()
+                    .any(|peer| peer.peer_id() == node_id)
+            })
+        {
+            return Err(NodeError::Codec(
+                "local identity must not appear in authorized remote peers".into(),
+            ));
+        }
         if let Some(invalid_member) = config
             .members
             .keys()
@@ -1311,7 +1326,9 @@ impl Node {
                 "cluster_secret must contain at least 32 bytes when configured".to_string(),
             ));
         }
-        if config.cluster_secret.is_none() {
+        if runtime_options.peer_authority.is_some() {
+            tracing::warn!("independent process credentials authenticate peer generations; protect post-handshake frames with an authenticated Network transport when channel integrity or confidentiality is required");
+        } else if config.cluster_secret.is_none() {
             tracing::warn!(
                 "no cluster_secret configured: anyone with TCP reachability can join the peer mesh"
             );
@@ -1619,6 +1636,10 @@ impl Node {
             receive_apply_gate: OperationGate::new(),
             local_drain: drain_persistence::DrainPersistence::new(),
             table_metrics: observability::TableRegistry::new(),
+            peer_authority: PeerAuthority::new(
+                node_id.clone(),
+                runtime_options.peer_authority.clone(),
+            ),
             shutdown_state: Mutex::new(ShutdownProgress::Running),
             replication_drain_report: StdMutex::new(None),
             network: config.network.clone(),
@@ -1939,6 +1960,7 @@ impl Node {
             // Admission and actor-owned completion are separate from socket
             // lifetime: a decoded page may still be queued inside a sender.
             self.receive_apply_gate.begin_shutdown();
+            self.peer_authority.close();
             self.mutation_service.request_shutdown();
             self.embedded_operations.request_shutdown();
             // Placement owns fragment and sender topology. Join it before the
@@ -1993,6 +2015,7 @@ impl Node {
             self.operation_gate.wait_for_drain().await;
             self.local_drain.wait_for_active().await;
             self.receive_apply_gate.wait_for_drain().await;
+            self.peer_authority.wait_closed().await;
 
             let senders: Vec<NodeSender> = self.senders.lock().await.values().cloned().collect();
             for sender in senders {

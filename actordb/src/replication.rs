@@ -2691,7 +2691,7 @@ async fn sender_task(
                                     round.round_id,
                                     &mut summary,
                                     &summaries,
-                                    done,
+                                    ReconcilePageInput { done, retention: apply_retention.clone() },
                                 )
                                 .await
                             }
@@ -3643,6 +3643,7 @@ async fn ensure_local_summary(
     local: &mut ReconcileLocalCursor,
     deadline: Instant,
     result_budget: &Arc<ByteBudget>,
+    retention: Option<Arc<dyn Send + Sync>>,
 ) -> Result<(), ReconcileError> {
     while local.current.is_none() {
         if let Some(summary) = local.buffered.pop_front() {
@@ -3680,7 +3681,7 @@ async fn ensure_local_summary(
                         limit: RECONCILE_LOCAL_READ_CHUNK,
                         reply,
                     }
-                    .with_retention(result_retention)
+                    .with_retention(Arc::new((result_retention, retention.clone())))
                 },
                 Some(deadline.saturating_duration_since(Instant::now())),
             )
@@ -3736,6 +3737,7 @@ async fn send_repair_keys(
     keys: Vec<String>,
     snapshot_time_ms: u64,
     deadline: Instant,
+    retention: Option<Arc<dyn Send + Sync>>,
 ) -> Result<(), ReconcileError> {
     let actor = router
         .route_for_fragment(fragment)
@@ -3762,6 +3764,7 @@ async fn send_repair_keys(
     while next_key_index < keys.len() {
         let request_keys = keys.clone();
         let request_retention = result_retention.clone();
+        let authority_retention = retention.clone();
         let value_page = match actor
             .call(
                 move |reply| {
@@ -3771,7 +3774,7 @@ async fn send_repair_keys(
                         snapshot_time_ms: Some(snapshot_time_ms),
                         reply,
                     }
-                    .with_retention(request_retention)
+                    .with_retention(Arc::new((request_retention, authority_retention)))
                 },
                 Some(deadline.saturating_duration_since(Instant::now())),
             )
@@ -3941,6 +3944,11 @@ async fn send_fetch(
 /// Merge one bounded peer summary page with bounded local summary pages.
 /// Values are read only for local winners, one at a time, so neither side's
 /// complete key or value set is materialized by reconciliation.
+struct ReconcilePageInput {
+    done: bool,
+    retention: Option<Arc<dyn Send + Sync>>,
+}
+
 async fn reconcile_summary_page(
     fragment: FragmentId,
     router: &FragmentRouter,
@@ -3948,8 +3956,9 @@ async fn reconcile_summary_page(
     round_id: u64,
     summary: &mut ReconcileSummaryState,
     summaries: &[KeySummary],
-    done: bool,
+    page: ReconcilePageInput,
 ) -> Result<VecDeque<Vec<String>>, ReconcileError> {
+    let ReconcilePageInput { done, retention } = page;
     let deadline = deadline_after(connection.peer_tx.local_work_timeout);
     let mut fetch_keys = Vec::new();
     let mut repair_keys = Vec::new();
@@ -3962,6 +3971,7 @@ async fn reconcile_summary_page(
                 &mut summary.local,
                 deadline,
                 &connection.peer_tx.reconciliation_result_budget,
+                retention.clone(),
             )
             .await?;
             match summary.local.current.as_ref() {
@@ -3986,6 +3996,7 @@ async fn reconcile_summary_page(
                             std::mem::take(&mut repair_keys),
                             snapshot_time_ms,
                             deadline,
+                            retention.clone(),
                         )
                         .await?;
                         repair_key_bytes = 0;
@@ -4015,6 +4026,7 @@ async fn reconcile_summary_page(
                                 std::mem::take(&mut repair_keys),
                                 snapshot_time_ms,
                                 deadline,
+                                retention.clone(),
                             )
                             .await?;
                             repair_key_bytes = 0;
@@ -4048,6 +4060,7 @@ async fn reconcile_summary_page(
             std::mem::take(&mut repair_keys),
             snapshot_time_ms,
             deadline,
+            retention.clone(),
         )
         .await?;
         repair_key_bytes = 0;
@@ -4061,6 +4074,7 @@ async fn reconcile_summary_page(
                 &mut summary.local,
                 deadline,
                 &connection.peer_tx.reconciliation_result_budget,
+                retention.clone(),
             )
             .await?;
             let Some(local) = take_local_summary(&mut summary.local) else {
@@ -4085,6 +4099,7 @@ async fn reconcile_summary_page(
                     std::mem::take(&mut repair_keys),
                     snapshot_time_ms,
                     deadline,
+                    retention.clone(),
                 )
                 .await?;
                 repair_key_bytes = 0;
@@ -4103,6 +4118,7 @@ async fn reconcile_summary_page(
                 repair_keys,
                 snapshot_time_ms,
                 deadline,
+                retention.clone(),
             )
             .await?;
         }
@@ -4765,7 +4781,10 @@ mod tests {
                 1,
                 &mut summary,
                 &[remote],
-                true,
+                ReconcilePageInput {
+                    done: true,
+                    retention: None,
+                },
             )
             .await;
             if same_contents {

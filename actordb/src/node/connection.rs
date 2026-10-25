@@ -16,6 +16,9 @@ use super::*;
 /// shared by every producer and the socket reader/writer tasks.
 #[derive(Clone)]
 pub(super) struct PeerChannel {
+    /// Admission of the decoded frame that produced this work. Not present on
+    /// long-lived map/writer handles; work clones retain it through completion.
+    pub(super) work_retention: Option<Arc<dyn Send + Sync>>,
     pub(super) outbound: BudgetedPeerTx,
     pub(super) cancel: watch::Sender<bool>,
     pub(super) queue_admission_timeout: Duration,
@@ -32,6 +35,16 @@ impl Drop for ConnectionCancelGuard {
 }
 
 impl PeerChannel {
+    pub(super) fn send_sender_control(
+        &self,
+        sender: &NodeSender,
+        control: SenderMsg,
+    ) -> Result<(), NodeSenderSendError> {
+        match &self.work_retention {
+            Some(retention) => sender.send_retained(control, retention.clone()),
+            None => sender.send(control),
+        }
+    }
     pub(super) fn same_channel(&self, other: &Self) -> bool {
         self.outbound.same_channel(&other.outbound)
     }
@@ -206,6 +219,7 @@ pub(super) struct ConnContext {
     pub(super) read_service: Arc<ReadService>,
     pub(super) operation_gate: Arc<OperationGate>,
     pub(super) receive_apply_gate: Arc<OperationGate>,
+    pub(super) peer_authority: Arc<PeerAuthority>,
     /// Monotonic wake-up signal for dial supervisors waiting behind another
     /// physical connection to the same authenticated peer.
     pub(super) peer_changes: watch::Sender<u64>,
@@ -577,6 +591,7 @@ pub(super) async fn handle_connection(
         read_service,
         operation_gate,
         receive_apply_gate,
+        peer_authority,
         peer_changes,
         hlc,
         senders,
@@ -595,7 +610,13 @@ pub(super) async fn handle_connection(
         #[cfg(test)]
         sender_snapshot_hook,
     } = ctx;
-    let local_hello = match fresh_hello(&node_id) {
+    let Some(authority_era) = peer_authority.handshake_era() else {
+        return ConnectionOutcome {
+            peer_id: None,
+            was_established: false,
+        };
+    };
+    let mut local_hello = match fresh_hello(&node_id) {
         Ok(hello) => hello,
         Err(error) => {
             tracing::error!(%error, "failed to generate a handshake challenge");
@@ -605,6 +626,8 @@ pub(super) async fn handle_connection(
             };
         }
     };
+    local_hello.process_generation = authority_era.local_generation();
+    let mut authority_session = None;
     // Phase 5: current session per (peer, fragment) on this connection.
     // Sessions are per-connection: a new connection means a new pairing.
     let sessions: InboundSessions = Arc::new(Mutex::new(HashMap::new()));
@@ -640,6 +663,7 @@ pub(super) async fn handle_connection(
         peer_queue_byte_capacity - PEER_RESPONSE_BYTE_RESERVE,
     ));
     let mut tx = PeerChannel {
+        work_retention: None,
         outbound: BudgetedPeerTx {
             node_byte_budget: node_peer_queue_budget,
             tx: frame_tx,
@@ -763,6 +787,7 @@ pub(super) async fn handle_connection(
     let mut was_established = false;
     // Length-delimited framing: 4-byte big-endian length prefix.
     'connection: loop {
+        tx.work_retention = None;
         let Some(buf) = read_connection_frame(
             &mut reader,
             &mut read_cancel,
@@ -783,6 +808,14 @@ pub(super) async fn handle_connection(
             Ok(e) => e,
             Err(_) => break,
         };
+        if let Some(session) = &authority_session {
+            // The lease linearizes eligibility before any frame can observe
+            // timestamps, affect ACKs, forward, reconcile, or mutate actors.
+            tx.work_retention = match peer_authority.admit(session) {
+                Ok(retention) => Some(retention),
+                Err(_) => break,
+            };
+        }
         let peer_node_id = handshake.established_peer_id().map(str::to_owned);
 
         // A small, absolute-deadline handshake accepts only its two flights.
@@ -810,15 +843,17 @@ pub(super) async fn handle_connection(
                     tracing::warn!(claimed_node_id = %peer_hello.node_id, %reason, "rejecting Hello");
                     break;
                 }
+                if !authority_era.accepts(&peer_hello) {
+                    peer_authority.reject_handshake();
+                    break;
+                }
                 let (dialer, listener) = if we_dialed {
                     (&local_hello, &peer_hello)
                 } else {
                     (&peer_hello, &local_hello)
                 };
-                let auth_tag = cluster_secret
-                    .as_deref()
-                    .map(|secret| handshake_auth_tag(secret, we_dialed, dialer, listener))
-                    .unwrap_or_default();
+                let auth_tag =
+                    authority_era.sign(cluster_secret.as_deref(), we_dialed, dialer, listener);
                 if !send_hello_auth_until(&tx, auth_tag, handshake_deadline).await {
                     break;
                 }
@@ -837,13 +872,14 @@ pub(super) async fn handle_connection(
                 } else {
                     (&peer_hello, &local_hello)
                 };
-                if !verify_handshake_auth(
+                if !authority_era.verify(
                     cluster_secret.as_deref(),
                     !we_dialed,
                     dialer,
                     listener,
                     &auth_tag,
                 ) {
+                    peer_authority.reject_handshake();
                     tracing::warn!(
                         claimed_node_id = %peer_hello.node_id,
                         "challenge-bound handshake proof failed"
@@ -852,6 +888,11 @@ pub(super) async fn handle_connection(
                 }
 
                 let peer = peer_hello.node_id.clone();
+                let Some(session) = peer_authority.register(&authority_era, &peer, tx.clone())
+                else {
+                    break;
+                };
+                authority_session = Some(session);
                 authenticated_peer_id = Some(peer.clone());
                 tx.rank = Some(connection_rank(dialer, listener));
                 tx.capabilities = peer_hello.capabilities;
@@ -859,6 +900,9 @@ pub(super) async fn handle_connection(
                     let mut peer_guard = peers.lock().await;
                     match peer_guard.get(&peer) {
                         Some(current) if current.same_channel(&tx) => (true, None),
+                        Some(current) if *current.cancel.borrow() => {
+                            (true, peer_guard.insert(peer.clone(), tx.clone()))
+                        }
                         Some(current) if current.rank.as_ref() >= tx.rank.as_ref() => (false, None),
                         Some(_) => (true, peer_guard.insert(peer.clone(), tx.clone())),
                         None => {
@@ -1020,7 +1064,7 @@ pub(super) async fn handle_connection(
             }
             Some(EnvelopeMsg::ReplicateBatch(b)) => {
                 let apply_retention: Arc<dyn Send + Sync> = match receive_apply_gate.try_enter() {
-                    Ok(permit) => Arc::new(permit),
+                    Ok(permit) => Arc::new((permit, tx.work_retention.clone())),
                     Err(_) => break,
                 };
                 if b.ops.len() > MAX_WIRE_BATCH_ITEMS {
@@ -1294,17 +1338,20 @@ pub(super) async fn handle_connection(
                             hook.resume.notified().await;
                         }
                     }
-                    if let Some(tx) = sender {
+                    if let Some(sender) = sender {
                         if tx
-                            .send(SenderMsg::Ack {
-                                session_id: a.session_id,
-                                batch_seq: a.batch_seq,
-                                durability,
-                            })
+                            .send_sender_control(
+                                &sender,
+                                SenderMsg::Ack {
+                                    session_id: a.session_id,
+                                    batch_seq: a.batch_seq,
+                                    durability,
+                                },
+                            )
                             .is_err()
                         {
                             let still_current =
-                                sender_task_is_current(&senders, &sender_key, &tx).await;
+                                sender_task_is_current(&senders, &sender_key, &sender).await;
                             if still_current {
                                 break;
                             }
@@ -1323,17 +1370,20 @@ pub(super) async fn handle_connection(
                             hook.resume.notified().await;
                         }
                     }
-                    if let Some(tx) = sender {
+                    if let Some(sender) = sender {
                         if tx
-                            .send(SenderMsg::Nack {
-                                session_id: n.session_id,
-                                batch_seq: n.batch_seq,
-                                error: n.error,
-                            })
+                            .send_sender_control(
+                                &sender,
+                                SenderMsg::Nack {
+                                    session_id: n.session_id,
+                                    batch_seq: n.batch_seq,
+                                    error: n.error,
+                                },
+                            )
                             .is_err()
                         {
                             let still_current =
-                                sender_task_is_current(&senders, &sender_key, &tx).await;
+                                sender_task_is_current(&senders, &sender_key, &sender).await;
                             if still_current {
                                 break;
                             }
@@ -1442,17 +1492,20 @@ pub(super) async fn handle_connection(
                 if let Some((route_generation, actor)) = route {
                     if let Ok(CallResult::Success(page)) = actor
                         .call(
-                            |reply| KvMessage::GetSummaryPage {
-                                after_key: (!first_page).then_some(r.after_key.clone()),
-                                // Do not hold or clone a fragment-wide
-                                // snapshot across network turns. Revision
-                                // drift is returned to the requester, which
-                                // completes this bounded pass and then runs a
-                                // mutation-free verification pass.
-                                expected_revision: None,
-                                snapshot_time_ms: (!first_page).then_some(r.snapshot_time_ms),
-                                limit: RECONCILE_SUMMARY_PAGE_ITEMS,
-                                reply,
+                            |reply| {
+                                KvMessage::GetSummaryPage {
+                                    after_key: (!first_page).then_some(r.after_key.clone()),
+                                    // Do not hold or clone a fragment-wide
+                                    // snapshot across network turns. Revision
+                                    // drift is returned to the requester, which
+                                    // completes this bounded pass and then runs a
+                                    // mutation-free verification pass.
+                                    expected_revision: None,
+                                    snapshot_time_ms: (!first_page).then_some(r.snapshot_time_ms),
+                                    limit: RECONCILE_SUMMARY_PAGE_ITEMS,
+                                    reply,
+                                }
+                                .with_optional_retention(tx.work_retention.clone())
                             },
                             None,
                         )
@@ -1666,6 +1719,7 @@ pub(super) async fn handle_connection(
                     break;
                 };
                 let job = ReconcileResponseJob {
+                    retention: tx.work_retention.clone(),
                     peer: peer.clone(),
                     session: current.expect("validated reconcile fetch session"),
                     actor,
@@ -1704,6 +1758,7 @@ pub(super) async fn handle_connection(
                 // The sender owns exact session/round/phase correlation. Let
                 // it validate correlation before this frame may advance the
                 // HLC; stale responses must be side-effect free.
+                let frame_retention = tx.work_retention.clone();
                 if let Some(peer) = peer_node_id.clone() {
                     let sender_key = (FragmentId(r.fragment), peer);
                     let sender = senders.lock().await.get(&sender_key).cloned();
@@ -1716,18 +1771,21 @@ pub(super) async fn handle_connection(
                     }
                     if let Some(tx) = sender {
                         let (connection_valid, validation) = oneshot::channel();
-                        match tx.send(SenderMsg::ReconcileResponse {
-                            session_id: r.session_id,
-                            round_id: r.round_id,
-                            page_seq: r.page_seq,
-                            next_after_key: r.next_after_key,
-                            snapshot_revision: r.snapshot_revision,
-                            snapshot_time_ms: r.snapshot_time_ms,
-                            done: r.done,
-                            restart: r.restart,
-                            summaries: r.summaries,
-                            connection_valid,
-                        }) {
+                        match tx.send_retained(
+                            SenderMsg::ReconcileResponse {
+                                session_id: r.session_id,
+                                round_id: r.round_id,
+                                page_seq: r.page_seq,
+                                next_after_key: r.next_after_key,
+                                snapshot_revision: r.snapshot_revision,
+                                snapshot_time_ms: r.snapshot_time_ms,
+                                done: r.done,
+                                restart: r.restart,
+                                summaries: r.summaries,
+                                connection_valid,
+                            },
+                            frame_retention.expect("authenticated frame has authority ownership"),
+                        ) {
                             Ok(()) => {}
                             // Placement may retire the sender after the map
                             // lookup above. That is a stale local consumer,
@@ -1789,7 +1847,7 @@ pub(super) async fn handle_connection(
             }
             Some(EnvelopeMsg::ReconcileData(d)) => {
                 let apply_retention: Arc<dyn Send + Sync> = match receive_apply_gate.try_enter() {
-                    Ok(permit) => Arc::new(permit),
+                    Ok(permit) => Arc::new((permit, tx.work_retention.clone())),
                     Err(_) => break,
                 };
                 if d.entries.len() > MAX_RECONCILE_PAGE_ITEMS {
@@ -1939,7 +1997,7 @@ pub(super) async fn handle_connection(
                         operation,
                         mutation_lease,
                     );
-                    mutation_service.submit(job);
+                    mutation_service.submit(job.with_peer_retention(tx.work_retention.clone()));
                     if concerned {
                         let response_tx = tx.clone();
                         if let Some(tasks) = tasks.upgrade() {
@@ -2333,7 +2391,7 @@ pub(super) async fn handle_connection(
                     operation,
                     mutation_lease,
                 );
-                mutation_service.submit(job);
+                mutation_service.submit(job.with_peer_retention(tx.work_retention.clone()));
                 let Ok(completion) = completion.await else {
                     break;
                 };
@@ -2493,7 +2551,7 @@ pub(super) async fn handle_connection(
                 };
                 // Rejected post-cutoff traffic must not retain query runtime
                 // reservations while its unavailable reply waits on a socket.
-                let operation = Arc::new(operation);
+                let operation = Arc::new((operation, tx.work_retention.clone()));
                 let retention =
                     match query::reserve_inbound(&query_admission, &req, operation.clone()) {
                         Ok(retention) => retention,
@@ -2572,7 +2630,7 @@ pub(super) async fn handle_connection(
                         continue;
                     }
                 };
-                let operation = Arc::new(operation);
+                let operation = Arc::new((operation, tx.work_retention.clone()));
                 let retention = match query_admission.reserve_work_retained(
                     req.encoded_len().saturating_add(1024),
                     48 * 1024 * 1024,
@@ -2812,8 +2870,10 @@ pub(super) fn fresh_hello(node_id: &str) -> Result<Hello, getrandom::Error> {
         capabilities: REQUIRED_WIRE_CAPABILITIES
             | CAPABILITY_SCAN
             | CAPABILITY_QUERY_PAGES
-            | CAPABILITY_QUERY_METADATA,
+            | CAPABILITY_QUERY_METADATA
+            | CAPABILITY_AUTHENTICATED_PEER_GENERATIONS,
         challenge,
+        process_generation: 0,
     })
 }
 
@@ -2857,6 +2917,10 @@ pub(super) fn handshake_transcript(dialer: &Hello, listener: &Hello) -> Vec<u8> 
         out.extend_from_slice(&hello.capabilities.to_be_bytes());
         out.extend_from_slice(&(hello.challenge.len() as u64).to_be_bytes());
         out.extend_from_slice(&hello.challenge);
+        if hello.process_generation != 0 {
+            out.extend_from_slice(b"authenticated-process-generation\0");
+            out.extend_from_slice(&hello.process_generation.to_be_bytes());
+        }
     }
 
     let mut transcript = Vec::with_capacity(256);
@@ -3216,6 +3280,7 @@ impl Node {
             read_service: self.read_service.clone(),
             operation_gate: self.operation_gate.clone(),
             receive_apply_gate: self.receive_apply_gate.clone(),
+            peer_authority: self.peer_authority.clone(),
             peer_changes: self.peer_changes.clone(),
             hlc: self.hlc.clone(),
             senders: self.senders.clone(),
@@ -3554,6 +3619,7 @@ mod tests {
             max_protocol_version: WIRE_PROTOCOL_VERSION,
             capabilities: 0x7f, // Fixed offer for the independent transcript vector.
             challenge: vec![1; HANDSHAKE_CHALLENGE_BYTES],
+            process_generation: 0,
         };
         let listener = Hello {
             node_id: "listener".to_string(),
@@ -3562,6 +3628,7 @@ mod tests {
             max_protocol_version: WIRE_PROTOCOL_VERSION,
             capabilities: 0x7f, // Fixed offer for the independent transcript vector.
             challenge: vec![2; HANDSHAKE_CHALLENGE_BYTES],
+            process_generation: 0,
         };
         let authenticated = handshake_auth_tag(b"secret", true, &dialer, &listener);
         // Independently computed SHA-256/HMAC vectors pin the existing wire
@@ -3663,6 +3730,7 @@ mod tests {
             max_protocol_version: WIRE_PROTOCOL_VERSION,
             capabilities: REQUIRED_WIRE_CAPABILITIES,
             challenge: vec![1; HANDSHAKE_CHALLENGE_BYTES],
+            process_generation: 0,
         };
         let b = Hello {
             node_id: "b".to_string(),
@@ -3671,6 +3739,7 @@ mod tests {
             max_protocol_version: WIRE_PROTOCOL_VERSION,
             capabilities: REQUIRED_WIRE_CAPABILITIES,
             challenge: vec![2; HANDSHAKE_CHALLENGE_BYTES],
+            process_generation: 0,
         };
 
         let canonical = connection_rank(&a, &b);
@@ -5008,6 +5077,7 @@ mod tests {
         let byte_budget = Arc::new(Semaphore::new(encoded_len * 3));
         let producer_byte_budget = Arc::new(Semaphore::new(encoded_len * 2));
         let peer = PeerChannel {
+            work_retention: None,
             outbound: BudgetedPeerTx {
                 node_byte_budget: NodePeerByteBudget::new(NODE_PEER_QUEUE_BYTE_CAPACITY),
                 tx: frame_tx,
@@ -5048,6 +5118,7 @@ mod tests {
         let byte_budget = Arc::new(Semaphore::new(encoded_len * 2));
         let producer_byte_budget = Arc::new(Semaphore::new(encoded_len));
         let peer = PeerChannel {
+            work_retention: None,
             outbound: BudgetedPeerTx {
                 node_byte_budget: NodePeerByteBudget::new(NODE_PEER_QUEUE_BYTE_CAPACITY),
                 tx: frame_tx,

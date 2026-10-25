@@ -268,6 +268,7 @@ async fn forwarded_concern_accepts_replication_ack_on_the_same_peer_connection()
                 max_protocol_version: WIRE_PROTOCOL_VERSION,
                 capabilities: REQUIRED_WIRE_CAPABILITIES,
                 challenge: vec![1; 32],
+                process_generation: 0,
                 auth_tag: vec![],
             })),
         },

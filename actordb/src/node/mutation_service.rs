@@ -31,6 +31,7 @@ pub(super) const FORWARDED_MUTATION_BYTE_CAPACITY: usize = 64 * 1024 * 1024;
 const WORKERS_PER_PRIORITY: usize = 8;
 
 struct MutationRetention {
+    _peer_work: Option<Arc<dyn Send + Sync>>,
     _count: Option<OwnedSemaphorePermit>,
     _payload: OwnedSemaphorePermit,
 }
@@ -113,6 +114,7 @@ fn apply_clone_bytes(put: &ForwardedPut) -> usize {
 }
 
 pub(super) struct MutationJob {
+    peer_work: Option<Arc<dyn Send + Sync>>,
     request: MutationRequest,
     actor: ActorRef<KvMessage>,
     senders: SenderMap,
@@ -144,6 +146,10 @@ impl MutationCompletion {
 }
 
 impl MutationJob {
+    pub(super) fn with_peer_retention(mut self, retention: Option<Arc<dyn Send + Sync>>) -> Self {
+        self.peer_work = retention;
+        self
+    }
     pub(super) fn new(
         request: MutationRequest,
         actor: ActorRef<KvMessage>,
@@ -155,6 +161,7 @@ impl MutationJob {
         let (reply, response) = oneshot::channel();
         (
             Self {
+                peer_work: None,
                 request,
                 actor,
                 senders,
@@ -170,6 +177,7 @@ impl MutationJob {
 
     fn reject(self, reason: &str) {
         let Self {
+            peer_work: _peer_work,
             request,
             reply,
             retention,
@@ -268,6 +276,7 @@ impl MutationService {
             return;
         };
         job.retention = Some(Arc::new(MutationRetention {
+            _peer_work: job.peer_work.clone(),
             _count: Some(count),
             _payload: payload,
         }));
@@ -445,6 +454,7 @@ async fn complete_job(
     tracker: Option<&Arc<crate::write_concern::WriteConcernTracker>>,
 ) -> Option<ConcernCompletionJob> {
     let MutationJob {
+        peer_work,
         request,
         actor,
         senders,
@@ -537,8 +547,16 @@ async fn complete_job(
         } else {
             None
         };
-        let mut result =
-            apply_forwarded_mutation(&actor, &senders, fragment, op, priority, index).await;
+        let mut result = apply_forwarded_mutation(
+            &actor,
+            &senders,
+            fragment,
+            op,
+            priority,
+            index,
+            peer_work.clone(),
+        )
+        .await;
         if let Some(pending) = pending {
             // Replication fan-out has completed; ownership teardown must not
             // wait on client acknowledgement policy. Single writes only.

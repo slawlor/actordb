@@ -118,6 +118,13 @@ use placement::{placement_driver, PlacementDriverDeps, BOOTSTRAP_TIMEOUT};
 
 pub mod drain;
 mod drain_persistence;
+pub mod peer_authority;
+use peer_authority::PeerAuthority;
+pub use peer_authority::{
+    AuthorizedPeerGeneration, PeerAuthorityOptions, PeerAuthoritySnapshot, PeerCredential,
+    PeerFenceError, PeerFenceOptions, PeerFencePhase, PeerFenceReport, PeerFenceStage,
+    PeerFenceStatus, PeerIdentity,
+};
 mod lifecycle;
 pub use drain::{
     DrainCutoff, DrainDiagnostics, DrainDurability, DrainError, DrainOptions, DrainPhase,
@@ -201,6 +208,8 @@ pub const CAPABILITY_TYPED_UNKNOWN_MUTATION: u64 = 1 << 11;
 /// Replicated records carry the deterministic logical-table namespace used by
 /// the 0.8 shared-node table views.
 pub const CAPABILITY_TABLE_NAMESPACES: u64 = 1 << 13;
+/// Per-process credentials authenticate generation claims in the transcript.
+pub const CAPABILITY_AUTHENTICATED_PEER_GENERATIONS: u64 = 1 << 14;
 /// Capabilities required by this binary before it installs a peer connection.
 pub const REQUIRED_WIRE_CAPABILITIES: u64 = CAPABILITY_MUTATION_RESULTS
     | CAPABILITY_DURABILITY_ACKS
@@ -946,12 +955,13 @@ async fn apply_forwarded_mutation(
     op: ReplicatedOp,
     priority: OpPriority,
     request_index: usize,
+    retention: Option<Arc<dyn Send + Sync>>,
 ) -> MutationResult {
     let key = op.key.clone();
     if let Err(error) = validate_replicated_op(&op) {
         return mutation_result(key, request_index, Err(error));
     }
-    let result = match call_apply(actor, op.clone(), priority, false).await {
+    let result = match call_apply_retained(actor, op.clone(), priority, false, retention).await {
         // A dispatcher/worker disappearing is routing availability, not a
         // terminal mutation outcome. The stamped operation is idempotent and
         // may be retried at another configured holder.
@@ -1272,6 +1282,7 @@ pub struct Node {
     receive_apply_gate: Arc<OperationGate>,
     local_drain: Arc<drain_persistence::DrainPersistence>,
     table_metrics: observability::TableRegistry,
+    peer_authority: Arc<PeerAuthority>,
     shutdown_state: Mutex<ShutdownProgress>,
     replication_drain_report: StdMutex<Option<ReplicationDrainReport>>,
     network: Arc<dyn Network>,
@@ -1290,6 +1301,7 @@ pub struct Node {
 /// [`Node::start_with_options`].
 #[derive(Clone, Debug, bon::Builder)]
 pub struct NodeRuntimeOptions {
+    peer_authority: Option<PeerAuthorityOptions>,
     #[builder(default = 256 * 1024 * 1024)]
     replication_retained_byte_capacity: usize,
     #[builder(default = Duration::from_secs(30))]
@@ -1365,6 +1377,17 @@ impl Default for NodeRuntimeOptions {
 }
 
 impl NodeRuntimeOptions {
+    /// Opt into exact per-peer process authentication and hot generation fencing.
+    /// This mode replaces cluster-secret proofs with independent process keys.
+    pub fn with_peer_authority(mut self, authority: PeerAuthorityOptions) -> Self {
+        self.peer_authority = Some(authority);
+        self
+    }
+    /// Startup authority configuration. Use `Node::peer_fence_status` for hot
+    /// transitions and the currently active authority revision/generations.
+    pub fn peer_authority(&self) -> Option<&PeerAuthorityOptions> {
+        self.peer_authority.as_ref()
+    }
     /// Set aggregate encoded-body admission across every physical peer writer.
     /// Default 256 MiB; minimum 32 MiB. Ordinary producers leave one maximum
     /// 16 MiB priority response reserved across the Node. This does not include
@@ -1756,6 +1779,9 @@ impl NodeRuntimeOptions {
     }
 
     fn validate(&self) -> Result<(), NodeError> {
+        if let Some(authority) = &self.peer_authority {
+            authority.validate().map_err(NodeError::Codec)?;
+        }
         if self.reconciliation_retained_byte_capacity < 4 * MAX_FRAME_BYTES {
             return Err(NodeError::Actor(
                 "reconciliation result allowance must be at least 64 MiB".into(),
@@ -4015,6 +4041,7 @@ mod tests {
             max_protocol_version: WIRE_PROTOCOL_VERSION,
             capabilities: REQUIRED_WIRE_CAPABILITIES,
             challenge: vec![1; HANDSHAKE_CHALLENGE_BYTES],
+            process_generation: 0,
         };
         assert_eq!(validate_peer_hello("local", Some("peer"), &hello), Ok(()));
         hello.capabilities &= !CAPABILITY_RECORD_CONTENT_DIGEST;
@@ -4033,6 +4060,7 @@ mod tests {
             max_protocol_version: WIRE_PROTOCOL_VERSION,
             capabilities: REQUIRED_WIRE_CAPABILITIES,
             challenge: vec![1; HANDSHAKE_CHALLENGE_BYTES],
+            process_generation: 0,
         };
         assert_eq!(validate_peer_hello("local", Some("peer"), &hello), Ok(()));
         hello.capabilities &= !CAPABILITY_TYPED_UNKNOWN_MUTATION;
@@ -4354,6 +4382,7 @@ mod tests {
             },
             OpPriority::Default,
             0,
+            None,
         )
         .await;
         assert_eq!(

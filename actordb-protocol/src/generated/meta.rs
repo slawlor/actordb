@@ -24,11 +24,17 @@ pub struct Hello {
     /// connection. Both peers' complete Hellos are bound into each HelloAuth.
     #[prost(bytes = "vec", tag = "6")]
     pub challenge: ::prost::alloc::vec::Vec<u8>,
+    /// Externally allocated process generation, authenticated by the configured
+    /// independent process credential. Zero denotes legacy cluster authentication.
+    #[prost(uint64, tag = "8")]
+    pub process_generation: u64,
 }
 /// Second handshake flight. With a configured cluster secret, auth_tag is an
 /// HMAC-SHA256 over the ordered dialer/listener Hello transcript and the
 /// proving role. Without a secret it is empty, but the flight still makes
 /// handshake completion explicit before either peer publishes the connection.
+/// With authenticated process-generation authority, auth_tag instead carries
+/// an Ed25519 signature under that process's configured public identity.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct HelloAuth {
     #[prost(bytes = "vec", tag = "1")]
