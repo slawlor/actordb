@@ -193,6 +193,25 @@ impl ReadJob {
 }
 
 impl ReadService {
+    pub(super) fn queued(&self) -> usize {
+        self.lanes
+            .iter()
+            .map(|lane| {
+                lane.jobs
+                    .max_capacity()
+                    .saturating_sub(lane.jobs.capacity())
+            })
+            .sum()
+    }
+    pub(super) fn admitted_slots(&self) -> usize {
+        self.lanes
+            .iter()
+            .map(|lane| {
+                (lane.jobs.max_capacity() + READ_WORKERS_PER_PRIORITY)
+                    .saturating_sub(lane.count.available_permits())
+            })
+            .sum()
+    }
     pub(super) fn bind_operation_gate(&self, gate: Arc<OperationGate>) {
         *self.operation_gate.lock().unwrap() = Some(gate);
     }
@@ -339,6 +358,9 @@ async fn serve_read(job: ReadJob, shutdown: &mut watch::Receiver<bool>) {
     }
     let sent = match response {
         Ok(Ok(CallResult::Success(page))) if Instant::now() < deadline && route.is_current() => {
+            if let Some(operation) = &retention._operation {
+                operation.mark_responding();
+            }
             reply_kind.send_page_retained(&tx, page, Some(retention))
         }
         _ => reply_kind.unavailable(&tx),

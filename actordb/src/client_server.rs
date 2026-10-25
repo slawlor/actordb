@@ -385,6 +385,9 @@ async fn serve_connection(
                 ..Default::default()
             };
         }
+        if let Ok(operation) = &response_ownership {
+            operation.mark_responding();
+        }
         let result = tokio::time::timeout(
             options.timeout,
             send(

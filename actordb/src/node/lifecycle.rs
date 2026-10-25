@@ -255,6 +255,7 @@ pub(super) struct OperationGate {
     pub(super) timing_enabled: std::sync::atomic::AtomicBool,
     pub(super) request_duration: observability::AtomicDurationSummary,
     pub(super) waiter_timeouts: AtomicU64,
+    pub(super) awaiting_responses: AtomicUsize,
 }
 
 impl OperationGate {
@@ -275,6 +276,7 @@ impl OperationGate {
             timing_enabled: std::sync::atomic::AtomicBool::new(false),
             request_duration: observability::AtomicDurationSummary::default(),
             waiter_timeouts: AtomicU64::new(0),
+            awaiting_responses: AtomicUsize::new(0),
         })
     }
 
@@ -307,6 +309,7 @@ impl OperationGate {
                         .load(Ordering::Acquire)
                         .then(std::time::Instant::now),
                     table: None,
+                    responding: std::sync::atomic::AtomicBool::new(false),
                 }),
             });
         }
@@ -353,6 +356,14 @@ pub(crate) struct OperationPermit {
     ownership: Arc<OperationOwnership>,
 }
 impl OperationPermit {
+    pub(crate) fn mark_responding(&self) {
+        if !self.ownership.responding.swap(true, Ordering::SeqCst) {
+            self.ownership
+                .gate
+                .awaiting_responses
+                .fetch_add(1, Ordering::SeqCst);
+        }
+    }
     pub(super) fn with_table(mut self, table: Option<observability::TableObservation>) -> Self {
         Arc::get_mut(&mut self.ownership)
             .expect("fresh admission permit")
@@ -364,9 +375,15 @@ struct OperationOwnership {
     gate: Arc<OperationGate>,
     started: Option<std::time::Instant>,
     table: Option<observability::TableObservation>,
+    responding: std::sync::atomic::AtomicBool,
 }
 impl Drop for OperationOwnership {
     fn drop(&mut self) {
+        if self.responding.load(Ordering::SeqCst) {
+            self.gate.awaiting_responses.fetch_sub(1, Ordering::SeqCst);
+        }
+        // Publish scoped completion before the gate's final wakeup.
+        drop(self.table.take());
         if let Some(started) = self.started {
             self.gate.request_duration.observe(started.elapsed());
         }

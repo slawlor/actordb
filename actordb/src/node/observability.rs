@@ -66,6 +66,19 @@ pub struct TableMetricsSnapshot {
     pub duration: DurationSummary,
 }
 
+/// Bounded queue/ownership observations. Worker queues are reported separately
+/// by detailed pool snapshots; these values describe node admission pipelines.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct RequestQueueDiagnostics {
+    pub queued_embedded_mutations: usize,
+    pub queued_forwarded_mutations: usize,
+    pub forwarded_apply_slots: usize,
+    pub queued_forwarded_reads: usize,
+    pub forwarded_read_slots: usize,
+    pub awaiting_responses: usize,
+}
+
 #[derive(Default)]
 pub(super) struct TableCounters {
     accepted: AtomicU64,
@@ -162,6 +175,19 @@ impl TableRegistry {
 }
 
 impl Node {
+    pub fn queue_diagnostics(&self) -> RequestQueueDiagnostics {
+        RequestQueueDiagnostics {
+            queued_embedded_mutations: self.embedded_operations.queued(),
+            queued_forwarded_mutations: self.mutation_service.queued(),
+            forwarded_apply_slots: self.mutation_service.admitted_apply_slots(),
+            queued_forwarded_reads: self.read_service.queued(),
+            forwarded_read_slots: self.read_service.admitted_slots(),
+            awaiting_responses: self
+                .operation_gate
+                .awaiting_responses
+                .load(Ordering::SeqCst),
+        }
+    }
     pub fn storage_diagnostics(&self) -> crate::store::StorageDiagnostics {
         self.storage_executor.diagnostics()
     }

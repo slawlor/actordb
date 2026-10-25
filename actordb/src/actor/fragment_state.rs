@@ -699,6 +699,9 @@ impl FragmentState {
             let children = self.table_children.read().await.clone();
             for child in children.values() {
                 durability = match (durability, child.flush_stable_local().await?) {
+                    (ApplyDurability::MemoryApplied, _) | (_, ApplyDurability::MemoryApplied) => {
+                        ApplyDurability::MemoryApplied
+                    }
                     (ApplyDurability::StableCommitted, ApplyDurability::StableCommitted) => {
                         ApplyDurability::StableCommitted
                     }

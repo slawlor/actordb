@@ -2147,6 +2147,9 @@ pub(super) async fn handle_connection(
                 };
                 if let Some(relay) = relay {
                     let _ = relay.timeout_cancel.send(());
+                    if let Some(operation) = &relay._operation {
+                        operation.mark_responding();
+                    }
                     let _ = send_envelope_retained(
                         &relay.origin_tx,
                         Envelope {
@@ -2259,6 +2262,7 @@ pub(super) async fn handle_connection(
                 if let Some(relay) = relay {
                     let _ = relay.timeout_cancel.send(());
                     response.req_id = relay.origin_req_id;
+                    relay._operation.mark_responding();
                     let _ = send_envelope_retained(
                         &relay.origin_tx,
                         Envelope {

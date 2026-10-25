@@ -135,6 +135,9 @@ pub(super) struct MutationCompletion {
 
 impl MutationCompletion {
     pub(super) fn send(self, tx: &PeerChannel) -> bool {
+        if let Some(operation) = &self._operation {
+            operation.mark_responding();
+        }
         super::connection::send_envelope_retained(
             tx,
             crate::proto::Envelope {
@@ -211,6 +214,17 @@ pub(super) struct MutationService {
 }
 
 impl MutationService {
+    pub(super) fn queued(&self) -> usize {
+        self.lanes
+            .iter()
+            .map(|lane| lane.max_capacity().saturating_sub(lane.capacity()))
+            .sum()
+    }
+    pub(super) fn admitted_apply_slots(&self) -> usize {
+        self.lanes[0]
+            .max_capacity()
+            .saturating_sub(self.count.available_permits())
+    }
     #[cfg(test)]
     pub(super) fn new(capacity: usize, byte_capacity: usize) -> Arc<Self> {
         Self::new_inner(capacity, byte_capacity, None)

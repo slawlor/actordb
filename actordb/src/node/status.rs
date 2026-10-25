@@ -211,6 +211,9 @@ pub struct NodeStatus {
     pub request_duration: super::observability::DurationSummary,
     pub request_waiter_timeouts: u64,
     pub tables: Vec<super::observability::TableMetricsSnapshot>,
+    pub queues: super::observability::RequestQueueDiagnostics,
+    pub write_concerns: crate::write_concern::WriteConcernDiagnostics,
+    pub peer_fence: super::PeerFenceStatus,
     /// Conservative query/scan coordinator and actor-owned byte reservations.
     /// Request draining also waits for this ownership to finish.
     pub query_reserved_runtime_bytes: usize,
@@ -428,6 +431,9 @@ impl Node {
             request_duration: self.operation_gate.request_duration.snapshot(),
             request_waiter_timeouts: self.operation_gate.waiter_timeouts.load(Ordering::Relaxed),
             tables,
+            queues: self.queue_diagnostics(),
+            write_concerns: self.write_concern_diagnostics(),
+            peer_fence: self.peer_fence_status(),
             query_reserved_runtime_bytes: self.query_admission.diagnostics().reserved_runtime_bytes,
             shutdown_stage,
             readiness,

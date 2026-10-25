@@ -634,6 +634,161 @@ metric!(
     "Cumulative monotonic callback queue residence summary."
 );
 
+metric!(
+    QUEUED_EMBEDDED,
+    "actordb.request.queued_embedded_mutations",
+    Gauge,
+    Requests,
+    "Mutations queued in the embedded completion manager."
+);
+metric!(
+    QUEUED_FORWARDED_WRITES,
+    "actordb.request.queued_forwarded_mutations",
+    Gauge,
+    Requests,
+    "Forwarded writes queued before completion-worker execution."
+);
+metric!(
+    FORWARDED_APPLY_SLOTS,
+    "actordb.request.forwarded_apply_slots",
+    Gauge,
+    Requests,
+    "Forwarded apply admission use; concern waiters are separate."
+);
+metric!(
+    QUEUED_FORWARDED_READS,
+    "actordb.request.queued_forwarded_reads",
+    Gauge,
+    Requests,
+    "Forwarded reads queued before actor handoff."
+);
+metric!(
+    FORWARDED_READ_SLOTS,
+    "actordb.request.forwarded_read_slots",
+    Gauge,
+    Requests,
+    "Forwarded read slots retained through actual actor/response ownership."
+);
+metric!(
+    AWAITING_RESPONSES,
+    "actordb.request.awaiting_responses",
+    Gauge,
+    Requests,
+    "Accepted request response slots held through socket write or terminal drop."
+);
+metric!(
+    CONCERN_ACCEPTED,
+    "actordb.write_concern.accepted",
+    Counter,
+    Requests,
+    "Accepted captured write-concern tickets."
+);
+metric!(
+    CONCERN_SATISFIED,
+    "actordb.write_concern.satisfied",
+    Counter,
+    Requests,
+    "Tickets satisfied by validated acknowledgement/durability evidence."
+);
+metric!(
+    CONCERN_TIMEOUTS,
+    "actordb.write_concern.timed_out",
+    Counter,
+    Requests,
+    "Concern deadlines expired with explicit partial progress."
+);
+metric!(
+    CONCERN_DURABILITY_FAILURES,
+    "actordb.write_concern.durability_failed",
+    Counter,
+    Events,
+    "Required local durability was not achieved."
+);
+metric!(
+    CONCERN_OPERATION_FAILURES,
+    "actordb.write_concern.operation_failed",
+    Counter,
+    Events,
+    "Operation failed/superseded before concern success."
+);
+metric!(
+    CONCERN_UNKNOWN,
+    "actordb.write_concern.unknown_outcomes",
+    Counter,
+    Events,
+    "Lost or uncertain operation/fence outcomes."
+);
+metric!(
+    CONCERN_REJECTED,
+    "actordb.write_concern.rejected",
+    Counter,
+    Requests,
+    "Rejected write-concern policies or waiter admission."
+);
+metric!(
+    CONCERN_CANCELLED,
+    "actordb.write_concern.cancelled",
+    Counter,
+    Requests,
+    "Concern waiter cancellations, not execution completion."
+);
+metric!(
+    CONCERN_ACTIVE,
+    "actordb.write_concern.active",
+    Gauge,
+    Requests,
+    "Captured concern tickets still owned."
+);
+metric!(
+    CONCERN_WAIT,
+    "actordb.write_concern.wait_duration",
+    Distribution,
+    Nanoseconds,
+    "Actual concern wait duration through terminal waiter outcome."
+);
+metric!(
+    PEER_ACCEPTED,
+    "actordb.peer.admitted_frames",
+    Counter,
+    Frames,
+    "Authenticated decoded frames accepted by receiver authority."
+);
+metric!(
+    PEER_COMPLETED,
+    "actordb.peer.completed_frames",
+    Counter,
+    Frames,
+    "Receiver frame ownership terminally released after actor/store/response work."
+);
+metric!(
+    PEER_REJECTED,
+    "actordb.peer.rejected_frames",
+    Counter,
+    Frames,
+    "Receiver authority frame rejections."
+);
+metric!(
+    PEER_HANDSHAKES_REJECTED,
+    "actordb.peer.rejected_handshakes",
+    Counter,
+    Events,
+    "Rejected process authentication/authority handshakes."
+);
+metric!(
+    PEER_PENDING_FRAMES,
+    "actordb.peer.outstanding_fence_frames",
+    Gauge,
+    Frames,
+    "Old authority frame ownership not yet drained."
+);
+metric!(
+    PEER_PENDING_PERSISTENCE,
+    "actordb.peer.outstanding_fence_persistence",
+    Gauge,
+    Operations,
+    "Old authority persistence fence work not yet terminal."
+);
+
 impl Node {
     /// Collect metrics with default fragment/sender limits.
     pub fn metrics_snapshot(&self) -> MetricsSnapshot {
@@ -724,6 +879,67 @@ impl Node {
                 );
             }
         }
+        for (descriptor, value) in [
+            (&QUEUED_EMBEDDED, status.queues.queued_embedded_mutations),
+            (
+                &QUEUED_FORWARDED_WRITES,
+                status.queues.queued_forwarded_mutations,
+            ),
+            (&FORWARDED_APPLY_SLOTS, status.queues.forwarded_apply_slots),
+            (
+                &QUEUED_FORWARDED_READS,
+                status.queues.queued_forwarded_reads,
+            ),
+            (&FORWARDED_READ_SLOTS, status.queues.forwarded_read_slots),
+            (&AWAITING_RESPONSES, status.lifecycle.awaiting_responses()),
+        ] {
+            node_point(descriptor, MetricValue::Gauge(value as u64));
+        }
+        for (descriptor, value) in [
+            (&CONCERN_ACCEPTED, status.write_concerns.accepted),
+            (&CONCERN_SATISFIED, status.write_concerns.satisfied),
+            (&CONCERN_TIMEOUTS, status.write_concerns.timed_out),
+            (
+                &CONCERN_DURABILITY_FAILURES,
+                status.write_concerns.durability_failed,
+            ),
+            (
+                &CONCERN_OPERATION_FAILURES,
+                status.write_concerns.operation_failed,
+            ),
+            (&CONCERN_UNKNOWN, status.write_concerns.unknown_outcomes),
+            (&CONCERN_REJECTED, status.write_concerns.rejected),
+            (&CONCERN_CANCELLED, status.write_concerns.cancelled),
+            (&PEER_ACCEPTED, status.peer_fence.accepted_frames()),
+            (&PEER_COMPLETED, status.peer_fence.completed_frames()),
+            (&PEER_REJECTED, status.peer_fence.rejected_frames()),
+            (
+                &PEER_HANDSHAKES_REJECTED,
+                status.peer_fence.rejected_handshakes(),
+            ),
+        ] {
+            node_point(descriptor, MetricValue::Counter(value));
+        }
+        node_point(
+            &CONCERN_ACTIVE,
+            MetricValue::Gauge(status.write_concerns.active),
+        );
+        node_point(
+            &CONCERN_WAIT,
+            MetricValue::Distribution(DistributionSummary {
+                count: status.write_concerns.wait_count,
+                sum: status.write_concerns.wait_nanos,
+                max: status.write_concerns.max_wait_nanos,
+            }),
+        );
+        node_point(
+            &PEER_PENDING_FRAMES,
+            MetricValue::Gauge(status.peer_fence.outstanding_frames() as u64),
+        );
+        node_point(
+            &PEER_PENDING_PERSISTENCE,
+            MetricValue::Gauge(status.peer_fence.outstanding_persistence() as u64),
+        );
         let drain = self.drain_diagnostics();
         for (descriptor, value) in [
             (&ACCEPTED_REQUESTS, drain.accepted_requests()),

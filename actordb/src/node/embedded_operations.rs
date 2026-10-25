@@ -94,6 +94,11 @@ impl EmbeddedOperations {
                 .saturating_sub(self.completions.available_permits()),
         }
     }
+    pub(super) fn queued(&self) -> usize {
+        self.jobs
+            .max_capacity()
+            .saturating_sub(self.jobs.capacity())
+    }
     #[cfg(test)]
     pub(super) fn admit(&self, bytes: usize) -> Result<Arc<RequestRetention>, NodeError> {
         self.admit_owned(bytes, None)
