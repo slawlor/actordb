@@ -107,20 +107,40 @@ async fn collectors_reenter_during_writes_and_observe_drain_and_stop() {
 }
 
 #[tokio::test]
-async fn bounded_partial_snapshots_do_not_claim_ready_or_zero_missing_values() {
+async fn bounded_partial_snapshots_preserve_known_readiness_without_inventing_missing_capacity() {
     let config = NodeConfig::builder().fragment_count(2).build();
     let node = Node::start("bounded".into(), "127.0.0.1:0".parse().unwrap(), config)
         .await
         .unwrap();
     let snapshot = node.metrics_snapshot_with_limits(SnapshotLimits::new(1, 0));
     assert_eq!(snapshot.status.fragments.len(), 1);
-    assert_eq!(snapshot.status.readiness, Readiness::Unknown);
+    // The declared initial boundary was established before collection. One
+    // observed running authoritative route proves availability even though
+    // this output limit cannot report every fragment or exact live capacity.
+    assert_eq!(snapshot.status.readiness, Readiness::Ready);
+    assert!(snapshot.status.initial_readiness_established);
+    assert_eq!(snapshot.status.available_fragments, None);
     assert!(snapshot.status.observation.fragments_truncated);
     assert!(!snapshot.status.observation.is_complete());
+    assert!(snapshot
+        .points
+        .iter()
+        .any(|point| point.descriptor.name == "actordb.node.ready"
+            && point.value == MetricValue::Gauge(1)));
     assert!(!snapshot
         .points
         .iter()
-        .any(|point| point.descriptor.name == "actordb.node.ready"));
+        .any(|point| point.descriptor.name == "actordb.lifecycle.available_fragments"));
+    // With no route observation, availability is genuinely unknown; it must
+    // not be replaced with a ready=false/zero capacity measurement.
+    let unobserved = node.metrics_snapshot_with_limits(SnapshotLimits::new(0, 0));
+    assert_eq!(unobserved.status.readiness, Readiness::Unknown);
+    assert!(unobserved.status.fragments.is_empty());
+    assert!(!unobserved
+        .points
+        .iter()
+        .any(|point| point.descriptor.name == "actordb.node.ready"
+            || point.descriptor.name == "actordb.lifecycle.available_fragments"));
     assert!(!snapshot
         .points
         .iter()
@@ -353,11 +373,43 @@ async fn cumulative_counters_and_distribution_summaries_are_not_reset_by_collect
             .unwrap();
         assert_eq!(point.value, next.value);
         if let MetricValue::Distribution(summary) = point.value {
-            assert!(summary.count > 0);
+            if point.descriptor.name.starts_with("actordb.expiry.") {
+                assert!(
+                    summary.count > 0,
+                    "the expiry workflow must produce its measured latency samples"
+                );
+            } else if summary.count == 0 {
+                assert_eq!((summary.sum, summary.max), (0, 0));
+            }
             assert!(summary.sum >= summary.max);
         }
     }
     assert_eq!(first.status.boot_id, second.status.boot_id);
+    assert!(!first.status.request_timing_enabled);
+    assert!(!first.status.storage.timing_enabled);
+    for summary in [
+        first.status.request_duration,
+        first.status.storage.queue_wait,
+        first.status.storage.execution_time,
+    ] {
+        assert_eq!(
+            (summary.count, summary.sum_nanos, summary.max_nanos),
+            (0, 0, 0)
+        );
+    }
+    for name in [
+        "actordb.request.owned_duration",
+        "actordb.storage.queue_wait",
+        "actordb.storage.execution_time",
+    ] {
+        assert!(
+            !first
+                .points
+                .iter()
+                .any(|point| point.descriptor.name == name),
+            "disabled optional timing must not be exported as an observed measurement"
+        );
+    }
     assert!(first.points.iter().any(|point| point.descriptor.name
         == "actordb.expiry.delivered_events"
         && point.value == MetricValue::Counter(1)));

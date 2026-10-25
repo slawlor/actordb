@@ -2767,14 +2767,17 @@ async fn bidirectional_large_reconciliation_keeps_connection_reader_live() {
     use actordb::shard::{fragment_of, FragmentId};
 
     // Two data pages cannot coexist in the minimum legal producer byte budget
-    // (one maximum 16 MiB frame; the other 16 MiB is response-only).
+    // (one maximum 16 MiB payload plus its signed transport header; the
+    // other maximum signed frame is response-only). Payload limits remain
+    // 16 MiB; queue accounting also reserves the sequence and signature bytes.
     // Both peers therefore need their connection reader to drain the opposite
     // direction while their responder waits to admit its second page. More
     // fragments than the responder queue depth also prove that the shared
     // connection credit schedules honest work instead of disconnecting a
     // simultaneous startup burst.
     const VALUE_BYTES: usize = 8 * 1024 * 1024;
-    const MIN_WRITER_BYTES: usize = 32 * 1024 * 1024;
+    const SIGNED_HEADER_BYTES: usize = 8 + 64;
+    const MIN_WRITER_BYTES: usize = 32 * 1024 * 1024 + 2 * SIGNED_HEADER_BYTES;
     const FRAGMENT_COUNT: usize = 10;
     const RECONCILE_TIMEOUT: Duration = Duration::from_secs(20);
 
