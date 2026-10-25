@@ -1,7 +1,8 @@
 //! Backend-neutral pull metrics over existing bounded diagnostics.
 //!
-//! Counters and distribution summaries are cumulative for one node incarnation
-//! (see [`MetricsSnapshot::status`]'s `boot_id`). Gauges are current approximate
+//! Counters and distribution summaries are cumulative for the descriptor's
+//! source lifetime. Node scopes use `boot_id`; shared storage scopes use
+//! `status.storage.scope_id`. Gauges are current approximate
 //! observations. Collection does not install callbacks on the request path.
 //! Exporters should replace cumulative values, or compute deltas themselves;
 //! adding each observed counter value to a backend counter double counts it.
@@ -34,8 +35,18 @@ pub enum MetricUnit {
     Events,
     Frames,
     Milliseconds,
+    Nanoseconds,
     /// Zero or one.
     Boolean,
+}
+
+/// Counter reset identity is metadata rather than an unbounded metric label.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum MetricLifetime {
+    NodeIncarnation,
+    /// Shared PersistenceConfig resources may outlive/reappear on another node.
+    PersistenceResources,
 }
 
 /// Stable metric name and meaning, independent of the recording backend.
@@ -46,6 +57,7 @@ pub struct MetricDescriptor {
     pub description: &'static str,
     pub kind: MetricKind,
     pub unit: MetricUnit,
+    pub lifetime: MetricLifetime,
 }
 
 /// Bounded operational scopes. Keys, values, request IDs, session IDs and
@@ -54,6 +66,10 @@ pub struct MetricDescriptor {
 #[non_exhaustive]
 pub enum MetricScope {
     Node,
+    /// A table name deliberately registered through `enable_table_metrics`.
+    Table {
+        table: String,
+    },
     Fragment {
         fragment: FragmentId,
     },
@@ -133,14 +149,129 @@ impl MetricsSnapshot {
 
 macro_rules! metric {
     ($constant:ident, $name:literal, $kind:ident, $unit:ident, $description:literal) => {
+        metric!(
+            $constant,
+            $name,
+            $kind,
+            $unit,
+            $description,
+            NodeIncarnation
+        );
+    };
+    ($constant:ident, $name:literal, $kind:ident, $unit:ident, $description:literal, $lifetime:ident) => {
         const $constant: MetricDescriptor = MetricDescriptor {
             name: $name,
             description: $description,
             kind: MetricKind::$kind,
             unit: MetricUnit::$unit,
+            lifetime: MetricLifetime::$lifetime,
         };
     };
 }
+
+metric!(
+    REQUEST_TIMEOUTS,
+    "actordb.request.waiter_timeouts",
+    Counter,
+    Requests,
+    "Expired request waiters; actual execution can remain outstanding."
+);
+metric!(
+    REQUEST_DURATION,
+    "actordb.request.owned_duration",
+    Distribution,
+    Nanoseconds,
+    "Time through final request ownership release; includes queue/execution and terminal errors."
+);
+metric!(
+    LOCAL_FENCES_ACTIVE,
+    "actordb.drain.active_persistence_fences",
+    Gauge,
+    Operations,
+    "Owned local persistence drain fences not yet terminal."
+);
+metric!(
+    LOCAL_FENCES_COMPLETED,
+    "actordb.drain.completed_persistence_fences",
+    Counter,
+    Operations,
+    "Successful local drain persistence fences; not peer evidence."
+);
+metric!(
+    STORAGE_QUEUED,
+    "actordb.storage.queued_jobs",
+    Gauge,
+    Operations,
+    "Backend jobs waiting for a bounded executor slot.",
+    PersistenceResources
+);
+metric!(
+    STORAGE_COMPLETED,
+    "actordb.storage.completed_jobs",
+    Counter,
+    Operations,
+    "Actual backend calls completed, including failures.",
+    PersistenceResources
+);
+metric!(
+    STORAGE_FAILED,
+    "actordb.storage.failed_jobs",
+    Counter,
+    Events,
+    "Actual failed backend calls, including panics.",
+    PersistenceResources
+);
+metric!(
+    STORAGE_QUEUE_WAIT,
+    "actordb.storage.queue_wait",
+    Distribution,
+    Nanoseconds,
+    "Monotonic executor queue wait for admitted backend calls.",
+    PersistenceResources
+);
+metric!(
+    STORAGE_EXECUTION,
+    "actordb.storage.execution_time",
+    Distribution,
+    Nanoseconds,
+    "Actual backend execution duration through return or panic.",
+    PersistenceResources
+);
+metric!(
+    TABLE_ACCEPTED,
+    "actordb.table.accepted_slots",
+    Counter,
+    Requests,
+    "Accepted ownership slots for a deliberately registered table."
+);
+metric!(
+    TABLE_COMPLETED,
+    "actordb.table.completed_slots",
+    Counter,
+    Requests,
+    "Registered table ownership released through terminal execution/response."
+);
+metric!(
+    TABLE_REJECTED,
+    "actordb.table.rejected_slots",
+    Counter,
+    Requests,
+    "Registered table lifecycle admission rejections."
+);
+metric!(
+    TABLE_ACTIVE,
+    "actordb.table.active_slots",
+    Gauge,
+    Requests,
+    "Registered table slots still owning request or response work."
+);
+metric!(
+    TABLE_DURATION,
+    "actordb.table.owned_duration",
+    Distribution,
+    Nanoseconds,
+    "Registered table slot duration through final ownership release."
+);
 
 metric!(
     ADMISSION_OPEN,
@@ -540,6 +671,59 @@ impl Node {
             &RECEIVE_APPLIES,
             MetricValue::Gauge(status.lifecycle.active_replication_applies() as u64),
         );
+        node_point(
+            &REQUEST_TIMEOUTS,
+            MetricValue::Counter(status.request_waiter_timeouts),
+        );
+        node_point(
+            &LOCAL_FENCES_ACTIVE,
+            MetricValue::Gauge(status.lifecycle.active_persistence_fences() as u64),
+        );
+        node_point(
+            &LOCAL_FENCES_COMPLETED,
+            MetricValue::Counter(status.completed_local_persistence_fences as u64),
+        );
+        for (descriptor, value) in [
+            (
+                &STORAGE_QUEUED,
+                MetricValue::Gauge(status.storage.queued_jobs as u64),
+            ),
+            (
+                &STORAGE_COMPLETED,
+                MetricValue::Counter(status.storage.completed_jobs),
+            ),
+            (
+                &STORAGE_FAILED,
+                MetricValue::Counter(status.storage.failed_jobs),
+            ),
+        ] {
+            node_point(descriptor, value);
+        }
+        if status.request_timing_enabled {
+            node_point(
+                &REQUEST_DURATION,
+                MetricValue::Distribution(DistributionSummary {
+                    count: status.request_duration.count,
+                    sum: status.request_duration.sum_nanos,
+                    max: status.request_duration.max_nanos,
+                }),
+            );
+        }
+        if status.storage.timing_enabled {
+            for (descriptor, duration) in [
+                (&STORAGE_QUEUE_WAIT, status.storage.queue_wait),
+                (&STORAGE_EXECUTION, status.storage.execution_time),
+            ] {
+                node_point(
+                    descriptor,
+                    MetricValue::Distribution(DistributionSummary {
+                        count: duration.count,
+                        sum: duration.sum_nanos,
+                        max: duration.max_nanos,
+                    }),
+                );
+            }
+        }
         let drain = self.drain_diagnostics();
         for (descriptor, value) in [
             (&ACCEPTED_REQUESTS, drain.accepted_requests()),
@@ -666,6 +850,30 @@ impl Node {
                         max,
                     }),
                 );
+            }
+        }
+        for table in &status.tables {
+            for (descriptor, value) in [
+                (&TABLE_ACCEPTED, MetricValue::Counter(table.accepted)),
+                (&TABLE_COMPLETED, MetricValue::Counter(table.completed)),
+                (&TABLE_REJECTED, MetricValue::Counter(table.rejected)),
+                (&TABLE_ACTIVE, MetricValue::Gauge(table.active as u64)),
+                (
+                    &TABLE_DURATION,
+                    MetricValue::Distribution(DistributionSummary {
+                        count: table.duration.count,
+                        sum: table.duration.sum_nanos,
+                        max: table.duration.max_nanos,
+                    }),
+                ),
+            ] {
+                points.push(MetricPoint {
+                    descriptor,
+                    scope: MetricScope::Table {
+                        table: table.table.clone(),
+                    },
+                    value,
+                });
             }
         }
         for fragment in &status.fragments {

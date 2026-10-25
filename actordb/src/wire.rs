@@ -63,6 +63,7 @@ pub(crate) struct BudgetedFrame {
     _producer_byte_permit: Option<OwnedSemaphorePermit>,
     _global_byte_permit: Option<OwnedSemaphorePermit>,
     _global_producer_byte_permit: Option<OwnedSemaphorePermit>,
+    _completion_retention: Option<Arc<dyn Send + Sync>>,
 }
 
 impl BudgetedFrame {
@@ -77,6 +78,7 @@ impl BudgetedFrame {
             _producer_byte_permit: Some(producer_byte_permit),
             _global_byte_permit: None,
             _global_producer_byte_permit: None,
+            _completion_retention: None,
         }
     }
 
@@ -87,12 +89,20 @@ impl BudgetedFrame {
             _producer_byte_permit: None,
             _global_byte_permit: None,
             _global_producer_byte_permit: None,
+            _completion_retention: None,
         }
     }
 
     pub(crate) fn with_global_permits(mut self, permits: GlobalBytePermits) -> Self {
         self._global_byte_permit = Some(permits.total);
         self._global_producer_byte_permit = permits.producer;
+        self
+    }
+    pub(crate) fn with_completion_retention(
+        mut self,
+        retention: Option<Arc<dyn Send + Sync>>,
+    ) -> Self {
+        self._completion_retention = retention;
         self
     }
 

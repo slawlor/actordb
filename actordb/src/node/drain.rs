@@ -19,6 +19,47 @@ pub enum DrainPhase {
     Stopped,
 }
 
+/// Identity of a node's one-way application admission cutoff. All retries
+/// refer to the same incarnation; acceptance is the gate's successful recheck.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub struct DrainCutoff {
+    pub node_boot_id: u64,
+}
+
+/// Requested local boundary. Remote replication is a separate contract.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum DrainDurability {
+    /// Wait for execution and response ownership only.
+    Applied,
+    /// Also flush every local fragment through its configured store contract.
+    #[default]
+    ConfiguredStore,
+    /// Require an explicit stable fence on every local fragment.
+    StableCommitted,
+}
+
+/// Actual local evidence returned by a fragment's persistence fence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum LocalDurability {
+    MemoryApplied,
+    StoreCommitted,
+    StableCommitted,
+}
+
+/// One completed local fence, captured after cutoff application work finishes.
+/// The revision is an observed cache floor, not a global snapshot or writer lease.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct FragmentDrainFence {
+    pub fragment: FragmentId,
+    pub actor_generation: u64,
+    pub revision: Option<u64>,
+    pub durability: LocalDurability,
+}
+
 /// Approximate current ownership counts, readable without actor RPCs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DrainStatus {
@@ -26,6 +67,9 @@ pub struct DrainStatus {
     active_requests: usize,
     active_replication_applies: usize,
     receive_apply_complete: bool,
+    cutoff: Option<DrainCutoff>,
+    active_persistence_fences: usize,
+    active_storage_jobs: usize,
 }
 
 /// Cumulative ownership/admission and bounded drain call observations.
@@ -114,6 +158,17 @@ impl Drop for DrainAttempt<'_> {
     }
 }
 impl DrainStatus {
+    pub fn cutoff(&self) -> Option<DrainCutoff> {
+        self.cutoff
+    }
+    /// Local drain fences still owned through their actual actor/store outcome.
+    pub fn active_persistence_fences(&self) -> usize {
+        self.active_persistence_fences
+    }
+    /// Active synchronous storage calls, including callers whose waiter left.
+    pub fn active_storage_jobs(&self) -> usize {
+        self.active_storage_jobs
+    }
     pub fn phase(&self) -> DrainPhase {
         self.phase
     }
@@ -136,6 +191,8 @@ impl DrainStatus {
 pub struct DrainOptions {
     #[builder(default = Duration::from_secs(30))]
     timeout: Duration,
+    #[builder(default)]
+    durability: DrainDurability,
 }
 impl Default for DrainOptions {
     fn default() -> Self {
@@ -143,6 +200,13 @@ impl Default for DrainOptions {
     }
 }
 impl DrainOptions {
+    pub fn with_durability(mut self, durability: DrainDurability) -> Self {
+        self.durability = durability;
+        self
+    }
+    pub fn durability(&self) -> DrainDurability {
+        self.durability
+    }
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
         self
@@ -161,11 +225,21 @@ impl DrainOptions {
 }
 
 /// Evidence of the completed local boundary; contains no peer ACK guarantee.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DrainReport {
     status: DrainStatus,
+    requested_durability: DrainDurability,
+    local_fences: Vec<FragmentDrainFence>,
 }
 impl DrainReport {
+    pub fn requested_durability(&self) -> DrainDurability {
+        self.requested_durability
+    }
+    /// Actual per-fragment local persistence evidence. An execution-only drain
+    /// has no persistence evidence; local shutdown alone never proves peer ACKs.
+    pub fn local_fences(&self) -> &[FragmentDrainFence] {
+        &self.local_fences
+    }
     pub fn status(&self) -> DrainStatus {
         self.status
     }
@@ -184,8 +258,17 @@ impl DrainReport {
 #[non_exhaustive]
 pub enum DrainError {
     InvalidOptions(String),
-    Timeout { status: DrainStatus },
+    Timeout {
+        status: DrainStatus,
+    },
     Local(NodeError),
+    /// A persistence outcome failed. Admission stays closed and retry resumes
+    /// the same selected durability rather than weakening its requirements.
+    Persistence {
+        fragment: FragmentId,
+        message: String,
+    },
+    IncompatibleRetry(String),
 }
 impl std::fmt::Display for DrainError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -199,6 +282,13 @@ impl std::fmt::Display for DrainError {
                 status.active_replication_applies()
             ),
             Self::Local(error) => write!(f, "local shutdown failed: {error}"),
+            Self::Persistence { fragment, message } => {
+                write!(
+                    f,
+                    "drain persistence fence for fragment {fragment} failed: {message}"
+                )
+            }
+            Self::IncompatibleRetry(message) => f.write_str(message),
         }
     }
 }
@@ -215,6 +305,18 @@ impl Node {
     /// Application sessions retain this slot through response send or failure.
     pub(crate) fn admit_client_request(&self) -> Result<OperationPermit, NodeError> {
         self.admit_operation()
+    }
+    pub(crate) fn admit_client_request_for_table(
+        &self,
+        table: &str,
+    ) -> Result<OperationPermit, NodeError> {
+        if !self.table_metrics.enabled() {
+            return self.admit_client_request();
+        }
+        match TableId::new(table) {
+            Ok(table) => self.admit_table_operation(table.name()),
+            Err(_) => self.admit_client_request(),
+        }
     }
     /// Observe cumulative slot outcomes and elapsed bounded drain attempts.
     pub fn drain_diagnostics(&self) -> DrainDiagnostics {
@@ -256,20 +358,28 @@ impl Node {
             active_replication_applies: self.receive_apply_gate.active.load(Ordering::SeqCst),
             receive_apply_complete: self.receive_apply_gate.phase.load(Ordering::SeqCst)
                 == NODE_STOPPED,
+            cutoff: (phase != DrainPhase::Running).then_some(DrainCutoff {
+                node_boot_id: self.boot_id,
+            }),
+            active_persistence_fences: self.local_drain.active(),
+            active_storage_jobs: self.storage_executor.active(),
         }
     }
 
     /// Close admission and wait for request completion, including cancelled
     /// waiters' actor work. Leaves peer transport/fragment actors alive; incoming
-    /// replication and maintenance may still change data. This establishes no
-    /// persistence or remote replication fence. Timeout/cancellation preserves
-    /// owned work and can be retried. Call `finish_shutdown` for the full barrier.
+    /// replication and maintenance may still change data. By default this also
+    /// waits for a configured local persistence fence on every hosted fragment;
+    /// choose `StableCommitted` to require explicit stable storage, or `Applied`
+    /// for execution only. This does not certify peer replication. Timeout or
+    /// cancellation retains exact in-progress fence ownership for retry.
     pub async fn drain_requests(&self, options: DrainOptions) -> Result<DrainReport, DrainError> {
         let deadline = options.deadline()?;
         let mut attempt = DrainAttempt::new(&self.operation_gate);
         self.begin_drain();
         let draining = async {
             let _coordinator = self.shutdown_state.lock().await;
+            self.local_drain.select(options.durability)?;
             self.placement_tasks.shutdown().await;
             self.operation_gate.wait_for_drain().await;
             // Query page ownership survives coordinator cancellation. Keep a
@@ -279,21 +389,25 @@ impl Node {
             }
             self.mutation_service.shutdown().await;
             self.embedded_operations.shutdown().await;
+            let local_fences = self.local_drain.complete(self, options.durability).await?;
             let _ = self.operation_gate.phase.compare_exchange(
                 NODE_QUIESCING,
                 NODE_DRAINED,
                 Ordering::SeqCst,
                 Ordering::SeqCst,
             );
-            DrainReport {
+            Ok(DrainReport {
                 status: self.drain_status(),
-            }
+                requested_durability: options.durability,
+                local_fences,
+            })
         };
-        let result = tokio::time::timeout_at(deadline, draining)
-            .await
-            .map_err(|_| DrainError::Timeout {
+        let result = match tokio::time::timeout_at(deadline, draining).await {
+            Ok(result) => result,
+            Err(_) => Err(DrainError::Timeout {
                 status: self.drain_status(),
-            });
+            }),
+        };
         attempt.report(&result);
         result
     }
@@ -311,14 +425,19 @@ impl Node {
         let deadline = options.deadline()?;
         let mut attempt = DrainAttempt::new(&self.operation_gate);
         self.begin_drain();
-        let result = match tokio::time::timeout_at(deadline, self.shutdown()).await {
+        let stopping = async {
+            let report = self.drain_requests(options.clone()).await?;
+            self.shutdown().await.map_err(DrainError::Local)?;
+            Ok(DrainReport {
+                status: self.drain_status(),
+                ..report
+            })
+        };
+        let result = match tokio::time::timeout_at(deadline, stopping).await {
             Err(_) => Err(DrainError::Timeout {
                 status: self.drain_status(),
             }),
-            Ok(Err(error)) => Err(DrainError::Local(error)),
-            Ok(Ok(())) => Ok(DrainReport {
-                status: self.drain_status(),
-            }),
+            Ok(result) => result,
         };
         attempt.report(&result);
         result

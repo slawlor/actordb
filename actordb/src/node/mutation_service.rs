@@ -22,8 +22,8 @@ use crate::actor::{KvMessage, OpPriority, ReplicatedOp, VersionedValue};
 use crate::proto::{BatchPut, ForwardedPut, MutationResponse};
 
 use super::{
-    apply_forwarded_mutation, priority_from_proto, send_mutation_response,
-    unavailable_mutation_results, FragmentId, OperationPermit, PeerChannel, SenderMap,
+    apply_forwarded_mutation, priority_from_proto, unavailable_mutation_results, FragmentId,
+    OperationPermit, PeerChannel, SenderMap,
 };
 
 pub(super) const FORWARDED_MUTATION_CAPACITY: usize = 128;
@@ -123,11 +123,18 @@ pub(super) struct MutationCompletion {
     // Include completed results still waiting for their reader's encoding in
     // admission. A dropped reader releases this only after apply/fanout ends.
     _retention: Option<Arc<MutationRetention>>,
+    _operation: Option<OperationPermit>,
 }
 
 impl MutationCompletion {
     pub(super) fn send(self, tx: &PeerChannel) -> bool {
-        send_mutation_response(tx, self.response)
+        super::connection::send_envelope_retained(
+            tx,
+            crate::proto::Envelope {
+                msg: Some(crate::proto::EnvelopeMsg::MutationResponse(self.response)),
+            },
+            Some(Arc::new((self._retention, self._operation))),
+        )
     }
 }
 
@@ -172,6 +179,7 @@ impl MutationJob {
                 results: unavailable_mutation_results(request.into_keys(), reason),
             },
             _retention: retention,
+            _operation: Some(_operation),
         });
     }
 }
@@ -551,6 +559,7 @@ async fn complete_job(
                                 results: vec![result],
                             },
                             _retention: retention,
+                            _operation: Some(_operation.clone()),
                         },
                         _operation,
                     });
@@ -571,6 +580,7 @@ async fn complete_job(
     let _ = reply.send(MutationCompletion {
         response: MutationResponse { req_id, results },
         _retention: retention,
+        _operation: Some(_operation),
     });
     None
 }

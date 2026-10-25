@@ -2939,6 +2939,14 @@ pub(super) fn send_envelope(tx: &PeerChannel, envelope: Envelope) -> bool {
 /// correlated senders then retry, while the reader remains available to drain
 /// frames that let the opposite writer make progress.
 pub(super) fn try_send_envelope_immediate(tx: &PeerChannel, envelope: Envelope) -> bool {
+    send_envelope_retained(tx, envelope, None)
+}
+
+pub(super) fn send_envelope_retained(
+    tx: &PeerChannel,
+    envelope: Envelope,
+    retention: Option<Arc<dyn Send + Sync>>,
+) -> bool {
     let encoded_len = match check_envelope_budget(&envelope, MAX_FRAME_BYTES) {
         Ok(encoded_len) => encoded_len,
         Err(error) => {
@@ -2984,8 +2992,11 @@ pub(super) fn try_send_envelope_immediate(tx: &PeerChannel, envelope: Envelope) 
             return false;
         }
     };
-    frame_permit
-        .send(BudgetedFrame::new_response(frame, byte_permit).with_global_permits(global_permits));
+    frame_permit.send(
+        BudgetedFrame::new_response(frame, byte_permit)
+            .with_global_permits(global_permits)
+            .with_completion_retention(retention),
+    );
     true
 }
 

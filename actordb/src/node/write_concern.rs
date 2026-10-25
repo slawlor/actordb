@@ -49,13 +49,11 @@ impl Node {
         options: WriteConcernOptions,
     ) -> Result<WriteConcernReceipt, WriteConcernError> {
         let key = Self::qualify_key(key);
-        let _operation = self.admit_operation()?;
-        let retention =
-            self.embedded_operations
-                .admit(embedded_operations::single_request_bytes(
-                    &key,
-                    Some(&value),
-                ))?;
+        let operation = self.admit_key_operation(&key)?;
+        let retention = self.embedded_operations.admit_owned(
+            embedded_operations::single_request_bytes(&key, Some(&value)),
+            Some(operation.clone()),
+        )?;
         options.validate()?;
         let fragment = fragment_of(&key, self.router.fragment_count);
         if self.serving.read().unwrap().contains(&fragment) {
@@ -107,10 +105,11 @@ impl Node {
         options: WriteConcernOptions,
     ) -> Result<WriteConcernReceipt, WriteConcernError> {
         let key = Self::qualify_key(key);
-        let _operation = self.admit_operation()?;
-        let retention = self
-            .embedded_operations
-            .admit(embedded_operations::single_request_bytes(&key, None))?;
+        let operation = self.admit_key_operation(&key)?;
+        let retention = self.embedded_operations.admit_owned(
+            embedded_operations::single_request_bytes(&key, None),
+            Some(operation.clone()),
+        )?;
         options.validate()?;
         let fragment = fragment_of(&key, self.router.fragment_count);
         if self.serving.read().unwrap().contains(&fragment) {

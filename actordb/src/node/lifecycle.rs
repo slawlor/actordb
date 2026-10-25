@@ -252,6 +252,9 @@ pub(super) struct OperationGate {
     pub(super) drain_failed: AtomicU64,
     pub(super) drain_cancelled: AtomicU64,
     pub(super) drain_duration_nanos: AtomicU64,
+    pub(super) timing_enabled: std::sync::atomic::AtomicBool,
+    pub(super) request_duration: observability::AtomicDurationSummary,
+    pub(super) waiter_timeouts: AtomicU64,
 }
 
 impl OperationGate {
@@ -269,6 +272,9 @@ impl OperationGate {
             drain_failed: AtomicU64::new(0),
             drain_cancelled: AtomicU64::new(0),
             drain_duration_nanos: AtomicU64::new(0),
+            timing_enabled: std::sync::atomic::AtomicBool::new(false),
+            request_duration: observability::AtomicDurationSummary::default(),
+            waiter_timeouts: AtomicU64::new(0),
         })
     }
 
@@ -293,7 +299,16 @@ impl OperationGate {
         self.active.fetch_add(1, Ordering::SeqCst);
         if self.phase.load(Ordering::SeqCst) == NODE_RUNNING {
             self.accepted.fetch_add(1, Ordering::Relaxed);
-            return Ok(OperationPermit { gate: self.clone() });
+            return Ok(OperationPermit {
+                ownership: Arc::new(OperationOwnership {
+                    gate: self.clone(),
+                    started: self
+                        .timing_enabled
+                        .load(Ordering::Acquire)
+                        .then(std::time::Instant::now),
+                    table: None,
+                }),
+            });
         }
         self.release();
         self.rejected.fetch_add(1, Ordering::Relaxed);
@@ -333,12 +348,28 @@ impl OperationGate {
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct OperationPermit {
-    pub(super) gate: Arc<OperationGate>,
+    ownership: Arc<OperationOwnership>,
 }
-
-impl Drop for OperationPermit {
+impl OperationPermit {
+    pub(super) fn with_table(mut self, table: Option<observability::TableObservation>) -> Self {
+        Arc::get_mut(&mut self.ownership)
+            .expect("fresh admission permit")
+            .table = table;
+        self
+    }
+}
+struct OperationOwnership {
+    gate: Arc<OperationGate>,
+    started: Option<std::time::Instant>,
+    table: Option<observability::TableObservation>,
+}
+impl Drop for OperationOwnership {
     fn drop(&mut self) {
+        if let Some(started) = self.started {
+            self.gate.request_duration.observe(started.elapsed());
+        }
         self.gate.completed.fetch_add(1, Ordering::Relaxed);
         self.gate.release();
     }
@@ -1586,6 +1617,8 @@ impl Node {
             peer_changes,
             operation_gate: OperationGate::new(),
             receive_apply_gate: OperationGate::new(),
+            local_drain: drain_persistence::DrainPersistence::new(),
+            table_metrics: observability::TableRegistry::new(),
             shutdown_state: Mutex::new(ShutdownProgress::Running),
             replication_drain_report: StdMutex::new(None),
             network: config.network.clone(),
@@ -1958,6 +1991,7 @@ impl Node {
             });
 
             self.operation_gate.wait_for_drain().await;
+            self.local_drain.wait_for_active().await;
             self.receive_apply_gate.wait_for_drain().await;
 
             let senders: Vec<NodeSender> = self.senders.lock().await.values().cloned().collect();

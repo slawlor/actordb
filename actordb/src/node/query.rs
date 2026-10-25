@@ -146,7 +146,7 @@ impl Node {
         options: QueryOptions,
     ) -> Result<(QueryResult, u64), QueryExecutionError> {
         let operation = Arc::new(
-            self.admit_operation()
+            self.admit_table_operation(&plan.table)
                 .map_err(|_| QueryExecutionError::ShuttingDown)?,
         );
         plan.validate()?;
@@ -238,7 +238,10 @@ impl Node {
             ),
         )
         .await
-        .map_err(|_| QueryExecutionError::Timeout)?
+        .map_err(|_| {
+            self.note_waiter_timeout();
+            QueryExecutionError::Timeout
+        })?
     }
 
     #[allow(clippy::too_many_arguments)]

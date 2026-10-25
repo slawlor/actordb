@@ -19,6 +19,7 @@ use crate::shard::FragmentId;
 pub struct SnapshotLimits {
     max_fragments: usize,
     max_senders: usize,
+    max_tables: usize,
 }
 
 impl SnapshotLimits {
@@ -28,6 +29,7 @@ impl SnapshotLimits {
         Self {
             max_fragments: max_fragments.min(4_096),
             max_senders: max_senders.min(4_096),
+            max_tables: 64,
         }
     }
 
@@ -39,6 +41,13 @@ impl SnapshotLimits {
     /// Maximum number of replication sender records.
     pub fn max_senders(&self) -> usize {
         self.max_senders
+    }
+    pub fn with_max_tables(mut self, max_tables: usize) -> Self {
+        self.max_tables = max_tables.min(256);
+        self
+    }
+    pub fn max_tables(&self) -> usize {
+        self.max_tables
     }
 }
 
@@ -147,6 +156,8 @@ pub struct ReplicationStatus {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct SnapshotObservation {
+    pub table_metrics_unavailable: bool,
+    pub table_metrics_truncated: bool,
     pub placement_unavailable: bool,
     pub fragments_truncated: bool,
     /// At most 64 replica IDs are copied for each fragment.
@@ -168,6 +179,8 @@ impl SnapshotObservation {
     /// or placement change occurred. Independent gauges still are approximate.
     pub fn is_complete(&self) -> bool {
         !self.placement_unavailable
+            && !self.table_metrics_unavailable
+            && !self.table_metrics_truncated
             && !self.fragments_truncated
             && !self.replicas_truncated
             && !self.senders_unavailable
@@ -191,6 +204,13 @@ pub struct NodeStatus {
     pub observed_at: SystemTime,
     pub collection_duration: Duration,
     pub lifecycle: DrainStatus,
+    pub completed_local_persistence_fences: usize,
+    pub local_persistence_failure: Option<(FragmentId, String)>,
+    pub storage: crate::store::StorageDiagnostics,
+    pub request_timing_enabled: bool,
+    pub request_duration: super::observability::DurationSummary,
+    pub request_waiter_timeouts: u64,
+    pub tables: Vec<super::observability::TableMetricsSnapshot>,
     /// Conservative query/scan coordinator and actor-owned byte reservations.
     /// Request draining also waits for this ownership to finish.
     pub query_reserved_runtime_bytes: usize,
@@ -223,6 +243,16 @@ impl Node {
         let observed_at = SystemTime::now();
         let lifecycle = self.drain_status();
         let mut observation = SnapshotObservation::default();
+        let tables = match self.table_metrics.snapshot(limits.max_tables) {
+            Some((tables, truncated)) => {
+                observation.table_metrics_truncated = truncated;
+                tables
+            }
+            None => {
+                observation.table_metrics_unavailable = true;
+                Vec::new()
+            }
+        };
         let shutdown_stage = match self.shutdown_state.try_lock() {
             Ok(progress) => Some(match &*progress {
                 ShutdownProgress::Running => ShutdownStage::NotStarted,
@@ -391,6 +421,13 @@ impl Node {
             observed_at,
             collection_duration: started.elapsed(),
             lifecycle,
+            completed_local_persistence_fences: self.local_drain.completed(),
+            local_persistence_failure: self.local_drain.failure(),
+            storage: self.storage_diagnostics(),
+            request_timing_enabled: self.operation_gate.timing_enabled.load(Ordering::Acquire),
+            request_duration: self.operation_gate.request_duration.snapshot(),
+            request_waiter_timeouts: self.operation_gate.waiter_timeouts.load(Ordering::Relaxed),
+            tables,
             query_reserved_runtime_bytes: self.query_admission.diagnostics().reserved_runtime_bytes,
             shutdown_stage,
             readiness,

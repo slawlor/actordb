@@ -117,9 +117,14 @@ mod placement;
 use placement::{placement_driver, PlacementDriverDeps, BOOTSTRAP_TIMEOUT};
 
 pub mod drain;
+mod drain_persistence;
 mod lifecycle;
-pub use drain::{DrainDiagnostics, DrainError, DrainOptions, DrainPhase, DrainReport, DrainStatus};
+pub use drain::{
+    DrainCutoff, DrainDiagnostics, DrainDurability, DrainError, DrainOptions, DrainPhase,
+    DrainReport, DrainStatus, FragmentDrainFence, LocalDurability,
+};
 pub mod metrics;
+pub mod observability;
 pub mod status;
 #[cfg(test)]
 use lifecycle::spawn_fragment_subtree;
@@ -1265,6 +1270,8 @@ pub struct Node {
     peer_changes: watch::Sender<u64>,
     operation_gate: Arc<OperationGate>,
     receive_apply_gate: Arc<OperationGate>,
+    local_drain: Arc<drain_persistence::DrainPersistence>,
+    table_metrics: observability::TableRegistry,
     shutdown_state: Mutex<ShutdownProgress>,
     replication_drain_report: StdMutex<Option<ReplicationDrainReport>>,
     network: Arc<dyn Network>,
@@ -2272,13 +2279,11 @@ impl Node {
     /// or await asynchronous fan-out to the other replicas.
     pub async fn put(&self, key: String, value: Vec<u8>) -> Result<(), NodeError> {
         let key = Self::qualify_key(key);
-        let _operation = self.admit_operation()?;
-        let retention =
-            self.embedded_operations
-                .admit(embedded_operations::single_request_bytes(
-                    &key,
-                    Some(&value),
-                ))?;
+        let operation = self.admit_key_operation(&key)?;
+        let retention = self.embedded_operations.admit_owned(
+            embedded_operations::single_request_bytes(&key, Some(&value)),
+            Some(operation.clone()),
+        )?;
         self.put_with_ttl_and_priority(key, value, None, OpPriority::Default, retention)
             .await
     }
@@ -2298,13 +2303,11 @@ impl Node {
         priority: OpPriority,
     ) -> Result<(), NodeError> {
         let key = Self::qualify_key(key);
-        let _operation = self.admit_operation()?;
-        let retention =
-            self.embedded_operations
-                .admit(embedded_operations::single_request_bytes(
-                    &key,
-                    Some(&value),
-                ))?;
+        let operation = self.admit_key_operation(&key)?;
+        let retention = self.embedded_operations.admit_owned(
+            embedded_operations::single_request_bytes(&key, Some(&value)),
+            Some(operation.clone()),
+        )?;
         self.put_with_ttl_and_priority(key, value, None, priority, retention)
             .await
     }
@@ -2318,13 +2321,11 @@ impl Node {
         priority: OpPriority,
     ) -> Result<(), NodeError> {
         let key = Self::qualify_key(key);
-        let _operation = self.admit_operation()?;
-        let retention =
-            self.embedded_operations
-                .admit(embedded_operations::single_request_bytes(
-                    &key,
-                    Some(&value),
-                ))?;
+        let operation = self.admit_key_operation(&key)?;
+        let retention = self.embedded_operations.admit_owned(
+            embedded_operations::single_request_bytes(&key, Some(&value)),
+            Some(operation.clone()),
+        )?;
         self.put_with_ttl_and_priority(key, value, ttl, priority, retention)
             .await
     }
@@ -2399,13 +2400,11 @@ impl Node {
         ttl: Option<Duration>,
     ) -> Result<(), NodeError> {
         let key = Self::qualify_key(key);
-        let _operation = self.admit_operation()?;
-        let retention =
-            self.embedded_operations
-                .admit(embedded_operations::single_request_bytes(
-                    &key,
-                    Some(&value),
-                ))?;
+        let operation = self.admit_key_operation(&key)?;
+        let retention = self.embedded_operations.admit_owned(
+            embedded_operations::single_request_bytes(&key, Some(&value)),
+            Some(operation.clone()),
+        )?;
         self.put_with_ttl_and_priority(key, value, ttl, OpPriority::Default, retention)
             .await
     }
@@ -2426,10 +2425,11 @@ impl Node {
         priority: OpPriority,
     ) -> Result<(), NodeError> {
         let key = Self::qualify_key(key);
-        let _operation = self.admit_operation()?;
-        let retention = self
-            .embedded_operations
-            .admit(embedded_operations::single_request_bytes(&key, None))?;
+        let operation = self.admit_key_operation(&key)?;
+        let retention = self.embedded_operations.admit_owned(
+            embedded_operations::single_request_bytes(&key, None),
+            Some(operation.clone()),
+        )?;
         let seq = {
             let mut guard = self.next_seq.lock().await;
             *guard += 1;
@@ -2468,10 +2468,11 @@ impl Node {
     /// holder is distinct from a valid not-found response.
     pub async fn get(&self, key: String) -> Result<Option<VersionedValue>, NodeError> {
         let key = Self::qualify_key(key);
-        let _operation = self.admit_operation()?;
-        let retention = self
-            .embedded_operations
-            .admit(embedded_operations::single_request_bytes(&key, None))?;
+        let operation = self.admit_key_operation(&key)?;
+        let retention = self.embedded_operations.admit_owned(
+            embedded_operations::single_request_bytes(&key, None),
+            Some(operation.clone()),
+        )?;
         self.get_with_priority_admitted(key, OpPriority::Default, retention)
             .await
     }
@@ -2489,10 +2490,11 @@ impl Node {
         priority: OpPriority,
     ) -> Result<Option<VersionedValue>, NodeError> {
         let key = Self::qualify_key(key);
-        let _operation = self.admit_operation()?;
-        let retention = self
-            .embedded_operations
-            .admit(embedded_operations::single_request_bytes(&key, None))?;
+        let operation = self.admit_key_operation(&key)?;
+        let retention = self.embedded_operations.admit_owned(
+            embedded_operations::single_request_bytes(&key, None),
+            Some(operation.clone()),
+        )?;
         self.get_with_priority_admitted(key, priority, retention)
             .await
     }
@@ -2530,7 +2532,10 @@ impl Node {
                 CallResult::Success(_) => {
                     Err(NodeError::Actor("point read result cardinality".into()))
                 }
-                CallResult::Timeout => Err(NodeError::Actor("get timed out".into())),
+                CallResult::Timeout => {
+                    self.note_waiter_timeout();
+                    Err(NodeError::Actor("get timed out".into()))
+                }
                 CallResult::SenderError => {
                     Err(NodeError::Actor("get reply channel dropped".into()))
                 }
@@ -2616,17 +2621,20 @@ impl Node {
     /// Request count admission is bounded; use bounded queries/scans for
     /// production reads.
     pub async fn get_all(&self) -> Result<HashMap<String, VersionedValue>, NodeError> {
-        let _operation = self.admit_operation()?;
+        let operation = self.admit_table_operation("KV")?;
         let retention = self
             .embedded_operations
-            .admit(std::mem::size_of::<KvMessage>())?;
+            .admit_owned(std::mem::size_of::<KvMessage>(), Some(operation.clone()))?;
         let ownership: Arc<dyn Send + Sync> = Arc::new((retention, self.admit_operation()?));
         let all = tokio::time::timeout(
             self.runtime_options.local_work_timeout(),
             self.router.get_all_retained(Some(ownership)),
         )
         .await
-        .map_err(|_| NodeError::Actor("get_all local work timed out".into()))??;
+        .map_err(|_| {
+            self.note_waiter_timeout();
+            NodeError::Actor("get_all local work timed out".into())
+        })??;
         // Hide tombstones from user reads (sync needs them, users don't), and
         // present the built-in KV table's keys in its user-facing form.
         Ok(all
@@ -2663,7 +2671,7 @@ impl Node {
             .into_iter()
             .map(|(key, value)| (Self::qualify_key(key), value))
             .collect();
-        let _operation = match self.admit_operation() {
+        let operation = match self.admit_batch_operation(kvs.iter().map(|(key, _)| key.as_str())) {
             Ok(operation) => operation,
             Err(_) => {
                 return kvs
@@ -2672,10 +2680,10 @@ impl Node {
                     .collect()
             }
         };
-        let retention = match self
-            .embedded_operations
-            .admit(embedded_operations::batch_put_request_bytes(&kvs))
-        {
+        let retention = match self.embedded_operations.admit_owned(
+            embedded_operations::batch_put_request_bytes(&kvs),
+            Some(operation.clone()),
+        ) {
             Ok(retention) => retention,
             Err(error) => return embedded_operations::reject_batch(kvs, error),
         };
@@ -2916,7 +2924,7 @@ impl Node {
             .into_iter()
             .map(|(key, value)| (Self::qualify_key(key), value))
             .collect();
-        let _operation = match self.admit_operation() {
+        let operation = match self.admit_batch_operation(kvs.iter().map(|(key, _)| key.as_str())) {
             Ok(operation) => operation,
             Err(_) => {
                 return kvs
@@ -2925,10 +2933,10 @@ impl Node {
                     .collect()
             }
         };
-        let retention = match self
-            .embedded_operations
-            .admit(embedded_operations::batch_put_request_bytes(&kvs))
-        {
+        let retention = match self.embedded_operations.admit_owned(
+            embedded_operations::batch_put_request_bytes(&kvs),
+            Some(operation.clone()),
+        ) {
             Ok(retention) => retention,
             Err(error) => return embedded_operations::reject_batch(kvs, error),
         };
@@ -2961,7 +2969,7 @@ impl Node {
         priority: OpPriority,
     ) -> Vec<Result<Option<VersionedValue>, NodeError>> {
         let keys: Vec<String> = keys.into_iter().map(Self::qualify_key).collect();
-        let _operation = match self.admit_operation() {
+        let operation = match self.admit_batch_operation(keys.iter().map(String::as_str)) {
             Ok(operation) => operation,
             Err(_) => {
                 return keys
@@ -2970,10 +2978,10 @@ impl Node {
                     .collect()
             }
         };
-        let retention = match self
-            .embedded_operations
-            .admit(embedded_operations::batch_get_request_bytes(&keys))
-        {
+        let retention = match self.embedded_operations.admit_owned(
+            embedded_operations::batch_get_request_bytes(&keys),
+            Some(operation.clone()),
+        ) {
             Ok(retention) => retention,
             Err(error) => return embedded_operations::reject_batch(keys, error),
         };
@@ -3188,7 +3196,7 @@ impl Node {
         keys: Vec<String>,
     ) -> Vec<Result<Option<VersionedValue>, NodeError>> {
         let keys: Vec<String> = keys.into_iter().map(Self::qualify_key).collect();
-        let _operation = match self.admit_operation() {
+        let operation = match self.admit_batch_operation(keys.iter().map(String::as_str)) {
             Ok(operation) => operation,
             Err(_) => {
                 return keys
@@ -3197,10 +3205,10 @@ impl Node {
                     .collect()
             }
         };
-        let retention = match self
-            .embedded_operations
-            .admit(embedded_operations::batch_get_request_bytes(&keys))
-        {
+        let retention = match self.embedded_operations.admit_owned(
+            embedded_operations::batch_get_request_bytes(&keys),
+            Some(operation.clone()),
+        ) {
             Ok(retention) => retention,
             Err(error) => return embedded_operations::reject_batch(keys, error),
         };

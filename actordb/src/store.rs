@@ -317,6 +317,22 @@ pub enum StoreCommitDurability {
     Stable,
 }
 
+/// Actual synchronous storage ownership and optional monotonic timing.
+/// Counters belong to `scope_id`, the shared PersistenceConfig executor
+/// incarnation, which can be deliberately reused across successive nodes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct StorageDiagnostics {
+    pub scope_id: u64,
+    pub queued_jobs: usize,
+    pub active_jobs: usize,
+    pub completed_jobs: u64,
+    pub failed_jobs: u64,
+    pub timing_enabled: bool,
+    pub queue_wait: crate::node::observability::DurationSummary,
+    pub execution_time: crate::node::observability::DurationSummary,
+}
+
 /// Result of asking a store to remove a key prefix.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PrefixDeleteOutcome {

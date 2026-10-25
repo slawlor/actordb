@@ -47,6 +47,7 @@ impl EmbeddedOperationDiagnostics {
 pub(super) struct RequestRetention {
     _count: OwnedSemaphorePermit,
     _bytes: OwnedSemaphorePermit,
+    _operation: Option<super::OperationPermit>,
 }
 
 pub(super) struct EmbeddedOperations {
@@ -93,7 +94,15 @@ impl EmbeddedOperations {
                 .saturating_sub(self.completions.available_permits()),
         }
     }
+    #[cfg(test)]
     pub(super) fn admit(&self, bytes: usize) -> Result<Arc<RequestRetention>, NodeError> {
+        self.admit_owned(bytes, None)
+    }
+    pub(super) fn admit_owned(
+        &self,
+        bytes: usize,
+        operation: Option<super::OperationPermit>,
+    ) -> Result<Arc<RequestRetention>, NodeError> {
         if !self.accepting.load(Ordering::Acquire) {
             return Err(NodeError::ShuttingDown);
         }
@@ -117,6 +126,7 @@ impl EmbeddedOperations {
         Ok(Arc::new(RequestRetention {
             _count: count,
             _bytes: bytes,
+            _operation: operation,
         }))
     }
     pub(super) fn submit(

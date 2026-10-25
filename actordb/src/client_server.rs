@@ -350,7 +350,7 @@ async fn serve_connection(
         );
         // Node admission includes the response's ownership on this independent
         // application listener, including a write blocked on the client socket.
-        let response_ownership = node.admit_client_request();
+        let response_ownership = node.admit_client_request_for_table(&request.table);
         let mut response = if response_ownership.is_err() {
             wire::Response {
                 id: request.id,

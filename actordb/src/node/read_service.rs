@@ -337,7 +337,7 @@ async fn serve_read(job: ReadJob, shutdown: &mut watch::Receiver<bool>) {
     }
     let sent = match response {
         Ok(Ok(CallResult::Success(page))) if Instant::now() < deadline && route.is_current() => {
-            reply_kind.send_page(&tx, page)
+            reply_kind.send_page_retained(&tx, page, Some(retention))
         }
         _ => reply_kind.unavailable(&tx),
     };
@@ -354,7 +354,12 @@ impl ReadReply {
         }
     }
 
-    fn send_page(self, tx: &PeerChannel, page: BatchReadPage) -> bool {
+    fn send_page_retained(
+        self,
+        tx: &PeerChannel,
+        page: BatchReadPage,
+        retention: Option<Arc<dyn Send + Sync>>,
+    ) -> bool {
         match self {
             Self::Single(req_id) => {
                 if page.entries.len() != 1 {
@@ -376,11 +381,12 @@ impl ReadReply {
                     response.expires_at_ms = value.expires_at_ms.unwrap_or(0);
                     response.is_tombstone = value.is_tombstone;
                 }
-                send_envelope(
+                super::connection::send_envelope_retained(
                     tx,
                     Envelope {
                         msg: Some(EnvelopeMsg::GetResponse(response)),
                     },
+                    retention,
                 )
             }
             Self::Batch(req_id) => {
@@ -421,7 +427,15 @@ impl ReadReply {
                         break;
                     }
                 }
-                send_batch_get_response(tx, req_id, results)
+                super::connection::send_envelope_retained(
+                    tx,
+                    Envelope {
+                        msg: Some(EnvelopeMsg::BatchGetResponse(
+                            crate::proto::BatchGetResponse { req_id, results },
+                        )),
+                    },
+                    retention,
+                )
             }
         }
     }
