@@ -2,10 +2,45 @@
 // Licensed under the MIT license in the repository root.
 
 //! Bounded ownership of synchronous backend operations and their completion tasks.
-use super::StoreError;
+use super::{StorageDiagnostics, StoreError};
+use crate::node::observability::{add_saturating, AtomicDurationSummary};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::{oneshot, Mutex, Notify, Semaphore};
 use tokio::task::JoinSet;
+
+struct StorageMetrics {
+    scope_id: u64,
+    queued: AtomicUsize,
+    completed: AtomicU64,
+    failed: AtomicU64,
+    timing_enabled: AtomicBool,
+    queue_wait: AtomicDurationSummary,
+    execution: AtomicDurationSummary,
+}
+
+struct QueuedStorage(Arc<StorageMetrics>);
+impl Drop for QueuedStorage {
+    fn drop(&mut self) {
+        self.0.queued.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+struct ExecutingStorage {
+    metrics: Arc<StorageMetrics>,
+    started: Option<std::time::Instant>,
+    succeeded: bool,
+}
+impl Drop for ExecutingStorage {
+    fn drop(&mut self) {
+        if let Some(started) = self.started {
+            self.metrics.execution.observe(started.elapsed());
+        }
+        add_saturating(&self.metrics.completed, 1);
+        if !self.succeeded {
+            add_saturating(&self.metrics.failed, 1);
+        }
+    }
+}
 
 pub(crate) struct StorageExecutor {
     permits: Arc<Semaphore>,
@@ -13,6 +48,7 @@ pub(crate) struct StorageExecutor {
     owners: StdMutex<JoinSet<()>>,
     owner_changes: Notify,
     drain_lock: Mutex<()>,
+    metrics: Arc<StorageMetrics>,
 }
 impl std::fmt::Debug for StorageExecutor {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -31,6 +67,15 @@ impl StorageExecutor {
             owners: StdMutex::new(JoinSet::new()),
             owner_changes: Notify::new(),
             drain_lock: Mutex::new(()),
+            metrics: Arc::new(StorageMetrics {
+                scope_id: crate::node::observability::fresh_incarnation(),
+                queued: AtomicUsize::new(0),
+                completed: AtomicU64::new(0),
+                failed: AtomicU64::new(0),
+                timing_enabled: AtomicBool::new(false),
+                queue_wait: AtomicDurationSummary::default(),
+                execution: AtomicDurationSummary::default(),
+            }),
         })
     }
 
@@ -72,17 +117,39 @@ impl StorageExecutor {
         T: Send + 'static,
         F: FnOnce() -> Result<T, StoreError> + Send + 'static,
     {
+        self.metrics.queued.fetch_add(1, Ordering::Relaxed);
+        let queued = QueuedStorage(self.metrics.clone());
+        let queued_at = self
+            .metrics
+            .timing_enabled
+            .load(Ordering::Acquire)
+            .then(std::time::Instant::now);
         let permit = self
             .permits
             .clone()
             .acquire_owned()
             .await
             .map_err(|error| StoreError(error.to_string()))?;
+        drop(queued);
+        if let Some(started) = queued_at {
+            self.metrics.queue_wait.observe(started.elapsed());
+        }
         let (reply, completion) = oneshot::channel();
+        let metrics = self.metrics.clone();
         self.spawn_owner(async move {
             let result = tokio::task::spawn_blocking(move || {
                 let _permit = permit;
-                operation()
+                let mut observation = ExecutingStorage {
+                    started: metrics
+                        .timing_enabled
+                        .load(Ordering::Acquire)
+                        .then(std::time::Instant::now),
+                    metrics,
+                    succeeded: false,
+                };
+                let result = operation();
+                observation.succeeded = result.is_ok();
+                result
             })
             .await
             .map_err(|error| StoreError(format!("storage job failed: {error}")))
@@ -121,6 +188,21 @@ impl StorageExecutor {
     }
     pub(crate) fn active(&self) -> usize {
         self.concurrency - self.permits.available_permits()
+    }
+    pub(crate) fn enable_timing(&self) {
+        self.metrics.timing_enabled.store(true, Ordering::Release);
+    }
+    pub(crate) fn diagnostics(&self) -> StorageDiagnostics {
+        StorageDiagnostics {
+            scope_id: self.metrics.scope_id,
+            queued_jobs: self.metrics.queued.load(Ordering::Relaxed),
+            active_jobs: self.active(),
+            completed_jobs: self.metrics.completed.load(Ordering::Relaxed),
+            failed_jobs: self.metrics.failed.load(Ordering::Relaxed),
+            timing_enabled: self.metrics.timing_enabled.load(Ordering::Acquire),
+            queue_wait: self.metrics.queue_wait.snapshot(),
+            execution_time: self.metrics.execution.snapshot(),
+        }
     }
     pub(crate) fn owned_tasks(&self) -> usize {
         self.owners

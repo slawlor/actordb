@@ -76,14 +76,17 @@ use crate::wire::{
     bytes_field_len, check_envelope_budget, check_record_budget, encode_envelope,
     message_field_len, preflight_envelope_decode, varint_field_len, BudgetedFrame, BudgetedPeerTx,
     NodePeerByteBudget, ReconcileGate, RepeatedFieldSizer, ANTI_ENTROPY_PAGE_BYTES,
-    MAX_FRAME_BYTES, MAX_RECONCILE_FETCH_KEYS, MAX_RECONCILE_PAGE_ITEMS, MAX_WIRE_BATCH_ITEMS,
-    MAX_WIRE_ERROR_BYTES, MAX_WIRE_NODE_ID_BYTES, NODE_PEER_QUEUE_BYTE_CAPACITY,
+    MAX_FRAME_BYTES, MAX_RECONCILE_FETCH_KEYS, MAX_RECONCILE_PAGE_ITEMS, MAX_TRANSPORT_FRAME_BYTES,
+    MAX_WIRE_BATCH_ITEMS, MAX_WIRE_ERROR_BYTES, MAX_WIRE_NODE_ID_BYTES,
+    NODE_PEER_QUEUE_BYTE_CAPACITY,
 };
 
 pub use crate::wire::PeerWriterDiagnostics;
 
 #[cfg(test)]
 mod peer_writer_budget_tests;
+#[cfg(test)]
+mod response_retention_tests;
 
 mod connection;
 use connection::{
@@ -117,10 +120,30 @@ mod placement;
 use placement::{placement_driver, PlacementDriverDeps, BOOTSTRAP_TIMEOUT};
 
 pub mod drain;
+mod drain_persistence;
+pub mod peer_authority;
+mod peer_frame;
+use peer_authority::PeerAuthority;
+pub use peer_authority::{
+    AuthorizedPeerGeneration, PeerAuthorityOptions, PeerAuthoritySnapshot, PeerCredential,
+    PeerFenceError, PeerFenceOptions, PeerFencePhase, PeerFenceReport, PeerFenceStage,
+    PeerFenceStatus, PeerIdentity,
+};
+use peer_frame::{FrameSigningState, FrameVerifier};
 mod lifecycle;
-pub use drain::{DrainDiagnostics, DrainError, DrainOptions, DrainPhase, DrainReport, DrainStatus};
+pub use drain::{
+    DrainCutoff, DrainDiagnostics, DrainDurability, DrainError, DrainOptions, DrainPhase,
+    DrainReport, DrainStatus, FragmentDrainFence, LocalDurability,
+};
+mod detailed_status;
+mod membership;
 pub mod metrics;
+pub mod observability;
 pub mod status;
+pub use detailed_status::{
+    DetailedObservation, DetailedSnapshotOptions, FragmentPoolObservation, PoolObservationFailure,
+};
+mod startup;
 #[cfg(test)]
 use lifecycle::spawn_fragment_subtree;
 pub use lifecycle::FragmentRouter;
@@ -130,6 +153,7 @@ use lifecycle::{
     RouteMonitorRegistrationGuard, SenderEntryDeps, SenderFinalizationRegistry, SenderMap,
     SenderReportMap, ShutdownProgress, SupervisorRegistry,
 };
+pub use startup::{NodeStartup, NodeStartupSnapshot, StartupStage};
 
 mod read_service;
 use read_service::{
@@ -196,6 +220,8 @@ pub const CAPABILITY_TYPED_UNKNOWN_MUTATION: u64 = 1 << 11;
 /// Replicated records carry the deterministic logical-table namespace used by
 /// the 0.8 shared-node table views.
 pub const CAPABILITY_TABLE_NAMESPACES: u64 = 1 << 13;
+/// Per-process credentials authenticate generations and every session frame.
+pub const CAPABILITY_AUTHENTICATED_PEER_GENERATIONS: u64 = 1 << 14;
 /// Capabilities required by this binary before it installs a peer connection.
 pub const REQUIRED_WIRE_CAPABILITIES: u64 = CAPABILITY_MUTATION_RESULTS
     | CAPABILITY_DURABILITY_ACKS
@@ -213,7 +239,7 @@ pub const REQUIRED_WIRE_CAPABILITIES: u64 = CAPABILITY_MUTATION_RESULTS
 const PEER_CHANNEL_DEPTH: usize = 256;
 /// Encoded bytes admitted to one peer's writer pipeline, including the frame
 /// currently blocked on the socket.
-const PEER_CHANNEL_BYTE_CAPACITY: usize = 32 * 1024 * 1024;
+const PEER_CHANNEL_BYTE_CAPACITY: usize = 2 * MAX_TRANSPORT_FRAME_BYTES;
 /// Bound control preference so sustained replies cannot starve ordinary RPC
 /// and replication traffic on the shared socket.
 const PEER_RESPONSE_BURST_LIMIT: usize = 16;
@@ -221,8 +247,9 @@ const PEER_RESPONSE_BURST_LIMIT: usize = 16;
 /// response can still enter the priority lane under load. Most aggregate
 /// responses target one MiB, but one individually valid record may approach
 /// the hard frame limit.
-const PEER_RESPONSE_BYTE_RESERVE: usize = MAX_FRAME_BYTES;
-const MIN_PEER_CHANNEL_BYTE_CAPACITY: usize = MAX_FRAME_BYTES + PEER_RESPONSE_BYTE_RESERVE;
+const PEER_RESPONSE_BYTE_RESERVE: usize = MAX_TRANSPORT_FRAME_BYTES;
+const MIN_PEER_CHANNEL_BYTE_CAPACITY: usize =
+    MAX_TRANSPORT_FRAME_BYTES + PEER_RESPONSE_BYTE_RESERVE;
 /// Soft encoded-byte target for aggregate request and response frames. One
 /// individually valid item may exceed this target up to `MAX_FRAME_BYTES`.
 const WIRE_BATCH_PAGE_BYTES: usize = ANTI_ENTROPY_PAGE_BYTES;
@@ -241,7 +268,7 @@ const INBOUND_CONNECTION_CAPACITY: usize = 1024;
 /// Node-wide raw receive bodies, including handshakes and outbound-dialed
 /// connections. Four maximum frames fit without allowing the socket count to
 /// multiply incomplete-body allocations into gigabytes.
-const RECEIVE_BYTE_CAPACITY: usize = 64 * 1024 * 1024;
+const RECEIVE_BYTE_CAPACITY: usize = 4 * MAX_TRANSPORT_FRAME_BYTES;
 const RELAY_CAPACITY: usize = 1024;
 const RELAY_KEY_BYTE_CAPACITY: usize = 64 * 1024 * 1024;
 /// Total budget for both flights of the peer handshake.
@@ -941,12 +968,13 @@ async fn apply_forwarded_mutation(
     op: ReplicatedOp,
     priority: OpPriority,
     request_index: usize,
+    retention: Option<Arc<dyn Send + Sync>>,
 ) -> MutationResult {
     let key = op.key.clone();
     if let Err(error) = validate_replicated_op(&op) {
         return mutation_result(key, request_index, Err(error));
     }
-    let result = match call_apply(actor, op.clone(), priority, false).await {
+    let result = match call_apply_retained(actor, op.clone(), priority, false, retention).await {
         // A dispatcher/worker disappearing is routing availability, not a
         // terminal mutation outcome. The stamped operation is idempotent and
         // may be retried at another configured holder.
@@ -1265,7 +1293,13 @@ pub struct Node {
     peer_changes: watch::Sender<u64>,
     operation_gate: Arc<OperationGate>,
     receive_apply_gate: Arc<OperationGate>,
+    local_drain: Arc<drain_persistence::DrainPersistence>,
+    table_metrics: observability::TableRegistry,
+    peer_authority: Arc<PeerAuthority>,
     shutdown_state: Mutex<ShutdownProgress>,
+    lifecycle_observation: Arc<startup::LifecycleObservation>,
+    detail_admission: Arc<Semaphore>,
+    pool_timing_enabled: Arc<std::sync::atomic::AtomicBool>,
     replication_drain_report: StdMutex<Option<ReplicationDrainReport>>,
     network: Arc<dyn Network>,
     ttl_expiry: Option<ExpiryRuntime>,
@@ -1273,6 +1307,9 @@ pub struct Node {
     /// releases it only after every fragment actor has stopped; cancellation
     /// and best-effort Drop leave managed backends fail-closed.
     store_binding: StdMutex<Option<StoreBinding>>,
+    /// Observe the root store without extending its physical backend lifetime
+    /// beyond shutdown. Callers retain an Arc for post-shutdown export.
+    checkpoint_store: Option<Weak<dyn KvStore>>,
     recovery: Option<Arc<RecoveryContext>>,
 }
 
@@ -1283,6 +1320,9 @@ pub struct Node {
 /// [`Node::start_with_options`].
 #[derive(Clone, Debug, bon::Builder)]
 pub struct NodeRuntimeOptions {
+    peer_authority: Option<PeerAuthorityOptions>,
+    #[builder(skip = Arc::new(std::sync::atomic::AtomicBool::new(false)))]
+    observation_timing: Arc<std::sync::atomic::AtomicBool>,
     #[builder(default = 256 * 1024 * 1024)]
     replication_retained_byte_capacity: usize,
     #[builder(default = Duration::from_secs(30))]
@@ -1358,9 +1398,20 @@ impl Default for NodeRuntimeOptions {
 }
 
 impl NodeRuntimeOptions {
+    /// Opt into exact per-peer process authentication and hot generation fencing.
+    /// This mode replaces cluster-secret proofs with independent process keys.
+    pub fn with_peer_authority(mut self, authority: PeerAuthorityOptions) -> Self {
+        self.peer_authority = Some(authority);
+        self
+    }
+    /// Startup authority configuration. Use `Node::peer_fence_status` for hot
+    /// transitions and the currently active authority revision/generations.
+    pub fn peer_authority(&self) -> Option<&PeerAuthorityOptions> {
+        self.peer_authority.as_ref()
+    }
     /// Set aggregate encoded-body admission across every physical peer writer.
-    /// Default 256 MiB; minimum 32 MiB. Ordinary producers leave one maximum
-    /// 16 MiB priority response reserved across the Node. This does not include
+    /// Default 256 MiB; minimum 32 MiB + 144 bytes. Ordinary producers leave one maximum
+    /// 16 MiB + 72-byte signed priority response reserved across the Node. This does not include
     /// protobuf objects, frame/task overhead, caches, or kernel socket buffers.
     pub fn with_node_peer_queue_byte_capacity(mut self, capacity: usize) -> Self {
         self.node_peer_queue_byte_capacity = capacity;
@@ -1505,7 +1556,8 @@ impl NodeRuntimeOptions {
     /// Set retained decoded read-key bytes per priority across this Node.
     /// Charges String buffer capacities and Vec/String allocation headers.
     /// This budget is separate from raw receive bodies, returned values, and
-    /// per-connection encoded writer queues. The minimum is 16 MiB.
+    /// per-connection encoded writer queues. The minimum is 16 MiB + 72 bytes
+    /// so one maximum signed physical body always fits.
     pub fn with_serving_read_key_byte_capacity(mut self, capacity: usize) -> Self {
         self.serving_read_key_byte_capacity = capacity;
         self
@@ -1735,6 +1787,7 @@ impl NodeRuntimeOptions {
 
     fn sender_options(&self) -> SenderRuntimeOptions {
         SenderRuntimeOptions::default()
+            .with_observation_timing(self.observation_timing.clone())
             .with_aggregate_retention(self.replication_retention.clone())
             .with_reconciliation_result_budget(self.reconciliation_retention.clone())
             .with_local_work_timeout(self.local_work_timeout)
@@ -1749,6 +1802,9 @@ impl NodeRuntimeOptions {
     }
 
     fn validate(&self) -> Result<(), NodeError> {
+        if let Some(authority) = &self.peer_authority {
+            authority.validate().map_err(NodeError::Codec)?;
+        }
         if self.reconciliation_retained_byte_capacity < 4 * MAX_FRAME_BYTES {
             return Err(NodeError::Actor(
                 "reconciliation result allowance must be at least 64 MiB".into(),
@@ -1844,7 +1900,7 @@ impl NodeRuntimeOptions {
                 "peer queue frame capacity must be at least 2".to_string(),
             ));
         }
-        if self.node_peer_queue_byte_capacity < 2 * MAX_FRAME_BYTES
+        if self.node_peer_queue_byte_capacity < 2 * MAX_TRANSPORT_FRAME_BYTES
             || self.node_peer_queue_byte_capacity > u32::MAX as usize
             || self.node_peer_queue_byte_capacity > Semaphore::MAX_PERMITS
         {
@@ -1865,9 +1921,9 @@ impl NodeRuntimeOptions {
                 "inbound connection capacity must be non-zero".to_string(),
             ));
         }
-        if self.receive_byte_capacity < MAX_FRAME_BYTES {
+        if self.receive_byte_capacity < MAX_TRANSPORT_FRAME_BYTES {
             return Err(NodeError::Actor(format!(
-                "receive byte capacity must be at least {MAX_FRAME_BYTES}"
+                "receive byte capacity must be at least {MAX_TRANSPORT_FRAME_BYTES}"
             )));
         }
         if self.receive_byte_capacity > tokio::sync::Semaphore::MAX_PERMITS {
@@ -1980,6 +2036,8 @@ impl NodeRuntimeOptions {
 #[derive(Clone, bon::Builder)]
 #[non_exhaustive]
 pub struct NodeConfig {
+    #[builder(skip = Arc::new(std::sync::atomic::AtomicBool::new(false)))]
+    pool_timing: Arc<std::sync::atomic::AtomicBool>,
     /// Explicit full-outage recovery authority for a complete durable dynamic
     /// replica set. Default None requires an already-serving bootstrap source.
     pub recovery: Option<RecoveryOptions>,
@@ -2272,13 +2330,11 @@ impl Node {
     /// or await asynchronous fan-out to the other replicas.
     pub async fn put(&self, key: String, value: Vec<u8>) -> Result<(), NodeError> {
         let key = Self::qualify_key(key);
-        let _operation = self.admit_operation()?;
-        let retention =
-            self.embedded_operations
-                .admit(embedded_operations::single_request_bytes(
-                    &key,
-                    Some(&value),
-                ))?;
+        let operation = self.admit_key_operation(&key)?;
+        let retention = self.embedded_operations.admit_owned(
+            embedded_operations::single_request_bytes(&key, Some(&value)),
+            Some(operation.clone()),
+        )?;
         self.put_with_ttl_and_priority(key, value, None, OpPriority::Default, retention)
             .await
     }
@@ -2298,13 +2354,11 @@ impl Node {
         priority: OpPriority,
     ) -> Result<(), NodeError> {
         let key = Self::qualify_key(key);
-        let _operation = self.admit_operation()?;
-        let retention =
-            self.embedded_operations
-                .admit(embedded_operations::single_request_bytes(
-                    &key,
-                    Some(&value),
-                ))?;
+        let operation = self.admit_key_operation(&key)?;
+        let retention = self.embedded_operations.admit_owned(
+            embedded_operations::single_request_bytes(&key, Some(&value)),
+            Some(operation.clone()),
+        )?;
         self.put_with_ttl_and_priority(key, value, None, priority, retention)
             .await
     }
@@ -2318,13 +2372,11 @@ impl Node {
         priority: OpPriority,
     ) -> Result<(), NodeError> {
         let key = Self::qualify_key(key);
-        let _operation = self.admit_operation()?;
-        let retention =
-            self.embedded_operations
-                .admit(embedded_operations::single_request_bytes(
-                    &key,
-                    Some(&value),
-                ))?;
+        let operation = self.admit_key_operation(&key)?;
+        let retention = self.embedded_operations.admit_owned(
+            embedded_operations::single_request_bytes(&key, Some(&value)),
+            Some(operation.clone()),
+        )?;
         self.put_with_ttl_and_priority(key, value, ttl, priority, retention)
             .await
     }
@@ -2399,13 +2451,11 @@ impl Node {
         ttl: Option<Duration>,
     ) -> Result<(), NodeError> {
         let key = Self::qualify_key(key);
-        let _operation = self.admit_operation()?;
-        let retention =
-            self.embedded_operations
-                .admit(embedded_operations::single_request_bytes(
-                    &key,
-                    Some(&value),
-                ))?;
+        let operation = self.admit_key_operation(&key)?;
+        let retention = self.embedded_operations.admit_owned(
+            embedded_operations::single_request_bytes(&key, Some(&value)),
+            Some(operation.clone()),
+        )?;
         self.put_with_ttl_and_priority(key, value, ttl, OpPriority::Default, retention)
             .await
     }
@@ -2426,10 +2476,11 @@ impl Node {
         priority: OpPriority,
     ) -> Result<(), NodeError> {
         let key = Self::qualify_key(key);
-        let _operation = self.admit_operation()?;
-        let retention = self
-            .embedded_operations
-            .admit(embedded_operations::single_request_bytes(&key, None))?;
+        let operation = self.admit_key_operation(&key)?;
+        let retention = self.embedded_operations.admit_owned(
+            embedded_operations::single_request_bytes(&key, None),
+            Some(operation.clone()),
+        )?;
         let seq = {
             let mut guard = self.next_seq.lock().await;
             *guard += 1;
@@ -2468,10 +2519,11 @@ impl Node {
     /// holder is distinct from a valid not-found response.
     pub async fn get(&self, key: String) -> Result<Option<VersionedValue>, NodeError> {
         let key = Self::qualify_key(key);
-        let _operation = self.admit_operation()?;
-        let retention = self
-            .embedded_operations
-            .admit(embedded_operations::single_request_bytes(&key, None))?;
+        let operation = self.admit_key_operation(&key)?;
+        let retention = self.embedded_operations.admit_owned(
+            embedded_operations::single_request_bytes(&key, None),
+            Some(operation.clone()),
+        )?;
         self.get_with_priority_admitted(key, OpPriority::Default, retention)
             .await
     }
@@ -2489,10 +2541,11 @@ impl Node {
         priority: OpPriority,
     ) -> Result<Option<VersionedValue>, NodeError> {
         let key = Self::qualify_key(key);
-        let _operation = self.admit_operation()?;
-        let retention = self
-            .embedded_operations
-            .admit(embedded_operations::single_request_bytes(&key, None))?;
+        let operation = self.admit_key_operation(&key)?;
+        let retention = self.embedded_operations.admit_owned(
+            embedded_operations::single_request_bytes(&key, None),
+            Some(operation.clone()),
+        )?;
         self.get_with_priority_admitted(key, priority, retention)
             .await
     }
@@ -2530,7 +2583,10 @@ impl Node {
                 CallResult::Success(_) => {
                     Err(NodeError::Actor("point read result cardinality".into()))
                 }
-                CallResult::Timeout => Err(NodeError::Actor("get timed out".into())),
+                CallResult::Timeout => {
+                    self.note_waiter_timeout();
+                    Err(NodeError::Actor("get timed out".into()))
+                }
                 CallResult::SenderError => {
                     Err(NodeError::Actor("get reply channel dropped".into()))
                 }
@@ -2616,17 +2672,20 @@ impl Node {
     /// Request count admission is bounded; use bounded queries/scans for
     /// production reads.
     pub async fn get_all(&self) -> Result<HashMap<String, VersionedValue>, NodeError> {
-        let _operation = self.admit_operation()?;
+        let operation = self.admit_table_operation("KV")?;
         let retention = self
             .embedded_operations
-            .admit(std::mem::size_of::<KvMessage>())?;
+            .admit_owned(std::mem::size_of::<KvMessage>(), Some(operation.clone()))?;
         let ownership: Arc<dyn Send + Sync> = Arc::new((retention, self.admit_operation()?));
         let all = tokio::time::timeout(
             self.runtime_options.local_work_timeout(),
             self.router.get_all_retained(Some(ownership)),
         )
         .await
-        .map_err(|_| NodeError::Actor("get_all local work timed out".into()))??;
+        .map_err(|_| {
+            self.note_waiter_timeout();
+            NodeError::Actor("get_all local work timed out".into())
+        })??;
         // Hide tombstones from user reads (sync needs them, users don't), and
         // present the built-in KV table's keys in its user-facing form.
         Ok(all
@@ -2663,7 +2722,7 @@ impl Node {
             .into_iter()
             .map(|(key, value)| (Self::qualify_key(key), value))
             .collect();
-        let _operation = match self.admit_operation() {
+        let operation = match self.admit_batch_operation(kvs.iter().map(|(key, _)| key.as_str())) {
             Ok(operation) => operation,
             Err(_) => {
                 return kvs
@@ -2672,10 +2731,10 @@ impl Node {
                     .collect()
             }
         };
-        let retention = match self
-            .embedded_operations
-            .admit(embedded_operations::batch_put_request_bytes(&kvs))
-        {
+        let retention = match self.embedded_operations.admit_owned(
+            embedded_operations::batch_put_request_bytes(&kvs),
+            Some(operation.clone()),
+        ) {
             Ok(retention) => retention,
             Err(error) => return embedded_operations::reject_batch(kvs, error),
         };
@@ -2916,7 +2975,7 @@ impl Node {
             .into_iter()
             .map(|(key, value)| (Self::qualify_key(key), value))
             .collect();
-        let _operation = match self.admit_operation() {
+        let operation = match self.admit_batch_operation(kvs.iter().map(|(key, _)| key.as_str())) {
             Ok(operation) => operation,
             Err(_) => {
                 return kvs
@@ -2925,10 +2984,10 @@ impl Node {
                     .collect()
             }
         };
-        let retention = match self
-            .embedded_operations
-            .admit(embedded_operations::batch_put_request_bytes(&kvs))
-        {
+        let retention = match self.embedded_operations.admit_owned(
+            embedded_operations::batch_put_request_bytes(&kvs),
+            Some(operation.clone()),
+        ) {
             Ok(retention) => retention,
             Err(error) => return embedded_operations::reject_batch(kvs, error),
         };
@@ -2961,7 +3020,7 @@ impl Node {
         priority: OpPriority,
     ) -> Vec<Result<Option<VersionedValue>, NodeError>> {
         let keys: Vec<String> = keys.into_iter().map(Self::qualify_key).collect();
-        let _operation = match self.admit_operation() {
+        let operation = match self.admit_batch_operation(keys.iter().map(String::as_str)) {
             Ok(operation) => operation,
             Err(_) => {
                 return keys
@@ -2970,10 +3029,10 @@ impl Node {
                     .collect()
             }
         };
-        let retention = match self
-            .embedded_operations
-            .admit(embedded_operations::batch_get_request_bytes(&keys))
-        {
+        let retention = match self.embedded_operations.admit_owned(
+            embedded_operations::batch_get_request_bytes(&keys),
+            Some(operation.clone()),
+        ) {
             Ok(retention) => retention,
             Err(error) => return embedded_operations::reject_batch(keys, error),
         };
@@ -3188,7 +3247,7 @@ impl Node {
         keys: Vec<String>,
     ) -> Vec<Result<Option<VersionedValue>, NodeError>> {
         let keys: Vec<String> = keys.into_iter().map(Self::qualify_key).collect();
-        let _operation = match self.admit_operation() {
+        let operation = match self.admit_batch_operation(keys.iter().map(String::as_str)) {
             Ok(operation) => operation,
             Err(_) => {
                 return keys
@@ -3197,10 +3256,10 @@ impl Node {
                     .collect()
             }
         };
-        let retention = match self
-            .embedded_operations
-            .admit(embedded_operations::batch_get_request_bytes(&keys))
-        {
+        let retention = match self.embedded_operations.admit_owned(
+            embedded_operations::batch_get_request_bytes(&keys),
+            Some(operation.clone()),
+        ) {
             Ok(retention) => retention,
             Err(error) => return embedded_operations::reject_batch(keys, error),
         };
@@ -3965,7 +4024,7 @@ mod tests {
                 .is_err());
         }
         assert!(NodeRuntimeOptions::default()
-            .with_receive_byte_capacity(MAX_FRAME_BYTES)
+            .with_receive_byte_capacity(MAX_TRANSPORT_FRAME_BYTES)
             .validate()
             .is_ok());
         assert!(NodeRuntimeOptions::default()
@@ -4007,6 +4066,7 @@ mod tests {
             max_protocol_version: WIRE_PROTOCOL_VERSION,
             capabilities: REQUIRED_WIRE_CAPABILITIES,
             challenge: vec![1; HANDSHAKE_CHALLENGE_BYTES],
+            process_generation: 0,
         };
         assert_eq!(validate_peer_hello("local", Some("peer"), &hello), Ok(()));
         hello.capabilities &= !CAPABILITY_RECORD_CONTENT_DIGEST;
@@ -4025,6 +4085,7 @@ mod tests {
             max_protocol_version: WIRE_PROTOCOL_VERSION,
             capabilities: REQUIRED_WIRE_CAPABILITIES,
             challenge: vec![1; HANDSHAKE_CHALLENGE_BYTES],
+            process_generation: 0,
         };
         assert_eq!(validate_peer_hello("local", Some("peer"), &hello), Ok(()));
         hello.capabilities &= !CAPABILITY_TYPED_UNKNOWN_MUTATION;
@@ -4346,6 +4407,7 @@ mod tests {
             },
             OpPriority::Default,
             0,
+            None,
         )
         .await;
         assert_eq!(

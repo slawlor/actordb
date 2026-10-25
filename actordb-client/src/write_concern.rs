@@ -15,6 +15,10 @@ pub enum WriteConcernClientError {
     InvalidPolicy(String),
     Unsupported(String),
     TimedOut(WriteConcernReceipt),
+    DurabilityFailed {
+        receipt: Box<WriteConcernReceipt>,
+        error: String,
+    },
     Backpressure,
     UnknownOutcome(String),
 }
@@ -33,6 +37,9 @@ impl fmt::Display for WriteConcernClientError {
                 receipt.required_acknowledgements()
             ),
             Self::Backpressure => f.write_str("write concern waiter capacity exhausted"),
+            Self::DurabilityFailed { error, .. } => {
+                write!(f, "write applied but durability fence failed: {error}")
+            }
         }
     }
 }
@@ -116,6 +123,21 @@ impl Client {
         operation: wire::request::Operation,
         options: WriteConcernOptions,
     ) -> Result<WriteConcernReceipt, WriteConcernClientError> {
+        let ((key_digest, value_digest), tombstone) = match &operation {
+            wire::request::Operation::Put(put) => (
+                WriteOperationEvidence::application_write_digests(
+                    &self.table,
+                    &put.key,
+                    &put.value,
+                ),
+                false,
+            ),
+            wire::request::Operation::Delete(delete) => (
+                WriteOperationEvidence::application_write_digests(&self.table, &delete.key, &[]),
+                true,
+            ),
+            _ => unreachable!("single mutation concern request"),
+        };
         if self.inner.capabilities & actordb_protocol::CLIENT_CAPABILITY_WRITE_CONCERNS == 0 {
             return Err(WriteConcernClientError::Unsupported(
                 "server did not negotiate write concerns".into(),
@@ -130,7 +152,21 @@ impl Client {
             ));
         }
         let result = response.mutations.remove(0);
-        decode_concern_result(result, &options)
+        let decoded = decode_concern_result(result, &options);
+        let receipt = match &decoded {
+            Ok(receipt) | Err(WriteConcernClientError::TimedOut(receipt)) => Some(receipt),
+            Err(WriteConcernClientError::DurabilityFailed { receipt, .. }) => {
+                Some(receipt.as_ref())
+            }
+            _ => None,
+        };
+        if let Some(evidence) = receipt.and_then(WriteConcernReceipt::evidence) {
+            evidence
+                .operation()
+                .validate_application_digests(&key_digest, &value_digest, tombstone)
+                .map_err(|error| WriteConcernClientError::UnknownOutcome(error.to_string()))?;
+        }
+        decoded
     }
 }
 
@@ -178,6 +214,27 @@ fn decode_concern_result(
         WriteConcernOutcome::InvalidPolicy(e) => Err(WriteConcernClientError::InvalidPolicy(e)),
         WriteConcernOutcome::Unsupported(e) => Err(WriteConcernClientError::Unsupported(e)),
         WriteConcernOutcome::Backpressure => Err(WriteConcernClientError::Backpressure),
+        WriteConcernOutcome::UnknownOutcome(error) => {
+            Err(WriteConcernClientError::UnknownOutcome(error))
+        }
+        WriteConcernOutcome::DurabilityFailed { receipt, error } => {
+            if result
+                .error
+                .as_ref()
+                .is_some_and(|error| error.code != wire::ErrorCode::Storage as i32)
+            {
+                return Err(WriteConcernClientError::UnknownOutcome(
+                    "durability failure receipt conflicts with mutation error".into(),
+                ));
+            }
+            receipt
+                .validate_for(options, false)
+                .map_err(|e| WriteConcernClientError::UnknownOutcome(e.to_string()))?;
+            Err(WriteConcernClientError::DurabilityFailed {
+                receipt: Box::new(receipt),
+                error,
+            })
+        }
         _ => Err(WriteConcernClientError::UnknownOutcome(
             "unsupported concern reply".into(),
         )),

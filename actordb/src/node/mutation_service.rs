@@ -22,8 +22,8 @@ use crate::actor::{KvMessage, OpPriority, ReplicatedOp, VersionedValue};
 use crate::proto::{BatchPut, ForwardedPut, MutationResponse};
 
 use super::{
-    apply_forwarded_mutation, priority_from_proto, send_mutation_response,
-    unavailable_mutation_results, FragmentId, OperationPermit, PeerChannel, SenderMap,
+    apply_forwarded_mutation, priority_from_proto, unavailable_mutation_results, FragmentId,
+    OperationPermit, PeerChannel, SenderMap,
 };
 
 pub(super) const FORWARDED_MUTATION_CAPACITY: usize = 128;
@@ -31,6 +31,7 @@ pub(super) const FORWARDED_MUTATION_BYTE_CAPACITY: usize = 64 * 1024 * 1024;
 const WORKERS_PER_PRIORITY: usize = 8;
 
 struct MutationRetention {
+    _peer_work: Option<Arc<dyn Send + Sync>>,
     _count: Option<OwnedSemaphorePermit>,
     _payload: OwnedSemaphorePermit,
 }
@@ -99,15 +100,21 @@ fn put_buffer_bytes(put: &ForwardedPut) -> usize {
 }
 
 fn apply_clone_bytes(put: &ForwardedPut) -> usize {
-    std::mem::size_of::<ReplicatedOp>()
+    let bytes = std::mem::size_of::<ReplicatedOp>()
         .saturating_add(put.key.len())
         .saturating_add(put.value.len())
         .saturating_add(put.node_id.len())
         .saturating_add(std::mem::size_of::<String>())
-        .saturating_add(put.key.len())
+        .saturating_add(put.key.len());
+    if put.write_concern.is_some() {
+        bytes.saturating_mul(2)
+    } else {
+        bytes
+    }
 }
 
 pub(super) struct MutationJob {
+    peer_work: Option<Arc<dyn Send + Sync>>,
     request: MutationRequest,
     actor: ActorRef<KvMessage>,
     senders: SenderMap,
@@ -123,15 +130,29 @@ pub(super) struct MutationCompletion {
     // Include completed results still waiting for their reader's encoding in
     // admission. A dropped reader releases this only after apply/fanout ends.
     _retention: Option<Arc<MutationRetention>>,
+    _operation: Option<OperationPermit>,
 }
 
 impl MutationCompletion {
     pub(super) fn send(self, tx: &PeerChannel) -> bool {
-        send_mutation_response(tx, self.response)
+        if let Some(operation) = &self._operation {
+            operation.mark_responding();
+        }
+        super::connection::send_envelope_retained(
+            tx,
+            crate::proto::Envelope {
+                msg: Some(crate::proto::EnvelopeMsg::MutationResponse(self.response)),
+            },
+            Some(Arc::new((self._retention, self._operation))),
+        )
     }
 }
 
 impl MutationJob {
+    pub(super) fn with_peer_retention(mut self, retention: Option<Arc<dyn Send + Sync>>) -> Self {
+        self.peer_work = retention;
+        self
+    }
     pub(super) fn new(
         request: MutationRequest,
         actor: ActorRef<KvMessage>,
@@ -143,6 +164,7 @@ impl MutationJob {
         let (reply, response) = oneshot::channel();
         (
             Self {
+                peer_work: None,
                 request,
                 actor,
                 senders,
@@ -158,6 +180,7 @@ impl MutationJob {
 
     fn reject(self, reason: &str) {
         let Self {
+            peer_work: _peer_work,
             request,
             reply,
             retention,
@@ -172,6 +195,7 @@ impl MutationJob {
                 results: unavailable_mutation_results(request.into_keys(), reason),
             },
             _retention: retention,
+            _operation: Some(_operation),
         });
     }
 }
@@ -190,6 +214,17 @@ pub(super) struct MutationService {
 }
 
 impl MutationService {
+    pub(super) fn queued(&self) -> usize {
+        self.lanes
+            .iter()
+            .map(|lane| lane.max_capacity().saturating_sub(lane.capacity()))
+            .sum()
+    }
+    pub(super) fn admitted_apply_slots(&self) -> usize {
+        self.lanes[0]
+            .max_capacity()
+            .saturating_sub(self.count.available_permits())
+    }
     #[cfg(test)]
     pub(super) fn new(capacity: usize, byte_capacity: usize) -> Arc<Self> {
         Self::new_inner(capacity, byte_capacity, None)
@@ -255,6 +290,7 @@ impl MutationService {
             return;
         };
         job.retention = Some(Arc::new(MutationRetention {
+            _peer_work: job.peer_work.clone(),
             _count: Some(count),
             _payload: payload,
         }));
@@ -350,7 +386,7 @@ struct ConcernCompletionJob {
     pending: crate::write_concern::PendingWrite,
     reply: oneshot::Sender<MutationCompletion>,
     completion: MutationCompletion,
-    _operation: OperationPermit,
+    _operation: Arc<OperationPermit>,
 }
 
 impl ConcernCompletionJob {
@@ -432,6 +468,7 @@ async fn complete_job(
     tracker: Option<&Arc<crate::write_concern::WriteConcernTracker>>,
 ) -> Option<ConcernCompletionJob> {
     let MutationJob {
+        peer_work,
         request,
         actor,
         senders,
@@ -442,6 +479,7 @@ async fn complete_job(
         mut retention,
     } = job;
     let req_id = request.req_id();
+    let _operation = Arc::new(_operation);
     let priority = request.priority();
     let batch = matches!(&request, MutationRequest::Batch(_));
     let puts = match request {
@@ -523,8 +561,16 @@ async fn complete_job(
         } else {
             None
         };
-        let mut result =
-            apply_forwarded_mutation(&actor, &senders, fragment, op, priority, index).await;
+        let mut result = apply_forwarded_mutation(
+            &actor,
+            &senders,
+            fragment,
+            op,
+            priority,
+            index,
+            peer_work.clone(),
+        )
+        .await;
         if let Some(pending) = pending {
             // Replication fan-out has completed; ownership teardown must not
             // wait on client acknowledgement policy. Single writes only.
@@ -535,6 +581,51 @@ async fn complete_job(
                     | crate::proto::MutationStatus::AlreadyPresent)
             ) {
                 pending.applied_locally();
+                if pending.minimum_durability()
+                    != crate::write_concern::WriteDurability::MemoryApplied
+                {
+                    let fence = super::flush_fence_retained(
+                        &actor,
+                        pending.minimum_durability().into(),
+                        Some(Arc::new((_operation.clone(), peer_work.clone()))),
+                    )
+                    .await;
+                    let failure = match fence {
+                        Ok(durability) => {
+                            let durability = durability.into();
+                            pending.reached_local_durability(durability);
+                            (durability < pending.minimum_durability())
+                                .then(|| "local store did not provide requested fence".to_string())
+                        }
+                        Err(
+                            error @ (super::NodeError::Actor(_)
+                            | super::NodeError::UnknownOutcome(_)),
+                        ) => {
+                            result.write_concern = Some(
+                                pending
+                                    .fail_with(
+                                        crate::write_concern::WriteConcernError::UnknownOutcome(
+                                            error.to_string(),
+                                        ),
+                                    )
+                                    .outcome()
+                                    .expect("unknown outcome is encoded")
+                                    .encode(),
+                            );
+                            results.push(result);
+                            continue;
+                        }
+                        Err(error) => Some(error.to_string()),
+                    };
+                    if let Some(error) = failure {
+                        result.write_concern = pending
+                            .fail_durability(error)
+                            .outcome()
+                            .map(|outcome| outcome.encode());
+                        results.push(result);
+                        continue;
+                    }
+                }
                 if pending.requires_wait() {
                     // ACK waiters have their own tracker admission. Release
                     // the apply slot so local-only writes can still enter;
@@ -551,6 +642,7 @@ async fn complete_job(
                                 results: vec![result],
                             },
                             _retention: retention,
+                            _operation: Some(_operation.as_ref().clone()),
                         },
                         _operation,
                     });
@@ -564,6 +656,22 @@ async fn complete_job(
                         .expect("wait returns receipt timeout")
                         .encode(),
                 });
+            } else {
+                if crate::proto::MutationStatus::try_from(result.status)
+                    == Ok(crate::proto::MutationStatus::StorageError)
+                {
+                    result.write_concern = pending
+                        .fail_with(crate::write_concern::WriteConcernError::UnknownOutcome(
+                            format!(
+                                "storage failed during apply; mutation may have applied: {}",
+                                result.error
+                            ),
+                        ))
+                        .outcome()
+                        .map(|outcome| outcome.encode());
+                } else {
+                    pending.operation_failed();
+                }
             }
         }
         results.push(result);
@@ -571,6 +679,7 @@ async fn complete_job(
     let _ = reply.send(MutationCompletion {
         response: MutationResponse { req_id, results },
         _retention: retention,
+        _operation: Some(_operation.as_ref().clone()),
     });
     None
 }
@@ -774,6 +883,7 @@ mod tests {
             last_ack_durability: None,
             ack_durability_mismatch: false,
             reconcile_rounds: 0,
+            progress: Default::default(),
         }));
         let sender = spawn_node_sender(
             FragmentId(0),
@@ -1025,7 +1135,18 @@ mod tests {
         service.submit(job);
         let completion = response.await.unwrap();
         assert_unavailable(&completion.response, 430, &keys, "shutting down");
-        gate.wait_for_drain().await;
+        // Rejected responses retain request ownership through send or drop.
+        // Waiting for that same ownership while keeping the response alive
+        // would make this fixture wait on itself indefinitely.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), gate.wait_for_drain())
+                .await
+                .is_err()
+        );
+        drop(completion);
+        tokio::time::timeout(Duration::from_secs(2), gate.wait_for_drain())
+            .await
+            .unwrap();
         drop(authority.write_owned().await);
         assert!(state.get_all().await.is_empty());
         capacity_restored(&service, 1, 1).await;
@@ -1436,7 +1557,15 @@ mod tests {
             rejected.response.results[0].status,
             MutationStatus::Unavailable as i32
         );
-        gate.wait_for_drain().await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), gate.wait_for_drain())
+                .await
+                .is_err()
+        );
+        drop(rejected);
+        tokio::time::timeout(Duration::from_secs(2), gate.wait_for_drain())
+            .await
+            .unwrap();
         drop(authority.write_owned().await);
         assert!(state.get("key").await.is_none());
         capacity_restored(&service, 1, 4096).await;

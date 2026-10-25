@@ -37,8 +37,11 @@ mod fragment_state;
 mod kv_actor;
 mod kv_worker;
 mod maintenance;
+pub mod observations;
 mod pool;
 mod pool_worker;
+#[cfg(test)]
+pub(crate) use pool_worker::install_worker_get_gate;
 mod protocol;
 mod scan;
 mod snapshotter;

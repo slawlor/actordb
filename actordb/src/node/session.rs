@@ -36,6 +36,7 @@ pub(super) struct InboundSession {
 pub(super) type InboundSessions = Arc<Mutex<HashMap<(String, FragmentId), InboundSession>>>;
 
 pub(super) struct ReconcileResponseJob {
+    pub(super) retention: Option<Arc<dyn Send + Sync>>,
     pub(super) peer: String,
     pub(super) session: InboundSession,
     pub(super) actor: ActorRef<KvMessage>,
@@ -135,6 +136,7 @@ pub(super) async fn send_reconcile_data_pages(
     fetch: ReconcileFetch,
     snapshot_time_ms: u64,
     admission_timeout: Duration,
+    retention: Option<Arc<dyn Send + Sync>>,
 ) -> bool {
     let ReconcileFetch {
         fragment,
@@ -162,13 +164,17 @@ pub(super) async fn send_reconcile_data_pages(
 
     while next_key_index < keys.len() {
         let request_keys = keys.clone();
+        let request_retention = retention.clone();
         let value_page = match actor
             .call(
-                move |reply| KvMessage::GetVersionedPage {
-                    keys: request_keys,
-                    start_index: next_key_index,
-                    snapshot_time_ms: Some(snapshot_time_ms),
-                    reply,
+                move |reply| {
+                    KvMessage::GetVersionedPage {
+                        keys: request_keys,
+                        start_index: next_key_index,
+                        snapshot_time_ms: Some(snapshot_time_ms),
+                        reply,
+                    }
+                    .with_optional_retention(request_retention)
                 },
                 None,
             )
@@ -294,6 +300,7 @@ pub(super) async fn run_reconcile_responder(
             job.fetch,
             job.snapshot_time_ms,
             admission_timeout,
+            job.retention,
         );
         tokio::pin!(response);
         loop {
@@ -505,6 +512,7 @@ mod tests {
             Duration::from_secs(30),
         ));
         jobs.send(ReconcileResponseJob {
+            retention: None,
             peer: "peer".to_string(),
             session: original_session,
             actor,

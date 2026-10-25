@@ -62,7 +62,9 @@ pub(super) fn test_peer_channel(
     let (cancel, _) = watch::channel(false);
     (
         PeerChannel {
+            work_retention: None,
             outbound: BudgetedPeerTx {
+                frame_overhead: 0,
                 node_byte_budget: NodePeerByteBudget::new(NODE_PEER_QUEUE_BYTE_CAPACITY),
                 tx,
                 response_tx,
@@ -94,6 +96,7 @@ pub(super) fn test_sender_report() -> Arc<Mutex<SenderStateReport>> {
         last_ack_durability: None,
         ack_durability_mismatch: false,
         reconcile_rounds: 0,
+        progress: Default::default(),
     }))
 }
 
@@ -134,6 +137,7 @@ pub(super) async fn test_connection_context(
             read_service,
             operation_gate: OperationGate::new(),
             receive_apply_gate: OperationGate::new(),
+            peer_authority: PeerAuthority::new("local".into(), None),
             peer_changes,
             hlc: Arc::new(Mutex::new(HlcClock::new())),
             senders,
@@ -173,6 +177,7 @@ pub(super) async fn complete_test_handshake(stream: &mut tokio::io::DuplexStream
                 max_protocol_version: WIRE_PROTOCOL_VERSION,
                 capabilities: REQUIRED_WIRE_CAPABILITIES,
                 challenge: vec![7; HANDSHAKE_CHALLENGE_BYTES],
+                process_generation: 0,
             })),
         },
     )

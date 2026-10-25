@@ -350,7 +350,7 @@ async fn serve_connection(
         );
         // Node admission includes the response's ownership on this independent
         // application listener, including a write blocked on the client socket.
-        let response_ownership = node.admit_client_request();
+        let response_ownership = node.admit_client_request_for_table(&request.table);
         let mut response = if response_ownership.is_err() {
             wire::Response {
                 id: request.id,
@@ -384,6 +384,9 @@ async fn serve_connection(
                 )),
                 ..Default::default()
             };
+        }
+        if let Ok(operation) = &response_ownership {
+            operation.mark_responding();
         }
         let result = tokio::time::timeout(
             options.timeout,
@@ -832,6 +835,7 @@ fn concern_mutation_result(
                     wire::ErrorCode::UnknownOutcome
                 }
                 WriteConcernError::Backpressure => wire::ErrorCode::Backpressure,
+                WriteConcernError::DurabilityFailed { .. } => wire::ErrorCode::Storage,
                 WriteConcernError::Unsupported(_) => wire::ErrorCode::Unsupported,
                 _ => wire::ErrorCode::Invalid,
             };

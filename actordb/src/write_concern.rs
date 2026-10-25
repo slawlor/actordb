@@ -7,10 +7,10 @@
 //! equal-or-newer LWW winner, with configured storage durability. They do not
 //! establish global ordering or guarantee that the submitted value stays live.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::num::NonZeroU32;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use sha2::{Digest, Sha256};
@@ -20,12 +20,13 @@ use tokio::time::Instant;
 mod overrides;
 use overrides::effective_acknowledgement_count;
 
-use crate::actor::ReplicatedOp;
+use crate::actor::{ApplyDurability, ReplicatedOp};
 use crate::node::NodeError;
 use crate::shard::FragmentId;
 pub use actordb_protocol::write_concern::{
-    WriteConcern, WriteConcernOptions, WriteConcernOutcome, WriteConcernPolicyError,
-    WriteConcernReceipt, MAX_WRITE_CONCERN_REPLICAS,
+    WriteAcknowledgement, WriteConcern, WriteConcernEvidence, WriteConcernOptions,
+    WriteConcernOutcome, WriteConcernPolicyError, WriteConcernReceipt, WriteDurability,
+    WriteOperationEvidence, MAX_WRITE_CONCERN_REPLICAS,
 };
 mod regions;
 use regions::RegionRequirement;
@@ -38,6 +39,11 @@ pub enum WriteConcernError {
     Unsupported(String),
     /// The update applied locally; the required acknowledgements did not arrive.
     TimedOut(WriteConcernReceipt),
+    /// Apply completed; the explicit local durability fence failed or was unsupported.
+    DurabilityFailed {
+        receipt: Box<WriteConcernReceipt>,
+        error: String,
+    },
     Backpressure,
     /// A reply was lost or malformed. The update may have applied.
     UnknownOutcome(String),
@@ -58,6 +64,9 @@ impl fmt::Display for WriteConcernError {
                 receipt.required_acknowledgements()
             ),
             Self::Backpressure => f.write_str("write concern waiter capacity exhausted"),
+            Self::DurabilityFailed { error, .. } => {
+                write!(f, "write applied but durability fence failed: {error}")
+            }
         }
     }
 }
@@ -93,7 +102,14 @@ impl WriteConcernError {
             Self::InvalidPolicy(e) => Some(WriteConcernOutcome::InvalidPolicy(e.clone())),
             Self::Unsupported(e) => Some(WriteConcernOutcome::Unsupported(e.clone())),
             Self::TimedOut(receipt) => Some(WriteConcernOutcome::TimedOut(receipt.clone())),
+            Self::DurabilityFailed { receipt, error } => {
+                Some(WriteConcernOutcome::DurabilityFailed {
+                    receipt: receipt.as_ref().clone(),
+                    error: error.clone(),
+                })
+            }
             Self::Backpressure => Some(WriteConcernOutcome::Backpressure),
+            Self::UnknownOutcome(error) => Some(WriteConcernOutcome::UnknownOutcome(error.clone())),
             _ => None,
         }
     }
@@ -121,6 +137,16 @@ pub(crate) fn decode_outcome(
         WriteConcernOutcome::InvalidPolicy(e) => Err(WriteConcernError::InvalidPolicy(e)),
         WriteConcernOutcome::Unsupported(e) => Err(WriteConcernError::Unsupported(e)),
         WriteConcernOutcome::Backpressure => Err(WriteConcernError::Backpressure),
+        WriteConcernOutcome::UnknownOutcome(error) => Err(WriteConcernError::UnknownOutcome(error)),
+        WriteConcernOutcome::DurabilityFailed { receipt, error } => {
+            receipt
+                .validate_for(options, false)
+                .map_err(|e| WriteConcernError::UnknownOutcome(e.to_string()))?;
+            Err(WriteConcernError::DurabilityFailed {
+                receipt: Box::new(receipt),
+                error,
+            })
+        }
         _ => Err(WriteConcernError::UnknownOutcome(
             "unsupported write concern response".into(),
         )),
@@ -176,12 +202,17 @@ impl WriteConcernPlan {
 #[derive(Debug, Default)]
 struct Progress {
     nodes: BTreeSet<String>,
+    durability: BTreeMap<String, WriteDurability>,
     deadline: Option<Instant>,
     complete: bool,
 }
 #[derive(Debug)]
 struct Ticket {
     plan: WriteConcernPlan,
+    fragment: FragmentId,
+    op: ReplicatedOp,
+    certificate: WriteOperationEvidence,
+    created: Instant,
     progress: Mutex<Progress>,
     changed: Notify,
 }
@@ -194,6 +225,68 @@ pub(crate) struct WriteConcernTracker {
     acknowledgement_cap: AtomicU32,
     pending: Mutex<HashMap<[u8; 32], Vec<Arc<Ticket>>>>,
     regions: RwLock<HashMap<String, String>>,
+    diagnostics: WriteConcernCounters,
+}
+
+/// Monotonic per-node write-concern preparation/completion counters. No key labels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub struct WriteConcernDiagnostics {
+    pub accepted: u64,
+    pub satisfied: u64,
+    pub timed_out: u64,
+    pub durability_failed: u64,
+    pub operation_failed: u64,
+    pub unknown_outcomes: u64,
+    pub rejected: u64,
+    pub cancelled: u64,
+    pub active: u64,
+    pub wait_count: u64,
+    pub wait_nanos: u64,
+    pub max_wait_nanos: u64,
+}
+#[derive(Debug, Default)]
+struct WriteConcernCounters {
+    accepted: AtomicU64,
+    satisfied: AtomicU64,
+    timed_out: AtomicU64,
+    durability_failed: AtomicU64,
+    operation_failed: AtomicU64,
+    unknown_outcomes: AtomicU64,
+    rejected: AtomicU64,
+    cancelled: AtomicU64,
+    active: AtomicU64,
+    wait_count: AtomicU64,
+    wait_nanos: AtomicU64,
+    max_wait_nanos: AtomicU64,
+}
+impl From<ApplyDurability> for WriteDurability {
+    fn from(durability: ApplyDurability) -> Self {
+        match durability {
+            ApplyDurability::MemoryApplied => Self::MemoryApplied,
+            ApplyDurability::StoreCommitted => Self::StoreCommitted,
+            ApplyDurability::StableCommitted => Self::StableCommitted,
+        }
+    }
+}
+impl From<WriteDurability> for crate::replication::ReplicationAckDurability {
+    fn from(durability: WriteDurability) -> Self {
+        match durability {
+            WriteDurability::MemoryApplied => Self::MemoryApplied,
+            WriteDurability::StoreCommitted => Self::StoreCommitted,
+            WriteDurability::StableCommitted => Self::StableCommitted,
+            _ => Self::StableCommitted,
+        }
+    }
+}
+impl From<crate::replication::ReplicationAckDurability> for WriteDurability {
+    fn from(durability: crate::replication::ReplicationAckDurability) -> Self {
+        match durability {
+            crate::replication::ReplicationAckDurability::MemoryApplied => Self::MemoryApplied,
+            crate::replication::ReplicationAckDurability::StoreCommitted => Self::StoreCommitted,
+            crate::replication::ReplicationAckDurability::StableCommitted => Self::StableCommitted,
+        }
+    }
 }
 
 impl WriteConcernTracker {
@@ -209,7 +302,59 @@ impl WriteConcernTracker {
             acknowledgement_cap: AtomicU32::new(0),
             pending: Mutex::new(HashMap::new()),
             regions: RwLock::new(HashMap::new()),
+            diagnostics: WriteConcernCounters::default(),
         })
+    }
+    pub(crate) fn diagnostics(&self) -> WriteConcernDiagnostics {
+        let d = &self.diagnostics;
+        WriteConcernDiagnostics {
+            accepted: d.accepted.load(Ordering::Relaxed),
+            satisfied: d.satisfied.load(Ordering::Relaxed),
+            timed_out: d.timed_out.load(Ordering::Relaxed),
+            durability_failed: d.durability_failed.load(Ordering::Relaxed),
+            operation_failed: d.operation_failed.load(Ordering::Relaxed),
+            unknown_outcomes: d.unknown_outcomes.load(Ordering::Relaxed),
+            rejected: d.rejected.load(Ordering::Relaxed),
+            cancelled: d.cancelled.load(Ordering::Relaxed),
+            active: d.active.load(Ordering::Relaxed),
+            wait_count: d.wait_count.load(Ordering::Relaxed),
+            wait_nanos: d.wait_nanos.load(Ordering::Relaxed),
+            max_wait_nanos: d.max_wait_nanos.load(Ordering::Relaxed),
+        }
+    }
+    /// Promote the actual outgoing batch fence while eligible tickets await this peer.
+    pub(crate) fn required_durability(&self, peer: &str, fragment: FragmentId) -> WriteDurability {
+        self.pending
+            .lock()
+            .unwrap()
+            .values()
+            .flatten()
+            .filter(|ticket| ticket.fragment == fragment && ticket.plan.eligible.contains(peer))
+            .map(|ticket| ticket.plan.options.minimum_durability())
+            .max()
+            .unwrap_or_default()
+    }
+    /// Bounded retries of the submitted floor survive ingress/history resets.
+    /// The sender reserves its own byte budget before cloning each operation.
+    pub(crate) fn retry_operations(
+        &self,
+        peer: &str,
+        fragment: FragmentId,
+        mut offer: impl FnMut(&ReplicatedOp),
+    ) {
+        for ticket in self.pending.lock().unwrap().values().flatten() {
+            let progress = ticket.progress.lock().unwrap();
+            if ticket.fragment == fragment
+                && ticket.plan.eligible.contains(peer)
+                && !progress.complete
+                && !progress.nodes.contains(peer)
+                && progress
+                    .deadline
+                    .is_some_and(|deadline| deadline > Instant::now())
+            {
+                offer(&ticket.op);
+            }
+        }
     }
     pub(crate) fn configure_regions(&self, regions: HashMap<String, String>) {
         *self.regions.write().unwrap() = regions;
@@ -233,6 +378,15 @@ impl WriteConcernTracker {
     }
 
     pub(crate) fn plan(
+        &self,
+        fragment: FragmentId,
+        options: &WriteConcernOptions,
+    ) -> Result<WriteConcernPlan, WriteConcernError> {
+        self.compute_plan(fragment, options).inspect_err(|_| {
+            self.diagnostics.rejected.fetch_add(1, Ordering::Relaxed);
+        })
+    }
+    fn compute_plan(
         &self,
         fragment: FragmentId,
         options: &WriteConcernOptions,
@@ -299,21 +453,25 @@ impl WriteConcernTracker {
     ) -> Result<PendingWrite, WriteConcernError> {
         let plan = self.plan(fragment, options)?;
         let permit = if plan.requires_wait() {
-            Some(
-                self.capacity
-                    .clone()
-                    .try_acquire_owned()
-                    .map_err(|_| WriteConcernError::Backpressure)?,
-            )
+            Some(self.capacity.clone().try_acquire_owned().map_err(|_| {
+                self.diagnostics.rejected.fetch_add(1, Ordering::Relaxed);
+                WriteConcernError::Backpressure
+            })?)
         } else {
             None
         };
         let key = plan.requires_wait().then(|| fingerprint(fragment, op));
         let ticket = Arc::new(Ticket {
             plan,
+            fragment,
+            op: op.clone(),
+            certificate: operation_certificate(fragment, op),
+            created: Instant::now(),
             progress: Mutex::new(Progress::default()),
             changed: Notify::new(),
         });
+        self.diagnostics.accepted.fetch_add(1, Ordering::Relaxed);
+        self.diagnostics.active.fetch_add(1, Ordering::Relaxed);
         if let Some(key) = key {
             self.pending
                 .lock()
@@ -327,34 +485,58 @@ impl WriteConcernTracker {
             key,
             ticket,
             _permit: permit,
+            terminal: false,
         })
     }
     /// Called only after session, batch identity, apply, and the sender's
     /// configured durability fence have all been validated.
+    #[cfg(test)]
     pub(crate) fn acknowledge(&self, peer: &str, fragment: FragmentId, ops: &[ReplicatedOp]) {
+        self.acknowledge_at(peer, fragment, ops, WriteDurability::MemoryApplied);
+    }
+    pub(crate) fn acknowledge_at(
+        &self,
+        peer: &str,
+        fragment: FragmentId,
+        ops: &[ReplicatedOp],
+        durability: WriteDurability,
+    ) {
         if peer == self.receiver || self.pending.lock().unwrap().is_empty() {
             return;
         }
         for op in ops {
-            let key = fingerprint(fragment, op);
             let pending = self.pending.lock().unwrap();
-            if let Some(tickets) = pending.get(&key) {
-                for ticket in tickets {
-                    let mut progress = ticket.progress.lock().unwrap();
-                    if progress.complete
-                        || !ticket.plan.eligible.contains(peer)
-                        || progress
-                            .deadline
-                            .is_some_and(|deadline| Instant::now() > deadline)
-                    {
-                        continue;
-                    }
-                    if progress.nodes.insert(peer.to_string()) {
-                        // A peer ACK cannot stand in for local application.
-                        progress.complete = progress.nodes.contains(&ticket.plan.receiver)
+            for ticket in pending.values().flatten().filter(|ticket| {
+                ticket.fragment == fragment
+                    && ticket.op.key == op.key
+                    && (op.value == ticket.op.value || op.value.wins_over(&ticket.op.value))
+            }) {
+                let mut progress = ticket.progress.lock().unwrap();
+                if progress.complete
+                    || durability < ticket.plan.options.minimum_durability()
+                    || !ticket.plan.eligible.contains(peer)
+                    || progress
+                        .deadline
+                        .is_some_and(|deadline| Instant::now() > deadline)
+                {
+                    continue;
+                }
+                let inserted = progress.nodes.insert(peer.to_string());
+                if inserted
+                    || progress
+                        .durability
+                        .get(peer)
+                        .is_some_and(|previous| durability > *previous)
+                {
+                    progress.durability.insert(peer.to_string(), durability);
+                    // A peer ACK cannot stand in for local application.
+                    progress.complete =
+                        progress.nodes.contains(&ticket.plan.receiver)
+                            && progress.durability.get(&ticket.plan.receiver).is_some_and(
+                                |level| *level >= ticket.plan.options.minimum_durability(),
+                            )
                             && ticket.plan.complete(&progress.nodes);
-                        ticket.changed.notify_waiters();
-                    }
+                    ticket.changed.notify_waiters();
                 }
             }
         }
@@ -366,25 +548,106 @@ pub(crate) struct PendingWrite {
     key: Option<[u8; 32]>,
     ticket: Arc<Ticket>,
     _permit: Option<OwnedSemaphorePermit>,
+    terminal: bool,
 }
 impl PendingWrite {
+    pub(crate) fn fail_with(mut self, error: WriteConcernError) -> WriteConcernError {
+        self.terminal = true;
+        if matches!(error, WriteConcernError::UnknownOutcome(_)) {
+            self.tracker
+                .diagnostics
+                .unknown_outcomes
+                .fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.tracker
+                .diagnostics
+                .operation_failed
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        error
+    }
+    pub(crate) fn operation_failed(mut self) {
+        self.terminal = true;
+        self.tracker
+            .diagnostics
+            .operation_failed
+            .fetch_add(1, Ordering::Relaxed);
+    }
+    pub(crate) fn minimum_durability(&self) -> WriteDurability {
+        self.ticket.plan.options.minimum_durability()
+    }
+    fn receipt(&self, progress: &Progress) -> WriteConcernReceipt {
+        self.ticket
+            .plan
+            .receipt(&progress.nodes)
+            .with_evidence(
+                WriteConcernEvidence::new(
+                    self.ticket.certificate.clone(),
+                    self.ticket.plan.eligible.iter().cloned().collect(),
+                    progress
+                        .durability
+                        .iter()
+                        .map(|(node, level)| WriteAcknowledgement::new(node.clone(), *level))
+                        .collect(),
+                )
+                .expect("validated evidence"),
+            )
+            .expect("evidence matches plan")
+            .with_requested_durability(self.minimum_durability())
+            .expect("captured policy has evidence")
+    }
     pub(crate) fn requires_wait(&self) -> bool {
         self.ticket.plan.requires_wait()
     }
     pub(crate) fn applied_locally(&self) {
         let mut progress = self.ticket.progress.lock().unwrap();
         progress.nodes.insert(self.ticket.plan.receiver.clone());
+        progress.durability.insert(
+            self.ticket.plan.receiver.clone(),
+            WriteDurability::MemoryApplied,
+        );
         progress.deadline = Some(Instant::now() + self.ticket.plan.options.timeout());
-        progress.complete = self.ticket.plan.complete(&progress.nodes);
+        progress.complete = self.ticket.plan.options.minimum_durability()
+            == WriteDurability::MemoryApplied
+            && self.ticket.plan.complete(&progress.nodes);
         self.ticket.changed.notify_waiters();
     }
-    pub(crate) async fn wait(self) -> Result<WriteConcernReceipt, WriteConcernError> {
+    pub(crate) fn reached_local_durability(&self, durability: WriteDurability) {
+        let mut progress = self.ticket.progress.lock().unwrap();
+        progress
+            .durability
+            .insert(self.ticket.plan.receiver.clone(), durability);
+        progress.complete = durability >= self.minimum_durability()
+            && self.ticket.plan.complete(&progress.nodes)
+            && progress
+                .deadline
+                .is_some_and(|deadline| Instant::now() <= deadline);
+        self.ticket.changed.notify_waiters();
+    }
+    pub(crate) fn fail_durability(mut self, error: String) -> WriteConcernError {
+        let receipt = self.receipt(&self.ticket.progress.lock().unwrap());
+        self.terminal = true;
+        self.tracker
+            .diagnostics
+            .durability_failed
+            .fetch_add(1, Ordering::Relaxed);
+        WriteConcernError::DurabilityFailed {
+            receipt: Box::new(receipt),
+            error,
+        }
+    }
+    pub(crate) async fn wait(mut self) -> Result<WriteConcernReceipt, WriteConcernError> {
         loop {
             let changed = self.ticket.changed.notified();
             let deadline = {
                 let progress = self.ticket.progress.lock().unwrap();
                 if progress.complete {
-                    return Ok(self.ticket.plan.receipt(&progress.nodes));
+                    self.terminal = true;
+                    self.tracker
+                        .diagnostics
+                        .satisfied
+                        .fetch_add(1, Ordering::Relaxed);
+                    return Ok(self.receipt(&progress));
                 }
                 progress
                     .deadline
@@ -392,10 +655,19 @@ impl PendingWrite {
             };
             if tokio::time::timeout_at(deadline, changed).await.is_err() {
                 let progress = self.ticket.progress.lock().unwrap();
-                let receipt = self.ticket.plan.receipt(&progress.nodes);
+                let receipt = self.receipt(&progress);
+                self.terminal = true;
                 return if progress.complete {
+                    self.tracker
+                        .diagnostics
+                        .satisfied
+                        .fetch_add(1, Ordering::Relaxed);
                     Ok(receipt)
                 } else {
+                    self.tracker
+                        .diagnostics
+                        .timed_out
+                        .fetch_add(1, Ordering::Relaxed);
                     Err(WriteConcernError::TimedOut(receipt))
                 };
             }
@@ -404,6 +676,20 @@ impl PendingWrite {
 }
 impl Drop for PendingWrite {
     fn drop(&mut self) {
+        let stats = &self.tracker.diagnostics;
+        stats.active.fetch_sub(1, Ordering::Relaxed);
+        if !self.terminal {
+            stats.cancelled.fetch_add(1, Ordering::Relaxed);
+        }
+        let nanos = self
+            .ticket
+            .created
+            .elapsed()
+            .as_nanos()
+            .min(u64::MAX as u128) as u64;
+        stats.wait_count.fetch_add(1, Ordering::Relaxed);
+        crate::node::observability::add_saturating(&stats.wait_nanos, nanos);
+        stats.max_wait_nanos.fetch_max(nanos, Ordering::Relaxed);
         if let Some(key) = self.key {
             let mut pending = self.tracker.pending.lock().unwrap();
             if let Some(tickets) = pending.get_mut(&key) {
@@ -414,6 +700,22 @@ impl Drop for PendingWrite {
             }
         }
     }
+}
+
+pub(crate) fn operation_certificate(
+    fragment: FragmentId,
+    op: &ReplicatedOp,
+) -> WriteOperationEvidence {
+    WriteOperationEvidence::new(
+        fragment.0,
+        &op.key,
+        &op.value.value,
+        actordb_protocol::RecordVersion::new(op.value.timestamp_ms, op.value.logical_counter),
+        op.value.node_id.clone(),
+        op.value.is_tombstone,
+        op.value.expires_at_ms,
+    )
+    .expect("validated operation")
 }
 
 fn fingerprint(fragment: FragmentId, op: &ReplicatedOp) -> [u8; 32] {
@@ -438,6 +740,72 @@ fn fingerprint(fragment: FragmentId, op: &ReplicatedOp) -> [u8; 32] {
 mod tests {
     use super::*;
     use crate::actor::VersionedValue;
+    #[tokio::test]
+    async fn only_actual_eligible_fences_certify_frozen_operation_floor_and_set() {
+        let tracker = tracker();
+        let op = op();
+        let options = WriteConcernOptions::builder()
+            .concern(WriteConcern::Majority)
+            .minimum_durability(WriteDurability::StableCommitted)
+            .build();
+        let pending = tracker.prepare(FragmentId(0), &op, &options).unwrap();
+        pending.applied_locally();
+        tracker.acknowledge_at(
+            "b",
+            FragmentId(0),
+            std::slice::from_ref(&op),
+            WriteDurability::StoreCommitted,
+        );
+        assert_eq!(pending.ticket.progress.lock().unwrap().nodes.len(), 1);
+        pending.reached_local_durability(WriteDurability::StableCommitted);
+        let captured = pending.ticket.plan.eligible.clone();
+        tracker
+            .placement
+            .write()
+            .unwrap()
+            .insert(FragmentId(0), vec!["a".into(), "new".into()]);
+        let mut offered = 0;
+        tracker.retry_operations("b", FragmentId(0), |retry| {
+            assert_eq!(retry.value, op.value);
+            offered += 1;
+        });
+        assert_eq!(offered, 1);
+        let mut newer = op.clone();
+        newer.value.timestamp_ms += 1;
+        tracker.acknowledge_at(
+            "new",
+            FragmentId(0),
+            &[newer.clone()],
+            WriteDurability::StableCommitted,
+        );
+        assert!(!pending.ticket.progress.lock().unwrap().complete);
+        tracker.acknowledge_at(
+            "b",
+            FragmentId(0),
+            &[newer],
+            WriteDurability::StableCommitted,
+        );
+        let receipt = pending.wait().await.unwrap();
+        let evidence = receipt.evidence().unwrap();
+        assert_eq!(
+            evidence.operation(),
+            &operation_certificate(FragmentId(0), &op)
+        );
+        assert_eq!(
+            evidence
+                .eligible_nodes()
+                .iter()
+                .cloned()
+                .collect::<HashSet<_>>(),
+            captured
+        );
+        assert_eq!(
+            evidence.durability_at("b"),
+            Some(WriteDurability::StableCommitted)
+        );
+        assert_eq!(tracker.diagnostics().satisfied, 1);
+        assert_eq!(tracker.diagnostics().active, 0);
+    }
     fn op() -> ReplicatedOp {
         ReplicatedOp {
             key: "key".into(),
@@ -508,7 +876,7 @@ mod tests {
         tracker.acknowledge("b", FragmentId(0), std::slice::from_ref(&op));
         tracker.acknowledge("ineligible", FragmentId(0), std::slice::from_ref(&op));
         let mut stale = op.clone();
-        stale.value.timestamp_ms += 1;
+        stale.value.timestamp_ms -= 1;
         tracker.acknowledge("c", FragmentId(0), &[stale]);
         tracker.acknowledge("c", FragmentId(1), std::slice::from_ref(&op));
         assert!(!pending.ticket.progress.lock().unwrap().complete);
@@ -578,6 +946,28 @@ mod tests {
         )
         .unwrap()
         .with_region_progress("r".repeat(255), ids[1..].to_vec())
+        .unwrap()
+        .with_evidence(
+            WriteConcernEvidence::new(
+                WriteOperationEvidence::new(
+                    0,
+                    &"k".repeat(low),
+                    &[],
+                    actordb_protocol::RecordVersion::new(1, 0),
+                    ids[0].clone(),
+                    false,
+                    None,
+                )
+                .unwrap(),
+                ids.clone(),
+                ids.iter()
+                    .map(|id| {
+                        WriteAcknowledgement::new(id.clone(), WriteDurability::StableCommitted)
+                    })
+                    .collect(),
+            )
+            .unwrap(),
+        )
         .unwrap();
         let envelope = Envelope {
             msg: Some(EnvelopeMsg::MutationResponse(MutationResponse {
@@ -634,6 +1024,7 @@ mod tests {
         ));
         pending.applied_locally();
         assert_eq!(pending.ticket.plan.required, 2);
+        assert_eq!(tracker.diagnostics().rejected, 1);
         tracker.acknowledge("b", FragmentId(0), std::slice::from_ref(&op));
         let receipt = pending.wait().await.unwrap();
         assert!(!receipt.was_overridden());

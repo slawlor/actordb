@@ -46,6 +46,12 @@ pub mod proto;
 /// namespace wrapper are always available for caller-supplied stores.
 pub mod store;
 
+/// Stable bounded checkpoint transfer and resumable import.
+pub mod checkpoint;
+
+/// Persisted, evidence-checked staged placement transitions.
+pub mod membership;
+
 /// Sharding: deterministic key → fragment mapping.
 pub mod shard;
 

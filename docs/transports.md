@@ -95,6 +95,15 @@ normal dependency on `actordb` or a TLS library.
 
 ## Transport contract
 
+Configured process-generation peers sign every post-handshake frame with
+sequence and fresh-session binding, so plain TCP provides peer payload integrity
+and replay rejection. This mode preserves the 16 MiB envelope/record limit and
+adds a 72-byte physical header charged to queue admission. See
+[peer-authority.md](peer-authority.md) for the exact format and test vector.
+It does not encrypt values; TLS remains appropriate for confidentiality.
+Legacy generation-zero cluster-secret peers retain their original framing and
+rely on a protected transport when channel integrity is required.
+
 - Deliver reliable, ordered bytes and support concurrent reads and writes.
   Propagate backpressure and connection errors. ActorDB flushes each complete
   frame, supporting buffered streams as well as sockets.

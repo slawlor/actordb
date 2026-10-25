@@ -15,6 +15,9 @@ use ractor::{Actor, ActorCell, ActorProcessingErr, ActorRef, ActorStatus};
 use tokio::sync::Mutex;
 
 use super::fragment_state::FragmentState;
+use super::observations::{
+    PoolCounters, PoolObservation, WorkCounters, WorkerObservation, WorkerWork,
+};
 #[cfg(test)]
 use super::pool_worker::{
     install_worker_get_gate, install_worker_startup_gate, take_worker_startup_gate,
@@ -161,9 +164,11 @@ impl Drop for WorkerStartupChildren {
 struct WorkerSlot {
     worker: ActorRef<KvMessage>,
     pending: Arc<AtomicU64>,
+    observations: Arc<WorkCounters>,
 }
 
 pub(super) struct WorkerPool {
+    observations: Arc<PoolCounters>,
     workers: Vec<WorkerSlot>,
     config: PoolConfig,
     /// Jobs currently active or queued across this pool's workers.
@@ -187,6 +192,7 @@ impl WorkerPool {
         worker_prefix: &str,
     ) -> Result<Self, ActorProcessingErr> {
         let worker_count = config.workers.max(1);
+        let observations = PoolCounters::new(shared.pool_timing_enabled());
         let pending = Arc::new(AtomicU64::new(0));
         let mut workers = Vec::with_capacity(worker_count);
         let mut startup_children = WorkerStartupChildren::default();
@@ -214,6 +220,7 @@ impl WorkerPool {
                 workers.push(WorkerSlot {
                     worker,
                     pending: slot_pending,
+                    observations: Arc::new(WorkCounters::default()),
                 });
             }
             Ok::<(), ActorProcessingErr>(())
@@ -232,6 +239,7 @@ impl WorkerPool {
             }
         }
         Ok(Self {
+            observations,
             workers,
             rate_limiter: config
                 .rate_limit_per_sec
@@ -252,6 +260,7 @@ impl WorkerPool {
         // Unsupervised spawn: used only in tests. Production pools go
         // through `spawn_linked` so the dispatcher restarts dead workers.
         let worker_count = config.workers.max(1);
+        let observations = PoolCounters::new(shared.pool_timing_enabled());
         let pending = Arc::new(AtomicU64::new(0));
         let mut workers = Vec::with_capacity(worker_count);
         let mut startup_children = WorkerStartupChildren::default();
@@ -274,6 +283,7 @@ impl WorkerPool {
                 workers.push(WorkerSlot {
                     worker,
                     pending: slot_pending,
+                    observations: Arc::new(WorkCounters::default()),
                 });
             }
             Ok::<(), ActorProcessingErr>(())
@@ -292,6 +302,7 @@ impl WorkerPool {
             }
         }
         Ok(Self {
+            observations,
             workers,
             rate_limiter: config
                 .rate_limit_per_sec
@@ -318,7 +329,11 @@ impl WorkerPool {
         pending: Arc<AtomicU64>,
     ) {
         if let Some(worker_slot) = self.workers.get_mut(slot) {
-            *worker_slot = WorkerSlot { worker, pending };
+            *worker_slot = WorkerSlot {
+                worker,
+                pending,
+                observations: Arc::new(WorkCounters::default()),
+            };
         }
     }
 
@@ -329,6 +344,7 @@ impl WorkerPool {
         if let Some(limiter) = &self.rate_limiter {
             if !limiter.lock().await.try_acquire() {
                 self.shed_count.fetch_add(1, Ordering::Relaxed);
+                self.observations.shed_rate.fetch_add(1, Ordering::Relaxed);
                 return None;
             }
         }
@@ -337,6 +353,7 @@ impl WorkerPool {
         if pending >= self.config.queue_cap as u64 {
             release_pending(&self.pending, 1);
             self.shed_count.fetch_add(1, Ordering::Relaxed);
+            self.observations.shed_queue.fetch_add(1, Ordering::Relaxed);
             return None;
         }
         Some(self.reserve_slot(key))
@@ -351,6 +368,7 @@ impl WorkerPool {
         if let Some(limiter) = &self.rate_limiter {
             if !limiter.lock().await.try_acquire() {
                 self.shed_count.fetch_add(1, Ordering::Relaxed);
+                self.observations.shed_rate.fetch_add(1, Ordering::Relaxed);
                 return None;
             }
         }
@@ -359,6 +377,7 @@ impl WorkerPool {
         if pending >= self.config.queue_cap as u64 {
             release_pending(&self.pending, 1);
             self.shed_count.fetch_add(1, Ordering::Relaxed);
+            self.observations.shed_queue.fetch_add(1, Ordering::Relaxed);
             return None;
         }
         Some(self.reserve_slot_round_robin())
@@ -367,6 +386,58 @@ impl WorkerPool {
     /// Number of ops shed by this pool.
     pub(super) fn shed_count(&self) -> u64 {
         self.shed_count.load(Ordering::Relaxed)
+    }
+    pub(super) fn observation(
+        &self,
+        table: Option<String>,
+        priority: super::OpPriority,
+        max_workers: usize,
+    ) -> PoolObservation {
+        let counters = &self.observations;
+        let workers = self
+            .workers
+            .iter()
+            .take(max_workers)
+            .enumerate()
+            .map(|(slot, worker)| {
+                let work = &worker.observations;
+                WorkerObservation {
+                    slot,
+                    actor_id: worker.worker.get_id().to_string(),
+                    incarnation: work.incarnation,
+                    state: worker.worker.get_status(),
+                    pending: worker.pending.load(Ordering::Acquire),
+                    queued: work.queued.load(Ordering::Acquire),
+                    active: work.active.load(Ordering::Acquire),
+                    accepted: work.accepted.load(Ordering::Relaxed),
+                    completed: work.completed.load(Ordering::Relaxed),
+                    abandoned: work.abandoned.load(Ordering::Relaxed),
+                    execution_duration: work.execution.snapshot(),
+                }
+            })
+            .collect();
+        PoolObservation {
+            table,
+            priority,
+            incarnation: counters.work.incarnation,
+            queue_capacity: self.config.queue_cap,
+            worker_count: self.workers.len(),
+            workers,
+            workers_truncated: self.workers.len() > max_workers,
+            pending: self.pending.load(Ordering::Acquire),
+            active: counters.work.active.load(Ordering::Acquire),
+            queued: counters.work.queued.load(Ordering::Acquire),
+            accepted: counters.work.accepted.load(Ordering::Relaxed),
+            completed: counters.work.completed.load(Ordering::Relaxed),
+            abandoned: counters.work.abandoned.load(Ordering::Relaxed),
+            shed_queue: counters.shed_queue.load(Ordering::Relaxed),
+            shed_rate: counters.shed_rate.load(Ordering::Relaxed),
+            shed_total: self.shed_count(),
+            timing_enabled: counters.timing.load(Ordering::Acquire),
+            oldest_queue_age: counters.oldest_queue_age(),
+            queue_duration: counters.queue_duration(),
+            execution_duration: counters.work.execution.snapshot(),
+        }
     }
 
     /// Reserve an op without cap/rate checks. Replication and reconciliation
@@ -442,6 +513,11 @@ impl WorkerReservation<'_> {
     /// send failure drops the reply port and rolls the reservation back, so
     /// callers observe actor unavailability rather than false backpressure.
     pub(super) fn send(mut self, message: KvMessage) {
+        let message = WorkerWork::new(
+            self.pool.observations.clone(),
+            self.pool.workers[self.slot].observations.clone(),
+        )
+        .wrap(message);
         if self.pool.workers[self.slot]
             .worker
             .send_message(message)

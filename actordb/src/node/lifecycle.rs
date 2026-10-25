@@ -194,6 +194,7 @@ pub(super) async fn ensure_sender_entry(
         last_ack_durability: None,
         ack_durability_mismatch: false,
         reconcile_rounds: 0,
+        progress: Default::default(),
     }));
     let peer_failures = deps.peer_failures.clone();
     let expected_peer = peer.to_string();
@@ -252,6 +253,10 @@ pub(super) struct OperationGate {
     pub(super) drain_failed: AtomicU64,
     pub(super) drain_cancelled: AtomicU64,
     pub(super) drain_duration_nanos: AtomicU64,
+    pub(super) timing_enabled: std::sync::atomic::AtomicBool,
+    pub(super) request_duration: observability::AtomicDurationSummary,
+    pub(super) waiter_timeouts: AtomicU64,
+    pub(super) awaiting_responses: AtomicUsize,
 }
 
 impl OperationGate {
@@ -269,6 +274,10 @@ impl OperationGate {
             drain_failed: AtomicU64::new(0),
             drain_cancelled: AtomicU64::new(0),
             drain_duration_nanos: AtomicU64::new(0),
+            timing_enabled: std::sync::atomic::AtomicBool::new(false),
+            request_duration: observability::AtomicDurationSummary::default(),
+            waiter_timeouts: AtomicU64::new(0),
+            awaiting_responses: AtomicUsize::new(0),
         })
     }
 
@@ -293,7 +302,17 @@ impl OperationGate {
         self.active.fetch_add(1, Ordering::SeqCst);
         if self.phase.load(Ordering::SeqCst) == NODE_RUNNING {
             self.accepted.fetch_add(1, Ordering::Relaxed);
-            return Ok(OperationPermit { gate: self.clone() });
+            return Ok(OperationPermit {
+                ownership: Arc::new(OperationOwnership {
+                    gate: self.clone(),
+                    started: self
+                        .timing_enabled
+                        .load(Ordering::Acquire)
+                        .then(std::time::Instant::now),
+                    table: None,
+                    responding: std::sync::atomic::AtomicBool::new(false),
+                }),
+            });
         }
         self.release();
         self.rejected.fetch_add(1, Ordering::Relaxed);
@@ -333,12 +352,42 @@ impl OperationGate {
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct OperationPermit {
-    pub(super) gate: Arc<OperationGate>,
+    ownership: Arc<OperationOwnership>,
 }
-
-impl Drop for OperationPermit {
+impl OperationPermit {
+    pub(crate) fn mark_responding(&self) {
+        if !self.ownership.responding.swap(true, Ordering::SeqCst) {
+            self.ownership
+                .gate
+                .awaiting_responses
+                .fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    pub(super) fn with_table(mut self, table: Option<observability::TableObservation>) -> Self {
+        Arc::get_mut(&mut self.ownership)
+            .expect("fresh admission permit")
+            .table = table;
+        self
+    }
+}
+struct OperationOwnership {
+    gate: Arc<OperationGate>,
+    started: Option<std::time::Instant>,
+    table: Option<observability::TableObservation>,
+    responding: std::sync::atomic::AtomicBool,
+}
+impl Drop for OperationOwnership {
     fn drop(&mut self) {
+        if self.responding.load(Ordering::SeqCst) {
+            self.gate.awaiting_responses.fetch_sub(1, Ordering::SeqCst);
+        }
+        // Publish scoped completion before the gate's final wakeup.
+        drop(self.table.take());
+        if let Some(started) = self.started {
+            self.gate.request_duration.observe(started.elapsed());
+        }
         self.gate.completed.fetch_add(1, Ordering::Relaxed);
         self.gate.release();
     }
@@ -583,6 +632,7 @@ impl Drop for Node {
         // admission open merely because a caller dropped the handle.
         self.operation_gate.begin_shutdown();
         self.receive_apply_gate.begin_shutdown();
+        self.peer_authority.close();
         self.mutation_service.request_shutdown();
         self.embedded_operations.request_shutdown();
         self.placement_tasks.request_shutdown();
@@ -645,6 +695,7 @@ pub(super) async fn spawn_fragment_subtree_registered(
             .clean_interval(config.clean_interval)
             .snapshot_interval(config.snapshot_interval)
             .build()
+            .with_pool_timing(config.pool_timing.clone())
             .with_expiry_publisher(expiry_publisher),
     )
     .map_err(|e| NodeError::Actor(e.to_string()))?;
@@ -1185,6 +1236,22 @@ impl Node {
         config: NodeConfig,
         runtime_options: NodeRuntimeOptions,
     ) -> Result<Self, NodeError> {
+        Self::start_observed(
+            node_id,
+            listen_addr,
+            config,
+            runtime_options,
+            startup::LifecycleObservation::new(),
+        )
+        .await
+    }
+    pub(super) async fn start_observed(
+        node_id: String,
+        listen_addr: SocketAddr,
+        config: NodeConfig,
+        runtime_options: NodeRuntimeOptions,
+        observation: Arc<startup::LifecycleObservation>,
+    ) -> Result<Self, NodeError> {
         runtime_options.validate()?;
         let mut runtime_options = runtime_options;
         runtime_options.replication_retention =
@@ -1201,6 +1268,20 @@ impl Node {
             return Err(NodeError::Actor(format!(
                 "node_id must contain 1 to {MAX_WIRE_NODE_ID_BYTES} bytes"
             )));
+        }
+        if runtime_options
+            .peer_authority
+            .as_ref()
+            .is_some_and(|authority| {
+                authority
+                    .peer_generations()
+                    .iter()
+                    .any(|peer| peer.peer_id() == node_id)
+            })
+        {
+            return Err(NodeError::Codec(
+                "local identity must not appear in authorized remote peers".into(),
+            ));
         }
         if let Some(invalid_member) = config
             .members
@@ -1280,7 +1361,9 @@ impl Node {
                 "cluster_secret must contain at least 32 bytes when configured".to_string(),
             ));
         }
-        if config.cluster_secret.is_none() {
+        if runtime_options.peer_authority.is_some() {
+            tracing::info!("independent process credentials authenticate peer generations and every session frame; use a protected Network transport when payload confidentiality is required");
+        } else if config.cluster_secret.is_none() {
             tracing::warn!(
                 "no cluster_secret configured: anyone with TCP reachability can join the peer mesh"
             );
@@ -1320,6 +1403,8 @@ impl Node {
         };
 
         let mut config = config;
+        config.pool_timing = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        runtime_options.observation_timing = config.pool_timing.clone();
         config.persistence = config.persistence.for_runtime().map_err(NodeError::Actor)?;
         let recovery = config.recovery.clone().map(|options| {
             Arc::new(RecoveryContext::new(
@@ -1336,6 +1421,18 @@ impl Node {
         // Bind immutable storage identity before network or actor side effects.
         // The binding remains owned by Node until every fragment has stopped.
         let store_identity = StoreIdentity::new(node_id.clone(), config.fragment_count as u32);
+        observation.required.store(
+            if !dynamic && config.fragment_map.is_empty() {
+                config.fragment_count
+            } else {
+                initial_placement
+                    .values()
+                    .filter(|replicas| replicas.contains(&node_id))
+                    .count()
+            },
+            Ordering::Release,
+        );
+        observation.startup(startup::StartupStage::BindingStorage);
         let store_binding = if let Some(store) = config.store.clone() {
             Some(
                 config
@@ -1374,6 +1471,11 @@ impl Node {
 
         // Bind before creating any actors so a transport startup error has no
         // fragment trees or durable-store users to roll back.
+        observation
+            .required
+            .store(my_fragments.len(), Ordering::Release);
+        observation.initial_boundary(&my_fragments);
+        observation.startup(startup::StartupStage::BindingTransport);
         let (bound_addr, mut acceptor) = config
             .network
             .bind(listen_addr)
@@ -1427,6 +1529,7 @@ impl Node {
         });
         let expiry_publisher = ttl_expiry.as_ref().map(ExpiryRuntime::publisher);
         let mut startup_supervisors = SupervisorStartupGuard::new(my_fragments.len());
+        observation.startup(startup::StartupStage::InitializingFragments);
         for fragment in my_fragments {
             // From this point cancellation may leave a synchronously starting
             // actor alive. The binding must then remain fail-closed.
@@ -1448,10 +1551,15 @@ impl Node {
                     startup_supervisors.disarm();
                     config.persistence.executor().drain().await;
                     store_binding.allow_release_after_join();
+                    observation.cleanup_complete.store(true, Ordering::Release);
                     return Err(error);
                 }
             };
             startup_supervisors.push(supervisor.clone());
+            observation.initialized_fragment();
+            if !dynamic {
+                observation.published_serving(fragment);
+            }
             supervisors
                 .lock()
                 .await
@@ -1473,6 +1581,7 @@ impl Node {
                 startup_supervisors.disarm();
                 config.persistence.executor().drain().await;
                 store_binding.allow_release_after_join();
+                observation.cleanup_complete.store(true, Ordering::Release);
                 return Err(NodeError::Actor(
                     "node runtime stopped during dispatcher-monitor startup".to_string(),
                 ));
@@ -1501,6 +1610,7 @@ impl Node {
             startup_supervisors.disarm();
             config.persistence.executor().drain().await;
             store_binding.allow_release_after_join();
+            observation.cleanup_complete.store(true, Ordering::Release);
             return Err(NodeError::Actor(
                 "node runtime stopped during serving read startup".to_string(),
             ));
@@ -1516,7 +1626,11 @@ impl Node {
                 .set_acknowledgement_cap(cap)
                 .expect("runtime options validated before startup");
         }
+        observation.startup(startup::StartupStage::StartingRuntime);
         let node = Self {
+            lifecycle_observation: observation.clone(),
+            detail_admission: Arc::new(Semaphore::new(16)),
+            pool_timing_enabled: config.pool_timing.clone(),
             recovery: recovery.clone(),
             node_id: node_id.clone(),
             boot_id: fresh_boot_id(),
@@ -1586,11 +1700,18 @@ impl Node {
             peer_changes,
             operation_gate: OperationGate::new(),
             receive_apply_gate: OperationGate::new(),
+            local_drain: drain_persistence::DrainPersistence::new(),
+            table_metrics: observability::TableRegistry::new(),
+            peer_authority: PeerAuthority::new(
+                node_id.clone(),
+                runtime_options.peer_authority.clone(),
+            ),
             shutdown_state: Mutex::new(ShutdownProgress::Running),
             replication_drain_report: StdMutex::new(None),
             network: config.network.clone(),
             ttl_expiry,
             store_binding: StdMutex::new(store_binding.transfer_to_node()),
+            checkpoint_store: config.store.as_ref().map(Arc::downgrade),
         };
         node.read_service
             .bind_operation_gate(node.operation_gate.clone());
@@ -1628,6 +1749,7 @@ impl Node {
         // the controller's desired placement.
         if dynamic {
             let deps = PlacementDriverDeps {
+                lifecycle_observation: node.lifecycle_observation.clone(),
                 recovery: recovery.clone(),
                 node_id: node_id.clone(),
                 controller: node.placement_controller.clone().expect("checked above"),
@@ -1748,6 +1870,8 @@ impl Node {
         }
 
         startup_supervisors.disarm();
+        observation.initialization_done();
+        observation.ready(node.status_snapshot().node_lifecycle);
         Ok(node)
     }
     pub(super) async fn replication_drain_targets(&self) -> Vec<ReplicationDrainTarget> {
@@ -1906,6 +2030,7 @@ impl Node {
             // Admission and actor-owned completion are separate from socket
             // lifetime: a decoded page may still be queued inside a sender.
             self.receive_apply_gate.begin_shutdown();
+            self.peer_authority.close();
             self.mutation_service.request_shutdown();
             self.embedded_operations.request_shutdown();
             // Placement owns fragment and sender topology. Join it before the
@@ -1958,7 +2083,9 @@ impl Node {
             });
 
             self.operation_gate.wait_for_drain().await;
+            self.local_drain.wait_for_active().await;
             self.receive_apply_gate.wait_for_drain().await;
+            self.peer_authority.wait_closed().await;
 
             let senders: Vec<NodeSender> = self.senders.lock().await.values().cloned().collect();
             for sender in senders {
@@ -1970,6 +2097,8 @@ impl Node {
             }
             self.retiring_senders.clear();
             *progress = ShutdownProgress::QuiescingFragments;
+            self.lifecycle_observation
+                .shutdown(status::ShutdownStage::QuiescingFragments);
         }
 
         if matches!(progress, ShutdownProgress::QuiescingFragments) {
@@ -2040,6 +2169,8 @@ impl Node {
             // cancelled caller can then resume joins without asking a stopped
             // supervisor to prove durability again.
             *progress = ShutdownProgress::StoppingFragments;
+            self.lifecycle_observation
+                .shutdown(status::ShutdownStage::StoppingFragments);
         }
 
         if matches!(progress, ShutdownProgress::StoppingFragments) {
@@ -2068,6 +2199,9 @@ impl Node {
             self.operation_gate.finish_shutdown();
             self.receive_apply_gate.finish_shutdown();
             *progress = ShutdownProgress::Stopped;
+            self.lifecycle_observation.clear_failure();
+            self.lifecycle_observation
+                .shutdown(status::ShutdownStage::Stopped);
         }
         Ok(())
     }
@@ -2104,8 +2238,14 @@ impl Node {
             self.operation_gate.begin_shutdown();
             *self.replication_drain_report.lock().unwrap() = None;
             *progress = ShutdownProgress::StoppingTransport;
+            self.lifecycle_observation
+                .shutdown(status::ShutdownStage::StoppingTransport);
         }
-        self.finish_local_shutdown(&mut progress).await
+        let result = self.finish_local_shutdown(&mut progress).await;
+        if let Err(error) = &result {
+            self.lifecycle_observation.fail(&error.to_string());
+        }
+        result
     }
     /// Callback diagnostics, or `None` when registration is disabled. Counters
     /// describe local best-effort delivery and are readable after shutdown.
@@ -2186,6 +2326,8 @@ impl Node {
             // can still register a transition.
             self.placement_tasks.request_shutdown();
             *progress = ShutdownProgress::FencingReplication;
+            self.lifecycle_observation
+                .shutdown(status::ShutdownStage::ReplicationFence);
         }
 
         if matches!(*progress, ShutdownProgress::FencingReplication) {
@@ -2235,6 +2377,8 @@ impl Node {
                     }
                 };
             *progress = ShutdownProgress::DrainingReplication(waiters);
+            self.lifecycle_observation
+                .shutdown(status::ShutdownStage::ReplicationDrain);
         }
 
         if let ShutdownProgress::DrainingReplication(waiters) = &*progress {
@@ -2257,6 +2401,8 @@ impl Node {
                         // a retry can install and fence a fresh sender from the
                         // still-authoritative cache.
                         *progress = ShutdownProgress::FencingReplication;
+                        self.lifecycle_observation
+                            .shutdown(status::ShutdownStage::ReplicationFence);
                         return Err(ReplicationDrainShutdownError::RetryableSender(format!(
                             "{error}; retry to replace and re-fence the sender"
                         )));
@@ -2281,6 +2427,8 @@ impl Node {
                     .await;
             }
             *progress = ShutdownProgress::StoppingTransport;
+            self.lifecycle_observation
+                .shutdown(status::ShutdownStage::StoppingTransport);
         }
 
         let report = stored_report().ok_or_else(|| {

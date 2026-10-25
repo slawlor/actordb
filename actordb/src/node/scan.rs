@@ -286,16 +286,23 @@ impl Node {
 /// read loop never blocks on scan work; the scan itself runs in the
 /// fragment's background pool under admission control.
 pub(super) async fn serve_scan_request(
-    tx: PeerChannel,
+    mut tx: PeerChannel,
     serving: Arc<StdRwLock<HashSet<FragmentId>>>,
     router: super::FragmentRouter,
     req: proto::ScanRequest,
     retention: Arc<crate::query::QueryRetention>,
+    operation: super::OperationPermit,
 ) {
+    tx.work_retention = Some(Arc::new((
+        tx.work_retention.clone(),
+        retention.clone(),
+        operation.clone(),
+    )));
     let fragment = FragmentId(req.fragment);
     let req_id = req.req_id;
 
     if !serving.read().unwrap().contains(&fragment) {
+        operation.mark_responding();
         send_scan_response(
             &tx,
             req_id,
@@ -308,6 +315,7 @@ pub(super) async fn serve_scan_request(
     let spec = match ScanSpec::from_scan_request(&req) {
         Ok(spec) => spec,
         Err(error) => {
+            operation.mark_responding();
             send_scan_response(
                 &tx,
                 req_id,
@@ -319,6 +327,7 @@ pub(super) async fn serve_scan_request(
         }
     };
     let Some(actor) = router.route_for_fragment(fragment) else {
+        operation.mark_responding();
         send_scan_response(
             &tx,
             req_id,
@@ -342,10 +351,12 @@ pub(super) async fn serve_scan_request(
     {
         Ok(CallResult::Success(Ok(matches))) => matches,
         Ok(CallResult::Success(Err(shed))) => {
+            operation.mark_responding();
             send_scan_response(&tx, req_id, Vec::new(), format!("scan shed: {shed}")).await;
             return;
         }
         _ => {
+            operation.mark_responding();
             send_scan_response(
                 &tx,
                 req_id,
@@ -364,6 +375,7 @@ pub(super) async fn serve_scan_request(
             value: m.value,
         })
         .collect();
+    operation.mark_responding();
     send_scan_response(&tx, req_id, proto_matches, String::new()).await;
 }
 

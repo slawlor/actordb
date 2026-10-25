@@ -21,8 +21,12 @@ pub(crate) use peer_budget::{
     GlobalBytePermits, NodePeerByteBudget, NODE_PEER_QUEUE_BYTE_CAPACITY,
 };
 
-/// Hard limit for one length-prefixed protobuf envelope body.
+/// Existing protobuf/record budget, unchanged for opaque persisted values.
 pub(crate) const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
+pub(crate) const PEER_SIGNATURE_HEADER_BYTES: usize = 8 + 64;
+/// Signed physical bodies reserve a fixed integrity header in addition to the
+/// unchanged envelope budget. Legacy physical bodies remain MAX_FRAME_BYTES.
+pub(crate) const MAX_TRANSPORT_FRAME_BYTES: usize = MAX_FRAME_BYTES + PEER_SIGNATURE_HEADER_BYTES;
 
 /// Soft target for one anti-entropy page. A single individually valid entry
 /// may exceed this target, but no encoded envelope may exceed
@@ -63,6 +67,7 @@ pub(crate) struct BudgetedFrame {
     _producer_byte_permit: Option<OwnedSemaphorePermit>,
     _global_byte_permit: Option<OwnedSemaphorePermit>,
     _global_producer_byte_permit: Option<OwnedSemaphorePermit>,
+    _completion_retention: Option<Arc<dyn Send + Sync>>,
 }
 
 impl BudgetedFrame {
@@ -77,6 +82,7 @@ impl BudgetedFrame {
             _producer_byte_permit: Some(producer_byte_permit),
             _global_byte_permit: None,
             _global_producer_byte_permit: None,
+            _completion_retention: None,
         }
     }
 
@@ -87,12 +93,20 @@ impl BudgetedFrame {
             _producer_byte_permit: None,
             _global_byte_permit: None,
             _global_producer_byte_permit: None,
+            _completion_retention: None,
         }
     }
 
     pub(crate) fn with_global_permits(mut self, permits: GlobalBytePermits) -> Self {
         self._global_byte_permit = Some(permits.total);
         self._global_producer_byte_permit = permits.producer;
+        self
+    }
+    pub(crate) fn with_completion_retention(
+        mut self,
+        retention: Option<Arc<dyn Send + Sync>>,
+    ) -> Self {
+        self._completion_retention = retention;
         self
     }
 
@@ -110,6 +124,8 @@ impl BudgetedFrame {
 /// frame-count nor encoded-byte budget can be bypassed or mismatched.
 #[derive(Clone)]
 pub(crate) struct BudgetedPeerTx {
+    /// Signed sessions reserve header bytes before queue/encoding admission.
+    pub(crate) frame_overhead: usize,
     /// Ordinary producer traffic. Reader-generated protocol responses have a
     /// separate priority lane so a full data queue cannot make both peers
     /// stop reading while they wait to acknowledge one another.

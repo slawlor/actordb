@@ -15,6 +15,7 @@ use super::*;
 /// ownership; `Clone` for spawning per-fragment gain/lose tasks.
 #[derive(Clone)]
 pub(super) struct PlacementDriverDeps {
+    pub(super) lifecycle_observation: Arc<startup::LifecycleObservation>,
     pub(super) expiry_publisher: Option<ExpiryPublisher>,
     pub(super) node_id: String,
     pub(super) controller: Arc<dyn PlacementController>,
@@ -123,6 +124,7 @@ pub(super) async fn placement_driver(
 /// One driver tick: publish the controller's map as the authoritative
 /// routing table, then gain/lose fragments to match.
 pub(super) async fn placement_tick(deps: &PlacementDriverDeps) {
+    let before_generation = deps.placement_generation.load(Ordering::Acquire);
     let desired = deps.controller.desired_placement();
     if let Err(e) = validate_placement(&desired, deps.fragment_count) {
         tracing::warn!(error = %e, "invalid desired placement; keeping current map");
@@ -147,6 +149,7 @@ pub(super) async fn placement_tick(deps: &PlacementDriverDeps) {
             *published = desired.clone();
             deps.placement_generation.fetch_add(1, Ordering::AcqRel);
         }
+        deps.lifecycle_observation.desired(&mine_desired);
         drop(published);
         let mut current = HashSet::new();
         let mut flight = HashSet::new();
@@ -197,6 +200,11 @@ pub(super) async fn placement_tick(deps: &PlacementDriverDeps) {
         }
         (current, flight, transitions)
     };
+    if !transitions.is_empty()
+        || before_generation != deps.placement_generation.load(Ordering::Acquire)
+    {
+        deps.lifecycle_observation.changed();
+    }
 
     // Register outside the placement-state commit mutex. The placement task manager
     // owns and joins transitions directly, so aborting the polling driver
@@ -346,17 +354,24 @@ pub(super) async fn commit_fragment_gain(
         .unwrap_or_default();
     if !current.iter().any(|node| node == &deps.node_id) {
         states.insert(fragment, FragmentPlacementState::Draining);
+        drop(states);
+        deps.lifecycle_observation.changed();
         return FragmentGainCommit::Revoked;
     }
     if current != expected_replicas
         || deps.placement_generation.load(Ordering::Acquire) != expected_generation
     {
         states.insert(fragment, FragmentPlacementState::Bootstrapping);
+        drop(states);
+        deps.lifecycle_observation.changed();
         return FragmentGainCommit::Retry;
     }
 
     deps.serving.write().unwrap().insert(fragment);
     states.insert(fragment, FragmentPlacementState::Serving);
+    deps.lifecycle_observation.published_serving(fragment);
+    drop(states);
+    deps.lifecycle_observation.changed();
     FragmentGainCommit::Serving
 }
 
@@ -901,6 +916,7 @@ pub(super) async fn finish_fragment_prefix_retirement(
         .lock()
         .await
         .insert(fragment, FragmentPlacementState::Stopped);
+    deps.lifecycle_observation.changed();
 }
 
 pub(super) async fn lose_fragment(deps: &PlacementDriverDeps, fragment: FragmentId) {
@@ -1396,6 +1412,7 @@ pub(super) async fn lose_fragment_retaining_prefix(
                 .lock()
                 .await
                 .insert(fragment, FragmentPlacementState::Stopped);
+            deps.lifecycle_observation.changed();
             return;
         }
         if std::time::Instant::now() >= next_warning {
@@ -1466,6 +1483,7 @@ mod tests {
             last_ack_durability: None,
             ack_durability_mismatch: false,
             reconcile_rounds: 0,
+            progress: Default::default(),
         }));
         let sender = spawn_node_sender(
             fragment,
@@ -2190,6 +2208,7 @@ mod tests {
             }
         }
         PlacementDriverDeps {
+            lifecycle_observation: startup::LifecycleObservation::new(),
             expiry_publisher: None,
             recovery: None,
             node_id: "node-a".to_string(),

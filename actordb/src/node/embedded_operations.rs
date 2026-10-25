@@ -47,6 +47,7 @@ impl EmbeddedOperationDiagnostics {
 pub(super) struct RequestRetention {
     _count: OwnedSemaphorePermit,
     _bytes: OwnedSemaphorePermit,
+    _operation: Option<super::OperationPermit>,
 }
 
 pub(super) struct EmbeddedOperations {
@@ -93,7 +94,20 @@ impl EmbeddedOperations {
                 .saturating_sub(self.completions.available_permits()),
         }
     }
+    pub(super) fn queued(&self) -> usize {
+        self.jobs
+            .max_capacity()
+            .saturating_sub(self.jobs.capacity())
+    }
+    #[cfg(test)]
     pub(super) fn admit(&self, bytes: usize) -> Result<Arc<RequestRetention>, NodeError> {
+        self.admit_owned(bytes, None)
+    }
+    pub(super) fn admit_owned(
+        &self,
+        bytes: usize,
+        operation: Option<super::OperationPermit>,
+    ) -> Result<Arc<RequestRetention>, NodeError> {
         if !self.accepting.load(Ordering::Acquire) {
             return Err(NodeError::ShuttingDown);
         }
@@ -117,6 +131,7 @@ impl EmbeddedOperations {
         Ok(Arc::new(RequestRetention {
             _count: count,
             _bytes: bytes,
+            _operation: operation,
         }))
     }
     pub(super) fn submit(
@@ -219,6 +234,14 @@ pub(super) fn single_request_bytes(key: &String, value: Option<&Vec<u8>>) -> usi
         .saturating_add(key.capacity().saturating_mul(3))
         .saturating_add(value.map_or(0, |value| value.capacity().saturating_mul(2)))
         .saturating_add(2 * super::MAX_WIRE_NODE_ID_BYTES)
+}
+/// Concern tickets retain one additional exact operation for reset recovery.
+pub(super) fn single_concern_request_bytes(key: &String, value: Option<&Vec<u8>>) -> usize {
+    single_request_bytes(key, value)
+        .saturating_add(std::mem::size_of::<crate::actor::ReplicatedOp>())
+        .saturating_add(key.capacity())
+        .saturating_add(value.map_or(0, Vec::capacity))
+        .saturating_add(super::MAX_WIRE_NODE_ID_BYTES)
 }
 pub(super) fn batch_put_request_bytes(values: &Vec<(String, Vec<u8>)>) -> usize {
     std::mem::size_of::<Vec<(String, Vec<u8>)>>()
@@ -419,18 +442,33 @@ mod tests {
             request.await.unwrap(),
             Err(NodeError::UnknownOutcome(_))
         ));
+        // The public request lease and the internal apply/completion lease
+        // each own a gate slot after the waiter times out. Neither may be
+        // released until the blocked actor actually completes.
+        let held_owners = node.operation_gate.active.load(Ordering::SeqCst);
+        assert_eq!(held_owners, 2);
         assert!(matches!(
             node.put("excess".into(), vec![2]).await,
             Err(NodeError::Backpressure(_))
         ));
-        assert_eq!(node.operation_gate.active.load(Ordering::SeqCst), 1);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while node.operation_gate.active.load(Ordering::SeqCst) != held_owners {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(gate.received.load(Ordering::SeqCst), 1);
         let mut shutdown = Box::pin(node.shutdown());
         assert!(
             tokio::time::timeout(Duration::from_millis(20), &mut shutdown)
                 .await
                 .is_err()
         );
-        assert_eq!(node.operation_gate.active.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            node.operation_gate.active.load(Ordering::SeqCst),
+            held_owners
+        );
         gate.release.add_permits(1);
         tokio::time::timeout(Duration::from_secs(2), shutdown)
             .await

@@ -35,6 +35,7 @@ pub(super) const READ_QUEUE_CAPACITY: usize = 64;
 pub(super) const READ_KEY_BYTE_CAPACITY: usize = 64 * 1024 * 1024;
 
 struct ReadRetention {
+    _peer_work: Option<Arc<dyn Send + Sync>>,
     _count: OwnedSemaphorePermit,
     _key_bytes: OwnedSemaphorePermit,
     _operation: Option<OperationPermit>,
@@ -155,6 +156,7 @@ pub(super) struct ReadJob {
     tx: PeerChannel,
     deadline: Instant,
     retention: Option<Arc<ReadRetention>>,
+    operation: Option<OperationPermit>,
 }
 
 impl ReadJob {
@@ -172,12 +174,18 @@ impl ReadJob {
             tx,
             deadline,
             retention: None,
+            operation: None,
         }
     }
 
     fn reject(self, shed: bool) -> bool {
         if *self.tx.cancel.borrow() {
             return false;
+        }
+        if shed || matches!(&self.request, ReadRequest::Batch(_)) {
+            if let Some(operation) = &self.operation {
+                operation.mark_responding();
+            }
         }
         let sent = if shed {
             self.request.shed(&self.tx)
@@ -192,6 +200,25 @@ impl ReadJob {
 }
 
 impl ReadService {
+    pub(super) fn queued(&self) -> usize {
+        self.lanes
+            .iter()
+            .map(|lane| {
+                lane.jobs
+                    .max_capacity()
+                    .saturating_sub(lane.jobs.capacity())
+            })
+            .sum()
+    }
+    pub(super) fn admitted_slots(&self) -> usize {
+        self.lanes
+            .iter()
+            .map(|lane| {
+                (lane.jobs.max_capacity() + READ_WORKERS_PER_PRIORITY)
+                    .saturating_sub(lane.count.available_permits())
+            })
+            .sum()
+    }
     pub(super) fn bind_operation_gate(&self, gate: Arc<OperationGate>) {
         *self.operation_gate.lock().unwrap() = Some(gate);
     }
@@ -236,6 +263,11 @@ impl ReadService {
             },
             None => None,
         };
+        job.operation = operation.clone();
+        if operation.is_some() {
+            job.tx.work_retention =
+                Some(Arc::new((job.tx.work_retention.clone(), operation.clone())));
+        }
         if Instant::now() >= job.deadline {
             return job.reject(false);
         }
@@ -259,6 +291,7 @@ impl ReadService {
             Err(_) => return job.reject(true),
         };
         job.retention = Some(Arc::new(ReadRetention {
+            _peer_work: job.tx.work_retention.clone(),
             _count: count,
             _key_bytes: key_bytes,
             _operation: operation,
@@ -304,6 +337,7 @@ async fn serve_read(job: ReadJob, shutdown: &mut watch::Receiver<bool>) {
         tx,
         deadline,
         retention,
+        operation,
     } = job;
     // Keep one copy while result keys are in the reply port or being encoded;
     // the actor's copy survives cancellation until its request really drops.
@@ -337,9 +371,19 @@ async fn serve_read(job: ReadJob, shutdown: &mut watch::Receiver<bool>) {
     }
     let sent = match response {
         Ok(Ok(CallResult::Success(page))) if Instant::now() < deadline && route.is_current() => {
-            reply_kind.send_page(&tx, page)
+            if let Some(operation) = &retention._operation {
+                operation.mark_responding();
+            }
+            reply_kind.send_page_retained(&tx, page, Some(retention))
         }
-        _ => reply_kind.unavailable(&tx),
+        _ => {
+            if matches!(reply_kind, ReadReply::Batch(_)) {
+                if let Some(operation) = &operation {
+                    operation.mark_responding();
+                }
+            }
+            reply_kind.unavailable(&tx)
+        }
     };
     if !sent {
         tx.cancel();
@@ -354,7 +398,12 @@ impl ReadReply {
         }
     }
 
-    fn send_page(self, tx: &PeerChannel, page: BatchReadPage) -> bool {
+    fn send_page_retained(
+        self,
+        tx: &PeerChannel,
+        page: BatchReadPage,
+        retention: Option<Arc<dyn Send + Sync>>,
+    ) -> bool {
         match self {
             Self::Single(req_id) => {
                 if page.entries.len() != 1 {
@@ -376,11 +425,12 @@ impl ReadReply {
                     response.expires_at_ms = value.expires_at_ms.unwrap_or(0);
                     response.is_tombstone = value.is_tombstone;
                 }
-                send_envelope(
+                super::connection::send_envelope_retained(
                     tx,
                     Envelope {
                         msg: Some(EnvelopeMsg::GetResponse(response)),
                     },
+                    retention,
                 )
             }
             Self::Batch(req_id) => {
@@ -421,7 +471,15 @@ impl ReadReply {
                         break;
                     }
                 }
-                send_batch_get_response(tx, req_id, results)
+                super::connection::send_envelope_retained(
+                    tx,
+                    Envelope {
+                        msg: Some(EnvelopeMsg::BatchGetResponse(
+                            crate::proto::BatchGetResponse { req_id, results },
+                        )),
+                    },
+                    retention,
+                )
             }
         }
     }

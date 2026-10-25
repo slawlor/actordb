@@ -31,9 +31,9 @@ pub(super) struct PoolWorkerArgs {
 
 #[cfg(test)]
 #[derive(Clone, Default)]
-pub(super) struct WorkerTestGate {
-    pub(super) entered: Arc<tokio::sync::Notify>,
-    pub(super) release: Arc<tokio::sync::Notify>,
+pub(crate) struct WorkerTestGate {
+    pub(crate) entered: Arc<tokio::sync::Notify>,
+    pub(crate) release: Arc<tokio::sync::Notify>,
 }
 
 #[cfg(test)]
@@ -65,7 +65,7 @@ pub(super) fn take_worker_startup_gate(name: &str) -> Option<WorkerTestGate> {
 }
 
 #[cfg(test)]
-pub(super) fn install_worker_get_gate(key: String) -> WorkerTestGate {
+pub(crate) fn install_worker_get_gate(key: String) -> WorkerTestGate {
     let gate = WorkerTestGate::default();
     let replaced = WORKER_GET_GATES
         .lock()
@@ -107,86 +107,94 @@ impl Actor for PoolWorker {
         message: Self::Msg,
         state: &mut Self::State,
     ) -> Result<(), ActorProcessingErr> {
-        let (message, _retention) = message.into_retained_parts();
-        match message {
-            KvMessage::ApplyOp {
-                op,
-                priority: _,
-                is_replication: _,
-                reply,
-            } => {
-                let result = state.shared.apply(&op).await;
-                release_pool_reservation(state);
-                match result {
-                    Ok(outcome) => {
-                        if let Some(reply) = reply {
-                            let _ = reply.send(Ok(outcome));
-                        }
-                        Ok(())
-                    }
-                    Err(error) => {
-                        let fatal = match &error {
-                            ApplyError::Storage(message) => {
-                                Some(ActorProcessingErr::from(message.clone()))
-                            }
-                            ApplyError::Backpressure
-                            | ApplyError::InvalidInput(_)
-                            | ApplyError::VersionConflict { .. } => None,
-                        };
-                        if let Some(reply) = reply {
-                            let _ = reply.send(Err(error));
-                        }
-                        match fatal {
-                            Some(error) => Err(error),
-                            None => Ok(()),
-                        }
-                    }
-                }
-            }
-            KvMessage::Get {
-                key,
-                reply,
-                priority: _,
-            } => {
-                #[cfg(test)]
-                if let Some(gate) = take_worker_get_gate(&key) {
-                    gate.entered.notify_one();
-                    gate.release.notified().await;
-                }
-                let value = state.shared.get(&key).await;
-                release_pool_reservation(state);
-                let _ = reply.send(Ok(value));
-                Ok(())
-            }
-            KvMessage::ContinueBatchRead(mut work) => {
-                let Some(key) = work.current_key() else {
+        let (message, mut observation) = message.into_observed_worker();
+        let result = async {
+            let (message, _retention) = message.into_retained_parts();
+            match message {
+                KvMessage::ApplyOp {
+                    op,
+                    priority: _,
+                    is_replication: _,
+                    reply,
+                } => {
+                    let result = state.shared.apply(&op).await;
                     release_pool_reservation(state);
-                    work.finish();
-                    return Ok(());
-                };
-                #[cfg(test)]
-                if let Some(gate) = take_worker_get_gate(key) {
-                    gate.entered.notify_one();
-                    gate.release.notified().await;
+                    match result {
+                        Ok(outcome) => {
+                            if let Some(reply) = reply {
+                                let _ = reply.send(Ok(outcome));
+                            }
+                            Ok(())
+                        }
+                        Err(error) => {
+                            let fatal = match &error {
+                                ApplyError::Storage(message) => {
+                                    Some(ActorProcessingErr::from(message.clone()))
+                                }
+                                ApplyError::Backpressure
+                                | ApplyError::InvalidInput(_)
+                                | ApplyError::VersionConflict { .. } => None,
+                            };
+                            if let Some(reply) = reply {
+                                let _ = reply.send(Err(error));
+                            }
+                            match fatal {
+                                Some(error) => Err(error),
+                                None => Ok(()),
+                            }
+                        }
+                    }
                 }
-                let value = state.shared.get(key).await;
-                // Release before the dispatcher admits the next key. At a
-                // queue-cap boundary, forwarding first would make completed
-                // work look pending and spuriously shed the continuation.
-                release_pool_reservation(state);
-                work.push(Ok(value));
-                work.return_to_dispatcher();
-                Ok(())
-            }
-            message => {
-                // Dispatcher-only variants are never routed here. Keep the
-                // public KvWorker's defensive behavior if an internal bug
-                // does so, while still balancing the reservation.
-                let result = handle_worker_message(&state.shared, message).await;
-                release_pool_reservation(state);
-                result
+                KvMessage::Get {
+                    key,
+                    reply,
+                    priority: _,
+                } => {
+                    #[cfg(test)]
+                    if let Some(gate) = take_worker_get_gate(&key) {
+                        gate.entered.notify_one();
+                        gate.release.notified().await;
+                    }
+                    let value = state.shared.get(&key).await;
+                    release_pool_reservation(state);
+                    let _ = reply.send(Ok(value));
+                    Ok(())
+                }
+                KvMessage::ContinueBatchRead(mut work) => {
+                    let Some(key) = work.current_key() else {
+                        release_pool_reservation(state);
+                        work.finish();
+                        return Ok(());
+                    };
+                    #[cfg(test)]
+                    if let Some(gate) = take_worker_get_gate(key) {
+                        gate.entered.notify_one();
+                        gate.release.notified().await;
+                    }
+                    let value = state.shared.get(key).await;
+                    // Release before the dispatcher admits the next key. At a
+                    // queue-cap boundary, forwarding first would make completed
+                    // work look pending and spuriously shed the continuation.
+                    release_pool_reservation(state);
+                    work.push(Ok(value));
+                    work.return_to_dispatcher();
+                    Ok(())
+                }
+                message => {
+                    // Dispatcher-only variants are never routed here. Keep the
+                    // public KvWorker's defensive behavior if an internal bug
+                    // does so, while still balancing the reservation.
+                    let result = handle_worker_message(&state.shared, message).await;
+                    release_pool_reservation(state);
+                    result
+                }
             }
         }
+        .await;
+        if let Some(observation) = observation.as_mut() {
+            observation.complete();
+        }
+        result
     }
 }
 

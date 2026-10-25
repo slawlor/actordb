@@ -245,6 +245,11 @@ pub struct StoreBinding {
 }
 
 impl StoreBinding {
+    /// Whether this backend supplied explicit managed attachment ownership.
+    /// Checkpoint-capable root stores must provide an exclusive managed lease.
+    pub fn is_managed(&self) -> bool {
+        self.release.is_some()
+    }
     /// Construct a binding with no release action.
     ///
     /// This is useful to custom stores which validate [`StoreIdentity`] but do
@@ -317,6 +322,22 @@ pub enum StoreCommitDurability {
     Stable,
 }
 
+/// Actual synchronous storage ownership and optional monotonic timing.
+/// Counters belong to `scope_id`, the shared PersistenceConfig executor
+/// incarnation, which can be deliberately reused across successive nodes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct StorageDiagnostics {
+    pub scope_id: u64,
+    pub queued_jobs: usize,
+    pub active_jobs: usize,
+    pub completed_jobs: u64,
+    pub failed_jobs: u64,
+    pub timing_enabled: bool,
+    pub queue_wait: crate::node::observability::DurationSummary,
+    pub execution_time: crate::node::observability::DurationSummary,
+}
+
 /// Result of asking a store to remove a key prefix.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PrefixDeleteOutcome {
@@ -350,6 +371,11 @@ pub enum PrefixDeleteOutcome {
 /// Digests are derived from loaded winners in memory and require no persisted
 /// digest metadata.
 pub trait KvStore: Send + Sync + 'static {
+    /// Optional durable snapshot and atomic resumable import capability.
+    /// No full-dataset `load` fallback is used for checkpoint transfer.
+    fn checkpoint_backend(&self) -> Option<&dyn crate::checkpoint::CheckpointBackend> {
+        None
+    }
     /// Attach one live node and validate any backend identity metadata.
     ///
     /// The default is an unmanaged no-op so existing custom implementations

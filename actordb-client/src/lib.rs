@@ -28,7 +28,10 @@ pub use wire::Scan as ScanOptions;
 pub use wire::{Inspection, Value};
 
 mod write_concern;
-pub use actordb_protocol::write_concern::{WriteConcern, WriteConcernOptions, WriteConcernReceipt};
+pub use actordb_protocol::write_concern::{
+    WriteAcknowledgement, WriteConcern, WriteConcernEvidence, WriteConcernOptions,
+    WriteConcernReceipt, WriteDurability, WriteOperationEvidence,
+};
 pub use write_concern::WriteConcernClientError;
 
 /// Connection and queue bounds. Credentials are independent of cluster secrets.

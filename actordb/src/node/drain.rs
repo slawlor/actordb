@@ -19,6 +19,47 @@ pub enum DrainPhase {
     Stopped,
 }
 
+/// Identity of a node's one-way application admission cutoff. All retries
+/// refer to the same incarnation; acceptance is the gate's successful recheck.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub struct DrainCutoff {
+    pub node_boot_id: u64,
+}
+
+/// Requested local boundary. Remote replication is a separate contract.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum DrainDurability {
+    /// Wait for execution and response ownership only.
+    Applied,
+    /// Also flush every local fragment through its configured store contract.
+    #[default]
+    ConfiguredStore,
+    /// Require an explicit stable fence on every local fragment.
+    StableCommitted,
+}
+
+/// Actual local evidence returned by a fragment's persistence fence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum LocalDurability {
+    MemoryApplied,
+    StoreCommitted,
+    StableCommitted,
+}
+
+/// One completed local fence, captured after cutoff application work finishes.
+/// The revision is an observed cache floor, not a global snapshot or writer lease.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct FragmentDrainFence {
+    pub fragment: FragmentId,
+    pub actor_generation: u64,
+    pub revision: Option<u64>,
+    pub durability: LocalDurability,
+}
+
 /// Approximate current ownership counts, readable without actor RPCs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DrainStatus {
@@ -26,6 +67,10 @@ pub struct DrainStatus {
     active_requests: usize,
     active_replication_applies: usize,
     receive_apply_complete: bool,
+    cutoff: Option<DrainCutoff>,
+    active_persistence_fences: usize,
+    active_storage_jobs: usize,
+    awaiting_responses: usize,
 }
 
 /// Cumulative ownership/admission and bounded drain call observations.
@@ -114,6 +159,20 @@ impl Drop for DrainAttempt<'_> {
     }
 }
 impl DrainStatus {
+    pub fn awaiting_responses(&self) -> usize {
+        self.awaiting_responses
+    }
+    pub fn cutoff(&self) -> Option<DrainCutoff> {
+        self.cutoff
+    }
+    /// Local drain fences still owned through their actual actor/store outcome.
+    pub fn active_persistence_fences(&self) -> usize {
+        self.active_persistence_fences
+    }
+    /// Active synchronous storage calls, including callers whose waiter left.
+    pub fn active_storage_jobs(&self) -> usize {
+        self.active_storage_jobs
+    }
     pub fn phase(&self) -> DrainPhase {
         self.phase
     }
@@ -136,6 +195,8 @@ impl DrainStatus {
 pub struct DrainOptions {
     #[builder(default = Duration::from_secs(30))]
     timeout: Duration,
+    #[builder(default)]
+    durability: DrainDurability,
 }
 impl Default for DrainOptions {
     fn default() -> Self {
@@ -143,6 +204,13 @@ impl Default for DrainOptions {
     }
 }
 impl DrainOptions {
+    pub fn with_durability(mut self, durability: DrainDurability) -> Self {
+        self.durability = durability;
+        self
+    }
+    pub fn durability(&self) -> DrainDurability {
+        self.durability
+    }
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
         self
@@ -161,11 +229,21 @@ impl DrainOptions {
 }
 
 /// Evidence of the completed local boundary; contains no peer ACK guarantee.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DrainReport {
     status: DrainStatus,
+    requested_durability: DrainDurability,
+    local_fences: Vec<FragmentDrainFence>,
 }
 impl DrainReport {
+    pub fn requested_durability(&self) -> DrainDurability {
+        self.requested_durability
+    }
+    /// Actual per-fragment local persistence evidence. An execution-only drain
+    /// has no persistence evidence; local shutdown alone never proves peer ACKs.
+    pub fn local_fences(&self) -> &[FragmentDrainFence] {
+        &self.local_fences
+    }
     pub fn status(&self) -> DrainStatus {
         self.status
     }
@@ -184,8 +262,17 @@ impl DrainReport {
 #[non_exhaustive]
 pub enum DrainError {
     InvalidOptions(String),
-    Timeout { status: DrainStatus },
+    Timeout {
+        status: DrainStatus,
+    },
     Local(NodeError),
+    /// A persistence outcome failed. Admission stays closed and retry resumes
+    /// the same selected durability rather than weakening its requirements.
+    Persistence {
+        fragment: FragmentId,
+        message: String,
+    },
+    IncompatibleRetry(String),
 }
 impl std::fmt::Display for DrainError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -199,6 +286,13 @@ impl std::fmt::Display for DrainError {
                 status.active_replication_applies()
             ),
             Self::Local(error) => write!(f, "local shutdown failed: {error}"),
+            Self::Persistence { fragment, message } => {
+                write!(
+                    f,
+                    "drain persistence fence for fragment {fragment} failed: {message}"
+                )
+            }
+            Self::IncompatibleRetry(message) => f.write_str(message),
         }
     }
 }
@@ -215,6 +309,18 @@ impl Node {
     /// Application sessions retain this slot through response send or failure.
     pub(crate) fn admit_client_request(&self) -> Result<OperationPermit, NodeError> {
         self.admit_operation()
+    }
+    pub(crate) fn admit_client_request_for_table(
+        &self,
+        table: &str,
+    ) -> Result<OperationPermit, NodeError> {
+        if !self.table_metrics.enabled() {
+            return self.admit_client_request();
+        }
+        match TableId::new(table) {
+            Ok(table) => self.admit_table_operation(table.name()),
+            Err(_) => self.admit_client_request(),
+        }
     }
     /// Observe cumulative slot outcomes and elapsed bounded drain attempts.
     pub fn drain_diagnostics(&self) -> DrainDiagnostics {
@@ -256,20 +362,32 @@ impl Node {
             active_replication_applies: self.receive_apply_gate.active.load(Ordering::SeqCst),
             receive_apply_complete: self.receive_apply_gate.phase.load(Ordering::SeqCst)
                 == NODE_STOPPED,
+            cutoff: (phase != DrainPhase::Running).then_some(DrainCutoff {
+                node_boot_id: self.boot_id,
+            }),
+            active_persistence_fences: self.local_drain.active(),
+            active_storage_jobs: self.storage_executor.active(),
+            awaiting_responses: self
+                .operation_gate
+                .awaiting_responses
+                .load(Ordering::SeqCst),
         }
     }
 
     /// Close admission and wait for request completion, including cancelled
     /// waiters' actor work. Leaves peer transport/fragment actors alive; incoming
-    /// replication and maintenance may still change data. This establishes no
-    /// persistence or remote replication fence. Timeout/cancellation preserves
-    /// owned work and can be retried. Call `finish_shutdown` for the full barrier.
+    /// replication and maintenance may still change data. By default this also
+    /// waits for a configured local persistence fence on every hosted fragment;
+    /// choose `StableCommitted` to require explicit stable storage, or `Applied`
+    /// for execution only. This does not certify peer replication. Timeout or
+    /// cancellation retains exact in-progress fence ownership for retry.
     pub async fn drain_requests(&self, options: DrainOptions) -> Result<DrainReport, DrainError> {
         let deadline = options.deadline()?;
         let mut attempt = DrainAttempt::new(&self.operation_gate);
         self.begin_drain();
         let draining = async {
             let _coordinator = self.shutdown_state.lock().await;
+            self.local_drain.select(options.durability)?;
             self.placement_tasks.shutdown().await;
             self.operation_gate.wait_for_drain().await;
             // Query page ownership survives coordinator cancellation. Keep a
@@ -279,21 +397,25 @@ impl Node {
             }
             self.mutation_service.shutdown().await;
             self.embedded_operations.shutdown().await;
+            let local_fences = self.local_drain.complete(self, options.durability).await?;
             let _ = self.operation_gate.phase.compare_exchange(
                 NODE_QUIESCING,
                 NODE_DRAINED,
                 Ordering::SeqCst,
                 Ordering::SeqCst,
             );
-            DrainReport {
+            Ok(DrainReport {
                 status: self.drain_status(),
-            }
+                requested_durability: options.durability,
+                local_fences,
+            })
         };
-        let result = tokio::time::timeout_at(deadline, draining)
-            .await
-            .map_err(|_| DrainError::Timeout {
+        let result = match tokio::time::timeout_at(deadline, draining).await {
+            Ok(result) => result,
+            Err(_) => Err(DrainError::Timeout {
                 status: self.drain_status(),
-            });
+            }),
+        };
         attempt.report(&result);
         result
     }
@@ -311,14 +433,19 @@ impl Node {
         let deadline = options.deadline()?;
         let mut attempt = DrainAttempt::new(&self.operation_gate);
         self.begin_drain();
-        let result = match tokio::time::timeout_at(deadline, self.shutdown()).await {
+        let stopping = async {
+            let report = self.drain_requests(options.clone()).await?;
+            self.shutdown().await.map_err(DrainError::Local)?;
+            Ok(DrainReport {
+                status: self.drain_status(),
+                ..report
+            })
+        };
+        let result = match tokio::time::timeout_at(deadline, stopping).await {
             Err(_) => Err(DrainError::Timeout {
                 status: self.drain_status(),
             }),
-            Ok(Err(error)) => Err(DrainError::Local(error)),
-            Ok(Ok(())) => Ok(DrainReport {
-                status: self.drain_status(),
-            }),
+            Ok(result) => result,
         };
         attempt.report(&result);
         result
@@ -336,6 +463,9 @@ mod tests {
         released: (StdMutex<bool>, Condvar),
         writes: StdMutex<Vec<(Vec<u8>, VersionedValue)>>,
         detached: Arc<AtomicBool>,
+        calls: AtomicUsize,
+        fail: AtomicBool,
+        stable: bool,
     }
     impl BlockingStore {
         fn release(&self) {
@@ -354,13 +484,31 @@ mod tests {
             Ok(Vec::new())
         }
         fn write_batch(&self, writes: &[(Vec<u8>, VersionedValue)]) -> Result<(), StoreError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
             self.entered.notify_one();
             let mut released = self.released.0.lock().unwrap();
             while !*released {
                 released = self.released.1.wait(released).unwrap();
             }
+            if self.fail.load(Ordering::SeqCst) {
+                return Err(StoreError("controlled persistence failure".into()));
+            }
             self.writes.lock().unwrap().extend_from_slice(writes);
             Ok(())
+        }
+        fn commit_durability(&self) -> crate::store::StoreCommitDurability {
+            if self.stable {
+                crate::store::StoreCommitDurability::Stable
+            } else {
+                crate::store::StoreCommitDurability::Buffered
+            }
+        }
+        fn stable_fence(&self) -> Result<crate::store::StoreCommitDurability, StoreError> {
+            if self.fail.load(Ordering::SeqCst) {
+                Err(StoreError("controlled stable fence failure".into()))
+            } else {
+                Ok(self.commit_durability())
+            }
         }
     }
     struct ReleaseStore(Arc<BlockingStore>);
@@ -396,7 +544,9 @@ mod tests {
             let (message, retention) = message.into_retained_parts();
             if matches!(
                 &message,
-                KvMessage::ApplyOp { .. } | KvMessage::QueryPage { .. }
+                KvMessage::ApplyOp { .. }
+                    | KvMessage::QueryPage { .. }
+                    | KvMessage::GetBatchRetained(_)
             ) {
                 state.entered.notify_one();
                 state.release.acquire().await.unwrap().forget();
@@ -589,6 +739,7 @@ mod tests {
                     last_ack_durability: None,
                     ack_durability_mismatch: false,
                     reconcile_rounds: 0,
+                    progress: Default::default(),
                 })))
                 .build(),
             SenderRuntimeOptions::default(),
@@ -701,6 +852,9 @@ mod tests {
             released: (StdMutex::new(false), Condvar::new()),
             writes: StdMutex::new(Vec::new()),
             detached: Arc::new(AtomicBool::new(false)),
+            calls: AtomicUsize::new(0),
+            fail: AtomicBool::new(false),
+            stable: false,
         });
         let _release = ReleaseStore(store.clone());
         let node = Arc::new(
@@ -719,13 +873,10 @@ mod tests {
             .unwrap(),
         );
         node.put("held".into(), vec![7]).await.unwrap();
-        let report = node.drain_requests(DrainOptions::default()).await.unwrap();
-        assert_eq!(report.status().phase(), DrainPhase::Drained);
-        assert!(!report.receive_apply_complete());
         let stopping = node.clone();
         let shutdown = tokio::spawn(async move {
             stopping
-                .finish_shutdown(DrainOptions::default().with_timeout(Duration::from_millis(100)))
+                .drain_requests(DrainOptions::default().with_timeout(Duration::from_millis(100)))
                 .await
         });
         tokio::time::timeout(Duration::from_secs(2), store.entered.notified())
@@ -735,6 +886,21 @@ mod tests {
             shutdown.await.unwrap(),
             Err(DrainError::Timeout { .. })
         ));
+        let status = node.drain_status();
+        assert_eq!(status.phase(), DrainPhase::Draining);
+        assert_eq!(status.active_persistence_fences(), 1);
+        assert_eq!(status.active_storage_jobs(), 1);
+        assert!(status.cutoff().is_some());
+        assert!(matches!(
+            node.finish_shutdown(DrainOptions::default().with_timeout(Duration::from_millis(20)))
+                .await,
+            Err(DrainError::Timeout { .. })
+        ));
+        assert_eq!(
+            store.calls.load(Ordering::SeqCst),
+            1,
+            "retry must wait the same owned fence"
+        );
         assert!(!store.detached.load(Ordering::SeqCst));
         assert_ne!(node.drain_status().phase(), DrainPhase::Stopped);
         assert!(matches!(
@@ -745,6 +911,15 @@ mod tests {
         let report = node.finish_shutdown(DrainOptions::default()).await.unwrap();
         assert!(report.shutdown_completed());
         assert!(report.receive_apply_complete());
+        assert_eq!(
+            report.local_fences()[0].durability,
+            LocalDurability::StoreCommitted
+        );
+        assert_eq!(report.status().active_storage_jobs(), 0);
+        assert_eq!(
+            node.finish_shutdown(DrainOptions::default()).await.unwrap(),
+            report
+        );
         assert!(store.detached.load(Ordering::SeqCst));
         assert!(store
             .writes
@@ -752,6 +927,404 @@ mod tests {
             .unwrap()
             .iter()
             .any(|(_, value)| value.value == vec![7]));
+    }
+
+    fn controlled_store(stable: bool) -> Arc<BlockingStore> {
+        Arc::new(BlockingStore {
+            entered: Notify::new(),
+            released: (StdMutex::new(false), Condvar::new()),
+            writes: StdMutex::new(Vec::new()),
+            detached: Arc::new(AtomicBool::new(false)),
+            calls: AtomicUsize::new(0),
+            fail: AtomicBool::new(false),
+            stable,
+        })
+    }
+
+    #[tokio::test]
+    async fn accepted_write_blocked_in_persistence_survives_waiter_loss_and_metrics_match() {
+        let store = controlled_store(true);
+        let _release = ReleaseStore(store.clone());
+        let node = Arc::new(
+            Node::start(
+                "durable-owned".into(),
+                "127.0.0.1:0".parse().unwrap(),
+                NodeConfig {
+                    store: Some(store.clone()),
+                    flush_batch_size: 1,
+                    flush_interval: Duration::from_secs(3600),
+                    snapshot_interval: Duration::from_secs(3600),
+                    ..NodeConfig::default()
+                },
+            )
+            .await
+            .unwrap(),
+        );
+        node.enable_table_metrics(&TableId::new("USERS").unwrap())
+            .unwrap();
+        let baseline_completed = node.storage_diagnostics().completed_jobs;
+        let writing = node.clone();
+        let writer = tokio::spawn(async move {
+            writing
+                .table("USERS")
+                .unwrap()
+                .put("private-key", vec![9])
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), store.entered.notified())
+            .await
+            .unwrap();
+        assert!(!writer.is_finished());
+        let cutoff = node.begin_drain().cutoff();
+        writer.abort();
+        let _ = writer.await;
+        assert!(node.drain_status().active_requests() > 0);
+        let options = DrainOptions::default().with_durability(DrainDurability::StableCommitted);
+        assert!(matches!(
+            node.drain_requests(options.clone().with_timeout(Duration::from_millis(20)))
+                .await,
+            Err(DrainError::Timeout { .. })
+        ));
+        let metrics = node.metrics_snapshot();
+        assert_eq!(metrics.status.lifecycle.cutoff(), cutoff);
+        assert!(metrics.status.lifecycle.active_requests() > 0);
+        assert_eq!(metrics.status.tables[0].active, 1);
+        assert_eq!(metrics.status.storage.active_jobs, 1);
+        assert_eq!(
+            metrics.status.storage.completed_jobs, baseline_completed,
+            "write is still blocked"
+        );
+        assert!(!store.detached.load(Ordering::SeqCst));
+        store.release();
+        let report = node.drain_requests(options.clone()).await.unwrap();
+        assert_eq!(report.status().active_requests(), 0);
+        assert_eq!(
+            report.local_fences()[0].durability,
+            LocalDurability::StableCommitted
+        );
+        assert_eq!(node.status_snapshot().tables[0].active, 0);
+        assert!(store
+            .writes
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(_, value)| value.value == vec![9]));
+        node.finish_shutdown(options).await.unwrap();
+        assert!(store.detached.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn failed_store_drain_retries_without_weakening_or_replaying_application_write() {
+        let store = controlled_store(true);
+        store.release();
+        store.fail.store(true, Ordering::SeqCst);
+        let node = Node::start(
+            "drain-failure".into(),
+            "127.0.0.1:0".parse().unwrap(),
+            NodeConfig {
+                store: Some(store.clone()),
+                flush_batch_size: 10_000,
+                flush_interval: Duration::from_secs(3600),
+                snapshot_interval: Duration::from_secs(3600),
+                ..NodeConfig::default()
+            },
+        )
+        .await
+        .unwrap();
+        node.table("named")
+            .unwrap()
+            .put("key", vec![6])
+            .await
+            .unwrap();
+        let options = DrainOptions::default().with_durability(DrainDurability::StableCommitted);
+        assert!(matches!(
+            node.drain_requests(options.clone()).await,
+            Err(DrainError::Persistence { .. })
+        ));
+        assert!(node.status_snapshot().local_persistence_failure.is_some());
+        assert!(matches!(
+            node.drain_requests(DrainOptions::default().with_durability(DrainDurability::Applied))
+                .await,
+            Err(DrainError::IncompatibleRetry(_))
+        ));
+        assert!(!store.detached.load(Ordering::SeqCst));
+        store.fail.store(false, Ordering::SeqCst);
+        let report = node.drain_requests(options.clone()).await.unwrap();
+        assert_eq!(
+            report.local_fences()[0].durability,
+            LocalDurability::StableCommitted
+        );
+        assert_eq!(store.writes.lock().unwrap().len(), 1);
+        assert!(node.status_snapshot().local_persistence_failure.is_none());
+        node.finish_shutdown(options).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stable_drain_without_store_reports_memory_not_fabricated_commit() {
+        let node = Node::start(
+            "memory-boundary".into(),
+            "127.0.0.1:0".parse().unwrap(),
+            NodeConfig::default(),
+        )
+        .await
+        .unwrap();
+        node.table("named")
+            .unwrap()
+            .put("key", vec![1])
+            .await
+            .unwrap();
+        assert!(
+            matches!(node.drain_requests(DrainOptions::default().with_durability(DrainDurability::StableCommitted)).await,
+            Err(DrainError::Persistence { message, .. }) if message.contains("MemoryApplied"))
+        );
+        node.shutdown().await.unwrap();
+        node.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn queued_writes_and_reads_keep_real_actor_ownership_after_all_waiters_leave() {
+        let (node, gate, actor) = gated_node().await;
+        let _release = ReleaseApply(gate.clone());
+        let writing = node.clone();
+        let first = tokio::spawn(async move { writing.put("first".into(), vec![1]).await });
+        tokio::time::timeout(Duration::from_secs(2), gate.entered.notified())
+            .await
+            .unwrap();
+        let mut queued = Vec::new();
+        for index in 0..3 {
+            let writing = node.clone();
+            queued.push(tokio::spawn(async move {
+                writing.put(format!("queued-{index}"), vec![2]).await
+            }));
+        }
+        let reading = node.clone();
+        let read = tokio::spawn(async move { reading.get("first".into()).await });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while node
+                .embedded_operation_diagnostics()
+                .active_mutation_completions()
+                < 4
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        node.begin_drain();
+        first.abort();
+        read.abort();
+        let _ = first.await;
+        let _ = read.await;
+        for task in queued {
+            task.abort();
+            let _ = task.await;
+        }
+        assert!(node.drain_status().active_requests() >= 4);
+        assert!(matches!(
+            node.drain_requests(DrainOptions::default().with_timeout(Duration::from_millis(20)))
+                .await,
+            Err(DrainError::Timeout { .. })
+        ));
+        gate.release.add_permits(256);
+        node.drain_requests(DrainOptions::default()).await.unwrap();
+        let rows = node.router.get_all().await.unwrap();
+        assert_eq!(rows.len(), 4);
+        assert_eq!(node.drain_status().active_requests(), 0);
+        node.finish_shutdown(DrainOptions::default()).await.unwrap();
+        actor.stop(None);
+        actor.wait(None).await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn real_sdk_admission_race_accounts_every_applied_write_and_repeated_shutdown() {
+        let node = Arc::new(
+            Node::start(
+                "admission-race".into(),
+                "127.0.0.1:0".parse().unwrap(),
+                NodeConfig::default(),
+            )
+            .await
+            .unwrap(),
+        );
+        node.put("before".into(), vec![1]).await.unwrap();
+        let barrier = Arc::new(tokio::sync::Barrier::new(65));
+        let mut writes = Vec::new();
+        for index in 0..64 {
+            let writing = node.clone();
+            let starting = barrier.clone();
+            writes.push(tokio::spawn(async move {
+                starting.wait().await;
+                writing.put(format!("racing-{index}"), vec![2]).await
+            }));
+        }
+        barrier.wait().await;
+        let cutoff = node.begin_drain().cutoff();
+        let mut applied = 1;
+        for write in writes {
+            match write.await.unwrap() {
+                Ok(()) => applied += 1,
+                Err(NodeError::ShuttingDown | NodeError::Backpressure(_)) => {}
+                other => panic!("unexpected raced result: {other:?}"),
+            }
+        }
+        let (a, b) = tokio::join!(
+            node.drain_requests(DrainOptions::default()),
+            node.drain_requests(DrainOptions::default())
+        );
+        assert_eq!(a.unwrap().status().cutoff(), cutoff);
+        assert_eq!(b.unwrap().status().cutoff(), cutoff);
+        assert_eq!(node.router.get_all().await.unwrap().len(), applied);
+        let counters = node.drain_diagnostics();
+        assert_eq!(counters.accepted_requests(), counters.completed_requests());
+        assert!(matches!(
+            node.put("after".into(), vec![3]).await,
+            Err(NodeError::ShuttingDown)
+        ));
+        let (a, b) = tokio::join!(
+            node.finish_shutdown(DrainOptions::default()),
+            node.finish_shutdown(DrainOptions::default())
+        );
+        assert!(a.unwrap().shutdown_completed());
+        assert!(b.unwrap().shutdown_completed());
+        node.shutdown().await.unwrap();
+        assert_eq!(node.drain_status().cutoff(), cutoff);
+    }
+
+    #[tokio::test]
+    async fn cancelled_sdk_read_is_still_counted_until_the_actor_really_finishes() {
+        let (node, gate, actor) = gated_node().await;
+        let _release = ReleaseApply(gate.clone());
+        let reading = node.clone();
+        let read = tokio::spawn(async move { reading.get("missing".into()).await });
+        tokio::time::timeout(Duration::from_secs(2), gate.entered.notified())
+            .await
+            .unwrap();
+        read.abort();
+        let _ = read.await;
+        assert!(node.drain_status().active_requests() > 0);
+        assert!(matches!(
+            node.drain_requests(DrainOptions::default().with_timeout(Duration::from_millis(20)))
+                .await,
+            Err(DrainError::Timeout { .. })
+        ));
+        gate.release.add_permits(1);
+        node.drain_requests(DrainOptions::default()).await.unwrap();
+        assert_eq!(node.drain_status().active_requests(), 0);
+        node.finish_shutdown(DrainOptions::default()).await.unwrap();
+        actor.stop(None);
+        actor.wait(None).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn accepted_forwarded_response_stays_owned_while_the_real_socket_is_blocked() {
+        use super::super::test_support::{complete_test_handshake, write_test_envelope};
+        let node = Arc::new(
+            Node::start(
+                "response-owner".into(),
+                "127.0.0.1:0".parse().unwrap(),
+                NodeConfig::default(),
+            )
+            .await
+            .unwrap(),
+        );
+        node.put("wide".into(), vec![4; 4096]).await.unwrap();
+        let (stream, mut peer) = tokio::io::duplex(256);
+        let context = node.connection_context();
+        assert!(
+            node.tasks
+                .spawn(async move {
+                    handle_connection(context, Box::pin(stream), false, None, None).await;
+                })
+                .await
+        );
+        complete_test_handshake(&mut peer, "caller").await;
+        write_test_envelope(
+            &mut peer,
+            Envelope {
+                msg: Some(EnvelopeMsg::ForwardedGet(ForwardedGet {
+                    key: Node::qualify_key("wide".into()),
+                    req_id: 42,
+                    ..Default::default()
+                })),
+            },
+        )
+        .await;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while node.drain_status().awaiting_responses() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(matches!(
+            node.drain_requests(DrainOptions::default().with_timeout(Duration::from_millis(20)))
+                .await,
+            Err(DrainError::Timeout { .. })
+        ));
+        assert!(
+            node.metrics_snapshot()
+                .status
+                .lifecycle
+                .awaiting_responses()
+                > 0
+        );
+        drop(peer);
+        node.drain_requests(DrainOptions::default()).await.unwrap();
+        assert_eq!(node.drain_status().awaiting_responses(), 0);
+        node.finish_shutdown(DrainOptions::default()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn post_cutoff_forwarded_read_cannot_register_a_relay_on_a_routing_node() {
+        use super::super::test_support::{complete_test_handshake, write_test_envelope};
+        let node = Arc::new(
+            Node::start(
+                "relay".into(),
+                "127.0.0.1:0".parse().unwrap(),
+                NodeConfig::builder()
+                    .fragment_map(HashMap::from([(FragmentId(0), vec!["owner".into()])]))
+                    .build(),
+            )
+            .await
+            .unwrap(),
+        );
+        let (owner, mut owner_data, _owner_responses) = super::super::tests::test_peer_channel(8);
+        node.peers.lock().await.insert("owner".into(), owner);
+        let (stream, mut peer) = tokio::io::duplex(4096);
+        let context = node.connection_context();
+        assert!(
+            node.tasks
+                .spawn(async move {
+                    handle_connection(context, Box::pin(stream), false, None, None).await;
+                })
+                .await
+        );
+        complete_test_handshake(&mut peer, "caller").await;
+        node.begin_drain();
+        let rejected = node.drain_diagnostics().rejected_requests();
+        write_test_envelope(
+            &mut peer,
+            Envelope {
+                msg: Some(EnvelopeMsg::ForwardedGet(ForwardedGet {
+                    key: Node::qualify_key("key".into()),
+                    req_id: 17,
+                    ..Default::default()
+                })),
+            },
+        )
+        .await;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while node.drain_diagnostics().rejected_requests() == rejected {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(node.pending_relays.lock().unwrap().is_empty());
+        assert!(owner_data.try_recv().is_err());
+        node.drain_requests(DrainOptions::default()).await.unwrap();
+        drop(peer);
+        node.finish_shutdown(DrainOptions::default()).await.unwrap();
     }
 
     #[tokio::test]

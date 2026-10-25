@@ -30,7 +30,7 @@ use super::{
 /// live [`StoreBinding`], and physical keys must begin with their four-byte
 /// fragment id followed by the UTF-8 logical key.
 pub struct RocksDbStore {
-    db: rocksdb_engine::DBWithThreadMode<rocksdb_engine::MultiThreaded>,
+    db: Arc<rocksdb_engine::DBWithThreadMode<rocksdb_engine::MultiThreaded>>,
     options: RocksDbOptions,
     manifest_lock: std::sync::Mutex<()>,
     attached: Arc<std::sync::atomic::AtomicBool>,
@@ -45,6 +45,8 @@ const ROCKSDB_MANIFEST_MAGIC: &[u8; 8] = b"ACTORDB\0";
 const ROCKSDB_MANIFEST_VERSION: u32 = 1;
 const ROCKSDB_DATA_FORMAT_VERSION: u32 = 2;
 const ROCKSDB_PARTITIONER_VERSION: u32 = 1;
+
+mod checkpoint;
 
 impl RocksDbStore {
     /// Open (creating if missing) the RocksDB at `path`.
@@ -171,7 +173,7 @@ impl RocksDbStore {
         let mut sync_write_options = rocksdb_engine::WriteOptions::default();
         sync_write_options.set_sync(true);
         Ok(Self {
-            db,
+            db: Arc::new(db),
             options,
             manifest_lock: std::sync::Mutex::new(()),
             attached: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -323,7 +325,13 @@ impl RocksDbStore {
                 .iterator_cf(&metadata, rocksdb_engine::IteratorMode::Start)
             {
                 let (key, _) = item.map_err(|error| StoreError(error.to_string()))?;
-                if key.as_ref() != ROCKSDB_MANIFEST_KEY {
+                if key.as_ref() == checkpoint::IMPORT_KEY {
+                    return Err(StoreError("checkpoint import is incomplete; resume the exact import before Node startup".into()));
+                }
+                if key.as_ref() != ROCKSDB_MANIFEST_KEY
+                    && key.as_ref() != checkpoint::GENERATION_KEY
+                    && !key.starts_with(checkpoint::PROVENANCE_PREFIX)
+                {
                     return Err(StoreError(format!(
                         "RocksDB metadata column family contains an unsupported key ({} bytes)",
                         key.len()
@@ -582,6 +590,9 @@ impl RocksDbStore {
 }
 
 impl KvStore for RocksDbStore {
+    fn checkpoint_backend(&self) -> Option<&dyn crate::checkpoint::CheckpointBackend> {
+        Some(self)
+    }
     fn bind(&self, identity: &StoreIdentity) -> Result<StoreBinding, StoreError> {
         use std::sync::atomic::Ordering;
 
@@ -667,6 +678,15 @@ impl KvStore for RocksDbStore {
         })?;
         let mut batch = rocksdb_engine::WriteBatch::default();
         batch.delete_range(prefix, &end);
+        let metadata = self.metadata_cf()?;
+        let revision = checkpoint::provenance_generation(&self.db)?
+            .checked_add(1)
+            .ok_or_else(|| StoreError("checkpoint provenance generation exhausted".into()))?;
+        batch.put_cf(
+            &metadata,
+            checkpoint::GENERATION_KEY,
+            revision.to_be_bytes(),
+        );
         // Namespace retirement is always synchronous even when ordinary data
         // batches use AsyncWal: placement must never publish deletion before
         // the range tombstone can survive an operating-system crash.

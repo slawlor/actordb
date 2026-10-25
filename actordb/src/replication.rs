@@ -83,6 +83,8 @@ type QueueFailureHandler = Arc<dyn Fn(mpsc::Sender<Vec<u8>>) + Send + Sync>;
 /// Node's internal ingress capacity or transport-failure callback.
 #[derive(Clone, bon::Builder)]
 pub struct SenderRuntimeOptions {
+    #[builder(skip = Arc::new(std::sync::atomic::AtomicBool::new(false)))]
+    observation_timing: Arc<std::sync::atomic::AtomicBool>,
     #[builder(default = Duration::from_secs(30))]
     ack_timeout: Duration,
     #[builder(default = Duration::from_secs(30))]
@@ -224,6 +226,18 @@ impl std::fmt::Display for SenderOptionsError {
 impl std::error::Error for SenderOptionsError {}
 
 impl SenderRuntimeOptions {
+    pub(crate) fn with_observation_timing(
+        mut self,
+        timing: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Self {
+        self.observation_timing = timing;
+        self
+    }
+    /// Measure retained-operation queue ages for new Node sender submissions.
+    pub fn with_timing_enabled(self, enabled: bool) -> Self {
+        self.observation_timing.store(enabled, Ordering::Release);
+        self
+    }
     pub(crate) fn with_recovery(
         mut self,
         recovery: Option<Arc<crate::node::recovery::RecoveryContext>>,
@@ -450,7 +464,11 @@ impl SenderRetention {
     }
     fn owned(&self, op: crate::actor::ReplicatedOp) -> Option<RetainedOp> {
         let lease = self.reserve(retained_op_bytes(&op))?;
-        Some(RetainedOp { op, _lease: lease })
+        Some(RetainedOp {
+            op,
+            _lease: lease,
+            enqueued_at: None,
+        })
     }
     fn borrowed(&self, op: &crate::actor::ReplicatedOp) -> Option<RetainedOp> {
         // Reserve before fanout clones a payload for this replica.
@@ -458,6 +476,7 @@ impl SenderRetention {
         Some(RetainedOp {
             op: op.clone(),
             _lease: lease,
+            enqueued_at: None,
         })
     }
 }
@@ -482,6 +501,7 @@ fn retained_borrowed_op_bytes(op: &crate::actor::ReplicatedOp) -> usize {
 struct RetainedOp {
     op: crate::actor::ReplicatedOp,
     _lease: RetentionLease,
+    enqueued_at: Option<std::time::Instant>,
 }
 impl std::ops::Deref for RetainedOp {
     type Target = crate::actor::ReplicatedOp;
@@ -704,6 +724,7 @@ pub fn spawn_bounded_sender(
 /// lifecycle/recovery signals remain available even when either lane is full.
 #[derive(Clone)]
 pub(crate) struct NodeSender {
+    observation_timing: Arc<std::sync::atomic::AtomicBool>,
     data_tx: mpsc::Sender<RetainedOp>,
     control_tx: mpsc::Sender<RetainedControl>,
     signals_tx: watch::Sender<NodeSenderSignals>,
@@ -823,7 +844,7 @@ impl NodeSender {
         if *draining || self.is_closed() {
             return Err(NodeSenderSendError::Closed);
         }
-        let Some(op) = self.ingress.retention.borrowed(op) else {
+        let Some(mut op) = self.ingress.retention.borrowed(op) else {
             tracing::warn!(
                 retained_bytes = self.ingress.retention.local.used(),
                 aggregate_retained_bytes = self.ingress.retention.aggregate.used(),
@@ -832,6 +853,10 @@ impl NodeSender {
             self.schedule_reset();
             return Ok(());
         };
+        op.enqueued_at = self
+            .observation_timing
+            .load(Ordering::Acquire)
+            .then(std::time::Instant::now);
         self.ingress.pending_data.fetch_add(1, Ordering::AcqRel);
         let result = match self.data_tx.try_send(op) {
             Ok(()) => Ok(()),
@@ -1396,6 +1421,7 @@ fn disconnect_transport(
 /// A snapshot of a sender's state, for health checks and tests.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SenderStateReport {
+    pub progress: SenderProgress,
     /// "disconnected", "connected", or "buffer_reset".
     pub state: String,
     /// Current session id (0 if none).
@@ -1418,6 +1444,30 @@ pub struct SenderStateReport {
     /// Completed anti-entropy reconcile rounds. The Phase 8 placement
     /// driver polls this to detect bootstrap completion.
     pub reconcile_rounds: u64,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ReconciliationStage {
+    AwaitingSummary,
+    Fetching,
+    AwaitingDurability,
+    RetryBackoff,
+}
+/// Actual local sender observations. Fetch counts cover the current chunk,
+/// not a measured fraction of remote dataset convergence.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub struct SenderProgress {
+    pub incarnation: u64,
+    pub observed_at: Option<std::time::SystemTime>,
+    pub last_successful_ack_at: Option<std::time::SystemTime>,
+    pub last_successful_ack_durability: Option<ReplicationAckDurability>,
+    pub last_successful_reconcile_at: Option<std::time::SystemTime>,
+    pub reconciliation_stage: Option<ReconciliationStage>,
+    pub expected_fetch_keys: Option<usize>,
+    pub received_fetch_keys: Option<usize>,
+    pub timing_enabled: bool,
+    pub oldest_retained_operation_age: Option<Duration>,
 }
 
 /// Shared dependencies for a sender task.
@@ -1509,6 +1559,7 @@ pub(crate) fn spawn_node_sender(
     let (stopped_tx, stopped) = watch::channel(false);
     let (drain_completed_tx, drain_completed) = watch::channel(0u64);
     let configured_ack_durability = config.required_ack_durability;
+    let observation_timing = options.observation_timing.clone();
     let task_ingress = ingress.clone();
     let inbox = SenderInbox::Node {
         data_rx,
@@ -1537,6 +1588,7 @@ pub(crate) fn spawn_node_sender(
         .await;
     });
     Ok(NodeSender {
+        observation_timing,
         data_tx,
         control_tx,
         signals_tx,
@@ -1647,6 +1699,7 @@ async fn send_envelope(
         return false;
     }
     if let Some(outbound) = &peer.budgeted {
+        let charged_len = encoded_len + outbound.frame_overhead;
         let frame_permit =
             match tokio::time::timeout_at(admission_deadline, outbound.tx.reserve()).await {
                 Ok(Ok(permit)) => permit,
@@ -1660,7 +1713,7 @@ async fn send_envelope(
             outbound
                 .producer_byte_budget
                 .clone()
-                .acquire_many_owned(encoded_len as u32),
+                .acquire_many_owned(charged_len as u32),
         )
         .await
         {
@@ -1675,7 +1728,7 @@ async fn send_envelope(
             outbound
                 .byte_budget
                 .clone()
-                .acquire_many_owned(encoded_len as u32),
+                .acquire_many_owned(charged_len as u32),
         )
         .await
         {
@@ -1686,7 +1739,7 @@ async fn send_envelope(
             }
         };
         let global_permits = match outbound
-            .acquire_global_producer(encoded_len as u32, admission_deadline)
+            .acquire_global_producer(charged_len as u32, admission_deadline)
             .await
         {
             Ok(permits) => permits,
@@ -1774,6 +1827,10 @@ async fn sender_task(
     let mut reconcile_rounds: u64 = 0;
     let mut last_ack_durability = None;
     let mut ack_durability_mismatch = false;
+    let mut last_successful_ack_at = None;
+    let mut last_successful_ack_durability = None;
+    let mut last_successful_reconcile_at = None;
+    let observation_incarnation = crate::node::observability::fresh_incarnation();
     let mut retry_not_before: Option<Instant> = None;
     let mut session_retry: Option<Instant> = None;
     let mut reconcile_retry: Option<(Instant, ReconcilePurpose)> = None;
@@ -1860,6 +1917,63 @@ async fn sender_task(
                 DeliveryState::Streaming => "disconnected",
             };
             *deps.state_report.lock().await = SenderStateReport {
+                progress: {
+                    let timing_enabled = runtime.observation_timing.load(Ordering::Acquire);
+                    let first = connection
+                        .as_ref()
+                        .and_then(|connection| connection.in_flight.front())
+                        .and_then(|batch| batch.ops.first())
+                        .or_else(|| buffer.front());
+                    let pending_ingress = match &inbox {
+                        SenderInbox::Node { ingress, .. } => {
+                            ingress.pending_data.load(Ordering::Acquire) != 0
+                        }
+                        SenderInbox::Legacy(inbox) => !inbox.is_empty(),
+                    };
+                    let oldest_retained_operation_age = if !timing_enabled {
+                        None
+                    } else {
+                        match first {
+                            Some(op) => op.enqueued_at.map(|at| at.elapsed()),
+                            None if pending_ingress => None,
+                            None => Some(Duration::ZERO),
+                        }
+                    };
+                    let (reconciliation_stage, expected_fetch_keys, received_fetch_keys) =
+                        match active_reconcile.as_ref().map(|round| &round.phase) {
+                            Some(ReconcilePhase::Response(_)) => {
+                                (Some(ReconciliationStage::AwaitingSummary), None, None)
+                            }
+                            Some(ReconcilePhase::Data {
+                                expected_keys,
+                                received_keys,
+                                ..
+                            }) => (
+                                Some(ReconciliationStage::Fetching),
+                                Some(expected_keys.len()),
+                                Some(received_keys.len()),
+                            ),
+                            Some(ReconcilePhase::Barrier { .. }) => {
+                                (Some(ReconciliationStage::AwaitingDurability), None, None)
+                            }
+                            None if reconcile_retry.is_some() => {
+                                (Some(ReconciliationStage::RetryBackoff), None, None)
+                            }
+                            None => (None, None, None),
+                        };
+                    SenderProgress {
+                        incarnation: observation_incarnation,
+                        observed_at: Some(std::time::SystemTime::now()),
+                        last_successful_ack_at,
+                        last_successful_ack_durability,
+                        last_successful_reconcile_at,
+                        reconciliation_stage,
+                        expected_fetch_keys,
+                        received_fetch_keys,
+                        timing_enabled,
+                        oldest_retained_operation_age,
+                    }
+                },
                 state: state.to_string(),
                 session_id: connection.as_ref().map_or(0, |c| c.session_id),
                 buffered: buffer.len(),
@@ -2200,8 +2314,10 @@ async fn sender_task(
                                     );
                                 }
                                 InflightAckResult::Accepted { kind, ops } => {
+                                    last_successful_ack_at = Some(std::time::SystemTime::now());
+                                    last_successful_ack_durability = Some(durability);
                                     if let Some(tracker) = runtime.write_concerns.as_ref() {
-                                        for op in &ops { tracker.acknowledge(&peer_id, fragment, std::slice::from_ref(&op.op)); }
+                                        for op in &ops { tracker.acknowledge_at(&peer_id, fragment, std::slice::from_ref(&op.op), durability.into()); }
                                     }
                                     last_ack_durability = Some(durability);
                                     ack_durability_mismatch = false;
@@ -2234,6 +2350,7 @@ async fn sender_task(
                                     };
                                     if snapshot_is_current {
                                         reconcile_rounds = reconcile_rounds.saturating_add(1);
+                                        last_successful_reconcile_at = Some(std::time::SystemTime::now());
                                         if let ReconcilePurpose::Drain { generation, .. } =
                                             round.purpose
                                         {
@@ -2393,6 +2510,7 @@ async fn sender_task(
                                         {
                                             delivery = DeliveryState::Streaming;
                                             reconcile_rounds = reconcile_rounds.saturating_add(1);
+                                            last_successful_reconcile_at = Some(std::time::SystemTime::now());
                                             if let Some((ingress, generation)) =
                                                 active_ingress_overflow.take()
                                             {
@@ -2691,7 +2809,7 @@ async fn sender_task(
                                     round.round_id,
                                     &mut summary,
                                     &summaries,
-                                    done,
+                                    ReconcilePageInput { done, retention: apply_retention.clone() },
                                 )
                                 .await
                             }
@@ -3036,6 +3154,23 @@ async fn sender_task(
                 if matches!(delivery, DeliveryState::Reset { .. }) {
                     continue;
                 }
+                // Reset recovery may have discarded the original ingress
+                // history. Live concern tickets still own the exact submitted
+                // floor; retry it under its requested fence once streaming is
+                // available. A superseding receiver winner is a valid floor.
+                if connection.as_ref().is_some_and(|conn| conn.session_ready) && active_reconcile.is_none() {
+                    if let Some(tracker) = runtime.write_concerns.as_ref() {
+                        tracker.retry_operations(&peer_id, fragment, |operation| {
+                            if buffer.len() >= config.buffer_capacity { return; }
+                            let present = buffer.iter().any(|queued| queued.key == operation.key && queued.value == operation.value)
+                                || connection.as_ref().is_some_and(|conn| conn.in_flight.iter().flat_map(|batch| &batch.ops)
+                                    .any(|queued| queued.key == operation.key && queued.value == operation.value));
+                            if !present {
+                                if let Some(operation) = retention.borrowed(operation) { buffer.push_back(operation); }
+                            }
+                        });
+                    }
+                }
                 let (sid, tx, tracked_deadline) = match connection.as_ref() {
                     Some(conn)
                         if !buffer.is_empty()
@@ -3060,7 +3195,9 @@ async fn sender_task(
                     Some(conn) => allocate_batch_seq(conn),
                     None => continue,
                 };
-                let required_ack_level = config.required_ack_durability.proto_level() as i32;
+                let required_ack_durability = runtime.write_concerns.as_ref().map_or(config.required_ack_durability,
+                    |tracker| config.required_ack_durability.max(tracker.required_durability(&peer_id, fragment).into()));
+                let required_ack_level = required_ack_durability.proto_level() as i32;
                 let (ops, proto_ops) = match take_streaming_batch(
                     &mut buffer,
                     config.batch_size,
@@ -3100,7 +3237,7 @@ async fn sender_task(
                             kind: InflightKind::Streaming {
                                 ack_deadline: deadline_after(runtime.ack_timeout),
                             },
-                            required_ack_durability: config.required_ack_durability,
+                            required_ack_durability,
                         });
                     }
                 } else {
@@ -3624,6 +3761,7 @@ async fn ensure_local_summary(
     local: &mut ReconcileLocalCursor,
     deadline: Instant,
     result_budget: &Arc<ByteBudget>,
+    retention: Option<Arc<dyn Send + Sync>>,
 ) -> Result<(), ReconcileError> {
     while local.current.is_none() {
         if let Some(summary) = local.buffered.pop_front() {
@@ -3661,7 +3799,7 @@ async fn ensure_local_summary(
                         limit: RECONCILE_LOCAL_READ_CHUNK,
                         reply,
                     }
-                    .with_retention(result_retention)
+                    .with_retention(Arc::new((result_retention, retention.clone())))
                 },
                 Some(deadline.saturating_duration_since(Instant::now())),
             )
@@ -3717,6 +3855,7 @@ async fn send_repair_keys(
     keys: Vec<String>,
     snapshot_time_ms: u64,
     deadline: Instant,
+    retention: Option<Arc<dyn Send + Sync>>,
 ) -> Result<(), ReconcileError> {
     let actor = router
         .route_for_fragment(fragment)
@@ -3743,6 +3882,7 @@ async fn send_repair_keys(
     while next_key_index < keys.len() {
         let request_keys = keys.clone();
         let request_retention = result_retention.clone();
+        let authority_retention = retention.clone();
         let value_page = match actor
             .call(
                 move |reply| {
@@ -3752,7 +3892,7 @@ async fn send_repair_keys(
                         snapshot_time_ms: Some(snapshot_time_ms),
                         reply,
                     }
-                    .with_retention(request_retention)
+                    .with_retention(Arc::new((request_retention, authority_retention)))
                 },
                 Some(deadline.saturating_duration_since(Instant::now())),
             )
@@ -3922,6 +4062,11 @@ async fn send_fetch(
 /// Merge one bounded peer summary page with bounded local summary pages.
 /// Values are read only for local winners, one at a time, so neither side's
 /// complete key or value set is materialized by reconciliation.
+struct ReconcilePageInput {
+    done: bool,
+    retention: Option<Arc<dyn Send + Sync>>,
+}
+
 async fn reconcile_summary_page(
     fragment: FragmentId,
     router: &FragmentRouter,
@@ -3929,8 +4074,9 @@ async fn reconcile_summary_page(
     round_id: u64,
     summary: &mut ReconcileSummaryState,
     summaries: &[KeySummary],
-    done: bool,
+    page: ReconcilePageInput,
 ) -> Result<VecDeque<Vec<String>>, ReconcileError> {
+    let ReconcilePageInput { done, retention } = page;
     let deadline = deadline_after(connection.peer_tx.local_work_timeout);
     let mut fetch_keys = Vec::new();
     let mut repair_keys = Vec::new();
@@ -3943,6 +4089,7 @@ async fn reconcile_summary_page(
                 &mut summary.local,
                 deadline,
                 &connection.peer_tx.reconciliation_result_budget,
+                retention.clone(),
             )
             .await?;
             match summary.local.current.as_ref() {
@@ -3967,6 +4114,7 @@ async fn reconcile_summary_page(
                             std::mem::take(&mut repair_keys),
                             snapshot_time_ms,
                             deadline,
+                            retention.clone(),
                         )
                         .await?;
                         repair_key_bytes = 0;
@@ -3996,6 +4144,7 @@ async fn reconcile_summary_page(
                                 std::mem::take(&mut repair_keys),
                                 snapshot_time_ms,
                                 deadline,
+                                retention.clone(),
                             )
                             .await?;
                             repair_key_bytes = 0;
@@ -4029,6 +4178,7 @@ async fn reconcile_summary_page(
             std::mem::take(&mut repair_keys),
             snapshot_time_ms,
             deadline,
+            retention.clone(),
         )
         .await?;
         repair_key_bytes = 0;
@@ -4042,6 +4192,7 @@ async fn reconcile_summary_page(
                 &mut summary.local,
                 deadline,
                 &connection.peer_tx.reconciliation_result_budget,
+                retention.clone(),
             )
             .await?;
             let Some(local) = take_local_summary(&mut summary.local) else {
@@ -4066,6 +4217,7 @@ async fn reconcile_summary_page(
                     std::mem::take(&mut repair_keys),
                     snapshot_time_ms,
                     deadline,
+                    retention.clone(),
                 )
                 .await?;
                 repair_key_bytes = 0;
@@ -4084,6 +4236,7 @@ async fn reconcile_summary_page(
                 repair_keys,
                 snapshot_time_ms,
                 deadline,
+                retention.clone(),
             )
             .await?;
         }
@@ -4268,6 +4421,7 @@ mod tests {
             last_ack_durability: None,
             ack_durability_mismatch: false,
             reconcile_rounds: 0,
+            progress: Default::default(),
         }))
     }
 
@@ -4746,7 +4900,10 @@ mod tests {
                 1,
                 &mut summary,
                 &[remote],
-                true,
+                ReconcilePageInput {
+                    done: true,
+                    retention: None,
+                },
             )
             .await;
             if same_contents {
@@ -4849,6 +5006,7 @@ mod tests {
             let _ = finish_rx.await;
         });
         let sender = NodeSender {
+            observation_timing: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             data_tx,
             control_tx,
             signals_tx,
@@ -4967,6 +5125,7 @@ mod tests {
             let _ = finish_rx.await;
         });
         let sender = NodeSender {
+            observation_timing: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             data_tx,
             control_tx,
             signals_tx,
@@ -5505,6 +5664,7 @@ mod tests {
         let budget = Arc::new(tokio::sync::Semaphore::new(encoded_len * 2));
         let producer_budget = Arc::new(tokio::sync::Semaphore::new(encoded_len * 2));
         let outbound = BudgetedPeerTx {
+            frame_overhead: 0,
             node_byte_budget: crate::wire::NodePeerByteBudget::new(
                 crate::wire::NODE_PEER_QUEUE_BYTE_CAPACITY,
             ),
@@ -5533,7 +5693,8 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn replication_peers_share_aggregate_encoded_body_admission() {
-        let budget = crate::wire::NodePeerByteBudget::new(2 * MAX_FRAME_BYTES);
+        let physical_max = crate::wire::MAX_TRANSPORT_FRAME_BYTES;
+        let budget = crate::wire::NodePeerByteBudget::new(2 * physical_max);
         let msg = EnvelopeMsg::SessionStart(SessionStart {
             session_id: 7,
             fragment: 0,
@@ -5544,7 +5705,7 @@ mod tests {
         .encoded_len();
         let held = budget
             .acquire_producer(
-                (MAX_FRAME_BYTES - bytes) as u32,
+                (physical_max - bytes) as u32,
                 Instant::now() + Duration::from_secs(1),
             )
             .await
@@ -5554,6 +5715,7 @@ mod tests {
             let (response_tx, _response_rx) = mpsc::channel(4);
             let (identity, _identity_rx) = mpsc::channel(1);
             let outbound = BudgetedPeerTx {
+                frame_overhead: 0,
                 tx,
                 response_tx,
                 identity: identity.clone(),
@@ -5593,6 +5755,7 @@ mod tests {
         let (identity, _identity_rx) = mpsc::channel(1);
         let reconcile_gate = crate::wire::ReconcileGate::new();
         let outbound = BudgetedPeerTx {
+            frame_overhead: 0,
             node_byte_budget: crate::wire::NodePeerByteBudget::new(
                 crate::wire::NODE_PEER_QUEUE_BYTE_CAPACITY,
             ),

@@ -384,6 +384,13 @@ pub enum KvMessage {
     /// Internal admission lease retained through dispatcher/worker completion.
     #[doc(hidden)]
     Retained(RetainedActorMessage),
+    #[doc(hidden)]
+    ObservedWorker(super::observations::ObservedWorkerMessage),
+    #[doc(hidden)]
+    ObservePools {
+        request: super::observations::PoolObservationRequest,
+        reply: RpcReplyPort<super::observations::PoolObservationPage>,
+    },
     /// Apply a write — local or replicated. Merged with last-writer-wins,
     /// so applying the same op twice is harmless (idempotent).
     ///

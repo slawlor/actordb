@@ -1,7 +1,8 @@
 //! Backend-neutral pull metrics over existing bounded diagnostics.
 //!
-//! Counters and distribution summaries are cumulative for one node incarnation
-//! (see [`MetricsSnapshot::status`]'s `boot_id`). Gauges are current approximate
+//! Counters and distribution summaries are cumulative for the descriptor's
+//! source lifetime. Node scopes use `boot_id`; shared storage scopes use
+//! `status.storage.scope_id`. Gauges are current approximate
 //! observations. Collection does not install callbacks on the request path.
 //! Exporters should replace cumulative values, or compute deltas themselves;
 //! adding each observed counter value to a backend counter double counts it.
@@ -34,8 +35,21 @@ pub enum MetricUnit {
     Events,
     Frames,
     Milliseconds,
+    Nanoseconds,
     /// Zero or one.
     Boolean,
+}
+
+/// Counter reset identity is metadata rather than an unbounded metric label.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum MetricLifetime {
+    NodeIncarnation,
+    /// Shared PersistenceConfig resources may outlive/reappear on another node.
+    PersistenceResources,
+    PoolIncarnation,
+    WorkerIncarnation,
+    SenderIncarnation,
 }
 
 /// Stable metric name and meaning, independent of the recording backend.
@@ -46,6 +60,7 @@ pub struct MetricDescriptor {
     pub description: &'static str,
     pub kind: MetricKind,
     pub unit: MetricUnit,
+    pub lifetime: MetricLifetime,
 }
 
 /// Bounded operational scopes. Keys, values, request IDs, session IDs and
@@ -54,12 +69,27 @@ pub struct MetricDescriptor {
 #[non_exhaustive]
 pub enum MetricScope {
     Node,
+    /// A table name deliberately registered through `enable_table_metrics`.
+    Table {
+        table: String,
+    },
     Fragment {
         fragment: FragmentId,
     },
     FragmentPeer {
         fragment: FragmentId,
         peer_id: String,
+    },
+    Pool {
+        fragment: FragmentId,
+        table: Option<String>,
+        priority: crate::actor::OpPriority,
+    },
+    Worker {
+        fragment: FragmentId,
+        table: Option<String>,
+        priority: crate::actor::OpPriority,
+        slot: usize,
     },
 }
 
@@ -95,6 +125,9 @@ impl MetricValue {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct MetricPoint {
+    /// Counter reset metadata, not a metric label. Actor pools/workers can be
+    /// replaced while the same node boot_id remains alive.
+    pub source_incarnation: Option<u64>,
     pub descriptor: &'static MetricDescriptor,
     pub scope: MetricScope,
     pub value: MetricValue,
@@ -133,14 +166,297 @@ impl MetricsSnapshot {
 
 macro_rules! metric {
     ($constant:ident, $name:literal, $kind:ident, $unit:ident, $description:literal) => {
+        metric!(
+            $constant,
+            $name,
+            $kind,
+            $unit,
+            $description,
+            NodeIncarnation
+        );
+    };
+    ($constant:ident, $name:literal, $kind:ident, $unit:ident, $description:literal, $lifetime:ident) => {
         const $constant: MetricDescriptor = MetricDescriptor {
             name: $name,
             description: $description,
             kind: MetricKind::$kind,
             unit: MetricUnit::$unit,
+            lifetime: MetricLifetime::$lifetime,
         };
     };
 }
+metric!(
+    POOL_PENDING,
+    "actordb.pool.pending",
+    Gauge,
+    Operations,
+    "Pool admission slots active, queued or being reserved.",
+    PoolIncarnation
+);
+metric!(
+    POOL_ACTIVE,
+    "actordb.pool.active",
+    Gauge,
+    Operations,
+    "Worker futures executing, including backend waits.",
+    PoolIncarnation
+);
+metric!(
+    POOL_QUEUED,
+    "actordb.pool.queued",
+    Gauge,
+    Operations,
+    "Observed jobs queued for worker execution.",
+    PoolIncarnation
+);
+metric!(
+    POOL_ACCEPTED,
+    "actordb.pool.accepted",
+    Counter,
+    Operations,
+    "Accepted worker handoffs; includes subsequently abandoned jobs.",
+    PoolIncarnation
+);
+metric!(
+    POOL_COMPLETED,
+    "actordb.pool.completed",
+    Counter,
+    Operations,
+    "Worker jobs finished, including terminal errors, after actual worker future completion.",
+    PoolIncarnation
+);
+metric!(
+    POOL_ABANDONED,
+    "actordb.pool.abandoned",
+    Counter,
+    Operations,
+    "Queued or executing jobs abandoned on actor termination or failed handoff.",
+    PoolIncarnation
+);
+metric!(
+    POOL_SHED_QUEUE,
+    "actordb.pool.shed_queue",
+    Counter,
+    Events,
+    "Admissions rejected at the pool queue cap.",
+    PoolIncarnation
+);
+metric!(
+    POOL_SHED_RATE,
+    "actordb.pool.shed_rate",
+    Counter,
+    Events,
+    "Admissions rejected at the pool token bucket.",
+    PoolIncarnation
+);
+metric!(POOL_QUEUE_AGE, "actordb.pool.oldest_queue_age", Gauge, Nanoseconds, "Measured oldest queued job age; omitted if unmeasured, contended, or sampling capacity is exhausted.", PoolIncarnation);
+metric!(
+    POOL_QUEUE_DURATION,
+    "actordb.pool.queue_duration",
+    Distribution,
+    Nanoseconds,
+    "Observed queue wait count/sum/max for timed jobs, without quantiles.",
+    PoolIncarnation
+);
+metric!(
+    POOL_EXECUTION_DURATION,
+    "actordb.pool.execution_duration",
+    Distribution,
+    Nanoseconds,
+    "Actual worker future execution count/sum/max, including errors.",
+    PoolIncarnation
+);
+metric!(
+    WORKER_PENDING,
+    "actordb.worker.pending",
+    Gauge,
+    Operations,
+    "Exact worker slot admission ownership.",
+    WorkerIncarnation
+);
+metric!(
+    WORKER_ACTIVE,
+    "actordb.worker.active",
+    Gauge,
+    Operations,
+    "Actual active worker futures.",
+    WorkerIncarnation
+);
+metric!(
+    WORKER_QUEUED,
+    "actordb.worker.queued",
+    Gauge,
+    Operations,
+    "Observed queued worker jobs.",
+    WorkerIncarnation
+);
+metric!(
+    WORKER_COMPLETED,
+    "actordb.worker.completed",
+    Counter,
+    Operations,
+    "Finished worker futures including terminal errors.",
+    WorkerIncarnation
+);
+
+metric!(
+    REQUEST_TIMEOUTS,
+    "actordb.request.waiter_timeouts",
+    Counter,
+    Requests,
+    "Expired request waiters; actual execution can remain outstanding."
+);
+metric!(
+    INITIAL_READY,
+    "actordb.lifecycle.initial_readiness_established",
+    Gauge,
+    Boolean,
+    "Declared initial authority boundary established by publication events, never by collection."
+);
+metric!(
+    DESIRED_LOCAL,
+    "actordb.lifecycle.desired_local_fragments",
+    Gauge,
+    Operations,
+    "Local fragments in the last published desired map."
+);
+metric!(
+    SERVING_LOCAL,
+    "actordb.lifecycle.serving_fragments",
+    Gauge,
+    Operations,
+    "Published local serving authority count; not remote quorum or catch-up percentage."
+);
+metric!(AVAILABLE_LOCAL, "actordb.lifecycle.available_fragments", Gauge, Operations, "Running authoritative dispatcher count, omitted when observation limits prevent an exact count.");
+metric!(
+    SENDER_CONNECTED,
+    "actordb.replication.connected",
+    Gauge,
+    Boolean,
+    "Observed ready sender session; omitted when connection state is unknown or reset-only.",
+    SenderIncarnation
+);
+metric!(
+    SENDER_ACTIVE,
+    "actordb.replication.active",
+    Gauge,
+    Boolean,
+    "Observed queued, in-flight or reconciliation work; steady does not prove equality.",
+    SenderIncarnation
+);
+metric!(SENDER_QUEUE_AGE, "actordb.replication.oldest_retained_operation_age", Gauge, Nanoseconds, "Measured age of the earliest retained streaming operation; omitted for unmeasured history/ingress.", SenderIncarnation);
+metric!(
+    SENDER_ACK_AGE,
+    "actordb.replication.last_successful_ack_age",
+    Gauge,
+    Nanoseconds,
+    "Age since a correlated ACK actually met its batch fence; not LWW lag.",
+    SenderIncarnation
+);
+metric!(
+    SENDER_RECONCILE_AGE,
+    "actordb.replication.last_successful_reconcile_age",
+    Gauge,
+    Nanoseconds,
+    "Age since a verified reconciliation completed; not remote data lag.",
+    SenderIncarnation
+);
+metric!(
+    REQUEST_DURATION,
+    "actordb.request.owned_duration",
+    Distribution,
+    Nanoseconds,
+    "Time through final request ownership release; includes queue/execution and terminal errors."
+);
+metric!(
+    LOCAL_FENCES_ACTIVE,
+    "actordb.drain.active_persistence_fences",
+    Gauge,
+    Operations,
+    "Owned local persistence drain fences not yet terminal."
+);
+metric!(
+    LOCAL_FENCES_COMPLETED,
+    "actordb.drain.completed_persistence_fences",
+    Counter,
+    Operations,
+    "Successful local drain persistence fences; not peer evidence."
+);
+metric!(
+    STORAGE_QUEUED,
+    "actordb.storage.queued_jobs",
+    Gauge,
+    Operations,
+    "Backend jobs waiting for a bounded executor slot.",
+    PersistenceResources
+);
+metric!(
+    STORAGE_COMPLETED,
+    "actordb.storage.completed_jobs",
+    Counter,
+    Operations,
+    "Actual backend calls completed, including failures.",
+    PersistenceResources
+);
+metric!(
+    STORAGE_FAILED,
+    "actordb.storage.failed_jobs",
+    Counter,
+    Events,
+    "Actual failed backend calls, including panics.",
+    PersistenceResources
+);
+metric!(
+    STORAGE_QUEUE_WAIT,
+    "actordb.storage.queue_wait",
+    Distribution,
+    Nanoseconds,
+    "Monotonic executor queue wait for admitted backend calls.",
+    PersistenceResources
+);
+metric!(
+    STORAGE_EXECUTION,
+    "actordb.storage.execution_time",
+    Distribution,
+    Nanoseconds,
+    "Actual backend execution duration through return or panic.",
+    PersistenceResources
+);
+metric!(
+    TABLE_ACCEPTED,
+    "actordb.table.accepted_slots",
+    Counter,
+    Requests,
+    "Accepted ownership slots for a deliberately registered table."
+);
+metric!(
+    TABLE_COMPLETED,
+    "actordb.table.completed_slots",
+    Counter,
+    Requests,
+    "Registered table ownership released through terminal execution/response."
+);
+metric!(
+    TABLE_REJECTED,
+    "actordb.table.rejected_slots",
+    Counter,
+    Requests,
+    "Registered table lifecycle admission rejections."
+);
+metric!(
+    TABLE_ACTIVE,
+    "actordb.table.active_slots",
+    Gauge,
+    Requests,
+    "Registered table slots still owning request or response work."
+);
+metric!(
+    TABLE_DURATION,
+    "actordb.table.owned_duration",
+    Distribution,
+    Nanoseconds,
+    "Registered table slot duration through final ownership release."
+);
 
 metric!(
     ADMISSION_OPEN,
@@ -503,6 +819,161 @@ metric!(
     "Cumulative monotonic callback queue residence summary."
 );
 
+metric!(
+    QUEUED_EMBEDDED,
+    "actordb.request.queued_embedded_mutations",
+    Gauge,
+    Requests,
+    "Mutations queued in the embedded completion manager."
+);
+metric!(
+    QUEUED_FORWARDED_WRITES,
+    "actordb.request.queued_forwarded_mutations",
+    Gauge,
+    Requests,
+    "Forwarded writes queued before completion-worker execution."
+);
+metric!(
+    FORWARDED_APPLY_SLOTS,
+    "actordb.request.forwarded_apply_slots",
+    Gauge,
+    Requests,
+    "Forwarded apply admission use; concern waiters are separate."
+);
+metric!(
+    QUEUED_FORWARDED_READS,
+    "actordb.request.queued_forwarded_reads",
+    Gauge,
+    Requests,
+    "Forwarded reads queued before actor handoff."
+);
+metric!(
+    FORWARDED_READ_SLOTS,
+    "actordb.request.forwarded_read_slots",
+    Gauge,
+    Requests,
+    "Forwarded read slots retained through actual actor/response ownership."
+);
+metric!(
+    AWAITING_RESPONSES,
+    "actordb.request.awaiting_responses",
+    Gauge,
+    Requests,
+    "Accepted request response slots held through socket write or terminal drop."
+);
+metric!(
+    CONCERN_ACCEPTED,
+    "actordb.write_concern.accepted",
+    Counter,
+    Requests,
+    "Accepted captured write-concern tickets."
+);
+metric!(
+    CONCERN_SATISFIED,
+    "actordb.write_concern.satisfied",
+    Counter,
+    Requests,
+    "Tickets satisfied by validated acknowledgement/durability evidence."
+);
+metric!(
+    CONCERN_TIMEOUTS,
+    "actordb.write_concern.timed_out",
+    Counter,
+    Requests,
+    "Concern deadlines expired with explicit partial progress."
+);
+metric!(
+    CONCERN_DURABILITY_FAILURES,
+    "actordb.write_concern.durability_failed",
+    Counter,
+    Events,
+    "Required local durability was not achieved."
+);
+metric!(
+    CONCERN_OPERATION_FAILURES,
+    "actordb.write_concern.operation_failed",
+    Counter,
+    Events,
+    "Operation failed/superseded before concern success."
+);
+metric!(
+    CONCERN_UNKNOWN,
+    "actordb.write_concern.unknown_outcomes",
+    Counter,
+    Events,
+    "Lost or uncertain operation/fence outcomes."
+);
+metric!(
+    CONCERN_REJECTED,
+    "actordb.write_concern.rejected",
+    Counter,
+    Requests,
+    "Rejected write-concern policies or waiter admission."
+);
+metric!(
+    CONCERN_CANCELLED,
+    "actordb.write_concern.cancelled",
+    Counter,
+    Requests,
+    "Concern waiter cancellations, not execution completion."
+);
+metric!(
+    CONCERN_ACTIVE,
+    "actordb.write_concern.active",
+    Gauge,
+    Requests,
+    "Captured concern tickets still owned."
+);
+metric!(
+    CONCERN_WAIT,
+    "actordb.write_concern.wait_duration",
+    Distribution,
+    Nanoseconds,
+    "Actual concern wait duration through terminal waiter outcome."
+);
+metric!(
+    PEER_ACCEPTED,
+    "actordb.peer.admitted_frames",
+    Counter,
+    Frames,
+    "Authenticated decoded frames accepted by receiver authority."
+);
+metric!(
+    PEER_COMPLETED,
+    "actordb.peer.completed_frames",
+    Counter,
+    Frames,
+    "Receiver frame ownership terminally released after actor/store/response work."
+);
+metric!(
+    PEER_REJECTED,
+    "actordb.peer.rejected_frames",
+    Counter,
+    Frames,
+    "Receiver authority frame rejections."
+);
+metric!(
+    PEER_HANDSHAKES_REJECTED,
+    "actordb.peer.rejected_handshakes",
+    Counter,
+    Events,
+    "Rejected process authentication/authority handshakes."
+);
+metric!(
+    PEER_PENDING_FRAMES,
+    "actordb.peer.outstanding_fence_frames",
+    Gauge,
+    Frames,
+    "Old authority frame ownership not yet drained."
+);
+metric!(
+    PEER_PENDING_PERSISTENCE,
+    "actordb.peer.outstanding_fence_persistence",
+    Gauge,
+    Operations,
+    "Old authority persistence fence work not yet terminal."
+);
+
 impl Node {
     /// Collect metrics with default fragment/sender limits.
     pub fn metrics_snapshot(&self) -> MetricsSnapshot {
@@ -515,9 +986,17 @@ impl Node {
     /// reads, rather than a transaction across subsystems.
     pub fn metrics_snapshot_with_limits(&self, limits: SnapshotLimits) -> MetricsSnapshot {
         let status = self.status_snapshot_with_limits(limits);
+        self.metrics_from_status(status)
+    }
+    pub(super) fn metrics_from_status(&self, status: NodeStatus) -> MetricsSnapshot {
         let mut points = Vec::new();
         let mut node_point = |descriptor: &'static MetricDescriptor, value| {
             points.push(MetricPoint {
+                source_incarnation: match descriptor.lifetime {
+                    MetricLifetime::NodeIncarnation => Some(status.boot_id),
+                    MetricLifetime::PersistenceResources => Some(status.storage.scope_id),
+                    _ => None,
+                },
                 descriptor,
                 scope: MetricScope::Node,
                 value,
@@ -527,6 +1006,20 @@ impl Node {
             &ADMISSION_OPEN,
             MetricValue::Gauge(u64::from(status.lifecycle.phase() == DrainPhase::Running)),
         );
+        node_point(
+            &INITIAL_READY,
+            MetricValue::Gauge(u64::from(status.initial_readiness_established)),
+        );
+        node_point(
+            &DESIRED_LOCAL,
+            MetricValue::Gauge(status.desired_local_fragments as u64),
+        );
+        if let Some(count) = status.serving_fragments {
+            node_point(&SERVING_LOCAL, MetricValue::Gauge(count as u64));
+        }
+        if let Some(count) = status.available_fragments {
+            node_point(&AVAILABLE_LOCAL, MetricValue::Gauge(count as u64));
+        }
         match status.readiness {
             Readiness::Ready => node_point(&READY, MetricValue::Gauge(1)),
             Readiness::NotReady => node_point(&READY, MetricValue::Gauge(0)),
@@ -539,6 +1032,120 @@ impl Node {
         node_point(
             &RECEIVE_APPLIES,
             MetricValue::Gauge(status.lifecycle.active_replication_applies() as u64),
+        );
+        node_point(
+            &REQUEST_TIMEOUTS,
+            MetricValue::Counter(status.request_waiter_timeouts),
+        );
+        node_point(
+            &LOCAL_FENCES_ACTIVE,
+            MetricValue::Gauge(status.lifecycle.active_persistence_fences() as u64),
+        );
+        node_point(
+            &LOCAL_FENCES_COMPLETED,
+            MetricValue::Counter(status.completed_local_persistence_fences as u64),
+        );
+        for (descriptor, value) in [
+            (
+                &STORAGE_QUEUED,
+                MetricValue::Gauge(status.storage.queued_jobs as u64),
+            ),
+            (
+                &STORAGE_COMPLETED,
+                MetricValue::Counter(status.storage.completed_jobs),
+            ),
+            (
+                &STORAGE_FAILED,
+                MetricValue::Counter(status.storage.failed_jobs),
+            ),
+        ] {
+            node_point(descriptor, value);
+        }
+        if status.request_timing_enabled {
+            node_point(
+                &REQUEST_DURATION,
+                MetricValue::Distribution(DistributionSummary {
+                    count: status.request_duration.count,
+                    sum: status.request_duration.sum_nanos,
+                    max: status.request_duration.max_nanos,
+                }),
+            );
+        }
+        if status.storage.timing_enabled {
+            for (descriptor, duration) in [
+                (&STORAGE_QUEUE_WAIT, status.storage.queue_wait),
+                (&STORAGE_EXECUTION, status.storage.execution_time),
+            ] {
+                node_point(
+                    descriptor,
+                    MetricValue::Distribution(DistributionSummary {
+                        count: duration.count,
+                        sum: duration.sum_nanos,
+                        max: duration.max_nanos,
+                    }),
+                );
+            }
+        }
+        for (descriptor, value) in [
+            (&QUEUED_EMBEDDED, status.queues.queued_embedded_mutations),
+            (
+                &QUEUED_FORWARDED_WRITES,
+                status.queues.queued_forwarded_mutations,
+            ),
+            (&FORWARDED_APPLY_SLOTS, status.queues.forwarded_apply_slots),
+            (
+                &QUEUED_FORWARDED_READS,
+                status.queues.queued_forwarded_reads,
+            ),
+            (&FORWARDED_READ_SLOTS, status.queues.forwarded_read_slots),
+            (&AWAITING_RESPONSES, status.lifecycle.awaiting_responses()),
+        ] {
+            node_point(descriptor, MetricValue::Gauge(value as u64));
+        }
+        for (descriptor, value) in [
+            (&CONCERN_ACCEPTED, status.write_concerns.accepted),
+            (&CONCERN_SATISFIED, status.write_concerns.satisfied),
+            (&CONCERN_TIMEOUTS, status.write_concerns.timed_out),
+            (
+                &CONCERN_DURABILITY_FAILURES,
+                status.write_concerns.durability_failed,
+            ),
+            (
+                &CONCERN_OPERATION_FAILURES,
+                status.write_concerns.operation_failed,
+            ),
+            (&CONCERN_UNKNOWN, status.write_concerns.unknown_outcomes),
+            (&CONCERN_REJECTED, status.write_concerns.rejected),
+            (&CONCERN_CANCELLED, status.write_concerns.cancelled),
+            (&PEER_ACCEPTED, status.peer_fence.accepted_frames()),
+            (&PEER_COMPLETED, status.peer_fence.completed_frames()),
+            (&PEER_REJECTED, status.peer_fence.rejected_frames()),
+            (
+                &PEER_HANDSHAKES_REJECTED,
+                status.peer_fence.rejected_handshakes(),
+            ),
+        ] {
+            node_point(descriptor, MetricValue::Counter(value));
+        }
+        node_point(
+            &CONCERN_ACTIVE,
+            MetricValue::Gauge(status.write_concerns.active),
+        );
+        node_point(
+            &CONCERN_WAIT,
+            MetricValue::Distribution(DistributionSummary {
+                count: status.write_concerns.wait_count,
+                sum: status.write_concerns.wait_nanos,
+                max: status.write_concerns.max_wait_nanos,
+            }),
+        );
+        node_point(
+            &PEER_PENDING_FRAMES,
+            MetricValue::Gauge(status.peer_fence.outstanding_frames() as u64),
+        );
+        node_point(
+            &PEER_PENDING_PERSISTENCE,
+            MetricValue::Gauge(status.peer_fence.outstanding_persistence() as u64),
         );
         let drain = self.drain_diagnostics();
         for (descriptor, value) in [
@@ -668,12 +1275,38 @@ impl Node {
                 );
             }
         }
+        for table in &status.tables {
+            for (descriptor, value) in [
+                (&TABLE_ACCEPTED, MetricValue::Counter(table.accepted)),
+                (&TABLE_COMPLETED, MetricValue::Counter(table.completed)),
+                (&TABLE_REJECTED, MetricValue::Counter(table.rejected)),
+                (&TABLE_ACTIVE, MetricValue::Gauge(table.active as u64)),
+                (
+                    &TABLE_DURATION,
+                    MetricValue::Distribution(DistributionSummary {
+                        count: table.duration.count,
+                        sum: table.duration.sum_nanos,
+                        max: table.duration.max_nanos,
+                    }),
+                ),
+            ] {
+                points.push(MetricPoint {
+                    source_incarnation: None,
+                    descriptor,
+                    scope: MetricScope::Table {
+                        table: table.table.clone(),
+                    },
+                    value,
+                });
+            }
+        }
         for fragment in &status.fragments {
             for (descriptor, value) in [
                 (&FRAGMENT_SERVING, fragment.serving),
                 (&FRAGMENT_ASSIGNED, fragment.assigned_locally),
             ] {
                 points.push(MetricPoint {
+                    source_incarnation: None,
                     descriptor,
                     scope: MetricScope::Fragment {
                         fragment: fragment.fragment,
@@ -683,6 +1316,61 @@ impl Node {
             }
         }
         for sender in &status.replication {
+            let scope = MetricScope::FragmentPeer {
+                fragment: sender.fragment,
+                peer_id: sender.peer_id.clone(),
+            };
+            for (descriptor, value) in [
+                (
+                    &SENDER_CONNECTED,
+                    match sender.connection {
+                        super::status::SenderConnectionState::Connected => Some(1),
+                        super::status::SenderConnectionState::Disconnected => Some(0),
+                        super::status::SenderConnectionState::ResetRequired
+                        | super::status::SenderConnectionState::Unknown => None,
+                    },
+                ),
+                (
+                    &SENDER_ACTIVE,
+                    (sender.activity != super::status::ReplicationActivity::Unknown).then(|| {
+                        u64::from(
+                            sender.activity == super::status::ReplicationActivity::Active
+                                || sender.buffered_operations != 0
+                                || sender.in_flight_batches != 0
+                                || sender.reconciliation_stage.is_some(),
+                        )
+                    }),
+                ),
+                (
+                    &SENDER_QUEUE_AGE,
+                    sender
+                        .oldest_retained_operation_age
+                        .map(|age| age.as_nanos().min(u64::MAX as u128) as u64),
+                ),
+                (
+                    &SENDER_ACK_AGE,
+                    sender
+                        .last_successful_ack_at
+                        .and_then(|at| at.elapsed().ok())
+                        .map(|age| age.as_nanos().min(u64::MAX as u128) as u64),
+                ),
+                (
+                    &SENDER_RECONCILE_AGE,
+                    sender
+                        .last_successful_reconcile_at
+                        .and_then(|at| at.elapsed().ok())
+                        .map(|age| age.as_nanos().min(u64::MAX as u128) as u64),
+                ),
+            ] {
+                if let Some(value) = value {
+                    points.push(MetricPoint {
+                        descriptor,
+                        scope: scope.clone(),
+                        source_incarnation: (sender.incarnation != 0).then_some(sender.incarnation),
+                        value: MetricValue::Gauge(value),
+                    });
+                }
+            }
             for (descriptor, value) in [
                 (&SENDER_BUFFERED, sender.buffered_operations as u64),
                 (&SENDER_BYTES, sender.retained_bytes as u64),
@@ -694,6 +1382,7 @@ impl Node {
                 ),
             ] {
                 points.push(MetricPoint {
+                    source_incarnation: None,
                     descriptor,
                     scope: MetricScope::FragmentPeer {
                         fragment: sender.fragment,
@@ -701,6 +1390,73 @@ impl Node {
                     },
                     value: MetricValue::Gauge(value),
                 });
+            }
+        }
+        for observed in &status.pools {
+            let pool = &observed.pool;
+            let scope = MetricScope::Pool {
+                fragment: observed.fragment,
+                table: pool.table.clone(),
+                priority: pool.priority,
+            };
+            let mut point = |descriptor: &'static MetricDescriptor, value| {
+                points.push(MetricPoint {
+                    descriptor,
+                    scope: scope.clone(),
+                    value,
+                    source_incarnation: Some(pool.incarnation),
+                })
+            };
+            for (descriptor, value) in [
+                (&POOL_PENDING, MetricValue::Gauge(pool.pending)),
+                (&POOL_ACTIVE, MetricValue::Gauge(pool.active)),
+                (&POOL_QUEUED, MetricValue::Gauge(pool.queued)),
+                (&POOL_ACCEPTED, MetricValue::Counter(pool.accepted)),
+                (&POOL_COMPLETED, MetricValue::Counter(pool.completed)),
+                (&POOL_ABANDONED, MetricValue::Counter(pool.abandoned)),
+                (&POOL_SHED_QUEUE, MetricValue::Counter(pool.shed_queue)),
+                (&POOL_SHED_RATE, MetricValue::Counter(pool.shed_rate)),
+            ] {
+                point(descriptor, value);
+            }
+            if let Some(age) = pool.oldest_queue_age {
+                point(
+                    &POOL_QUEUE_AGE,
+                    MetricValue::Gauge(age.as_nanos().min(u64::MAX as u128) as u64),
+                );
+            }
+            for (descriptor, summary) in [
+                (&POOL_QUEUE_DURATION, pool.queue_duration),
+                (&POOL_EXECUTION_DURATION, pool.execution_duration),
+            ] {
+                point(
+                    descriptor,
+                    MetricValue::Distribution(DistributionSummary {
+                        count: summary.count,
+                        sum: summary.sum_nanos,
+                        max: summary.max_nanos,
+                    }),
+                );
+            }
+            for worker in &pool.workers {
+                for (descriptor, value) in [
+                    (&WORKER_PENDING, MetricValue::Gauge(worker.pending)),
+                    (&WORKER_ACTIVE, MetricValue::Gauge(worker.active)),
+                    (&WORKER_QUEUED, MetricValue::Gauge(worker.queued)),
+                    (&WORKER_COMPLETED, MetricValue::Counter(worker.completed)),
+                ] {
+                    points.push(MetricPoint {
+                        descriptor,
+                        scope: MetricScope::Worker {
+                            fragment: observed.fragment,
+                            table: pool.table.clone(),
+                            priority: pool.priority,
+                            slot: worker.slot,
+                        },
+                        source_incarnation: Some(worker.incarnation),
+                        value,
+                    });
+                }
             }
         }
         MetricsSnapshot { status, points }
@@ -712,5 +1468,98 @@ impl Node {
         let snapshot = self.metrics_snapshot();
         snapshot.record(sink);
         snapshot
+    }
+    pub async fn metrics_snapshot_detailed(
+        &self,
+        options: super::DetailedSnapshotOptions,
+    ) -> Result<MetricsSnapshot, super::NodeError> {
+        Ok(self.metrics_from_status(self.status_snapshot_detailed(options).await?))
+    }
+    /// Collector callbacks run only after every observation lock and actor RPC
+    /// has completed. The returned owned snapshot is exactly what was exported.
+    pub async fn collect_metrics_detailed(
+        &self,
+        options: super::DetailedSnapshotOptions,
+        sink: &(impl MetricsSink + ?Sized),
+    ) -> Result<MetricsSnapshot, super::NodeError> {
+        let snapshot = self.metrics_snapshot_detailed(options).await?;
+        snapshot.record(sink);
+        Ok(snapshot)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::node::{test_support::test_sender_report, NodeConfig};
+    use std::time::SystemTime;
+
+    #[tokio::test]
+    async fn sender_connection_gauge_preserves_known_values_and_reset_identity() {
+        let node = Node::start(
+            "connection-metrics".into(),
+            "127.0.0.1:0".parse().unwrap(),
+            NodeConfig::builder().fragment_count(1).build(),
+        )
+        .await
+        .unwrap();
+        let report = test_sender_report();
+        report.lock().await.progress = crate::replication::SenderProgress {
+            incarnation: 41,
+            observed_at: Some(SystemTime::now()),
+            ..Default::default()
+        };
+        node.sender_reports
+            .lock()
+            .await
+            .insert((FragmentId(0), "peer".into()), report.clone());
+        for (state, incarnation, expected) in [
+            ("connected", 41, Some(1)),
+            ("disconnected", 41, Some(0)),
+            ("buffer_reset", 41, None),
+            ("future-state", 41, None),
+            ("connected", 42, Some(1)),
+        ] {
+            {
+                let mut report = report.lock().await;
+                report.state = state.into();
+                report.progress.incarnation = incarnation;
+            }
+            let snapshot = node.metrics_snapshot();
+            let connected = snapshot
+                .points
+                .iter()
+                .find(|point| point.descriptor.name == "actordb.replication.connected");
+            assert_eq!(
+                connected.map(|point| point.value),
+                expected.map(MetricValue::Gauge)
+            );
+            if let Some(point) = connected {
+                assert_eq!(point.descriptor.kind, MetricKind::Gauge);
+                assert_eq!(point.descriptor.unit, MetricUnit::Boolean);
+                assert_eq!(point.descriptor.lifetime, MetricLifetime::SenderIncarnation);
+                assert_eq!(point.source_incarnation, Some(incarnation));
+                assert_eq!(
+                    point.scope,
+                    MetricScope::FragmentPeer {
+                        fragment: FragmentId(0),
+                        peer_id: "peer".into(),
+                    }
+                );
+            }
+        }
+        // A busy report is omitted rather than inventing a disconnection.
+        let held = report.lock().await;
+        assert!(!node
+            .metrics_snapshot()
+            .points
+            .iter()
+            .any(|point| point.descriptor.name == "actordb.replication.connected"));
+        drop(held);
+        node.sender_reports
+            .lock()
+            .await
+            .remove(&(FragmentId(0), "peer".into()));
+        node.shutdown().await.unwrap();
     }
 }

@@ -1,6 +1,17 @@
 # Release notes
 
-## 0.8.1 (draft)
+## 0.9.0 (draft)
+
+- Complete authenticated peer/process generation fencing, bounded stable
+  checkpoint export/import and qualified staged membership support, and typed
+  per-write durability/replica-set/version-floor evidence.
+- Request draining now defaults to the configured local persistence boundary,
+  with explicit execution-only and stable options. Retained fence tickets
+  preserve actual storage ownership through caller cancellation and retry.
+- Extend backend-neutral collection with deliberately registered table scopes,
+  request/storage timing and queue pressure, and lifecycle/recovery blockers.
+- Use `0.9.0` for public protocol/actor schema additions and stronger drain
+  semantics. The unpublished `0.8.1` implementation stages are included here.
 
 - Add explicit application admission/draining APIs with bounded retryable
   waits, status and outstanding-work reporting. Accepted work retains
@@ -14,15 +25,18 @@
 - Add opt-in strict write-concern acknowledgement requirements. Operational
   caps that would lower the requested threshold fail before apply; embedded,
   forwarded and client receipt validation preserves the constraint.
-- Document replacement authentication and staged membership requirements;
-  hot epoch fencing and portable recovery checkpoints remain tracked backlog.
+- Include authenticated hot fencing, stable checkpoints and native staged
+  membership validation with actual source/target and receiver evidence.
 - Bump all four published crates and compatible dependency minimums to
-  `0.8.1`. New APIs are additive; default wire encodings and protocol versions
-  remain compatible. Strict policies sent to older nodes fail closed.
+  `0.9.0`. Existing default wire encodings retain their meaning; enabled new
+  requirements fail closed on older peers. Public schema/actor literals and
+  matching assumptions need the documented migration.
 
 See [migration](docs/support-api-migration.md),
 [draining](docs/draining.md), [metrics](docs/metrics.md), and
-[status](docs/status.md). Follow-up scope remains in the
+[status](docs/status.md), [peer authority](docs/peer-authority.md),
+[checkpoints](docs/stable-checkpoints.md), [membership](docs/staged-membership.md),
+and [write durability](docs/write-concerns.md). Acceptance coverage is mapped in the
 [support API roadmap](docs/support-api-roadmap.md).
 
 ## 0.8.0
