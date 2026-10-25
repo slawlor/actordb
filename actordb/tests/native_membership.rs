@@ -191,6 +191,18 @@ async fn workflow(old: &[&str], desired: &[&str]) {
     .unwrap();
     assert!(native_joint.is_native());
     transition.record_authority_fence(native_joint).unwrap();
+    for index in 0..65 {
+        let table = nodes[desired[0]]
+            .table(format!("metric_scope_{index}"))
+            .unwrap();
+        nodes[desired[0]].enable_table_metrics(table.id()).unwrap();
+    }
+    assert!(
+        nodes[desired[0]]
+            .status_snapshot()
+            .observation
+            .table_metrics_truncated
+    );
     let mut old_ready = Vec::new();
     for target in desired {
         common::wait_for(
@@ -380,4 +392,91 @@ async fn native_fixed_count_replacement() {
 #[tokio::test]
 async fn native_staged_shrink() {
     workflow(&["a", "b", "c"], &["c"]).await;
+}
+
+#[tokio::test]
+async fn legacy_to_native_pending_fence_never_certifies_external_readiness() {
+    let directory = tempfile::tempdir().unwrap();
+    let epoch = [11; 32];
+    let source_store = Arc::new(RocksDbStore::open(directory.path().join("a")).unwrap());
+    let source = Node::start(
+        "a".into(),
+        "127.0.0.1:0".parse().unwrap(),
+        NodeConfig::builder()
+            .fragment_count(1)
+            .store(source_store)
+            .build(),
+    )
+    .await
+    .unwrap();
+    source.put("key".into(), vec![1]).await.unwrap();
+    source.shutdown().await.unwrap();
+    let bundle = directory.path().join("bundle");
+    let manifest = source
+        .export_checkpoint(&bundle, CheckpointOptions::default())
+        .await
+        .unwrap();
+    let target = Arc::new(RocksDbStore::open(directory.path().join("b")).unwrap());
+    let receipt =
+        CheckpointImporter::open(target.clone(), StoreIdentity::new("b".into(), 1), &bundle)
+            .unwrap()
+            .finish()
+            .unwrap();
+    let mut transition = MembershipTransition::create(
+        directory.path().join("transition"),
+        epoch,
+        map(&["a"]),
+        map(&["b"]),
+        1,
+    )
+    .unwrap();
+    transition.record_source(manifest).unwrap();
+    transition.record_import(receipt).unwrap();
+    let controller = ManualPlacement::new(map(&["a"]));
+    transition.publish_joint(&controller).unwrap();
+    let ids = vec!["a".to_owned(), "b".to_owned()];
+    let registry = ids
+        .iter()
+        .map(|id| {
+            let identity = policy(id, &ids, 1).local_public_identity();
+            (
+                id.clone(),
+                MembershipPeerIdentity::new(identity.generation(), *identity.public_key()).unwrap(),
+            )
+        })
+        .collect();
+    transition
+        .record_authority_fence(
+            MembershipAuthority::certify_external(epoch, registry, [11; 32]).unwrap(),
+        )
+        .unwrap();
+    let node = Node::start(
+        "b".into(),
+        "127.0.0.1:0".parse().unwrap(),
+        NodeConfig::builder()
+            .fragment_count(1)
+            .store(target)
+            .fragment_map(transition.joint())
+            .build(),
+    )
+    .await
+    .unwrap();
+    assert!(node.certify_membership_ready(&transition).is_ok());
+    let next = policy("b", &ids, 1);
+    node.begin_peer_fence(next.clone()).unwrap();
+    assert!(node.peer_authority_snapshot().is_none());
+    assert_eq!(
+        node.peer_fence_status().phase(),
+        actordb::node::PeerFencePhase::Fencing
+    );
+    assert!(node
+        .certify_membership_ready(&transition)
+        .unwrap_err()
+        .to_string()
+        .contains("native fencing"));
+    node.advance_peer_authority(next, PeerFenceOptions::default())
+        .await
+        .unwrap();
+    assert!(node.certify_membership_ready(&transition).is_ok());
+    node.shutdown().await.unwrap();
 }

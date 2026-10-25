@@ -870,8 +870,9 @@ impl PeerAuthority {
 }
 
 impl Node {
-    /// Exact current public identity policy; None denotes legacy unconfigured
-    /// authentication. Fencing/Stopped snapshots confer no current eligibility.
+    /// Exact current public identity policy. None denotes an era with no native
+    /// identity; check `peer_fence_status` to distinguish unconfigured legacy
+    /// from an enabling fence. Fencing/Stopped confer no current eligibility.
     pub fn peer_authority_snapshot(&self) -> Option<PeerAuthoritySnapshot> {
         let state = self.peer_authority.state.lock().unwrap();
         let phase = if state.stopped {

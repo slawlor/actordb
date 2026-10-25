@@ -87,6 +87,14 @@ coordinator restart; fresh process authority needs a new transition decision.
 Unconfigured legacy receivers can use only the explicitly external route; they
 cannot contribute a native SDK fence certificate.
 
+Membership eligibility checks complete placement and lifecycle observations,
+not optional metric-table or sender-report coverage. Registering more metric
+scopes or truncating diagnostic sender output cannot block a fully validated
+cutover. External legacy readiness is rejected while native authority is being
+enabled: an absent old-era public snapshot does not mean the pending fence is
+inactive. Peer phase, placement generation and application admission are checked
+again after retained floor verification.
+
 ## Restarts and bounds
 
 The transition file uses a canonical checksummed encoding with atomic write,

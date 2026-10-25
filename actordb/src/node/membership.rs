@@ -12,7 +12,7 @@ use crate::membership::{
 
 use super::drain::DrainPhase;
 use super::peer_authority::PeerFencePhase;
-use super::status::{Readiness, SnapshotLimits};
+use super::status::{NodeLifecycle, Readiness, SnapshotLimits, SnapshotObservation};
 use super::*;
 
 impl Node {
@@ -105,6 +105,7 @@ impl Node {
                 )
             })?;
         let captured_authority = self.peer_authority_snapshot();
+        let captured_peer_phase = self.peer_fence_status().phase();
         if let Some(snapshot) = &captured_authority {
             if snapshot.receiver_id() != self.node_id
                 || snapshot.node_boot_id() != self.boot_id
@@ -132,6 +133,10 @@ impl Node {
         } else if authority.is_native() {
             return Err(MembershipError::InsufficientEvidence(
                 "native evidence cannot authorize a legacy unconfigured receiver".into(),
+            ));
+        } else if captured_peer_phase != PeerFencePhase::Unconfigured {
+            return Err(MembershipError::InsufficientEvidence(
+                "legacy external readiness is unavailable during native fencing/shutdown".into(),
             ));
         }
         let store = self.checkpoint_store.as_ref().ok_or_else(|| {
@@ -169,7 +174,10 @@ impl Node {
             verified_receipts.push(receipt);
         }
         let status = self.status_snapshot_with_limits(SnapshotLimits::new(4096, 4096));
-        if status.readiness != Readiness::Ready || !status.observation.is_complete() {
+        if status.readiness != Readiness::Ready
+            || status.node_lifecycle != NodeLifecycle::Serving
+            || !placement_observation_complete(&status.observation)
+        {
             return Err(MembershipError::InsufficientEvidence(
                 "joint placement is not completely observed and serving".into(),
             ));
@@ -204,6 +212,10 @@ impl Node {
         if self.placement_generation.load(Ordering::Acquire)
             != status.placement_generation.unwrap_or(u64::MAX)
             || self.peer_authority_snapshot() != captured_authority
+            || self.peer_fence_status().phase() != captured_peer_phase
+            || self.drain_status().phase() != DrainPhase::Running
+            || self.lifecycle_observation.revision.load(Ordering::Acquire)
+                != status.lifecycle_revision
         {
             return Err(MembershipError::InsufficientEvidence(
                 "placement or native authority changed during certification".into(),
@@ -224,5 +236,32 @@ impl Node {
             })?,
             native_revision: captured_authority.map(|snapshot| snapshot.revision()),
         })
+    }
+}
+
+fn placement_observation_complete(observation: &SnapshotObservation) -> bool {
+    !observation.placement_unavailable
+        && !observation.fragments_truncated
+        && !observation.replicas_truncated
+        && !observation.placement_changed
+        && !observation.lifecycle_changed
+        && !observation.lifecycle_reason_unavailable
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn telemetry_limits_do_not_make_complete_placement_ineligible() {
+        let mut observation = SnapshotObservation::default();
+        observation.table_metrics_truncated = true;
+        observation.table_metrics_unavailable = true;
+        observation.senders_truncated = true;
+        observation.senders_unavailable = true;
+        observation.unavailable_sender_reports = 100;
+        observation.stale_sender_reports = 100;
+        assert!(placement_observation_complete(&observation));
+        observation.fragments_truncated = true;
+        assert!(!placement_observation_complete(&observation));
     }
 }
