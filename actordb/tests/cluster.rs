@@ -2633,22 +2633,23 @@ async fn wide_reconciliation_keys_use_bounded_pages_and_release_result_admission
     wait_for_peers(&source, &receiver).await;
     common::wait_for(
         || async {
-            for key in &keys {
-                if receiver
-                    .get(key.clone())
-                    .await
-                    .unwrap()
-                    .map(|value| value.value)
-                    != Some(vec![7])
-                {
-                    return false;
-                }
-            }
-            source
+            // Observe the cheap completion state before submitting wide-key
+            // reads. Batch the exact data check rather than serializing 64
+            // point-read round trips on this single-threaded runtime: this
+            // tests reconciliation paging, not observer scheduling under load.
+            if !source
                 .sender_report(FragmentId(0), "wide-key-receiver")
                 .await
                 .is_some_and(|report| report.reconcile_rounds >= 1)
-                && source.reconciliation_retained_bytes() == 0
+                || source.reconciliation_retained_bytes() != 0
+            {
+                return false;
+            }
+            let values = receiver.get_multi(keys.clone()).await;
+            values.len() == keys.len()
+                && values
+                    .into_iter()
+                    .all(|value| value.unwrap().map(|value| value.value) == Some(vec![7]))
         },
         Duration::from_secs(10),
     )
