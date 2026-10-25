@@ -688,11 +688,7 @@ impl Drop for PendingWrite {
             .as_nanos()
             .min(u64::MAX as u128) as u64;
         stats.wait_count.fetch_add(1, Ordering::Relaxed);
-        let _ = stats
-            .wait_nanos
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |sum| {
-                Some(sum.saturating_add(nanos))
-            });
+        crate::node::observability::add_saturating(&stats.wait_nanos, nanos);
         stats.max_wait_nanos.fetch_max(nanos, Ordering::Relaxed);
         if let Some(key) = self.key {
             let mut pending = self.tracker.pending.lock().unwrap();
