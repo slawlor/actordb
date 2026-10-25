@@ -4,6 +4,14 @@ Normal dynamic startup requires a surviving **serving** replica. After every
 replica of a fragment stops, restored copies stay non-authoritative. They do
 not automatically elect a seed or certify each other's empty state.
 
+Stable checkpoint export/import and validated staged identity replacement or
+shrink are supported separately; see [stable-checkpoints.md](stable-checkpoints.md)
+and [staged-membership.md](staged-membership.md). Those APIs preserve physical
+table namespaces and historical record origins while requiring source and target
+evidence before retirement. Permanent source loss requires a distinct explicit
+application decision and authenticated process fences; qualifying a smaller
+source set alone does not authorize removal or writer election.
+
 `NodeConfig::recovery` provides explicit operator authority to recover that
 complete replica set. It requires dynamic placement, a configured store, and
 successful stable-storage fences. It adds no consensus or durable callback

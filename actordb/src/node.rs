@@ -130,6 +130,7 @@ pub use drain::{
     DrainCutoff, DrainDiagnostics, DrainDurability, DrainError, DrainOptions, DrainPhase,
     DrainReport, DrainStatus, FragmentDrainFence, LocalDurability,
 };
+mod membership;
 pub mod metrics;
 pub mod observability;
 pub mod status;
@@ -1291,6 +1292,9 @@ pub struct Node {
     /// releases it only after every fragment actor has stopped; cancellation
     /// and best-effort Drop leave managed backends fail-closed.
     store_binding: StdMutex<Option<StoreBinding>>,
+    /// Root store retained for explicit stopped-node checkpoint export and
+    /// import-floor certification. No additional live binding is created.
+    checkpoint_store: Option<Arc<dyn KvStore>>,
     recovery: Option<Arc<RecoveryContext>>,
 }
 

@@ -245,6 +245,11 @@ pub struct StoreBinding {
 }
 
 impl StoreBinding {
+    /// Whether this backend supplied explicit managed attachment ownership.
+    /// Checkpoint-capable root stores must provide an exclusive managed lease.
+    pub fn is_managed(&self) -> bool {
+        self.release.is_some()
+    }
     /// Construct a binding with no release action.
     ///
     /// This is useful to custom stores which validate [`StoreIdentity`] but do
@@ -366,6 +371,11 @@ pub enum PrefixDeleteOutcome {
 /// Digests are derived from loaded winners in memory and require no persisted
 /// digest metadata.
 pub trait KvStore: Send + Sync + 'static {
+    /// Optional durable snapshot and atomic resumable import capability.
+    /// No full-dataset `load` fallback is used for checkpoint transfer.
+    fn checkpoint_backend(&self) -> Option<&dyn crate::checkpoint::CheckpointBackend> {
+        None
+    }
     /// Attach one live node and validate any backend identity metadata.
     ///
     /// The default is an unmanaged no-op so existing custom implementations
