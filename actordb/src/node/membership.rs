@@ -253,13 +253,15 @@ mod tests {
     use super::*;
     #[test]
     fn telemetry_limits_do_not_make_complete_placement_ineligible() {
-        let mut observation = SnapshotObservation::default();
-        observation.table_metrics_truncated = true;
-        observation.table_metrics_unavailable = true;
-        observation.senders_truncated = true;
-        observation.senders_unavailable = true;
-        observation.unavailable_sender_reports = 100;
-        observation.stale_sender_reports = 100;
+        let mut observation = SnapshotObservation {
+            table_metrics_truncated: true,
+            table_metrics_unavailable: true,
+            senders_truncated: true,
+            senders_unavailable: true,
+            unavailable_sender_reports: 100,
+            stale_sender_reports: 100,
+            ..Default::default()
+        };
         assert!(placement_observation_complete(&observation));
         observation.fragments_truncated = true;
         assert!(!placement_observation_complete(&observation));
