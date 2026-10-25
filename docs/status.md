@@ -55,7 +55,7 @@ separately. Treat unobserved ages and unknown remote lag as unknown.
 
 `lifecycle` comes from `Node::drain_status()`: `Running`, `Draining`, `Drained`,
 or `Stopped`, with active ownership counts and receive/apply completion.
-`overall_lifecycle` adds Starting/Initializing/Recovering/Serving/Blocked/Failed
+`node_lifecycle` adds Starting/Initializing/Recovering/Serving/Blocked/Failed
 and Stopping views with typed reasons and fragment activity. `Drained` proves
 completion of the selected admitted local execution/persistence boundary;
 incoming replication and maintenance can still run. Only full shutdown proves

@@ -29,6 +29,12 @@ reconcile round totals are **gauges**: replacing a sender resets its total. The
 session ID stays status metadata and is never a metric label. Both cumulative
 amounts and distribution summaries can saturate rather than overflow.
 
+`actordb.replication.connected` is a Boolean fragment/peer gauge: one for an
+observed ready sender session, zero for an observed disconnected sender. Unknown,
+reset-only, or contended reports omit the point rather than assert disconnection.
+Its sender-incarnation metadata changes when the sender is replaced; connection
+does not certify replica equality or durability.
+
 Admission counters and `actordb.node.active_requests` count request/actor gate
 ownership slots. A batch can own several slots. Completed slots do not mean
 successful user writes, and rejected slots count the lifecycle admission fence,

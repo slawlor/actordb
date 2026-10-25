@@ -329,6 +329,14 @@ metric!(
 );
 metric!(AVAILABLE_LOCAL, "actordb.lifecycle.available_fragments", Gauge, Operations, "Running authoritative dispatcher count, omitted when observation limits prevent an exact count.");
 metric!(
+    SENDER_CONNECTED,
+    "actordb.replication.connected",
+    Gauge,
+    Boolean,
+    "Observed ready sender session; omitted when connection state is unknown or reset-only.",
+    SenderIncarnation
+);
+metric!(
     SENDER_ACTIVE,
     "actordb.replication.active",
     Gauge,
@@ -1314,6 +1322,15 @@ impl Node {
             };
             for (descriptor, value) in [
                 (
+                    &SENDER_CONNECTED,
+                    match sender.connection {
+                        super::status::SenderConnectionState::Connected => Some(1),
+                        super::status::SenderConnectionState::Disconnected => Some(0),
+                        super::status::SenderConnectionState::ResetRequired
+                        | super::status::SenderConnectionState::Unknown => None,
+                    },
+                ),
+                (
                     &SENDER_ACTIVE,
                     (sender.activity != super::status::ReplicationActivity::Unknown).then(|| {
                         u64::from(
@@ -1468,5 +1485,81 @@ impl Node {
         let snapshot = self.metrics_snapshot_detailed(options).await?;
         snapshot.record(sink);
         Ok(snapshot)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::node::{test_support::test_sender_report, NodeConfig};
+    use std::time::SystemTime;
+
+    #[tokio::test]
+    async fn sender_connection_gauge_preserves_known_values_and_reset_identity() {
+        let node = Node::start(
+            "connection-metrics".into(),
+            "127.0.0.1:0".parse().unwrap(),
+            NodeConfig::builder().fragment_count(1).build(),
+        )
+        .await
+        .unwrap();
+        let report = test_sender_report();
+        report.lock().await.progress = crate::replication::SenderProgress {
+            incarnation: 41,
+            observed_at: Some(SystemTime::now()),
+            ..Default::default()
+        };
+        node.sender_reports
+            .lock()
+            .await
+            .insert((FragmentId(0), "peer".into()), report.clone());
+        for (state, incarnation, expected) in [
+            ("connected", 41, Some(1)),
+            ("disconnected", 41, Some(0)),
+            ("buffer_reset", 41, None),
+            ("future-state", 41, None),
+            ("connected", 42, Some(1)),
+        ] {
+            {
+                let mut report = report.lock().await;
+                report.state = state.into();
+                report.progress.incarnation = incarnation;
+            }
+            let snapshot = node.metrics_snapshot();
+            let connected = snapshot
+                .points
+                .iter()
+                .find(|point| point.descriptor.name == "actordb.replication.connected");
+            assert_eq!(
+                connected.map(|point| point.value),
+                expected.map(MetricValue::Gauge)
+            );
+            if let Some(point) = connected {
+                assert_eq!(point.descriptor.kind, MetricKind::Gauge);
+                assert_eq!(point.descriptor.unit, MetricUnit::Boolean);
+                assert_eq!(point.descriptor.lifetime, MetricLifetime::SenderIncarnation);
+                assert_eq!(point.source_incarnation, Some(incarnation));
+                assert_eq!(
+                    point.scope,
+                    MetricScope::FragmentPeer {
+                        fragment: FragmentId(0),
+                        peer_id: "peer".into(),
+                    }
+                );
+            }
+        }
+        // A busy report is omitted rather than inventing a disconnection.
+        let held = report.lock().await;
+        assert!(!node
+            .metrics_snapshot()
+            .points
+            .iter()
+            .any(|point| point.descriptor.name == "actordb.replication.connected"));
+        drop(held);
+        node.sender_reports
+            .lock()
+            .await
+            .remove(&(FragmentId(0), "peer".into()));
+        node.shutdown().await.unwrap();
     }
 }

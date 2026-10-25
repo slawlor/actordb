@@ -442,18 +442,33 @@ mod tests {
             request.await.unwrap(),
             Err(NodeError::UnknownOutcome(_))
         ));
+        // The public request lease and the internal apply/completion lease
+        // each own a gate slot after the waiter times out. Neither may be
+        // released until the blocked actor actually completes.
+        let held_owners = node.operation_gate.active.load(Ordering::SeqCst);
+        assert_eq!(held_owners, 2);
         assert!(matches!(
             node.put("excess".into(), vec![2]).await,
             Err(NodeError::Backpressure(_))
         ));
-        assert_eq!(node.operation_gate.active.load(Ordering::SeqCst), 1);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while node.operation_gate.active.load(Ordering::SeqCst) != held_owners {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(gate.received.load(Ordering::SeqCst), 1);
         let mut shutdown = Box::pin(node.shutdown());
         assert!(
             tokio::time::timeout(Duration::from_millis(20), &mut shutdown)
                 .await
                 .is_err()
         );
-        assert_eq!(node.operation_gate.active.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            node.operation_gate.active.load(Ordering::SeqCst),
+            held_owners
+        );
         gate.release.add_permits(1);
         tokio::time::timeout(Duration::from_secs(2), shutdown)
             .await
