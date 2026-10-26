@@ -183,7 +183,7 @@ impl Node {
         }
         let status = self.status_snapshot_with_limits(SnapshotLimits::new(4096, 4096));
         if status.readiness != Readiness::Ready
-            || status.node_lifecycle != NodeLifecycle::Serving
+            || status.lifecycle != NodeLifecycle::Serving
             || !placement_observation_complete(&status.observation)
         {
             return Err(MembershipError::InsufficientEvidence(

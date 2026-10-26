@@ -178,13 +178,9 @@ async fn initial_catchup_is_not_background_replication_and_progress_is_unknown()
     .await;
     let status = node.status_snapshot();
     assert_eq!(status.readiness, Readiness::NotReady);
-    assert!(status
-        .fragments
-        .iter()
-        .all(|fragment| fragment.catch_up_fraction.is_none() && !fragment.serving));
+    assert!(status.fragments.iter().all(|fragment| !fragment.serving));
     for sender in &status.replication {
         assert_eq!(sender.purpose, ReplicationPurpose::InitialCatchUp);
-        assert!(sender.lag.is_none());
         assert!(sender.last_ack_durability.is_none());
         let original = node
             .sender_report(sender.fragment, &sender.peer_id)

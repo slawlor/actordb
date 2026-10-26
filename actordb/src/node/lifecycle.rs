@@ -1871,7 +1871,7 @@ impl Node {
 
         startup_supervisors.disarm();
         observation.initialization_done();
-        observation.ready(node.status_snapshot().node_lifecycle);
+        observation.ready(node.status_snapshot().lifecycle);
         Ok(node)
     }
     pub(super) async fn replication_drain_targets(&self) -> Vec<ReplicationDrainTarget> {

@@ -26,7 +26,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
     println!(
         "lifecycle {:?}, complete {}",
-        snapshot.status.node_lifecycle,
+        snapshot.status.lifecycle,
         snapshot.status.is_complete()
     );
     node.shutdown().await?;
