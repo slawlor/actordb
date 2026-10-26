@@ -1129,22 +1129,26 @@ pub(super) async fn handle_connection(
                 });
 
                 if failure.is_none() && reconcile_barrier {
-                    let source_authorized = serving.read().unwrap().contains(&frag)
-                        || served_reconciles
-                            .lock()
-                            .unwrap()
-                            .get(&session_key)
-                            .is_some_and(|state| {
-                                recovery.as_ref().is_some_and(|authority| {
-                                    authority.authorizes(
-                                        frag,
-                                        &peer,
-                                        &state.recovery_epoch,
-                                        &state.recovery_replica_digest,
-                                        &placement.read().unwrap(),
-                                    )
-                                })
-                            });
+                    let is_serving = {
+                        let serving = serving.read().unwrap();
+                        serving.contains(&frag)
+                    };
+                    let recovery_fields = {
+                        let served = served_reconciles.lock().unwrap();
+                        served.get(&session_key).map(|state| {
+                            (
+                                state.recovery_epoch.clone(),
+                                state.recovery_replica_digest.clone(),
+                            )
+                        })
+                    };
+                    let recovery_authorized = recovery.as_ref().zip(recovery_fields).is_some_and(
+                        |(authority, (epoch, digest))| {
+                            let placement = placement.read().unwrap();
+                            authority.authorizes(frag, &peer, &epoch, &digest, &placement)
+                        },
+                    );
+                    let source_authorized = is_serving || recovery_authorized;
                     let same_serving_incarnation = source_authorized
                         && route.as_ref().is_some_and(|(generation, _)| {
                             served_reconciles
@@ -1421,7 +1425,11 @@ pub(super) async fn handle_connection(
                         &placement.read().unwrap(),
                     )
                 });
-                if !serving.read().unwrap().contains(&frag) && !recovery_authorized {
+                let is_serving = {
+                    let serving = serving.read().unwrap();
+                    serving.contains(&frag)
+                };
+                if !is_serving && !recovery_authorized {
                     // Independent placement observers can legitimately race:
                     // the serving replica may start its routine round before
                     // this node has finished bootstrapping the same fragment.
@@ -1542,22 +1550,26 @@ pub(super) async fn handle_connection(
                     );
                     continue;
                 }
-                let recovery_authorized = served_reconciles
-                    .lock()
-                    .unwrap()
-                    .get(&(peer.clone(), frag))
-                    .is_some_and(|state| {
-                        recovery.as_ref().is_some_and(|authority| {
-                            authority.authorizes(
-                                frag,
-                                &peer,
-                                &state.recovery_epoch,
-                                &state.recovery_replica_digest,
-                                &placement.read().unwrap(),
-                            )
-                        })
-                    });
-                if !serving.read().unwrap().contains(&frag) && !recovery_authorized {
+                let recovery_fields = {
+                    let served = served_reconciles.lock().unwrap();
+                    served.get(&(peer.clone(), frag)).map(|state| {
+                        (
+                            state.recovery_epoch.clone(),
+                            state.recovery_replica_digest.clone(),
+                        )
+                    })
+                };
+                let recovery_authorized = recovery.as_ref().zip(recovery_fields).is_some_and(
+                    |(authority, (epoch, digest))| {
+                        let placement = placement.read().unwrap();
+                        authority.authorizes(frag, &peer, &epoch, &digest, &placement)
+                    },
+                );
+                let is_serving = {
+                    let serving = serving.read().unwrap();
+                    serving.contains(&frag)
+                };
+                if !is_serving && !recovery_authorized {
                     // A fragment can lose authority between the summary and
                     // fetch phases. Let the correlated sender expire and retry
                     // without tearing down other traffic on this connection.

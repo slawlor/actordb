@@ -306,3 +306,115 @@ async fn successful_summary_publishes_authorization_before_response_and_retains_
     assert!(dropped.load(Ordering::Acquire));
     actor.stop_and_wait(None, None).await.unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pending_serving_writer_cannot_make_fetch_hold_the_served_round_registry() {
+    use std::sync::Condvar;
+    struct ReleaseWriter(Arc<(StdMutex<bool>, Condvar)>);
+    impl Drop for ReleaseWriter {
+        fn drop(&mut self) {
+            *self.0 .0.lock().unwrap() = true;
+            self.0 .1.notify_all();
+        }
+    }
+    let (context, actor, _state, sessions, _changes, changes_rx) = fixture(false).await;
+    let generation = context
+        .router
+        .route_with_generation(FragmentId(0))
+        .unwrap()
+        .0;
+    context.served.lock().unwrap().insert(
+        ("peer".into(), FragmentId(0)),
+        ServedReconcileState {
+            session_id: 7,
+            round_id: 9,
+            next_page_seq: 1,
+            next_after_key: "key".into(),
+            snapshot_revision: 5,
+            snapshot_time_ms: 1,
+            next_fetch_chunk_seq: 1,
+            advertised_keys: HashSet::new(),
+            route_generation: generation,
+            recovery_epoch: Vec::new(),
+            recovery_replica_digest: Vec::new(),
+        },
+    );
+    let served = context.served.clone();
+    let serving = context.serving.clone();
+    let released = Arc::new((StdMutex::new(false), Condvar::new()));
+    let release = ReleaseWriter(released.clone());
+    let (ready, writer_ready) = oneshot::channel();
+    let writer = std::thread::spawn(move || {
+        let _writer = serving.write().unwrap();
+        let _ = ready.send(());
+        let mut released_guard = released.0.lock().unwrap();
+        while !*released_guard {
+            released_guard = released.1.wait(released_guard).unwrap();
+        }
+    });
+    writer_ready.await.unwrap();
+    let (peer, _frames, _responses) = test_peer_channel(2);
+    let channel = peer.clone();
+    let (fetches, fetch_rx) = mpsc::channel(1);
+    let (summaries, summary_rx) = mpsc::channel(1);
+    let responder = tokio::spawn(run_reconcile_responder(
+        fetch_rx,
+        summary_rx,
+        peer,
+        sessions,
+        changes_rx,
+        Duration::from_secs(1),
+        context,
+    ));
+    fetches
+        .send(ReconcileResponderJob::Fetch(ReconcileResponseJob {
+            retention: None,
+            peer: "peer".into(),
+            session: InboundSession {
+                session_id: 7,
+                generation: 1,
+            },
+            actor: actor.clone(),
+            fetch: ReconcileFetch {
+                fragment: 0,
+                session_id: 7,
+                round_id: 9,
+                chunk_seq: 0,
+                keys: vec!["key".into()],
+            },
+            snapshot_time_ms: 1,
+            route_generation: generation,
+            recovery_epoch: Vec::new(),
+            recovery_replica_digest: Vec::new(),
+        }))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while fetches.capacity() == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    // The worker reaches a blocking Serving read while the independent writer
+    // holds it. The served-round guard must already be dropped; retaining it
+    // here recreates the reader/worker/Serving-writer lock-order cycle.
+    for _ in 0..20 {
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        assert!(
+            served.try_lock().is_ok(),
+            "fetch retained served while waiting for Serving"
+        );
+        assert!(!responder.is_finished());
+    }
+    channel.cancel();
+    drop(fetches);
+    drop(summaries);
+    drop(release);
+    writer.join().unwrap();
+    tokio::time::timeout(Duration::from_secs(1), responder)
+        .await
+        .unwrap()
+        .unwrap();
+    actor.stop_and_wait(None, None).await.unwrap();
+}

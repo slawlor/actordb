@@ -96,16 +96,23 @@ async fn send_reconcile_summary(
     let key = (peer.clone(), fragment);
     let first_page = request.page_seq == 0;
     let authorized = || {
-        context.serving.read().unwrap().contains(&fragment)
-            || context.recovery.as_ref().is_some_and(|authority| {
-                authority.authorizes(
-                    fragment,
-                    &peer,
-                    &request.recovery_epoch,
-                    &request.recovery_replica_digest,
-                    &context.placement.read().unwrap(),
-                )
-            })
+        let is_serving = {
+            let serving = context.serving.read().unwrap();
+            serving.contains(&fragment)
+        };
+        if is_serving {
+            return true;
+        }
+        context.recovery.as_ref().is_some_and(|authority| {
+            let placement = context.placement.read().unwrap();
+            authority.authorizes(
+                fragment,
+                &peer,
+                &request.recovery_epoch,
+                &request.recovery_replica_digest,
+                &placement,
+            )
+        })
     };
     let _mutation_lease = if context.dynamic_placement {
         match tokio::time::timeout_at(
@@ -565,13 +572,20 @@ pub(super) async fn run_reconcile_responder(
                         admission_timeout,
                         job.retention,
                         || {
-                            context
-                                .router
-                                .is_current(fragment, job.route_generation, &job.actor)
-                                && context
-                                    .served
-                                    .lock()
-                                    .unwrap()
+                            if !context.router.is_current(
+                                fragment,
+                                job.route_generation,
+                                &job.actor,
+                            ) {
+                                return false;
+                            }
+                            // Never retain served while acquiring Serving or
+                            // Placement: writer-preferring RW locks can turn
+                            // opposite reader/worker boolean chains into a
+                            // lock-order cycle when a Serving writer queues.
+                            let round_current = {
+                                let served = context.served.lock().unwrap();
+                                served
                                     .get(&(job.peer.clone(), fragment))
                                     .is_some_and(|state| {
                                         state.session_id == job.session.session_id
@@ -579,16 +593,27 @@ pub(super) async fn run_reconcile_responder(
                                             && state.route_generation == job.route_generation
                                             && state.next_fetch_chunk_seq > chunk_seq
                                     })
-                                && (context.serving.read().unwrap().contains(&fragment)
-                                    || context.recovery.as_ref().is_some_and(|authority| {
-                                        authority.authorizes(
-                                            fragment,
-                                            &job.peer,
-                                            &job.recovery_epoch,
-                                            &job.recovery_replica_digest,
-                                            &context.placement.read().unwrap(),
-                                        )
-                                    }))
+                            };
+                            if !round_current {
+                                return false;
+                            }
+                            let is_serving = {
+                                let serving = context.serving.read().unwrap();
+                                serving.contains(&fragment)
+                            };
+                            if is_serving {
+                                return true;
+                            }
+                            context.recovery.as_ref().is_some_and(|authority| {
+                                let placement = context.placement.read().unwrap();
+                                authority.authorizes(
+                                    fragment,
+                                    &job.peer,
+                                    &job.recovery_epoch,
+                                    &job.recovery_replica_digest,
+                                    &placement,
+                                )
+                            })
                         },
                     )
                     .await
