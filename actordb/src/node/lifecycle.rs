@@ -1762,6 +1762,7 @@ impl Node {
                 prefix_retirements: Arc::new(SenderFinalizationRegistry::default()),
                 preloaded_fragments,
                 placement_generation: node.placement_generation.clone(),
+                fragment_generations: Arc::new(StdMutex::new(HashMap::new())),
                 senders: node.senders.clone(),
                 finalizing_senders: node.finalizing_senders.clone(),
                 retiring_senders: node.retiring_senders.clone(),

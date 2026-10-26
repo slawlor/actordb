@@ -187,7 +187,7 @@ async fn publish_readd_and_unrelated_changes(
         deps.placement_states.lock().await.get(&FragmentId(2)),
         Some(&FragmentPlacementState::Draining)
     );
-    let generation = deps.placement_generation.load(Ordering::Acquire);
+    let generation = deps.fragment_generation(FragmentId(1));
     assert_eq!(
         tokio::time::timeout(
             Duration::from_millis(250),
@@ -412,8 +412,15 @@ async fn unchanged_authority_retries_ambiguous_deletion_idempotently() {
 
 #[tokio::test]
 async fn placement_aba_before_delete_never_mutates_the_prefix() {
-    let (deps, supervisor, _, store) = retirement_fixture().await;
-    deps.placement_generation.store(2, Ordering::Release);
+    let (deps, supervisor, controller, store) = retirement_fixture().await;
+    let mut changed = controller.placement();
+    changed.insert(FragmentId(0), vec!["node-c".into()]);
+    controller.set_placement(changed.clone());
+    placement_tick(&deps).await;
+    changed.insert(FragmentId(0), vec!["node-b".into()]);
+    controller.set_placement(changed);
+    placement_tick(&deps).await;
+    assert_eq!(deps.fragment_generation(FragmentId(0)), 2);
     finish_fragment_prefix_retirement(&deps, FragmentId(0), supervisor, vec!["node-b".into()], 0)
         .await;
     assert_eq!(store.deletion.entered.load(Ordering::Acquire), 0);
