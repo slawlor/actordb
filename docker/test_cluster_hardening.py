@@ -29,6 +29,8 @@ class Fake:
         self.events.append(("phase", phase, target, kwargs))
     def partition(self, node, isolated):
         self.events.append(("partition", node, isolated))
+    def confirm_isolation(self, node):
+        self.events.append(("isolated", node))
     def wait(self, *args):
         self.events.append(("wait", args[0]))
 
@@ -68,6 +70,26 @@ class Tests(unittest.TestCase):
                     backend.checker("verify")
             with patch.object(hardening, "command", return_value="SCENARIO_OK phase=verify"):
                 self.assertIn("SCENARIO_OK", backend.checker("verify"))
+
+    def test_docker_isolation_requires_detached_peer_bridge_and_retained_control(self):
+        with tempfile.TemporaryDirectory() as directory:
+            backend = hardening.Docker(SimpleNamespace(), Path(directory))
+            for networks, valid in [
+                ({backend.project + "_control-net": {}}, True),
+                ({backend.network: {}, backend.project + "_control-net": {}}, False),
+                ({}, False),
+            ]:
+                with patch.object(backend, "container", return_value="owned-id"), patch.object(
+                    hardening, "command", return_value=hardening.json.dumps(networks)
+                ) as run:
+                    if valid:
+                        backend.confirm_isolation("node-c")
+                    else:
+                        with self.assertRaises(RuntimeError):
+                            backend.confirm_isolation("node-c")
+                    run.assert_called_once_with([
+                        "docker", "inspect", "--format", "{{json .NetworkSettings.Networks}}", "owned-id"
+                    ])
 
     def test_command_checks_exit_status(self):
         with patch.object(hardening.subprocess, "run", return_value=SimpleNamespace(returncode=1, stdout="failure")):

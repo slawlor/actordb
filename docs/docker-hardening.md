@@ -44,6 +44,9 @@ atomically. Next-boot-only intent configures an absent target before killing it.
 Peers use peer-net; SDK/control uses control-net. Docker actually disconnects
 the peer bridge while retaining access for assertions. Process mode substitutes
 a test-only peer transport gate; it is not proof that Docker networking passed.
+Docker bridge detachment is inspected directly, then routed availability and
+isolated-quorum outcomes prove the outage. Idle TCP peers can stay registered
+after packet loss, so peer count alone is not an outage signal.
 Injected store failure/delay tests backend contracts, not kernel ENOSPC,
 filesystem corruption or power loss. Growth/shrink uses real dynamic placement
 and durable handoff, not the separate staged-membership journal protocol.

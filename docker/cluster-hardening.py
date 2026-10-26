@@ -78,6 +78,10 @@ class Backend:
                          and (old_boot is None or s["boot_id"] != old_boot),
                          "new process and placement observation")
 
+    def confirm_isolation(self, node):
+        # The process-mode transport gate actively closes its peer streams.
+        self.wait(node, lambda s: s["peers"] == 0, "closed test peer transport")
+
 
 class Processes(Backend):
     def __init__(self, args, directory):
@@ -193,6 +197,16 @@ class Docker(Backend):
             "docker", "network", "connect", "--alias", "peer-" + node, self.network, self.container(node)]
         command(argv)
 
+    def confirm_isolation(self, node):
+        networks = json.loads(command([
+            "docker", "inspect", "--format", "{{json .NetworkSettings.Networks}}",
+            self.container(node)]))
+        if self.network in networks or self.project + "_control-net" not in networks:
+            raise RuntimeError(f"{node}: peer bridge not isolated with control access retained: {networks}")
+        # Bridge removal drops packets, not idle TCP stream registrations.
+        # Routed read/query failure and isolated majority timeout below prove
+        # the outage at the application boundary without trusting peer_count.
+
     def diagnostics(self):
         if self.started:
             output = command([*self.compose, "logs", "--no-color", "--timestamps"], timeout=30)
@@ -217,12 +231,12 @@ def run(backend, args):
     backend.checker("grow-two")
     backend.checker("grow-three")
     backend.partition("node-d", True)
-    backend.wait("node-d", lambda s: s["peers"] == 0, "routing ingress outage")
+    backend.confirm_isolation("node-d")
     backend.checker("unavailable", "node-d")
     backend.partition("node-d", False)
     backend.wait("node-d", lambda s: s["peers"] == 3, "routing ingress healing")
     backend.partition("node-c", True)
-    backend.wait("node-c", lambda s: s["peers"] == 0, "replica partition")
+    backend.confirm_isolation("node-c")
     backend.checker("partition")
     backend.partition("node-c", False)
     backend.wait("node-c", lambda s: s["peers"] == 3, "replica healing")
