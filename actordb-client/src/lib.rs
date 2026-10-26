@@ -804,62 +804,17 @@ fn validate_response(frame: &wire::Frame, response: &wire::Response) -> Result<(
         }
         for row in &result.rows {
             for (cell, projection) in row.cells.iter().zip(&plan.projections) {
-                use actordb_protocol::meta::query_cell::Value;
                 use actordb_query::Projection;
                 let value = decode_cell(cell.clone())?;
-                let valid = match (projection, &cell.value, &value) {
-                    (Projection::Key, Some(Value::Text(_)), _) => true,
-                    (Projection::Value, Some(Value::Bytes(_)), _) => true,
-                    (Projection::PrefixBytes(count), Some(Value::Bytes(bytes)), _) => {
-                        bytes.len() <= *count as usize
-                    }
-                    (Projection::Fragment, _, QueryValue::Integer(value)) => {
-                        u32::try_from(*value).is_ok_and(|fragment| plan.matches_fragment(fragment))
-                    }
-                    (Projection::OctetLength, _, QueryValue::Integer(value)) => {
-                        u64::try_from(*value).is_ok()
-                    }
-                    (
-                        Projection::Aggregate {
-                            function: actordb_query::AggregateFunction::Count,
-                            ..
-                        },
-                        _,
-                        QueryValue::Integer(value),
-                    ) => *value >= 0 && *value <= u64::MAX as i128,
-                    (
-                        Projection::Aggregate {
-                            function: actordb_query::AggregateFunction::Count,
-                            ..
-                        },
-                        _,
-                        _,
-                    ) => false,
-                    (
-                        Projection::Aggregate {
-                            input: actordb_query::AggregateInput::OctetLength,
-                            ..
-                        },
-                        _,
-                        QueryValue::Integer(value),
-                    ) => *value >= 0,
-                    (
-                        Projection::Aggregate {
-                            function:
-                                actordb_query::AggregateFunction::Min
-                                | actordb_query::AggregateFunction::Max,
-                            input: actordb_query::AggregateInput::BigInt,
-                        },
-                        _,
-                        QueryValue::Integer(value),
-                    ) => i64::try_from(*value).is_ok(),
-                    (
-                        Projection::Aggregate { .. },
-                        _,
-                        QueryValue::Integer(_) | QueryValue::Null,
-                    ) => true,
-                    _ => false,
-                };
+                let valid = projection.accepts_value(&value)
+                    && match (projection, &value) {
+                        (Projection::Fragment, QueryValue::Integer(value)) => u32::try_from(*value)
+                            .is_ok_and(|fragment| plan.matches_fragment(fragment)),
+                        (Projection::NodeId, QueryValue::Text(node_id)) => {
+                            !node_id.is_empty() && node_id.len() <= 255
+                        }
+                        _ => true,
+                    };
                 if !valid {
                     return Err(invalid());
                 }

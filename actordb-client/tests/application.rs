@@ -139,6 +139,278 @@ async fn full_application_catalog_preserves_peer_membership_and_node_lifecycle()
 }
 
 #[tokio::test]
+async fn metadata_queries_match_embedded_results_and_keep_the_sdk_connection_usable() {
+    let (node, mut listener) = server(ClientServerOptions::default()).await;
+    let client = Client::connect(listener.addr(), ClientOptions::default())
+        .await
+        .unwrap();
+    client.put("plain", b"opaque\0\xff".to_vec()).await.unwrap();
+    client
+        .put_with_ttl("ttl", b"ttl".to_vec(), Some(Duration::from_secs(3600)))
+        .await
+        .unwrap();
+    client.put("deleted", b"gone".to_vec()).await.unwrap();
+    client.delete("deleted").await.unwrap();
+    for projection in [
+        "timestamp_ms",
+        "logical_counter",
+        "node_id",
+        "expires_at_ms",
+        "is_tombstone",
+    ] {
+        for key in ["plain", "ttl", "deleted"] {
+            let sql =
+                format!("SELECT {projection} FROM kv INCLUDING TOMBSTONES WHERE key = '{key}'");
+            let embedded = node.query(&sql).await.unwrap();
+            let remote = client.query(&sql).await.unwrap();
+            assert_eq!(remote, embedded, "{sql}");
+            assert_eq!(remote.rows.len(), 1);
+            assert_eq!(
+                client.get("plain").await.unwrap().unwrap().bytes,
+                b"opaque\0\xff"
+            );
+        }
+    }
+    let sql = "SELECT key, value, timestamp_ms, logical_counter, node_id, expires_at_ms, is_tombstone, frag, OCTET_LENGTH(value), PREFIX_BYTES(value, ?) FROM kv INCLUDING TOMBSTONES WHERE timestamp_ms >= ? AND logical_counter >= ? AND node_id = ? AND is_tombstone >= ? AND STARTS_WITH(key, ?)";
+    let params = [
+        QueryValue::Integer(2),
+        QueryValue::Integer(0),
+        QueryValue::Integer(0),
+        QueryValue::Text("sdk-node".into()),
+        QueryValue::Integer(0),
+        QueryValue::Text("".into()),
+    ];
+    assert_eq!(
+        client.query_with_params(sql, &params).await.unwrap(),
+        node.query_with_params(sql, &params).await.unwrap()
+    );
+    let expiry_sql = "SELECT key, expires_at_ms FROM kv WHERE expires_at_ms >= ?";
+    assert_eq!(
+        client
+            .query_with_params(expiry_sql, &[QueryValue::Integer(1)])
+            .await
+            .unwrap()
+            .rows
+            .len(),
+        1
+    );
+    let tombstones = client.query("SELECT key, timestamp_ms, logical_counter, node_id, expires_at_ms, is_tombstone FROM kv INCLUDING TOMBSTONES WHERE is_tombstone = 1").await.unwrap();
+    assert_eq!(tombstones.rows.len(), 1);
+    assert_eq!(tombstones.rows[0][0], QueryValue::Text("deleted".into()));
+    assert_eq!(tombstones.rows[0][5], QueryValue::Integer(1));
+    assert_eq!(
+        client
+            .query("SELECT expires_at_ms FROM kv WHERE key = 'plain'")
+            .await
+            .unwrap()
+            .rows,
+        vec![vec![QueryValue::Null]]
+    );
+    // Server-rejected SQL/ranges must not retire a valid application socket.
+    for (sql, params) in [
+        (
+            "SELECT timestamp_ms FROM kv WHERE timestamp_ms >= ?",
+            vec![QueryValue::Integer(-1)],
+        ),
+        (
+            "SELECT logical_counter FROM kv WHERE logical_counter = ?",
+            vec![QueryValue::Integer(u64::MAX as i128 + 1)],
+        ),
+        (
+            "SELECT is_tombstone FROM kv WHERE is_tombstone = ?",
+            vec![QueryValue::Integer(2)],
+        ),
+        ("SELECT unknown_metadata FROM kv", vec![]),
+    ] {
+        assert!(matches!(
+            client.query_with_params(sql, &params).await,
+            Err(ClientError::Server(error)) if error.code == wire::ErrorCode::Invalid as i32
+        ));
+        assert!(client.get("plain").await.unwrap().is_some());
+    }
+    client.close().await;
+    listener.shutdown().await;
+    node.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn malformed_metadata_responses_still_fail_closed() {
+    use actordb_protocol::meta::{query_cell::Value as Cell, QueryCell, QueryPageRow};
+    use wire::QueryResult;
+    let cases = [
+        ("timestamp_ms", Some(Cell::Integer("-1".into()))),
+        (
+            "timestamp_ms",
+            Some(Cell::Integer((u64::MAX as i128 + 1).to_string())),
+        ),
+        ("timestamp_ms", Some(Cell::Integer("01".into()))),
+        ("timestamp_ms", Some(Cell::Integer("+1".into()))),
+        ("timestamp_ms", Some(Cell::Null(true))),
+        ("logical_counter", Some(Cell::Text("1".into()))),
+        (
+            "logical_counter",
+            Some(Cell::Integer((u64::MAX as i128 + 1).to_string())),
+        ),
+        ("node_id", Some(Cell::Bytes(b"writer".to_vec()))),
+        ("node_id", Some(Cell::Text(String::new()))),
+        ("node_id", Some(Cell::Text("w".repeat(256)))),
+        ("expires_at_ms", Some(Cell::Null(false))),
+        ("expires_at_ms", Some(Cell::Integer("-1".into()))),
+        (
+            "expires_at_ms",
+            Some(Cell::Integer((u64::MAX as i128 + 1).to_string())),
+        ),
+        ("is_tombstone", Some(Cell::Integer("2".into()))),
+        ("is_tombstone", Some(Cell::Null(true))),
+        ("is_tombstone", None),
+    ];
+    for (projection, cell) in cases {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mock = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            mock_handshake(&mut stream).await;
+            let Some(wire::frame::Message::Request(request)) = receive(&mut stream).await.message
+            else {
+                panic!("expected query request")
+            };
+            send(
+                &mut stream,
+                wire::Frame {
+                    message: Some(wire::frame::Message::Response(wire::Response {
+                        id: request.id,
+                        query: Some(QueryResult {
+                            columns: vec![projection.into()],
+                            rows: vec![QueryPageRow {
+                                key: String::new(),
+                                cells: vec![QueryCell { value: cell }],
+                            }],
+                        }),
+                        ..Default::default()
+                    })),
+                },
+            )
+            .await;
+            let mut byte = [0];
+            let closed = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut byte))
+                .await
+                .unwrap();
+            assert!(
+                matches!(closed, Ok(0))
+                    || matches!(closed, Err(ref error) if error.kind() == std::io::ErrorKind::ConnectionReset)
+            );
+        });
+        let client = Client::connect(addr, ClientOptions::default())
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                client.query(&format!("SELECT {projection} FROM kv")).await,
+                Err(ClientError::Protocol(_))
+            ),
+            "{projection}"
+        );
+        assert!(matches!(client.get("next").await, Err(ClientError::Closed)));
+        mock.await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn sdk_metadata_validation_accepts_canonical_full_unsigned_ranges_and_null_expiry() {
+    use actordb_protocol::meta::{query_cell::Value as Cell, QueryCell};
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let mock = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        mock_handshake(&mut stream).await;
+        let Some(wire::frame::Message::Request(request)) = receive(&mut stream).await.message
+        else {
+            panic!("expected query")
+        };
+        send(
+            &mut stream,
+            wire::Frame {
+                message: Some(wire::frame::Message::Response(wire::Response {
+                    id: request.id,
+                    query: Some(wire::QueryResult {
+                        columns: [
+                            "timestamp_ms",
+                            "logical_counter",
+                            "node_id",
+                            "expires_at_ms",
+                            "is_tombstone",
+                        ]
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect(),
+                        rows: [
+                            vec![
+                                Cell::Integer("0".into()),
+                                Cell::Integer("0".into()),
+                                Cell::Text("writer".into()),
+                                Cell::Null(true),
+                                Cell::Integer("0".into()),
+                            ],
+                            vec![
+                                Cell::Integer(u64::MAX.to_string()),
+                                Cell::Integer(u64::MAX.to_string()),
+                                Cell::Text("w".repeat(255)),
+                                Cell::Integer(u64::MAX.to_string()),
+                                Cell::Integer("1".into()),
+                            ],
+                        ]
+                        .into_iter()
+                        .map(|values| actordb_protocol::meta::QueryPageRow {
+                            key: String::new(),
+                            cells: values
+                                .into_iter()
+                                .map(|value| QueryCell { value: Some(value) })
+                                .collect(),
+                        })
+                        .collect(),
+                    }),
+                    ..Default::default()
+                })),
+            },
+        )
+        .await;
+        let Some(wire::frame::Message::Request(request)) = receive(&mut stream).await.message
+        else {
+            panic!("expected follow-up get")
+        };
+        send(
+            &mut stream,
+            wire::Frame {
+                message: Some(wire::frame::Message::Response(wire::Response {
+                    id: request.id,
+                    reads: vec![wire::ReadResult {
+                        key: "next".into(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                })),
+            },
+        )
+        .await;
+    });
+    let client = Client::connect(addr, ClientOptions::default())
+        .await
+        .unwrap();
+    let rows = client
+        .query("SELECT timestamp_ms, logical_counter, node_id, expires_at_ms, is_tombstone FROM kv")
+        .await
+        .unwrap()
+        .rows;
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0][3], QueryValue::Null);
+    assert_eq!(rows[1][0], QueryValue::Integer(u64::MAX as i128));
+    assert_eq!(rows[1][4], QueryValue::Integer(1));
+    assert!(client.get("next").await.unwrap().is_none());
+    client.close().await;
+    mock.await.unwrap();
+}
+
+#[tokio::test]
 async fn application_credentials_are_mutual_and_separate_from_cluster_auth() {
     let secret = vec![42; 32];
     let (node, mut server) = server(ClientServerOptions {
