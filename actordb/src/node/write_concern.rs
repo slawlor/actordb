@@ -211,7 +211,8 @@ impl Node {
                 .local_work_timeout()
                 .checked_add(options.map_or(Duration::ZERO, WriteConcernOptions::timeout))
                 .ok_or_else(|| NodeError::Codec("local mutation deadline overflow".into()))?;
-            self.embedded_operations.submit(async move {
+            let paced = retention.pace_completions;
+            let completion_job = async move {
                 // These leases belong to actual completion, independently of
                 // the caller waiter. No accepted ApplyOp is abandoned at its
                 // user deadline; exact outcome and fanout must finish first.
@@ -302,7 +303,14 @@ impl Node {
                 }
                 .await;
                 let _ = reply.send(result);
-            })?;
+            };
+            if paced {
+                self.embedded_operations
+                    .submit_paced(completion_job, self.runtime_options.local_work_timeout())
+                    .await?;
+            } else {
+                self.embedded_operations.submit(completion_job)?;
+            }
             return tokio::time::timeout(budget, response)
                 .await
                 .map_err(|_| {

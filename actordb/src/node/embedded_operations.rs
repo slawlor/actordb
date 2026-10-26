@@ -48,6 +48,9 @@ pub(super) struct RequestRetention {
     _count: OwnedSemaphorePermit,
     _bytes: OwnedSemaphorePermit,
     _operation: Option<super::OperationPermit>,
+    /// Only points from an already-admitted aggregate may await completion
+    /// capacity. External request admission remains nonwaiting.
+    pub(super) pace_completions: bool,
 }
 
 pub(super) struct EmbeddedOperations {
@@ -108,6 +111,23 @@ impl EmbeddedOperations {
         bytes: usize,
         operation: Option<super::OperationPermit>,
     ) -> Result<Arc<RequestRetention>, NodeError> {
+        self.admit_request(bytes, operation, false)
+    }
+
+    pub(super) fn admit_batch_owned(
+        &self,
+        bytes: usize,
+        operation: Option<super::OperationPermit>,
+    ) -> Result<Arc<RequestRetention>, NodeError> {
+        self.admit_request(bytes, operation, true)
+    }
+
+    fn admit_request(
+        &self,
+        bytes: usize,
+        operation: Option<super::OperationPermit>,
+        pace_completions: bool,
+    ) -> Result<Arc<RequestRetention>, NodeError> {
         if !self.accepting.load(Ordering::Acquire) {
             return Err(NodeError::ShuttingDown);
         }
@@ -132,6 +152,7 @@ impl EmbeddedOperations {
             _count: count,
             _bytes: bytes,
             _operation: operation,
+            pace_completions,
         }))
     }
     pub(super) fn submit(
@@ -146,6 +167,48 @@ impl EmbeddedOperations {
         let completion = self.completions.clone().try_acquire_owned().map_err(|_| {
             NodeError::Backpressure("embedded mutation completion capacity exhausted".into())
         })?;
+        self.transfer(job, completion)
+    }
+
+    /// Pace only fanout belonging to a bounded, already-admitted batch. Each
+    /// waiter owns no completion permit until FIFO admission succeeds; batches
+    /// therefore cannot hold one another's permits while waiting for more.
+    pub(super) async fn submit_paced(
+        &self,
+        job: impl Future<Output = ()> + Send + 'static,
+        timeout: std::time::Duration,
+    ) -> Result<(), NodeError> {
+        let mut stopped = self.stop.subscribe();
+        if !self.accepting.load(Ordering::Acquire) || *stopped.borrow() {
+            return Err(NodeError::ShuttingDown);
+        }
+        let completion = tokio::select! {
+            biased;
+            _ = stopped.changed() => return Err(NodeError::ShuttingDown),
+            permit = tokio::time::timeout(timeout, self.completions.clone().acquire_owned()) => {
+                match permit {
+                    Ok(Ok(permit)) => permit,
+                    Ok(Err(_)) => return Err(NodeError::ShuttingDown),
+                    Err(_) => return Err(NodeError::Backpressure(
+                        "embedded batch completion admission timed out".into(),
+                    )),
+                }
+            }
+        };
+        self.transfer(job, completion)
+    }
+
+    fn transfer(
+        &self,
+        job: impl Future<Output = ()> + Send + 'static,
+        completion: OwnedSemaphorePermit,
+    ) -> Result<(), NodeError> {
+        if !self.accepting.load(Ordering::Acquire) {
+            return Err(NodeError::ShuttingDown);
+        }
+        // The queue and total completion capacity are equal. Owning this
+        // permit leaves room for its queue entry, including the tiny interval
+        // between a previous reply wakeup and that job's actual permit drop.
         self.jobs
             .try_send(Box::pin(async move {
                 let _completion = completion;
@@ -277,6 +340,10 @@ pub(super) fn reject_batch<T, R>(items: Vec<T>, error: NodeError) -> Vec<Result<
         })
         .collect()
 }
+
+#[cfg(test)]
+#[path = "embedded_batch_tests.rs"]
+mod batch_tests;
 
 #[cfg(test)]
 mod tests {
@@ -596,6 +663,73 @@ mod tests {
         .unwrap()
         .unwrap();
         drop(permit);
+        cleanup(&node, &gate, &actor).await;
+    }
+
+    #[tokio::test]
+    async fn cancelled_batch_retains_only_its_already_accepted_bounded_prefix() {
+        let (node, gate, actor) = gated_node(
+            NodeRuntimeOptions::builder()
+                .embedded_operation_capacity(2)
+                .build(),
+        )
+        .await;
+        let _release = ReleaseGate(gate.clone());
+        let writing = node.clone();
+        let batch = tokio::spawn(async move {
+            writing
+                .put_multi_with_priority(
+                    (0..8)
+                        .map(|index| (format!("key-{index}"), vec![index]))
+                        .collect(),
+                    crate::actor::OpPriority::Default,
+                )
+                .await
+        });
+        gate.entered.notified().await;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while node
+                .embedded_operation_diagnostics()
+                .active_mutation_completions()
+                != 2
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        batch.abort();
+        assert!(batch.await.unwrap_err().is_cancelled());
+        assert_eq!(node.embedded_operation_diagnostics().active_requests(), 1);
+        assert_eq!(
+            node.embedded_operation_diagnostics()
+                .active_mutation_completions(),
+            2
+        );
+        assert_eq!(*node.next_seq.lock().await, 2);
+        assert!(matches!(
+            node.put("external-excess".into(), vec![9]).await,
+            Err(NodeError::Backpressure(_))
+        ));
+        assert_eq!(gate.received.load(Ordering::Acquire), 1);
+        gate.release.add_permits(32);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while node.embedded_operation_diagnostics().active_requests() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(gate.received.load(Ordering::Acquire), 2);
+        for index in 0..8 {
+            let value = node.get(format!("key-{index}")).await.unwrap();
+            if index < 2 {
+                assert_eq!(value.unwrap().value, [index]);
+            } else {
+                assert!(value.is_none(), "cancelled suffix was admitted");
+            }
+        }
+        assert!(node.get("external-excess".into()).await.unwrap().is_none());
         cleanup(&node, &gate, &actor).await;
     }
 
