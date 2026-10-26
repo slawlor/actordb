@@ -1,6 +1,9 @@
-# Fresh deployment of ActorDB 0.9.0
+# ActorDB 0.9.1 deployment
 
-ActorDB `0.9.0` is a hard migration. Start a new deployment with fresh stores,
+ActorDB `0.9.1` preserves the wire and data formats of the published `0.9.0`.
+Existing deployments on that release require no data conversion for this patch.
+The 0.9 release line remains a hard migration from non-current formats. Start a
+new deployment with fresh stores,
 current configuration and matching database/protocol/query/SDK crates. There
 are no compatibility aliases, old-data adoption switches, rolling wire upgrades
 or automatic conversions.

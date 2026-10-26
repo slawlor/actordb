@@ -1,10 +1,11 @@
 # Current record and deployment versions
 
-ActorDB `0.9.0` supports fresh deployments only: exact peer protocol **6**,
+ActorDB `0.9.1` keeps the published `0.9.0` wire and data contracts: peer protocol **6**,
 application protocol **4**, RocksDB record/manifest format **3**, checkpoint
 **ACTCP003** and membership journal **ACTMEM04**. Deploy matching participants
 and use fresh data directories. There is no old-format reader, manifest adoption,
-wire fallback or automatic record conversion.
+wire fallback or automatic record conversion. Current-format deployments need
+no data conversion for this corrective patch.
 
 Non-current data and wire versions fail closed. Existing source data must be
 handled through a separately planned application export/re-ingestion workflow;

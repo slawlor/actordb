@@ -8,7 +8,7 @@ Connect to the **application listener**, using `Client::connect(address,
 ClientOptions::default())`. A server explicitly binds
 `actordb::client_server::ClientServer` around an existing `Arc<Node>`.
 
-Use `actordb-client = "0.9.0"` with a current application listener. The SDK
+Use `actordb-client = "0.9.1"` with a current application listener. The SDK
 uses exact application protocol 4, without version-range or capability
 negotiation. Construct `ClientOptions` and `PutOptions` with their Bon builders,
 or start with `Default` and modify public fields; these structs are
@@ -68,7 +68,7 @@ real application listener.
 
 Per-write acknowledgement counts and region requirements are available through
 `put_with_write_concern` and `delete_with_write_concern`. Install
-`actordb-client = "0.9.0"` for region, strict-policy and durability evidence support; the compatible dependency minimums
+`actordb-client = "0.9.1"` for region, strict-policy and durability evidence support; the compatible dependency minimums
 also select the required protocol and query revisions. See the
 [region guide](../docs/write-concern-regions.md) for configuration and receipt
 semantics. Local acknowledgement remains the default.
