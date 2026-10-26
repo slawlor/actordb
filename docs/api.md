@@ -132,7 +132,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 - The local node id, every `members` key, and every placement replica id must
   contain 1 to 255 UTF-8 bytes. Every dynamic map and every non-empty static map
   must contain exactly the fragments in `0..fragment_count` and use non-empty,
-  duplicate-free replica lists. An empty static map is the legacy
+  duplicate-free replica lists. An empty static map is the current
   full-replication mode.
 - `node.id()`, `node.addr()`, `node.peer_count()` are the basic inspectors.
 - `node.shutdown().await` is a fallible, one-way lifecycle fence. It rejects
@@ -190,7 +190,7 @@ ordinary-write policy. Dynamic prefix retirement privately requires this
 strongest level from every replacement replica.
 Explicit placement
 targets every configured remote replica for each locally active fragment after
-placement freezes. Empty-map legacy mode can only target senders already known
+placement freezes. Map-empty mode can only target senders already known
 at the fence; an empty target report is therefore possible.
 
 On `ReplicationDrainShutdownError::Timeout`, the structured `completed` and
@@ -375,7 +375,7 @@ the old session are rejected. A well-formed ACK below
 deadline. Reconciliation barriers use `SenderConfig::reconcile_timeout`, not
 `SenderRuntimeOptions::ack_timeout`.
 
-Protocol v3 uses the same correlated reconciliation engine for static and
+Peer protocol 6 uses the same correlated reconciliation engine for static and
 dynamic placement. Summary, fetch, data, repair, and ordinary replication
 frames are split using their exact protobuf-encoded size, with a 1 MiB soft
 page target and 16 MiB hard limit. The public actor surface includes
@@ -389,13 +389,11 @@ per-key pool admission and sticky routing. An orderly dispatcher drain returns
 the prefix after its admitted key completes; callers resume the untouched
 suffix explicitly. `FlushStable` returns
 `ApplyDurability::StableCommitted` only after that fence succeeds. `GetAll` and
-`GetSnapshot` remain source-compatible, but the network responder no longer
-uses them to clone an entire fragment.
+`GetSnapshot` are explicit local debug operations; the network responder uses
+bounded pages instead of cloning an entire fragment.
 
-`KvMessage` is now `#[non_exhaustive]`: downstream matches must include a
-wildcard arm. This is a one-time source migration for exhaustive 0.1-era
-matches and prevents future internal routing/query additions from repeatedly
-breaking embedders. The opaque `ContinueBatchRead` variant is dispatcher/
+`KvMessage` is `#[non_exhaustive]`: downstream matches include a wildcard arm.
+The opaque `ContinueBatchRead` variant is dispatcher/
 worker plumbing and cannot be constructed directly. Direct `ApplyOp` calls
 return `ApplyError::InvalidInput` for a record that cannot traverse the wire;
 this is nonfatal and does not restart a worker.
@@ -405,14 +403,13 @@ worker or roll back failed delivery. Direct actor embedders should send the
 same public `KvMessage` variants to `KvActor`, which owns admission, routing,
 supervision, and exact per-worker accounting.
 
-Protocol implementations import `actordb_protocol::meta` and upgrade in lockstep
-with the cluster. Reconciliation uses cursor, revision, page-sequence,
+Protocol implementations import `actordb_protocol::meta` and use exact peer
+protocol 6 with application protocol 4. Reconciliation uses cursor, revision, page-sequence,
 completion, and restart fields; acknowledgement levels explicitly distinguish
 applied, store-committed, and stable-committed evidence. A non-empty
 `BatchGetResponse` may now be an ordered request prefix; an empty response is
-unavailable, never not-found. The generated
-whole-state synchronization messages and unbounded sender constructors are
-not public compatibility APIs. `SenderMsg::{ReconcileResponse, ReconcileData}`
+unavailable, never not-found. There are no generated whole-state sync messages
+or unbounded sender constructors. `SenderMsg::{ReconcileResponse, ReconcileData}`
 require exact session/round/page correlation. Direct actor integrations handle
 all `ApplyDurability` and `ReplicationAckDurability` levels explicitly.
 
@@ -454,12 +451,11 @@ timeout is supplied. Already-closed queued reply ports are skipped. A probe
 already executing may finish its bounded inner wait after its caller cancels;
 this never extends the aggregate `Node::health()` deadline.
 
-`sender_report(fragment, peer)` is a `#[doc(hidden)]` test hook; production
-monitoring should use `health()` and `placement_report()`. There is also
-`sync_entries_applied()` — a compatibility counter for the retired
-`SyncResponse` path. It remains zero in protocol v3 for every placement mode.
+`sender_report(fragment, peer)` is a `#[doc(hidden)]` test hook. Production
+monitoring uses `status_snapshot`, `metrics_snapshot` or their bounded detailed
+variants; `health()` and `placement_report()` expose their separate snapshots.
 
-## Low-level maintenance message migration
+## Low-level maintenance messages
 
 `CleanerMessage::Sweep` and `SnapshotterMessage::Snap` still construct the same
 manual full operations, and all maintenance/supervisor argument structs keep
@@ -467,8 +463,7 @@ their existing fields. `FragmentState::expire_values(now)` still performs a
 full sweep and returns the total converted count. Automatic periodic work now
 uses doc-hidden variants carrying opaque, non-forgeable admission leases.
 Both public maintenance message enums are `#[non_exhaustive]`: downstream
-exhaustive matches must add a wildcard arm. This is a pre-release API change,
-not a claim of complete source compatibility. See
+matches include a wildcard arm. See
 [maintenance bounds and consistency](persistence.md#bounded-automatic-maintenance).
 
 ## Errors

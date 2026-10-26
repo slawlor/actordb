@@ -22,7 +22,7 @@ node captures that fragment's replica set when it accepts the write; changing
 placement does not change an existing waiter's threshold or eligible peers.
 Majority is calculated from configured replicas, including unavailable ones,
 rather than from the currently connected peer count. Local and `Count(1)`
-also work in the legacy empty-map configuration.
+also work in the map-empty configuration.
 
 ## APIs
 
@@ -126,22 +126,16 @@ is automatically lowered because peers are disconnected.
 | Operational cap | Explicitly lower the numeric threshold for new writes and report requested/effective counts in the receipt. |
 
 The region requirement and operational cap apply independently. A numeric cap
-never removes a region requirement. Decoders reject unknown required policy
-fields, so an older implementation cannot silently ignore a new constraint.
+never removes a region requirement. Decoders reject malformed or unknown
+required policy fields before application.
 
-## Release and compatibility
+## Current deployment contract
 
-The **0.5.0** release includes acknowledgement policies, region requirements,
-and operational caps. It uses a new minor version because generated public
-message structs gain optional `write_concern` fields. Downstream struct literals
-must initialize those fields or use `Default`. All four public crates and inter-crate minimum
-requirements move to compatible `0.5.0` ranges.
-
-Peers require the new write-concern capability before connecting. Upgrade the
-peer cluster together. The application protocol negotiates concern support;
-older SDK operations without a concern retain their local-acknowledged wire
-behavior. The LWW record/store format and ordinary Node mutation signatures
-remain the same.
+Use `0.9.0` database, protocol, query and SDK crates together. Exact peer
+protocol 6 and application protocol 4 include all current concern, region,
+strict-policy and durability-evidence messages. There is no capability or
+mixed-version negotiation. Ordinary writes still select local acknowledgement
+by default; this is a current policy choice, not a wire fallback.
 
 ## Operational overrides
 

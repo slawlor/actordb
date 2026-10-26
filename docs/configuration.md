@@ -7,7 +7,7 @@ storage feature. Opt into the `rocksdb` feature to make the offered durable
 backend available. `NodeConfig::with_rocksdb(path)` layers persistence on top of
 the defaults using synchronous WAL commits. Use
 `NodeConfig::with_rocksdb_options(path, RocksDbOptions)` for an explicit
-durability or one-time legacy-manifest adoption policy.
+durability policy. Format 3 is required; old-store adoption is not supported.
 
 ## Async configuration providers
 
@@ -84,17 +84,15 @@ an invalid limit or weak secret into a valid one.
 | `actor` | `SnapshotterArgs` | `shared` | 60-second interval |
 | `replication` | `SenderConfig` | None | Existing batching, reconciliation, and `MemoryApplied` ACK policy |
 | `replication` | `SenderRuntimeOptions` | None | 30-second ACK and 5-second queue-admission deadlines |
-| `replication` | `SenderDeps` | `router`, `hlc`, `state_report` | Fresh legacy reset-sender map |
-| `store` (`rocksdb` feature) | `RocksDbOptions` | None | `SyncWal`, legacy adoption disabled |
+| `replication` | `SenderDeps` | `router`, `hlc`, `state_report` | Explicit sender dependencies |
+| `store` (`rocksdb` feature) | `RocksDbOptions` | None | `SyncWal`, current format only |
 
-Supervisor, cleaner, and snapshotter types are also reexported from
-`supervision` for compatibility.
+Supervisor, cleaner and snapshotter types live in the canonical `actor` module.
 
 Required shared state, clocks, routers, and reports must come from the actual
 embedding; builders do not manufacture these dependencies or a fragment/node
-identity. Legacy reset maps in `SupervisorArgs` and `CleanerArgs` also default
-to fresh, independent maps. Public struct literals remain supported where
-fields are public, and existing `Default`, `with_*` methods, and getters remain
+identity. Public struct literals are supported only where their types and
+fields allow them; `Default`, `with_*` methods and getters remain
 available. No existing field visibility is widened: standalone sender control
 capacity and Node queue-failure hooks remain private and have no builder setters.
 
@@ -150,7 +148,7 @@ below before using the default plain-TCP transport in production.
 | `placement_poll_interval` | `Duration` | `1 s` | Driver re-evaluation cadence. Ignored in static mode. |
 | `placement_drain_warn_interval` | `Duration` | `10 s` | Warning cadence while a revoked fragment cannot safely drain. This never forces destructive teardown; the node remains `Draining` until recovery completes. |
 | `max_clock_skew` | `Duration` | `300 s` (5 min) | Peer and persisted timestamps farther ahead than this are rejected before storage. A violating peer connection is closed; poisoned durable state fails startup. |
-| `cluster_secret` | `Option<Vec<u8>>` | `None` | At least 32 independently generated, high-entropy random bytes for protocol-v3 mutual HMAC proofs. Each physical connection uses two fresh challenges, and the proof binds the ordered roles, ids, version ranges, capabilities, and challenges, so a captured v3 handshake cannot be replayed. The shared key proves fresh cluster-key possession, not individual member identity, and does not encrypt or integrity-protect later frames. Use a protected, mutually authenticated custom `Network` when those properties matter. Must be identical on every node. |
+| `cluster_secret` | `Option<Vec<u8>>` | `None` | At least 32 high-entropy random bytes for current challenge-bound mutual HMAC proofs. The transcript binds roles, identities, exact protocol version, generations and fresh challenges. The shared key does not distinguish holders or protect subsequent frames; TLS supplies transport authentication, integrity and confidentiality. Must match across communicating nodes. |
 
 `clock_skew_ms` exists but is `#[doc(hidden)]` — it is a test-only HLC skew
 simulator, not a tuning knob.
@@ -193,12 +191,9 @@ mode.
 RocksDB binds its first Node's id, `fragment_count`, data-format version, and
 partitioner version in a metadata column family. A mismatch or corrupt/future
 manifest returns `NodeError::Storage` before network bind. Unknown column
-families and metadata records are also rejected. A non-empty database from a
-pre-manifest release is rejected without adding a metadata column family unless
-its one-time open explicitly uses `.legacy_manifest_adoption(true)` on the
-options builder (or the existing `with_legacy_manifest_adoption(true)`); verify
-the claimed fragment layout and back it up first, then remove the flag after a
-successful start. Open-time rejection is a `StoreError` from the constructor.
+families and metadata records are rejected. Only current format 3 is accepted;
+non-current or unmanifested data is rejected without adoption or conversion.
+Use fresh directories. Open-time rejection is a `StoreError` from the constructor.
 Placement, membership, and durability policy may change without changing the
 identity manifest.
 
@@ -225,7 +220,7 @@ getter/field name, for example `.receive_byte_capacity(bytes)` followed by
 | `with_replication_control_message_capacity` / `replication_control_message_capacity` | `64` messages | Capacity of the separate ACK/NACK/reconciliation-response lane per fragment/peer sender. Full admission fails the contributing connection so session replay/reconciliation recovers it. A reconcile reply targeting a sender already retired by placement is ignored without dropping the shared peer connection. Peer lifecycle and on-demand reconcile signals are coalesced out of band. |
 | `with_inbound_connection_capacity` / `inbound_connection_capacity` | `1024` connections | Maximum accepted sockets concurrently handshaking or serving as inbound peers. Excess accepted sockets are closed immediately. |
 | `with_receive_byte_capacity` / `receive_byte_capacity` | `64 MiB` | Node-wide raw encoded receive bodies across accepted and outbound-dialed connections, including handshakes. Must fit at least one `16 MiB` maximum frame. Bytes are reserved before body allocation and retained through decoding and the inline handler turn. Saturation rejects only the contributing connection without waiting for capacity. |
-| `with_relay_capacity` / `relay_capacity` | `1024` relays | Node-wide aggregate admission for relayed single reads and single/batched mutations. Includes pending timer registration/enqueue and live timers until they exit. Admission never waits; saturation leaves legacy reads unavailable and returns explicit mutation `Unavailable`. |
+| `with_relay_capacity` / `relay_capacity` | `1024` relays | Node-wide aggregate admission for relayed single reads and single/batched mutations. Includes pending timer registration/enqueue and live timers until they exit. Admission never waits; saturation leaves single reads unavailable and returns explicit mutation `Unavailable`. |
 | `with_relay_key_byte_capacity` / `relay_key_byte_capacity` | `64 MiB` | Node-wide retained relay request-key storage: String headers and buffer capacities, plus batch Vec header and allocated String slots, including unused capacity. Not mutation payloads, writer buffers, decoded frames, caches, allocator overhead, or total heap. Fixed relay/timer overhead is separately count-bounded. No minimum other than nonzero; smaller budgets may reject otherwise legal key sets. |
 | `with_serving_read_queue_capacity` / `serving_read_queue_capacity` | `64` jobs/class | Node-wide serving single/batch-read queue per priority, backed by eight fixed workers/class. Count admission also includes active and actor-retained jobs (queue capacity + eight). Nonzero. |
 | `with_serving_read_key_byte_capacity` / `serving_read_key_byte_capacity` | `64 MiB`/class | Node-wide retained decoded read-key storage per priority, charging String buffer capacities and Vec/String headers through actor ownership after waiter cancellation. Separate from raw receive bodies, values, cache, and writer queues; at least 16 MiB. |
@@ -267,7 +262,7 @@ failure or cancellation rolls back synchronously. Each relay is pinned to its
 exact origin and expected-owner physical channels; disconnect or replacement
 reclaims only work belonging to those channels, not new work with the same
 authenticated peer id. Relay timeout uses `forwarded_attempt_timeout` and does
-not invent a legacy single-read miss or change mutation stamps/durability.
+not invent a single-read miss or change mutation stamps/durability.
 
 ## `SenderConfig` (replication)
 
@@ -336,7 +331,7 @@ These are `const`s, documented here so they don't surprise you:
 
 | Constant | Value | Meaning |
 |---|---|---|
-| `WIRE_PROTOCOL_VERSION` | `5` | The current binary accepts only wire v5. V5 requires paged anti-entropy, byte-bounded batches, stable-durability ACKs, and logical-table namespace capabilities. Binaries missing these contracts are rejected, so upgrades must be coordinated. |
+| `WIRE_PROTOCOL_VERSION` | `6` | Exact current peer protocol, including all paged anti-entropy, byte bounds, typed durability and logical-table contracts; no capability or range negotiation. |
 | `MAX_FORWARD_HOPS` | `4` | Bounds re-forward chains during placement disagreement. |
 | `NACK_RETRY_DELAY` | `1 s` | Minimum delay before retrying a receiver-rejected replication batch. |
 | `BOOTSTRAP_TIMEOUT` | `30 s` | Max wait for one of the connected, already-serving source candidates to complete bootstrap. Timeout leaves the gained fragment non-authoritative and eligible for retry. |
@@ -350,8 +345,8 @@ These are `const`s, documented here so they don't surprise you:
 | `RECONNECT_MAX` | `30 s` | Reconnect backoff cap; attempts add up to 50% jitter. |
 
 There is no setting that permits records above `MAX_FRAME_BYTES`. On startup,
-durable records written by an older binary are preflighted against every
-required single-record envelope; an oversized legacy record, or one whose
+current durable records are preflighted against every required single-record
+envelope; an oversized record, or one whose
 provenance node id is empty or exceeds 255 UTF-8 bytes, fails startup rather
 than loading data that can never replicate or be returned remotely. Repair or
 remove that record offline before restarting.
@@ -361,8 +356,8 @@ remove that record offline before restarting.
 `NodeConfig` and `SenderConfig` are non-exhaustive. Use their Bon builders to
 select settings; omitted fields keep their documented defaults. Public fields
 remain available for inspecting or adjusting a configuration created through a
-builder or `Default`. This replaces external struct literals in the unpublished
-pre-0.8 API and allows future optional settings to be added compatibly.
+builder or `Default`. The current release makes no old struct-literal or
+wire/store migration promises.
 
 ```rust
 use actordb::{node::NodeConfig, replication::SenderConfig};

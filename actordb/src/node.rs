@@ -1940,7 +1940,7 @@ impl NodeRuntimeOptions {
 /// Configuration for a [Node]. Use [`NodeConfig::builder`] to override only
 /// the settings you need; omitted fields retain the documented defaults.
 /// The non-exhaustive settings retain public fields for inspection and tuning;
-/// construct them through the builder or [`Default`] so added options remain compatible.
+/// construct them through the builder or [`Default`] to select validated settings.
 /// This is the seed of the operator-facing
 /// configuration surface (see the `NodeConfig` productionization issue).
 ///
@@ -2030,7 +2030,7 @@ pub struct NodeConfig {
     /// on every node. A non-empty map must cover exactly
     /// `0..fragment_count`; every replica list must be non-empty and
     /// duplicate-free, and every replica id must contain 1 to 255 bytes.
-    /// Empty (default) = this node serves all fragments (single-node / legacy
+    /// Empty (default) = this node serves all fragments (single-node / full
     /// full replication).
     #[builder(default)]
     pub fragment_map: HashMap<FragmentId, Vec<String>>,

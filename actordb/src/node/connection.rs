@@ -984,7 +984,7 @@ pub(super) async fn handle_connection(
                 // New sender↔receiver pairing: adopt the session id.
                 // Batches from older sessions are discarded.
                 // Zero is protobuf's absent/default value and must not create
-                // a session that legacy, uncorrelated messages can match.
+                // an uncorrelated session that invalid messages can match.
                 if s.session_id == 0 {
                     tracing::warn!(
                         fragment = s.fragment,
@@ -2033,7 +2033,7 @@ pub(super) async fn handle_connection(
                     continue;
                 }
                 let Some((generation, actor)) = router.route_with_generation(frag) else {
-                    // The legacy response cannot express unavailability.
+                    // An unavailable read must not be encoded as a false miss.
                     continue;
                 };
                 let priority = priority_from_proto(g.priority);
@@ -2703,8 +2703,8 @@ pub(super) async fn handle_connection(
         if let Some(tx_existing) = guard.get(&peer) {
             if tx_existing.same_connection(&tx) {
                 guard.remove(&peer);
-                let legacy_full_replication = placement.read().unwrap().is_empty();
-                if legacy_full_replication && operation_gate.is_running() {
+                let full_replication = placement.read().unwrap().is_empty();
+                if full_replication && operation_gate.is_running() {
                     let mut senders_guard = senders.lock().await;
                     let keys: Vec<(FragmentId, String)> = senders_guard
                         .keys()
@@ -2720,7 +2720,7 @@ pub(super) async fn handle_connection(
                         reports_guard.remove(&key);
                     }
                 } else {
-                    // Explicitly placed senders, plus legacy senders already
+                    // Explicitly placed senders, plus discovered senders already
                     // captured by a shutdown fence, retain their recovery
                     // state for reconnect. Only notify if this was the
                     // current channel.

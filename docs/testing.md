@@ -176,8 +176,8 @@ yet produced a recorded release baseline; no p99 improvement is claimed.
 
 Storage-contract tests additionally cover fail-closed manifest versions and
 metadata schemas, exact identity and exclusive attachment, concurrent bind,
-strict non-mutating rejection of legacy databases, explicit adoption with
-UTF-8/fragment-hash/wire-budget validation, bounded prefix reads, direct-write
+strict byte-for-byte non-mutating rejection of non-current databases,
+current UTF-8/fragment-hash/wire-budget validation, explicit prefix reads, direct-write
 validation, and synchronous isolated/idempotent range deletion. Node lifecycle
 tests abort startup inside a gated store load and prove the lease remains
 fail-closed, while a fully joined failed startup releases it for retry.
@@ -263,7 +263,7 @@ no-op store plumbing, not durable storage:
   `reconciliation_paginates_summaries_and_fetches_without_restart_storms`,
   `reconcile_cursor_continues_after_revision_drift_for_verified_multi_pass`,
   `worker_kill_triggers_supervised_restart`, and
-  `incompatible_hello_capabilities_are_rejected`.
+  `incompatible_hello_versions_are_rejected`.
 - **TTL/tombstones**: `ttl_expiry_removes_key`,
   `ttl_expiry_is_persisted_as_a_versioned_tombstone`,
   `ttl_expiry_does_not_resurrect_an_older_partitioned_value`,

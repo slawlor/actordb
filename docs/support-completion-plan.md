@@ -1,40 +1,36 @@
-# Support completion gates
+# Fresh-deployment support validation
 
-The full six-contract scope follows the initial PRs #137 and #138. Release
-target **0.9.0** accounts for public protocol/actor changes and the configured
-local persistence drain default. Three isolated implementation streams supplied
-peer security, checkpoint/membership and write certificates; integration also
-completed lifecycle, scoped observations and durable draining.
+ActorDB `0.9.0` has one current Rust/wire/storage contract. Deploy fresh stores
+and matching participants; no compatibility aliases, old-format import/adoption
+or version/capability negotiation is supported.
 
-## Implemented acceptance coverage
+## Required acceptance coverage
 
-- [x] Real persistence blocking and failure, cancellation-safe fence tickets,
-  exact retry, SDK admission races, queued/cancelled reads/writes, forwarded and
-  client response ownership, concurrent/repeated shutdown and store binding.
-- [x] Typed node/table/fragment/peer observations, bounded detailed pool/worker
-  metrics, actual storage/concern/request timing and errors, explicit resets,
-  freshness, omissions and callback safety.
-- [x] Owned startup, initial readiness publication, healthy Serving during
-  background gain, missing-peer/recovery blockers and live shutdown stages.
-- [x] Ed25519 process identity plus per-frame session/direction/sequence integrity,
-  never-reused historical keys, decoded old work, reconnect/tamper/replay and
-  historical provenance.
-- [x] Immutable stable checkpoint paging, authenticated bounded chunks and durable
-  cursor, torn append recovery, partial transfer/import restart, ordinary-store
-  exclusion and guarded native replacement/shrink.
-- [x] Actual memory/store/stable evidence, frozen replica identity, certified
-  operation floor, cap rejection, buffering/fence failures, uncertain outcomes,
-  supersession and retained execution after caller deadlines.
+- Real persistence blocking/failure, cancellation-safe fences, exact retry,
+  admission races, queued/cancelled point/batch/SQL/scan work and response
+  ownership, repeated shutdown and backend release.
+- Typed node/table/fragment/peer/pool/worker observations, optional timing,
+  bounded callbacks, explicit freshness, reset metadata and actual omissions.
+- Owned startup, established Serving during background gain, recovery blockers
+  and atomically published shutdown progress.
+- Exact current protocol checks, optional shared-secret challenge proof,
+  operational generation fences, decoded old work, reconnect and transport TLS.
+  Credential revocation remains external; no independent process keys exist.
+- Fresh RocksDB format 3, checkpoint ACTCP003 and membership ACTMEM04 only;
+  non-current data rejected without mutation; bounded stable snapshot/import,
+  atomic cursors, partial transfer/restart and native replacement/shrink.
+- Actual memory/store/stable evidence, frozen replica identity, submitted LWW
+  floor, strict caps, failed fences, uncertain outcomes and retained execution.
 
-## Required delivery gates
+## Delivery gates
 
 - Backend-free, memory-only and all-feature workspace suites.
-- Rust 1.88/current Clippy, protocol regeneration agreement and examples.
-- Verified package artifacts and all repository CI/Docker checks.
-- Complete PRs merged only after all ten check families succeed.
-- Component issues/tracking updated and the workspace synchronized to main.
+- Rust 1.88/current Clippy, protocol regeneration agreement and runnable examples.
+- A documentation-wide current-version/API audit and release guard tests.
+- Verified package artifacts and all ten repository CI check families,
+  including Docker, coverage, docs and benchmarks.
+- PRs merged only after their exact head passes checks.
 
-Core APIs remain independent of hosting/discovery/monitoring backends. No
-consensus, membership allocator or writer lease is claimed. External authority
-and permanently unavailable source decisions remain explicit application
-decisions, distinct from native SDK evidence.
+These APIs do not provide consensus, a hosting allocator or writer leases.
+External authority and permanent source-loss decisions remain explicit
+application decisions, distinct from actual SDK work and durable floor evidence.

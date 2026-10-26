@@ -27,7 +27,7 @@ Invalid entries fail startup before binding storage or transport. Empty and
 partial maps are accepted for writes without a region requirement.
 Region-constrained writes require explicit fragment replica placement. Labels
 for nodes outside the responsible replica set cannot satisfy the condition;
-the legacy configuration without a replica map does not establish eligible
+the configuration without a replica map does not establish eligible
 outside-region peers.
 
 Request the additional condition on a write's policy:
@@ -70,13 +70,11 @@ occurred. Success reports processing acknowledgements, without establishing a
 global order for concurrent updates or a stable-storage guarantee. Existing
 last-write-wins reconciliation and eventual replication continue to apply.
 
-## Compatibility
+## Current deployment contract
 
-Region requirements are included in the `0.5.0` release.
-
-Region requirements use an additional policy field. Older implementations
-reject unknown policy fields before application; they cannot silently ignore a
-required region condition. Upgrade nodes that process region-constrained writes
-before enabling the option. New callers reject missing or malformed required
-region progress in a success receipt as an unknown outcome. Region metadata is
-omitted when the caller has not requested the condition.
+Region requirements are part of `0.9.0`, exact peer protocol 6 and application
+protocol 4. Every participant uses the current schema; there is no feature
+negotiation or non-current receiver fallback. A missing or malformed required
+region condition is rejected before application, and malformed required
+progress in a success receipt yields an unknown outcome. Region metadata is
+omitted only when the caller has not requested the condition.

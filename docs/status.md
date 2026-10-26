@@ -27,8 +27,8 @@ placement driver and increments only when its published map changes.
 | `NotReady` | Initial authority is incomplete, admission is closed, or no established serving capacity remains |
 | `Unknown` | Contention, truncation, or a detected placement/lifecycle change prevented establishing readiness |
 
-A routing-only node can be ready with no locally assigned fragments. In legacy
-single-node mode an empty placement map means all fragments are assigned locally.
+A routing-only node can be ready with no locally assigned fragments. In
+full-replication mode an empty static placement map assigns all fragments locally.
 Readiness is about local serving authority and admission, not whether every
 remote replica is connected or a particular write concern can currently succeed.
 The last ACK's receiver durability is historical evidence only. An established
@@ -47,21 +47,21 @@ replication for a serving fragment, and placement drain. Connection state is
 typed from the existing sender report. Buffered operation count, retained-byte
 charge, in-flight batches, completed reconciliation rounds, last ACK durability,
 and an ACK mismatch preserve the existing reports' meanings. Round counts are
-sender-instance totals, not progress percentages. Catch-up fraction and lag are
-currently `None`: ActorDB has no trustworthy denominator or measured lag
-estimate. Local retained-operation queue ages, last actual successful ACK and
+sender-instance totals, not progress percentages. There is no implemented
+remote lag or dataset denominator, so no placeholder lag/fraction field is
+exposed. Local retained-operation queue ages, last actual successful ACK and
 reconciliation times, their durability and measured fetch progress are exposed
-separately. Treat unobserved ages and unknown remote lag as unknown.
+separately. Treat unobserved ages as unknown.
 
-`lifecycle` comes from `Node::drain_status()`: `Running`, `Draining`, `Drained`,
-or `Stopped`, with active ownership counts and receive/apply completion.
-`node_lifecycle` adds Starting/Initializing/Recovering/Serving/Blocked/Failed
-and Stopping views with typed reasons and fragment activity. `Drained` proves
+`lifecycle` is the typed `NodeLifecycle`, including startup, recovery, serving,
+blocking, draining, stopping and stopped states. `drain` separately contains
+`Node::drain_status()`: `Running`, `Draining`, `Drained`, or `Stopped`, with
+active ownership counts and receive/apply completion. `Drained` proves
 completion of the selected admitted local execution/persistence boundary;
 incoming replication and maintenance can still run. Only full shutdown proves
 receive/apply ownership ended. See [draining.md](draining.md).
 
-`shutdown_stage` observes an atomically published full shutdown stage, including
+`shutdown_stage` is always present and observes an atomically published stage, including
 while a call owns the coordinator or its waiter is cancelled. It identifies replication
 fencing/draining, transport shutdown, fragment quiescence/stopping, or completed
 shutdown after a cancelled/timed-out call. A retained persistence error remains

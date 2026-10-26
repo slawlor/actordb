@@ -116,7 +116,7 @@ mutation completions, and conservative retained request bytes, including work af
 request ownership across fragments/priorities; they do not cap cache,
 persistence, replication, query/scan result storage, caller-returned datasets,
 or allocator overhead. Queries/scans and serving peer reads have their own
-admission. `get_all` is a legacy debug operation with bounded request count but
+admission. `get_all` is a explicit local debug operation with bounded request count but
 an unbounded whole-dataset result; production reads should use bounded scans or
 queries. Operators must budget these other allocations separately.
 
@@ -178,19 +178,13 @@ On partition:
   longer or hide a live one slightly early. The cleaner eventually persists a
   deterministic expiry tombstone using the TTL write's original LWW version.
 
-## Content digest compatibility
+## Current wire contract
 
-Peer protocol v5 also requires `CAPABILITY_RECORD_CONTENT_DIGEST` (bit 10) and
-`CAPABILITY_TABLE_NAMESPACES` (bit 13) for shared-node logical table routing.
-A v4 peer from the earlier clock-only implementation is rejected during Hello
-negotiation if it cannot advertise and compare the 32-byte content digest.
-The capability is part of the authenticated Hello transcript; independent
-authentication test vectors remain unchanged.
+Exact peer protocol 6 includes content digests, logical table namespaces and
+typed mutation outcomes, including `MutationStatus::UnknownOutcome`. There are
+no capability bits or protocol-range negotiation. The shared-secret proof binds
+the current Hello transcript; TLS provides transport integrity and peer trust.
 
-## Typed mutation outcome compatibility
-
-Peer protocol v5 requires `CAPABILITY_TYPED_UNKNOWN_MUTATION` (bit 11) to
-interpret `MutationStatus::UnknownOutcome`. Nodes reject v4 peers missing this
-capability during Hello negotiation, before sending a status the peer cannot
-classify. The capability is authenticated with the Hello transcript; the
-existing independent authentication vectors are unchanged.
+Every current participant compares full record versions and payload digests.
+A non-current wire version is rejected before peer installation. Uncertain
+mutation completion is never converted into a false pre-apply failure.

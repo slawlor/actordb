@@ -51,9 +51,9 @@ Node without creating peer membership or replication senders.
 | `actordb::client_server` | Separate bounded application TCP listener for SDK connections |
 | `actordb::query` | SQL execution policy, bounded background pages, and revision-checked fragment coordination |
 | `actordb::actor` | All ractor actors: dispatcher/workers, `FragmentSupervisor`, `Cleaner`, `Snapshotter`; shared cache, clock, and operation/value contracts |
-| `actordb::replication` | Phase 5 async sender/receiver: `ReplicationSender` state machine, sessions, acks, protocol-v3 paged `ReconcileRequest/Response/Fetch/Data` anti-entropy |
+| `actordb::replication` | Bounded sender/receiver state, sessions, ACKs and current protocol-6 paged `ReconcileRequest/Response/Fetch/Data` anti-entropy |
 | `actordb::placement` | Phase 8 dynamic placement: `PlacementController` trait, `StaticPlacement`, `ManualPlacement`, migration lifecycle states |
-| `actordb::store` | Shared `KvStore` identity/batch/prefix contract, errors, capabilities, backend options, and compatible implementation reexports |
+| `actordb::store` | Explicit `KvStore` attachment, prefix access, commit/stable durability contracts and optional backend capabilities |
 | `actordb::store::prefixed` | Always-available fragment-view `PrefixedStore` wrapper |
 | `actordb::store::memory` | No-op `MemoryStore` test double; opt-in `memory` feature |
 | `actordb::store::rocksdb` | Fail-closed `RocksDbStore` durable backend; opt-in `rocksdb` feature |
@@ -165,11 +165,11 @@ Key design points:
 
 - No transactions, no multi-key atomicity (see [Multi-key batching](batching.md)
   for exactly what `put_multi` guarantees — it's fan-out, not a transaction).
-- Plain TCP by default and no built-in TLS. Protocol v3 uses two fresh
-  challenges when proving possession of the optional cluster-wide secret, but
-  that shared key does not distinguish members and does not protect subsequent
-  frames. Confidential, individually authenticated transports remain an
-  extension point via the `Network` trait.
+- Plain TCP is available for local use. The optional rustls `TlsNetwork` and
+  custom `Network` transports accept caller-provisioned certificates and trust
+  policy. Current shared-secret challenge proof does not distinguish holders
+  or protect subsequent frames; TLS supplies those properties. There is no
+  capability/range negotiation or independent process signing layer.
 - No consensus: conflict resolution is last-writer-wins by HLC timestamp, not
   Raft/Paxos (see [Consistency](consistency.md)).
 - Persistence is opt-in (`store: None` by default = pure in-memory) and crash

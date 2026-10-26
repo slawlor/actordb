@@ -8,11 +8,11 @@ Connect to the **application listener**, using `Client::connect(address,
 ClientOptions::default())`. A server explicitly binds
 `actordb::client_server::ClientServer` around an existing `Arc<Node>`.
 
-Construct `ClientOptions` and `PutOptions` with their Bon builders, or start
-with `Default` and modify public fields. In 0.8.0 these structs are
-`non_exhaustive`, allowing future optional settings without another literal
-construction break. Replace struct literals with builder chains; see the
-[option migration guide](../docs/client-options.md).
+Use `actordb-client = "0.9.0"` with a current application listener. The SDK
+uses exact application protocol 4, without version-range or capability
+negotiation. Construct `ClientOptions` and `PutOptions` with their Bon builders,
+or start with `Default` and modify public fields; these structs are
+`non_exhaustive`. See the [option guide](../docs/client-options.md).
 
 Run the complete TCP and SQL example with
 `cargo run -p actordb-client --example query_demo`. It starts a local listener,

@@ -10,8 +10,7 @@
 2. On restart with the same `node_id`, the node re-establishes sessions (new
    `session_id`; receivers discard the old session's batches) and the Phase 5
    reconciler repairs the divergence. Static and dynamic placement use the same
-   correlated, byte-bounded reconciliation path; `SyncRequest`/`SyncResponse`
-   are retired and `sync_entries_applied()` remains zero.
+   current correlated, byte-bounded reconciliation path.
 3. The Docker `SIGKILL + restart reconvergence` scenario covers exactly this:
    a node is SIGKILLed mid-write, restarted, and must reconverge with its
    peers. A redial supervisor in the node layer re-establishes dropped
@@ -27,11 +26,9 @@ network bind or actor startup. A restart must use the same `node_id` and
 `fragment_count`; cloned/restored database directories retain that identity.
 Unknown/corrupt versions and mismatches return `NodeError::Storage` without
 rewriting the manifest. Unknown column families and metadata records are also
-rejected. A strict open of a non-empty default-CF-only database from a
-pre-manifest release fails before adding the metadata CF, so an attempted
-upgrade does not prevent rollback. Adoption must be explicitly enabled once,
-after the operator verifies the path, fragment layout, and backup. It validates
-that every key hashes to its stored fragment under the claimed count. Two live
+rejected. Only current record/manifest format 3 is supported. Non-current or
+unmanifested data is rejected unchanged; there is no adoption or upgrade path.
+Use fresh deployment directories. Two live
 Nodes cannot share one `Arc<RocksDbStore>`; cancelled startup and best-effort
 Node drop leave that same object fail-closed.
 
@@ -41,8 +38,7 @@ than allowing that version to freeze its key; investigate clock rollback or
 poisoned data before widening the bound.
 
 Fragment startup preflights every durable record in the locally assigned
-prefixes against the protocol's required single-record envelopes. Explicit
-legacy adoption separately scans every record before writing the manifest. A
+prefixes against the current protocol's required single-record envelopes. A
 key/value that cannot fit the 16 MiB hard frame limit, has malformed encoding,
 or whose provenance node id is empty or exceeds 255 UTF-8 bytes fails startup
 instead of loading permanently unreplicable data. Repair or remove the record
@@ -166,7 +162,7 @@ buffers, and caller results remain separate memory consumers.
   challenge-bound transcript and direction, keep the same winner, cancel the
   loser, and park its dial supervisor while the winner remains healthy. This
   avoids continuously rotating replication sessions.
-- With `cluster_secret`, protocol v3 proves fresh possession of the shared key
+- With `cluster_secret`, current protocol 6 proves fresh possession of the shared key
   using both peers' random challenges. It does not distinguish holders of that
   shared key, encrypt traffic, or integrity-protect post-handshake frames. Use a
   mutually authenticated protected `Network` on an untrusted network.
@@ -239,7 +235,7 @@ mutation-admission fence or a newer winner, at `MemoryApplied` or
 `StoreCommitted`/`StableCommitted` as configured. `StoreCommitted` is ordinary
 store acceptance; `StableCommitted` invokes the backend's explicit stable
 fence. Offered RocksDB can force that fence even when ordinary writes use
-`AsyncWal`. Explicit placement supplies the closed target set; legacy empty-map mode
+`AsyncWal`. Explicit placement supplies the closed target set; map-empty mode
 can cover only authenticated peers whose senders existed at the fence. Clients
 must still retry a stamped mutation if its network response was lost.
 
@@ -279,7 +275,7 @@ states (`Bootstrapping`/`Serving`/`Draining`/`Stopped`) for diagnosis.
 | Shed counters | `health()[frag].shed_counts` | `(high, default, background)` — backpressure pressure per traffic class |
 | Restarts | `health()[frag].restarts` | Repeated worker/dispatcher restarts = crash loop; investigate before it cascades |
 | Placement | `Node::placement_report()` | Authoritative map, lifecycle states, `dynamic` flag — is migration stuck in `Bootstrapping`/`Draining`? |
-| Legacy sync entries | `Node::sync_entries_applied()` | Compatibility counter for retired `SyncResponse`; always zero in protocol v3 |
+| Typed lifecycle and drain | `Node::status_snapshot()` | Current lifecycle, separate drain ownership, atomically published shutdown stages and explicit incomplete observations |
 | Replication lag | `batch_interval` + receiver apply/flush + peer RTT | ACKs follow the receiver fence; an unanswered ordinary batch rotates and replays at `replication_ack_timeout`, while barriers use `reconcile_timeout` |
 | Peer churn | `Node::peer_count()` and timeout/session-rotation warning logs | Repeated queue/write cancellation or ACK expiry usually means a non-reading, overloaded, or unhealthy peer |
 

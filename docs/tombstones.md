@@ -16,7 +16,7 @@ serving the old value forever.
 2. **Reads**: `get` filters tombstones — a tombstoned key reads as `Ok(None)`,
    indistinguishable from "never existed".
 3. **Replication**: tombstones ride in `ReplicateBatch` ops, reconcile
-   `SyncEntry` data pages, and `KeySummary`s with their `is_tombstone` flag.
+   `ReconcileEntry` data pages, and `KeySummary`s with their `is_tombstone` flag.
    Ordered summary pages, `GetVersioned`, and bounded `GetVersionedPage`
    explicitly include tombstones —
    anti-entropy must ship tombstones so deletes propagate.
@@ -58,7 +58,7 @@ maintenance creates expiry tombstones and retains all existing deletion floors.
 
 ## On-disk encoding
 
-Tombstones persist with the `is_tombstone` byte set in the 29-byte value
-header (see [Persistence](persistence.md)). Expiry tombstones additionally
+Tombstones persist with the explicit deletion flag in the current format-3
+value header (see [Persistence](persistence.md)). Expiry tombstones additionally
 retain the original TTL deadline. They are durable across restarts — which is
 why delete state survives a node restart.

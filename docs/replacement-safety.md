@@ -12,8 +12,8 @@ Changing placement or closing a connection does not revoke a process that
 still holds valid peer credentials. Already decoded replication or
 reconciliation can also be applying after its stream closes. Successful
 full node shutdown is a supported receive/apply completion barrier. The
-authenticated generation API now also provides a hot receiver barrier:
-configure per-process signing keys/public identities and use
+operational generation API also provides a hot receiver barrier:
+configure each receiver's generation allowlist and use
 `begin_peer_fence` / `advance_peer_authority` to retire old sessions and join
 their actual work before opening the next authority. See
 [peer-authority.md](peer-authority.md). Application request admission is
@@ -25,15 +25,13 @@ For a cohort replacement that must exclude an unreachable old instance:
 1. Close external serving admission and freeze the transition's source set.
 2. Complete shutdown of surviving old SDK instances, handling errors and
    retries. A missing instance cannot provide a successful handoff receipt.
-3. Establish authenticated authority for the new cohort that excludes old
-   instances. Provision a fresh signing seed and higher generation for every
-   replacement, and update each receiver's exact authorized public identities
-   through its completed hot fence (or configure them at startup after full
-   shutdown). A retired instance cannot sign as a replacement using its old
-   key or the replacement's public verification key. Process sessions sign
-   every frame with fresh-session and sequence binding, including on plain
-   TCP; use a protected `Network` when payload confidentiality is required. Externally coordinated
-   legacy protected transport/cluster-secret replacement remains possible.
+3. Establish transport authority for the new cohort and revoke old credentials
+   externally. Provision the TLS certificate/trust policy and optional shared
+   secret, then update each receiver's exact generation allowlist through a
+   completed hot fence (or configure it at startup after full shutdown).
+   Generation checks drain accepted old work but do not prove credential
+   revocation: a process holding valid credentials can claim an allowed
+   identity/generation. There are no independent process signing keys.
 4. Recover from qualified durable sources, validate required data and writer
    authority, and then reopen external admission. Local `Serving` does not
    prove either latest-writer authority or a stable remote quorum.

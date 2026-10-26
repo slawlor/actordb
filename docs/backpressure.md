@@ -175,7 +175,7 @@ Key charges include String headers/buffer capacities and the batch Vec header
 and allocated String slots, including unused capacity. Mutation values, decoded
 frames, writer buffers, caches, and allocator overhead are outside this key
 budget; fixed relay/timer overhead is separately count-bounded. Admission never
-waits. Saturation or a lost owner yields explicit mutation `Unavailable`; legacy
+waits. Saturation or a lost owner yields explicit mutation `Unavailable`; current
 single reads stay unavailable and expire at the origin instead of falsely
 reporting a miss. Registration/enqueue cancellation rolls back the exact relay
 generation, and a timer retains admission until its future exits. Disconnect
@@ -199,7 +199,7 @@ three independent Node-wide priority queues. Each class defaults to 64 queued
 jobs, eight fixed workers, and a separate 64 MiB decoded-key-byte budget.
 Admission is nonwaiting: capacity exhaustion returns explicit shed (one ordered
 position for a batch); unavailable actors/routes return an empty batch prefix
-or silence for the legacy single-read protocol. The configured forwarded
+or silence for the single-read protocol. The configured forwarded
 attempt deadline includes queue wait and actor wait, without resetting on
 dequeue. Responses use the request's exact physical channel, and stale route
 incarnations cannot publish authoritative reads.

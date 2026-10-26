@@ -95,11 +95,11 @@ impl fmt::Display for ScanError {
 impl std::error::Error for ScanError {}
 
 impl Node {
-    /// Scan through bounded query pages while retaining the legacy per-fragment
+    /// Scan through bounded query pages using the current per-fragment
     /// offset/limit and fragment-order merge. Replies fail completely at a
     /// 16 MiB aggregate storage budget or one million visited records.
     /// Fragment work is sequential, keeping active page copies bounded.
-    pub async fn scan_bounded(
+    async fn scan_pages(
         &self,
         spec: &ScanSpec,
     ) -> Result<Vec<ScanMatch>, crate::query::QueryExecutionError> {
@@ -258,7 +258,7 @@ impl Node {
             ),
         };
         let mut rows = self
-            .scan_bounded(&scoped)
+            .scan_pages(&scoped)
             .await
             .map_err(|error| match error {
                 QueryExecutionError::FragmentsUnavailable(ids) => {
