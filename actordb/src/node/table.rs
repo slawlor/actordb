@@ -79,7 +79,14 @@ impl<'a> Table<'a> {
 
     /// Write a value into this table.
     pub async fn put(&self, key: impl Into<String>, value: Vec<u8>) -> Result<(), NodeError> {
-        self.node.put(self.id.encode_key(&key.into()), value).await
+        self.node
+            .put_qualified_with_options(
+                self.id.encode_key(&key.into()),
+                value,
+                None,
+                OpPriority::Default,
+            )
+            .await
     }
 
     /// Write with TTL and scheduling priority.
@@ -91,7 +98,7 @@ impl<'a> Table<'a> {
         priority: OpPriority,
     ) -> Result<(), NodeError> {
         self.node
-            .put_with_options(self.id.encode_key(&key.into()), value, ttl, priority)
+            .put_qualified_with_options(self.id.encode_key(&key.into()), value, ttl, priority)
             .await
     }
 
@@ -105,7 +112,7 @@ impl<'a> Table<'a> {
         options: WriteConcernOptions,
     ) -> Result<WriteConcernReceipt, WriteConcernError> {
         self.node
-            .put_with_write_concern_options(
+            .put_qualified_with_write_concern_options(
                 self.id.encode_key(&key.into()),
                 value,
                 ttl,
@@ -127,7 +134,7 @@ impl<'a> Table<'a> {
         priority: OpPriority,
     ) -> Result<(), NodeError> {
         self.node
-            .delete_with_priority(self.id.encode_key(&key.into()), priority)
+            .delete_qualified_with_priority(self.id.encode_key(&key.into()), priority)
             .await
     }
 
@@ -139,7 +146,11 @@ impl<'a> Table<'a> {
         options: WriteConcernOptions,
     ) -> Result<WriteConcernReceipt, WriteConcernError> {
         self.node
-            .delete_with_write_concern_options(self.id.encode_key(&key.into()), priority, options)
+            .delete_qualified_with_write_concern_options(
+                self.id.encode_key(&key.into()),
+                priority,
+                options,
+            )
             .await
     }
 
@@ -155,7 +166,7 @@ impl<'a> Table<'a> {
         priority: OpPriority,
     ) -> Result<Option<VersionedValue>, NodeError> {
         self.node
-            .get_with_priority(self.id.encode_key(&key.into()), priority)
+            .get_qualified_with_priority(self.id.encode_key(&key.into()), priority)
             .await
     }
 
@@ -172,7 +183,7 @@ impl<'a> Table<'a> {
         priority: OpPriority,
     ) -> Vec<Result<(), NodeError>> {
         self.node
-            .put_multi_with_priority(
+            .put_multi_qualified_with_priority(
                 values
                     .into_iter()
                     .map(|(key, value)| (self.id.encode_key(&key), value))
@@ -198,7 +209,7 @@ impl<'a> Table<'a> {
         priority: OpPriority,
     ) -> Vec<Result<Option<VersionedValue>, NodeError>> {
         self.node
-            .get_multi_with_priority(
+            .get_multi_qualified_with_priority(
                 keys.into_iter()
                     .map(|key| self.id.encode_key(&key))
                     .collect(),
@@ -268,19 +279,18 @@ impl<'a> Table<'a> {
             KeyMatcher::All => KeyMatcher::Prefix(self.id.key_prefix().into_bytes()),
             KeyMatcher::Prefix(prefix) => KeyMatcher::Prefix(self.id.encode_prefix(prefix)),
         };
-        let mut rows = self.node.scan(&scoped).await?;
+        let mut rows = self.node.scan_qualified(self.id.name(), &scoped).await?;
         for row in &mut rows {
-            if crate::table_key::table_name(&row.key).is_some() {
-                row.key = self
-                    .id
-                    .decode_key(&row.key)
-                    .map_err(|error| crate::node::ScanError::Actor(error.to_string()))?;
-            }
+            row.key = self
+                .id
+                .decode_key(&row.key)
+                .map_err(|error| crate::node::ScanError::Actor(error.to_string()))?;
         }
         Ok(rows)
     }
 
     fn namespace_plan(&self, plan: &QueryPlan) -> Result<QueryPlan, QueryExecutionError> {
+        plan.validate()?;
         let mut scoped = plan.clone();
         if !scoped.table.eq_ignore_ascii_case(self.id.name()) {
             return Err(QueryExecutionError::InvalidQuery(format!(
@@ -311,7 +321,7 @@ impl<'a> Table<'a> {
         scoped
             .predicates
             .push(KeyPredicate::Prefix(self.id.key_prefix().into_bytes()));
-        scoped.validate().map_err(QueryExecutionError::from)?;
+        crate::query::validate_physical_plan(&scoped)?;
         Ok(scoped)
     }
 }

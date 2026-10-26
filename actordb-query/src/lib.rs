@@ -23,13 +23,14 @@ mod parser;
 
 use std::fmt;
 
-pub use parser::{parse, parse_with_params};
+pub use parser::{parse, parse_with_limits, parse_with_params, parse_with_params_and_limits};
 
 /// Maximum SQL text size accepted by the parser, measured in UTF-8 bytes.
 pub const MAX_SQL_BYTES: usize = 65_536;
 /// Maximum lexical tokens in one statement.
 pub const MAX_QUERY_TOKENS: usize = 4_096;
-/// Maximum projections or key predicates in one plan.
+/// Maximum projections or combined key/metadata predicates in one plan.
+/// The independently bounded fragment scope is not part of this count.
 pub const MAX_QUERY_EXPRESSIONS: usize = 32;
 /// Maximum fragment IDs in an explicit query scope.
 pub const MAX_QUERY_FRAGMENTS: usize = 1_024;
@@ -39,6 +40,69 @@ pub const MAX_QUERY_LITERAL_BYTES: usize = 16_384;
 pub const MAX_QUERY_LIMIT: u64 = 100_000;
 /// Maximum global offset. Keyset pagination is preferable for large extracts.
 pub const MAX_QUERY_OFFSET: u64 = 100_000;
+
+/// Canonical plans may expand small placeholder SQL into 32 bounded literals.
+/// Raw SQL input remains capped by MAX_SQL_BYTES; this is the separate bounded
+/// serialization allowance, including worst-case quoting and fixed syntax.
+pub const MAX_CANONICAL_SQL_BYTES: usize =
+    MAX_QUERY_EXPRESSIONS * (MAX_QUERY_LITERAL_BYTES * 2 + 128) + MAX_SQL_BYTES;
+
+/// Bounded syntax allowances. Default preserves the public user limits.
+/// Namespace encoding is an execution representation, not permission for a
+/// client to supply more user predicates or larger logical literals.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QueryLimits {
+    predicates: usize,
+    literal_bytes: usize,
+    sql_bytes: usize,
+    canonical_sql_bytes: usize,
+}
+impl Default for QueryLimits {
+    fn default() -> Self {
+        Self {
+            predicates: MAX_QUERY_EXPRESSIONS,
+            literal_bytes: MAX_QUERY_LITERAL_BYTES,
+            sql_bytes: MAX_SQL_BYTES,
+            canonical_sql_bytes: MAX_CANONICAL_SQL_BYTES,
+        }
+    }
+}
+impl QueryLimits {
+    /// Parse the bounded literal serialization of an already-bound plan.
+    /// Public raw SQL entrypoints continue to use Default's 64 KiB input cap.
+    pub fn for_plan_serialization() -> Self {
+        Self {
+            sql_bytes: MAX_CANONICAL_SQL_BYTES,
+            ..Self::default()
+        }
+    }
+    /// Allow one namespace predicate plus hex/prefix expansion for an already
+    /// validated user plan. Consumers must separately validate the decoded
+    /// logical plan. Namespace overhead itself is bounded to 1 KiB.
+    pub fn for_namespace_encoding(namespace_bytes: usize) -> Result<Self, QueryError> {
+        check_len("namespace bytes", namespace_bytes, 1024)?;
+        Ok(Self {
+            predicates: MAX_QUERY_EXPRESSIONS + 1,
+            literal_bytes: MAX_QUERY_LITERAL_BYTES * 2 + namespace_bytes,
+            sql_bytes: MAX_CANONICAL_SQL_BYTES * 2
+                + (MAX_QUERY_EXPRESSIONS + 1) * (namespace_bytes * 2 + 128),
+            canonical_sql_bytes: MAX_CANONICAL_SQL_BYTES * 2
+                + (MAX_QUERY_EXPRESSIONS + 1) * (namespace_bytes * 2 + 128),
+        })
+    }
+    pub fn max_predicates(self) -> usize {
+        self.predicates
+    }
+    pub fn max_literal_bytes(self) -> usize {
+        self.literal_bytes
+    }
+    pub fn max_sql_bytes(self) -> usize {
+        self.sql_bytes
+    }
+    pub fn max_canonical_sql_bytes(self) -> usize {
+        self.canonical_sql_bytes
+    }
+}
 
 /// A portable cell. Integers must travel on language-neutral wires as decimal
 /// strings rather than floating-point JSON numbers.
@@ -203,6 +267,11 @@ impl std::error::Error for QueryError {}
 impl QueryPlan {
     /// Validate a programmatically constructed plan before executing it.
     pub fn validate(&self) -> Result<(), QueryError> {
+        self.validate_with_limits(QueryLimits::default())
+    }
+    /// Validate an execution representation under bounded syntax allowances.
+    /// This does not replace validation of the original logical user plan.
+    pub fn validate_with_limits(&self, limits: QueryLimits) -> Result<(), QueryError> {
         if !valid_table_name(&self.table) {
             return Err(QueryError::InvalidPlan(
                 "table must be a non-empty SQL identifier".into(),
@@ -214,11 +283,7 @@ impl QueryPlan {
             ));
         }
         check_len("projections", self.projections.len(), MAX_QUERY_EXPRESSIONS)?;
-        check_len(
-            "key predicates",
-            self.predicates.len(),
-            MAX_QUERY_EXPRESSIONS,
-        )?;
+        check_len("key predicates", self.predicates.len(), limits.predicates)?;
         check_len(
             "metadata predicates",
             self.metadata_predicates.len(),
@@ -229,7 +294,7 @@ impl QueryPlan {
             self.predicates
                 .len()
                 .saturating_add(self.metadata_predicates.len()),
-            MAX_QUERY_EXPRESSIONS,
+            limits.predicates,
         )?;
         if let Some(fragments) = &self.fragments {
             check_len("fragments", fragments.len(), MAX_QUERY_FRAGMENTS)?;
@@ -243,7 +308,7 @@ impl QueryPlan {
                 | KeyPredicate::GreaterThan(key)
                 | KeyPredicate::GreaterOrEqual(key) => key.len(),
             };
-            check_len("literal bytes", len, MAX_QUERY_LITERAL_BYTES)?;
+            check_len("literal bytes", len, limits.literal_bytes)?;
         }
         for predicate in &self.metadata_predicates {
             if let MetadataPredicate::NodeId(_, node_id) = predicate {
@@ -290,10 +355,12 @@ impl QueryPlan {
                 limit: MAX_QUERY_OFFSET as usize,
             });
         }
-        // Parameter binding can expand tiny placeholder SQL into a large
-        // literal statement. Keep every accepted plan transmissible through
-        // the same bounded parser used by other processes and languages.
-        check_len("canonical SQL bytes", self.to_sql().len(), MAX_SQL_BYTES)?;
+        // Raw input and bound-plan serialization have separate finite bounds.
+        check_len(
+            "canonical SQL bytes",
+            self.to_sql().len(),
+            limits.canonical_sql_bytes,
+        )?;
         Ok(())
     }
 
@@ -618,6 +685,11 @@ pub struct QueryAccumulator {
 
 impl QueryAccumulator {
     pub fn new(plan: &QueryPlan) -> Self {
+        Self::new_with_limits(plan, QueryLimits::default())
+    }
+    /// Compose partials for a plan validated under the supplied bounded
+    /// execution allowances. Original user-plan validation remains separate.
+    pub fn new_with_limits(plan: &QueryPlan, limits: QueryLimits) -> Self {
         let states = plan
             .projections
             .iter()
@@ -633,7 +705,7 @@ impl QueryAccumulator {
         Self {
             plan: plan.clone(),
             states,
-            validation_error: plan.validate().err().or_else(|| {
+            validation_error: plan.validate_with_limits(limits).err().or_else(|| {
                 (!plan.is_aggregate()).then(|| {
                     QueryError::InvalidPlan(
                         "QueryAccumulator requires aggregate projections".into(),

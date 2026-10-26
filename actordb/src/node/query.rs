@@ -106,6 +106,7 @@ impl Node {
     }
     /// Execute a validated structured query plan using default limits.
     pub async fn query_plan(&self, plan: &QueryPlan) -> Result<QueryResult, QueryExecutionError> {
+        plan.validate()?;
         let table = self
             .table(plan.table.clone())
             .map_err(|error| QueryExecutionError::InvalidQuery(error.to_string()))?;
@@ -118,6 +119,7 @@ impl Node {
         plan: &QueryPlan,
         options: QueryOptions,
     ) -> Result<QueryResult, QueryExecutionError> {
+        plan.validate()?;
         let table = self
             .table(plan.table.clone())
             .map_err(|error| QueryExecutionError::InvalidQuery(error.to_string()))?;
@@ -143,7 +145,7 @@ impl Node {
             self.admit_table_operation(&plan.table)
                 .map_err(|_| QueryExecutionError::ShuttingDown)?,
         );
-        plan.validate()?;
+        let syntax_limits = crate::query::validate_physical_plan(plan)?;
         let deadline = Instant::now()
             .checked_add(options.timeout)
             .filter(|_| !options.timeout.is_zero())
@@ -163,9 +165,9 @@ impl Node {
             ));
         }
         let sql = plan.to_sql();
-        if sql.len() > 1024 * 1024 {
+        if sql.len() > syntax_limits.max_canonical_sql_bytes() {
             return Err(QueryExecutionError::BudgetExceeded(
-                "query text exceeds 1 MiB".into(),
+                "query text exceeds bounded physical-plan serialization".into(),
             ));
         }
         let retention = self.query_admission.reserve_work_retained(
@@ -274,7 +276,10 @@ impl Node {
         let options = &merge_options;
         let mut visited = 0u64;
         if plan.is_aggregate() {
-            let mut aggregate = QueryAccumulator::new(&plan);
+            let mut aggregate = QueryAccumulator::new_with_limits(
+                &plan,
+                crate::query::validate_physical_plan(&plan)?,
+            );
             // One active fragment page keeps aggregate memory independent of
             // record count; the accumulator merges exact partial states.
             for index in 0..cursors.len() {
@@ -848,10 +853,12 @@ async fn actor_page(
     deadline: Instant,
 ) -> Result<QueryPageResponse, QueryExecutionError> {
     let fragment = request.fragment;
+    let validation_limits = crate::query::validate_physical_plan(&plan)?;
     let work = QueryPageWork {
         plan,
         request,
         retention: Some(retention),
+        validation_limits,
     };
     match tokio::time::timeout_at(
         deadline,
@@ -880,7 +887,7 @@ pub(super) async fn serve_query_page(
         retention.clone(),
         operation.clone(),
     )));
-    let plan = actordb_query::parse(&request.sql);
+    let plan = crate::query::parse_physical_plan(&request.sql);
     let fragment = FragmentId(request.fragment);
     let page = match plan {
         Err(error) => page_error(&request, QueryPageStatus::Invalid, error.to_string()),
@@ -917,9 +924,10 @@ pub(super) fn reserve_inbound(
     request: &QueryPageRequest,
     operation: Arc<dyn Send + Sync>,
 ) -> Result<Arc<QueryRetention>, QueryExecutionError> {
-    if request.sql.len() > 1024 * 1024 {
+    let limits = actordb_query::QueryLimits::for_namespace_encoding(1024)?;
+    if request.sql.len() > limits.max_sql_bytes() {
         return Err(QueryExecutionError::BudgetExceeded(
-            "SQL text exceeds 1 MiB".into(),
+            "SQL text exceeds bounded physical-plan serialization".into(),
         ));
     }
     let page_bytes = if request.max_bytes == 0 {

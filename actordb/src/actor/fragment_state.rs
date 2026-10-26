@@ -34,7 +34,7 @@ const VERSIONED_PAGE_TARGET_BYTES: usize = 1024 * 1024;
 fn query_page_limits(work: &crate::query::QueryPageWork) -> Result<(usize, usize, usize), String> {
     use crate::query::{MAX_QUERY_PAGE_BYTES, QUERY_PAGE_VISITS};
     let req = &work.request;
-    if let Err(error) = work.plan.validate() {
+    if let Err(error) = work.plan.validate_with_limits(work.validation_limits) {
         return Err(error.to_string());
     }
     let max_rows = if req.max_rows == 0 {
@@ -1058,11 +1058,12 @@ impl FragmentState {
                     if let Some(table) = crate::table_key::table_name(prefix) {
                         let child = self.table_children.read().await.get(&table).cloned();
                         if let Some(child) = child {
-                            return child.scan_local(spec).await;
+                            return child.scan_local_encoded(spec, Some(&table)).await;
                         }
                         // Preserve validation even for an absent relation.
-                        spec.query_plan(None)
-                            .validate()
+                        let mut plan = spec.query_plan(None);
+                        plan.table = table;
+                        crate::query::validate_physical_plan(&plan)
                             .map_err(|error| error.to_string())?;
                         return Ok(Vec::new());
                     }
@@ -1073,10 +1074,22 @@ impl FragmentState {
     }
 
     async fn scan_local(&self, spec: &ScanSpec) -> Result<Vec<ScanMatch>, String> {
+        self.scan_local_encoded(spec, None).await
+    }
+
+    async fn scan_local_encoded(
+        &self,
+        spec: &ScanSpec,
+        table: Option<&str>,
+    ) -> Result<Vec<ScanMatch>, String> {
         use crate::proto::{QueryPageRequest, QueryPageStatus};
         use crate::query::{cell_to_value, QueryOptions, QueryPageWork};
         use actordb_query::QueryValue;
-        let plan = Arc::new(spec.query_plan(None));
+        let mut plan = spec.query_plan(None);
+        if let Some(table) = table {
+            plan.table = table.into();
+        }
+        let plan = Arc::new(plan);
         let options = QueryOptions::default();
         let mut req = QueryPageRequest {
             max_rows: 256,
@@ -1103,7 +1116,12 @@ impl FragmentState {
             .min(256) as u32;
             // Page projection clones remain bounded in addition to the retained
             // reply; reject a projected row before copying a full wide value.
-            let work = QueryPageWork::new(plan.clone(), req.clone());
+            let work = if table.is_some() {
+                QueryPageWork::physical(plan.clone(), req.clone())
+                    .map_err(|error| error.to_string())?
+            } else {
+                QueryPageWork::new(plan.clone(), req.clone())
+            };
             let page = self.query_page(&work).await;
             if page.status != QueryPageStatus::Ok as i32 {
                 return Err(page.error);
@@ -1149,7 +1167,12 @@ impl FragmentState {
                 req.incarnation = page.incarnation;
                 req.after_key = page.next_after_key;
                 req.verify_only = true;
-                let verify = self.query_page(&QueryPageWork::new(plan, req)).await;
+                let work = if table.is_some() {
+                    QueryPageWork::physical(plan, req).map_err(|error| error.to_string())?
+                } else {
+                    QueryPageWork::new(plan, req)
+                };
+                let verify = self.query_page(&work).await;
                 if verify.status != QueryPageStatus::Ok as i32 {
                     return Err(verify.error);
                 }
@@ -1231,15 +1254,18 @@ impl FragmentState {
         };
         if !req.verify_only && work.plan.matches_fragment(req.fragment) && work.plan.is_aggregate()
         {
-            page.rows = actordb_query::QueryAccumulator::new(&work.plan)
-                .finish()
-                .rows
-                .into_iter()
-                .map(|row| QueryPageRow {
-                    key: String::new(),
-                    cells: row.into_iter().map(value_to_cell).collect(),
-                })
-                .collect();
+            page.rows = actordb_query::QueryAccumulator::new_with_limits(
+                &work.plan,
+                work.validation_limits,
+            )
+            .finish()
+            .rows
+            .into_iter()
+            .map(|row| QueryPageRow {
+                key: String::new(),
+                cells: row.into_iter().map(value_to_cell).collect(),
+            })
+            .collect();
         }
         if page_encoded_len(&page) > max_bytes {
             return page_error(
@@ -1306,7 +1332,7 @@ impl FragmentState {
             )
         });
         let mut keys = cache.ordered_keys.range(bounds).peekable();
-        let mut accumulator = QueryAccumulator::new(plan);
+        let mut accumulator = QueryAccumulator::new_with_limits(plan, work.validation_limits);
         let empty_metadata = actordb_query::RecordMetadata::default();
         let needs_metadata = plan.needs_metadata();
         while let Some(key) = keys.peek().copied() {

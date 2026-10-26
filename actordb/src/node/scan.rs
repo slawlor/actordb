@@ -101,6 +101,7 @@ impl Node {
     /// Fragment work is sequential, keeping active page copies bounded.
     async fn scan_pages(
         &self,
+        table: &str,
         spec: &ScanSpec,
     ) -> Result<Vec<ScanMatch>, crate::query::QueryExecutionError> {
         use crate::query::{QueryExecutionError, QueryOptions};
@@ -130,6 +131,7 @@ impl Node {
             let mut visited = 0u64;
             for fragment in 0..self.router.fragment_count() {
                 let mut plan = spec.query_plan(Some(fragment as u32));
+                plan.table = table.into();
                 plan.limit = Some(spec.effective_limit().min(MAX_SCAN_TOTAL_MATCHES as u64));
                 // Even after the aggregate count cap, validate later fragments
                 // so an unavailable holder never produces silent partial success.
@@ -239,26 +241,30 @@ impl Node {
     /// # }
     /// ```
     pub async fn scan(&self, spec: &ScanSpec) -> Result<Vec<ScanMatch>, ScanError> {
-        use crate::query::QueryExecutionError;
         let mut scoped = spec.clone();
         scoped.matcher = match &spec.matcher {
             crate::actor::KeyMatcher::All => {
                 crate::actor::KeyMatcher::Prefix(crate::table_key::table_prefix("KV").into_bytes())
             }
-            crate::actor::KeyMatcher::Prefix(prefix)
-                if std::str::from_utf8(prefix)
-                    .ok()
-                    .and_then(crate::table_key::table_name)
-                    .is_some() =>
-            {
-                crate::actor::KeyMatcher::Prefix(prefix.clone())
-            }
             crate::actor::KeyMatcher::Prefix(prefix) => crate::actor::KeyMatcher::Prefix(
                 crate::table_key::encode_table_prefix("KV", prefix),
             ),
         };
-        let mut rows = self
-            .scan_pages(&scoped)
+        let mut rows = self.scan_qualified("KV", &scoped).await?;
+        for row in &mut rows {
+            row.key = crate::table_key::decode_table_key("KV", &row.key)
+                .ok_or_else(|| ScanError::Actor("invalid KV table key namespace".into()))?;
+        }
+        Ok(rows)
+    }
+
+    pub(super) async fn scan_qualified(
+        &self,
+        table: &str,
+        spec: &ScanSpec,
+    ) -> Result<Vec<ScanMatch>, ScanError> {
+        use crate::query::QueryExecutionError;
+        self.scan_pages(table, spec)
             .await
             .map_err(|error| match error {
                 QueryExecutionError::FragmentsUnavailable(ids) => {
@@ -267,17 +273,7 @@ impl Node {
                 QueryExecutionError::Backpressure(reason) => ScanError::Backpressure(reason),
                 QueryExecutionError::ShuttingDown => ScanError::ShuttingDown,
                 other => ScanError::Actor(other.to_string()),
-            })?;
-        // The unqualified Node API is the named `KV` table view. Keep its
-        // public scan keys in user-key form; other named tables remain
-        // encoded until their `Table` handle decodes them.
-        for row in &mut rows {
-            if crate::table_key::table_name(&row.key).as_deref() == Some("KV") {
-                row.key = crate::table_key::decode_table_key("KV", &row.key)
-                    .ok_or_else(|| ScanError::Actor("invalid KV table key namespace".into()))?;
-            }
-        }
-        Ok(rows)
+            })
     }
 }
 

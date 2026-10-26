@@ -496,5 +496,11 @@ The distinction that matters in practice:
 
 ## Debug helpers
 
+Public Node point/batch keys are literal KV keys, including strings that look
+like internal namespaces. Table handles select their namespace explicitly;
+see [literal keys and table execution](key-namespaces.md).
+
 `node.get_all().await` returns every live key/value this node holds (hides
 tombstones) — intended for debugging and tests, not for production scans.
+Ambiguous mixed display keys (decoded KV versus other physical namespaces)
+return an explicit error; per-table queries avoid that ambiguity.
