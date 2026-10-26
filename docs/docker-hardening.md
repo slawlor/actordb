@@ -63,6 +63,14 @@ After building the existing server/client images, run:
 
     python3 docker/cluster-hardening.py --cycles 3 --records-per-fragment 128
 
+The image build defaults to four Cargo jobs to bound native compilation memory.
+For smaller Docker Desktop VMs, build each target with a lower limit:
+
+    docker build --build-arg CARGO_BUILD_JOBS=2 --target runtime \
+      -f docker-tests/Dockerfile . -t actordb-docker-test:latest
+    docker build --build-arg CARGO_BUILD_JOBS=2 --target client-runtime \
+      -f docker-tests/Dockerfile . -t actordb-docker-client-test:latest
+
 Without Docker:
 
     cargo build --package docker-tests --package docker-client-tests

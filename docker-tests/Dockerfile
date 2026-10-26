@@ -35,6 +35,9 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends cmake build-essential clang \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=planner /usr/src/app/recipe.json recipe.json
+# Native RocksDB compilation follows Cargo's parallel job count. Bound it on
+# memory-limited Docker Desktop VMs; callers can override this build argument.
+ARG CARGO_BUILD_JOBS=4
 # Compile third-party dependencies only. A compatible cache can retain an older
 # resolution; rebuilding without that cache resolves the manifest ranges anew.
 RUN cargo chef cook --release --recipe-path recipe.json
