@@ -198,6 +198,12 @@ in flight until the store write succeeds; failures and cancelled flush callers
 therefore leave it available for an idempotent retry. Duplicate updates to one
 key are coalesced to their LWW winner before calling the store.
 
+Handled backend errors, including caught backend panics, are returned to the
+write caller without terminating the managed worker. Unrelated admitted reads
+and writes stay in that worker's mailbox, and failed persistence winners remain
+owned for retry. An error can follow a winning cache merge; it does not prove
+the write was unapplied or durable. Actual actor failures still use supervision.
+
 The buffer is pushed to the store when:
 
 - it reaches `flush_batch_size` (default 1000 ops; ignored when `store` is `None`), or
