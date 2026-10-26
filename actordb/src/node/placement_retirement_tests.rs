@@ -70,14 +70,17 @@ impl KvStore for GatedRetirementStore {
     fn delete_prefix(&self, prefix: &[u8]) -> Result<PrefixDeleteOutcome, StoreError> {
         self.prefixes.lock().unwrap().push(prefix.to_vec());
         self.deletion.block();
-        if self
-            .fail_delete
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
-                remaining.checked_sub(1)
-            })
-            .is_ok()
-        {
-            return Err(StoreError("injected ambiguous delete failure".into()));
+        let mut remaining = self.fail_delete.load(Ordering::Acquire);
+        while remaining != 0 {
+            match self.fail_delete.compare_exchange_weak(
+                remaining,
+                remaining - 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Err(StoreError("injected ambiguous delete failure".into())),
+                Err(actual) => remaining = actual,
+            }
         }
         Ok(PrefixDeleteOutcome::Deleted)
     }
