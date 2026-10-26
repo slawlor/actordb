@@ -22,6 +22,17 @@ cells use canonical decimal strings to preserve i128 precision. Paginated
 reconciliation, bounded batches, scalar RPCs, tables, scans, queries, and
 durability acknowledgements are current mandatory contracts.
 
+Application preflight also admits aggregate decoded storage separately from
+wire size. The default accounted allowance is 64 MiB; the SDK can explicitly
+configure a larger one. Raw bytes, geometric/minimum vector capacities, message/
+cell/map headers, string/byte buffers and nested receipt/evidence conversion are
+charged before Prost materializes them. `preflight_client_frame_with_budget`
+returns the `ClientDecodeReport`; `preflight_client_response` additionally checks
+the actual pending request ID, operation counts and trusted query width/limit.
+Handshake phases can require an exact `ClientFrameKind` before materialization.
+Returned caller-owned data, allocator slack and transport buffers are not an RSS
+guarantee. This admission policy changes no protocol tags or value encodings.
+
 Application requests require a logical `table` name. Empty tables and unknown
 operations are rejected explicitly. Never reuse reserved field numbers or
 silently alter enum/absence meanings.

@@ -27,6 +27,13 @@ pub const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_BATCH_ITEMS: usize = 4096;
 pub const MAX_HANDSHAKE_BYTES: usize = 4096;
 
+mod client_decode;
+pub use client_decode::{
+    preflight_client_frame, preflight_client_frame_kind, preflight_client_frame_with_budget,
+    preflight_client_response, ClientDecodeReport, ClientFrameKind, ClientResponseShape,
+    DEFAULT_MAX_DECODED_RESPONSE_BYTES, PORTABLE_CELL_HEADER_CHARGE,
+};
+
 /// Canonical challenge proof. Client credentials use their own domain and never
 /// authenticate a peer. Both identities, offers, and fresh challenges are bound.
 pub fn client_auth_proof(
@@ -86,7 +93,7 @@ pub fn valid_client_hello(hello: &client::Hello) -> bool {
 /// Allocation-free protobuf preflight. Bounds repeated fields before Prost
 /// materializes empty nested messages. Rejects duplicate envelope/operation
 /// variants rather than accepting protobuf's last-one-wins interpretation.
-pub fn preflight_client_frame(bytes: &[u8]) -> Result<(), &'static str> {
+fn validate_client_frame_structure(bytes: &[u8]) -> Result<(), &'static str> {
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum Context {
         Frame,
