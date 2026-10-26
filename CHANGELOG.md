@@ -6,6 +6,12 @@ Corrective patch preparation for the P1 findings in #142 and #143. Peer protocol
 6, application protocol 4 and existing storage/checkpoint/journal formats remain
 unchanged. No new release is published by these pull requests.
 
+- Persist membership-transition journal updates before committing in-memory
+  state, and re-establish durability barriers on retries/reopen (#142).
+- Bound named-table actor pools and pending-empty namespace metadata; reclaim
+  only idle/unowned runtime state while preserving data, persistence ownership
+  and query incarnations (#143).
+
 ## 0.9.0
 
 This is a fresh-deployment release. Deploy the database, protocol, query and SDK

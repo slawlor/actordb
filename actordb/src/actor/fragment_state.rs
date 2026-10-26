@@ -31,14 +31,11 @@ static NEXT_QUERY_INCARNATION: AtomicU64 = AtomicU64::new(1);
 const SUMMARY_PAGE_TARGET_BYTES: usize = 1024 * 1024;
 const VERSIONED_PAGE_TARGET_BYTES: usize = 1024 * 1024;
 
-fn query_page_limits(
-    work: &crate::query::QueryPageWork,
-) -> Result<(usize, usize, usize), crate::proto::QueryPageResponse> {
-    use crate::proto::QueryPageStatus;
-    use crate::query::{page_error, MAX_QUERY_PAGE_BYTES, QUERY_PAGE_VISITS};
+fn query_page_limits(work: &crate::query::QueryPageWork) -> Result<(usize, usize, usize), String> {
+    use crate::query::{MAX_QUERY_PAGE_BYTES, QUERY_PAGE_VISITS};
     let req = &work.request;
     if let Err(error) = work.plan.validate() {
-        return Err(page_error(req, QueryPageStatus::Invalid, error.to_string()));
+        return Err(error.to_string());
     }
     let max_rows = if req.max_rows == 0 {
         QUERY_PAGE_VISITS
@@ -59,11 +56,7 @@ fn query_page_limits(
         || max_visits > QUERY_PAGE_VISITS
         || !(1024..=MAX_QUERY_PAGE_BYTES).contains(&max_bytes)
     {
-        return Err(page_error(
-            req,
-            QueryPageStatus::Invalid,
-            "invalid query page limits",
-        ));
+        return Err("invalid query page limits".into());
     }
     if !req.continuation
         && (!req.after_key.is_empty()
@@ -72,18 +65,10 @@ fn query_page_limits(
             || req.incarnation != 0
             || req.verify_only)
     {
-        return Err(page_error(
-            req,
-            QueryPageStatus::Invalid,
-            "initial page contains continuation state",
-        ));
+        return Err("initial page contains continuation state".into());
     }
     if req.continuation && (req.snapshot_time_ms == 0 || req.incarnation == 0) {
-        return Err(page_error(
-            req,
-            QueryPageStatus::Invalid,
-            "continuation lacks pinned identity/time",
-        ));
+        return Err("continuation lacks pinned identity/time".into());
     }
     Ok((max_rows, max_visits, max_bytes))
 }
@@ -1203,7 +1188,7 @@ impl FragmentState {
         use crate::query::{page_encoded_len, page_error, value_to_cell};
         let (_, _, max_bytes) = match query_page_limits(work) {
             Ok(limits) => limits,
-            Err(page) => return page,
+            Err(error) => return page_error(&work.request, QueryPageStatus::Invalid, error),
         };
         let req = &work.request;
         if req.continuation && (req.revision != 0 || req.incarnation != self.query_incarnation) {
@@ -1261,7 +1246,7 @@ impl FragmentState {
         let plan = &work.plan;
         let (max_rows, max_visits, max_bytes) = match query_page_limits(work) {
             Ok(limits) => limits,
-            Err(page) => return page,
+            Err(error) => return page_error(req, QueryPageStatus::Invalid, error),
         };
         let cache = self.cache.read().await;
         let revision = self.revision.load(Ordering::Acquire);
