@@ -444,7 +444,8 @@ impl Harness {
             .put_with_write_concern(&key, value.clone(), concern(majority))
             .await;
         c.close().await;
-        let receipt = result.map_err(|e| e.to_string())?;
+        let receipt =
+            result.map_err(|e| format!("{id} {table} key {key:?}: stable write failed: {e:?}"))?;
         self.ledger.add(certified(table, &key, value, &receipt)?);
         Ok(())
     }
@@ -832,6 +833,56 @@ impl Harness {
                 self.barrier(&id, "rolling", true).await?;
             }
             "unavailable" => self.unavailable().await?,
+            "survivors-ready" => {
+                // Exact cached rows do not mean a sender's reset/catch-up lane
+                // has finished. Prove the surviving delivery cohort is ready
+                // before submitting one non-retried strict-majority write.
+                let survivors: Vec<_> = self
+                    .ledger
+                    .owners
+                    .iter()
+                    .filter(|id| self.args.absent.as_ref() != Some(*id))
+                    .cloned()
+                    .collect();
+                require(survivors.len() == 3, "expected three bootstrap survivors")?;
+                retry("surviving stable delivery lanes", async || {
+                    for id in &survivors {
+                        let status =
+                            control(self.endpoint(id)?, json!({"command":"status"})).await?;
+                        require(
+                            status["complete"] == true,
+                            "incomplete survivor observation",
+                        )?;
+                        let fragments =
+                            status["fragments"].as_array().ok_or("missing fragments")?;
+                        require(
+                            fragments.len() == FRAGMENTS as usize
+                                && fragments
+                                    .iter()
+                                    .all(|f| f["serving"] == true && f["state"] == "Serving"),
+                            format!("{id}: surviving authority not ready: {status}"),
+                        )?;
+                        let senders = status["senders"].as_array().ok_or("missing senders")?;
+                        for peer in survivors.iter().filter(|peer| *peer != id) {
+                            for fragment in 0..FRAGMENTS {
+                                require(
+                                    senders.iter().any(|s| {
+                                        s["fragment"] == fragment
+                                            && s["peer"] == *peer
+                                            && s["state"] == "Connected"
+                                            && s["rounds"].as_u64().unwrap_or(0) > 0
+                                    }),
+                                    format!(
+                                        "{id}: delivery to {peer}/{fragment} not ready: {status}"
+                                    ),
+                                )?;
+                            }
+                        }
+                    }
+                    Ok(())
+                })
+                .await?;
+            }
             "await-bootstrap" => {
                 retry("new owner bootstrapping", async || {
                     let status = control(

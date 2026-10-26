@@ -34,6 +34,14 @@ rebuilt from recovered replicas. Stable receipts and fragment barriers define
 the floors expected to survive. Unflushed acknowledged tails are not claimed
 to survive complete failure.
 
+After killing the new bootstrap candidate, the driver separately observes
+Serving authority and completed surviving sender lanes before submitting a
+strict-majority write. Exact cached records alone do not prove delivery is
+ready. Mutation timeouts still fail the scenario and are never retried;
+failures retain full receipt diagnostics and live node/sender snapshots.
+The legacy restart scenario also gates the kill on survivor readiness and
+the restart on observed peer death, so a fast reboot cannot hide the outage.
+
 ## Control and failure scope
 
 The cluster-node control socket is PRIVATE TEST-ONLY, unauthenticated, and

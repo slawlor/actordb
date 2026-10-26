@@ -82,6 +82,15 @@ class Backend:
         # The process-mode transport gate actively closes its peer streams.
         self.wait(node, lambda s: s["peers"] == 0, "closed test peer transport")
 
+    def capture_statuses(self):
+        for node in NODES:
+            try:
+                status = self.status(node)
+                (self.directory / f"diagnostic-{node}.json").write_text(json.dumps(status, indent=2))
+                print(f"DIAGNOSTIC {node}: {json.dumps(status)}", flush=True)
+            except Exception as error:
+                print(f"DIAGNOSTIC {node} unavailable: {error}", flush=True)
+
 
 class Processes(Backend):
     def __init__(self, args, directory):
@@ -257,6 +266,7 @@ def run(backend, args):
     backend.checker("grow-four")
     backend.checker("await-bootstrap", "node-d")
     backend.stop("node-d")
+    backend.checker("survivors-ready", absent="node-d")
     backend.checker("rolling", "node-b", round=100)
     backend.start("node-d")
     backend.ready("node-d", old)
@@ -317,6 +327,7 @@ def main():
         backend.diagnostics()
     except BaseException:
         try:
+            backend.capture_statuses()
             backend.diagnostics()
         except Exception as error:
             print(f"diagnostics failed: {error}", flush=True)

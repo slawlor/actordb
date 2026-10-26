@@ -483,8 +483,10 @@ async fn restart_survivor(
         put_key(&ctx, key.clone(), expect_value.into_bytes()),
     )
     .await?;
+    println!("SURVIVOR_READY");
     ctx.log("waiting for peer to die (SIGKILL)");
     phase(&ctx, "wait-peer-death", wait_for_peer_death(&ctx)).await?;
+    println!("PEER_DIED");
     ctx.log("PEER_DIED: waiting for it to return");
     phase(&ctx, "wait-peer-return", wait_for_peers(&ctx, 1)).await?;
     ctx.log("PEER_RETURNED: letting post-restart sync settle");

@@ -44,6 +44,10 @@ class Tests(unittest.TestCase):
         shrink = next(i for i, e in enumerate(events) if e[:2] == ("phase", "shrink"))
         self.assertTrue(any(e == ("stop", "node-d", True) for e in events[prepare:shrink]))
         self.assertEqual(events[shrink][3]["absent"], "node-d")
+        survivors = next(i for i, e in enumerate(events) if e[:2] == ("phase", "survivors-ready"))
+        self.assertEqual(events[survivors - 1], ("stop", "node-d", True))
+        self.assertEqual(events[survivors][3]["absent"], "node-d")
+        self.assertEqual(events[survivors + 1][:2], ("phase", "rolling"))
         arm = next(i for i, e in enumerate(events) if e[:2] == ("phase", "arm-recovery"))
         blocked = next(i for i, e in enumerate(events) if e[:2] == ("phase", "blocked"))
         self.assertEqual({e[1] for e in events[arm:blocked] if e[0] == "stop"}, set(hardening.NODES))
@@ -95,6 +99,16 @@ class Tests(unittest.TestCase):
         with patch.object(hardening.subprocess, "run", return_value=SimpleNamespace(returncode=1, stdout="failure")):
             with self.assertRaises(RuntimeError):
                 hardening.command(["checker"])
+
+    def test_failure_status_capture_continues_after_unavailable_node(self):
+        with tempfile.TemporaryDirectory() as directory:
+            backend = hardening.Backend(SimpleNamespace(), Path(directory))
+            with patch.object(backend, "status", side_effect=[{"node":"node-a"}, RuntimeError("stopped"), {"node":"node-c"}, {"node":"node-d"}]):
+                backend.capture_statuses()
+            self.assertTrue((Path(directory) / "diagnostic-node-a.json").exists())
+            self.assertFalse((Path(directory) / "diagnostic-node-b.json").exists())
+            self.assertTrue((Path(directory) / "diagnostic-node-c.json").exists())
+            self.assertTrue((Path(directory) / "diagnostic-node-d.json").exists())
 
 
 if __name__ == "__main__":
