@@ -37,6 +37,25 @@ pull requests, and current-format stores require no conversion.
 - Admit decoded application responses before materialization, including
   collection growth, nested inspection/receipt data and portable conversion;
   share one decode/conversion owner across client clones (#153).
+- Page reconciliation through ordered cached metadata without cloning an
+  entire fragment, preserve the pinned TTL view, and atomically pair diagnostic
+  snapshots with their corresponding mutation revision (#172, #167, #168).
+- Share persistence record and byte admission across every table in a
+  fragment while preserving independent table workers and retry ownership
+  (#170); ensure standalone managed-actor persistence fences and orderly drain
+  include their table children (#178).
+- Validate durable table namespaces against the exact logical replicated
+  record, so accepted near-limit keys and values remain persistable and
+  transferable through checkpoints (#166).
+- Keep managed workers alive after handled backend errors and caught backend
+  panics, preserving unrelated admitted mailbox work and failed persistence
+  winners for retry (#171).
+- Reject unsolicited peer scan responses before allocating their result
+  collections, and remove the unused outgoing-scan registry while preserving
+  current inbound scan serving and healthy duplex sessions (#169).
+- Fence gains and durable handoffs with fragment-scoped placement generations;
+  unrelated topology changes no longer restart stable fragment catch-up, while
+  same-fragment ABA changes remain fenced (#173).
 
 ## 0.9.0
 
