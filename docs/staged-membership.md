@@ -7,6 +7,18 @@ old local floors. It allocates no machines, selects no failed member to discard,
 and implements no consensus. The application owns serialized control-plane
 decisions and authentication of supplied evidence.
 
+Authentication belongs to TLS and the optional shared PSK. Receiver generation
+gates are cooperative: an old process retaining valid transport credentials
+can claim an allowed generation. Changing a counter does not revoke those
+credentials; retire/rotate them externally. Checkpoint and receiver-fence
+evidence certifies observed local work and stable floors, not cryptographic
+identity or consensus.
+
+Only ACTMEM04 journals are read or written. Older journal headers are rejected
+without conversion or modification. The format stores process IDs/generations,
+receiver boot/revision observations and explicit application decisions, with
+no signing keys or credential payloads.
+
 ## Workflow
 
 Run the native SDK workflow with a fresh directory:
@@ -28,12 +40,10 @@ and distributed decision IDs; those are not inferred from local revisions.
    of each changed fragment, including holders retained in the final map. Record
    each immutable `CheckpointManifest` with `record_source`. The joint map keeps
    the old holder set and adds the new targets.
-3. Complete the appropriate authenticated process-authority transition at every
+3. Complete the operational receiver-generation transition at every
    affected node. Record the externally certified `MembershipAuthority` with
    `record_authority_fence`: it binds this epoch, the exact joint node IDs, their
-   positive process generations and unique Ed25519 public identities, and a
-   nonzero durable external decision ID. Secret signing material is not stored
-   in transition progress. A process-local revision is not distributed evidence.
+   positive process generations and a nonzero durable external decision ID. A process-local revision is not distributed evidence.
 4. `publish_joint(&controller)` persists the overlap intent before publishing it.
    A controller changed outside the captured old/joint map is rejected. An exact
    retry can repair publication after controller restart.
@@ -43,16 +53,15 @@ and distributed decision IDs; those are not inferred from local revisions.
    physical layout and intended target. Interruptions resume through the durable
    backend import marker; incomplete targets cannot start serving.
 6. Start/reconcile the joint set using its appropriate explicit recovery authority
-   and public peer identities. `Node::certify_membership_ready` checks actual
+   and current receiver generations. `Node::certify_membership_ready` checks actual
    joint serving routes, placement generation, and currently retained stable
    import evidence. Record every final target's returned live evidence. Checkpoint
    qualification alone does not certify readiness or elect a writer.
 7. Drain retiring processes and complete the **final** authority fences at every
    affected node. `record_final_authority_fence` must contain exactly the desired
-   identities, excluding retirees. A retained process can retain its key and
-   generation or advance its generation with a fresh key; rollback, same-generation
-   key change, and changed-generation key reuse are rejected. Joint overlap
-   authority is not treated as final revocation.
+   process IDs/generations, excluding retirees. A retained process can retain
+   or advance its generation; rollback is rejected. This operational gate does
+   not authenticate a generation claim or revoke transport credentials.
    Authority changes invalidate cached readiness; reacquire every target's
    `Node::certify_membership_ready` evidence under the final policy before retiring.
 8. `publish_final(&controller)` requires both authority decisions, all required
@@ -60,19 +69,19 @@ and distributed decision IDs; those are not inferred from local revisions.
    publishing the desired map. Normal placement handoff then stops retired
    fragments. Resume application writes under the final authenticated policy.
 
-Applications should use the native authenticated peer-fence report to certify
+Applications should use the native receiver-fence report to certify
 the corresponding external decision after all affected nodes have completed
 their fences. A caller's `MembershipAuthority::certify_external` call explicitly
 asserts that this external decision/evidence exists; ActorDB does not turn that
 declaration into consensus, verify a control-plane signature, or automatically
 distribute process credentials. Historical imported writer IDs are independent
-of current authenticated process identities.
+of current receiver-generation policies.
 
 `MembershipAuthority::certify_native_joint` requires a `MembershipFenceObservation`
 for every exact joint receiver. Each genuine `PeerFenceReport::public_authority()`
 must equal that live Node's current `Ready` snapshot, including receiver boot,
-local public key/generation, peer registry and process-local revision. Receivers
-must agree on the whole public registry. The final collector also requires a
+local generation, peer generation registry and process-local revision. Receivers
+must agree on the whole receiver generation registry. The final collector also requires a
 `MembershipShutdownObservation` for every retiring SDK process; full receive/apply
 shutdown and cutoff boot are verified separately from surviving receivers' peer
 revocation. The transition checks retired boots against its captured joint cohort.
@@ -80,17 +89,17 @@ revocation. The transition checks retired boots against its captured joint cohor
 `Node::certify_membership_ready` independently matches configured native policy
 against the selected joint/final certificate, verifies every assigned joint
 fragment is `Serving`, and rechecks placement generation, public authority and
-retained import receipts. A fencing phase, changed key, old report/boot, or
+retained import receipts. A fencing phase, changed generation, old report/boot, or
 incomplete assigned gain fails certification even when ordinary local readiness
 remains usable for established fragments. Native boot/revision evidence survives
 coordinator restart; fresh process authority needs a new transition decision.
-Unconfigured legacy receivers can use only the explicitly external route; they
+Receivers without optional generation gates can use only the explicitly external route; they
 cannot contribute a native SDK fence certificate.
 
 Membership eligibility checks complete placement and lifecycle observations,
 not optional metric-table or sender-report coverage. Registering more metric
 scopes or truncating diagnostic sender output cannot block a fully validated
-cutover. External legacy readiness is rejected while native authority is being
+cutover. External-only readiness is rejected while native authority is being
 enabled: an absent old-era public snapshot does not mean the pending fence is
 inactive. Peer phase, placement generation and application admission are checked
 again after retained floor verification.
@@ -109,10 +118,7 @@ node incarnation and placement generation; a token from another epoch or a
 previous joint/final process policy cannot satisfy the new decision.
 Each joint/final authority decision is immutable once recorded; identical retries
 are allowed, but further process-authority changes require a fresh transition
-epoch. Changed final keys cannot reuse any key admitted by the joint registry,
-including a retiring member's key. The native peer authority maintains global
-historical key tombstones across transitions; external authority providers must
-retain their corresponding durable history.
+epoch.
 
 The supported envelope is at most 4,096 fragments, 64 joint holders per fragment,
 256 distinct node IDs, and 32 MiB of proposal/evidence metadata. Adding evidence
@@ -135,9 +141,9 @@ missing retiring IDs, the proposal epoch and its nonzero external decision ID,
 then `authorize_permanent_loss` while the proposal is prepared.
 
 This explicit decision records an unavailable floor; it is **not** a checkpoint
-or successful handoff receipt. A completed authenticated joint fence is required
+or successful handoff receipt. A completed operational joint fence is required
 before that decision can remove failed processes from the joint set. All surviving
-qualified floors, stable target imports, live readiness and final revocation are
+qualified floors, stable target imports, live readiness and final receiver cutoff are
 still required before publishing final membership. The missing member contributes
 no fabricated receipt, and its latest writes may remain unrecoverable. Source-set
 qualification by itself never authorizes discard or automatic writer election.

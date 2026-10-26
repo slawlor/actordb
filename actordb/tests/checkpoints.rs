@@ -13,8 +13,7 @@ use actordb::checkpoint::{
     CheckpointError, CheckpointExporter, CheckpointImporter, CheckpointManifest, CheckpointOptions,
 };
 use actordb::membership::{
-    MembershipAuthority, MembershipPeerIdentity, MembershipStage, MembershipTransition,
-    PermanentSourceLoss,
+    MembershipAuthority, MembershipStage, MembershipTransition, PermanentSourceLoss,
 };
 use actordb::node::{Node, NodeConfig, RecoveryOptions, ReplicationDrainOptions};
 use actordb::placement::{ManualPlacement, PlacementController};
@@ -70,16 +69,8 @@ fn authority(
     map: &HashMap<FragmentId, Vec<String>>,
     decision: u8,
 ) -> MembershipAuthority {
-    let identities = map
-        .values()
-        .flatten()
-        .map(|id| {
-            let mut key = [0; 32];
-            key[..id.len()].copy_from_slice(id.as_bytes());
-            (id.clone(), MembershipPeerIdentity::new(1, key).unwrap())
-        })
-        .collect();
-    MembershipAuthority::certify_external(epoch, identities, [decision; 32]).unwrap()
+    let generations = map.values().flatten().map(|id| (id.clone(), 1)).collect();
+    MembershipAuthority::certify_external(epoch, generations, [decision; 32]).unwrap()
 }
 fn physical(table: &str, key: &str) -> Vec<u8> {
     let hex = |value: &str| {

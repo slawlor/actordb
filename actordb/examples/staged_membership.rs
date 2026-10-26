@@ -1,5 +1,5 @@
 //! Run with --features rocksdb --example staged_membership -- FRESH_DIRECTORY replace|shrink
-//! The application owns external decision IDs, durable credential history and allocation.
+//! The application owns external decisions, TLS/PSK revocation and allocation.
 
 #[cfg(feature = "rocksdb")]
 #[tokio::main]
@@ -13,8 +13,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         MembershipTransition,
     };
     use actordb::node::{
-        DrainOptions, Node, NodeConfig, NodeRuntimeOptions, PeerAuthorityOptions, PeerCredential,
-        PeerFenceOptions, RecoveryOptions,
+        DrainOptions, Node, NodeConfig, NodeRuntimeOptions, PeerAuthorityOptions, PeerFenceOptions,
+        RecoveryOptions,
     };
     use actordb::placement::ManualPlacement;
     use actordb::shard::FragmentId;
@@ -120,28 +120,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         copies.targets().len()
     );
     let joint_ids = transition.joint()[&FragmentId(0)].clone();
-    let mut credentials = HashMap::new();
-    for generation in 1..=3 {
-        for id in &joint_ids {
-            let mut seed = [0; 32];
-            getrandom::fill(&mut seed)?;
-            credentials.insert(
-                (id.clone(), generation),
-                PeerCredential::new(generation, seed),
-            );
-        }
-    }
     let policy = |id: &str, ids: &[String], generation| {
         PeerAuthorityOptions::new(
-            credentials[&(id.to_owned(), generation)].clone(),
+            generation,
             ids.iter()
                 .filter(|peer| peer.as_str() != id)
-                .map(|peer| {
-                    (
-                        peer.clone(),
-                        credentials[&(peer.clone(), generation)].public_identity(),
-                    )
-                })
+                .map(|peer| (peer.clone(), generation))
                 .collect(),
         )
     };

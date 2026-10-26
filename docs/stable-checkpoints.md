@@ -1,5 +1,9 @@
 # Stable recovery checkpoints
 
+Fresh deployments use ACTCP003 bundles and RocksDB format3 only. Older bundle
+headers and store formats are rejected; import never converts them. Historical
+record stamps in a valid current-format bundle remain unchanged.
+
 The `checkpoint` module exports bounded, immutable local store copies and
 imports them into an explicitly chosen node identity without rewriting historical
 LWW origins. The offered RocksDB backend implements the required capability.
@@ -85,7 +89,7 @@ load order. A conflicting import is not permission to overwrite data with a
 reused stamp. Preserve that target for diagnosis and use an explicitly repaired
 or fresh target for recovery.
 
-Import can adopt historical records into a **new** node identity on a fresh
+Import can restore historical records into a **new** node identity on a fresh
 store. It cannot rebind an existing different node manifest or change the
 fragment count/partitioner. Retained named-table physical prefixes, binary values,
 timestamps, logical counters, origins, tombstones and TTL deadlines are copied

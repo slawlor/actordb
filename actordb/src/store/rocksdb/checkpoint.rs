@@ -254,6 +254,7 @@ impl CheckpointBackend for RocksDbStore {
         directory: &Path,
         identity: &StoreIdentity,
     ) -> Result<Box<dyn CheckpointReader>, CheckpointError> {
+        RocksDbStore::preflight_existing(directory)?;
         let cf_names = rocksdb_engine::DB::list_cf(&rocksdb_engine::Options::default(), directory)
             .map_err(|error| StoreError(error.to_string()))?;
         let descriptors = cf_names.into_iter().map(|name| {

@@ -186,6 +186,19 @@ mod tests {
             written: std::sync::Mutex<Vec<(Vec<u8>, VersionedValue)>>,
         }
         impl KvStore for Rec {
+            fn bind(&self, _: &StoreIdentity) -> Result<StoreBinding, StoreError> {
+                Ok(StoreBinding::unmanaged())
+            }
+            fn load_prefix(
+                &self,
+                prefix: &[u8],
+            ) -> Result<Vec<(Vec<u8>, VersionedValue)>, StoreError> {
+                Ok(self
+                    .load()?
+                    .into_iter()
+                    .filter(|(key, _)| key.starts_with(prefix))
+                    .collect())
+            }
             fn load(&self) -> Result<Vec<(Vec<u8>, VersionedValue)>, StoreError> {
                 Ok(self.written.lock().unwrap().clone())
             }
@@ -261,6 +274,15 @@ mod tests {
             written: Mutex<Vec<(Vec<u8>, VersionedValue)>>,
         }
         impl KvStore for Rec {
+            fn bind(&self, _: &StoreIdentity) -> Result<StoreBinding, StoreError> {
+                Ok(StoreBinding::unmanaged())
+            }
+            fn commit_durability(&self) -> StoreCommitDurability {
+                StoreCommitDurability::Buffered
+            }
+            fn stable_fence(&self) -> Result<StoreCommitDurability, StoreError> {
+                Ok(StoreCommitDurability::Buffered)
+            }
             fn load(&self) -> Result<Vec<(Vec<u8>, VersionedValue)>, StoreError> {
                 Ok(self.written.lock().unwrap().clone())
             }

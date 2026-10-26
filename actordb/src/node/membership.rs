@@ -117,7 +117,7 @@ impl Node {
                 || !crate::membership::native::matches_snapshot(authority, snapshot)
             {
                 return Err(MembershipError::InsufficientEvidence(
-                    "current native public authority does not match the exact transition policy"
+                    "current native receiver policy does not match the exact transition policy"
                         .into(),
                 ));
             }
@@ -136,11 +136,11 @@ impl Node {
             }
         } else if authority.is_native() {
             return Err(MembershipError::InsufficientEvidence(
-                "native evidence cannot authorize a legacy unconfigured receiver".into(),
+                "native evidence requires a configured receiver-generation policy".into(),
             ));
         } else if captured_peer_phase != PeerFencePhase::Unconfigured {
             return Err(MembershipError::InsufficientEvidence(
-                "legacy external readiness is unavailable during native fencing/shutdown".into(),
+                "external-only readiness is unavailable during native fencing/shutdown".into(),
             ));
         }
         let store = self

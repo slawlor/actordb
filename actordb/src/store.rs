@@ -240,8 +240,8 @@ impl StoreIdentity {
 
 /// RAII ownership returned when a node attaches to a store.
 ///
-/// Custom stores receive an unmanaged binding from the default
-/// [`KvStore::bind`] implementation. RocksDB uses a managed binding to reject
+/// Every backend implements an explicit [`KvStore::bind`] policy. RocksDB
+/// uses a managed binding to reject
 /// two live nodes sharing one `RocksDbStore` instance; dropping the binding
 /// releases that in-process attachment.
 pub struct StoreBinding {
@@ -347,8 +347,8 @@ pub struct StorageDiagnostics {
 pub enum PrefixDeleteOutcome {
     /// The prefix was durably made invisible before the call returned.
     Deleted,
-    /// The backend retained the prefix. This is the source-compatible default
-    /// for custom stores which have not implemented durable namespace cleanup.
+    /// The backend retained the prefix because durable namespace cleanup is
+    /// unsupported or deliberately disabled.
     Retained,
 }
 

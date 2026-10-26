@@ -92,25 +92,18 @@ pub(crate) fn matches_snapshot(
     if snapshot.phase() != PeerFencePhase::Ready {
         return false;
     }
-    let Some(local) = authority.identities().get(snapshot.receiver_id()) else {
+    let Some(local) = authority.generations().get(snapshot.receiver_id()) else {
         return false;
     };
-    if local.generation() != snapshot.local_public_identity().generation()
-        || local.public_key() != snapshot.local_public_identity().public_key()
-    {
-        return false;
-    }
-    if snapshot.peer_identities().len() + 1 != authority.identities().len() {
-        return false;
-    }
-    snapshot.peer_identities().iter().all(|(id, observed)| {
-        authority.identities().get(id).is_some_and(|expected| {
-            expected.generation() == observed.generation()
-                && expected.public_key() == observed.public_key()
-        })
-    }) && !snapshot
-        .peer_identities()
-        .contains_key(snapshot.receiver_id())
+    *local == snapshot.local_generation()
+        && snapshot.peer_generations().len() + 1 == authority.generations().len()
+        && snapshot
+            .peer_generations()
+            .iter()
+            .all(|(id, generation)| authority.generations().get(id) == Some(generation))
+        && !snapshot
+            .peer_generations()
+            .contains_key(snapshot.receiver_id())
 }
 fn node_ids(map: &MembershipMap) -> BTreeSet<String> {
     map.values().flatten().cloned().collect()
@@ -133,7 +126,7 @@ fn certify_receivers(
     for observation in observations {
         let snapshot = observation.node.peer_authority_snapshot().ok_or_else(|| {
             MembershipError::InsufficientEvidence(
-                "legacy external authority is not a native SDK fence".into(),
+                "external-only authority is not a native SDK receiver fence".into(),
             )
         })?;
         if snapshot.phase() != PeerFencePhase::Ready
@@ -147,27 +140,19 @@ fn certify_receivers(
             ));
         }
         let mut identities = snapshot
-            .peer_identities()
+            .peer_generations()
             .iter()
-            .map(|(id, peer)| {
-                Ok((
-                    id.clone(),
-                    MembershipPeerIdentity::new(peer.generation(), *peer.public_key())?,
-                ))
-            })
-            .collect::<Result<BTreeMap<_, _>, MembershipError>>()?;
+            .map(|(id, generation)| (id.clone(), *generation))
+            .collect::<BTreeMap<_, _>>();
         identities.insert(
             snapshot.receiver_id().to_owned(),
-            MembershipPeerIdentity::new(
-                snapshot.local_public_identity().generation(),
-                *snapshot.local_public_identity().public_key(),
-            )?,
+            snapshot.local_generation(),
         );
         if identities.keys().cloned().collect::<BTreeSet<_>>() != expected
             || registry.as_ref().is_some_and(|prior| prior != &identities)
         {
             return Err(MembershipError::InsufficientEvidence(
-                "live receiver public registries disagree with exact membership".into(),
+                "live receiver generation policies disagree with exact membership".into(),
             ));
         }
         registry = Some(identities);
