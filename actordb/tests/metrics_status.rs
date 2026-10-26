@@ -81,13 +81,13 @@ async fn collectors_reenter_during_writes_and_observe_drain_and_stop() {
         }
         let beginning = node.begin_drain();
         let draining = node.metrics_snapshot();
-        assert_eq!(draining.status.lifecycle.phase(), beginning.phase());
+        assert_eq!(draining.status.drain.phase(), beginning.phase());
         assert_eq!(draining.status.readiness, Readiness::NotReady);
         let report = node.drain_requests(DrainOptions::default()).await.unwrap();
         assert_eq!(report.status().phase(), DrainPhase::Drained);
         let drained = node.metrics_snapshot();
-        assert_eq!(drained.status.lifecycle.phase(), report.status().phase());
-        assert_eq!(drained.status.lifecycle.active_requests(), 0);
+        assert_eq!(drained.status.drain.phase(), report.status().phase());
+        assert_eq!(drained.status.drain.active_requests(), 0);
         assert_eq!(drained.status.readiness, Readiness::NotReady);
         assert!(matches!(
             node.put("closed".into(), vec![]).await,
@@ -98,8 +98,8 @@ async fn collectors_reenter_during_writes_and_observe_drain_and_stop() {
         let stopped = node.collect_metrics(&|_: &actordb::node::metrics::MetricPoint| {
             assert_eq!(node.drain_status().phase(), DrainPhase::Stopped);
         });
-        assert_eq!(stopped.status.lifecycle, stopped_report.status());
-        assert!(stopped.status.lifecycle.receive_apply_complete());
+        assert_eq!(stopped.status.drain, stopped_report.status());
+        assert!(stopped.status.drain.receive_apply_complete());
         assert_eq!(stopped.status.readiness, Readiness::NotReady);
     })
     .await

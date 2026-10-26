@@ -986,8 +986,8 @@ mod tests {
             Err(DrainError::Timeout { .. })
         ));
         let metrics = node.metrics_snapshot();
-        assert_eq!(metrics.status.lifecycle.cutoff(), cutoff);
-        assert!(metrics.status.lifecycle.active_requests() > 0);
+        assert_eq!(metrics.status.drain.cutoff(), cutoff);
+        assert!(metrics.status.drain.active_requests() > 0);
         assert_eq!(metrics.status.tables[0].active, 1);
         assert_eq!(metrics.status.storage.active_jobs, 1);
         assert_eq!(
