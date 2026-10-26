@@ -26,8 +26,9 @@ message Hello {
   // Fresh 256-bit challenge generated independently for every physical
   // connection. Both peers' complete Hellos are bound into each HelloAuth.
   bytes challenge = 6;
-  // Externally allocated process generation, authenticated by the configured
-  // independent process credential. Zero denotes non-process authentication.
+  // Externally allocated operational generation checked by a receiver policy.
+  // Zero means no managed generation policy. TLS/shared-secret credential
+  // ownership and revocation remain external to this claim.
   uint64 process_generation = 8;
 }
 

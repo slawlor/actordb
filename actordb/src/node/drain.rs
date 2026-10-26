@@ -1273,13 +1273,7 @@ mod tests {
                 .await,
             Err(DrainError::Timeout { .. })
         ));
-        assert!(
-            node.metrics_snapshot()
-                .status
-                .drain
-                .awaiting_responses()
-                > 0
-        );
+        assert!(node.metrics_snapshot().status.drain.awaiting_responses() > 0);
         drop(peer);
         node.drain_requests(DrainOptions::default()).await.unwrap();
         assert_eq!(node.drain_status().awaiting_responses(), 0);

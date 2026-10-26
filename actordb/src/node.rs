@@ -1209,9 +1209,6 @@ pub struct Node {
     persistence_budget: Arc<crate::retained::ByteBudget>,
     /// State reports for each sender, keyed by (fragment, peer).
     sender_reports: SenderReportMap,
-    /// Compatibility counter for the retired full-state sync protocol.
-    /// Protocol v3 leaves it at zero; sender reconciliation metrics report
-    /// anti-entropy progress.
     /// Coalesced wakeup for the placement driver on membership change (Phase 8).
     membership_tx: Option<watch::Sender<u64>>,
     /// Pre-shared cluster secret for the challenge-bound Hello transcript proof.

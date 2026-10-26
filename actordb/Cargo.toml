@@ -39,7 +39,6 @@ hmac = { version = "0.13.0" }
 prost = { version = "0.14" }
 prost-types = { version = "0.14" }
 ractor = { version = "0.16" }
-ring = "0.17"
 serde = { version = "1", features = ["derive"], optional = true }
 rocksdb = { version = "0.25", optional = true }
 seahash = { version = "4" }

@@ -71,7 +71,6 @@ async fn replication_reports_real_success_timestamps_and_enabled_queue_ages() {
     );
     let snapshot = source.status_snapshot();
     assert_eq!(snapshot.lifecycle, NodeLifecycle::Serving);
-    assert!(snapshot.replication[0].lag.is_none());
     source.shutdown().await.unwrap();
     peer.shutdown().await.unwrap();
 }

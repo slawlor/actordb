@@ -11,8 +11,9 @@ pub struct Hello {
     /// connection. Both peers' complete Hellos are bound into each HelloAuth.
     #[prost(bytes = "vec", tag = "6")]
     pub challenge: ::prost::alloc::vec::Vec<u8>,
-    /// Externally allocated process generation, authenticated by the configured
-    /// independent process credential. Zero denotes non-process authentication.
+    /// Externally allocated operational generation checked by a receiver policy.
+    /// Zero means no managed generation policy. TLS/shared-secret credential
+    /// ownership and revocation remain external to this claim.
     #[prost(uint64, tag = "8")]
     pub process_generation: u64,
 }

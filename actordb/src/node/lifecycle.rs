@@ -1353,10 +1353,10 @@ impl Node {
             ));
         }
         if runtime_options.peer_authority.is_some() {
-            tracing::info!("independent process credentials authenticate peer generations and every session frame; use a protected Network transport when payload confidentiality is required");
+            tracing::info!("peer generation allowlists fence accepted work; TLS and shared-secret credential authentication, frame integrity and revocation remain transport/deployment responsibilities");
         } else if config.cluster_secret.is_none() {
             tracing::warn!(
-                "no cluster_secret configured: anyone with TCP reachability can join the peer mesh"
+                "no cluster_secret configured: peer authentication depends on the supplied transport; use verified TLS outside local testing"
             );
         } else {
             tracing::warn!(
