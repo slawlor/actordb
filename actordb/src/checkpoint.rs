@@ -1283,8 +1283,8 @@ mod tests {
     }
     #[test]
     fn unsupported_backend_never_uses_full_load_or_creates_transfer_files() {
-        struct Legacy;
-        impl KvStore for Legacy {
+        struct UnsupportedStore;
+        impl KvStore for UnsupportedStore {
             fn bind(&self, _: &StoreIdentity) -> Result<crate::store::StoreBinding, StoreError> {
                 Ok(crate::store::StoreBinding::unmanaged())
             }
@@ -1308,8 +1308,8 @@ mod tests {
         let bundle = directory.path().join("unsupported");
         assert!(matches!(
             CheckpointExporter::open(
-                Arc::new(Legacy),
-                StoreIdentity::new("legacy".into(), 1),
+                Arc::new(UnsupportedStore),
+                StoreIdentity::new("unsupported".into(), 1),
                 &bundle,
                 CheckpointOptions::default()
             ),

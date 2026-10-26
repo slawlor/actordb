@@ -483,7 +483,7 @@ mod tests {
     }
 
     #[test]
-    fn custom_store_capabilities_default_to_retention_and_buffering() {
+    fn custom_store_declares_durability_and_retains_unsupported_deletion() {
         struct CustomStore;
 
         impl KvStore for CustomStore {

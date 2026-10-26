@@ -70,9 +70,8 @@ The contract is deliberately narrow:
   this check from raw lengths before decoding/retaining another value copy. A
   persisted key/value that exceeds the 16 MiB hard frame limit, or whose provenance
   node id is empty or exceeds 255 UTF-8 bytes, fails startup rather than entering
-  the cache in a permanently unreplicable state. Migrate or remove that record
-  offline with a compatible older binary before upgrade; actordb never truncates
-  or repairs it automatically.
+  the cache in a permanently unreplicable state. Fresh deployment must supply
+  a valid keyspace; actordb never rewrites, truncates, or repairs invalid data.
 
 ## Implementations
 
@@ -133,7 +132,7 @@ as committed. `stable_fence` calls `flush_wal(true)`, so placement handoff can
 establish stable storage even when ordinary writes use `AsyncWal`. Manifest
 writes and prefix deletion are always synchronous regardless of this setting.
 
-### RocksDB manifest and upgrades
+### RocksDB format3 manifest
 
 The first successful storage bind during `Node::start` synchronously stores a
 manifest containing the node id, fragment count, data-format version, and
