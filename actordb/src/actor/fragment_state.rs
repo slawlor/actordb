@@ -7,7 +7,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock as StdRwLock};
 use std::time::{Duration, Instant};
 
 use ractor::ActorProcessingErr;
@@ -92,6 +92,14 @@ pub struct FragmentState {
     /// Advances for every winning cache mutation, including replicated
     /// writes and expiry conversion.
     revision: AtomicU64,
+    /// Fragment-wide metadata publication, shared with every data child. No
+    /// payloads are retained here; summary paging never acquires child locks.
+    summary_index: Arc<StdRwLock<SummaryIndex>>,
+    /// Winning cache publication takes the shared side; the explicitly full
+    /// diagnostic snapshot takes the exclusive side. Never held through I/O.
+    snapshot_fence: Arc<RwLock<()>>,
+    #[cfg(test)]
+    snapshot_pause: std::sync::Mutex<Option<Arc<summary_revision_tests::SnapshotPause>>>,
     query_incarnation: u64,
     /// Buffered writes awaiting flush.
     flush: Arc<Mutex<FlushBuffer>>,
@@ -104,7 +112,7 @@ pub struct FragmentState {
     flush_interval: Duration,
     expiry_publisher: Option<(FragmentId, ExpiryPublisher)>,
     /// Independently cached and persisted table partitions. Table children
-    /// are created lazily and share only the backend handle and node executor.
+    /// are created lazily and share the backend/executor and snapshot metadata.
     table_children: Arc<RwLock<BTreeMap<String, Arc<FragmentState>>>>,
     partitioned: bool,
     persistence_template: Option<PersistenceConfig>,
@@ -131,6 +139,53 @@ struct FragmentCache {
 struct CachedDigests {
     live: [u8; 32],
     expired: [u8; 32],
+}
+
+#[derive(Default)]
+struct SummaryIndex {
+    values: BTreeMap<String, SummaryValue>,
+    revision: u64,
+}
+
+struct SummaryValue {
+    timestamp_ms: u64,
+    logical_counter: u64,
+    node_id: String,
+    expires_at_ms: Option<u64>,
+    is_tombstone: bool,
+    digests: CachedDigests,
+}
+
+impl SummaryValue {
+    fn new(value: &VersionedValue, digests: CachedDigests) -> Self {
+        Self {
+            timestamp_ms: value.timestamp_ms,
+            logical_counter: value.logical_counter,
+            node_id: value.node_id.clone(),
+            expires_at_ms: value.expires_at_ms,
+            is_tombstone: value.is_tombstone,
+            digests,
+        }
+    }
+
+    fn summary(&self, key: &str, snapshot_time_ms: u64) -> SnapshotSummary {
+        let expired = !self.is_tombstone
+            && self
+                .expires_at_ms
+                .is_some_and(|deadline| deadline <= snapshot_time_ms);
+        SnapshotSummary {
+            key: key.to_string(),
+            timestamp_ms: self.timestamp_ms,
+            logical_counter: self.logical_counter,
+            node_id: self.node_id.clone(),
+            is_tombstone: self.is_tombstone || expired,
+            content_digest: if expired {
+                self.digests.expired
+            } else {
+                self.digests.live
+            },
+        }
+    }
 }
 impl CachedDigests {
     fn new(value: &VersionedValue) -> Self {
@@ -274,12 +329,10 @@ impl FragmentState {
                 });
                 (
                     table,
-                    Arc::new(Self::new_local(
-                        cache,
-                        store,
-                        flush_batch_size,
-                        flush_interval,
-                    )),
+                    Arc::new(
+                        Self::new_local(cache, store, flush_batch_size, flush_interval)
+                            .with_summary_state(&state),
+                    ),
                 )
             })
             .collect();
@@ -294,9 +347,13 @@ impl FragmentState {
         flush_interval: Duration,
     ) -> Self {
         let ordered_keys = cache.keys().cloned().collect();
-        let content_digests = cache
+        let content_digests: HashMap<String, CachedDigests> = cache
             .iter()
             .map(|(key, value)| (key.clone(), CachedDigests::new(value)))
+            .collect();
+        let summary_values = cache
+            .iter()
+            .map(|(key, value)| (key.clone(), SummaryValue::new(value, content_digests[key])))
             .collect();
         let expiry_deadlines = cache
             .iter()
@@ -316,6 +373,13 @@ impl FragmentState {
             }),
             kvstore,
             revision: AtomicU64::new(0),
+            summary_index: Arc::new(StdRwLock::new(SummaryIndex {
+                values: summary_values,
+                revision: 0,
+            })),
+            snapshot_fence: Arc::new(RwLock::new(())),
+            #[cfg(test)]
+            snapshot_pause: std::sync::Mutex::new(None),
             query_incarnation: NEXT_QUERY_INCARNATION.fetch_add(1, Ordering::Relaxed),
             flush: Arc::new(Mutex::new(FlushBuffer {
                 pending: HashMap::new(),
@@ -338,6 +402,31 @@ impl FragmentState {
             table_pool_capacity: 16,
             empty_tables: std::sync::Mutex::new(BTreeSet::new()),
         }
+    }
+
+    /// Called only for an unshared, newly constructed child. Move metadata,
+    /// never payloads, into the root's index before publishing that child.
+    fn with_summary_state(self, root: &Self) -> Self {
+        self.with_summary_handles(root.summary_index.clone(), root.snapshot_fence.clone())
+    }
+
+    fn with_summary_handles(
+        mut self,
+        summary_index: Arc<StdRwLock<SummaryIndex>>,
+        snapshot_fence: Arc<RwLock<()>>,
+    ) -> Self {
+        let own = Arc::get_mut(&mut self.summary_index)
+            .expect("new child metadata is not shared")
+            .get_mut()
+            .unwrap();
+        summary_index
+            .write()
+            .unwrap()
+            .values
+            .extend(std::mem::take(&mut own.values));
+        self.summary_index = summary_index;
+        self.snapshot_fence = snapshot_fence;
+        self
     }
 
     /// Configure retained persistence admission before sharing or applying work.
@@ -484,6 +573,8 @@ impl FragmentState {
                 .collect();
             cache.values = retained;
         }
+        let summary_index = self.summary_index.clone();
+        let snapshot_fence = self.snapshot_fence.clone();
         {
             let children = Arc::get_mut(&mut self.table_children)
                 .expect("table partitions are not concurrently shared during startup")
@@ -493,7 +584,8 @@ impl FragmentState {
                     Arc::new(TableStore::new(inner.clone(), &table)) as Arc<dyn KvStore>
                 });
                 let mut child =
-                    Self::new_local(values, store, self.flush_batch_size, self.flush_interval);
+                    Self::new_local(values, store, self.flush_batch_size, self.flush_interval)
+                        .with_summary_handles(summary_index.clone(), snapshot_fence.clone());
                 child.pool_timing = self.pool_timing.clone();
                 child.table_pool_capacity = self.table_pool_capacity;
                 child.expiry_publisher = self.expiry_publisher.clone();
@@ -549,7 +641,7 @@ impl FragmentState {
                 .with_persistence_config(config.clone())
                 .expect("validated persistence configuration");
         }
-        let state = Arc::new(state);
+        let state = Arc::new(state.with_summary_state(self));
         if table != "KV" {
             empty.insert(table.to_string());
         }
@@ -701,11 +793,6 @@ impl FragmentState {
         if let Some(table) = crate::table_key::table_name(&op.key) {
             let child = self.table_state(&table).await?;
             let result = child.apply_local(op).await;
-            if self.partitioned
-                && matches!(result, Ok(ApplyOutcome::Applied | ApplyOutcome::Expired))
-            {
-                self.revision.fetch_add(1, Ordering::Release);
-            }
             drop(child);
             self.prune_empty_table(&table).await;
             return result;
@@ -723,6 +810,7 @@ impl FragmentState {
         // its cached live/expired digests inside the mutation critical section.
         let digests = CachedDigests::new(&op.value);
         if self.kvstore.is_none() {
+            let _publication = self.snapshot_fence.read().await;
             let mut cache = self.cache.write().await;
             Self::check_version_conflict(&cache, &op.key, &op.value)?;
             let expired = op.value.is_expired(now_ms());
@@ -734,6 +822,7 @@ impl FragmentState {
             }
             let outcome = Self::merge_cache(&mut cache, &op.key, value, selected_digests)?;
             if outcome == ApplyOutcome::Applied {
+                self.publish_summary(&op.key, value, selected_digests);
                 self.revision.fetch_add(1, Ordering::Release);
             }
             return Ok(Self::reported_outcome(outcome, expired));
@@ -744,6 +833,7 @@ impl FragmentState {
             // admission. Nothing mutates or awaits after acquiring both locks
             // until the winning merge, durable enqueue, and revision agree.
             let mut flush = self.flush.lock().await;
+            let _publication = self.snapshot_fence.read().await;
             let mut cache = self.cache.write().await;
             Self::check_version_conflict(&cache, &op.key, &op.value)?;
             let expired = op.value.is_expired(now_ms());
@@ -770,6 +860,7 @@ impl FragmentState {
             if outcome != ApplyOutcome::Applied {
                 return Ok(Self::reported_outcome(outcome, expired));
             }
+            self.publish_summary(&op.key, value, selected_digests);
             self.revision.fetch_add(1, Ordering::Release);
             let should_flush = flush.should_flush(self.flush_batch_size, self.flush_interval);
             (outcome, expired, should_flush)
@@ -780,6 +871,16 @@ impl FragmentState {
                 .map_err(|error| ApplyError::Storage(error.to_string()))?;
         }
         Ok(Self::reported_outcome(outcome, expired))
+    }
+
+    /// Called synchronously while cache.write and the publication fence are
+    /// held, before exposing the winning cache update or awaiting persistence.
+    fn publish_summary(&self, key: &str, value: &VersionedValue, digests: CachedDigests) {
+        let mut index = self.summary_index.write().unwrap();
+        index
+            .values
+            .insert(key.to_string(), SummaryValue::new(value, digests));
+        index.revision = index.revision.wrapping_add(1);
     }
 
     fn check_version_conflict(
@@ -1497,43 +1598,62 @@ impl FragmentState {
 
     /// Read a cache snapshot and its mutation revision atomically with
     /// respect to winning cache updates.
+    ///
+    /// A partitioned live fragment includes every table and excludes cache
+    /// publication while cloning this explicitly full diagnostic snapshot.
+    /// It can allocate the resident dataset and delay writers; reconciliation
+    /// uses bounded [`Self::summary_page`] instead. A standalone unpartitioned
+    /// state retains its direct base-cache view and local mutation revision.
     pub async fn snapshot_with_revision(&self) -> (HashMap<String, VersionedValue>, u64) {
         self.reclaim_empty_tables().await;
         if self.partitioned {
-            let mut snapshot = self.snapshot_local().await;
-            let children = self.table_children.read().await.clone();
-            let mut revision = self.revision.load(Ordering::Acquire);
-            for child in children.values() {
-                let child_snapshot = child.snapshot_local().await;
-                let child_revision = child.revision.load(Ordering::Acquire);
-                snapshot.extend(child_snapshot);
-                revision = revision.saturating_add(child_revision);
-            }
-            drop(children);
+            let result = {
+                // Only this explicitly full diagnostic operation excludes
+                // cross-table cache publication. Never fence backend I/O.
+                let _snapshot = self.snapshot_fence.write().await;
+                let snapshot_time_ms = now_ms();
+                let mut snapshot = self.snapshot_local(snapshot_time_ms).await.0;
+                let children = self.table_children.read().await.clone();
+                for child in children.values() {
+                    snapshot.extend(child.snapshot_local(snapshot_time_ms).await.0);
+                }
+                let revision = self.summary_index.read().unwrap().revision;
+                (snapshot, revision)
+            };
             self.reclaim_empty_tables().await;
-            return (snapshot, revision);
+            return result;
         }
-        (
-            self.snapshot_local().await,
-            self.revision.load(Ordering::Acquire),
-        )
+        self.snapshot_local(now_ms()).await
     }
 
-    async fn snapshot_local(&self) -> HashMap<String, VersionedValue> {
-        let now = now_ms();
+    async fn snapshot_local(
+        &self,
+        snapshot_time_ms: u64,
+    ) -> (HashMap<String, VersionedValue>, u64) {
         let cache = self.cache.read().await;
-        cache
+        let snapshot = cache
             .values
             .iter()
             .map(|(key, value)| {
-                let value = if value.is_expired(now) {
+                let value = if value.is_expired(snapshot_time_ms) {
                     value.expiry_tombstone()
                 } else {
                     value.clone()
                 };
                 (key.clone(), value)
             })
-            .collect()
+            .collect();
+        #[cfg(test)]
+        {
+            let pause = self.snapshot_pause.lock().unwrap().take();
+            if let Some(pause) = pause {
+                pause.captured.notify_one();
+                pause.resume.notified().await;
+            }
+        }
+        // Winning writers advance this counter before releasing cache.write.
+        // Pair it with values under the same read guard, never after cloning.
+        (snapshot, self.revision.load(Ordering::Acquire))
     }
 
     /// Read one lexicographically ordered page of version summaries.
@@ -1565,7 +1685,10 @@ impl FragmentState {
         snapshot_time_ms: Option<u64>,
         limit: usize,
     ) -> SummaryPage {
-        let (snapshot, revision) = self.snapshot_with_revision().await;
+        use std::ops::Bound::{Excluded, Unbounded};
+
+        let index = self.summary_index.read().unwrap();
+        let revision = index.revision;
         let snapshot_time_ms = snapshot_time_ms.unwrap_or_else(now_ms);
         if expected_revision.is_some_and(|expected| expected != revision) {
             return SummaryPage {
@@ -1576,21 +1699,18 @@ impl FragmentState {
                 restart: true,
             };
         }
-        let mut keys: Vec<_> = snapshot.keys().cloned().collect();
-        keys.sort();
-        let start = after_key
-            .map(|after| keys.partition_point(|key| key.as_str() <= after))
-            .unwrap_or(0);
+        // Physical-key ordering is not table-name ordering (prefix delimiters
+        // matter). The shared index directly seeks the caller's exact cursor.
+        let lower = after_key.map_or(Unbounded, Excluded);
         let limit = limit.max(1);
         let mut summaries = Vec::with_capacity(limit.min(256));
         let mut payload_bytes = 0usize;
         let mut done = true;
-        for key in keys.into_iter().skip(start) {
+        for (key, value) in index.values.range::<str, _>((lower, Unbounded)) {
             if summaries.len() == limit {
                 done = false;
                 break;
             }
-            let value = &snapshot[&key];
             let summary_bytes = key
                 .len()
                 .saturating_add(value.node_id.len())
@@ -1601,12 +1721,7 @@ impl FragmentState {
                 done = false;
                 break;
             }
-            summaries.push(Self::snapshot_summary(
-                &key,
-                value,
-                CachedDigests::new(value),
-                snapshot_time_ms,
-            ));
+            summaries.push(value.summary(key, snapshot_time_ms));
             payload_bytes = payload_bytes.saturating_add(summary_bytes);
         }
         SummaryPage {
@@ -1844,19 +1959,16 @@ impl FragmentState {
         }
     }
 
-    /// Read the mutation revision while holding the cache read lock.
+    /// Read the mutation revision at the cache publication boundary.
     ///
     /// Writers advance the revision while holding the cache write lock, so
-    /// taking the corresponding read lock makes this a fence against an
-    /// in-progress winning mutation rather than a merely atomic observation.
+    /// taking the corresponding read lock fences local cache publication.
+    /// Partitioned fragments read the shared metadata revision without walking
+    /// tables or waiting for child caches/backend work. Metadata and revision
+    /// are published together before any winning cache lock is released.
     pub async fn current_revision(&self) -> u64 {
         if self.partitioned {
-            let mut revision = self.current_revision_local().await;
-            let children = self.table_children.read().await.clone();
-            for child in children.values() {
-                revision = revision.saturating_add(child.current_revision_local().await);
-            }
-            return revision;
+            return self.summary_index.read().unwrap().revision;
         }
         self.current_revision_local().await
     }
@@ -2029,7 +2141,9 @@ impl FragmentState {
             } else {
                 None
             };
+            let _publication = self.snapshot_fence.read().await;
             let mut cache = self.cache.write().await;
+            let mut summary_index = self.summary_index.write().unwrap();
             if !pass.initialized {
                 pass.remaining = cache.expiry_deadlines.len();
                 pass.initialized = true;
@@ -2075,6 +2189,13 @@ impl FragmentState {
                     continue;
                 }
                 let previous_value = self.install_expiry(value, tombstone);
+                let summary = summary_index
+                    .values
+                    .get_mut(key)
+                    .expect("cache summary exists");
+                summary.is_tombstone = value.is_tombstone;
+                summary.expires_at_ms = value.expires_at_ms;
+                summary.digests.expire();
                 cache
                     .content_digests
                     .get_mut(key)
@@ -2103,6 +2224,9 @@ impl FragmentState {
                 pass.remaining = 0;
             }
             if page.converted != 0 {
+                summary_index.revision = summary_index
+                    .revision
+                    .wrapping_add(u64::try_from(page.converted).unwrap_or(u64::MAX));
                 self.revision.fetch_add(
                     u64::try_from(page.converted).unwrap_or(u64::MAX),
                     Ordering::Release,
@@ -2121,6 +2245,10 @@ impl FragmentState {
         Ok(page)
     }
 }
+
+#[cfg(test)]
+#[path = "summary_revision_tests.rs"]
+mod summary_revision_tests;
 
 impl FlushBuffer {
     fn should_flush(&self, batch_size: usize, interval: Duration) -> bool {
