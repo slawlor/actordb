@@ -139,7 +139,7 @@ fn valid_hex_utf8(encoded: &str, canonical: bool) -> bool {
             return false;
         };
         let mut bytes = [0; 4];
-        for (index, pair) in encoded[position..end].chunks_exact(2).enumerate() {
+        for (index, pair) in encoded[position..end].as_chunks::<2>().0.iter().enumerate() {
             let Some(byte) = decoded_pair(pair, canonical) else {
                 return false;
             };
