@@ -122,6 +122,62 @@ async fn aggregate_exhausts_input_beyond_both_legacy_scan_caps() {
 }
 
 #[tokio::test]
+async fn merge_accounting_keeps_offset_limits_sparse_pages_and_budget_failures_exact() {
+    let count = 2_048;
+    let node = start(
+        "query-accounting",
+        NodeConfig::builder()
+            .fragment_count(64)
+            .store(loaded_store(count, 64))
+            .build(),
+    )
+    .await;
+    let mut plan = parse("SELECT key FROM kv ORDER BY key ASC LIMIT 31 OFFSET 277").unwrap();
+    plan.projections = vec![actordb_query::Projection::Key; 32];
+    let options = QueryOptions {
+        max_buffer_bytes: 8 * 1024 * 1024,
+        max_result_bytes: 16 * 1024 * 1024,
+        ..Default::default()
+    };
+    let result = node
+        .query_plan_with_options(&plan, options.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        result.rows,
+        (277..308)
+            .map(|index| vec![QueryValue::Text(format!("record:{index:06}")); 32])
+            .collect::<Vec<_>>()
+    );
+    // No row matches, but metadata filtering must still exhaust and advance
+    // through sparse continuations rather than treating an empty page as EOF.
+    let sparse = parse("SELECT key FROM kv WHERE logical_counter = 77").unwrap();
+    assert!(node
+        .query_plan_with_options(&sparse, options.clone())
+        .await
+        .unwrap()
+        .rows
+        .is_empty());
+    let aggregate = node
+        .query_plan_with_options(&parse("SELECT COUNT(*) FROM kv").unwrap(), options.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        aggregate.rows,
+        vec![vec![QueryValue::Integer(count as i128)]]
+    );
+    let exhausted = QueryOptions {
+        max_buffer_bytes: 32 * 1024,
+        ..options
+    };
+    assert!(matches!(
+        node.query_plan_with_options(&plan, exhausted).await,
+        Err(actordb::query::QueryExecutionError::BudgetExceeded(_))
+    ));
+    node.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn sql_projects_durable_record_metadata() {
     let node = start(
         "query-metadata",

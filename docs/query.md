@@ -112,6 +112,13 @@ query rather than silently truncating aggregates. Background scheduling keeps
 worker capacity separate; shared fragment locks still cause contention while
 a page executes.
 
+Coordinator buffer charges are incremental: a page measures its rows once,
+consumption removes the consumed row's charge, and only a depleted cursor runs
+refill admission. Capacities, continuation metadata, and heap copies remain
+conservatively charged; this does not relax any query limit. See the
+[fixed-fixture release measurements](query-accounting-measurements.md) for the
+before/after matrix and reproduction command.
+
 Use `Node::query_plan_with_options` for explicit budgets. Keep `Node::scan`
 for its existing per-fragment limit/offset semantics; SQL has its own global
 pagination and completion contract.

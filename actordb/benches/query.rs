@@ -1,7 +1,7 @@
 //! Selective queries over fixed resident key sets and selected fragment counts.
 use actordb::actor::VersionedValue;
 use actordb::node::{Node, NodeConfig};
-use actordb::shard::fragment_of;
+use actordb::shard::fragment_of_literal;
 use actordb::store::{KvStore, StoreError};
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use std::sync::Arc;
@@ -49,8 +49,16 @@ fn bench_query(c: &mut Criterion) {
         let values = (0..10_000)
             .map(|index| {
                 let key = format!("key:{index:06}");
-                let mut stored = fragment_of(&key, fragments).0.to_be_bytes().to_vec();
-                stored.extend_from_slice(key.as_bytes());
+                let encoded: String = key
+                    .as_bytes()
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect();
+                let mut stored = fragment_of_literal(&key, fragments).0.to_be_bytes().to_vec();
+                stored.extend_from_slice(
+                    format!("\u{001d}actordb.table.store.v1:4b56:\u{001e}actordb.table.v1:4b56:{encoded}")
+                        .as_bytes(),
+                );
                 (
                     stored,
                     VersionedValue::new(vec![1; 100], actordb::actor::now_ms(), "fixture".into()),
@@ -81,6 +89,29 @@ fn bench_query(c: &mut Criterion) {
             ("all_fragments", "SELECT COUNT(*) FROM kv"),
         ] {
             let plan = actordb_query::parse(sql).unwrap();
+            // Validate resident fixture routing outside the timed loop. An
+            // incorrectly encoded store fixture must not benchmark empty scans.
+            let result = rt.block_on(node.query_plan(&plan)).unwrap();
+            match label {
+                "exact_late" => assert_eq!(result.rows.len(), 1),
+                "range_late" | "prefix_late" => assert_eq!(result.rows.len(), 10),
+                "all_fragments" => assert_eq!(
+                    result.rows,
+                    vec![vec![actordb_query::QueryValue::Integer(10_000)]]
+                ),
+                "one_fragment" => {
+                    let count = (0..10_000)
+                        .filter(|index| {
+                            fragment_of_literal(&format!("key:{index:06}"), fragments).0 == 0
+                        })
+                        .count();
+                    assert_eq!(
+                        result.rows,
+                        vec![vec![actordb_query::QueryValue::Integer(count as i128)]]
+                    );
+                }
+                _ => unreachable!(),
+            }
             group.bench_with_input(BenchmarkId::new(label, fragments), &plan, |b, plan| {
                 b.to_async(&rt)
                     .iter(|| async { std::hint::black_box(node.query_plan(plan).await.unwrap()) });
