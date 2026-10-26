@@ -5,7 +5,7 @@
 
 //! Shared cache, ordered persistence, expiry, and snapshot state.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -105,7 +105,7 @@ pub struct FragmentState {
     expiry_publisher: Option<(FragmentId, ExpiryPublisher)>,
     /// Independently cached and persisted table partitions. Table children
     /// are created lazily and share only the backend handle and node executor.
-    table_children: Arc<RwLock<HashMap<String, Arc<FragmentState>>>>,
+    table_children: Arc<RwLock<BTreeMap<String, Arc<FragmentState>>>>,
     partitioned: bool,
     persistence_template: Option<PersistenceConfig>,
     pool_timing: Arc<std::sync::atomic::AtomicBool>,
@@ -154,6 +154,11 @@ pub(crate) struct ExpiryPass {
     initialized: bool,
     remaining: usize,
     after_deadline: Option<(u64, String)>,
+    root_done: bool,
+    tables_remaining: Option<usize>,
+    after_table: Option<String>,
+    active_table: Option<Arc<FragmentState>>,
+    partition_done: bool,
 }
 
 impl ExpiryPass {
@@ -163,7 +168,18 @@ impl ExpiryPass {
             initialized: false,
             remaining: 0,
             after_deadline: None,
+            root_done: false,
+            tables_remaining: None,
+            after_table: None,
+            active_table: None,
+            partition_done: false,
         }
+    }
+
+    fn reset_deadlines(&mut self) {
+        self.initialized = false;
+        self.remaining = 0;
+        self.after_deadline = None;
     }
 }
 
@@ -315,7 +331,7 @@ impl FragmentState {
             flush_batch_size,
             flush_interval,
             expiry_publisher: None,
-            table_children: Arc::new(RwLock::new(HashMap::new())),
+            table_children: Arc::new(RwLock::new(BTreeMap::new())),
             partitioned: false,
             persistence_template: None,
             pool_timing: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -1865,38 +1881,118 @@ impl FragmentState {
         Ok(converted)
     }
 
-    /// Visit at most 256 due deadlines under one cache write lock. One terminal
-    /// record may cross the soft work-byte target. Successful conversion removes
-    /// the deadline while retaining the tombstone's key/version floor forever.
+    /// Visit at most 256 deadlines/table entries across the entire fragment.
+    /// Table traversal also consumes the aggregate work allowance, so empty
+    /// namespaces cannot turn one automatic message into an unbounded scan.
+    /// One terminal record may cross the soft work-byte target. The pass pins
+    /// its expiry time and retains at most one child across messages.
     pub(crate) async fn expire_values_page(
         &self,
         pass: &mut ExpiryPass,
     ) -> Result<ExpiryPage, ActorProcessingErr> {
-        if self.partitioned {
-            let page = self.expire_values_page_local(pass).await?;
-            if page.done {
-                let children = self.table_children.read().await.clone();
-                let mut converted = page.converted;
-                for child in children.values() {
-                    converted =
-                        converted.saturating_add(child.expire_values_local(now_ms()).await?);
-                }
-                return Ok(ExpiryPage {
-                    converted,
-                    visited: page.visited,
-                    work_bytes: page.work_bytes,
-                    done: true,
-                    saturated: page.saturated,
-                });
-            }
+        use std::ops::Bound::{Excluded, Unbounded};
+        if !self.partitioned {
+            return self.expire_values_page_local(pass).await;
+        }
+        let mut page = ExpiryPage {
+            visited: 0,
+            converted: 0,
+            work_bytes: 0,
+            done: pass.partition_done,
+            saturated: false,
+        };
+        if pass.partition_done {
             return Ok(page);
         }
-        self.expire_values_page_local(pass).await
+        if pass.tables_remaining.is_none() {
+            pass.tables_remaining = Some(self.table_children.read().await.len());
+        }
+        while page.visited < EXPIRY_PAGE_VISIT_LIMIT && page.work_bytes < EXPIRY_PAGE_WORK_BYTES {
+            let next = if !pass.root_done {
+                self.expire_values_page_local_budget(
+                    pass,
+                    EXPIRY_PAGE_VISIT_LIMIT - page.visited,
+                    EXPIRY_PAGE_WORK_BYTES - page.work_bytes,
+                )
+                .await?
+            } else {
+                if pass.active_table.is_none() {
+                    if pass.tables_remaining == Some(0) {
+                        pass.partition_done = true;
+                        break;
+                    }
+                    let next = {
+                        let children = self.table_children.read().await;
+                        let lower = pass.after_table.as_ref().map_or(Unbounded, Excluded);
+                        children
+                            .range::<String, _>((lower, Unbounded))
+                            .next()
+                            .map(|(name, child)| (name.clone(), child.clone()))
+                    };
+                    let Some((name, child)) = next else {
+                        pass.partition_done = true;
+                        break;
+                    };
+                    page.visited += 1;
+                    page.work_bytes = page.work_bytes.saturating_add(
+                        std::mem::size_of::<(String, Arc<FragmentState>)>()
+                            .saturating_add(name.capacity()),
+                    );
+                    pass.after_table = Some(name);
+                    pass.active_table = Some(child);
+                    *pass
+                        .tables_remaining
+                        .as_mut()
+                        .expect("table quota initialized") -= 1;
+                    if page.visited == EXPIRY_PAGE_VISIT_LIMIT
+                        || page.work_bytes >= EXPIRY_PAGE_WORK_BYTES
+                    {
+                        break;
+                    }
+                }
+                let child = pass.active_table.as_ref().expect("selected child").clone();
+                child
+                    .expire_values_page_local_budget(
+                        pass,
+                        EXPIRY_PAGE_VISIT_LIMIT - page.visited,
+                        EXPIRY_PAGE_WORK_BYTES - page.work_bytes,
+                    )
+                    .await?
+            };
+            page.visited += next.visited;
+            page.converted = page.converted.saturating_add(next.converted);
+            page.work_bytes = page.work_bytes.saturating_add(next.work_bytes);
+            page.saturated |= next.saturated;
+            if next.done {
+                if pass.root_done {
+                    pass.active_table = None;
+                } else {
+                    pass.root_done = true;
+                }
+                pass.reset_deadlines();
+            }
+            if pass.root_done && pass.active_table.is_none() && pass.tables_remaining == Some(0) {
+                pass.partition_done = true;
+                break;
+            }
+        }
+        page.done = pass.partition_done;
+        Ok(page)
     }
 
     async fn expire_values_page_local(
         &self,
         pass: &mut ExpiryPass,
+    ) -> Result<ExpiryPage, ActorProcessingErr> {
+        self.expire_values_page_local_budget(pass, EXPIRY_PAGE_VISIT_LIMIT, EXPIRY_PAGE_WORK_BYTES)
+            .await
+    }
+
+    async fn expire_values_page_local_budget(
+        &self,
+        pass: &mut ExpiryPass,
+        visit_limit: usize,
+        work_bytes: usize,
     ) -> Result<ExpiryPage, ActorProcessingErr> {
         use std::ops::Bound::{Excluded, Unbounded};
         let (page, should_flush) = {
@@ -1919,10 +2015,8 @@ impl FragmentState {
                 done: pass.remaining == 0,
                 saturated: false,
             };
-            let limit = pass.remaining.min(EXPIRY_PAGE_VISIT_LIMIT);
-            while page.visited < limit
-                && (page.visited == 0 || page.work_bytes < EXPIRY_PAGE_WORK_BYTES)
-            {
+            let limit = pass.remaining.min(visit_limit);
+            while page.visited < limit && (page.visited == 0 || page.work_bytes < work_bytes) {
                 let lower = pass.after_deadline.as_ref().map_or(Unbounded, Excluded);
                 let Some(entry) = cache
                     .expiry_deadlines
@@ -1996,7 +2090,7 @@ impl FragmentState {
             (page, should_flush)
         };
         if should_flush {
-            self.flush().await?;
+            self.flush_local().await?;
         }
         Ok(page)
     }
@@ -4523,5 +4617,151 @@ mod empty_table_reclamation_tests {
             0,
             "unrelated maintenance retries deferred cleanup"
         );
+    }
+}
+
+#[cfg(test)]
+mod partitioned_expiry_tests {
+    use super::*;
+
+    fn value(deadline: Option<u64>, bytes: usize) -> VersionedValue {
+        let mut value = VersionedValue::new(vec![1; bytes], 10, "writer".into());
+        value.expires_at_ms = deadline;
+        value
+    }
+
+    fn state(values: HashMap<String, VersionedValue>) -> FragmentState {
+        FragmentState::new(values, None, 100, Duration::from_secs(3600))
+            .enable_partitions()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn named_expiry_pages_share_one_budget_and_keep_the_pinned_time() {
+        let mut values = HashMap::new();
+        for index in 0..600 {
+            values.insert(
+                crate::table_key::encode_table_key("DUE", &format!("k{index:04}")),
+                value(Some(100), 32),
+            );
+        }
+        let future = crate::table_key::encode_table_key("FUTURE", "still-live");
+        values.insert(future.clone(), value(Some(101), 32));
+        let state = state(values);
+        let mut pass = ExpiryPass::new(100);
+        let mut converted = 0;
+        let mut pages = 0;
+        loop {
+            let page = state.expire_values_page(&mut pass).await.unwrap();
+            assert!(page.visited <= EXPIRY_PAGE_VISIT_LIMIT);
+            assert!(page.converted <= page.visited);
+            assert!(page.work_bytes < EXPIRY_PAGE_WORK_BYTES);
+            if pages == 0 {
+                assert_eq!((page.visited, page.converted, page.done), (256, 255, false));
+                assert!(page.work_bytes > 0);
+            }
+            converted += page.converted;
+            pages += 1;
+            assert!(pages <= 4);
+            if page.done {
+                break;
+            }
+        }
+        assert_eq!(converted, 600);
+        assert_eq!(pages, 3);
+        let children = state.table_children.read().await;
+        assert!(!children["FUTURE"].cache.read().await.values[&future].is_tombstone);
+        assert!(children["DUE"]
+            .cache
+            .read()
+            .await
+            .values
+            .values()
+            .all(|v| v.is_tombstone));
+        drop(children);
+        let done = state.expire_values_page(&mut pass).await.unwrap();
+        assert_eq!((done.visited, done.converted, done.done), (0, 0, true));
+    }
+
+    #[tokio::test]
+    async fn work_bytes_are_aggregate_across_parent_and_child_locks() {
+        let state = state(HashMap::from([
+            ("parent".into(), value(Some(100), 600_000)),
+            (
+                crate::table_key::encode_table_key("A", "large"),
+                value(Some(100), 600_000),
+            ),
+            (
+                crate::table_key::encode_table_key("B", "small"),
+                value(Some(100), 1),
+            ),
+        ]));
+        let mut pass = ExpiryPass::new(100);
+        let first = state.expire_values_page(&mut pass).await.unwrap();
+        assert_eq!((first.visited, first.converted, first.done), (3, 2, false));
+        assert!(first.work_bytes > EXPIRY_PAGE_WORK_BYTES);
+        assert!(first.work_bytes < EXPIRY_PAGE_WORK_BYTES + 601_000);
+        let next = state.expire_values_page(&mut pass).await.unwrap();
+        assert_eq!((next.visited, next.converted, next.done), (2, 1, true));
+    }
+
+    #[tokio::test]
+    async fn table_walk_is_paged_even_when_every_table_has_no_due_deadline() {
+        let values = (0..1000)
+            .map(|index| {
+                (
+                    crate::table_key::encode_table_key(&format!("T{index:04}"), "live"),
+                    value(None, 1),
+                )
+            })
+            .collect();
+        let state = state(values);
+        let mut pass = ExpiryPass::new(100);
+        let mut visits = 0;
+        let mut pages = 0;
+        loop {
+            let page = state.expire_values_page(&mut pass).await.unwrap();
+            assert!(page.visited <= EXPIRY_PAGE_VISIT_LIMIT);
+            assert_eq!(page.converted, 0);
+            assert!(page.work_bytes > 0);
+            visits += page.visited;
+            pages += 1;
+            assert!(pages <= 4);
+            if page.done {
+                break;
+            }
+        }
+        assert_eq!((visits, pages), (1000, 4));
+    }
+
+    #[tokio::test]
+    async fn table_insert_churn_cannot_extend_the_original_pass_quota() {
+        let values = (0..300)
+            .map(|index| {
+                (
+                    crate::table_key::encode_table_key(&format!("T{index:04}"), "live"),
+                    value(None, 1),
+                )
+            })
+            .collect();
+        let state = state(values);
+        let mut pass = ExpiryPass::new(100);
+        let first = state.expire_values_page(&mut pass).await.unwrap();
+        assert_eq!((first.visited, first.done), (256, false));
+        for index in 0..100 {
+            state
+                .apply(&ReplicatedOp {
+                    key: crate::table_key::encode_table_key(&format!("Z{index:04}"), "new"),
+                    value: value(None, 1),
+                    seq: 0,
+                    boot_id: 0,
+                })
+                .await
+                .unwrap();
+        }
+        let last = state.expire_values_page(&mut pass).await.unwrap();
+        assert_eq!((last.visited, last.done), (44, true));
+        assert!(pass.active_table.is_none());
+        assert_eq!(state.table_children.read().await.len(), 400);
     }
 }
