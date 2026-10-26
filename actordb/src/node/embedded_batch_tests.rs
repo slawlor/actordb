@@ -134,6 +134,25 @@ async fn idle_1024_point_batches_do_not_shed_their_own_completion_capacity() {
 }
 
 #[tokio::test]
+async fn named_table_batch_uses_the_same_paced_single_request_admission() {
+    let node = batch_node(1, true).await;
+    let users = node.table("USERS").unwrap();
+    let values = (0..128)
+        .map(|index| (format!("user-{index}"), vec![index as u8]))
+        .collect();
+    let results = users
+        .put_multi_with_priority(values, OpPriority::Default)
+        .await;
+    assert_eq!(results.len(), 128);
+    assert!(results.iter().all(Result::is_ok));
+    settle(&node).await;
+    assert_eq!(users.get("user-127").await.unwrap().unwrap().value, [127]);
+    assert!(node.get("user-127".into()).await.unwrap().is_none());
+    assert_eq!(node.embedded_operation_diagnostics().active_requests(), 0);
+    node.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn competing_batches_progress_fairly_without_reserved_per_batch_completion_slots() {
     for capacity in [2, 8] {
         let node = batch_node(capacity, true).await;
