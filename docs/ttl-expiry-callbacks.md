@@ -94,6 +94,15 @@ separate durable outbox with an explicit atomicity and replay design.
 
 ## Bounds, batching and lifecycle
 
+Automatic Cleaner messages share one fragment-wide allowance of 256 visits and
+a soft 1 MiB work target across the base cache and every named table. Namespace
+walks consume visits too, including tables with no due deadline; a single
+terminal record can exceed the soft byte target. The pass retains one table
+cursor/child and a pinned expiry time between messages, rather than sweeping
+all children within one message. Actor drain/cancellation checks run between
+pages. Explicit manual and final shutdown cleanup still finish an authoritative
+full pass. Work bytes are a conservative work charge, not an RSS or time bound.
+
 Configure `NodeConfig.ttl_expiry_options` with `TtlExpiryOptions::builder()`:
 
 | Option | Default | Meaning |

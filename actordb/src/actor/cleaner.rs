@@ -133,6 +133,58 @@ mod tests {
     use crate::actor::{Snapshotter, SnapshotterArgs, SnapshotterMessage};
 
     #[tokio::test]
+    async fn draining_named_table_cleaner_stops_between_aggregate_pages() {
+        let store = Arc::new(GatedStore::default());
+        let release = ReleaseMaintenanceStore(store.clone());
+        let values = (0..600)
+            .map(|index| {
+                let mut value = VersionedValue::new(vec![1], 10, "writer".into());
+                value.expires_at_ms = Some(1);
+                (
+                    crate::table_key::encode_table_key("DUE", &format!("k{index:04}")),
+                    value,
+                )
+            })
+            .collect();
+        let shared = Arc::new(
+            FragmentState::new(values, Some(store.clone()), 1, Duration::from_secs(3600))
+                .enable_partitions()
+                .unwrap(),
+        );
+        let (cleaner, _) = Cleaner::spawn(
+            None,
+            Cleaner,
+            CleanerArgs::builder()
+                .fragment(FragmentId(0))
+                .shared(shared.clone())
+                .interval(Duration::from_secs(3600))
+                .build(),
+        )
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !store.entered.load(std::sync::atomic::Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        cleaner.drain().unwrap();
+        drop(release);
+        tokio::time::timeout(Duration::from_secs(2), cleaner.wait(None))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(store.entries.lock().unwrap().len(), 255);
+        // The explicit shutdown/manual fence can still materialize every
+        // remaining deadline after automatic maintenance relinquishes its pass.
+        assert_eq!(shared.expire_values(1).await.unwrap(), 345);
+        let entries = store.entries.lock().unwrap();
+        assert_eq!(entries.len(), 600);
+        assert!(entries.values().all(|value| value.is_tombstone));
+    }
+
+    #[tokio::test]
     async fn automatic_cleaner_completes_multiple_pages_and_manual_snap_flushes_markers() {
         let store = Arc::new(GatedStore::default());
         let _release = ReleaseMaintenanceStore(store.clone());
