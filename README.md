@@ -14,16 +14,18 @@ with logical tables, a standalone Rust SDK and opt-in persistence.
 
 ## Current release and deployment
 
-ActorDB `0.9.1` requires Rust **1.88+** and a **fresh deployment**. Deploy
-matching database, protocol, query and SDK crates together. Peers use exact
+ActorDB `0.10.0` requires Rust **1.88+**. Deploy matching database, protocol,
+query and SDK crates together. Peers use exact
 protocol **6**, application connections exact protocol **4**, and RocksDB
 record/manifest format **3**. There is no rolling wire upgrade, old-store
-adoption, compatibility API alias or automatic data conversion. Use new data
-directories and handle any source-data export/re-ingestion separately.
+adoption, compatibility API alias or automatic data conversion. Current-format
+`0.9.0` deployments require no data conversion; non-current formats require a
+fresh deployment. The SDK's new decoded-response allowance defaults to 64 MiB;
+configure a larger allowance explicitly for supported wide responses.
 
 ```toml
 [dependencies]
-actordb = "0.9.1"
+actordb = "0.10.0"
 ```
 
 The default feature set is empty. The Node uses a volatile actor cache and
@@ -31,7 +33,7 @@ provides the `KvStore` interface without enabling a bundled store. RocksDB is
 an independent opt-in:
 
 ```toml
-actordb = { version = "0.9.1", features = ["rocksdb"] }
+actordb = { version = "0.10.0", features = ["rocksdb"] }
 ```
 
 The `memory` feature exposes a no-op test store, not durable storage.
@@ -128,7 +130,7 @@ The peer listener is not an application endpoint. Bind a
 `actordb-client`. Application connections never become replication members.
 
 ```toml
-actordb-client = "0.9.1"
+actordb-client = "0.10.0"
 ```
 
 The SDK supports point and batch operations, TTL, priorities, write concerns,

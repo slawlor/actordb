@@ -1,10 +1,13 @@
 # Release notes
 
-## 0.9.1 (unreleased)
+## 0.10.0 (unreleased)
 
-Corrective patch preparation for the P1 findings in #142 and #143. Peer protocol
+Corrective release for the P1/P2 findings tracked under #114. Peer protocol
 6, application protocol 4 and existing storage/checkpoint/journal formats remain
-unchanged. No new release is published by these pull requests.
+unchanged. The breaking change is the SDK's configurable decoded-response
+admission allowance, defaulting to 64 MiB (#153): responses accepted by 0.9.0
+can now require an explicitly larger allowance. No release is published by these
+pull requests, and current-format stores require no conversion.
 
 - Persist membership-transition journal updates before committing in-memory
   state, and re-establish durability barriers on retries/reopen (#142).

@@ -1,11 +1,13 @@
 # Current record and deployment versions
 
-ActorDB `0.9.1` keeps the published `0.9.0` wire and data contracts: peer protocol **6**,
+ActorDB `0.10.0` keeps the published `0.9.0` wire and data contracts: peer protocol **6**,
 application protocol **4**, RocksDB record/manifest format **3**, checkpoint
 **ACTCP003** and membership journal **ACTMEM04**. Deploy matching participants
-and use fresh data directories. There is no old-format reader, manifest adoption,
-wire fallback or automatic record conversion. Current-format deployments need
-no data conversion for this corrective patch.
+without changing current-format data directories. There is no old-format reader,
+manifest adoption, wire fallback or automatic record conversion. Non-current
+formats require fresh directories. This release's semver break is the SDK's
+configurable decoded-response admission allowance (64 MiB by default); callers
+expecting larger supported responses must explicitly raise that allowance.
 
 Non-current data and wire versions fail closed. Existing source data must be
 handled through a separately planned application export/re-ingestion workflow;
