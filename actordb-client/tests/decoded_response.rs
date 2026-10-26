@@ -197,7 +197,7 @@ async fn current_server_maximum_narrow_query_and_wide_default_envelope_pass_defa
     tokio::time::timeout(Duration::from_secs(120), async {
         let node = Arc::new(
             Node::start(
-                "decode-budget".into(),
+                "n".repeat(64),
                 "127.0.0.1:0".parse().unwrap(),
                 NodeConfig::default(),
             )
@@ -247,6 +247,35 @@ async fn current_server_maximum_narrow_query_and_wide_default_envelope_pass_defa
         assert!(wide.rows.iter().all(|row| row.len() == 32));
         assert!(client.get("row:000000").await.unwrap().is_some());
         assert!(!client.inspect().await.unwrap().health.is_empty());
+        // A legitimate text result near the server's own default retained
+        // limit may exceed the stricter decoded allowance as well. This
+        // compatibility change is explicit, not only a wide-row rule.
+        assert!(matches!(
+            client.query("SELECT node_id FROM kv LIMIT 100000").await,
+            Err(ClientError::Protocol(_))
+        ));
+        assert!(matches!(
+            client.get("row:000000").await,
+            Err(ClientError::Closed)
+        ));
+        let expanded = Client::connect(
+            server.addr(),
+            ClientOptions::builder()
+                .timeout(Duration::from_secs(60))
+                .max_decoded_response_bytes(128 * 1024 * 1024)
+                .build(),
+        )
+        .await
+        .unwrap();
+        let text = expanded
+            .query("SELECT node_id FROM kv LIMIT 100000")
+            .await
+            .unwrap();
+        assert_eq!(text.rows.len(), 100_000);
+        let expected = vec![QueryValue::Text("n".repeat(64))];
+        assert!(text.rows.iter().all(|row| row == &expected));
+        assert!(expanded.get("row:000000").await.unwrap().is_some());
+        expanded.close().await;
         client.close().await;
         server.shutdown().await;
         node.shutdown().await.unwrap();

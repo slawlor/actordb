@@ -41,6 +41,10 @@ capacity/message headers, payloads and portable result/receipt conversion.
 Cells and nested inspection/acknowledgement entries count toward one aggregate
 budget; server errors cannot waive it. This stricter default can reject large
 responses that encoded-framing-only clients accepted.
+It can also reject a near-limit text result produced under the server's default
+result policy: encoded size and server-retained size do not account for the same
+decoded/conversion capacities. It is not a promise that every server-accepted
+result fits the receiving client's default allowance.
 
 ```rust,ignore
 let options = ClientOptions::builder()
