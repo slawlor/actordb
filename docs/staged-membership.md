@@ -109,6 +109,16 @@ again after retained floor verification.
 The transition file uses a canonical checksummed encoding with atomic write,
 file sync and directory sync. Reopen the existing proposal with
 `MembershipTransition::reopen`; do not construct a fresh proposal over its path.
+Every mutation stages a bounded candidate and commits it to the live coordinator
+only after all journal durability barriers succeed. On an I/O error, the same
+object retains its previously committed evidence/stage and does not publish a
+controller map. Retry the exact operation after repairing the I/O failure.
+A rename can succeed before directory sync fails, so the visible journal may
+contain the candidate even though its caller received an error. `reopen` validates
+that exact proposal and writes/syncs it again before returning; reopening requires
+a writable, fsync-capable journal directory. Completed-intent publication also
+reestablishes its durability barriers on every replay. It does not demand new
+readiness or live shutdown evidence from processes already legitimately retired.
 Source digests and import receipts survive controller/caller restart, and changes
 to a source checkpoint within one transition are rejected. Live serving readiness
 is deliberately reacquired after restart. A completed final intent remains
