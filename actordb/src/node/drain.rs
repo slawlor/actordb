@@ -1276,7 +1276,7 @@ mod tests {
         assert!(
             node.metrics_snapshot()
                 .status
-                .lifecycle
+                .drain
                 .awaiting_responses()
                 > 0
         );

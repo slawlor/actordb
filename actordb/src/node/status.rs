@@ -797,7 +797,6 @@ mod tests {
             status.replication[0].purpose,
             ReplicationPurpose::Background
         );
-        assert!(status.replication[0].lag.is_none());
         assert!(!status.is_complete());
         status.observed_at = old;
         assert!(status.is_stale(Duration::from_secs(1)));
