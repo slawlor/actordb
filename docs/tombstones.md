@@ -53,8 +53,8 @@ evidence scoped to each key; those persisted watermarks do not exist yet.
 Dynamic placement's whole-fragment prefix retirement is different: it has a
 closed replica set, exact full-state handoff, and quiesced namespace, so it
 does not authorize arbitrary tombstone collection.
-The public `FragmentState::gc_tombstones` method likewise remains as a
-source-compatible no-op that retains every tombstone and returns zero.
+There is no time-based `FragmentState::gc_tombstones` API. Periodic TTL
+maintenance creates expiry tombstones and retains all existing deletion floors.
 
 ## On-disk encoding
 

@@ -19,10 +19,10 @@ use actordb::node::{
     ReplicationDrainPhase, ReplicationDrainShutdownError, REQUIRED_WIRE_CAPABILITIES,
     WIRE_PROTOCOL_VERSION,
 };
-use actordb::proto::{Envelope, EnvelopeMsg, Hello, HelloAuth};
 use actordb::store::{
     KvStore, PrefixDeleteOutcome, PrefixDeleteSupport, StoreCommitDurability, StoreError,
 };
+use actordb_protocol::meta::{envelope::Msg as EnvelopeMsg, Envelope, Hello, HelloAuth};
 use prost::Message;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -485,7 +485,7 @@ async fn recv_frame(stream: &mut tokio::net::TcpStream) -> Envelope {
     .expect("timed out waiting for protocol frame")
 }
 
-async fn recv_batch_put(stream: &mut tokio::net::TcpStream) -> actordb::proto::BatchPut {
+async fn recv_batch_put(stream: &mut tokio::net::TcpStream) -> actordb_protocol::meta::BatchPut {
     loop {
         if let Some(EnvelopeMsg::BatchPut(batch)) = recv_frame(stream).await.msg {
             return batch;
@@ -494,10 +494,10 @@ async fn recv_batch_put(stream: &mut tokio::net::TcpStream) -> actordb::proto::B
 }
 
 fn batch_put_response(
-    batch: &actordb::proto::BatchPut,
-    statuses: &[actordb::proto::MutationStatus],
+    batch: &actordb_protocol::meta::BatchPut,
+    statuses: &[actordb_protocol::meta::MutationStatus],
 ) -> Envelope {
-    use actordb::proto::{MutationResponse, MutationResult, MutationStatus};
+    use actordb_protocol::meta::{MutationResponse, MutationResult, MutationStatus};
 
     assert_eq!(batch.puts.len(), statuses.len());
     let results = batch
@@ -544,14 +544,14 @@ fn batch_put_response(
 }
 
 fn complete_reconcile_response(
-    request: &actordb::proto::ReconcileRequest,
-    summaries: Vec<actordb::proto::KeySummary>,
-) -> actordb::proto::ReconcileResponse {
+    request: &actordb_protocol::meta::ReconcileRequest,
+    summaries: Vec<actordb_protocol::meta::KeySummary>,
+) -> actordb_protocol::meta::ReconcileResponse {
     let next_after_key = summaries
         .last()
         .map(|summary| summary.key.clone())
         .unwrap_or_else(|| request.after_key.clone());
-    actordb::proto::ReconcileResponse {
+    actordb_protocol::meta::ReconcileResponse {
         fragment: request.fragment,
         summaries,
         session_id: request.session_id,
@@ -574,10 +574,10 @@ fn complete_reconcile_response(
 }
 
 fn complete_reconcile_data(
-    fetch: &actordb::proto::ReconcileFetch,
-    entries: Vec<actordb::proto::SyncEntry>,
-) -> actordb::proto::ReconcileData {
-    actordb::proto::ReconcileData {
+    fetch: &actordb_protocol::meta::ReconcileFetch,
+    entries: Vec<actordb_protocol::meta::SyncEntry>,
+) -> actordb_protocol::meta::ReconcileData {
+    actordb_protocol::meta::ReconcileData {
         fragment: fetch.fragment,
         entries,
         session_id: fetch.session_id,
@@ -593,20 +593,22 @@ fn complete_reconcile_data(
 async fn recv_reconcile_repairs_and_barrier(
     stream: &mut tokio::net::TcpStream,
 ) -> (
-    Vec<actordb::proto::KeySummary>,
-    actordb::proto::ReplicateBatch,
+    Vec<actordb_protocol::meta::KeySummary>,
+    actordb_protocol::meta::ReplicateBatch,
 ) {
     let mut summaries = Vec::new();
     loop {
         if let Some(EnvelopeMsg::ReplicateBatch(batch)) = recv_frame(stream).await.msg {
             if batch.batch_seq == u64::MAX {
-                summaries.extend(batch.ops.into_iter().map(|op| actordb::proto::KeySummary {
-                    content_digest: content_digest(&op.value, op.expires_at_ms),
-                    key: op.key,
-                    timestamp_ms: op.timestamp_ms,
-                    logical_counter: op.logical_counter,
-                    node_id: op.node_id,
-                    is_tombstone: op.is_tombstone,
+                summaries.extend(batch.ops.into_iter().map(|op| {
+                    actordb_protocol::meta::KeySummary {
+                        content_digest: content_digest(&op.value, op.expires_at_ms),
+                        key: op.key,
+                        timestamp_ms: op.timestamp_ms,
+                        logical_counter: op.logical_counter,
+                        node_id: op.node_id,
+                        is_tombstone: op.is_tombstone,
+                    }
                 }));
             } else {
                 summaries.sort_by(|left, right| left.key.cmp(&right.key));
@@ -642,7 +644,7 @@ async fn complete_empty_reconcile(stream: &mut tokio::net::TcpStream, session_id
                 send_frame(
                     stream,
                     Envelope {
-                        msg: Some(EnvelopeMsg::BatchAck(actordb::proto::BatchAck {
+                        msg: Some(EnvelopeMsg::BatchAck(actordb_protocol::meta::BatchAck {
                             session_id: batch.session_id,
                             batch_seq: batch.batch_seq,
                             fragment: batch.fragment,
@@ -658,7 +660,9 @@ async fn complete_empty_reconcile(stream: &mut tokio::net::TcpStream, session_id
     }
 }
 
-async fn recv_session_start(stream: &mut tokio::net::TcpStream) -> actordb::proto::SessionStart {
+async fn recv_session_start(
+    stream: &mut tokio::net::TcpStream,
+) -> actordb_protocol::meta::SessionStart {
     loop {
         if let Some(EnvelopeMsg::SessionStart(session)) = recv_frame(stream).await.msg {
             return session;
@@ -669,7 +673,7 @@ async fn recv_session_start(stream: &mut tokio::net::TcpStream) -> actordb::prot
 async fn recv_reconcile_request(
     stream: &mut tokio::net::TcpStream,
     session_id: u64,
-) -> actordb::proto::ReconcileRequest {
+) -> actordb_protocol::meta::ReconcileRequest {
     loop {
         if let Some(EnvelopeMsg::ReconcileRequest(request)) = recv_frame(stream).await.msg {
             if request.session_id == session_id {
@@ -681,8 +685,8 @@ async fn recv_reconcile_request(
 
 async fn send_reconcile_response(
     stream: &mut tokio::net::TcpStream,
-    request: &actordb::proto::ReconcileRequest,
-    summaries: Vec<actordb::proto::KeySummary>,
+    request: &actordb_protocol::meta::ReconcileRequest,
+    summaries: Vec<actordb_protocol::meta::KeySummary>,
 ) {
     send_frame(
         stream,
@@ -697,14 +701,14 @@ async fn send_reconcile_response(
 
 async fn ack_replication_batch(
     stream: &mut tokio::net::TcpStream,
-    batch: &actordb::proto::ReplicateBatch,
+    batch: &actordb_protocol::meta::ReplicateBatch,
     session_id: u64,
-    level: actordb::proto::ReplicationAckLevel,
+    level: actordb_protocol::meta::ReplicationAckLevel,
 ) {
     send_frame(
         stream,
         Envelope {
-            msg: Some(EnvelopeMsg::BatchAck(actordb::proto::BatchAck {
+            msg: Some(EnvelopeMsg::BatchAck(actordb_protocol::meta::BatchAck {
                 session_id,
                 batch_seq: batch.batch_seq,
                 fragment: batch.fragment,
@@ -1039,9 +1043,9 @@ async fn static_placement_ignores_unused_placement_intervals() {
 
 #[tokio::test]
 async fn maintenance_builders_retain_tombstone_version_floors() {
+    use actordb::actor::{CleanerArgs, FragmentHealth, SupervisorArgs};
     use actordb::actor::{FragmentState, HlcClock, PoolConfig};
     use actordb::shard::FragmentId;
-    use actordb::supervision::{CleanerArgs, FragmentHealth, SupervisorArgs};
     use tokio::sync::Mutex;
 
     let shared = Arc::new(FragmentState::new(
@@ -1075,12 +1079,11 @@ async fn maintenance_builders_retain_tombstone_version_floors() {
         worker_count: 0,
         worker_names: Vec::new(),
         restarts: HashMap::new(),
-        last_reaped: 0,
         shed_counts: (0, 0, 0),
     };
-    assert_eq!(shared.gc_tombstones(u64::MAX, 0).await, 0);
+    assert_eq!(shared.expire_values(u64::MAX).await.unwrap(), 0);
     assert!(shared.get_all().await.contains_key("deleted"));
-    assert_eq!(health.last_reaped, 0);
+    assert_eq!(health.shed_counts, (0, 0, 0));
     let _ = (cleaner, supervisor);
 }
 
@@ -1153,8 +1156,8 @@ async fn replication_drained_shutdown_fences_an_immediate_write() {
 
 #[tokio::test]
 async fn drain_requires_no_change_verification_round() {
-    use actordb::proto::ReplicationAckLevel;
     use actordb::replication::SenderConfig;
+    use actordb_protocol::meta::ReplicationAckLevel;
 
     let peer_id = "raw-stable-drain-peer";
     let (source, mut stream, initial_session_id) = raw_replication_drain_source(
@@ -1229,9 +1232,9 @@ async fn drain_requires_no_change_verification_round() {
 
 #[tokio::test]
 async fn drain_ignores_stale_old_session_ack_after_rotation() {
-    use actordb::proto::{KeySummary, ReplicationAckLevel};
     use actordb::replication::{ReplicationAckDurability, SenderConfig};
     use actordb::shard::FragmentId;
+    use actordb_protocol::meta::{KeySummary, ReplicationAckLevel};
 
     let peer_id = "raw-stale-drain-peer";
     let (source, mut stream, old_session_id) = raw_replication_drain_source(
@@ -1362,8 +1365,8 @@ async fn drain_ignores_stale_old_session_ack_after_rotation() {
 
 #[tokio::test]
 async fn drain_disconnect_reconnect_retries_same_generation() {
-    use actordb::proto::ReplicationAckLevel;
     use actordb::replication::SenderConfig;
+    use actordb_protocol::meta::ReplicationAckLevel;
 
     let peer_id = "raw-reconnect-drain-peer";
     let (source, mut first_stream, initial_session_id) = raw_replication_drain_source(
@@ -1457,9 +1460,9 @@ async fn drain_disconnect_reconnect_retries_same_generation() {
 #[tokio::test]
 async fn manual_placement_drain_freezes_target_and_keeps_replication_runtime_alive() {
     use actordb::placement::{FragmentPlacementState, ManualPlacement};
-    use actordb::proto::ReplicationAckLevel;
     use actordb::replication::SenderConfig;
     use actordb::shard::FragmentId;
+    use actordb_protocol::meta::ReplicationAckLevel;
 
     let fragment = FragmentId(0);
     let source_id = "dynamic-drain-source";
@@ -2932,7 +2935,7 @@ async fn bidirectional_large_reconciliation_keeps_connection_reader_live() {
 
 #[tokio::test]
 async fn reconcile_cursor_continues_after_revision_drift_for_verified_multi_pass() {
-    use actordb::proto::{EnvelopeMsg, ReconcileRequest, SessionStart};
+    use actordb_protocol::meta::{envelope::Msg as EnvelopeMsg, ReconcileRequest, SessionStart};
 
     let node = test_node("paged-revision-source").await;
     for index in 0..300 {
@@ -3026,8 +3029,8 @@ async fn reconcile_cursor_continues_after_revision_drift_for_verified_multi_pass
 
 #[tokio::test]
 async fn reconcile_barrier_revokes_prior_fetch_authorization() {
-    use actordb::proto::{
-        BatchAck, EnvelopeMsg, ReconcileFetch, ReconcileRequest, ReplicateBatch,
+    use actordb_protocol::meta::{
+        envelope::Msg as EnvelopeMsg, BatchAck, ReconcileFetch, ReconcileRequest, ReplicateBatch,
         ReplicationAckLevel, SessionStart,
     };
 
@@ -3139,10 +3142,11 @@ async fn reconcile_barrier_revokes_prior_fetch_authorization() {
 #[tokio::test]
 async fn reconcile_barrier_rejects_a_replaced_fragment_incarnation() {
     use actordb::placement::{FragmentPlacementState, ManualPlacement};
-    use actordb::proto::{
-        BatchNack, EnvelopeMsg, ReconcileRequest, ReplicateBatch, ReplicationAckLevel, SessionStart,
-    };
     use actordb::shard::FragmentId;
+    use actordb_protocol::meta::{
+        envelope::Msg as EnvelopeMsg, BatchNack, ReconcileRequest, ReplicateBatch,
+        ReplicationAckLevel, SessionStart,
+    };
 
     let fragment = FragmentId(0);
     let controller = Arc::new(ManualPlacement::new(HashMap::from([(
@@ -3263,8 +3267,8 @@ async fn reconcile_barrier_rejects_a_replaced_fragment_incarnation() {
 
 #[tokio::test]
 async fn failed_immediate_reconciliation_is_not_counted_and_retries() {
-    use actordb::proto::{EnvelopeMsg, KeySummary, SyncEntry};
     use actordb::shard::FragmentId;
+    use actordb_protocol::meta::{envelope::Msg as EnvelopeMsg, KeySummary, SyncEntry};
 
     let node = Node::start(
         "sync-failure-receiver".to_string(),
@@ -4932,9 +4936,11 @@ async fn unchanged_placement_polls_preserve_sender_session() {
 /// ACK fence after outbound repair frames.
 #[tokio::test]
 async fn stale_reconcile_round_cannot_complete_live_reset() {
-    use actordb::proto::{BatchAck, Envelope, EnvelopeMsg, KeySummary, ReplicationAckLevel};
     use actordb::replication::SenderConfig;
     use actordb::shard::FragmentId;
+    use actordb_protocol::meta::{
+        envelope::Msg as EnvelopeMsg, BatchAck, Envelope, KeySummary, ReplicationAckLevel,
+    };
 
     let mut fragment_map = HashMap::new();
     fragment_map.insert(
@@ -5144,11 +5150,12 @@ async fn stale_reconcile_round_cannot_complete_live_reset() {
 #[tokio::test]
 async fn placement_bootstrap_fetch_requires_verification_round() {
     use actordb::placement::{FragmentPlacementState, ManualPlacement};
-    use actordb::proto::{
-        BatchAck, Envelope, EnvelopeMsg, KeySummary, ReplicationAckLevel, SyncEntry,
-    };
     use actordb::replication::{ReplicationAckDurability, SenderConfig};
     use actordb::shard::FragmentId;
+    use actordb_protocol::meta::{
+        envelope::Msg as EnvelopeMsg, BatchAck, Envelope, KeySummary, ReplicationAckLevel,
+        SyncEntry,
+    };
 
     let controller = Arc::new(ManualPlacement::new(HashMap::from([(
         FragmentId(0),
@@ -5333,9 +5340,9 @@ async fn placement_bootstrap_fetch_requires_verification_round() {
 /// and a fresh correlated round within the configured phase timeout.
 #[tokio::test]
 async fn silent_reconcile_phase_times_out_and_retries() {
-    use actordb::proto::EnvelopeMsg;
     use actordb::replication::SenderConfig;
     use actordb::shard::FragmentId;
+    use actordb_protocol::meta::envelope::Msg as EnvelopeMsg;
 
     let mut fragment_map = HashMap::new();
     fragment_map.insert(
@@ -5419,11 +5426,12 @@ async fn silent_reconcile_phase_times_out_and_retries() {
 /// after the snapshot must force another verification round.
 #[tokio::test]
 async fn inbound_mutation_after_snapshot_invalidates_reset_completion() {
-    use actordb::proto::{
-        BatchAck, Envelope, EnvelopeMsg, ReplicateBatch, ReplicateOp, ReplicationAckLevel,
-    };
     use actordb::replication::SenderConfig;
     use actordb::shard::FragmentId;
+    use actordb_protocol::meta::{
+        envelope::Msg as EnvelopeMsg, BatchAck, Envelope, ReplicateBatch, ReplicateOp,
+        ReplicationAckLevel,
+    };
 
     let mut fragment_map = HashMap::new();
     fragment_map.insert(
@@ -5502,10 +5510,12 @@ async fn inbound_mutation_after_snapshot_invalidates_reset_completion() {
     send_frame(
         &mut stream,
         Envelope {
-            msg: Some(EnvelopeMsg::SessionStart(actordb::proto::SessionStart {
-                session_id: inbound_session,
-                fragment: 0,
-            })),
+            msg: Some(EnvelopeMsg::SessionStart(
+                actordb_protocol::meta::SessionStart {
+                    session_id: inbound_session,
+                    fragment: 0,
+                },
+            )),
         },
     )
     .await;
@@ -5581,9 +5591,9 @@ async fn inbound_mutation_after_snapshot_invalidates_reset_completion() {
 /// then certified by a barrier.
 #[tokio::test]
 async fn malformed_reconcile_data_is_rejected_without_partial_apply() {
-    use actordb::proto::{Envelope, EnvelopeMsg, KeySummary, SyncEntry};
     use actordb::replication::SenderConfig;
     use actordb::shard::FragmentId;
+    use actordb_protocol::meta::{envelope::Msg as EnvelopeMsg, Envelope, KeySummary, SyncEntry};
 
     let mut fragment_map = HashMap::new();
     fragment_map.insert(
@@ -5739,7 +5749,9 @@ async fn malformed_reconcile_data_is_rejected_without_partial_apply() {
 /// receiver must drop it.
 #[tokio::test]
 async fn stale_session_batches_discarded() {
-    use actordb::proto::{Envelope, EnvelopeMsg, ReplicateBatch, ReplicateOp, ReplicationAckLevel};
+    use actordb_protocol::meta::{
+        envelope::Msg as EnvelopeMsg, Envelope, ReplicateBatch, ReplicateOp, ReplicationAckLevel,
+    };
 
     let b = test_node("b").await;
 
@@ -5782,8 +5794,9 @@ async fn stale_session_batches_discarded() {
 
 #[tokio::test]
 async fn session_start_for_out_of_range_fragment_is_not_admitted() {
-    use actordb::proto::{
-        EnvelopeMsg, ReplicateBatch, ReplicateOp, ReplicationAckLevel, SessionStart,
+    use actordb_protocol::meta::{
+        envelope::Msg as EnvelopeMsg, ReplicateBatch, ReplicateOp, ReplicationAckLevel,
+        SessionStart,
     };
 
     let node = test_node("session-bound-receiver").await;
@@ -5846,10 +5859,11 @@ async fn session_start_for_out_of_range_fragment_is_not_admitted() {
 #[tokio::test]
 async fn session_started_before_actor_installation_survives_placement_race() {
     use actordb::placement::{FragmentPlacementState, ManualPlacement};
-    use actordb::proto::{
-        EnvelopeMsg, ReplicateBatch, ReplicateOp, ReplicationAckLevel, SessionStart,
-    };
     use actordb::shard::FragmentId;
+    use actordb_protocol::meta::{
+        envelope::Msg as EnvelopeMsg, ReplicateBatch, ReplicateOp, ReplicationAckLevel,
+        SessionStart,
+    };
 
     let controller = Arc::new(ManualPlacement::new(HashMap::from([(
         FragmentId(0),
@@ -5964,8 +5978,9 @@ async fn session_started_before_actor_installation_survives_placement_race() {
 
 #[tokio::test]
 async fn current_session_rejects_far_future_timestamp() {
-    use actordb::proto::{
-        Envelope, EnvelopeMsg, ReplicateBatch, ReplicateOp, ReplicationAckLevel, SessionStart,
+    use actordb_protocol::meta::{
+        envelope::Msg as EnvelopeMsg, Envelope, ReplicateBatch, ReplicateOp, ReplicationAckLevel,
+        SessionStart,
     };
     let node = test_node("receiver").await;
     let mut stream = tokio::net::TcpStream::connect(node.addr()).await.unwrap();
@@ -6416,8 +6431,8 @@ async fn batch_operations_fail_over_after_a_stale_owner_returns_unavailable() {
 #[tokio::test]
 async fn mixed_batch_put_retries_only_unavailable_positions_with_exact_stamps() {
     use actordb::actor::OpPriority;
-    use actordb::proto::{MutationStatus, Priority};
     use actordb::shard::FragmentId;
+    use actordb_protocol::meta::{MutationStatus, Priority};
 
     let config = NodeConfig::builder()
         .fragment_map(HashMap::from([(
@@ -6564,8 +6579,8 @@ async fn mixed_batch_put_retries_only_unavailable_positions_with_exact_stamps() 
 
 #[tokio::test]
 async fn mixed_batch_put_malformed_subset_exhaustion_preserves_terminal_results() {
-    use actordb::proto::MutationStatus;
     use actordb::shard::FragmentId;
+    use actordb_protocol::meta::MutationStatus;
 
     let config = NodeConfig::builder()
         .fragment_map(HashMap::from([(
@@ -6653,8 +6668,8 @@ async fn mixed_batch_put_malformed_subset_exhaustion_preserves_terminal_results(
 
 #[tokio::test]
 async fn timed_out_single_put_retries_the_exact_stamped_operation() {
-    use actordb::proto::{MutationResponse, MutationResult, MutationStatus};
     use actordb::shard::FragmentId;
+    use actordb_protocol::meta::{MutationResponse, MutationResult, MutationStatus};
 
     let config = NodeConfig::builder()
         .fragment_map(HashMap::from([(
@@ -6740,8 +6755,8 @@ async fn timed_out_single_put_retries_the_exact_stamped_operation() {
 #[tokio::test]
 async fn timed_out_single_get_tries_the_next_holder() {
     use actordb::actor::OpPriority;
-    use actordb::proto::{GetResponse, Priority};
     use actordb::shard::FragmentId;
+    use actordb_protocol::meta::{GetResponse, Priority};
 
     let config = NodeConfig::builder()
         .fragment_map(HashMap::from([(
@@ -7885,9 +7900,11 @@ async fn placement_prefix_delete_failure_retries_before_stopped() {
 #[tokio::test]
 async fn placement_drain_waits_for_buffer_reset() {
     use actordb::placement::{FragmentPlacementState, ManualPlacement};
-    use actordb::proto::{BatchAck, Envelope, EnvelopeMsg, ReplicationAckLevel};
     use actordb::replication::SenderConfig;
     use actordb::shard::FragmentId;
+    use actordb_protocol::meta::{
+        envelope::Msg as EnvelopeMsg, BatchAck, Envelope, ReplicationAckLevel,
+    };
 
     let initial = HashMap::from([(FragmentId(0), vec!["drain-a".to_string()])]);
     let controller = Arc::new(ManualPlacement::new(initial));
@@ -8167,9 +8184,11 @@ async fn placement_readd_waits_for_failed_final_flush_and_reloads() {
 #[tokio::test]
 async fn placement_readd_while_draining_cancels_teardown() {
     use actordb::placement::{FragmentPlacementState, ManualPlacement};
-    use actordb::proto::{BatchAck, Envelope, EnvelopeMsg, ReplicationAckLevel};
     use actordb::replication::SenderConfig;
     use actordb::shard::FragmentId;
+    use actordb_protocol::meta::{
+        envelope::Msg as EnvelopeMsg, BatchAck, Envelope, ReplicationAckLevel,
+    };
 
     let overlap = HashMap::from([(
         FragmentId(0),
@@ -8788,7 +8807,7 @@ async fn established_idle_is_allowed_but_partial_frame_body_times_out() {
 /// the socket and must never be applied.
 #[tokio::test]
 async fn pre_handshake_forwarded_put_ignored() {
-    use actordb::proto::{Envelope, EnvelopeMsg, ForwardedPut};
+    use actordb_protocol::meta::{envelope::Msg as EnvelopeMsg, Envelope, ForwardedPut};
 
     let a = test_node("a").await;
 
@@ -8901,7 +8920,7 @@ async fn hello_auth_mismatch_drops_connection() {
 #[tokio::test]
 async fn incompatible_hello_capabilities_are_rejected() {
     use actordb::node::{CAPABILITY_BYTE_BOUNDED_BATCHES, CAPABILITY_STABLE_DURABILITY_ACKS};
-    use actordb::proto::{EnvelopeMsg, Hello};
+    use actordb_protocol::meta::{envelope::Msg as EnvelopeMsg, Hello};
 
     let node = test_node("capability-server").await;
     let incompatible = [
@@ -8950,7 +8969,7 @@ async fn incompatible_hello_capabilities_are_rejected() {
 
 #[tokio::test]
 async fn retired_full_state_sync_frames_close_protocol_v3_connection() {
-    use actordb::proto::{EnvelopeMsg, SyncRequest};
+    use actordb_protocol::meta::{envelope::Msg as EnvelopeMsg, SyncRequest};
 
     let node = test_node("retired-sync-server").await;
     let mut stream = tokio::net::TcpStream::connect(node.addr()).await.unwrap();
@@ -9062,8 +9081,9 @@ async fn second_hello_closes_established_connection() {
 /// untracked repair failed and falsely certify convergence.
 #[tokio::test]
 async fn same_session_replay_does_not_clear_reconcile_failure() {
-    use actordb::proto::{
-        Envelope, EnvelopeMsg, ReplicateBatch, ReplicateOp, ReplicationAckLevel, SessionStart,
+    use actordb_protocol::meta::{
+        envelope::Msg as EnvelopeMsg, Envelope, ReplicateBatch, ReplicateOp, ReplicationAckLevel,
+        SessionStart,
     };
 
     let node = Node::start(
@@ -9472,9 +9492,9 @@ async fn replication_rejects_an_ack_below_the_configured_durability() {
 /// harmless even when the new session reuses the same batch sequence number.
 #[tokio::test]
 async fn ordinary_ack_timeout_rotates_session_and_replays_exact_batch() {
-    use actordb::proto::{BatchAck, EnvelopeMsg, ReplicationAckLevel};
     use actordb::replication::{ReplicationAckDurability, SenderConfig};
     use actordb::shard::FragmentId;
+    use actordb_protocol::meta::{envelope::Msg as EnvelopeMsg, BatchAck, ReplicationAckLevel};
 
     let ack_timeout = Duration::from_secs(2);
 
@@ -9628,9 +9648,9 @@ async fn ordinary_ack_timeout_rotates_session_and_replays_exact_batch() {
 /// replayed when that older deadline rotates the session.
 #[tokio::test]
 async fn older_batch_timeout_replays_only_the_unacknowledged_batch() {
-    use actordb::proto::{BatchAck, EnvelopeMsg, ReplicationAckLevel};
     use actordb::replication::{ReplicationAckDurability, SenderConfig};
     use actordb::shard::FragmentId;
+    use actordb_protocol::meta::{envelope::Msg as EnvelopeMsg, BatchAck, ReplicationAckLevel};
 
     let mut fragment_map = HashMap::new();
     fragment_map.insert(
@@ -9796,9 +9816,9 @@ async fn older_batch_timeout_replays_only_the_unacknowledged_batch() {
 /// same fail-closed session rotation and exact replay as a missing ACK.
 #[tokio::test]
 async fn weak_ack_does_not_prevent_timeout_and_exact_replay() {
-    use actordb::proto::{BatchAck, EnvelopeMsg, ReplicationAckLevel};
     use actordb::replication::{ReplicationAckDurability, SenderConfig};
     use actordb::shard::FragmentId;
+    use actordb_protocol::meta::{envelope::Msg as EnvelopeMsg, BatchAck, ReplicationAckLevel};
 
     let ack_timeout = Duration::from_secs(2);
 
@@ -10111,11 +10131,12 @@ async fn failed_reconcile_repair_cannot_be_hidden_by_barrier_ack() {
 /// second fetch. The remote barrier alone cannot certify requester durability.
 #[tokio::test]
 async fn fetched_reconcile_value_retries_failed_local_store_fence() {
-    use actordb::proto::{
-        BatchAck, Envelope, EnvelopeMsg, KeySummary, ReplicationAckLevel, SyncEntry,
-    };
     use actordb::replication::{ReplicationAckDurability, SenderConfig};
     use actordb::shard::FragmentId;
+    use actordb_protocol::meta::{
+        envelope::Msg as EnvelopeMsg, BatchAck, Envelope, KeySummary, ReplicationAckLevel,
+        SyncEntry,
+    };
 
     let store = Arc::new(FailOnceStore::default());
     let mut fragment_map = HashMap::new();

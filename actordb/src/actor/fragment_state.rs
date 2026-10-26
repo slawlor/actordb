@@ -1583,15 +1583,6 @@ impl FragmentState {
         self.revision.load(Ordering::Acquire)
     }
 
-    /// Legacy compatibility shim for the removed time-based collector.
-    ///
-    /// This method intentionally retains every tombstone and returns zero.
-    /// Elapsed time cannot prove that all replicas have durably observed a
-    /// delete, so age-based removal can resurrect stale values.
-    pub async fn gc_tombstones(&self, _now_ms: u64, _gc_age_ms: u64) -> usize {
-        0
-    }
-
     /// Convert all due live values to durable expiry tombstones using the
     /// deadline index. Non-TTL values and retained tombstones are never visited.
     /// Locks are released between bounded pages; concurrent writes may change
@@ -2300,7 +2291,6 @@ mod flush_tests {
 
         assert_eq!(state.expire_values(300).await.unwrap(), 1);
         assert_eq!(state.expire_values(u64::MAX).await.unwrap(), 0);
-        assert_eq!(state.gc_tombstones(u64::MAX, 0).await, 0);
 
         let values = state.get_all().await;
         assert_eq!(values.get("deleted"), Some(&existing));
@@ -3648,7 +3638,6 @@ mod expiry_callback_tests {
         assert_eq!(runtime.diagnostics().enqueued_events, 0);
         assert_eq!(state.expire_values(100).await.unwrap(), 1);
         assert_eq!(state.expire_values(100).await.unwrap(), 0);
-        assert_eq!(state.gc_tombstones(u64::MAX, 0).await, 0);
         runtime.shutdown().await;
         let batch = output.try_recv().unwrap();
         let event = &batch.events[0];

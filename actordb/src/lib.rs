@@ -30,14 +30,9 @@ pub mod query;
 /// TCP; implement `Network` for TLS or other transports.
 pub mod network;
 
-/// Raw generated protobuf wire bindings.
-///
-/// This module remains available only as a compatibility escape hatch for
-/// protocol and integration testing. It is not part of the supported
-/// `actordb` application API; use the high-level node/client APIs or the
-/// language-independent `actordb-protocol` crate instead.
-#[doc(hidden)]
-pub mod proto;
+// Internal shorthand for the shared actordb-protocol bindings. Protocol
+// implementations import actordb_protocol::meta directly.
+mod proto;
 
 /// Pluggable durable storage for a node's local copy. The default crate ships
 /// no storage backend; its Node still uses a volatile actor cache. Enable
@@ -54,9 +49,6 @@ pub mod membership;
 
 /// Sharding: deterministic key → fragment mapping.
 pub mod shard;
-
-/// Compatibility reexports of the supervisor and maintenance actors in [`actor`].
-pub mod supervision;
 
 /// Phase 5: async sender/receiver replication (per-fragment, per-peer
 /// senders with batching, acks, and reconciliation).

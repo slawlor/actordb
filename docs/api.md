@@ -27,11 +27,10 @@ this guide. The crate follows pre-1.0 semver policy: breaking Rust API or wire
 protocol changes use a new minor version, while patch releases are reserved
 for compatible fixes and documentation.
 
-The raw generated `actordb::proto` module is hidden from generated
-documentation and is retained only for protocol and integration-test
-compatibility. It is not a supported application API. Consumers that need
-language-independent wire bindings should depend directly on
-`actordb-protocol`; ordinary applications should use the high-level APIs.
+Consumers that need language-independent wire bindings depend directly on
+`actordb-protocol` and import `actordb_protocol::meta` or
+`actordb_protocol::client`; ordinary applications use the high-level APIs.
+The node crate's internal protocol shorthand is private.
 
 ## Starting a node
 
@@ -323,11 +322,11 @@ Semantics (full detail in [Multi-key batching](batching.md)):
 
 ## Advanced replication embedding
 
-`actordb::replication::spawn_sender` starts one per-fragment/per-peer sender
-with `SenderRuntimeOptions::default()`. Embedders that construct senders
-directly can call `spawn_sender_with_options(fragment, peer_id, config, deps,
-options)` instead; it returns `SenderOptionsError` for zero or unrepresentable
-sender limits and timeouts. Its public options are:
+`actordb::replication::spawn_bounded_sender(fragment, peer_id, config, deps,
+options)` starts one per-fragment/per-peer sender and returns a `BoundedSender`.
+It returns `SenderOptionsError` for zero or unrepresentable sender limits and
+timeouts before spawning work. Use `SenderRuntimeOptions::default()` for the
+default liveness policy. Its public options are:
 
 - `with_ack_timeout` (default 30 seconds): deadline for an acceptable ACK to an
   ordinary streaming batch after queue admission;
@@ -353,9 +352,19 @@ let deps = SenderDeps::builder()
     .build();
 ```
 
+`BoundedSender::send` admits data and protocol controls through independent
+bounded lanes. `Enqueue` must name an already-applied mutation: saturation
+sheds its delta into visible snapshot-reset recovery rather than rejecting
+the completed local write. An `Ok` submission is not remote delivery or a
+durability receipt. `ingress_diagnostics()` reports admitted pending operations,
+queued controls, payload charges, cumulative shed/reset requests, and an
+unsettled recovery flag. Protocol `Full` errors require retry or connection
+closure; raw peer frame channels are caller-owned and count-bounded, and callers
+must enforce their own transport byte budget. `stop()` cancels locally and
+releases ingress ownership; it does not complete pending remote recovery.
+
 `build()` checks that dependencies were supplied, not that runtime limits are
-valid. Prefer the fallible `spawn_sender_with_options`; the legacy
-`spawn_sender` still panics for invalid configuration. Private Node control
+valid. The fallible `spawn_bounded_sender` validates limits. Private Node control
 capacity and queue-failure hooks are not exposed as builder setters.
 
 An ordinary ACK timeout rotates the sender session, restores all unacknowledged
@@ -396,20 +405,16 @@ worker or roll back failed delivery. Direct actor embedders should send the
 same public `KvMessage` variants to `KvActor`, which owns admission, routing,
 supervision, and exact per-worker accounting.
 
-Protocol implementations using hidden `actordb::proto` compatibility types must upgrade in lockstep with
-the cluster: wire v3 requires the paged-anti-entropy, byte-bounded-batches, and
-stable-durability-ACK capabilities and adds cursor, revision, page-sequence,
-completion, and restart fields to reconciliation messages. The generated
-`ReplicationAckLevel` also gains `StableCommitted`. A non-empty
+Protocol implementations import `actordb_protocol::meta` and upgrade in lockstep
+with the cluster. Reconciliation uses cursor, revision, page-sequence,
+completion, and restart fields; acknowledgement levels explicitly distinguish
+applied, store-committed, and stable-committed evidence. A non-empty
 `BatchGetResponse` may now be an ordered request prefix; an empty response is
 unavailable, never not-found. The generated
-`SyncRequest`/`SyncResponse` types remain for source compatibility, but a v3
-connection rejects either envelope variant.
-The public `replication::SenderMsg::{ReconcileResponse, ReconcileData}` variants
-also gained correlation/page fields, so direct `spawn_sender*` users must update
-struct construction and exhaustive matches. Exhaustive matches over public
-`ApplyDurability` and `ReplicationAckDurability` must likewise handle
-`StableCommitted`.
+whole-state synchronization messages and unbounded sender constructors are
+not public compatibility APIs. `SenderMsg::{ReconcileResponse, ReconcileData}`
+require exact session/round/page correlation. Direct actor integrations handle
+all `ApplyDurability` and `ReplicationAckDurability` levels explicitly.
 
 ## Health and observability
 
@@ -427,8 +432,7 @@ println!("dynamic={} map={:?} states={:?}", report.dynamic, report.placement, re
 ```
 
 `FragmentHealth` fields: `fragment`, `worker_count`, `worker_names`,
-`restarts` (per-child restart counts), `last_reaped` (a legacy compatibility
-field that is always zero), and `shed_counts: (u64, u64, u64)` — operations
+`restarts` (per-child restart counts), and `shed_counts: (u64, u64, u64)` — operations
 shed by backpressure per pool, ordered **(high, default, background)**, always
 counted, never silent.
 

@@ -383,10 +383,12 @@ ACK retirement, reset, sender cancellation and shutdown release owning permits.
 diagnostics include both allowances. These charges exclude the separately
 bounded peer frame pipeline and the cache.
 
-Standalone callers should use `replication::spawn_bounded_sender`. Legacy
-`spawn_sender`/`spawn_sender_with_options` still return unbounded channels for
-compatibility: their consumed payloads are byte-bounded, but callers must
-externally bound the preceding legacy channel.
+Standalone callers use `replication::spawn_bounded_sender`, which bounds both
+ingress lanes and payload ownership. `BoundedSender::ingress_diagnostics()`
+reports pending data, queued controls, shed deltas, requested resets and unsettled
+recovery. `Enqueue` saturation schedules snapshot recovery for an already-applied
+write; accepted submission never proves remote delivery. Embedders still own
+the supplied bounded peer-frame channel and its transport byte budget.
 
 ## Storage execution and local deadlines
 

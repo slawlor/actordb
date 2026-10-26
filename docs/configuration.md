@@ -285,8 +285,7 @@ The batch size, in-flight limit, buffer capacity, intervals, and timeout must
 all be nonzero. Timer values must also be representable by Tokio's clock.
 `Node::start*` rejects an invalid replication configuration before binding;
 standalone callers get `SenderOptionsError` from
-`spawn_sender_with_options` (the legacy `spawn_sender` entry point panics on
-an invalid configuration).
+`spawn_bounded_sender`, which rejects unrepresentable bounded-channel capacities.
 
 An ACK below `required_ack_durability` is observable but does not retire its
 batch or extend the batch's original ordinary ACK deadline. At expiry the
@@ -308,17 +307,17 @@ and each planned stop chooses its own tolerance for unavailable peers.
 
 ## `SenderRuntimeOptions` (standalone senders)
 
-Direct users of `actordb::replication::spawn_sender` get a 30-second ordinary
-ACK timeout and 5-second peer-queue admission timeout. Use
-`spawn_sender_with_options` with
+Direct users of `actordb::replication::spawn_bounded_sender` get a 30-second ordinary
+ACK timeout and 5-second peer-queue admission timeout with default runtime options. Use
 `SenderRuntimeOptions::builder().ack_timeout(duration).queue_admission_timeout(duration).build()` to override
 them; the function returns `SenderOptionsError` for invalid sender limits or
 timeouts, including values that Tokio's clock cannot represent.
 `SenderConfig::reconcile_timeout` still controls summary, data, and barrier
 phases. Node users normally configure the corresponding values through
-`NodeRuntimeOptions` instead. For source compatibility these standalone
-constructors still return `mpsc::UnboundedSender<SenderMsg>`; the bounded
-mutation/control split is the `Node` integration's lifecycle-aware path.
+`NodeRuntimeOptions` instead. Standalone senders return `BoundedSender` and use
+the same bounded mutation/control lanes and persistent recovery signals as Node.
+The ingress observation distinguishes pending admission from completed remote
+delivery; a local stop is cancellation, not a durability fence.
 
 ## `PoolConfig`
 

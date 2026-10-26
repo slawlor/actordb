@@ -42,9 +42,6 @@ pub struct FragmentHealth {
     /// Restart counts per child (`dispatcher`, `cleaner`, `snapshotter`,
     /// `worker-<slot>`).
     pub restarts: HashMap<String, u64>,
-    /// Legacy compatibility field. Always zero because the unsafe time-based
-    /// tombstone collector has been removed.
-    pub last_reaped: usize,
     /// Ops shed by backpressure, per pool (high, default, background).
     /// Explicit and counted, never silent (Phase 7).
     pub shed_counts: (u64, u64, u64),
@@ -404,7 +401,6 @@ async fn probe_health(
         worker_count: worker_names.len(),
         worker_names,
         restarts: restarts.clone(),
-        last_reaped: 0,
         shed_counts,
     })
 }

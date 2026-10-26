@@ -719,7 +719,6 @@ async fn dispatch(node: &Node, request: wire::Request) -> wire::Response {
                         worker_count: item.worker_count as u64,
                         worker_names: item.worker_names,
                         restarts: item.restarts,
-                        last_reaped: item.last_reaped as u64,
                         shed_high: item.shed_counts.0,
                         shed_default: item.shed_counts.1,
                         shed_background: item.shed_counts.2,

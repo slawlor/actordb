@@ -27,8 +27,7 @@
 //! rejected explicitly; see [`crate::actor::VersionedValue`].
 //!
 //! This is also the canonical facade for the fragment supervisor, cleaner,
-//! and snapshotter. Their previous [`crate::supervision`] imports remain
-//! available as compatibility reexports of the same types.
+//! and snapshotter.
 
 mod cleaner;
 mod clock;

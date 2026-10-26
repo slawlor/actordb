@@ -3413,7 +3413,9 @@ mod tests {
         let sequence = node.next_seq.lock().await;
         let mut clock = node.hlc.lock().await;
         let future = crate::actor::now_ms() + 120_000;
-        clock.seed_persisted(future).unwrap();
+        clock
+            .seed_version(actordb_protocol::RecordVersion::new(future, 0))
+            .unwrap();
         let next_request = node.next_req_id.load(Ordering::Relaxed);
         for ttl in [
             Duration::MAX,
@@ -3466,7 +3468,11 @@ mod tests {
         .await
         .unwrap();
         let future = crate::actor::now_ms() + 120_000;
-        node.hlc.lock().await.seed_persisted(future).unwrap();
+        node.hlc
+            .lock()
+            .await
+            .seed_version(actordb_protocol::RecordVersion::new(future, 0))
+            .unwrap();
         node.put_with_ttl("permanent".into(), b"value".to_vec(), None)
             .await
             .unwrap();
@@ -3584,7 +3590,9 @@ mod tests {
         .unwrap();
         let future = crate::actor::now_ms() + 120_000;
         let mut clock = caller.hlc.lock().await;
-        clock.seed_persisted(future).unwrap();
+        clock
+            .seed_version(actordb_protocol::RecordVersion::new(future, 0))
+            .unwrap();
         let next_request = caller.next_req_id.load(Ordering::Relaxed);
         assert!(matches!(
             tokio::time::timeout(

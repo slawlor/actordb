@@ -116,10 +116,6 @@ impl HlcClock {
         self.last = next;
         Ok(next)
     }
-    /// Observe a legacy timestamp with logical counter zero.
-    pub fn observe(&mut self, timestamp_ms: u64) -> Result<(), ClockError> {
-        self.observe_version(RecordVersion::from(timestamp_ms))
-    }
     /// Observe a remote timestamp after validating its physical component.
     pub fn observe_version(&mut self, remote: RecordVersion) -> Result<(), ClockError> {
         self.observe_at(remote, self.wall())
@@ -134,10 +130,6 @@ impl HlcClock {
             self.successor(floor, wall)?
         };
         Ok(())
-    }
-    /// Seed a legacy durable timestamp without creating an event.
-    pub fn seed_persisted(&mut self, timestamp_ms: u64) -> Result<(), ClockSkewError> {
-        self.seed_version(RecordVersion::from(timestamp_ms))
     }
     /// Seed the highest durable physical/logical timestamp before serving.
     pub fn seed_version(&mut self, version: RecordVersion) -> Result<(), ClockSkewError> {
@@ -214,6 +206,6 @@ mod tests {
         let version = RecordVersion::new(clock.wall() + 60_000, 42);
         clock.seed_version(version).unwrap();
         assert!(clock.tick().unwrap() > version);
-        assert!(clock.seed_persisted(u64::MAX).is_err());
+        assert!(clock.seed_version(RecordVersion::new(u64::MAX, 0)).is_err());
     }
 }

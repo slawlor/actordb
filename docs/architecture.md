@@ -52,7 +52,6 @@ Node without creating peer membership or replication senders.
 | `actordb::query` | SQL execution policy, bounded background pages, and revision-checked fragment coordination |
 | `actordb::actor` | All ractor actors: dispatcher/workers, `FragmentSupervisor`, `Cleaner`, `Snapshotter`; shared cache, clock, and operation/value contracts |
 | `actordb::replication` | Phase 5 async sender/receiver: `ReplicationSender` state machine, sessions, acks, protocol-v3 paged `ReconcileRequest/Response/Fetch/Data` anti-entropy |
-| `actordb::supervision` | Compatibility reexports of supervisor and maintenance actor APIs from `actordb::actor` |
 | `actordb::placement` | Phase 8 dynamic placement: `PlacementController` trait, `StaticPlacement`, `ManualPlacement`, migration lifecycle states |
 | `actordb::store` | Shared `KvStore` identity/batch/prefix contract, errors, capabilities, backend options, and compatible implementation reexports |
 | `actordb::store::prefixed` | Always-available fragment-view `PrefixedStore` wrapper |
@@ -60,16 +59,14 @@ Node without creating peer membership or replication senders.
 | `actordb::store::rocksdb` | Fail-closed `RocksDbStore` durable backend; opt-in `rocksdb` feature |
 | `actordb::shard` | `FragmentId`, `hash_key` (seahash), `fragment_of` |
 | `actordb::network` | Transport abstraction: `Network`, `TcpNetwork`, `PeerStream`; 4-byte length-prefixed `Envelope` framing |
-| `actordb::proto` | Hidden compatibility reexports of shared generated peer messages, priorities, mutation outcomes, handshake, replication, reconciliation, scans, and query pages; supported wire bindings live in `actordb-protocol` |
+| `actordb_protocol::meta` | Shared generated peer messages, priorities, mutation outcomes, handshake, replication, reconciliation, scans, and query pages |
 
 ### Actor implementation files
 
 Each actor's implementation, arguments, and runtime state live together in a
 dedicated file under `actor/`, including the supervisor and maintenance actors.
-`actor.rs` is the canonical public facade; `supervision.rs` only preserves the
-legacy supervisor and maintenance imports. Existing imports such as
-`actordb::actor::{KvActor, KvArgs}` and
-`actordb::supervision::{Cleaner, CleanerArgs}` still work, including their
+`actor.rs` is the canonical public facade. Imports such as
+`actordb::actor::{KvActor, KvArgs, Cleaner, CleanerArgs}` include their
 generated Bon builder types and inferred typestate setter chains. Bon's
 anonymous state modules remain private. Internal module boundaries are not
 new public APIs.

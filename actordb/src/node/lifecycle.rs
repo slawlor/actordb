@@ -1318,10 +1318,6 @@ impl Node {
             .replication
             .validate()
             .map_err(|error| NodeError::Actor(error.to_string()))?;
-        config
-            .replication
-            .validate_node_ingress()
-            .map_err(|error| NodeError::Actor(error.to_string()))?;
         // Validate before binding storage or transport. Maintenance actors
         // construct interval timers during startup and placement can construct
         // warning deadlines much later; neither may panic on user input.
@@ -3104,7 +3100,6 @@ mod tests {
                     worker_count: 0,
                     worker_names: Vec::new(),
                     restarts: HashMap::new(),
-                    last_reaped: 0,
                     shed_counts: (7, 11, 13),
                 });
             }
@@ -3280,7 +3275,6 @@ mod tests {
                         worker_count: 0,
                         worker_names: Vec::new(),
                         restarts: HashMap::new(),
-                        last_reaped: 0,
                         shed_counts: (0, 0, 0),
                     });
                 }

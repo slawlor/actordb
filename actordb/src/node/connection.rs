@@ -3463,7 +3463,7 @@ mod tests {
     use super::*;
     use crate::proto::ReconcileRequest;
     use crate::proto::SessionStart;
-    use crate::replication::spawn_sender_with_options;
+    use crate::replication::spawn_bounded_sender;
 
     #[tokio::test]
     async fn receive_byte_permit_follows_completed_frame_and_releases_on_eof() {
@@ -5297,7 +5297,7 @@ mod tests {
             reconcile_rounds: 0,
             progress: Default::default(),
         }));
-        let sender = crate::replication::spawn_sender(
+        let sender = crate::replication::spawn_bounded_sender(
             FragmentId(0),
             "peer".to_string(),
             SenderConfig {
@@ -5309,7 +5309,9 @@ mod tests {
                 hlc: Arc::new(Mutex::new(HlcClock::new())),
                 state_report: report.clone(),
             },
-        );
+            SenderRuntimeOptions::default(),
+        )
+        .unwrap();
         let (old_tx, mut old_rx) = mpsc::channel(4);
         let (new_tx, mut new_rx) = mpsc::channel(4);
 
@@ -5368,7 +5370,7 @@ mod tests {
             reconcile_rounds: 0,
             progress: Default::default(),
         }));
-        let sender = spawn_sender_with_options(
+        let sender = spawn_bounded_sender(
             FragmentId(0),
             "peer".to_string(),
             SenderConfig {
@@ -5456,7 +5458,7 @@ mod tests {
             reconcile_rounds: 0,
             progress: Default::default(),
         }));
-        let sender = spawn_sender_with_options(
+        let sender = spawn_bounded_sender(
             FragmentId(0),
             "peer".to_string(),
             SenderConfig {
@@ -5584,7 +5586,7 @@ mod tests {
             reconcile_rounds: 0,
             progress: Default::default(),
         }));
-        let sender = spawn_sender_with_options(
+        let sender = spawn_bounded_sender(
             FragmentId(0),
             "peer".to_string(),
             SenderConfig {
@@ -5726,7 +5728,7 @@ mod tests {
             reconcile_rounds: 0,
             progress: Default::default(),
         }));
-        let sender = spawn_sender_with_options(
+        let sender = spawn_bounded_sender(
             FragmentId(0),
             "peer".to_string(),
             SenderConfig {
@@ -5839,7 +5841,7 @@ mod tests {
             reconcile_rounds: 0,
             progress: Default::default(),
         }));
-        let sender = spawn_sender_with_options(
+        let sender = spawn_bounded_sender(
             FragmentId(0),
             "peer".to_string(),
             SenderConfig {
@@ -5978,7 +5980,7 @@ mod tests {
                 SenderRuntimeOptions::default().with_ack_timeout(Duration::from_secs(1))
             }
         };
-        let sender = spawn_sender_with_options(
+        let sender = spawn_bounded_sender(
             FragmentId(0),
             "peer".to_string(),
             SenderConfig {
