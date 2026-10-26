@@ -627,7 +627,7 @@ pub(super) async fn handle_connection(
     let mut reconcile_failures: HashMap<(String, FragmentId), (u64, String)> = HashMap::new();
     // Bounded responder-side authorization. Only the exact next cursor page
     // and keys advertised by the most recent page may be fetched.
-    let mut served_reconciles: HashMap<(String, FragmentId), ServedReconcileState> = HashMap::new();
+    let served_reconciles: ServedReconciles = Arc::new(StdMutex::new(HashMap::new()));
     let (mut reader, writer) = tokio::io::split(stream);
     let socket_write_timeout = runtime_options.socket_write_timeout;
     let peer_queue_frame_capacity = runtime_options.peer_queue_frame_capacity;
@@ -706,11 +706,16 @@ pub(super) async fn handle_connection(
         };
     }
 
-    // Fetch responses can span multiple near-limit frames. Produce them in a
-    // bounded connection-owned worker so the reader always keeps consuming
+    // Fetch responses can span multiple near-limit frames, and summaries can
+    // wait behind a fragment's dispatcher flush. Produce both in a bounded
+    // connection-owned worker so the reader always keeps consuming
     // the opposite direction and cannot participate in a bidirectional
     // socket/byte-budget deadlock.
     let (reconcile_response_tx, reconcile_response_rx) =
+        mpsc::channel(RECONCILE_RESPONSE_QUEUE_DEPTH);
+    // Reserve fetch capacity independently: pending readonly summaries cannot
+    // take the slot for keys which this connection already advertised.
+    let (reconcile_summary_tx, reconcile_summary_rx) =
         mpsc::channel(RECONCILE_RESPONSE_QUEUE_DEPTH);
     let responder_registered = match tasks.upgrade() {
         Some(tasks) => {
@@ -720,10 +725,19 @@ pub(super) async fn handle_connection(
                 handshake_deadline,
                 tasks.spawn(run_reconcile_responder(
                     reconcile_response_rx,
+                    reconcile_summary_rx,
                     responder_tx,
                     sessions.clone(),
                     session_change_rx,
                     admission_timeout,
+                    ReconcileResponderContext {
+                        served: served_reconciles.clone(),
+                        router: router.clone(),
+                        serving: serving.clone(),
+                        placement: placement.clone(),
+                        recovery: recovery.clone(),
+                        dynamic_placement,
+                    },
                 )),
             )
             .await
@@ -766,7 +780,7 @@ pub(super) async fn handle_connection(
     let mut authenticated_peer_id = None;
     let mut was_established = false;
     // Length-delimited framing: 4-byte big-endian length prefix.
-    'connection: loop {
+    loop {
         tx.work_retention = None;
         let Some(buf) = read_connection_frame(
             &mut reader,
@@ -1032,7 +1046,7 @@ pub(super) async fn handle_connection(
                     };
                     if changed {
                         reconcile_failures.remove(&key);
-                        served_reconciles.remove(&key);
+                        served_reconciles.lock().unwrap().remove(&key);
                         session_changes.send_modify(|generation| {
                             *generation = generation.wrapping_add(1);
                         });
@@ -1116,23 +1130,31 @@ pub(super) async fn handle_connection(
 
                 if failure.is_none() && reconcile_barrier {
                     let source_authorized = serving.read().unwrap().contains(&frag)
-                        || served_reconciles.get(&session_key).is_some_and(|state| {
-                            recovery.as_ref().is_some_and(|authority| {
-                                authority.authorizes(
-                                    frag,
-                                    &peer,
-                                    &state.recovery_epoch,
-                                    &state.recovery_replica_digest,
-                                    &placement.read().unwrap(),
-                                )
-                            })
-                        });
+                        || served_reconciles
+                            .lock()
+                            .unwrap()
+                            .get(&session_key)
+                            .is_some_and(|state| {
+                                recovery.as_ref().is_some_and(|authority| {
+                                    authority.authorizes(
+                                        frag,
+                                        &peer,
+                                        &state.recovery_epoch,
+                                        &state.recovery_replica_digest,
+                                        &placement.read().unwrap(),
+                                    )
+                                })
+                            });
                     let same_serving_incarnation = source_authorized
                         && route.as_ref().is_some_and(|(generation, _)| {
-                            served_reconciles.get(&session_key).is_some_and(|state| {
-                                state.session_id == b.session_id
-                                    && state.route_generation == *generation
-                            })
+                            served_reconciles
+                                .lock()
+                                .unwrap()
+                                .get(&session_key)
+                                .is_some_and(|state| {
+                                    state.session_id == b.session_id
+                                        && state.route_generation == *generation
+                                })
                         });
                     if !same_serving_incarnation {
                         failure = Some(format!(
@@ -1239,7 +1261,7 @@ pub(super) async fn handle_connection(
                     // The empty tracked batch is the reconcile durability
                     // barrier. Its ACK or NACK ends this responder round, so
                     // no fetch authorization may survive into a retry.
-                    served_reconciles.remove(&session_key);
+                    served_reconciles.lock().unwrap().remove(&session_key);
                 }
 
                 if tracked {
@@ -1434,6 +1456,8 @@ pub(super) async fn handle_connection(
                 let route = router.route_with_generation(frag);
                 if !first_page
                     && !served_reconciles
+                        .lock()
+                        .unwrap()
                         .get(&reconcile_key)
                         .zip(route.as_ref())
                         .is_some_and(|(state, (generation, _))| {
@@ -1444,18 +1468,22 @@ pub(super) async fn handle_connection(
                     // paged round between frames. Drop its authorization and
                     // let the correlated sender rotate/retry without closing
                     // the multiplexed connection.
-                    served_reconciles.remove(&reconcile_key);
+                    served_reconciles.lock().unwrap().remove(&reconcile_key);
                     continue;
                 }
                 if !first_page
-                    && !served_reconciles.get(&reconcile_key).is_some_and(|state| {
-                        state.session_id == r.session_id
-                            && state.round_id == r.round_id
-                            && state.next_page_seq == r.page_seq
-                            && state.next_after_key == r.after_key
-                            && state.snapshot_revision == r.snapshot_revision
-                            && state.snapshot_time_ms == r.snapshot_time_ms
-                    })
+                    && !served_reconciles
+                        .lock()
+                        .unwrap()
+                        .get(&reconcile_key)
+                        .is_some_and(|state| {
+                            state.session_id == r.session_id
+                                && state.round_id == r.round_id
+                                && state.next_page_seq == r.page_seq
+                                && state.next_after_key == r.after_key
+                                && state.snapshot_revision == r.snapshot_revision
+                                && state.snapshot_time_ms == r.snapshot_time_ms
+                        })
                 {
                     tracing::warn!(
                         peer = %peer,
@@ -1467,115 +1495,27 @@ pub(super) async fn handle_connection(
                     break;
                 }
                 if let Some((route_generation, actor)) = route {
-                    if let Ok(CallResult::Success(page)) = actor
-                        .call(
-                            |reply| {
-                                KvMessage::GetSummaryPage {
-                                    after_key: (!first_page).then_some(r.after_key.clone()),
-                                    // Do not hold or clone a fragment-wide
-                                    // snapshot across network turns. Revision
-                                    // drift is returned to the requester, which
-                                    // completes this bounded pass and then runs a
-                                    // mutation-free verification pass.
-                                    expected_revision: None,
-                                    snapshot_time_ms: (!first_page).then_some(r.snapshot_time_ms),
-                                    limit: RECONCILE_SUMMARY_PAGE_ITEMS,
-                                    reply,
-                                }
-                                .with_optional_retention(tx.work_retention.clone())
-                            },
-                            None,
-                        )
-                        .await
-                    {
-                        let summaries: Vec<KeySummary> = page
-                            .summaries
-                            .into_iter()
-                            .map(|summary| KeySummary {
-                                key: summary.key,
-                                timestamp_ms: summary.timestamp_ms,
-                                logical_counter: summary.logical_counter,
-                                node_id: summary.node_id,
-                                is_tombstone: summary.is_tombstone,
-                                content_digest: summary.content_digest.to_vec(),
-                            })
-                            .collect();
-                        let mut response = ReconcileResponse {
-                            fragment: r.fragment,
-                            summaries,
-                            session_id: r.session_id,
-                            round_id: r.round_id,
-                            page_seq: r.page_seq,
-                            next_after_key: String::new(),
-                            snapshot_revision: page.revision,
-                            snapshot_time_ms: page.snapshot_time_ms,
-                            done: false,
-                            restart: page.restart,
-                        };
-                        if let Err(encoded_len) =
-                            fit_reconcile_response_page(&mut response, &r.after_key, page.done)
-                        {
-                            tracing::warn!(
-                                peer = %peer,
-                                fragment = r.fragment,
-                                round_id = r.round_id,
-                                page_seq = r.page_seq,
-                                encoded_len,
-                                "one reconcile summary exceeds the hard frame limit"
+                    let job = ReconcileResponderJob::Summary(ReconcileSummaryJob {
+                        retention: tx.work_retention.clone(),
+                        peer,
+                        session: current.expect("validated reconcile request session"),
+                        actor,
+                        route_generation,
+                        request: r,
+                        deadline: Instant::now() + runtime_options.local_work_timeout,
+                    });
+                    match reconcile_summary_tx.try_send(job) {
+                        Ok(()) => {}
+                        Err(mpsc::error::TrySendError::Full(_)) => {
+                            // Summary reads are retryable and do not admit a
+                            // mutation. A busy responder must not disconnect
+                            // unrelated ACKs/RPCs sharing this healthy socket.
+                            tracing::debug!(
+                                fragment = frag.0,
+                                "reconcile summary queue busy; sender will retry"
                             );
-                            break 'connection;
                         }
-                        let (
-                            snapshot_revision,
-                            snapshot_time_ms,
-                            next_fetch_chunk_seq,
-                            served_route_generation,
-                        ) = if first_page {
-                            (
-                                response.snapshot_revision,
-                                response.snapshot_time_ms,
-                                0,
-                                route_generation,
-                            )
-                        } else {
-                            let state = served_reconciles
-                                .get(&reconcile_key)
-                                .expect("validated continuation");
-                            (
-                                state.snapshot_revision,
-                                state.snapshot_time_ms,
-                                state.next_fetch_chunk_seq,
-                                state.route_generation,
-                            )
-                        };
-                        let served_state = (!response.restart).then(|| ServedReconcileState {
-                            recovery_epoch: r.recovery_epoch.clone(),
-                            recovery_replica_digest: r.recovery_replica_digest.clone(),
-                            session_id: response.session_id,
-                            round_id: response.round_id,
-                            next_page_seq: response.page_seq.saturating_add(1),
-                            next_after_key: response.next_after_key.clone(),
-                            snapshot_revision,
-                            snapshot_time_ms,
-                            next_fetch_chunk_seq,
-                            advertised_keys: response
-                                .summaries
-                                .iter()
-                                .map(|summary| summary.key.clone())
-                                .collect(),
-                            route_generation: served_route_generation,
-                        });
-                        let envelope = Envelope {
-                            msg: Some(EnvelopeMsg::ReconcileResponse(response)),
-                        };
-                        if !try_send_envelope_immediate(&tx, envelope) {
-                            break 'connection;
-                        }
-                        if let Some(state) = served_state {
-                            served_reconciles.insert(reconcile_key.clone(), state);
-                        } else {
-                            served_reconciles.remove(&reconcile_key);
-                        }
+                        Err(mpsc::error::TrySendError::Closed(_)) => break,
                     }
                 }
             }
@@ -1602,20 +1542,21 @@ pub(super) async fn handle_connection(
                     );
                     continue;
                 }
-                let recovery_authorized =
-                    served_reconciles
-                        .get(&(peer.clone(), frag))
-                        .is_some_and(|state| {
-                            recovery.as_ref().is_some_and(|authority| {
-                                authority.authorizes(
-                                    frag,
-                                    &peer,
-                                    &state.recovery_epoch,
-                                    &state.recovery_replica_digest,
-                                    &placement.read().unwrap(),
-                                )
-                            })
-                        });
+                let recovery_authorized = served_reconciles
+                    .lock()
+                    .unwrap()
+                    .get(&(peer.clone(), frag))
+                    .is_some_and(|state| {
+                        recovery.as_ref().is_some_and(|authority| {
+                            authority.authorizes(
+                                frag,
+                                &peer,
+                                &state.recovery_epoch,
+                                &state.recovery_replica_digest,
+                                &placement.read().unwrap(),
+                            )
+                        })
+                    });
                 if !serving.read().unwrap().contains(&frag) && !recovery_authorized {
                     // A fragment can lose authority between the summary and
                     // fetch phases. Let the correlated sender expire and retry
@@ -1655,10 +1596,12 @@ pub(super) async fn handle_connection(
                 }
                 let reconcile_key = (peer.clone(), frag);
                 let Some((route_generation, actor)) = router.route_with_generation(frag) else {
-                    served_reconciles.remove(&reconcile_key);
+                    served_reconciles.lock().unwrap().remove(&reconcile_key);
                     continue;
                 };
                 if served_reconciles
+                    .lock()
+                    .unwrap()
                     .get(&reconcile_key)
                     .is_some_and(|state| state.route_generation != route_generation)
                 {
@@ -1667,11 +1610,14 @@ pub(super) async fn handle_connection(
                     // malicious. An absent authorization, by contrast, falls
                     // through to the strict correlation check below and
                     // closes the connection.
-                    served_reconciles.remove(&reconcile_key);
+                    served_reconciles.lock().unwrap().remove(&reconcile_key);
                     continue;
                 }
-                let snapshot_time_ms =
-                    served_reconciles.get_mut(&reconcile_key).and_then(|state| {
+                let snapshot_time_ms = served_reconciles
+                    .lock()
+                    .unwrap()
+                    .get_mut(&reconcile_key)
+                    .and_then(|state| {
                         if state.session_id != f.session_id
                             || state.round_id != f.round_id
                             || state.next_fetch_chunk_seq != f.chunk_seq
@@ -1683,9 +1629,15 @@ pub(super) async fn handle_connection(
                             state.advertised_keys.remove(key);
                         }
                         state.next_fetch_chunk_seq = state.next_fetch_chunk_seq.saturating_add(1);
-                        Some(state.snapshot_time_ms)
+                        Some((
+                            state.snapshot_time_ms,
+                            state.recovery_epoch.clone(),
+                            state.recovery_replica_digest.clone(),
+                        ))
                     });
-                let Some(snapshot_time_ms) = snapshot_time_ms else {
+                let Some((snapshot_time_ms, recovery_epoch, recovery_replica_digest)) =
+                    snapshot_time_ms
+                else {
                     tracing::warn!(
                         peer = %peer,
                         fragment = f.fragment,
@@ -1702,8 +1654,14 @@ pub(super) async fn handle_connection(
                     actor,
                     fetch: f,
                     snapshot_time_ms,
+                    route_generation,
+                    recovery_epoch,
+                    recovery_replica_digest,
                 };
-                if reconcile_response_tx.try_send(job).is_err() {
+                if reconcile_response_tx
+                    .try_send(ReconcileResponderJob::Fetch(job))
+                    .is_err()
+                {
                     tracing::warn!(
                         peer = %peer,
                         fragment = frag.0,
@@ -2751,6 +2709,7 @@ pub(super) async fn handle_connection(
         }
     }
     drop(reconcile_response_tx);
+    drop(reconcile_summary_tx);
     for sender in disconnected_senders {
         sender.join().await;
     }

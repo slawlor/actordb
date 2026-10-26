@@ -34,6 +34,32 @@ pub(super) struct InboundSession {
 }
 
 pub(super) type InboundSessions = Arc<Mutex<HashMap<(String, FragmentId), InboundSession>>>;
+pub(super) type ServedReconciles =
+    Arc<StdMutex<HashMap<(String, FragmentId), ServedReconcileState>>>;
+
+pub(super) enum ReconcileResponderJob {
+    Fetch(ReconcileResponseJob),
+    Summary(ReconcileSummaryJob),
+}
+
+pub(super) struct ReconcileSummaryJob {
+    pub(super) retention: Option<Arc<dyn Send + Sync>>,
+    pub(super) peer: String,
+    pub(super) session: InboundSession,
+    pub(super) actor: ActorRef<KvMessage>,
+    pub(super) route_generation: u64,
+    pub(super) request: crate::proto::ReconcileRequest,
+    pub(super) deadline: Instant,
+}
+
+pub(super) struct ReconcileResponderContext {
+    pub(super) served: ServedReconciles,
+    pub(super) router: FragmentRouter,
+    pub(super) serving: Arc<RwLock<HashSet<FragmentId>>>,
+    pub(super) placement: Arc<RwLock<HashMap<FragmentId, Vec<String>>>>,
+    pub(super) recovery: Option<Arc<RecoveryContext>>,
+    pub(super) dynamic_placement: bool,
+}
 
 pub(super) struct ReconcileResponseJob {
     pub(super) retention: Option<Arc<dyn Send + Sync>>,
@@ -42,6 +68,198 @@ pub(super) struct ReconcileResponseJob {
     pub(super) actor: ActorRef<KvMessage>,
     pub(super) fetch: ReconcileFetch,
     pub(super) snapshot_time_ms: u64,
+    pub(super) route_generation: u64,
+    pub(super) recovery_epoch: Vec<u8>,
+    pub(super) recovery_replica_digest: Vec<u8>,
+}
+
+/// Read summary pages outside the multiplexed reader. The deadline covers both
+/// time in the bounded responder queue and waiting for this fragment's actor.
+/// Accepted actor requests retain their authority lease even when this waiter
+/// times out or its session is rotated.
+async fn send_reconcile_summary(
+    context: &ReconcileResponderContext,
+    sessions: &InboundSessions,
+    tx: &PeerChannel,
+    job: ReconcileSummaryJob,
+) -> bool {
+    let ReconcileSummaryJob {
+        retention,
+        peer,
+        session,
+        actor,
+        route_generation,
+        request,
+        deadline,
+    } = job;
+    let fragment = FragmentId(request.fragment);
+    let key = (peer.clone(), fragment);
+    let first_page = request.page_seq == 0;
+    let authorized = || {
+        context.serving.read().unwrap().contains(&fragment)
+            || context.recovery.as_ref().is_some_and(|authority| {
+                authority.authorizes(
+                    fragment,
+                    &peer,
+                    &request.recovery_epoch,
+                    &request.recovery_replica_digest,
+                    &context.placement.read().unwrap(),
+                )
+            })
+    };
+    let _mutation_lease = if context.dynamic_placement {
+        match tokio::time::timeout_at(
+            deadline,
+            context.router.mutation_gate(fragment).read_owned(),
+        )
+        .await
+        {
+            Ok(lease) => Some(lease),
+            Err(_) => return true,
+        }
+    } else {
+        None
+    };
+    if !authorized()
+        || !context
+            .router
+            .is_current(fragment, route_generation, &actor)
+    {
+        return true;
+    }
+    let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+        return true;
+    };
+    let page = match actor
+        .call(
+            |reply| {
+                KvMessage::GetSummaryPage {
+                    after_key: (!first_page).then_some(request.after_key.clone()),
+                    // Revision drift completes this bounded pass; the sender
+                    // subsequently requires a mutation-free verification pass.
+                    expected_revision: None,
+                    snapshot_time_ms: (!first_page).then_some(request.snapshot_time_ms),
+                    limit: RECONCILE_SUMMARY_PAGE_ITEMS,
+                    reply,
+                }
+                .with_optional_retention(retention)
+            },
+            Some(remaining),
+        )
+        .await
+    {
+        Ok(CallResult::Success(page)) => page,
+        _ => {
+            // This is a bounded, readonly failure. Let the sender rotate/retry
+            // the round without closing ACKs and other fragments on the socket.
+            tracing::debug!(
+                fragment = fragment.0,
+                round_id = request.round_id,
+                "reconcile summary read unavailable or exceeded local work deadline"
+            );
+            return true;
+        }
+    };
+    let summaries = page
+        .summaries
+        .into_iter()
+        .map(|summary| KeySummary {
+            key: summary.key,
+            timestamp_ms: summary.timestamp_ms,
+            logical_counter: summary.logical_counter,
+            node_id: summary.node_id,
+            is_tombstone: summary.is_tombstone,
+            content_digest: summary.content_digest.to_vec(),
+        })
+        .collect();
+    let mut response = ReconcileResponse {
+        fragment: request.fragment,
+        summaries,
+        session_id: request.session_id,
+        round_id: request.round_id,
+        page_seq: request.page_seq,
+        next_after_key: String::new(),
+        snapshot_revision: page.revision,
+        snapshot_time_ms: page.snapshot_time_ms,
+        done: false,
+        restart: page.restart,
+    };
+    if fit_reconcile_response_page(&mut response, &request.after_key, page.done).is_err() {
+        tracing::warn!(
+            fragment = fragment.0,
+            "one reconcile summary exceeds the hard frame limit"
+        );
+        return false;
+    }
+    // Session replacement uses sessions -> served ordering. These guards only
+    // protect validation, bounded state publication, and synchronous enqueue;
+    // neither actor execution nor network admission waits hold them.
+    let current_sessions = sessions.lock().await;
+    if current_sessions.get(&key).copied() != Some(session)
+        || !authorized()
+        || !context
+            .router
+            .is_current(fragment, route_generation, &actor)
+    {
+        return true;
+    }
+    let mut served = context.served.lock().unwrap();
+    let (snapshot_revision, snapshot_time_ms, next_fetch_chunk_seq) = if first_page {
+        (response.snapshot_revision, response.snapshot_time_ms, 0)
+    } else {
+        let Some(state) = served.get(&key) else {
+            return true;
+        };
+        if state.session_id != request.session_id
+            || state.round_id != request.round_id
+            || state.next_page_seq != request.page_seq
+            || state.next_after_key != request.after_key
+            || state.snapshot_revision != request.snapshot_revision
+            || state.snapshot_time_ms != request.snapshot_time_ms
+            || state.route_generation != route_generation
+        {
+            return true;
+        }
+        (
+            state.snapshot_revision,
+            state.snapshot_time_ms,
+            state.next_fetch_chunk_seq,
+        )
+    };
+    if !response.restart {
+        served.insert(
+            key.clone(),
+            ServedReconcileState {
+                session_id: response.session_id,
+                round_id: response.round_id,
+                next_page_seq: response.page_seq.saturating_add(1),
+                next_after_key: response.next_after_key.clone(),
+                snapshot_revision,
+                snapshot_time_ms,
+                next_fetch_chunk_seq,
+                advertised_keys: response
+                    .summaries
+                    .iter()
+                    .map(|summary| summary.key.clone())
+                    .collect(),
+                route_generation,
+                recovery_epoch: request.recovery_epoch,
+                recovery_replica_digest: request.recovery_replica_digest,
+            },
+        );
+    } else {
+        served.remove(&key);
+    }
+    let sent = connection::try_send_envelope_immediate(
+        tx,
+        Envelope {
+            msg: Some(EnvelopeMsg::ReconcileResponse(response)),
+        },
+    );
+    if !sent {
+        served.remove(&key);
+    }
+    sent
 }
 
 /// Keep the largest ordered summary prefix which obeys the soft page target,
@@ -137,6 +355,7 @@ pub(super) async fn send_reconcile_data_pages(
     snapshot_time_ms: u64,
     admission_timeout: Duration,
     retention: Option<Arc<dyn Send + Sync>>,
+    authorized: impl Fn() -> bool,
 ) -> bool {
     let ReconcileFetch {
         fragment,
@@ -163,6 +382,9 @@ pub(super) async fn send_reconcile_data_pages(
     let mut sizing = RepeatedFieldSizer::new(14, 2, base_payload_len);
 
     while next_key_index < keys.len() {
+        if !authorized() {
+            return true;
+        }
         let request_keys = keys.clone();
         let request_retention = retention.clone();
         let value_page = match actor
@@ -183,6 +405,9 @@ pub(super) async fn send_reconcile_data_pages(
             Ok(CallResult::Success(value_page)) => value_page,
             _ => return false,
         };
+        if !authorized() {
+            return true;
+        }
         if value_page.next_index <= next_key_index || value_page.next_index > keys.len() {
             return false;
         }
@@ -213,6 +438,9 @@ pub(super) async fn send_reconcile_data_pages(
             if encoded_len > MAX_FRAME_BYTES
                 || (encoded_len > ANTI_ENTROPY_PAGE_BYTES && !page.entries.is_empty())
             {
+                if !authorized() {
+                    return true;
+                }
                 let next_page_seq = page.page_seq.saturating_add(1);
                 if !try_send_envelope_with_admission_timeout(
                     tx,
@@ -253,6 +481,9 @@ pub(super) async fn send_reconcile_data_pages(
     }
 
     page.done = true;
+    if !authorized() {
+        return true;
+    }
     try_send_envelope_with_admission_timeout(
         tx,
         Envelope {
@@ -268,40 +499,105 @@ pub(super) async fn send_reconcile_data_pages(
 /// divergent values simultaneously, and each reader must remain available to
 /// drain the other peer's data while its own writer is backpressured.
 pub(super) async fn run_reconcile_responder(
-    mut jobs: mpsc::Receiver<ReconcileResponseJob>,
+    mut jobs: mpsc::Receiver<ReconcileResponderJob>,
+    mut summaries: mpsc::Receiver<ReconcileResponderJob>,
     tx: PeerChannel,
     sessions: InboundSessions,
     mut session_changes: watch::Receiver<u64>,
     admission_timeout: Duration,
+    context: ReconcileResponderContext,
 ) {
     let mut cancelled = tx.cancel.subscribe();
+    let mut fetches_open = true;
+    let mut summaries_open = true;
     'jobs: loop {
-        if *cancelled.borrow() {
+        if *cancelled.borrow() || (!fetches_open && !summaries_open) {
             return;
         }
         let job = tokio::select! {
+            biased;
             changed = cancelled.changed() => {
                 let _ = changed;
                 return;
             }
-            job = jobs.recv() => match job {
+            job = jobs.recv(), if fetches_open => match job {
                 Some(job) => job,
-                None => return,
+                None => { fetches_open = false; continue; }
+            },
+            job = summaries.recv(), if summaries_open => match job {
+                Some(job) => job,
+                None => { summaries_open = false; continue; }
             }
         };
-        let session_key = (job.peer.clone(), FragmentId(job.fetch.fragment));
-        if sessions.lock().await.get(&session_key).copied() != Some(job.session) {
+        let (session_key, session) = match &job {
+            ReconcileResponderJob::Fetch(job) => (
+                (job.peer.clone(), FragmentId(job.fetch.fragment)),
+                job.session,
+            ),
+            ReconcileResponderJob::Summary(job) => (
+                (job.peer.clone(), FragmentId(job.request.fragment)),
+                job.session,
+            ),
+        };
+        if sessions.lock().await.get(&session_key).copied() != Some(session) {
             continue;
         }
+        // The responder is registered before authentication. Attach the exact
+        // admitted frame's authority to every generated response instead of
+        // using its pre-handshake channel clone with no work ownership.
+        let mut response_tx = tx.clone();
+        response_tx.work_retention = match &job {
+            ReconcileResponderJob::Fetch(job) => job.retention.clone(),
+            ReconcileResponderJob::Summary(job) => job.retention.clone(),
+        };
 
-        let response = send_reconcile_data_pages(
-            &job.actor,
-            &tx,
-            job.fetch,
-            job.snapshot_time_ms,
-            admission_timeout,
-            job.retention,
-        );
+        let response = async {
+            match job {
+                ReconcileResponderJob::Fetch(job) => {
+                    let fragment = FragmentId(job.fetch.fragment);
+                    let round_id = job.fetch.round_id;
+                    let chunk_seq = job.fetch.chunk_seq;
+                    send_reconcile_data_pages(
+                        &job.actor,
+                        &response_tx,
+                        job.fetch,
+                        job.snapshot_time_ms,
+                        admission_timeout,
+                        job.retention,
+                        || {
+                            context
+                                .router
+                                .is_current(fragment, job.route_generation, &job.actor)
+                                && context
+                                    .served
+                                    .lock()
+                                    .unwrap()
+                                    .get(&(job.peer.clone(), fragment))
+                                    .is_some_and(|state| {
+                                        state.session_id == job.session.session_id
+                                            && state.round_id == round_id
+                                            && state.route_generation == job.route_generation
+                                            && state.next_fetch_chunk_seq > chunk_seq
+                                    })
+                                && (context.serving.read().unwrap().contains(&fragment)
+                                    || context.recovery.as_ref().is_some_and(|authority| {
+                                        authority.authorizes(
+                                            fragment,
+                                            &job.peer,
+                                            &job.recovery_epoch,
+                                            &job.recovery_replica_digest,
+                                            &context.placement.read().unwrap(),
+                                        )
+                                    }))
+                        },
+                    )
+                    .await
+                }
+                ReconcileResponderJob::Summary(job) => {
+                    send_reconcile_summary(&context, &sessions, &response_tx, job).await
+                }
+            }
+        };
         tokio::pin!(response);
         loop {
             tokio::select! {
@@ -313,7 +609,7 @@ pub(super) async fn run_reconcile_responder(
                     if changed.is_err() {
                         return;
                     }
-                    if sessions.lock().await.get(&session_key).copied() != Some(job.session) {
+                    if sessions.lock().await.get(&session_key).copied() != Some(session) {
                         // Dropping the response future cancels an in-progress
                         // actor RPC or outbound admission wait for the stale
                         // session without disturbing the replacement session.
@@ -331,6 +627,10 @@ pub(super) async fn run_reconcile_responder(
         }
     }
 }
+
+#[cfg(test)]
+#[path = "session_summary_tests.rs"]
+mod summary_tests;
 
 #[cfg(test)]
 mod tests {
@@ -504,14 +804,43 @@ mod tests {
         )])));
         let (session_changes, session_change_rx) = watch::channel(0u64);
         let (jobs, job_rx) = mpsc::channel(1);
+        let (summaries, summary_rx) = mpsc::channel(1);
+        drop(summaries);
+        let router = FragmentRouter::new(1, 0);
+        let route_generation = router.insert(FragmentId(0), actor.clone());
+        let served = Arc::new(StdMutex::new(HashMap::from([(
+            session_key.clone(),
+            ServedReconcileState {
+                session_id: 7,
+                round_id: 1,
+                next_page_seq: 1,
+                next_after_key: "key".into(),
+                snapshot_revision: 1,
+                snapshot_time_ms: 1,
+                next_fetch_chunk_seq: 1,
+                advertised_keys: HashSet::new(),
+                route_generation,
+                recovery_epoch: Vec::new(),
+                recovery_replica_digest: Vec::new(),
+            },
+        )])));
         let responder = tokio::spawn(run_reconcile_responder(
             job_rx,
+            summary_rx,
             peer,
             sessions.clone(),
             session_change_rx,
             Duration::from_secs(30),
+            ReconcileResponderContext {
+                served,
+                router,
+                serving: Arc::new(RwLock::new(HashSet::from([FragmentId(0)]))),
+                placement: Arc::new(RwLock::new(HashMap::new())),
+                recovery: None,
+                dynamic_placement: false,
+            },
         ));
-        jobs.send(ReconcileResponseJob {
+        jobs.send(ReconcileResponderJob::Fetch(ReconcileResponseJob {
             retention: None,
             peer: "peer".to_string(),
             session: original_session,
@@ -524,7 +853,10 @@ mod tests {
                 chunk_seq: 0,
             },
             snapshot_time_ms: 1,
-        })
+            route_generation,
+            recovery_epoch: Vec::new(),
+            recovery_replica_digest: Vec::new(),
+        }))
         .await
         .unwrap();
         started.notified().await;
