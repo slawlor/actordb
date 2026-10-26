@@ -1759,6 +1759,7 @@ impl Node {
                 supervisors: supervisors.clone(),
                 supervisor_stops: supervisor_stops.clone(),
                 placement_states: placement_states.clone(),
+                prefix_retirements: Arc::new(SenderFinalizationRegistry::default()),
                 preloaded_fragments,
                 placement_generation: node.placement_generation.clone(),
                 senders: node.senders.clone(),

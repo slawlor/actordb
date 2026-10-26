@@ -39,6 +39,15 @@ delivery guarantee.
    restart, preserving a surviving serving replica. Do not reuse the epoch for
    another outage.
 
+If the current replica set differs from the authority captured at startup, the
+fragment stays non-serving with `recovery_placement_mismatch` diagnostics,
+rate-limited by `placement_drain_warn_interval`. It waits with bounded 100 ms
+placement checks rather than repeatedly retiring/recreating its actor and
+senders. Changing unrelated fragments does not retry that unchanged mismatch;
+revocation wakes the affected gain within one check interval, and shutdown
+cancels the wait immediately. A different recovery authority requires an
+explicitly authorized restart; this wait does not elect or authorize a source.
+
 ```rust
 use actordb::node::{NodeConfig, RecoveryOptions};
 
