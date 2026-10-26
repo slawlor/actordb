@@ -51,7 +51,7 @@ The contract is deliberately narrow:
 - `write_batch` persists a batch of **winning writes** (post-LWW-merge).
   The actor never calls `get`/`put`/`delete` on the store; it works from the
   in-memory `FragmentState` cache and pushes batches down.
-- Writes are serialized per fragment and each batch contains at most one
+- Writes are serialized per table/cache partition and each batch contains at most one
   version per key. A failed or cancelled attempt can be retried, so custom
   stores must apply identical key/version writes idempotently.
 - `commit_durability` describes an ordinary successful batch as `Buffered` or
@@ -193,7 +193,9 @@ one ordered operation. This prevents workers in different priority pools from
 persisting versions in a different order from the in-memory winner. Reads use
 the cache and do not wait for an ordinary buffered write to reach disk.
 
-Only one store write may be in progress per fragment. A batch remains marked
+Only one store write may be in progress per table/cache partition. Independent
+tables may flush concurrently through the configured node-wide storage executor;
+same-key ordering is isolated by their disjoint physical namespaces. A batch remains marked
 in flight until the store write succeeds; failures and cancelled flush callers
 therefore leave it available for an idempotent retry. Duplicate updates to one
 key are coalesced to their LWW winner before calling the store.
@@ -203,6 +205,16 @@ write caller without terminating the managed worker. Unrelated admitted reads
 and writes stay in that worker's mailbox, and failed persistence winners remain
 owned for retry. An error can follow a winning cache merge; it does not prove
 the write was unapplied or durable. Actual actor failures still use supervision.
+
+`PersistenceConfig::max_records` and `max_bytes` are shared across the entire
+fragment, including its base cache, KV, and every named table. Each pending or
+immutable active representation owns one record slot and its retained-byte
+charge until actual storage completion or authoritative failed-batch restoration.
+Replacing a pending winner reserves only byte growth; a newer pending winner
+beside an active batch owns a second slot. Failed reservation leaves the cache,
+version floor and previous charges unchanged. The separate node-wide byte cap
+remains shared across fragments. Table worker pools and ordered flush buffers
+remain independent; fragment admission adds no global backend serialization.
 
 The buffer is pushed to the store when:
 
