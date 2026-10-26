@@ -29,6 +29,10 @@ pub(super) struct PlacementDriverDeps {
     pub(super) supervisors: Arc<Mutex<HashMap<FragmentId, ActorRef<SupervisorMessage>>>>,
     pub(super) supervisor_stops: Arc<SupervisorRegistry>,
     pub(super) placement_states: Arc<Mutex<HashMap<FragmentId, FragmentPlacementState>>>,
+    /// A backend-owned deletion seal defers publication for its fragment only.
+    /// Unlike the global transition mutex, this ownership survives cancellation
+    /// of a result waiter without stalling unrelated placement changes.
+    pub(super) prefix_retirements: Arc<SenderFinalizationRegistry>,
     /// Subtrees loaded synchronously during dynamic startup but not yet
     /// reconciled or published as authoritative. The first placement tick
     /// consumes this set into explicit gain/loss transitions.
@@ -125,26 +129,48 @@ pub(super) async fn placement_driver(
 /// routing table, then gain/lose fragments to match.
 pub(super) async fn placement_tick(deps: &PlacementDriverDeps) {
     let before_generation = deps.placement_generation.load(Ordering::Acquire);
-    let desired = deps.controller.desired_placement();
+    let mut desired = deps.controller.desired_placement();
     if let Err(e) = validate_placement(&desired, deps.fragment_count) {
         tracing::warn!(error = %e, "invalid desired placement; keeping current map");
         return;
     }
-    let mine_desired: HashSet<FragmentId> = desired
-        .iter()
-        .filter(|(_, r)| r.iter().any(|id| id == &deps.node_id))
-        .map(|(f, _)| *f)
-        .collect();
-
     // `placement_states` is also the transition commit mutex. Publishing a
     // controller map and marking its gain/loss transitions in one critical
     // section prevents a stale drainer from validating the old map and then
     // tearing down state after a re-add has already been published.
-    let (mine_current, in_flight, transitions) = {
+    let (mine_desired, mine_current, in_flight, transitions) = {
         let mut states = deps.placement_states.lock().await;
         // Canonical lock order is placement_states -> placement. The sync map
         // guard never crosses an await.
         let mut published = deps.placement.write().unwrap();
+        // A certified deletion is irreversible once its synchronous backend
+        // starts. Keep that fragment's certified map until the backend-owned
+        // seal drops, but publish every unrelated controller change now.
+        // Installation is ordered by placement_states, so no re-add can slip
+        // between the final generation check and sealing this fragment.
+        let retiring: Vec<FragmentId> = deps
+            .prefix_retirements
+            .fragments
+            .lock()
+            .unwrap()
+            .keys()
+            .copied()
+            .collect();
+        for fragment in retiring {
+            match published.get(&fragment) {
+                Some(replicas) => {
+                    desired.insert(fragment, replicas.clone());
+                }
+                None => {
+                    desired.remove(&fragment);
+                }
+            }
+        }
+        let mine_desired: HashSet<FragmentId> = desired
+            .iter()
+            .filter(|(_, r)| r.iter().any(|id| id == &deps.node_id))
+            .map(|(f, _)| *f)
+            .collect();
         if *published != desired {
             *published = desired.clone();
             deps.placement_generation.fetch_add(1, Ordering::AcqRel);
@@ -198,7 +224,7 @@ pub(super) async fn placement_tick(deps: &PlacementDriverDeps) {
             states.insert(*f, FragmentPlacementState::Draining);
             transitions.push((*f, false, false));
         }
-        (current, flight, transitions)
+        (mine_desired, current, flight, transitions)
     };
     if !transitions.is_empty()
         || before_generation != deps.placement_generation.load(Ordering::Acquire)
@@ -401,11 +427,29 @@ pub(super) async fn converge_fragment_gain(
             .as_ref()
             .is_some_and(|recovery| !recovery.matches_placement(fragment, &replicas))
         {
-            tracing::warn!(
-                fragment = fragment.0,
-                "recovery placement changed; explicit new recovery authority required"
-            );
-            return false;
+            // Recovery authority is immutable for this runtime. Repeating the
+            // same failed gain through the retirement/re-add loop cannot make
+            // progress and used to spin and flood diagnostics. Keep the actor
+            // non-serving until this fragment's placement changes; cancellation
+            // drops this timer immediately during shutdown.
+            let mut next_warning = Instant::now();
+            loop {
+                if deps.placement.read().unwrap().get(&fragment) != Some(&replicas) {
+                    break;
+                }
+                if Instant::now() >= next_warning {
+                    tracing::warn!(
+                        fragment = fragment.0,
+                        blocked_reason = "recovery_placement_mismatch",
+                        ?replicas,
+                        "recovery placement changed; explicit new recovery authority required"
+                    );
+                    next_warning =
+                        Instant::now() + deps.drain_warn_interval.max(Duration::from_millis(100));
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            continue;
         }
         ensure_fragment_senders(deps, fragment, &desired).await;
         let sources: Vec<String> = replicas
@@ -855,10 +899,11 @@ pub(super) async fn finish_fragment_prefix_retirement(
     let fragment_store = Arc::new(PrefixedStore::new(base_store, fragment));
     let mut next_delete_warning = std::time::Instant::now();
     loop {
-        // Placement publication uses this same mutex. Holding it through the
-        // synchronous, idempotent delete makes the final revoked-map check and
-        // namespace mutation one atomic lifecycle decision.
-        let states = deps.placement_states.clone().lock_owned().await;
+        // Order the exact handoff check and per-fragment publication seal with
+        // placement ticks. Never transfer the global mutex to a storage job:
+        // executor admission and fsync for one fragment must not hold topology
+        // progress for every other fragment hostage.
+        let states = deps.placement_states.lock().await;
         if !fragment_placement_matches(deps, fragment, &expected_replicas, expected_generation) {
             tracing::info!(
                 fragment = fragment.0,
@@ -867,13 +912,21 @@ pub(super) async fn finish_fragment_prefix_retirement(
             drop(states);
             break;
         }
+        let Some(retirement) = deps.prefix_retirements.seal(fragment) else {
+            // Another completion owner still holds this fragment. This is a
+            // fail-closed retry, never permission for concurrent deletion.
+            drop(states);
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            continue;
+        };
+        drop(states);
         let backend = fragment_store.clone();
         let deleted = deps
             .subtree_config
             .persistence
             .executor()
             .run(move || {
-                let _placement_guard = states;
+                let _retirement = retirement;
                 backend.delete_prefix(&[])
             })
             .await;
@@ -1440,6 +1493,10 @@ impl Node {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "placement_retirement_tests.rs"]
+mod retirement_tests;
 
 #[cfg(test)]
 mod tests {
@@ -2193,7 +2250,7 @@ mod tests {
         replacement.stop().await;
     }
 
-    fn test_placement_deps(
+    pub(super) fn test_placement_deps(
         router: FragmentRouter,
         serving: Arc<RwLock<HashSet<FragmentId>>>,
         placement: Arc<RwLock<HashMap<FragmentId, Vec<String>>>>,
@@ -2226,6 +2283,7 @@ mod tests {
                 FragmentId(0),
                 FragmentPlacementState::Draining,
             )]))),
+            prefix_retirements: Arc::new(SenderFinalizationRegistry::default()),
             preloaded_fragments: Arc::new(StdMutex::new(HashSet::new())),
             placement_generation: Arc::new(AtomicU64::new(0)),
             senders,

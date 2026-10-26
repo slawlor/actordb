@@ -154,8 +154,15 @@ one another's empty state.
    reconciles, and restores `Serving`.
 5. After detach, quiesce periodic actors, drain dispatcher/worker mailboxes,
    and require the final local flush before touching storage. Revalidate the
-   certified placement, then invoke idempotent fragment-prefix deletion while
-   placement publication is excluded. An error remains `Draining` and retries;
+   certified placement and install a backend-owned deletion seal for that
+   fragment before releasing the global placement lock. Executor admission and
+   idempotent deletion defer only that fragment's map publication; unrelated
+   placement changes and serving commits remain available. The seal survives
+   cancellation of an admitted result waiter until the synchronous backend
+   actually finishes. A cancelled queued job never starts its delete. An error
+   remains `Draining` and retries only while the certified placement generation
+   still matches; a changed map retains the quiesced prefix instead of issuing
+   another stale deletion.
    `Deleted` or the backend's terminal `Retained` outcome permits supervisor
    stop and `Stopped`. A post-detach re-add waits for that outcome and starts a
    fresh subtree. RocksDB uses a synchronous range tombstone; compaction later
