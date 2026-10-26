@@ -28,11 +28,15 @@
 //!
 //! ```
 //! use actordb::{actor::VersionedValue, shard::FragmentId};
-//! use actordb::store::{KvStore, PrefixedStore, StoreError};
+//! use actordb::store::{KvStore, PrefixedStore, StoreError, StoreBinding, StoreIdentity, StoreCommitDurability};
 //! use std::sync::Arc;
 //!
 //! struct CallerStore;
 //! impl KvStore for CallerStore {
+//!     fn bind(&self, _: &StoreIdentity) -> Result<StoreBinding, StoreError> { Ok(StoreBinding::unmanaged()) }
+//!     fn load_prefix(&self, _: &[u8]) -> Result<Vec<(Vec<u8>, VersionedValue)>, StoreError> { Ok(Vec::new()) }
+//!     fn commit_durability(&self) -> StoreCommitDurability { StoreCommitDurability::Buffered }
+//!     fn stable_fence(&self) -> Result<StoreCommitDurability, StoreError> { Ok(StoreCommitDurability::Buffered) }
 //!     fn load(&self) -> Result<Vec<(Vec<u8>, VersionedValue)>, StoreError> {
 //!         Ok(Vec::new())
 //!     }
@@ -378,52 +382,31 @@ pub trait KvStore: Send + Sync + 'static {
     }
     /// Attach one live node and validate any backend identity metadata.
     ///
-    /// The default is an unmanaged no-op so existing custom implementations
-    /// remain source compatible. Backends which persist multiple fragment
-    /// namespaces should bind at least the node id and fragment count. A
-    /// wrapper around a backend which requires binding must delegate this call
-    /// and retain the returned ownership rather than relying on the default.
-    fn bind(&self, _identity: &StoreIdentity) -> Result<StoreBinding, StoreError> {
-        Ok(StoreBinding::unmanaged())
-    }
+    /// Implement the backend's explicit identity/exclusivity policy. A wrapper
+    /// delegates and retains the returned ownership. Choosing unmanaged
+    /// attachment is an explicit backend decision, never a hidden default.
+    fn bind(&self, identity: &StoreIdentity) -> Result<StoreBinding, StoreError>;
     /// Load the full backing dataset, with exactly one current winner per key.
-    /// The default [`KvStore::load_prefix`]
-    /// implementation filters this result during fragment startup.
     fn load(&self) -> Result<Vec<(Vec<u8>, VersionedValue)>, StoreError>;
-    /// Load only keys beginning with `prefix`. The default preserves source
-    /// compatibility for custom stores; stores with ordered iteration should
-    /// override it to avoid a full-dataset scan for every fragment.
-    fn load_prefix(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, VersionedValue)>, StoreError> {
-        Ok(self
-            .load()?
-            .into_iter()
-            .filter(|(key, _)| key.starts_with(prefix))
-            .collect())
-    }
+    /// Load only the requested namespace. Implement prefix-specific storage
+    /// access; there is no implicit full-dataset load/filter fallback.
+    fn load_prefix(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, VersionedValue)>, StoreError>;
     /// Crash durability provided by an ordinary successful `write_batch`.
     ///
-    /// Existing custom stores default to [`StoreCommitDurability::Buffered`].
-    /// A wrapper must delegate this method if the wrapped backend offers a
-    /// stronger guarantee.
-    fn commit_durability(&self) -> StoreCommitDurability {
-        StoreCommitDurability::Buffered
-    }
+    /// Declare the actual backend completion contract; wrappers delegate it.
+    fn commit_durability(&self) -> StoreCommitDurability;
     /// Force writes completed before this call through the backend's strongest
     /// available crash-recovery fence.
     ///
-    /// Callers flush actor-side buffers before invoking this method. The default
-    /// performs no additional work and reports [`KvStore::commit_durability`],
-    /// preserving compatibility for custom stores. Implementations may override
-    /// it when an explicit fence can strengthen buffered ordinary writes.
-    fn stable_fence(&self) -> Result<StoreCommitDurability, StoreError> {
-        Ok(self.commit_durability())
-    }
+    /// Callers flush actor-side buffers first. Implement a real fence and
+    /// report its actual durability, or explicitly return unsupported/error.
+    fn stable_fence(&self) -> Result<StoreCommitDurability, StoreError>;
     /// Atomically persist a batch of winning writes. Each key occurs at most
     /// once in a batch.
     fn write_batch(&self, writes: &[(Vec<u8>, VersionedValue)]) -> Result<(), StoreError>;
     /// Declare whether lifecycle code may invoke [`KvStore::delete_prefix`].
     ///
-    /// Existing custom stores retain namespaces by default. Opting in promises
+    /// Backends retain namespaces unless they explicitly opt in. Opting in promises
     /// that `delete_prefix` obeys its quiescence, durability, and idempotency
     /// contract; the returned [`PrefixDeleteOutcome`] remains authoritative for
     /// each call.
@@ -434,7 +417,7 @@ pub trait KvStore: Send + Sync + 'static {
     /// been quiesced. The operation must be idempotent because lifecycle work
     /// can retry it after an ambiguous failure.
     ///
-    /// Existing custom stores retain data by default. Returning
+    /// Unsupported deletion retains data. Returning
     /// [`PrefixDeleteOutcome::Deleted`] promises that a successful reopen will
     /// not expose any pre-call key in this prefix.
     fn delete_prefix(&self, _prefix: &[u8]) -> Result<PrefixDeleteOutcome, StoreError> {
@@ -462,8 +445,6 @@ pub enum RocksDbDurability {
 pub struct RocksDbOptions {
     #[builder(default = RocksDbDurability::SyncWal)]
     durability: RocksDbDurability,
-    #[builder(default = false, name = legacy_manifest_adoption)]
-    adopt_legacy_manifest: bool,
 }
 
 #[cfg(feature = "rocksdb")]
@@ -481,26 +462,9 @@ impl RocksDbOptions {
         self
     }
 
-    /// Explicitly allow a non-empty pre-manifest database to be adopted by the
-    /// first [`StoreIdentity`] supplied to [`KvStore::bind`].
-    ///
-    /// This is a one-time migration escape hatch. A legacy database contains
-    /// no trustworthy original node id, so callers must verify the path and
-    /// take a backup before enabling it. Existing, corrupt, or mismatched
-    /// manifests are never overwritten.
-    pub fn with_legacy_manifest_adoption(mut self, allow: bool) -> Self {
-        self.adopt_legacy_manifest = allow;
-        self
-    }
-
     /// Current ordinary-write durability policy.
     pub fn durability(&self) -> RocksDbDurability {
         self.durability
-    }
-
-    /// Whether this open may adopt a non-empty pre-manifest database.
-    pub fn legacy_manifest_adoption(&self) -> bool {
-        self.adopt_legacy_manifest
     }
 }
 
@@ -523,6 +487,18 @@ mod tests {
         struct CustomStore;
 
         impl KvStore for CustomStore {
+            fn bind(&self, _: &StoreIdentity) -> Result<StoreBinding, StoreError> {
+                Ok(StoreBinding::unmanaged())
+            }
+            fn load_prefix(&self, _: &[u8]) -> Result<Vec<(Vec<u8>, VersionedValue)>, StoreError> {
+                Ok(Vec::new())
+            }
+            fn commit_durability(&self) -> StoreCommitDurability {
+                StoreCommitDurability::Buffered
+            }
+            fn stable_fence(&self) -> Result<StoreCommitDurability, StoreError> {
+                Ok(StoreCommitDurability::Buffered)
+            }
             fn load(&self) -> Result<Vec<(Vec<u8>, VersionedValue)>, StoreError> {
                 Ok(Vec::new())
             }
