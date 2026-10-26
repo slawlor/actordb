@@ -1,12 +1,15 @@
-# ActorDB 0.9.1 deployment
+# ActorDB 0.10.0 deployment
 
-ActorDB `0.9.1` preserves the wire and data formats of the published `0.9.0`.
-Existing deployments on that release require no data conversion for this patch.
-The 0.9 release line remains a hard migration from non-current formats. Start a
-new deployment with fresh stores,
-current configuration and matching database/protocol/query/SDK crates. There
-are no compatibility aliases, old-data adoption switches, rolling wire upgrades
-or automatic conversions.
+ActorDB `0.10.0` preserves the wire and data formats of the published `0.9.0`.
+Current-format deployments require no data conversion. The SDK's default 64 MiB
+decoded-response allowance is a breaking admission-policy change; configure
+`ClientOptions::max_decoded_response_bytes` explicitly for larger supported
+responses. The 16 MiB encoded-frame bound is unchanged.
+
+Non-current formats still require a new deployment with fresh stores, current
+configuration and matching database/protocol/query/SDK crates. There are no
+compatibility aliases, old-data adoption switches, wire-version fallbacks or
+automatic conversions.
 
 ## Deployment contract
 
@@ -19,7 +22,7 @@ or automatic conversions.
 - The envelope/record maximum remains **16 MiB**. There is no signed-frame
   header or Ed25519 dependency.
 
-Use new data directories. If existing business data must be retained, export it
+For non-current formats, use new data directories. If business data must be retained, export it
 through the source application's supported tools and ingest it as new
 application writes; preserving it is a separate operator-owned project, not an
 in-place ActorDB upgrade. Nothing in this release deletes an existing deployment.

@@ -8,7 +8,7 @@ Connect to the **application listener**, using `Client::connect(address,
 ClientOptions::default())`. A server explicitly binds
 `actordb::client_server::ClientServer` around an existing `Arc<Node>`.
 
-Use `actordb-client = "0.9.1"` with a current application listener. The SDK
+Use `actordb-client = "0.10.0"` with a current application listener. The SDK
 uses exact application protocol 4, without version-range or capability
 negotiation. Construct `ClientOptions` and `PutOptions` with their Bon builders,
 or start with `Default` and modify public fields; these structs are
@@ -30,13 +30,29 @@ isolate keys and SQL results by table.
 Inspection describes the contacted node; it is not a readiness or durability
 check. Batches are individual operations, not transactions.
 
-Clones share one connection and serialize requests. Count and encoded-byte
+Clones share one connection and serialize exchanges, decoding and conversion. Count and encoded-byte
 admission are nonwaiting and return `ClientError::Overloaded` at capacity. The
 request deadline includes waiting for the connection. For parallel connections,
-create several clients. Incoming frames are capped at 16 MiB and repeated fields
-are checked before decoding. Large complete results return a resource-limit
-error; reduce batch or query size. Scan limits/offsets retain per-fragment
+create several clients. Incoming frames retain their fixed 16 MiB wire cap.
+Before decoding, aggregate headers, cells, map entries, payloads and nested
+write-concern evidence must also fit `ClientOptions::max_decoded_response_bytes`
+(64 MiB by default). This stricter default can reject formerly accepted wide
+responses or near-server-limit narrow text results. For such a trusted workload, opt in with
+`.max_decoded_response_bytes(512 * 1024 * 1024)`; increasing that allowance does
+not increase the wire limit. Exceeding decoded admission retires the connection
+with `Protocol` (or `UnknownOutcome` for a possibly dispatched mutation).
+Server-side complete-result exhaustion remains a resource-limit error; reduce
+batch/query size or explicitly configure the receiving budget as appropriate.
+Scan limits/offsets retain per-fragment
 semantics and scans share the query engine's byte bounds.
+
+The allowance is conservative allocation accounting, not exact heap usage or
+RSS. It includes the raw body, decoded collection capacity/payloads, temporary
+validation copies and portable result/receipt conversion. A shared owner stays
+held until conversion returns, so the next clone cannot allocate a raw response
+while the previous response is being converted. Caller-retained returned results,
+outgoing request storage, transport buffers and allocator slack are outside this
+scope; independently connected clients each have their own allowance.
 
 No write retries happen automatically. Connection loss or timeout after possible
 dispatch returns `UnknownOutcome`: the write might have committed. Canceling an
@@ -68,7 +84,7 @@ real application listener.
 
 Per-write acknowledgement counts and region requirements are available through
 `put_with_write_concern` and `delete_with_write_concern`. Install
-`actordb-client = "0.9.1"` for region, strict-policy and durability evidence support; the compatible dependency minimums
+`actordb-client = "0.10.0"` for region, strict-policy and durability evidence support; the compatible dependency minimums
 also select the required protocol and query revisions. See the
 [region guide](../docs/write-concern-regions.md) for configuration and receipt
 semantics. Local acknowledgement remains the default.

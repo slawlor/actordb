@@ -71,6 +71,12 @@ pub struct ClientOptions {
     /// Encoded request bytes retained by admitted requests. Default 32 MiB.
     #[builder(default = 32 * 1024 * 1024)]
     pub max_queued_bytes: usize,
+    /// Accounted response admission, including raw framing, decoded headers/
+    /// payloads and portable conversion. Default 64 MiB; separate from the fixed
+    /// 16 MiB wire limit. Larger supported responses require an explicit larger
+    /// allowance. This is not an allocator/RSS or caller-retained result limit.
+    #[builder(default = actordb_protocol::DEFAULT_MAX_DECODED_RESPONSE_BYTES)]
+    pub max_decoded_response_bytes: usize,
 }
 impl std::fmt::Debug for ClientOptions {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -84,6 +90,10 @@ impl std::fmt::Debug for ClientOptions {
             .field("timeout", &self.timeout)
             .field("max_queued_requests", &self.max_queued_requests)
             .field("max_queued_bytes", &self.max_queued_bytes)
+            .field(
+                "max_decoded_response_bytes",
+                &self.max_decoded_response_bytes,
+            )
             .finish()
     }
 }
@@ -149,8 +159,29 @@ struct Inner {
     next_id: AtomicU64,
     count: Semaphore,
     bytes: Arc<Semaphore>,
+    /// One shared owner spans raw reading, decoding and public conversion.
+    /// Queued clones cannot allocate another raw response while it is held.
+    response_owner: Arc<Semaphore>,
     options: ClientOptions,
     closing: watch::Sender<bool>,
+}
+
+struct OwnedResponse {
+    response: wire::Response,
+    // Declared after response so unreturned decoded fields drop before another
+    // clone obtains materialization ownership. Returned values are caller-owned.
+    _owner: tokio::sync::OwnedSemaphorePermit,
+}
+impl std::ops::Deref for OwnedResponse {
+    type Target = wire::Response;
+    fn deref(&self) -> &Self::Target {
+        &self.response
+    }
+}
+impl std::ops::DerefMut for OwnedResponse {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.response
+    }
 }
 #[derive(Clone)]
 pub struct Client {
@@ -202,6 +233,7 @@ impl Client {
             || options.max_queued_bytes < MAX_FRAME_BYTES
             || options.max_queued_bytes > u32::MAX as usize
             || options.max_queued_bytes > Semaphore::MAX_PERMITS
+            || options.max_decoded_response_bytes < actordb_protocol::MAX_HANDSHAKE_BYTES
             || options
                 .credential
                 .as_ref()
@@ -237,9 +269,14 @@ impl Client {
                 },
             )
             .await?;
-            let server = match read_frame(&mut stream, actordb_protocol::MAX_HANDSHAKE_BYTES)
-                .await?
-                .message
+            let server = match read_frame(
+                &mut stream,
+                actordb_protocol::MAX_HANDSHAKE_BYTES,
+                options.max_decoded_response_bytes,
+                Incoming::Hello,
+            )
+            .await?
+            .message
             {
                 Some(wire::frame::Message::Hello(hello))
                     if actordb_protocol::valid_client_hello(&hello) =>
@@ -260,9 +297,14 @@ impl Client {
                 },
             )
             .await?;
-            match read_frame(&mut stream, actordb_protocol::MAX_HANDSHAKE_BYTES)
-                .await?
-                .message
+            match read_frame(
+                &mut stream,
+                actordb_protocol::MAX_HANDSHAKE_BYTES,
+                options.max_decoded_response_bytes,
+                Incoming::Auth,
+            )
+            .await?
+            .message
             {
                 Some(wire::frame::Message::Auth(auth))
                     if actordb_protocol::verify_client_auth(
@@ -284,6 +326,7 @@ impl Client {
                 next_id: AtomicU64::new(1),
                 count: Semaphore::new(options.max_queued_requests),
                 bytes: Arc::new(Semaphore::new(options.max_queued_bytes)),
+                response_owner: Arc::new(Semaphore::new(1)),
                 options,
                 closing: watch::channel(false).0,
             }),
@@ -309,7 +352,7 @@ impl Client {
         &self,
         operation: wire::request::Operation,
         mutation: bool,
-    ) -> Result<wire::Response, ClientError> {
+    ) -> Result<OwnedResponse, ClientError> {
         self.request_with_timeout(operation, mutation, Duration::ZERO)
             .await
     }
@@ -319,7 +362,7 @@ impl Client {
         operation: wire::request::Operation,
         mutation: bool,
         extra: Duration,
-    ) -> Result<wire::Response, ClientError> {
+    ) -> Result<OwnedResponse, ClientError> {
         let request_timeout = self
             .inner
             .options
@@ -369,6 +412,16 @@ impl Client {
             }
         };
         tokio::pin!(cancelled);
+        // Acquire before taking the transport or allocating a raw body. A
+        // clone parked here can time out/cancel without retiring a healthy
+        // connection and without overlapping another response conversion.
+        let response_owner = tokio::select! {
+            biased;
+            _ = &mut cancelled => return Err(ClientError::Closed),
+            owner = timeout_at(deadline, self.inner.response_owner.clone().acquire_owned()) => {
+                owner.map_err(|_| ClientError::Timeout)?.map_err(|_| ClientError::Closed)?
+            }
+        };
         let mut guard = tokio::select! {
             biased;
             _ = &mut cancelled => return Err(ClientError::Closed),
@@ -380,14 +433,26 @@ impl Client {
         // prefix/body can never be reused by the next queued request.
         let mut stream = guard.take().ok_or(ClientError::Closed)?;
         let mut dispatched = false;
+        let response_shape = response_shape(&frame)?;
         let exchange = timeout_at(deadline, async {
             // Mark before write: even a failing write can transmit a complete request.
             dispatched = true;
             send_frame(&mut stream, &frame).await?;
-            match read_frame(&mut stream, MAX_FRAME_BYTES).await?.message {
+            match read_frame(
+                &mut stream,
+                MAX_FRAME_BYTES,
+                self.inner.options.max_decoded_response_bytes,
+                Incoming::Response(&response_shape),
+            )
+            .await?
+            .message
+            {
                 Some(wire::frame::Message::Response(response)) if response.id == id => {
                     validate_response(&frame, &response)?;
-                    Ok(response)
+                    Ok(OwnedResponse {
+                        response,
+                        _owner: response_owner,
+                    })
                 }
                 _ => Err(ClientError::Protocol(
                     "unexpected response or request id".into(),
@@ -443,6 +508,7 @@ impl Client {
     pub async fn close_with_timeout(&self, graceful_timeout: Duration) {
         self.inner.count.close();
         self.inner.bytes.close();
+        self.inner.response_owner.close();
         self.inner.closing.send_replace(true);
         let deadline = (!graceful_timeout.is_zero())
             .then(|| Instant::now().checked_add(graceful_timeout))
@@ -470,7 +536,7 @@ impl Client {
         key: impl Into<String>,
         priority: Priority,
     ) -> Result<Option<Value>, ClientError> {
-        let response = self
+        let mut response = self
             .request(
                 wire::request::Operation::Get(wire::Get {
                     key: key.into(),
@@ -479,7 +545,7 @@ impl Client {
                 false,
             )
             .await?;
-        let mut results = decode_reads(response.reads);
+        let mut results = decode_reads(std::mem::take(&mut response.reads));
         if results.len() != 1 {
             return Err(ClientError::Protocol(
                 "single get result cardinality".into(),
@@ -552,8 +618,8 @@ impl Client {
         &self,
         operation: wire::request::Operation,
     ) -> Result<(), ClientError> {
-        let response = self.request(operation, true).await?;
-        let mut results = decode_mutations(response.mutations);
+        let mut response = self.request(operation, true).await?;
+        let mut results = decode_mutations(std::mem::take(&mut response.mutations));
         if results.len() != 1 {
             return Err(ClientError::UnknownOutcome(
                 "single mutation result cardinality".into(),
@@ -577,7 +643,7 @@ impl Client {
             return Err(ClientError::Invalid("too many batch keys".into()));
         }
         let count = keys.len();
-        let response = self
+        let mut response = self
             .request(
                 wire::request::Operation::BatchGet(wire::BatchGet {
                     keys,
@@ -589,7 +655,7 @@ impl Client {
         if response.reads.len() != count {
             return Err(ClientError::Protocol("batch get cardinality".into()));
         }
-        Ok(decode_reads(response.reads))
+        Ok(decode_reads(std::mem::take(&mut response.reads)))
     }
     pub async fn put_multi(
         &self,
@@ -618,7 +684,7 @@ impl Client {
                 write_concern: None,
             })
             .collect();
-        let response = self
+        let mut response = self
             .request(
                 wire::request::Operation::BatchPut(wire::BatchPut {
                     puts,
@@ -632,7 +698,7 @@ impl Client {
                 "batch mutation cardinality".into(),
             ));
         }
-        Ok(decode_mutations(response.mutations))
+        Ok(decode_mutations(std::mem::take(&mut response.mutations)))
     }
     pub async fn query(&self, sql: &str) -> Result<QueryResult, ClientError> {
         self.query_with_params(sql, &[]).await
@@ -673,7 +739,7 @@ impl Client {
             ));
         }
         let params = params.iter().map(encode_cell).collect();
-        let response = self
+        let mut response = self
             .request(
                 wire::request::Operation::Query(wire::Query {
                     sql: sql.into(),
@@ -684,6 +750,7 @@ impl Client {
             .await?;
         let result = response
             .query
+            .take()
             .ok_or_else(|| ClientError::Protocol("missing query result".into()))?;
         Ok(QueryResult {
             columns: result.columns,
@@ -696,9 +763,12 @@ impl Client {
     }
     /// Local health and placement inspection of the contacted Node, not readiness.
     pub async fn inspect(&self) -> Result<Inspection, ClientError> {
-        self.request(wire::request::Operation::Inspect(wire::Inspect {}), false)
-            .await?
+        let mut response = self
+            .request(wire::request::Operation::Inspect(wire::Inspect {}), false)
+            .await?;
+        response
             .inspection
+            .take()
             .ok_or_else(|| ClientError::Protocol("missing inspection".into()))
     }
     /// Existing count-bounded scan API. Limits/offsets apply independently per fragment.
@@ -706,10 +776,10 @@ impl Client {
         &self,
         spec: wire::Scan,
     ) -> Result<Vec<actordb_protocol::meta::ScanMatch>, ClientError> {
-        Ok(self
+        let mut response = self
             .request(wire::request::Operation::Scan(spec), false)
-            .await?
-            .scans)
+            .await?;
+        Ok(std::mem::take(&mut response.scans))
     }
 }
 
@@ -737,6 +807,31 @@ fn server_error(error: wire::Error) -> ClientError {
     } else {
         ClientError::Server(error)
     }
+}
+
+fn response_shape(
+    frame: &wire::Frame,
+) -> Result<actordb_protocol::ClientResponseShape, ClientError> {
+    let Some(wire::frame::Message::Request(request)) = &frame.message else {
+        unreachable!()
+    };
+    let mut shape = actordb_protocol::ClientResponseShape::from_request(request);
+    if let Some(wire::request::Operation::Query(query)) = &request.operation {
+        let params: Vec<_> = query
+            .params
+            .iter()
+            .cloned()
+            .map(decode_cell)
+            .collect::<Result<_, _>>()?;
+        // Invalid caller SQL retains the existing server-error behavior. It
+        // does not relax structural or decoded-byte limits on the response.
+        if let Ok(plan) = actordb_query::parse_with_params(&query.sql, &params) {
+            shape = shape
+                .with_query_shape(plan.projections.len(), plan.limit, plan.is_aggregate())
+                .map_err(|error| ClientError::Invalid(error.into()))?;
+        }
+    }
+    Ok(shape)
 }
 
 fn validate_response(frame: &wire::Frame, response: &wire::Response) -> Result<(), ClientError> {
@@ -863,15 +958,45 @@ async fn send_frame(stream: &mut BoxStream, frame: &wire::Frame) -> Result<(), C
     stream.flush().await?;
     Ok(())
 }
-async fn read_frame(stream: &mut BoxStream, max: usize) -> Result<wire::Frame, ClientError> {
+enum Incoming<'a> {
+    Hello,
+    Auth,
+    Response(&'a actordb_protocol::ClientResponseShape),
+}
+
+async fn read_frame(
+    stream: &mut BoxStream,
+    max: usize,
+    max_decoded_bytes: usize,
+    incoming: Incoming<'_>,
+) -> Result<wire::Frame, ClientError> {
     let length = stream.read_u32().await? as usize;
     if length == 0 || length > max {
         return Err(ClientError::Protocol("invalid frame length".into()));
     }
+    if length > max_decoded_bytes {
+        return Err(ClientError::Protocol(
+            "raw response exceeds decoded admission allowance".into(),
+        ));
+    }
     let mut bytes = vec![0; length];
     stream.read_exact(&mut bytes).await?;
-    actordb_protocol::preflight_client_frame(&bytes)
-        .map_err(|e| ClientError::Protocol(e.into()))?;
+    match incoming {
+        Incoming::Response(shape) => {
+            actordb_protocol::preflight_client_response(&bytes, max_decoded_bytes, shape)
+        }
+        Incoming::Hello => actordb_protocol::preflight_client_frame_kind(
+            &bytes,
+            max_decoded_bytes,
+            actordb_protocol::ClientFrameKind::Hello,
+        ),
+        Incoming::Auth => actordb_protocol::preflight_client_frame_kind(
+            &bytes,
+            max_decoded_bytes,
+            actordb_protocol::ClientFrameKind::Auth,
+        ),
+    }
+    .map_err(|e| ClientError::Protocol(e.into()))?;
     wire::Frame::decode(bytes.as_slice()).map_err(|e| ClientError::Protocol(e.to_string()))
 }
 
@@ -906,5 +1031,168 @@ mod credential_debug_tests {
         }
         assert!(format!("{:?}", ClientOptions::default()).contains("credential: None"));
         assert_eq!(options.credential.as_deref(), Some(secret.as_slice()));
+    }
+}
+
+#[cfg(test)]
+mod response_owner_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::DuplexStream;
+
+    async fn receive(stream: &mut DuplexStream) -> wire::Frame {
+        let size = stream.read_u32().await.unwrap() as usize;
+        let mut bytes = vec![0; size];
+        stream.read_exact(&mut bytes).await.unwrap();
+        wire::Frame::decode(bytes.as_slice()).unwrap()
+    }
+    async fn send(stream: &mut DuplexStream, frame: wire::Frame) {
+        let bytes = frame.encode_to_vec();
+        stream.write_u32(bytes.len() as u32).await.unwrap();
+        stream.write_all(&bytes).await.unwrap();
+    }
+    async fn peer(mut stream: DuplexStream, requests: Arc<AtomicUsize>) {
+        assert!(matches!(
+            receive(&mut stream).await.message,
+            Some(wire::frame::Message::Hello(_))
+        ));
+        send(
+            &mut stream,
+            wire::Frame {
+                message: Some(wire::frame::Message::Hello(wire::Hello {
+                    identity: "owner-test".into(),
+                    challenge: vec![1; 32],
+                    protocol_version: CLIENT_PROTOCOL_VERSION,
+                })),
+            },
+        )
+        .await;
+        assert!(matches!(
+            receive(&mut stream).await.message,
+            Some(wire::frame::Message::Auth(_))
+        ));
+        send(
+            &mut stream,
+            wire::Frame {
+                message: Some(wire::frame::Message::Auth(wire::Auth::default())),
+            },
+        )
+        .await;
+        loop {
+            let Ok(size) = stream.read_u32().await else {
+                return;
+            };
+            let mut bytes = vec![0; size as usize];
+            stream.read_exact(&mut bytes).await.unwrap();
+            let Some(wire::frame::Message::Request(request)) =
+                wire::Frame::decode(bytes.as_slice()).unwrap().message
+            else {
+                panic!("request")
+            };
+            let Some(wire::request::Operation::Get(get)) = request.operation else {
+                panic!("no queued mutation may be sent while response ownership is retained")
+            };
+            requests.fetch_add(1, Ordering::Relaxed);
+            send(
+                &mut stream,
+                wire::Frame {
+                    message: Some(wire::frame::Message::Response(wire::Response {
+                        id: request.id,
+                        reads: vec![wire::ReadResult {
+                            key: get.key,
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    })),
+                },
+            )
+            .await;
+        }
+    }
+    async fn fixture() -> (Client, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+        let (local, remote) = tokio::io::duplex(4096);
+        let requests = Arc::new(AtomicUsize::new(0));
+        let peer = tokio::spawn(peer(remote, requests.clone()));
+        let client = Client::from_stream(
+            local,
+            ClientOptions::builder()
+                .timeout(Duration::from_millis(100))
+                .max_queued_requests(3)
+                .build(),
+        )
+        .await
+        .unwrap();
+        (client, requests, peer)
+    }
+    async fn held(client: &Client) -> OwnedResponse {
+        client
+            .request(
+                wire::request::Operation::Get(wire::Get {
+                    key: "held".into(),
+                    priority: 0,
+                }),
+                false,
+            )
+            .await
+            .unwrap()
+    }
+    async fn await_admission(client: &Client) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while client.inner.count.available_permits() == 3 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn decoded_owner_spans_conversion_and_queued_timeout_cancel_do_not_take_transport() {
+        assert!(std::mem::size_of::<QueryValue>() <= actordb_protocol::PORTABLE_CELL_HEADER_CHARGE);
+        let (client, requests, peer) = fixture().await;
+        let response = held(&client).await;
+        assert_eq!(client.inner.response_owner.available_permits(), 0);
+        assert!(client.inner.stream.try_lock().unwrap().is_some());
+        let queued = client.clone();
+        let cancelled = tokio::spawn(async move { queued.get("cancelled").await });
+        await_admission(&client).await;
+        cancelled.abort();
+        assert!(cancelled.await.unwrap_err().is_cancelled());
+        assert!(matches!(
+            client.get("timed-out").await,
+            Err(ClientError::Timeout)
+        ));
+        assert!(matches!(
+            client.put("unsent", vec![1]).await,
+            Err(ClientError::Timeout)
+        ));
+        assert_eq!(
+            requests.load(Ordering::Relaxed),
+            1,
+            "queued clones sent no frame and allocated no raw response"
+        );
+        assert_eq!(client.inner.count.available_permits(), 3);
+        assert!(client.inner.stream.try_lock().unwrap().is_some());
+        drop(response);
+        assert_eq!(client.inner.response_owner.available_permits(), 1);
+        assert!(client.get("next").await.unwrap().is_none());
+        assert_eq!(requests.load(Ordering::Relaxed), 2);
+        client.close().await;
+        peer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn close_wakes_owner_waiters_and_drop_releases_owner() {
+        let (client, requests, peer) = fixture().await;
+        let response = held(&client).await;
+        let queued = client.clone();
+        let waiting = tokio::spawn(async move { queued.get("never-sent").await });
+        await_admission(&client).await;
+        client.close().await;
+        assert!(matches!(waiting.await.unwrap(), Err(ClientError::Closed)));
+        assert_eq!(requests.load(Ordering::Relaxed), 1);
+        drop(response);
+        assert_eq!(client.inner.response_owner.available_permits(), 1);
+        peer.await.unwrap();
     }
 }
