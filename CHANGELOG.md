@@ -14,6 +14,29 @@ pull requests, and current-format stores require no conversion.
 - Bound named-table actor pools and pending-empty namespace metadata; reclaim
   only idle/unowned runtime state while preserving data, persistence ownership
   and query incarnations (#143).
+- Accept every supported metadata SQL projection in the Rust SDK without
+  retiring a valid application connection (#144).
+- Route named-table scans through their actual table, treat public Node keys
+  as literals, and preserve advertised user query limits independently of
+  bounded namespace/canonical serialization overhead (#145, #146, #147).
+- Page automatic expiry across all named tables within one aggregate actor
+  work allowance and pinned expiry time; retain authoritative manual cleanup
+  and drain opportunities between pages (#148).
+- Keep invalid recovery placement in a bounded, cancellation-safe blocked
+  wait, and isolate durable prefix retirement from unrelated placement
+  publication using per-fragment backend-owned seals (#149, #154).
+- Move readonly reconciliation summaries out of the multiplexed peer reader;
+  reserve separate bounded fetch capacity and fence session/route/authority
+  changes without blocking unrelated Get/ACK traffic (#150).
+- Maintain incremental query-buffer ownership accounting and check increasing
+  next-head reservations before cloning, preserving hard budgets and identity
+  fences without repeated whole-buffer rescans (#151).
+- Pace admitted local bulk writes fairly to configured completion capacity
+  while retaining nonwaiting external admission and cancelled-job ownership
+  through actual apply/fanout completion (#152).
+- Admit decoded application responses before materialization, including
+  collection growth, nested inspection/receipt data and portable conversion;
+  share one decode/conversion owner across client clones (#153).
 
 ## 0.9.0
 
