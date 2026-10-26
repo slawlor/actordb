@@ -169,3 +169,180 @@ async fn table_partitions_reload_from_disjoint_durable_prefixes() {
     );
     node.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn empty_table_reads_queries_and_scans_do_not_create_workers_across_fragments() {
+    use actordb::actor::{KeyMatcher, ScanSpec, ValueTransform};
+    use actordb::node::DetailedSnapshotOptions;
+    let node = Node::start(
+        "empty-tables".into(),
+        "127.0.0.1:0".parse().unwrap(),
+        NodeConfig::builder()
+            .fragment_count(4)
+            .table_pool_capacity(2)
+            .build(),
+    )
+    .await
+    .unwrap();
+    let names: Vec<_> = (0..32).map(|index| format!("EMPTY_{index}")).collect();
+    for name in &names {
+        let table = node.table(name.clone()).unwrap();
+        assert!(table.get("absent").await.unwrap().is_none());
+        assert!(table
+            .get_multi(vec!["absent".into(), "duplicate".into()])
+            .await
+            .iter()
+            .all(|value| matches!(value, Ok(None))));
+        assert!(table
+            .query(&format!("SELECT key FROM {name}"))
+            .await
+            .unwrap()
+            .rows
+            .is_empty());
+        assert!(table
+            .scan(&ScanSpec {
+                matcher: KeyMatcher::All,
+                transform: ValueTransform::KeyOnly,
+                limit: 1,
+                offset: 0
+            })
+            .await
+            .unwrap()
+            .is_empty());
+    }
+    for chunk in names.chunks(4) {
+        futures::future::join_all(chunk.iter().map(|name| {
+            let node = &node;
+            async move {
+                let table = node.table(name.clone()).unwrap();
+                assert!(table.get("concurrent-miss").await.unwrap().is_none());
+                assert!(table
+                    .query(&format!("SELECT key FROM {name}"))
+                    .await
+                    .unwrap()
+                    .rows
+                    .is_empty());
+            }
+        }))
+        .await;
+    }
+    let status = node
+        .status_snapshot_detailed(
+            DetailedSnapshotOptions::builder()
+                .tables(names)
+                .include_internal(false)
+                .max_pools(256)
+                .max_workers(1024)
+                .build(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        status.pools.is_empty(),
+        "unknown tables have no worker sets"
+    );
+    assert_eq!(
+        node.status_snapshot().readiness,
+        actordb::node::status::Readiness::Ready
+    );
+    assert_eq!(node.query_diagnostics().reserved_runtime_bytes, 0);
+    node.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn bounded_worker_cache_preserves_durable_tables_and_tombstones_across_restart() {
+    use actordb::node::DetailedSnapshotOptions;
+    let store = Arc::new(RecordingStore::default());
+    let names: Vec<_> = (0..24).map(|index| format!("DATA_{index}")).collect();
+    for boot in 0..2 {
+        let node = Node::start(
+            "cached-durable-tables".into(),
+            "127.0.0.1:0".parse().unwrap(),
+            NodeConfig::builder()
+                .store(store.clone())
+                .table_pool_capacity(2)
+                .build(),
+        )
+        .await
+        .unwrap();
+        for (index, name) in names.iter().enumerate() {
+            let table = node.table(name.clone()).unwrap();
+            if boot == 0 {
+                table.put("live", vec![index as u8]).await.unwrap();
+                table.put("deleted", vec![7]).await.unwrap();
+                table.delete("deleted").await.unwrap();
+                table
+                    .put_with_options(
+                        "ttl",
+                        vec![8],
+                        Some(std::time::Duration::from_secs(3600)),
+                        actordb::actor::OpPriority::Default,
+                    )
+                    .await
+                    .unwrap();
+            }
+            assert_eq!(
+                table.get("live").await.unwrap().unwrap().value,
+                vec![index as u8]
+            );
+            assert!(table.get("deleted").await.unwrap().is_none());
+            assert_eq!(
+                table
+                    .query(&format!("SELECT COUNT(*) FROM {name} INCLUDING TOMBSTONES"))
+                    .await
+                    .unwrap()
+                    .rows,
+                vec![vec![actordb_query::QueryValue::Integer(3)]]
+            );
+            assert!(table
+                .get("ttl")
+                .await
+                .unwrap()
+                .unwrap()
+                .expires_at_ms
+                .is_some());
+            let status = node
+                .status_snapshot_detailed(
+                    DetailedSnapshotOptions::builder()
+                        .tables(names.clone())
+                        .include_internal(false)
+                        .max_pools(256)
+                        .max_workers(1024)
+                        .build(),
+                )
+                .await
+                .unwrap();
+            assert!(
+                status.pools.len() <= 6,
+                "at most two table sets per fragment"
+            );
+            assert!(
+                status
+                    .pools
+                    .iter()
+                    .map(|entry| entry.pool.worker_count)
+                    .sum::<usize>()
+                    <= 16
+            );
+        }
+        assert_eq!(
+            node.status_snapshot().readiness,
+            actordb::node::status::Readiness::Ready
+        );
+        node.shutdown().await.unwrap();
+    }
+    assert_eq!(store.records.lock().unwrap().len(), 72);
+}
+
+#[tokio::test]
+async fn table_worker_capacity_validates_before_node_startup() {
+    for capacity in [0, 4097] {
+        assert!(Node::start(
+            "bad-table-capacity".into(),
+            "127.0.0.1:0".parse().unwrap(),
+            NodeConfig::builder().table_pool_capacity(capacity).build()
+        )
+        .await
+        .is_err());
+    }
+}

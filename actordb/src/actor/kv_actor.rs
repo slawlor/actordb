@@ -62,6 +62,9 @@ pub struct KvState {
     high_config: PoolConfig,
     default_config: PoolConfig,
     background_config: PoolConfig,
+    table_pool_capacity: usize,
+    table_use: u64,
+    retired_shed_counts: (u64, u64, u64),
 }
 
 struct TablePools {
@@ -69,9 +72,32 @@ struct TablePools {
     default_pool: WorkerPool,
     background_pool: WorkerPool,
     shared: Arc<FragmentState>,
+    last_used: u64,
+}
+
+impl TablePools {
+    fn is_idle(&self) -> bool {
+        self.high_pool.is_idle() && self.default_pool.is_idle() && self.background_pool.is_idle()
+    }
+    async fn shutdown(&self) {
+        self.high_pool.begin_shutdown();
+        self.default_pool.begin_shutdown();
+        self.background_pool.begin_shutdown();
+        self.high_pool.join().await;
+        self.default_pool.join().await;
+        self.background_pool.join().await;
+    }
 }
 
 impl KvState {
+    fn note_cache_shed(&mut self, priority: OpPriority) {
+        let count = match priority {
+            OpPriority::High => &mut self.retired_shed_counts.0,
+            OpPriority::Default => &mut self.retired_shed_counts.1,
+            OpPriority::Background => &mut self.retired_shed_counts.2,
+        };
+        *count = count.saturating_add(1);
+    }
     fn base_pool(&self, priority: OpPriority) -> &WorkerPool {
         match priority {
             OpPriority::High => &self.high_pool,
@@ -130,11 +156,46 @@ impl KvState {
         &mut self,
         table: &str,
         myself: &ActorRef<KvMessage>,
-    ) -> Result<(), ActorProcessingErr> {
-        if self.table_pools.contains_key(table) {
-            return Ok(());
+    ) -> Result<bool, ActorProcessingErr> {
+        self.table_use = self.table_use.saturating_add(1);
+        if let Some(pools) = self.table_pools.get_mut(table) {
+            pools.last_used = self.table_use;
+            return Ok(true);
         }
-        let shared = self.shared.table_state_for_actor(table).await;
+        if self.table_pools.len() >= self.table_pool_capacity {
+            let idle = self
+                .table_pools
+                .iter()
+                .filter(|(_, pools)| pools.is_idle())
+                .min_by(|(a, x), (b, y)| x.last_used.cmp(&y.last_used).then_with(|| a.cmp(b)))
+                .map(|(name, _)| name.clone());
+            let Some(idle) = idle else {
+                return Ok(false);
+            };
+            // Remove ownership before awaiting termination. Stale supervision
+            // events cannot find these workers in a newer pool generation.
+            let retired = self
+                .table_pools
+                .remove(&idle)
+                .expect("selected idle pool exists");
+            self.retired_shed_counts.0 = self
+                .retired_shed_counts
+                .0
+                .saturating_add(retired.high_pool.shed_count());
+            self.retired_shed_counts.1 = self
+                .retired_shed_counts
+                .1
+                .saturating_add(retired.default_pool.shed_count());
+            self.retired_shed_counts.2 = self
+                .retired_shed_counts
+                .2
+                .saturating_add(retired.background_pool.shed_count());
+            retired.shutdown().await;
+            self.shared.prune_empty_table(&idle).await;
+        }
+        // Resolve a child at execution, not worker construction. A rejected
+        // or cancelled cold write cannot strand an empty cache behind a pool.
+        let shared = self.shared.clone();
         let prefix = format!("{}-table-{}", self.worker_prefix, table);
         let pools = spawn_pools(
             self.high_config.clone(),
@@ -152,9 +213,10 @@ impl KvState {
                 default_pool: pools.1,
                 background_pool: pools.2,
                 shared,
+                last_used: self.table_use,
             },
         );
-        Ok(())
+        Ok(true)
     }
 }
 
@@ -254,14 +316,23 @@ async fn route_batch_read(mut work: BatchReadContinuation, state: &mut KvState) 
             return;
         }
         let table = work.current_key().and_then(table_for_key);
-        if let Some(table) = table.as_deref() {
-            if state
-                .ensure_table_pools(table, &work.dispatcher)
-                .await
-                .is_err()
-            {
-                work.push(Err("table CRUD pool unavailable".to_string()));
-                continue;
+        let mut table = table;
+        if let Some(name) = table.as_deref() {
+            if !state.shared.has_table_for_actor(name).await {
+                table = None;
+            } else {
+                match state.ensure_table_pools(name, &work.dispatcher).await {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        state.note_cache_shed(work.priority);
+                        work.push(Err("shed: table worker cache is busy".into()));
+                        continue;
+                    }
+                    Err(_) => {
+                        work.push(Err("table CRUD pool unavailable".into()));
+                        continue;
+                    }
+                }
             }
         }
         let pool = state.pool(table.as_deref(), work.priority);
@@ -290,6 +361,12 @@ impl Actor for KvActor {
         myself: ActorRef<Self::Msg>,
         args: Self::Arguments,
     ) -> Result<Self::State, ActorProcessingErr> {
+        let table_pool_capacity = args.shared.table_pool_capacity();
+        if !(1..=4096).contains(&table_pool_capacity) {
+            return Err(ActorProcessingErr::from(
+                "table_pool_capacity must be between 1 and 4096",
+            ));
+        }
         // Workers are linked to the dispatcher: a dead worker raises a
         // supervision event here and gets replaced in-place. Named tables get
         // independent pool sets; the base pools remain only for internal
@@ -307,12 +384,12 @@ impl Actor for KvActor {
         // its CRUD pools with the fragment so the first application request
         // does not pay dynamic actor-creation latency (custom tables remain
         // lazy and are created on first use).
-        let kv_shared = args.shared.table_state_for_actor("KV").await;
+        args.shared.table_state_for_actor("KV").await;
         let (kv_high_pool, kv_default_pool, kv_background_pool) = spawn_pools(
             args.high_pool.clone(),
             args.default_pool.clone(),
             args.background_pool.clone(),
-            kv_shared.clone(),
+            args.shared.clone(),
             &myself,
             &format!("{}-table-KV", args.worker_prefix),
         )
@@ -324,7 +401,8 @@ impl Actor for KvActor {
                 high_pool: kv_high_pool,
                 default_pool: kv_default_pool,
                 background_pool: kv_background_pool,
-                shared: kv_shared,
+                shared: args.shared.clone(),
+                last_used: 0,
             },
         );
         Ok(KvState {
@@ -337,6 +415,9 @@ impl Actor for KvActor {
             high_config: args.high_pool,
             default_config: args.default_pool,
             background_config: args.background_pool,
+            table_pool_capacity,
+            table_use: 0,
+            retired_shed_counts: (0, 0, 0),
         })
     }
 
@@ -425,7 +506,13 @@ impl Actor for KvActor {
             } => {
                 let table = table_for_key(&op.key);
                 if let Some(table_name) = table.as_deref() {
-                    state.ensure_table_pools(table_name, &myself).await?;
+                    if !state.ensure_table_pools(table_name, &myself).await? {
+                        state.note_cache_shed(priority);
+                        if let Some(reply) = reply {
+                            let _ = reply.send(Err(ApplyError::Backpressure));
+                        }
+                        return Ok(());
+                    }
                 }
                 let pool = state.pool(table.as_deref(), priority);
                 // Phase 7: admission control. Shed explicitly if the
@@ -471,9 +558,15 @@ impl Actor for KvActor {
                 // through the caller's channel directly; on worker
                 // timeout/error it is dropped and the caller sees a
                 // SenderError.
-                let table = table_for_key(&key);
+                let mut table = table_for_key(&key);
                 if let Some(table_name) = table.as_deref() {
-                    state.ensure_table_pools(table_name, &myself).await?;
+                    if !state.shared.has_table_for_actor(table_name).await {
+                        table = None;
+                    } else if !state.ensure_table_pools(table_name, &myself).await? {
+                        state.note_cache_shed(priority);
+                        let _ = reply.send(Err("shed: table worker cache is busy".into()));
+                        return Ok(());
+                    }
                 }
                 let pool = state.pool(table.as_deref(), priority);
                 let Some(reservation) = pool.try_reserve(&key).await else {
@@ -501,9 +594,15 @@ impl Actor for KvActor {
                 // routing: a scan has no key, so spread concurrent scans
                 // round-robin across background workers. Shed explicitly
                 // under backpressure — never confused with "no matches".
-                let table = table_for_scan(&spec);
+                let mut table = table_for_scan(&spec);
                 if let Some(table_name) = table.as_deref() {
-                    state.ensure_table_pools(table_name, &myself).await?;
+                    if !state.shared.has_table_for_actor(table_name).await {
+                        table = None;
+                    } else if !state.ensure_table_pools(table_name, &myself).await? {
+                        state.note_cache_shed(OpPriority::Background);
+                        let _ = reply.send(Err("shed: table worker cache is busy".into()));
+                        return Ok(());
+                    }
                 }
                 let pool = state.pool(table.as_deref(), OpPriority::Background);
                 let Some(reservation) = pool.try_reserve_round_robin().await else {
@@ -524,9 +623,15 @@ impl Actor for KvActor {
                 if reply.is_closed() {
                     return Ok(());
                 }
-                let table = table_for_scan(&spec);
+                let mut table = table_for_scan(&spec);
                 if let Some(table_name) = table.as_deref() {
-                    state.ensure_table_pools(table_name, &myself).await?;
+                    if !state.shared.has_table_for_actor(table_name).await {
+                        table = None;
+                    } else if !state.ensure_table_pools(table_name, &myself).await? {
+                        state.note_cache_shed(OpPriority::Background);
+                        let _ = reply.send(Err("shed: table worker cache is busy".into()));
+                        return Ok(());
+                    }
                 }
                 let pool = state.pool(table.as_deref(), OpPriority::Background);
                 let Some(reservation) = pool.try_reserve_round_robin().await else {
@@ -547,10 +652,19 @@ impl Actor for KvActor {
                 if reply.is_closed() {
                     return Ok(());
                 }
-                let table = Some(work.plan.table.to_ascii_uppercase());
-                state
-                    .ensure_table_pools(table.as_deref().unwrap(), &myself)
-                    .await?;
+                let mut table = Some(work.plan.table.to_ascii_uppercase());
+                let name = table.as_deref().unwrap();
+                if !state.shared.has_table_for_actor(name).await {
+                    table = None;
+                } else if !state.ensure_table_pools(name, &myself).await? {
+                    state.note_cache_shed(OpPriority::Background);
+                    let _ = reply.send(crate::query::page_error(
+                        &work.request,
+                        crate::proto::QueryPageStatus::Backpressure,
+                        "table worker cache is busy",
+                    ));
+                    return Ok(());
+                }
                 let pool = state.pool(table.as_deref(), OpPriority::Background);
                 let Some(reservation) = pool.try_reserve_round_robin().await else {
                     let _ = reply.send(crate::query::page_error(
@@ -669,7 +783,12 @@ impl Actor for KvActor {
                 snapshot_time_ms,
                 reply,
             } => {
-                let _ = reply.send(state.shared.get_versioned(&key, snapshot_time_ms).await);
+                let _ = reply.send(
+                    state
+                        .shared
+                        .get_versioned_from_actor(&key, snapshot_time_ms)
+                        .await,
+                );
                 Ok(())
             }
             KvMessage::GetVersionedPage {
@@ -693,9 +812,18 @@ impl Actor for KvActor {
             KvMessage::Retained(_) => unreachable!("retained message was unwrapped"),
             KvMessage::GetShedCounts { reply } => {
                 let mut counts = (
-                    state.high_pool.shed_count(),
-                    state.default_pool.shed_count(),
-                    state.background_pool.shed_count(),
+                    state
+                        .high_pool
+                        .shed_count()
+                        .saturating_add(state.retired_shed_counts.0),
+                    state
+                        .default_pool
+                        .shed_count()
+                        .saturating_add(state.retired_shed_counts.1),
+                    state
+                        .background_pool
+                        .shed_count()
+                        .saturating_add(state.retired_shed_counts.2),
                 );
                 for pools in state.table_pools.values() {
                     counts.0 += pools.high_pool.shed_count();
@@ -762,6 +890,9 @@ impl Actor for KvActor {
                     pool.reclaim_slot(slot);
                     (shared, pool.pending.clone())
                 };
+                if let Some(table) = table.as_deref() {
+                    state.shared.prune_empty_table(table).await;
+                }
                 // Planned worker drains emit the same termination events as
                 // failures. Retire any remaining accounting above, but do not
                 // link a replacement to a draining parent.

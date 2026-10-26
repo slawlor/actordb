@@ -316,6 +316,14 @@ delivery; a local stop is cancellation, not a durability fence.
 
 ## `PoolConfig`
 
+`NodeConfig::table_pool_capacity` (default 16, range 1–4096) bounds cached
+named-table worker sets per fragment, including KV. Fixed base workers are
+additional; data is retained independently. Only idle sets are reclaimed and
+all-busy admission returns nonfatal backpressure. The same setting bounds
+pending-empty namespace metadata. See [bounded table runtime](table-runtime.md)
+for absence reads, retained owners, query identities and pool-incarnation/rate
+reset semantics. The TOML key is `table_pool_capacity`.
+
 Use `PoolConfig::builder()` for nested pool settings; its own defaults and the
 Node's per-priority profiles differ as described [above](#configuration-builders).
 

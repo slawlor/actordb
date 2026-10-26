@@ -136,6 +136,9 @@ pub struct SupervisorArgs {
     pub high_pool: PoolConfig,
     #[builder(default = PoolConfig::background_defaults())]
     pub background_pool: PoolConfig,
+    /// Maximum cached table worker sets per fragment, including KV.
+    #[builder(default = 16)]
+    pub table_pool_capacity: usize,
     /// Flush the write buffer after this many buffered ops.
     #[builder(default = DEFAULT_FLUSH_BATCH_SIZE)]
     pub flush_batch_size: usize,
@@ -446,6 +449,11 @@ impl FragmentSupervisor {
         args: SupervisorArgs,
         children: &mut SupervisorStartupChildren,
     ) -> Result<SupervisorState, ActorProcessingErr> {
+        if !(1..=4096).contains(&args.table_pool_capacity) {
+            return Err(ActorProcessingErr::from(
+                "table_pool_capacity must be between 1 and 4096",
+            ));
+        }
         args.persistence
             .validate()
             .map_err(FragmentStartupStorageError::boxed)?;
@@ -471,6 +479,8 @@ impl FragmentSupervisor {
                 args.flush_interval,
             )
             .with_persistence_config(args.persistence.clone())
+            .map_err(FragmentStartupStorageError::boxed)?
+            .with_table_pool_capacity(args.table_pool_capacity)
             .map_err(FragmentStartupStorageError::boxed)?
             .with_pool_timing(args.pool_timing.clone())
             .enable_partitions()
@@ -1142,6 +1152,7 @@ mod tests {
                 rate_limit_per_sec: None,
             };
             SupervisorArgs {
+                table_pool_capacity: 16,
                 expiry_publisher: None,
                 pool_timing: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 fragment: FragmentId(0),
@@ -1430,6 +1441,7 @@ mod tests {
                 rate_limit_per_sec: None,
             };
             let args = SupervisorArgs {
+                table_pool_capacity: 16,
                 expiry_publisher: None,
                 pool_timing: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 fragment: FragmentId(0),
@@ -1561,6 +1573,7 @@ mod tests {
                 None,
                 FragmentSupervisor,
                 SupervisorArgs {
+                    table_pool_capacity: 16,
                     expiry_publisher: None,
                     pool_timing: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                     fragment: FragmentId(0),
@@ -1605,6 +1618,7 @@ mod tests {
                 None,
                 FragmentSupervisor,
                 SupervisorArgs {
+                    table_pool_capacity: 16,
                     expiry_publisher: None,
                     pool_timing: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                     fragment: FragmentId(0),
@@ -1649,6 +1663,7 @@ mod tests {
                 None,
                 FragmentSupervisor,
                 SupervisorArgs {
+                    table_pool_capacity: 16,
                     expiry_publisher: None,
                     pool_timing: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                     fragment: FragmentId(0),

@@ -44,6 +44,8 @@ pub(crate) use pool_worker::install_worker_get_gate;
 mod protocol;
 mod scan;
 mod snapshotter;
+#[cfg(test)]
+mod table_runtime_tests;
 
 pub use actordb_protocol::RecordVersion;
 pub use cleaner::{Cleaner, CleanerArgs, CleanerArgsBuilder, CleanerMessage, CleanerState};

@@ -30,6 +30,63 @@ static NEXT_QUERY_INCARNATION: AtomicU64 = AtomicU64::new(1);
 
 const SUMMARY_PAGE_TARGET_BYTES: usize = 1024 * 1024;
 const VERSIONED_PAGE_TARGET_BYTES: usize = 1024 * 1024;
+
+fn query_page_limits(
+    work: &crate::query::QueryPageWork,
+) -> Result<(usize, usize, usize), crate::proto::QueryPageResponse> {
+    use crate::proto::QueryPageStatus;
+    use crate::query::{page_error, MAX_QUERY_PAGE_BYTES, QUERY_PAGE_VISITS};
+    let req = &work.request;
+    if let Err(error) = work.plan.validate() {
+        return Err(page_error(req, QueryPageStatus::Invalid, error.to_string()));
+    }
+    let max_rows = if req.max_rows == 0 {
+        QUERY_PAGE_VISITS
+    } else {
+        req.max_rows as usize
+    };
+    let max_visits = if req.max_visits == 0 {
+        QUERY_PAGE_VISITS
+    } else {
+        req.max_visits as usize
+    };
+    let max_bytes = if req.max_bytes == 0 {
+        1024 * 1024
+    } else {
+        req.max_bytes as usize
+    };
+    if max_rows > QUERY_PAGE_VISITS
+        || max_visits > QUERY_PAGE_VISITS
+        || !(1024..=MAX_QUERY_PAGE_BYTES).contains(&max_bytes)
+    {
+        return Err(page_error(
+            req,
+            QueryPageStatus::Invalid,
+            "invalid query page limits",
+        ));
+    }
+    if !req.continuation
+        && (!req.after_key.is_empty()
+            || req.revision != 0
+            || req.snapshot_time_ms != 0
+            || req.incarnation != 0
+            || req.verify_only)
+    {
+        return Err(page_error(
+            req,
+            QueryPageStatus::Invalid,
+            "initial page contains continuation state",
+        ));
+    }
+    if req.continuation && (req.snapshot_time_ms == 0 || req.incarnation == 0) {
+        return Err(page_error(
+            req,
+            QueryPageStatus::Invalid,
+            "continuation lacks pinned identity/time",
+        ));
+    }
+    Ok((max_rows, max_visits, max_bytes))
+}
 /// The fragment's shared state: one in-memory cache, one persistence
 /// buffer, one [`KvStore`].
 ///
@@ -67,6 +124,10 @@ pub struct FragmentState {
     partitioned: bool,
     persistence_template: Option<PersistenceConfig>,
     pool_timing: Arc<std::sync::atomic::AtomicBool>,
+    table_pool_capacity: usize,
+    /// Cold namespaces with no proven record yet. Bounded admission protects
+    /// metadata while snapshots/backend owners postpone safe reclamation.
+    empty_tables: std::sync::Mutex<BTreeSet<String>>,
 }
 
 /// Values and their ordered key index. Both live under one lock so every
@@ -273,6 +334,8 @@ impl FragmentState {
             partitioned: false,
             persistence_template: None,
             pool_timing: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            table_pool_capacity: 16,
+            empty_tables: std::sync::Mutex::new(BTreeSet::new()),
         }
     }
 
@@ -316,6 +379,24 @@ impl FragmentState {
     }
     pub(crate) fn pool_timing_enabled(&self) -> Arc<std::sync::atomic::AtomicBool> {
         self.pool_timing.clone()
+    }
+    /// Bound idle-reclaimable named-table worker sets when this state is
+    /// attached to a KvActor. Includes KV; fixed base workers are additional.
+    /// Data/version floors are not evicted. Configure before starting actors.
+    /// Recreated pools start fresh local counters/token buckets. This also
+    /// bounds pending-empty metadata retained while safe reclamation waits.
+    pub fn with_table_pool_capacity(mut self, capacity: usize) -> Result<Self, String> {
+        if !(1..=4096).contains(&capacity) {
+            return Err("table_pool_capacity must be between 1 and 4096".into());
+        }
+        if self.empty_tables.get_mut().unwrap().len() > capacity {
+            return Err("pending empty table ownership exceeds the requested capacity".into());
+        }
+        self.table_pool_capacity = capacity;
+        Ok(self)
+    }
+    pub(crate) fn table_pool_capacity(&self) -> usize {
+        self.table_pool_capacity
     }
     fn configure_persistence(&mut self, config: &PersistenceConfig) -> Result<(), String> {
         let flush = Arc::get_mut(&mut self.flush)
@@ -413,6 +494,7 @@ impl FragmentState {
                 let mut child =
                     Self::new_local(values, store, self.flush_batch_size, self.flush_interval);
                 child.pool_timing = self.pool_timing.clone();
+                child.table_pool_capacity = self.table_pool_capacity;
                 child.expiry_publisher = self.expiry_publisher.clone();
                 if let Some(config) = &self.persistence_template {
                     child = child.with_persistence_config(config.clone())?;
@@ -435,13 +517,18 @@ impl FragmentState {
         Ok(self)
     }
 
-    async fn table_state(&self, table: &str) -> Arc<FragmentState> {
+    async fn table_state(&self, table: &str) -> Result<Arc<FragmentState>, ApplyError> {
         if let Some(state) = self.table_children.read().await.get(table).cloned() {
-            return state;
+            return Ok(state);
         }
+        self.reclaim_empty_tables().await;
         let mut children = self.table_children.write().await;
         if let Some(state) = children.get(table).cloned() {
-            return state;
+            return Ok(state);
+        }
+        let mut empty = self.empty_tables.lock().unwrap();
+        if table != "KV" && empty.len() >= self.table_pool_capacity {
+            return Err(ApplyError::Backpressure);
         }
         let store = self
             .kvstore
@@ -455,31 +542,102 @@ impl FragmentState {
         );
         state.expiry_publisher = self.expiry_publisher.clone();
         state.pool_timing = self.pool_timing.clone();
+        state.table_pool_capacity = self.table_pool_capacity;
         if let Some(config) = &self.persistence_template {
             state = state
                 .with_persistence_config(config.clone())
                 .expect("validated persistence configuration");
         }
         let state = Arc::new(state);
-        children.insert(table.to_string(), state.clone());
-        state
-    }
-
-    /// Return the independently scheduled state for a named table.
-    ///
-    /// The fragment dispatcher uses this hook to attach a table's CRUD worker
-    /// actors to the same logical partition while keeping their cache, index,
-    /// durable queue, and admission budget isolated from sibling tables.
-    pub(crate) async fn table_state_for_actor(&self, table: &str) -> Arc<FragmentState> {
-        self.table_state(table).await
-    }
-
-    async fn child_for_key(&self, key: &str) -> Option<Arc<FragmentState>> {
-        if !self.partitioned {
-            return None;
+        if table != "KV" {
+            empty.insert(table.to_string());
         }
-        let table = crate::table_key::table_name(key)?;
-        Some(self.table_state(&table).await)
+        children.insert(table.to_string(), state.clone());
+        Ok(state)
+    }
+
+    /// Prepare the fixed KV partition during actor startup. Dynamic named
+    /// workers retain the root and resolve data children during execution.
+    pub(crate) async fn table_state_for_actor(&self, table: &str) -> Arc<FragmentState> {
+        debug_assert_eq!(
+            table, "KV",
+            "only fixed KV startup may create a table without mutation admission"
+        );
+        self.table_state(table)
+            .await
+            .expect("fixed KV partition is exempt from pending-empty admission")
+    }
+
+    /// Managed read paths never create unknown table cache entries. KV is
+    /// the fixed built-in namespace, independent of direct state-view mode.
+    pub(crate) async fn has_table_for_actor(&self, table: &str) -> bool {
+        if table == "KV" {
+            return true;
+        }
+        let child = self.table_children.read().await.get(table).cloned();
+        let Some(child) = child else {
+            return false;
+        };
+        let present = !child.cache.read().await.values.is_empty();
+        drop(child);
+        if !present {
+            self.prune_empty_table(table).await;
+        }
+        present
+    }
+
+    /// Never remove a data/version floor, or a child retained by executing
+    /// work. Worker sets retain the root rather than a speculative empty child.
+    pub(crate) async fn prune_empty_table(&self, table: &str) {
+        if table == "KV" {
+            return;
+        }
+        if !self.empty_tables.lock().unwrap().contains(table) {
+            return;
+        }
+        let mut children = self.table_children.write().await;
+        let mut empty_tables = self.empty_tables.lock().unwrap();
+        let has_data = children.get(table).is_some_and(|child| {
+            child
+                .cache
+                .try_read()
+                .is_ok_and(|cache| !cache.values.is_empty())
+        });
+        if has_data || !children.contains_key(table) {
+            empty_tables.remove(table);
+            return;
+        }
+        let empty = children.get(table).is_some_and(|child| {
+            Arc::strong_count(child) == 1
+                && child.cache.try_read().is_ok_and(|cache| {
+                    cache.values.is_empty()
+                        && cache.ordered_keys.is_empty()
+                        && cache.content_digests.is_empty()
+                        && cache.expiry_deadlines.is_empty()
+                })
+                && child
+                    .flush
+                    .try_lock()
+                    .is_ok_and(|flush| flush.record_count() == 0 && flush.in_flight.is_none())
+                && child.flush_in_progress.try_lock().is_ok()
+        });
+        if empty {
+            children.remove(table);
+            empty_tables.remove(table);
+        }
+    }
+
+    /// Retry only bounded cold-name candidates, independent of data cardinality.
+    pub(crate) async fn reclaim_empty_tables(&self) {
+        let pending: Vec<_> = self.empty_tables.lock().unwrap().iter().cloned().collect();
+        for table in pending {
+            self.prune_empty_table(&table).await;
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn cached_table_count(&self) -> usize {
+        self.table_children.read().await.len()
     }
 
     fn publish_expiry(&self, key: &str, previous_value: VersionedValue) {
@@ -527,11 +685,28 @@ impl FragmentState {
     /// arrival order. Custom writers must preserve [`VersionedValue`]'s unique
     /// version invariant.
     pub async fn apply(&self, op: &ReplicatedOp) -> Result<ApplyOutcome, ApplyError> {
-        if let Some(child) = self.child_for_key(&op.key).await {
+        if self.partitioned {
+            return self.apply_from_actor(op).await;
+        }
+        self.apply_local(op).await
+    }
+
+    /// Managed actors resolve encoded table keys even for a standalone public
+    /// unpartitioned root. Direct FragmentState users retain base-cache semantics.
+    pub(crate) async fn apply_from_actor(
+        &self,
+        op: &ReplicatedOp,
+    ) -> Result<ApplyOutcome, ApplyError> {
+        if let Some(table) = crate::table_key::table_name(&op.key) {
+            let child = self.table_state(&table).await?;
             let result = child.apply_local(op).await;
-            if matches!(result, Ok(ApplyOutcome::Applied | ApplyOutcome::Expired)) {
+            if self.partitioned
+                && matches!(result, Ok(ApplyOutcome::Applied | ApplyOutcome::Expired))
+            {
                 self.revision.fetch_add(1, Ordering::Release);
             }
+            drop(child);
+            self.prune_empty_table(&table).await;
             return result;
         }
         self.apply_local(op).await
@@ -695,12 +870,15 @@ impl FragmentState {
     /// it. Writes that arrive during the store call remain pending for the
     /// next flush.
     pub async fn flush(&self) -> Result<(), ActorProcessingErr> {
+        self.reclaim_empty_tables().await;
         if self.partitioned {
             self.flush_local().await?;
             let children = self.table_children.read().await.clone();
             for child in children.values() {
                 child.flush_local().await?;
             }
+            drop(children);
+            self.reclaim_empty_tables().await;
             return Ok(());
         }
         self.flush_local().await
@@ -714,6 +892,7 @@ impl FragmentState {
     /// the same ordering guard. The accepted operation remains owned when its
     /// waiter is canceled; safe teardown still waits for backend completion.
     pub async fn flush_stable(&self) -> Result<ApplyDurability, ActorProcessingErr> {
+        self.reclaim_empty_tables().await;
         if self.partitioned {
             let mut durability = self.flush_stable_local().await?;
             let children = self.table_children.read().await.clone();
@@ -728,6 +907,8 @@ impl FragmentState {
                     _ => ApplyDurability::StoreCommitted,
                 };
             }
+            drop(children);
+            self.reclaim_empty_tables().await;
             return Ok(durability);
         }
         self.flush_stable_local().await
@@ -823,8 +1004,21 @@ impl FragmentState {
 
     /// Read a key, treating expired values and tombstones as absent.
     pub async fn get(&self, key: &str) -> Option<VersionedValue> {
-        if let Some(child) = self.child_for_key(key).await {
-            return child.get_local(key).await;
+        if self.partitioned {
+            return self.get_from_actor(key).await;
+        }
+        self.get_local(key).await
+    }
+
+    pub(crate) async fn get_from_actor(&self, key: &str) -> Option<VersionedValue> {
+        if let Some(table) = crate::table_key::table_name(key) {
+            let child = self.table_children.read().await.get(&table).cloned()?;
+            let value = child.get_local(key).await;
+            drop(child);
+            if value.is_none() {
+                self.prune_empty_table(&table).await;
+            }
+            return value;
         }
         self.get_local(key).await
     }
@@ -848,13 +1042,28 @@ impl FragmentState {
     /// partial results are never returned. Use key/prefix transforms for wide
     /// values. Already expired values and tombstones remain invisible.
     pub async fn scan(&self, spec: &ScanSpec) -> Result<Vec<ScanMatch>, String> {
-        if self.partitioned && matches!(spec.matcher, KeyMatcher::Prefix(_)) {
+        if self.partitioned {
+            return self.scan_from_actor(spec).await;
+        }
+        self.scan_local(spec).await
+    }
+
+    pub(crate) async fn scan_from_actor(&self, spec: &ScanSpec) -> Result<Vec<ScanMatch>, String> {
+        if matches!(spec.matcher, KeyMatcher::Prefix(_)) {
             // A table-scoped scan carries the table namespace in its
             // prefix. Route it to that table's independent cache/index.
             if let KeyMatcher::Prefix(prefix) = &spec.matcher {
                 if let Ok(prefix) = std::str::from_utf8(prefix) {
                     if let Some(table) = crate::table_key::table_name(prefix) {
-                        return self.table_state(&table).await.scan_local(spec).await;
+                        let child = self.table_children.read().await.get(&table).cloned();
+                        if let Some(child) = child {
+                            return child.scan_local(spec).await;
+                        }
+                        // Preserve validation even for an absent relation.
+                        spec.query_plan(None)
+                            .validate()
+                            .map_err(|error| error.to_string())?;
+                        return Ok(Vec::new());
                     }
                 }
             }
@@ -962,13 +1171,83 @@ impl FragmentState {
         work: &crate::query::QueryPageWork,
     ) -> crate::proto::QueryPageResponse {
         if self.partitioned {
-            return self
-                .table_state(&work.plan.table.to_ascii_uppercase())
-                .await
-                .query_page_local(work)
-                .await;
+            return self.query_page_from_actor(work).await;
         }
         self.query_page_local(work).await
+    }
+
+    pub(crate) async fn query_page_from_actor(
+        &self,
+        work: &crate::query::QueryPageWork,
+    ) -> crate::proto::QueryPageResponse {
+        let table = work.plan.table.to_ascii_uppercase();
+        let child = self.table_children.read().await.get(&table).cloned();
+        if let Some(child) = child {
+            if table == "KV" || !child.cache.read().await.values.is_empty() {
+                return child.query_page_local(work).await;
+            }
+            drop(child);
+            self.prune_empty_table(&table).await;
+        }
+        self.query_page_absent(work)
+    }
+
+    /// An unknown relation has a stable empty identity, not a cached entry.
+    /// A later first record selects its child incarnation and invalidates an
+    /// old absence continuation. Other tables' mutations do not invalidate it.
+    fn query_page_absent(
+        &self,
+        work: &crate::query::QueryPageWork,
+    ) -> crate::proto::QueryPageResponse {
+        use crate::proto::{QueryPageRow, QueryPageStatus};
+        use crate::query::{page_encoded_len, page_error, value_to_cell};
+        let (_, _, max_bytes) = match query_page_limits(work) {
+            Ok(limits) => limits,
+            Err(page) => return page,
+        };
+        let req = &work.request;
+        if req.continuation && (req.revision != 0 || req.incarnation != self.query_incarnation) {
+            return page_error(
+                req,
+                QueryPageStatus::Changed,
+                "table changed since its absence snapshot",
+            );
+        }
+        let mut page = crate::proto::QueryPageResponse {
+            req_id: req.req_id,
+            fragment: req.fragment,
+            next_after_key: req.after_key.clone(),
+            done: true,
+            revision: 0,
+            incarnation: self.query_incarnation,
+            snapshot_time_ms: if req.continuation {
+                req.snapshot_time_ms
+            } else {
+                now_ms()
+            },
+            status: QueryPageStatus::Ok as i32,
+            ..Default::default()
+        };
+        if !req.verify_only && work.plan.matches_fragment(req.fragment) && work.plan.is_aggregate()
+        {
+            page.rows = actordb_query::QueryAccumulator::new(&work.plan)
+                .finish()
+                .rows
+                .into_iter()
+                .map(|row| QueryPageRow {
+                    key: String::new(),
+                    cells: row.into_iter().map(value_to_cell).collect(),
+                })
+                .collect();
+        }
+        if page_encoded_len(&page) > max_bytes {
+            return page_error(
+                req,
+                QueryPageStatus::Budget,
+                "empty aggregate exceeds query page budget",
+            );
+        }
+        page
     }
 
     async fn query_page_local(
@@ -976,57 +1255,14 @@ impl FragmentState {
         work: &crate::query::QueryPageWork,
     ) -> crate::proto::QueryPageResponse {
         use crate::proto::{QueryPageRow, QueryPageStatus};
-        use crate::query::{
-            page_encoded_len, page_error, value_to_cell, MAX_QUERY_PAGE_BYTES, QUERY_PAGE_VISITS,
-            QUERY_WORK_BYTES,
-        };
+        use crate::query::{page_encoded_len, page_error, value_to_cell, QUERY_WORK_BYTES};
         use actordb_query::{AggregateInput, Projection, QueryAccumulator};
         let req = &work.request;
         let plan = &work.plan;
-        if let Err(error) = plan.validate() {
-            return page_error(req, QueryPageStatus::Invalid, error.to_string());
-        }
-        let max_rows = if req.max_rows == 0 {
-            QUERY_PAGE_VISITS
-        } else {
-            req.max_rows as usize
+        let (max_rows, max_visits, max_bytes) = match query_page_limits(work) {
+            Ok(limits) => limits,
+            Err(page) => return page,
         };
-        let max_visits = if req.max_visits == 0 {
-            QUERY_PAGE_VISITS
-        } else {
-            req.max_visits as usize
-        };
-        let max_bytes = if req.max_bytes == 0 {
-            1024 * 1024
-        } else {
-            req.max_bytes as usize
-        };
-        if max_rows > QUERY_PAGE_VISITS
-            || max_visits > QUERY_PAGE_VISITS
-            || !(1024..=MAX_QUERY_PAGE_BYTES).contains(&max_bytes)
-        {
-            return page_error(req, QueryPageStatus::Invalid, "invalid query page limits");
-        }
-        if !req.continuation
-            && (!req.after_key.is_empty()
-                || req.revision != 0
-                || req.snapshot_time_ms != 0
-                || req.incarnation != 0
-                || req.verify_only)
-        {
-            return page_error(
-                req,
-                QueryPageStatus::Invalid,
-                "initial page contains continuation state",
-            );
-        }
-        if req.continuation && (req.snapshot_time_ms == 0 || req.incarnation == 0) {
-            return page_error(
-                req,
-                QueryPageStatus::Invalid,
-                "continuation lacks pinned identity/time",
-            );
-        }
         let cache = self.cache.read().await;
         let revision = self.revision.load(Ordering::Acquire);
         if req.continuation
@@ -1235,6 +1471,7 @@ impl FragmentState {
     /// Read a cache snapshot and its mutation revision atomically with
     /// respect to winning cache updates.
     pub async fn snapshot_with_revision(&self) -> (HashMap<String, VersionedValue>, u64) {
+        self.reclaim_empty_tables().await;
         if self.partitioned {
             let mut snapshot = self.snapshot_local().await;
             let children = self.table_children.read().await.clone();
@@ -1245,6 +1482,8 @@ impl FragmentState {
                 snapshot.extend(child_snapshot);
                 revision = revision.saturating_add(child_revision);
             }
+            drop(children);
+            self.reclaim_empty_tables().await;
             return (snapshot, revision);
         }
         (
@@ -1426,8 +1665,25 @@ impl FragmentState {
         key: &str,
         snapshot_time_ms: Option<u64>,
     ) -> Option<VersionedValue> {
-        if let Some(child) = self.child_for_key(key).await {
-            return child.get_versioned_local(key, snapshot_time_ms).await;
+        if self.partitioned {
+            return self.get_versioned_from_actor(key, snapshot_time_ms).await;
+        }
+        self.get_versioned_local(key, snapshot_time_ms).await
+    }
+
+    pub(crate) async fn get_versioned_from_actor(
+        &self,
+        key: &str,
+        snapshot_time_ms: Option<u64>,
+    ) -> Option<VersionedValue> {
+        if let Some(table) = crate::table_key::table_name(key) {
+            let child = self.table_children.read().await.get(&table).cloned()?;
+            let value = child.get_versioned_local(key, snapshot_time_ms).await;
+            drop(child);
+            if value.is_none() {
+                self.prune_empty_table(&table).await;
+            }
+            return value;
         }
         self.get_versioned_local(key, snapshot_time_ms).await
     }
@@ -1589,12 +1845,15 @@ impl FragmentState {
     /// the finite pass. Persistence admission failure keeps the deadline indexed
     /// and returns an error so shutdown can retry its final expiry fence.
     pub async fn expire_values(&self, now_ms: u64) -> Result<usize, ActorProcessingErr> {
+        self.reclaim_empty_tables().await;
         if self.partitioned {
             let mut converted = self.expire_values_local(now_ms).await?;
             let children = self.table_children.read().await.clone();
             for child in children.values() {
                 converted = converted.saturating_add(child.expire_values_local(now_ms).await?);
             }
+            drop(children);
+            self.reclaim_empty_tables().await;
             return Ok(converted);
         }
         self.expire_values_local(now_ms).await
@@ -4207,6 +4466,77 @@ mod expiry_index_tests {
         assert_eq!(
             cache.content_digests["due"].live,
             cache.values["due"].content_digest()
+        );
+    }
+}
+
+#[cfg(test)]
+mod empty_table_reclamation_tests {
+    use super::*;
+    use crate::actor::table_runtime_tests::{actor, apply, stop};
+
+    #[tokio::test]
+    async fn deferred_empty_owner_survives_failure_and_eviction_then_reclaims_on_unrelated_work() {
+        let (shared, actor) = actor(1, "deferred-empty-owner").await;
+        // Model a snapshot retaining the just-created cold child through both
+        // failed mutation completion and subsequent idle worker eviction.
+        let held = shared.table_state("HELD").await.unwrap();
+        assert!(matches!(
+            apply(&actor, "HELD", 1, false, "").await,
+            Err(ApplyError::InvalidInput(_))
+        ));
+        assert!(matches!(
+            apply(&actor, "OTHER", 1, false, "").await,
+            Err(ApplyError::Backpressure)
+        ));
+        assert_eq!(shared.cached_table_count().await, 2);
+        assert_eq!(shared.empty_tables.lock().unwrap().len(), 1);
+        drop(held);
+        assert!(matches!(
+            apply(&actor, "OTHER", 1, false, "").await,
+            Err(ApplyError::InvalidInput(_))
+        ));
+        assert_eq!(shared.cached_table_count().await, 1);
+        assert!(shared.empty_tables.lock().unwrap().is_empty());
+        stop(actor).await;
+    }
+
+    #[tokio::test]
+    async fn pending_backend_and_fence_ownership_prevent_pruning_then_maintenance_retries() {
+        let state = FragmentState::new(Default::default(), None, 100, Duration::from_secs(3600))
+            .with_table_pool_capacity(1)
+            .unwrap()
+            .enable_partitions()
+            .unwrap();
+        let child = state.table_state("BACKLOG").await.unwrap();
+        assert!(child
+            .flush
+            .lock()
+            .await
+            .enqueue("pending", &VersionedValue::new(vec![1], 1, "writer".into())));
+        drop(child);
+        state.prune_empty_table("BACKLOG").await;
+        assert_eq!(
+            state.cached_table_count().await,
+            1,
+            "cache-empty cannot discard a persistence owner"
+        );
+        let child = state.table_children.read().await["BACKLOG"].clone();
+        child.flush.lock().await.pending.clear();
+        let ordering = child.flush_in_progress.clone().lock_owned().await;
+        drop(child);
+        state.prune_empty_table("BACKLOG").await;
+        assert_eq!(
+            state.cached_table_count().await,
+            1,
+            "active fence ownership is retained"
+        );
+        drop(ordering);
+        state.flush().await.unwrap();
+        assert_eq!(
+            state.cached_table_count().await,
+            0,
+            "unrelated maintenance retries deferred cleanup"
         );
     }
 }

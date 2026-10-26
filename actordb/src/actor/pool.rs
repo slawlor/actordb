@@ -387,6 +387,15 @@ impl WorkerPool {
     pub(super) fn shed_count(&self) -> u64 {
         self.shed_count.load(Ordering::Relaxed)
     }
+
+    /// Only the dispatcher admits work. Pending remains nonzero through
+    /// queued-to-active transitions; observations also cover the reply tail
+    /// after the worker has released its reservation.
+    pub(super) fn is_idle(&self) -> bool {
+        self.pending.load(Ordering::Acquire) == 0
+            && self.observations.work.queued.load(Ordering::Acquire) == 0
+            && self.observations.work.active.load(Ordering::Acquire) == 0
+    }
     pub(super) fn observation(
         &self,
         table: Option<String>,

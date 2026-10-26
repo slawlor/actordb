@@ -117,7 +117,7 @@ impl Actor for PoolWorker {
                     is_replication: _,
                     reply,
                 } => {
-                    let result = state.shared.apply(&op).await;
+                    let result = state.shared.apply_from_actor(&op).await;
                     release_pool_reservation(state);
                     match result {
                         Ok(outcome) => {
@@ -155,7 +155,7 @@ impl Actor for PoolWorker {
                         gate.entered.notify_one();
                         gate.release.notified().await;
                     }
-                    let value = state.shared.get(&key).await;
+                    let value = state.shared.get_from_actor(&key).await;
                     release_pool_reservation(state);
                     let _ = reply.send(Ok(value));
                     Ok(())
@@ -171,13 +171,44 @@ impl Actor for PoolWorker {
                         gate.entered.notify_one();
                         gate.release.notified().await;
                     }
-                    let value = state.shared.get(key).await;
+                    let value = state.shared.get_from_actor(key).await;
                     // Release before the dispatcher admits the next key. At a
                     // queue-cap boundary, forwarding first would make completed
                     // work look pending and spuriously shed the continuation.
                     release_pool_reservation(state);
                     work.push(Ok(value));
                     work.return_to_dispatcher();
+                    Ok(())
+                }
+                KvMessage::Scan { spec, reply } => {
+                    let result = state.shared.scan_from_actor(&spec).await;
+                    release_pool_reservation(state);
+                    let _ = reply.send(result);
+                    Ok(())
+                }
+                KvMessage::ScanRetained {
+                    spec,
+                    retention,
+                    reply,
+                } => {
+                    let _retention = retention;
+                    if !reply.is_closed() {
+                        let result = state.shared.scan_from_actor(&spec).await;
+                        release_pool_reservation(state);
+                        let _ = reply.send(result);
+                    } else {
+                        release_pool_reservation(state);
+                    }
+                    Ok(())
+                }
+                KvMessage::QueryPage { work, reply } => {
+                    if !reply.is_closed() {
+                        let result = state.shared.query_page_from_actor(&work).await;
+                        release_pool_reservation(state);
+                        let _ = reply.send(result);
+                    } else {
+                        release_pool_reservation(state);
+                    }
                     Ok(())
                 }
                 message => {
