@@ -452,9 +452,19 @@ multi-node scenarios in CI (`docker-compose.yml`, `docker/`):
   writes through C, then verifies A recovers the exact new version after
   restart. Client connections must leave the database peer count unchanged.
 
-These catch what localhost integration tests can't: real process death, DNS
+These complement in-process integration tests with real process death, DNS
 and container-network behavior, and the full restart path including session
-re-establishment.
+re-establishment. The separate-process runner also covers process death and
+durable reopen without Docker; bridge isolation and image packaging still
+require Docker CI.
+
+The [four-node hardening matrix](docker-hardening.md) adds persistent named
+tables and exact version/tombstone oracles across growth, shrink, partitions,
+sender reset, repeated SIGKILL, complete outage with explicit recovery, and
+backend-failure/timeout cases. Every applicable PR runs it with three rolling
+cycles under a 90-minute Docker job budget. Its SDK-only checker preserves
+independent process boundaries and rejects false misses/partial results.
+Logs and status evidence are retained even when cleanup follows a failure.
 
 Run the external scenario with `bash docker/client-test.sh`. Build its two
 images first with `docker compose -f docker-compose.client.yml build`.

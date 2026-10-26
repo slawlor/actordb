@@ -1,0 +1,50 @@
+# PRIVATE test control only: no ports published to the host.
+# Peer bridge faults leave application/control access on control-net intact.
+x-server: &server
+  image: actordb-docker-test:latest
+  networks: [peer-net, control-net]
+  stop_grace_period: 75s
+services:
+  node-a:
+    <<: *server
+    command: cluster-node --node-id node-a --db-path /data --peer peer-node-b:7447 --peer peer-node-c:7447 --peer peer-node-d:7447
+    networks:
+      peer-net: {aliases: [peer-node-a]}
+      control-net: {}
+    volumes: [node-a-data:/data]
+  node-b:
+    <<: *server
+    command: cluster-node --node-id node-b --db-path /data --peer peer-node-a:7447 --peer peer-node-c:7447 --peer peer-node-d:7447
+    networks:
+      peer-net: {aliases: [peer-node-b]}
+      control-net: {}
+    volumes: [node-b-data:/data]
+  node-c:
+    <<: *server
+    command: cluster-node --node-id node-c --db-path /data --peer peer-node-a:7447 --peer peer-node-b:7447 --peer peer-node-d:7447
+    networks:
+      peer-net: {aliases: [peer-node-c]}
+      control-net: {}
+    volumes: [node-c-data:/data]
+  node-d:
+    <<: *server
+    command: cluster-node --node-id node-d --db-path /data --peer peer-node-a:7447 --peer peer-node-b:7447 --peer peer-node-c:7447
+    networks:
+      peer-net: {aliases: [peer-node-d]}
+      control-net: {}
+    volumes: [node-d-data:/data]
+  checker:
+    image: actordb-docker-client-test:latest
+    entrypoint: ["actordb-docker-cluster-client"]
+    profiles: [checker]
+    networks: [control-net]
+    volumes: [checker-state:/work]
+networks:
+  peer-net:
+  control-net:
+volumes:
+  node-a-data:
+  node-b-data:
+  node-c-data:
+  node-d-data:
+  checker-state:
