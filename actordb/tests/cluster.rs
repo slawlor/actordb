@@ -6,6 +6,9 @@ use content_digest::content_digest;
 
 mod common;
 
+#[path = "common/reconcile_isolation.rs"]
+mod reconcile_isolation;
+
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};

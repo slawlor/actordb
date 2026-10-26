@@ -100,6 +100,16 @@ incremental versioned pages and emit `ReconcileEntry` payloads, preserving write
 provenance, logical counters, tombstones and expiry. No record exceeds the
 16 MiB hard envelope limit.
 
+Summary and fetch responses run in one connection-owned responder, outside the
+sole socket reader. Each has its own bounded queue slot, and ready fetches take
+priority: busy summaries cannot consume capacity reserved for already-advertised
+keys. Summary queue admission and actor reads share `local_work_timeout`; busy
+or timed-out readonly requests leave the socket available for ACKs and unrelated
+fragment RPCs while the sender retries its round. Accepted actor messages and
+queued response frames retain their exact peer authority until completion even
+after cancellation. Session, round, subtree generation and serving/recovery
+authority are rechecked before asynchronous results authorize or emit data.
+
 Repairs use untracked batches followed by a tracked durability barrier. A
 failed untracked apply poisons its session's barrier; it cannot certify the
 successful prefix. A changed cache revision, transferred repair or reset epoch
