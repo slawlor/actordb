@@ -104,6 +104,7 @@ struct TomlNodeConfig {
     default_pool: Option<TomlPoolConfig>,
     high_pool: Option<TomlPoolConfig>,
     background_pool: Option<TomlPoolConfig>,
+    table_pool_capacity: Option<usize>,
     replication: Option<TomlReplicationConfig>,
     members: std::collections::HashMap<String, String>,
     fragment_map: std::collections::HashMap<u32, Vec<String>>,
@@ -184,6 +185,9 @@ impl ConfigurationProvider for TomlConfigProvider {
         }
         if let Some(values) = values.background_pool {
             apply_pool(&mut config.background_pool, values);
+        }
+        if let Some(value) = values.table_pool_capacity {
+            config.table_pool_capacity = value;
         }
         if let Some(values) = values.replication {
             if let Some(value) = values.batch_size {

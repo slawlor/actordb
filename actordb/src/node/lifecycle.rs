@@ -689,6 +689,7 @@ pub(super) async fn spawn_fragment_subtree_registered(
             .default_pool(config.default_pool.clone())
             .high_pool(config.high_pool.clone())
             .background_pool(config.background_pool.clone())
+            .table_pool_capacity(config.table_pool_capacity)
             .flush_batch_size(config.flush_batch_size)
             .persistence(config.persistence.clone())
             .flush_interval(config.flush_interval)
@@ -1301,6 +1302,11 @@ impl Node {
         if config.fragment_count == 0 {
             return Err(NodeError::Actor(
                 "fragment_count must be non-zero".to_string(),
+            ));
+        }
+        if !(1..=4096).contains(&config.table_pool_capacity) {
+            return Err(NodeError::Actor(
+                "table_pool_capacity must be between 1 and 4096".into(),
             ));
         }
         if config.fragment_count > u32::MAX as usize {

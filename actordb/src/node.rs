@@ -2050,6 +2050,13 @@ pub struct NodeConfig {
     pub high_pool: PoolConfig,
     #[builder(default = PoolConfig::background_defaults())]
     pub background_pool: PoolConfig,
+    /// Resident named-table worker pool sets per fragment, including KV.
+    /// Fixed base pools are additional. Only idle sets are reclaimed; data,
+    /// tombstones and query identities remain resident independently.
+    /// Eviction recreates pool incarnations and pool-local token buckets;
+    /// this is not a persistent logical-table or node-wide QPS limit.
+    #[builder(default = 16)]
+    pub table_pool_capacity: usize,
     /// How often each fragment's cleaner sweeps for TTL-expired keys.
     /// Default 30 seconds. Must be nonzero and representable by Tokio's clock.
     #[builder(default = crate::actor::DEFAULT_CLEAN_INTERVAL)]
