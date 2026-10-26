@@ -50,8 +50,8 @@ use crate::actor::{
 };
 use crate::node::FragmentRouter;
 use crate::proto::{
-    Envelope, EnvelopeMsg, KeySummary, ReconcileFetch, ReconcileRequest, ReplicateBatch,
-    ReplicateOp as ProtoReplicateOp, ReplicationAckLevel, SessionStart, SyncEntry,
+    Envelope, EnvelopeMsg, KeySummary, ReconcileEntry, ReconcileFetch, ReconcileRequest,
+    ReplicateBatch, ReplicateOp as ProtoReplicateOp, ReplicationAckLevel, SessionStart,
 };
 use crate::retained::{ByteBudget, BytePermit};
 use crate::shard::FragmentId;
@@ -526,7 +526,7 @@ fn retained_control_bytes(msg: &SenderMsg) -> usize {
             })),
         SenderMsg::ReconcileData { entries, .. } => entries
             .capacity()
-            .saturating_mul(std::mem::size_of::<SyncEntry>())
+            .saturating_mul(std::mem::size_of::<ReconcileEntry>())
             .saturating_add(entries.iter().fold(0usize, |bytes, s| {
                 bytes
                     .saturating_add(128)
@@ -588,7 +588,7 @@ pub enum SenderMsg {
         chunk_seq: u64,
         page_seq: u64,
         done: bool,
-        entries: Vec<SyncEntry>,
+        entries: Vec<ReconcileEntry>,
         connection_valid: oneshot::Sender<bool>,
     },
     /// Trigger an anti-entropy reconcile round now (if connected).
@@ -1673,7 +1673,7 @@ async fn send_envelope(
         return false;
     }
     if let Some(outbound) = &peer.budgeted {
-        let charged_len = encoded_len + outbound.frame_overhead;
+        let charged_len = encoded_len;
         let frame_permit =
             match tokio::time::timeout_at(admission_deadline, outbound.tx.reserve()).await {
                 Ok(Ok(permit)) => permit,
@@ -3667,7 +3667,7 @@ fn reconcile_summaries_are_well_formed(
 fn reconcile_entries_are_well_formed(
     fragment: FragmentId,
     router: &FragmentRouter,
-    entries: &[SyncEntry],
+    entries: &[ReconcileEntry],
     expected_keys: &HashSet<String>,
     received_keys: &HashSet<String>,
 ) -> bool {
@@ -4204,7 +4204,7 @@ async fn reconcile_summary_page(
 async fn apply_reconcile_entries(
     fragment: FragmentId,
     router: &FragmentRouter,
-    entries: Vec<SyncEntry>,
+    entries: Vec<ReconcileEntry>,
     timeout: Duration,
     retention: Option<Arc<dyn Send + Sync>>,
 ) -> Result<(), ReconcileError> {
@@ -5693,7 +5693,6 @@ mod tests {
         let budget = Arc::new(tokio::sync::Semaphore::new(encoded_len * 2));
         let producer_budget = Arc::new(tokio::sync::Semaphore::new(encoded_len * 2));
         let outbound = BudgetedPeerTx {
-            frame_overhead: 0,
             node_byte_budget: crate::wire::NodePeerByteBudget::new(
                 crate::wire::NODE_PEER_QUEUE_BYTE_CAPACITY,
             ),
@@ -5722,7 +5721,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn replication_peers_share_aggregate_encoded_body_admission() {
-        let physical_max = crate::wire::MAX_TRANSPORT_FRAME_BYTES;
+        let physical_max = crate::wire::MAX_FRAME_BYTES;
         let budget = crate::wire::NodePeerByteBudget::new(2 * physical_max);
         let msg = EnvelopeMsg::SessionStart(SessionStart {
             session_id: 7,
@@ -5744,7 +5743,6 @@ mod tests {
             let (response_tx, _response_rx) = mpsc::channel(4);
             let (identity, _identity_rx) = mpsc::channel(1);
             let outbound = BudgetedPeerTx {
-                frame_overhead: 0,
                 tx,
                 response_tx,
                 identity: identity.clone(),
@@ -5784,7 +5782,6 @@ mod tests {
         let (identity, _identity_rx) = mpsc::channel(1);
         let reconcile_gate = crate::wire::ReconcileGate::new();
         let outbound = BudgetedPeerTx {
-            frame_overhead: 0,
             node_byte_budget: crate::wire::NodePeerByteBudget::new(
                 crate::wire::NODE_PEER_QUEUE_BYTE_CAPACITY,
             ),

@@ -16,8 +16,7 @@ use actordb::actor::{now_ms, VersionedValue};
 use actordb::network::{BindFuture, ConnectFuture, Network, NetworkError, TcpNetwork};
 use actordb::node::{
     Node, NodeConfig, NodeError, NodeRuntimeOptions, ReplicationDrainOptions,
-    ReplicationDrainPhase, ReplicationDrainShutdownError, REQUIRED_WIRE_CAPABILITIES,
-    WIRE_PROTOCOL_VERSION,
+    ReplicationDrainPhase, ReplicationDrainShutdownError, WIRE_PROTOCOL_VERSION,
 };
 use actordb::store::{
     KvStore, PrefixDeleteOutcome, PrefixDeleteSupport, StoreCommitDurability, StoreError,
@@ -761,7 +760,7 @@ fn complete_reconcile_response(
 
 fn complete_reconcile_data(
     fetch: &actordb_protocol::meta::ReconcileFetch,
-    entries: Vec<actordb_protocol::meta::SyncEntry>,
+    entries: Vec<actordb_protocol::meta::ReconcileEntry>,
 ) -> actordb_protocol::meta::ReconcileData {
     actordb_protocol::meta::ReconcileData {
         fragment: fetch.fragment,
@@ -951,12 +950,7 @@ async fn complete_no_secret_handshake(stream: &mut tokio::net::TcpStream, peer_i
         Some(EnvelopeMsg::Hello(hello)) => hello,
         other => panic!("expected server Hello, got {other:?}"),
     };
-    assert_eq!(server_hello.min_protocol_version, WIRE_PROTOCOL_VERSION);
-    assert_eq!(server_hello.max_protocol_version, WIRE_PROTOCOL_VERSION);
-    assert_eq!(
-        server_hello.capabilities & REQUIRED_WIRE_CAPABILITIES,
-        REQUIRED_WIRE_CAPABILITIES
-    );
+    assert_eq!(server_hello.protocol_version, WIRE_PROTOCOL_VERSION);
     assert_eq!(server_hello.challenge.len(), 32);
 
     send_frame(
@@ -964,10 +958,7 @@ async fn complete_no_secret_handshake(stream: &mut tokio::net::TcpStream, peer_i
         Envelope {
             msg: Some(EnvelopeMsg::Hello(Hello {
                 node_id: peer_id.to_string(),
-                auth_tag: Vec::new(),
-                min_protocol_version: WIRE_PROTOCOL_VERSION,
-                max_protocol_version: WIRE_PROTOCOL_VERSION,
-                capabilities: REQUIRED_WIRE_CAPABILITIES,
+                protocol_version: WIRE_PROTOCOL_VERSION,
                 challenge: vec![0x5a; 32],
                 process_generation: 0,
             })),
@@ -2519,10 +2510,7 @@ async fn configured_member_retries_initial_failure_and_rejects_wrong_identity() 
         Envelope {
             msg: Some(EnvelopeMsg::Hello(Hello {
                 node_id: "wrong-peer".to_string(),
-                auth_tag: Vec::new(),
-                min_protocol_version: WIRE_PROTOCOL_VERSION,
-                max_protocol_version: WIRE_PROTOCOL_VERSION,
-                capabilities: REQUIRED_WIRE_CAPABILITIES,
+                protocol_version: WIRE_PROTOCOL_VERSION,
                 challenge: vec![0x31; 32],
                 process_generation: 0,
             })),
@@ -2591,10 +2579,7 @@ async fn address_only_connect_pins_the_first_authenticated_identity() {
         Envelope {
             msg: Some(EnvelopeMsg::Hello(Hello {
                 node_id: "peer-c".to_string(),
-                auth_tag: Vec::new(),
-                min_protocol_version: WIRE_PROTOCOL_VERSION,
-                max_protocol_version: WIRE_PROTOCOL_VERSION,
-                capabilities: REQUIRED_WIRE_CAPABILITIES,
+                protocol_version: WIRE_PROTOCOL_VERSION,
                 challenge: vec![0x42; 32],
                 process_generation: 0,
             })),
@@ -3454,7 +3439,7 @@ async fn reconcile_barrier_rejects_a_replaced_fragment_incarnation() {
 #[tokio::test]
 async fn failed_immediate_reconciliation_is_not_counted_and_retries() {
     use actordb::shard::FragmentId;
-    use actordb_protocol::meta::{envelope::Msg as EnvelopeMsg, KeySummary, SyncEntry};
+    use actordb_protocol::meta::{envelope::Msg as EnvelopeMsg, KeySummary, ReconcileEntry};
 
     let node = Node::start(
         "sync-failure-receiver".to_string(),
@@ -3504,7 +3489,7 @@ async fn failed_immediate_reconciliation_is_not_counted_and_retries() {
         Envelope {
             msg: Some(EnvelopeMsg::ReconcileData(complete_reconcile_data(
                 &fetch,
-                vec![SyncEntry {
+                vec![ReconcileEntry {
                     key: summary.key,
                     value: b"value".to_vec(),
                     timestamp_ms: summary.timestamp_ms,
@@ -5339,8 +5324,8 @@ async fn placement_bootstrap_fetch_requires_verification_round() {
     use actordb::replication::{ReplicationAckDurability, SenderConfig};
     use actordb::shard::FragmentId;
     use actordb_protocol::meta::{
-        envelope::Msg as EnvelopeMsg, BatchAck, Envelope, KeySummary, ReplicationAckLevel,
-        SyncEntry,
+        envelope::Msg as EnvelopeMsg, BatchAck, Envelope, KeySummary, ReconcileEntry,
+        ReplicationAckLevel,
     };
 
     let controller = Arc::new(ManualPlacement::new(HashMap::from([(
@@ -5423,7 +5408,7 @@ async fn placement_bootstrap_fetch_requires_verification_round() {
         Envelope {
             msg: Some(EnvelopeMsg::ReconcileData(complete_reconcile_data(
                 &fetch,
-                vec![SyncEntry {
+                vec![ReconcileEntry {
                     key: summary.key.clone(),
                     value: b"fetched".to_vec(),
                     timestamp_ms: summary.timestamp_ms,
@@ -5779,7 +5764,9 @@ async fn inbound_mutation_after_snapshot_invalidates_reset_completion() {
 async fn malformed_reconcile_data_is_rejected_without_partial_apply() {
     use actordb::replication::SenderConfig;
     use actordb::shard::FragmentId;
-    use actordb_protocol::meta::{envelope::Msg as EnvelopeMsg, Envelope, KeySummary, SyncEntry};
+    use actordb_protocol::meta::{
+        envelope::Msg as EnvelopeMsg, Envelope, KeySummary, ReconcileEntry,
+    };
 
     let mut fragment_map = HashMap::new();
     fragment_map.insert(
@@ -5889,7 +5876,7 @@ async fn malformed_reconcile_data_is_rejected_without_partial_apply() {
         Envelope {
             msg: Some(EnvelopeMsg::ReconcileData(complete_reconcile_data(
                 &second_fetch,
-                vec![SyncEntry {
+                vec![ReconcileEntry {
                     key: "unrequested-key".to_string(),
                     value: b"bad".to_vec(),
                     // Malformed/unrequested data is rejected before HLC
@@ -8724,11 +8711,6 @@ async fn placement_rolling_restart_delta_reconcile_only() {
     assert!((0..50).all(|i| {
         all.get(&format!("rk-{i}")).map(|v| v.value.clone()) == Some(format!("rv-{i}").into_bytes())
     }));
-    assert_eq!(
-        a2.sync_entries_applied(),
-        0,
-        "protocol-v3 placement bootstrap used the retired sync path"
-    );
 
     a2.shutdown().await.unwrap();
     b.shutdown().await.unwrap();
@@ -8925,10 +8907,7 @@ async fn hello_auth_second_flight_uses_the_original_handshake_deadline() {
         Envelope {
             msg: Some(EnvelopeMsg::Hello(Hello {
                 node_id: "slow-second-flight".to_string(),
-                auth_tag: Vec::new(),
-                min_protocol_version: WIRE_PROTOCOL_VERSION,
-                max_protocol_version: WIRE_PROTOCOL_VERSION,
-                capabilities: REQUIRED_WIRE_CAPABILITIES,
+                protocol_version: WIRE_PROTOCOL_VERSION,
                 challenge: vec![0x6b; 32],
                 process_generation: 0,
             })),
@@ -9061,10 +9040,7 @@ async fn hello_auth_mismatch_drops_connection() {
         Envelope {
             msg: Some(EnvelopeMsg::Hello(Hello {
                 node_id: "b".to_string(),
-                auth_tag: Vec::new(),
-                min_protocol_version: WIRE_PROTOCOL_VERSION,
-                max_protocol_version: WIRE_PROTOCOL_VERSION,
-                capabilities: REQUIRED_WIRE_CAPABILITIES,
+                protocol_version: WIRE_PROTOCOL_VERSION,
                 challenge: vec![0x6b; 32],
                 process_generation: 0,
             })),
@@ -9099,36 +9075,24 @@ async fn hello_auth_mismatch_drops_connection() {
     a.shutdown().await.unwrap();
 }
 
-/// A peer must explicitly negotiate the wire version and every semantic bit
-/// relied on by mutation, batching, and replication acknowledgements.
-/// Fieldless legacy Hellos and partial capability sets fail closed before peer
-/// installation.
+/// Exact current protocol is required before a peer can be published.
 #[tokio::test]
-async fn incompatible_hello_capabilities_are_rejected() {
-    use actordb::node::{CAPABILITY_BYTE_BOUNDED_BATCHES, CAPABILITY_STABLE_DURABILITY_ACKS};
-    use actordb_protocol::meta::{envelope::Msg as EnvelopeMsg, Hello};
-
-    let node = test_node("capability-server").await;
-    let incompatible = [
-        Hello {
-            node_id: "legacy-peer".to_string(),
-            ..Hello::default()
-        },
-        Hello {
-            node_id: "partial-peer".to_string(),
-            min_protocol_version: WIRE_PROTOCOL_VERSION,
-            max_protocol_version: WIRE_PROTOCOL_VERSION,
-            capabilities: REQUIRED_WIRE_CAPABILITIES & !CAPABILITY_BYTE_BOUNDED_BATCHES,
-            ..Hello::default()
-        },
-        Hello {
-            node_id: "no-stable-fence-peer".to_string(),
-            min_protocol_version: WIRE_PROTOCOL_VERSION,
-            max_protocol_version: WIRE_PROTOCOL_VERSION,
-            capabilities: REQUIRED_WIRE_CAPABILITIES & !CAPABILITY_STABLE_DURABILITY_ACKS,
-            ..Hello::default()
-        },
-    ];
+async fn incompatible_hello_versions_are_rejected() {
+    let node = test_node("version-server").await;
+    let mut incompatible: Vec<_> = (0..WIRE_PROTOCOL_VERSION)
+        .chain([WIRE_PROTOCOL_VERSION + 1])
+        .map(|protocol_version| Hello {
+            node_id: "incompatible-peer".into(),
+            protocol_version,
+            challenge: vec![1; 32],
+            process_generation: 0,
+        })
+        .collect();
+    incompatible.push(Hello {
+        node_id: "missing-challenge-peer".into(),
+        protocol_version: WIRE_PROTOCOL_VERSION,
+        ..Default::default()
+    });
     for hello in incompatible {
         let mut stream = tokio::net::TcpStream::connect(node.addr()).await.unwrap();
         assert!(matches!(
@@ -9154,24 +9118,20 @@ async fn incompatible_hello_capabilities_are_rejected() {
 }
 
 #[tokio::test]
-async fn retired_full_state_sync_frames_close_protocol_v3_connection() {
-    use actordb_protocol::meta::{envelope::Msg as EnvelopeMsg, SyncRequest};
-
-    let node = test_node("retired-sync-server").await;
+async fn unknown_envelope_message_closes_current_protocol_connection() {
+    let node = test_node("unsupported-message-server").await;
     let mut stream = tokio::net::TcpStream::connect(node.addr()).await.unwrap();
-    complete_no_secret_handshake(&mut stream, "retired-sync-peer").await;
-    send_frame(
-        &mut stream,
-        Envelope {
-            msg: Some(EnvelopeMsg::SyncRequest(SyncRequest { fragments: vec![0] })),
-        },
-    )
-    .await;
+    complete_no_secret_handshake(&mut stream, "unsupported-message-peer").await;
+    // Unknown Envelope oneof tag 25, with an empty payload. It must not
+    // masquerade as a supported request or be silently accepted.
+    stream.write_u32(3).await.unwrap();
+    stream.write_all(&[0xca, 0x01, 0]).await.unwrap();
+    stream.flush().await.unwrap();
 
     let mut remainder = Vec::new();
     tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut remainder))
         .await
-        .expect("retired sync frame did not close the connection")
+        .expect("unsupported message did not close the connection")
         .unwrap();
     common::wait_for(
         || async { node.peer_count().await == 0 },
@@ -9198,10 +9158,7 @@ async fn hello_claiming_self_id_rejected() {
         Envelope {
             msg: Some(EnvelopeMsg::Hello(Hello {
                 node_id: "a".to_string(), // our own id!
-                auth_tag: Vec::new(),
-                min_protocol_version: WIRE_PROTOCOL_VERSION,
-                max_protocol_version: WIRE_PROTOCOL_VERSION,
-                capabilities: REQUIRED_WIRE_CAPABILITIES,
+                protocol_version: WIRE_PROTOCOL_VERSION,
                 challenge: vec![0x7c; 32],
                 process_generation: 0,
             })),
@@ -9237,10 +9194,7 @@ async fn second_hello_closes_established_connection() {
         Envelope {
             msg: Some(EnvelopeMsg::Hello(Hello {
                 node_id: "second-peer".to_string(),
-                auth_tag: Vec::new(),
-                min_protocol_version: WIRE_PROTOCOL_VERSION,
-                max_protocol_version: WIRE_PROTOCOL_VERSION,
-                capabilities: REQUIRED_WIRE_CAPABILITIES,
+                protocol_version: WIRE_PROTOCOL_VERSION,
                 challenge: vec![0x8d; 32],
                 process_generation: 0,
             })),
@@ -10320,8 +10274,8 @@ async fn fetched_reconcile_value_retries_failed_local_store_fence() {
     use actordb::replication::{ReplicationAckDurability, SenderConfig};
     use actordb::shard::FragmentId;
     use actordb_protocol::meta::{
-        envelope::Msg as EnvelopeMsg, BatchAck, Envelope, KeySummary, ReplicationAckLevel,
-        SyncEntry,
+        envelope::Msg as EnvelopeMsg, BatchAck, Envelope, KeySummary, ReconcileEntry,
+        ReplicationAckLevel,
     };
 
     let store = Arc::new(FailOnceStore::default());
@@ -10419,7 +10373,7 @@ async fn fetched_reconcile_value_retries_failed_local_store_fence() {
         Envelope {
             msg: Some(EnvelopeMsg::ReconcileData(complete_reconcile_data(
                 &fetch,
-                vec![SyncEntry {
+                vec![ReconcileEntry {
                     key: summary.key.clone(),
                     value: b"durable".to_vec(),
                     timestamp_ms: summary.timestamp_ms,

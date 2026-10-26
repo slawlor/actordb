@@ -1272,12 +1272,7 @@ impl Node {
         if runtime_options
             .peer_authority
             .as_ref()
-            .is_some_and(|authority| {
-                authority
-                    .peer_generations()
-                    .iter()
-                    .any(|peer| peer.peer_id() == node_id)
-            })
+            .is_some_and(|authority| authority.peer_generations().contains_key(&node_id))
         {
             return Err(NodeError::Codec(
                 "local identity must not appear in authorized remote peers".into(),
@@ -1665,7 +1660,6 @@ impl Node {
             storage_executor: config.persistence.executor(),
             persistence_budget: config.persistence.aggregate(),
             sender_reports: Arc::new(Mutex::new(HashMap::new())),
-            sync_entries_applied: Arc::new(AtomicU64::new(0)),
             membership_tx: membership_tx.clone(),
             cluster_secret: config.cluster_secret.clone(),
             placement_tasks,

@@ -19,7 +19,7 @@ pub use meta::{
     BatchAck, BatchGet, BatchGetResponse, BatchNack, BatchPut, Envelope, ForwardedGet,
     ForwardedPut, GetResponse, Hello, HelloAuth, KeySummary, MutationResponse, MutationResult,
     MutationStatus, Priority, QueryCell, QueryPageRequest, QueryPageResponse, QueryPageRow,
-    QueryPageStatus, ReconcileData, ReconcileFetch, ReconcileRequest, ReconcileResponse,
-    ReplicateBatch, ReplicateOp, ReplicationAckLevel, ScanMatch as ScanMatchProto, ScanRequest,
-    ScanResponse, SessionStart, SyncEntry,
+    QueryPageStatus, ReconcileData, ReconcileEntry, ReconcileFetch, ReconcileRequest,
+    ReconcileResponse, ReplicateBatch, ReplicateOp, ReplicationAckLevel,
+    ScanMatch as ScanMatchProto, ScanRequest, ScanResponse, SessionStart,
 };

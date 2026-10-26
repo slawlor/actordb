@@ -9,10 +9,7 @@ use ractor::{rpc::CallResult, ActorRef};
 use tokio::sync::oneshot;
 use tokio::time::Instant;
 
-use super::{
-    try_send_envelope_until, FragmentRouter, Node, OperationPermit, PeerChannel,
-    CAPABILITY_QUERY_METADATA, CAPABILITY_QUERY_PAGES,
-};
+use super::{try_send_envelope_until, FragmentRouter, Node, OperationPermit, PeerChannel};
 use crate::actor::KvMessage;
 use crate::proto::{Envelope, EnvelopeMsg, QueryPageRequest, QueryPageResponse, QueryPageStatus};
 use crate::query::{
@@ -54,9 +51,6 @@ struct FragmentCursor {
     rows: VecDeque<crate::proto::QueryPageRow>,
 }
 
-fn query_requires_metadata(plan: &QueryPlan) -> bool {
-    plan.include_tombstones || plan.needs_metadata()
-}
 impl FragmentCursor {
     fn new(fragment: u32) -> Self {
         Self {
@@ -520,12 +514,7 @@ impl Node {
                     continue;
                 }
                 if let Some(channel) = self.peers.lock().await.get(&owner).cloned() {
-                    if channel.capabilities & CAPABILITY_QUERY_PAGES != 0
-                        && (!query_requires_metadata(plan)
-                            || channel.capabilities & CAPABILITY_QUERY_METADATA != 0)
-                    {
-                        holders.push(Holder::Remote(channel));
-                    }
+                    holders.push(Holder::Remote(channel));
                 }
             }
             let mut successful = None;
@@ -959,41 +948,6 @@ pub(super) fn reserve_inbound(
 mod page_validation_tests {
     use super::*;
     use crate::query::value_to_cell;
-
-    #[tokio::test]
-    async fn optional_query_and_scan_capabilities_preserve_old_peer_connections() {
-        let mut hello = super::super::fresh_hello("old-peer").unwrap();
-        hello.capabilities = super::super::REQUIRED_WIRE_CAPABILITIES;
-        super::super::validate_peer_hello("local", None, &hello).unwrap();
-        let node = Node::start(
-            "local".into(),
-            "127.0.0.1:0".parse().unwrap(),
-            super::super::NodeConfig {
-                fragment_map: HashMap::from([(FragmentId(0), vec!["old-peer".into()])]),
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap();
-        let (mut channel, mut requests, mut responses) = super::super::tests::test_peer_channel(4);
-        channel.capabilities = super::super::REQUIRED_WIRE_CAPABILITIES;
-        node.peers.lock().await.insert("old-peer".into(), channel);
-        assert!(matches!(
-            node.query("SELECT COUNT(*) FROM kv").await,
-            Err(QueryExecutionError::FragmentsUnavailable(_))
-        ));
-        let spec = crate::actor::ScanSpec {
-            matcher: crate::actor::KeyMatcher::All,
-            transform: crate::actor::ValueTransform::KeyOnly,
-            limit: 10,
-            offset: 0,
-        };
-        assert!(node.scan(&spec).await.is_err());
-        assert!(requests.try_recv().is_err());
-        assert!(responses.try_recv().is_err());
-        assert_eq!(node.peer_count().await, 1);
-        node.shutdown().await.unwrap();
-    }
 
     #[test]
     fn inbound_pages_share_runtime_admission_and_release_on_completion() {

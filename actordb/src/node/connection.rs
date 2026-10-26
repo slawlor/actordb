@@ -23,7 +23,6 @@ pub(super) struct PeerChannel {
     pub(super) cancel: watch::Sender<bool>,
     pub(super) queue_admission_timeout: Duration,
     pub(super) rank: Option<ConnectionRank>,
-    pub(super) capabilities: u64,
 }
 
 pub(super) struct ConnectionCancelGuard(pub(super) PeerChannel);
@@ -272,7 +271,6 @@ pub(super) async fn run_peer_writer<W>(
     run_bounded_peer_writer(
         writer,
         PeerWriterPipeline {
-            frame_auth: None,
             data_rx: rx,
             response_rx,
             byte_budget,
@@ -292,7 +290,6 @@ pub(super) struct PeerWriterExitGuard {
 }
 
 pub(super) struct PeerWriterPipeline {
-    pub(super) frame_auth: Option<Arc<FrameSigningState>>,
     pub(super) data_rx: mpsc::Receiver<BudgetedFrame>,
     pub(super) response_rx: mpsc::Receiver<BudgetedFrame>,
     pub(super) byte_budget: Arc<Semaphore>,
@@ -317,7 +314,6 @@ pub(super) async fn run_bounded_peer_writer<W>(
     W: AsyncWrite + Unpin,
 {
     let PeerWriterPipeline {
-        frame_auth,
         data_rx,
         response_rx,
         byte_budget,
@@ -335,7 +331,6 @@ pub(super) async fn run_bounded_peer_writer<W>(
         cancel_rx,
         cancel_tx.clone(),
         socket_write_timeout,
-        frame_auth,
     )
     .await;
     let _ = cancel_tx.send(true);
@@ -348,14 +343,12 @@ pub(super) async fn run_queued_peer_writer<W>(
     mut cancel_rx: watch::Receiver<bool>,
     cancel_tx: watch::Sender<bool>,
     socket_write_timeout: Duration,
-    frame_auth: Option<Arc<FrameSigningState>>,
 ) where
     W: AsyncWrite + Unpin,
 {
     let mut data_open = true;
     let mut response_open = true;
     let mut response_burst = 0usize;
-    let mut next_sequence = Some(1);
     'writer: while data_open || response_open {
         let (frame, is_response) = loop {
             if !data_open && !response_open {
@@ -403,29 +396,8 @@ pub(super) async fn run_queued_peer_writer<W>(
             );
             break;
         }
-        let signature = match frame_auth
-            .as_ref()
-            .map(|auth| auth.header(&mut next_sequence, frame.bytes()))
-            .transpose()
-        {
-            Ok(header) => header.flatten(),
-            Err(error) => {
-                tracing::warn!(%error, "closing peer before frame sequence wrap");
-                break;
-            }
-        };
-        let wire_len = frame.len() + signature.as_ref().map_or(0, |header| header.len());
-        if wire_len > MAX_TRANSPORT_FRAME_BYTES {
-            break;
-        }
-        // Envelope.HelloAuth is field20: canonical protobuf key162 = A2 01.
-        // The activation signal follows its actual write/flush, never enqueue.
-        let auth_flight = signature.is_none() && frame.bytes().starts_with(&[0xa2, 0x01]);
         let write = async {
-            writer.write_u32(wire_len as u32).await?;
-            if let Some(header) = &signature {
-                writer.write_all(header).await?;
-            }
+            writer.write_u32(frame.len() as u32).await?;
             writer.write_all(frame.bytes()).await?;
             writer.flush().await
         };
@@ -438,11 +410,6 @@ pub(super) async fn run_queued_peer_writer<W>(
         };
         if !matches!(result, Some(Ok(Ok(())))) {
             break;
-        }
-        if auth_flight {
-            if let Some(auth) = &frame_auth {
-                auth.publish_auth_written();
-            }
         }
     }
     let _ = cancel_tx.send(true);
@@ -495,7 +462,6 @@ pub(super) async fn read_connection_frame<R>(
     established: bool,
     handshake_deadline: Instant,
     frame_body_timeout: Duration,
-    max_frame_bytes: usize,
 ) -> Option<ReceivedFrame>
 where
     R: tokio::io::AsyncRead + Unpin,
@@ -520,7 +486,7 @@ where
     };
     let len = prefix as usize;
     let max_len = if established {
-        max_frame_bytes
+        MAX_FRAME_BYTES
     } else {
         4 * 1024
     };
@@ -570,22 +536,13 @@ pub(super) fn validate_peer_hello(
     if expected_peer_id.is_some_and(|expected| expected != hello.node_id) {
         return Err("peer identity did not match the configured member");
     }
-    if !hello.auth_tag.is_empty() {
-        return Err("peer used the retired replayable Hello auth_tag");
-    }
     if hello.challenge.len() != HANDSHAKE_CHALLENGE_BYTES
         || hello.challenge.iter().all(|byte| *byte == 0)
     {
         return Err("peer challenge is missing, invalid, or all-zero");
     }
-    if hello.min_protocol_version == 0
-        || hello.min_protocol_version > WIRE_PROTOCOL_VERSION
-        || hello.max_protocol_version < WIRE_PROTOCOL_VERSION
-    {
-        return Err("peer wire-version range is incompatible");
-    }
-    if REQUIRED_WIRE_CAPABILITIES & !hello.capabilities != 0 {
-        return Err("peer omitted required wire capabilities");
+    if hello.protocol_version != WIRE_PROTOCOL_VERSION {
+        return Err("peer must use the exact current wire protocol version");
     }
     Ok(())
 }
@@ -657,8 +614,6 @@ pub(super) async fn handle_connection(
     };
     local_hello.process_generation = authority_era.local_generation();
     let mut authority_session = None;
-    let mut frame_verifier: Option<FrameVerifier> = None;
-    let frame_auth = (local_hello.process_generation != 0).then(FrameSigningState::new);
     // Phase 5: current session per (peer, fragment) on this connection.
     // Sessions are per-connection: a new connection means a new pairing.
     let sessions: InboundSessions = Arc::new(Mutex::new(HashMap::new()));
@@ -696,11 +651,6 @@ pub(super) async fn handle_connection(
     let mut tx = PeerChannel {
         work_retention: None,
         outbound: BudgetedPeerTx {
-            frame_overhead: if frame_auth.is_some() {
-                super::peer_frame::SIGNATURE_HEADER_BYTES
-            } else {
-                0
-            },
             node_byte_budget: node_peer_queue_budget,
             tx: frame_tx,
             response_tx,
@@ -712,10 +662,6 @@ pub(super) async fn handle_connection(
         cancel: cancel.clone(),
         queue_admission_timeout: runtime_options.queue_admission_timeout,
         rank: None,
-        capabilities: REQUIRED_WIRE_CAPABILITIES
-            | CAPABILITY_SCAN
-            | CAPABILITY_QUERY_PAGES
-            | CAPABILITY_QUERY_METADATA,
     };
     let writer_cancel = cancel.subscribe();
     // Abort/early-return must cancel jobs bound to this exact physical socket.
@@ -725,7 +671,6 @@ pub(super) async fn handle_connection(
     // observed and leave the read side waiting forever.
     let mut read_cancel = cancel.subscribe();
     let writer_cancel_tx = cancel.clone();
-    let writer_frame_auth = frame_auth.clone();
     // The writer is independently registered with the Node task manager. The
     // context carries only a Weak reference, avoiding a manager→handler→manager
     // ownership cycle while still making shutdown join both halves.
@@ -739,7 +684,6 @@ pub(super) async fn handle_connection(
                     run_bounded_peer_writer(
                         writer,
                         PeerWriterPipeline {
-                            frame_auth: writer_frame_auth,
                             data_rx: rx,
                             response_rx,
                             byte_budget,
@@ -833,27 +777,12 @@ pub(super) async fn handle_connection(
             handshake.is_established(),
             handshake_deadline,
             runtime_options.socket_read_timeout,
-            if frame_verifier.is_some() {
-                MAX_TRANSPORT_FRAME_BYTES
-            } else {
-                MAX_FRAME_BYTES
-            },
         )
         .await
         else {
             break;
         };
-        let payload = match frame_verifier.as_mut() {
-            Some(verifier) => match verifier.verify(&buf.bytes) {
-                Ok(payload) => payload,
-                Err(error) => {
-                    peer_authority.reject_frame_integrity();
-                    tracing::warn!(%error, "rejecting peer before protobuf decode");
-                    break;
-                }
-            },
-            None => &buf.bytes,
-        };
+        let payload = buf.bytes.as_slice();
         if let Some(session) = &authority_session {
             // The lease linearizes eligibility before any frame can observe
             // timestamps, affect ACKs, forward, reconcile, or mutate actors.
@@ -907,7 +836,7 @@ pub(super) async fn handle_connection(
                     (&peer_hello, &local_hello)
                 };
                 let auth_tag =
-                    authority_era.sign(cluster_secret.as_deref(), we_dialed, dialer, listener);
+                    authority_era.proof(cluster_secret.as_deref(), we_dialed, dialer, listener);
                 if !send_hello_auth_until(&tx, auth_tag, handshake_deadline).await {
                     break;
                 }
@@ -941,24 +870,6 @@ pub(super) async fn handle_connection(
                     break;
                 }
 
-                if let Some(auth) = &frame_auth {
-                    if !auth
-                        .wait_for_auth_written(handshake_deadline, &mut read_cancel)
-                        .await
-                    {
-                        break;
-                    }
-                    auth.install(
-                        authority_era
-                            .frame_signer(we_dialed, dialer, listener)
-                            .expect("configured process signing key"),
-                    );
-                    frame_verifier =
-                        authority_era.frame_verifier(&peer_hello, !we_dialed, dialer, listener);
-                    if frame_verifier.is_none() {
-                        break;
-                    }
-                }
                 let peer = peer_hello.node_id.clone();
                 let Some(session) = peer_authority.register(&authority_era, &peer, tx.clone())
                 else {
@@ -967,7 +878,6 @@ pub(super) async fn handle_connection(
                 authority_session = Some(session);
                 authenticated_peer_id = Some(peer.clone());
                 tx.rank = Some(connection_rank(dialer, listener));
-                tx.capabilities = peer_hello.capabilities;
                 let (won_election, previous) = {
                     let mut peer_guard = peers.lock().await;
                     match peer_guard.get(&peer) {
@@ -997,11 +907,8 @@ pub(super) async fn handle_connection(
                 handshake = HandshakeState::Established { peer: peer.clone() };
                 was_established = true;
 
-                // Both static and dynamic placement use the same correlated,
-                // byte-bounded reconciliation protocol. The legacy
-                // SyncRequest/SyncResponse exchange is deliberately retired:
-                // keeping a second monolithic bootstrap path would re-open
-                // the frame and memory bounds enforced by protocol v3.
+                // Static and dynamic placement share the same correlated,
+                // byte-bounded reconciliation protocol.
                 // Phase 8: wake the placement driver so the controller
                 // sees the membership change promptly.
                 if let Some(mtx) = membership_tx.clone() {
@@ -2161,7 +2068,7 @@ pub(super) async fn handle_connection(
                             || {
                                 (
                                     relay._admission.clone(),
-                                    validate_legacy_get_response(&relay.expected_key, &r),
+                                    validate_get_response(&relay.expected_key, &r),
                                 )
                             },
                         )
@@ -2179,7 +2086,7 @@ pub(super) async fn handle_connection(
                 let Some(validation) = relay_validation.map(|(_, result)| result).or_else(|| {
                     pending_expected_key
                         .as_deref()
-                        .map(|key| validate_legacy_get_response(key, &r))
+                        .map(|key| validate_get_response(key, &r))
                 }) else {
                     continue;
                 };
@@ -2607,18 +2514,7 @@ pub(super) async fn handle_connection(
                     let _ = pending.reply.send(Ok(r.results));
                 }
             }
-            Some(EnvelopeMsg::SyncRequest(_)) | Some(EnvelopeMsg::SyncResponse(_)) => {
-                // Protocol v3 deliberately has one anti-entropy engine. A
-                // negotiated v3 peer that sends a legacy full-sync frame is
-                // either malformed or has falsely advertised capabilities;
-                // fail closed instead of rebuilding an unbounded response.
-                tracing::warn!("closing peer that sent a retired full-state sync frame");
-                break;
-            }
             Some(EnvelopeMsg::QueryPageRequest(req)) => {
-                if tx.capabilities & CAPABILITY_QUERY_PAGES == 0 {
-                    break;
-                }
                 let operation = match operation_gate.try_enter() {
                     Ok(operation) => operation,
                     Err(_) => {
@@ -2687,9 +2583,6 @@ pub(super) async fn handle_connection(
                 }
             }
             Some(EnvelopeMsg::QueryPageResponse(response)) => {
-                if tx.capabilities & CAPABILITY_QUERY_PAGES == 0 {
-                    break;
-                }
                 let pending = {
                     let mut pending = pending_query_pages.lock().unwrap();
                     if pending
@@ -2712,9 +2605,6 @@ pub(super) async fn handle_connection(
                 let tx = tx.clone();
                 let serving = serving.clone();
                 let router = router.clone();
-                if tx.capabilities & CAPABILITY_SCAN == 0 {
-                    break;
-                }
                 let operation = match operation_gate.try_enter() {
                     Ok(operation) => operation,
                     Err(_) => {
@@ -2974,14 +2864,7 @@ pub(super) fn fresh_hello(node_id: &str) -> Result<Hello, getrandom::Error> {
     getrandom::fill(&mut challenge)?;
     Ok(Hello {
         node_id: node_id.to_string(),
-        auth_tag: Vec::new(),
-        min_protocol_version: WIRE_PROTOCOL_VERSION,
-        max_protocol_version: WIRE_PROTOCOL_VERSION,
-        capabilities: REQUIRED_WIRE_CAPABILITIES
-            | CAPABILITY_SCAN
-            | CAPABILITY_QUERY_PAGES
-            | CAPABILITY_QUERY_METADATA
-            | CAPABILITY_AUTHENTICATED_PEER_GENERATIONS,
+        protocol_version: WIRE_PROTOCOL_VERSION,
         challenge,
         process_generation: 0,
     })
@@ -3014,31 +2897,24 @@ pub(super) async fn send_hello_auth_until(
 }
 
 /// Canonical manual encoding used by both HMAC and connection election. It is
-/// deliberately independent of protobuf encoding and binds both advertised
-/// offers plus the selected protocol/capabilities.
+/// deliberately independent of protobuf encoding and binds every current
+/// Hello field, including zero-valued process generation.
 pub(super) fn handshake_transcript(dialer: &Hello, listener: &Hello) -> Vec<u8> {
     fn append_hello(out: &mut Vec<u8>, role: &[u8], hello: &Hello) {
         out.extend_from_slice(&(role.len() as u64).to_be_bytes());
         out.extend_from_slice(role);
         out.extend_from_slice(&(hello.node_id.len() as u64).to_be_bytes());
         out.extend_from_slice(hello.node_id.as_bytes());
-        out.extend_from_slice(&hello.min_protocol_version.to_be_bytes());
-        out.extend_from_slice(&hello.max_protocol_version.to_be_bytes());
-        out.extend_from_slice(&hello.capabilities.to_be_bytes());
+        out.extend_from_slice(&hello.protocol_version.to_be_bytes());
         out.extend_from_slice(&(hello.challenge.len() as u64).to_be_bytes());
         out.extend_from_slice(&hello.challenge);
-        if hello.process_generation != 0 {
-            out.extend_from_slice(b"authenticated-process-generation\0");
-            out.extend_from_slice(&hello.process_generation.to_be_bytes());
-        }
+        out.extend_from_slice(&hello.process_generation.to_be_bytes());
     }
 
     let mut transcript = Vec::with_capacity(256);
-    transcript.extend_from_slice(b"actordb-handshake-transcript-v2\0");
+    transcript.extend_from_slice(b"actordb-handshake-transcript-v6\0");
     append_hello(&mut transcript, b"dialer", dialer);
     append_hello(&mut transcript, b"listener", listener);
-    transcript.extend_from_slice(&WIRE_PROTOCOL_VERSION.to_be_bytes());
-    transcript.extend_from_slice(&(dialer.capabilities & listener.capabilities).to_be_bytes());
     transcript
 }
 
@@ -3052,7 +2928,7 @@ pub(super) fn handshake_auth_tag(
     use sha2::Sha256;
 
     let mut mac = Hmac::<Sha256>::new_from_slice(secret).expect("HMAC accepts any key length");
-    mac.update(b"actordb-handshake-proof-v2\0");
+    mac.update(b"actordb-handshake-proof-v6\0");
     mac.update(if prover_is_dialer {
         b"dialer"
     } else {
@@ -3080,7 +2956,7 @@ pub(super) fn verify_handshake_auth(
             // `verify_slice` is constant-time.
             let mut verifier =
                 Hmac::<Sha256>::new_from_slice(secret).expect("HMAC accepts any key length");
-            verifier.update(b"actordb-handshake-proof-v2\0");
+            verifier.update(b"actordb-handshake-proof-v6\0");
             verifier.update(if prover_is_dialer {
                 b"dialer"
             } else {
@@ -3132,7 +3008,7 @@ pub(super) fn send_envelope_retained(
             return false;
         }
     };
-    let charged_len = encoded_len + tx.outbound.frame_overhead;
+    let charged_len = encoded_len;
     let frame_permit = match tx.outbound.response_tx.try_reserve() {
         Ok(permit) => permit,
         Err(_) => {
@@ -3219,7 +3095,7 @@ pub(super) async fn try_send_envelope_with_deadline(
             return false;
         }
     };
-    let charged_len = encoded_len + tx.outbound.frame_overhead;
+    let charged_len = encoded_len;
     let queue_deadline = deadline_after(admission_timeout);
     let admission_deadline = attempt_deadline
         .map(|deadline| deadline.min(queue_deadline))
@@ -3479,7 +3355,6 @@ mod tests {
             true,
             Instant::now(),
             Duration::from_secs(1),
-            MAX_FRAME_BYTES,
         )
         .await
         .unwrap();
@@ -3497,7 +3372,6 @@ mod tests {
             true,
             Instant::now(),
             Duration::from_secs(1),
-            MAX_FRAME_BYTES,
         )
         .await
         .unwrap();
@@ -3515,7 +3389,6 @@ mod tests {
             true,
             Instant::now(),
             Duration::from_secs(1),
-            MAX_FRAME_BYTES,
         )
         .await
         .is_none());
@@ -3543,7 +3416,6 @@ mod tests {
                     } else {
                         Duration::from_secs(10)
                     },
-                    MAX_FRAME_BYTES,
                 )
                 .await
             });
@@ -3571,15 +3443,7 @@ mod tests {
 
     #[tokio::test]
     async fn receive_byte_admission_checks_handshake_and_hard_limits_first() {
-        for (established, frame_limit, len) in [
-            (false, MAX_FRAME_BYTES, 4097),
-            (true, MAX_FRAME_BYTES, MAX_FRAME_BYTES + 1),
-            (
-                true,
-                MAX_TRANSPORT_FRAME_BYTES,
-                MAX_TRANSPORT_FRAME_BYTES + 1,
-            ),
-        ] {
+        for (established, len) in [(false, 4097), (true, MAX_FRAME_BYTES + 1)] {
             let budget = Arc::new(Semaphore::new(8));
             let (_cancel, mut cancelled) = watch::channel(false);
             let (mut client, mut reader) = tokio::io::duplex(64);
@@ -3591,7 +3455,6 @@ mod tests {
                 established,
                 Instant::now() + Duration::from_secs(1),
                 Duration::from_secs(1),
-                frame_limit,
             )
             .await
             .is_none());
@@ -3741,22 +3604,16 @@ mod tests {
     }
 
     #[test]
-    fn challenge_hmac_binds_both_offers_roles_and_freshness() {
+    fn challenge_hmac_binds_current_hellos_roles_and_freshness() {
         let dialer = Hello {
             node_id: "dialer".to_string(),
-            auth_tag: Vec::new(),
-            min_protocol_version: WIRE_PROTOCOL_VERSION,
-            max_protocol_version: WIRE_PROTOCOL_VERSION,
-            capabilities: 0x7f, // Fixed offer for the independent transcript vector.
+            protocol_version: WIRE_PROTOCOL_VERSION,
             challenge: vec![1; HANDSHAKE_CHALLENGE_BYTES],
             process_generation: 0,
         };
         let listener = Hello {
             node_id: "listener".to_string(),
-            auth_tag: Vec::new(),
-            min_protocol_version: WIRE_PROTOCOL_VERSION,
-            max_protocol_version: WIRE_PROTOCOL_VERSION,
-            capabilities: 0x7f, // Fixed offer for the independent transcript vector.
+            protocol_version: WIRE_PROTOCOL_VERSION,
             challenge: vec![2; HANDSHAKE_CHALLENGE_BYTES],
             process_generation: 0,
         };
@@ -3771,15 +3628,15 @@ mod tests {
         };
         assert_eq!(
             hex(&authenticated),
-            "c7814c60b1eb8fd3506cb944b143b2670e89df06c0aaffed72fa094136c4f753"
+            "d95e25795859a1e4637472c6c4ec19f3f1a715862fa2b089e6c57c25e6cab138"
         );
         assert_eq!(
             hex(&handshake_auth_tag(b"secret", false, &dialer, &listener)),
-            "e086e2e89582a35687e688ac90359ab853127b60fc870b3384c325600f08513a"
+            "ed255154af737a848cb4f219c39246f4419730f247bd39514e2a74d006629826"
         );
         assert_eq!(
             hex(&connection_rank(&dialer, &listener).transcript_id),
-            "aedafa6cf5d455e9979aaafc83a80ce5a402aad2c3e101c7314943898d5d7039"
+            "855dd11d65ac4bf2ff7d8f7f168f23aae5424b0a0a865b8518866a59f3e28744"
         );
         assert!(verify_handshake_auth(
             Some(b"secret"),
@@ -3822,13 +3679,31 @@ mod tests {
         ));
 
         let mut tampered_dialer = dialer.clone();
-        tampered_dialer.capabilities ^= CAPABILITY_MUTATION_RESULTS;
+        tampered_dialer.protocol_version += 1;
         assert!(!verify_handshake_auth(
             Some(b"secret"),
             true,
             &tampered_dialer,
             &listener,
             &authenticated,
+        ));
+        let mut changed_generation = dialer.clone();
+        changed_generation.process_generation = 1;
+        assert!(!verify_handshake_auth(
+            Some(b"secret"),
+            true,
+            &changed_generation,
+            &listener,
+            &authenticated
+        ));
+        let mut changed_identity = dialer.clone();
+        changed_identity.node_id.push('x');
+        assert!(!verify_handshake_auth(
+            Some(b"secret"),
+            true,
+            &changed_identity,
+            &listener,
+            &authenticated
         ));
         let reflected = handshake_auth_tag(b"secret", false, &listener, &dialer);
         assert!(!verify_handshake_auth(
@@ -3855,19 +3730,13 @@ mod tests {
     fn connection_rank_prefers_one_crossed_dial_and_totally_orders_duplicates() {
         let a = Hello {
             node_id: "a".to_string(),
-            auth_tag: Vec::new(),
-            min_protocol_version: WIRE_PROTOCOL_VERSION,
-            max_protocol_version: WIRE_PROTOCOL_VERSION,
-            capabilities: REQUIRED_WIRE_CAPABILITIES,
+            protocol_version: WIRE_PROTOCOL_VERSION,
             challenge: vec![1; HANDSHAKE_CHALLENGE_BYTES],
             process_generation: 0,
         };
         let b = Hello {
             node_id: "b".to_string(),
-            auth_tag: Vec::new(),
-            min_protocol_version: WIRE_PROTOCOL_VERSION,
-            max_protocol_version: WIRE_PROTOCOL_VERSION,
-            capabilities: REQUIRED_WIRE_CAPABILITIES,
+            protocol_version: WIRE_PROTOCOL_VERSION,
             challenge: vec![2; HANDSHAKE_CHALLENGE_BYTES],
             process_generation: 0,
         };
@@ -5034,7 +4903,6 @@ mod tests {
         let task = tokio::spawn(run_bounded_peer_writer(
             writer,
             PeerWriterPipeline {
-                frame_auth: None,
                 data_rx: frame_rx,
                 response_rx,
                 byte_budget: byte_budget.clone(),
@@ -5088,7 +4956,6 @@ mod tests {
         let task = tokio::spawn(run_bounded_peer_writer(
             writer,
             PeerWriterPipeline {
-                frame_auth: None,
                 data_rx: frame_rx,
                 response_rx,
                 byte_budget: byte_budget.clone(),
@@ -5212,7 +5079,6 @@ mod tests {
         let peer = PeerChannel {
             work_retention: None,
             outbound: BudgetedPeerTx {
-                frame_overhead: 0,
                 node_byte_budget: NodePeerByteBudget::new(NODE_PEER_QUEUE_BYTE_CAPACITY),
                 tx: frame_tx,
                 response_tx,
@@ -5224,7 +5090,6 @@ mod tests {
             cancel: cancel_tx,
             queue_admission_timeout: Duration::from_millis(10),
             rank: None,
-            capabilities: REQUIRED_WIRE_CAPABILITIES,
         };
 
         assert!(try_send_envelope(&peer, envelope.clone()).await);
@@ -5254,7 +5119,6 @@ mod tests {
         let peer = PeerChannel {
             work_retention: None,
             outbound: BudgetedPeerTx {
-                frame_overhead: 0,
                 node_byte_budget: NodePeerByteBudget::new(NODE_PEER_QUEUE_BYTE_CAPACITY),
                 tx: frame_tx,
                 response_tx,
@@ -5266,7 +5130,6 @@ mod tests {
             cancel: cancel_tx,
             queue_admission_timeout: Duration::from_millis(10),
             rank: None,
-            capabilities: REQUIRED_WIRE_CAPABILITIES,
         };
 
         assert!(try_send_envelope(&peer, envelope.clone()).await);

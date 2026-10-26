@@ -8,9 +8,7 @@
 //! [`Client::connect`] uses plain TCP; [`Client::from_stream`] accepts a
 //! caller-established stream, including TLS, with the same application protocol.
 
-use actordb_protocol::{
-    client as wire, CLIENT_CAPABILITIES, CLIENT_PROTOCOL_VERSION, MAX_FRAME_BYTES,
-};
+use actordb_protocol::{client as wire, CLIENT_PROTOCOL_VERSION, MAX_FRAME_BYTES};
 use prost::Message;
 use std::fmt;
 use std::net::SocketAddr;
@@ -137,7 +135,6 @@ struct Inner {
     count: Semaphore,
     bytes: Arc<Semaphore>,
     options: ClientOptions,
-    capabilities: u64,
     closing: watch::Sender<bool>,
 }
 #[derive(Clone)]
@@ -210,15 +207,13 @@ impl Client {
         deadline: Instant,
     ) -> Result<Self, ClientError> {
         let table = options.table.clone();
-        let (stream, capabilities) = timeout_at(deadline, async {
+        let stream = timeout_at(deadline, async {
             let mut challenge = vec![0; 32];
             getrandom::fill(&mut challenge).map_err(|e| ClientError::Protocol(e.to_string()))?;
             let hello = wire::Hello {
                 identity: options.identity.clone(),
                 challenge,
-                min_version: CLIENT_PROTOCOL_VERSION,
-                max_version: CLIENT_PROTOCOL_VERSION,
-                capabilities: CLIENT_CAPABILITIES,
+                protocol_version: CLIENT_PROTOCOL_VERSION,
             };
             send_frame(
                 &mut stream,
@@ -264,7 +259,7 @@ impl Client {
                     ) => {}
                 _ => return Err(ClientError::Authentication),
             }
-            Ok((stream, hello.capabilities & server.capabilities))
+            Ok(stream)
         })
         .await
         .map_err(|_| ClientError::Timeout)??;
@@ -275,7 +270,6 @@ impl Client {
                 count: Semaphore::new(options.max_queued_requests),
                 bytes: Arc::new(Semaphore::new(options.max_queued_bytes)),
                 options,
-                capabilities,
                 closing: watch::channel(false).0,
             }),
             table,
@@ -663,11 +657,6 @@ impl Client {
                 "query parameters exceed frame limit".into(),
             ));
         }
-        if self.inner.capabilities & actordb_protocol::CLIENT_CAPABILITY_QUERY == 0 {
-            return Err(ClientError::Invalid(
-                "server does not support queries".into(),
-            ));
-        }
         let params = params.iter().map(encode_cell).collect();
         let response = self
             .request(
@@ -702,9 +691,6 @@ impl Client {
         &self,
         spec: wire::Scan,
     ) -> Result<Vec<actordb_protocol::meta::ScanMatch>, ClientError> {
-        if self.inner.capabilities & actordb_protocol::CLIENT_CAPABILITY_SCAN == 0 {
-            return Err(ClientError::Invalid("server does not support scans".into()));
-        }
         Ok(self
             .request(wire::request::Operation::Scan(spec), false)
             .await?

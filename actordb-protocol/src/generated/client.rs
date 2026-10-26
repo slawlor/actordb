@@ -6,12 +6,9 @@ pub struct Hello {
     pub identity: ::prost::alloc::string::String,
     #[prost(bytes = "vec", tag = "2")]
     pub challenge: ::prost::alloc::vec::Vec<u8>,
+    /// Exact application protocol version; older and newer binaries fail closed.
     #[prost(uint32, tag = "3")]
-    pub min_version: u32,
-    #[prost(uint32, tag = "4")]
-    pub max_version: u32,
-    #[prost(uint64, tag = "5")]
-    pub capabilities: u64,
+    pub protocol_version: u32,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct Auth {
@@ -200,8 +197,6 @@ pub struct FragmentHealth {
     pub worker_names: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
     #[prost(map = "string, uint64", tag = "4")]
     pub restarts: ::std::collections::HashMap<::prost::alloc::string::String, u64>,
-    #[prost(uint64, tag = "5")]
-    pub last_reaped: u64,
     #[prost(uint64, tag = "6")]
     pub shed_high: u64,
     #[prost(uint64, tag = "7")]

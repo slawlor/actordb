@@ -2,41 +2,33 @@
 // Licensed under the MIT license in the repository root.
 
 //! Run with `cargo run -p actordb --example peer_fence`.
-//! Production provisioning distributes public identities independently and
-//! gives each process only its own fresh signing seed.
+//! Generations are operational IDs; production transport authentication and
+//! credential revocation remain the application's responsibility.
 
-use actordb::node::{
-    Node, NodeConfig, NodeRuntimeOptions, PeerAuthorityOptions, PeerCredential, PeerFenceOptions,
-};
+use actordb::node::{Node, NodeConfig, NodeRuntimeOptions, PeerAuthorityOptions, PeerFenceOptions};
 use std::collections::HashMap;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut a_seed = [0; 32];
-    getrandom::fill(&mut a_seed)?;
-    let mut b_seed = [0; 32];
-    getrandom::fill(&mut b_seed)?;
-    let a_key = PeerCredential::new(1, a_seed);
-    let b_key = PeerCredential::new(1, b_seed);
-    let a_policy = PeerAuthorityOptions::new(
-        a_key.clone(),
-        HashMap::from([("b".into(), b_key.public_identity())]),
-    );
-    let b_policy = PeerAuthorityOptions::new(
-        b_key,
-        HashMap::from([("a".into(), a_key.public_identity())]),
-    );
+    let mut secret = vec![0; 32];
+    getrandom::fill(&mut secret)?;
+    let a_policy = PeerAuthorityOptions::new(1, HashMap::from([("b".into(), 1)]));
+    let b_policy = PeerAuthorityOptions::new(1, HashMap::from([("a".into(), 1)]));
     let a = Node::start_with_options(
         "a".into(),
         "127.0.0.1:0".parse()?,
-        NodeConfig::default(),
+        NodeConfig::builder()
+            .maybe_cluster_secret(Some(secret.clone()))
+            .build(),
         NodeRuntimeOptions::default().with_peer_authority(a_policy.clone()),
     )
     .await?;
     let b = Node::start_with_options(
         "b".into(),
         "127.0.0.1:0".parse()?,
-        NodeConfig::default(),
+        NodeConfig::builder()
+            .maybe_cluster_secret(Some(secret))
+            .build(),
         NodeRuntimeOptions::default().with_peer_authority(b_policy),
     )
     .await?;

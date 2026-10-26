@@ -9,9 +9,7 @@
 use crate::actor::{OpPriority, VersionedValue};
 use crate::network::{Acceptor, BoxStream, Network};
 use crate::node::{Node, NodeError, Table};
-use actordb_protocol::{
-    client as wire, CLIENT_CAPABILITIES, CLIENT_PROTOCOL_VERSION, MAX_FRAME_BYTES,
-};
+use actordb_protocol::{client as wire, CLIENT_PROTOCOL_VERSION, MAX_FRAME_BYTES};
 use prost::Message;
 use std::collections::HashSet;
 use std::net::SocketAddr;
@@ -205,9 +203,7 @@ async fn serve_connection(
         let server = wire::Hello {
             identity: node.id().into(),
             challenge,
-            min_version: CLIENT_PROTOCOL_VERSION,
-            max_version: CLIENT_PROTOCOL_VERSION,
-            capabilities: CLIENT_CAPABILITIES,
+            protocol_version: CLIENT_PROTOCOL_VERSION,
         };
         send(
             &mut stream,
@@ -245,13 +241,13 @@ async fn serve_connection(
             },
         )
         .await?;
-        Some(client.capabilities & server.capabilities)
+        Some(())
     };
     let completed = tokio::select! {
         _ = cancellation.changed() => None,
         result = tokio::time::timeout(options.timeout.min(Duration::from_secs(5)), handshake) => result.ok().flatten(),
     };
-    let Some(capabilities) = completed else {
+    let Some(()) = completed else {
         return;
     };
     loop {
@@ -300,45 +296,6 @@ async fn serve_connection(
         };
         if *cancellation.borrow() {
             return;
-        }
-        let optional_capability = match request.operation {
-            Some(wire::request::Operation::Put(ref put)) if put.write_concern.is_some() => {
-                actordb_protocol::CLIENT_CAPABILITY_WRITE_CONCERNS
-            }
-            Some(wire::request::Operation::Delete(ref delete))
-                if delete.write_concern.is_some() =>
-            {
-                actordb_protocol::CLIENT_CAPABILITY_WRITE_CONCERNS
-            }
-            Some(wire::request::Operation::Query(_)) => actordb_protocol::CLIENT_CAPABILITY_QUERY,
-            Some(wire::request::Operation::Scan(_)) => actordb_protocol::CLIENT_CAPABILITY_SCAN,
-            _ => 0,
-        };
-        if optional_capability & capabilities != optional_capability {
-            let response = wire::Response {
-                id: request.id,
-                error: Some(error(
-                    wire::ErrorCode::Unsupported,
-                    "operation capability was not negotiated",
-                )),
-                ..Default::default()
-            };
-            if !matches!(
-                tokio::time::timeout(
-                    options.timeout,
-                    send(
-                        &mut stream,
-                        wire::Frame {
-                            message: Some(wire::frame::Message::Response(response))
-                        }
-                    )
-                )
-                .await,
-                Ok(Some(()))
-            ) {
-                return;
-            }
-            continue;
         }
         let mutation = matches!(
             request.operation,
@@ -986,9 +943,7 @@ mod outcome_mapping_tests {
                 message: Some(wire::frame::Message::Hello(wire::Hello {
                     identity: "drain-client".into(),
                     challenge: vec![1; 32],
-                    min_version: CLIENT_PROTOCOL_VERSION,
-                    max_version: CLIENT_PROTOCOL_VERSION,
-                    capabilities: CLIENT_CAPABILITIES,
+                    protocol_version: CLIENT_PROTOCOL_VERSION,
                 })),
             },
         )

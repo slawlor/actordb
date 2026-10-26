@@ -22,15 +22,7 @@ impl client::Value {
     }
 }
 
-pub const CLIENT_PROTOCOL_VERSION: u32 = 3;
-pub const CLIENT_CAPABILITY_QUERY: u64 = 1;
-pub const CLIENT_CAPABILITY_SCAN: u64 = 2;
-pub const CLIENT_CAPABILITY_WRITE_CONCERNS: u64 = 4;
-pub const CLIENT_CAPABILITY_TABLES: u64 = 8;
-pub const CLIENT_CAPABILITIES: u64 = CLIENT_CAPABILITY_QUERY
-    | CLIENT_CAPABILITY_SCAN
-    | CLIENT_CAPABILITY_WRITE_CONCERNS
-    | CLIENT_CAPABILITY_TABLES;
+pub const CLIENT_PROTOCOL_VERSION: u32 = 4;
 pub const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_BATCH_ITEMS: usize = 4096;
 pub const MAX_HANDSHAKE_BYTES: usize = 4096;
@@ -46,14 +38,12 @@ pub fn client_auth_proof(
     use hmac::{KeyInit, Mac};
     let mut mac =
         hmac::Hmac::<sha2::Sha256>::new_from_slice(secret).expect("HMAC accepts any key size");
-    mac.update(b"actordb-client-proof-v1\0");
+    mac.update(b"actordb-client-proof-v4\0");
     mac.update(if dialer { b"client" } else { b"server" });
     for hello in [client, server] {
         mac.update(&(hello.identity.len() as u64).to_be_bytes());
         mac.update(hello.identity.as_bytes());
-        mac.update(&hello.min_version.to_be_bytes());
-        mac.update(&hello.max_version.to_be_bytes());
-        mac.update(&hello.capabilities.to_be_bytes());
+        mac.update(&hello.protocol_version.to_be_bytes());
         mac.update(&(hello.challenge.len() as u64).to_be_bytes());
         mac.update(&hello.challenge);
     }
@@ -90,9 +80,7 @@ pub fn valid_client_hello(hello: &client::Hello) -> bool {
         && hello.identity.len() <= 255
         && hello.challenge.len() == 32
         && hello.challenge.iter().any(|byte| *byte != 0)
-        && hello.min_version != 0
-        && hello.min_version <= CLIENT_PROTOCOL_VERSION
-        && hello.max_version >= CLIENT_PROTOCOL_VERSION
+        && hello.protocol_version == CLIENT_PROTOCOL_VERSION
 }
 
 /// Allocation-free protobuf preflight. Bounds repeated fields before Prost

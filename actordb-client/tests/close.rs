@@ -6,7 +6,7 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use actordb_client::{Client, ClientError, ClientOptions};
-use actordb_protocol::{client as wire, CLIENT_CAPABILITIES, CLIENT_PROTOCOL_VERSION};
+use actordb_protocol::{client as wire, CLIENT_PROTOCOL_VERSION};
 use prost::Message;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf};
 
@@ -85,9 +85,7 @@ async fn client() -> (Client, DuplexStream, Arc<State>) {
             wire::frame::Message::Hello(wire::Hello {
                 identity: "server".into(),
                 challenge: vec![1; 32],
-                min_version: CLIENT_PROTOCOL_VERSION,
-                max_version: CLIENT_PROTOCOL_VERSION,
-                capabilities: CLIENT_CAPABILITIES,
+                protocol_version: CLIENT_PROTOCOL_VERSION,
             }),
         )
         .await;

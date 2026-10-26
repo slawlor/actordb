@@ -58,7 +58,7 @@ use crate::proto::{
     BatchAck, BatchGet, BatchGetResponse, BatchKeyValue, BatchNack, BatchPut, Envelope,
     EnvelopeMsg, ForwardedGet, ForwardedPut, GetResponse, Hello, HelloAuth, KeySummary,
     MutationResponse, MutationResult, MutationStatus, Priority as ProtoPriority, ReconcileData,
-    ReconcileFetch, ReconcileResponse, ReplicationAckLevel, SyncEntry,
+    ReconcileEntry, ReconcileFetch, ReconcileResponse, ReplicationAckLevel,
 };
 use crate::replication::{
     spawn_node_sender, NodeSender, NodeSenderDrain, NodeSenderSendError, ReplicationAckDurability,
@@ -76,9 +76,8 @@ use crate::wire::{
     bytes_field_len, check_envelope_budget, check_record_budget, encode_envelope,
     message_field_len, preflight_envelope_decode, varint_field_len, BudgetedFrame, BudgetedPeerTx,
     NodePeerByteBudget, ReconcileGate, RepeatedFieldSizer, ANTI_ENTROPY_PAGE_BYTES,
-    MAX_FRAME_BYTES, MAX_RECONCILE_FETCH_KEYS, MAX_RECONCILE_PAGE_ITEMS, MAX_TRANSPORT_FRAME_BYTES,
-    MAX_WIRE_BATCH_ITEMS, MAX_WIRE_ERROR_BYTES, MAX_WIRE_NODE_ID_BYTES,
-    NODE_PEER_QUEUE_BYTE_CAPACITY,
+    MAX_FRAME_BYTES, MAX_RECONCILE_FETCH_KEYS, MAX_RECONCILE_PAGE_ITEMS, MAX_WIRE_BATCH_ITEMS,
+    MAX_WIRE_ERROR_BYTES, MAX_WIRE_NODE_ID_BYTES, NODE_PEER_QUEUE_BYTE_CAPACITY,
 };
 
 pub use crate::wire::PeerWriterDiagnostics;
@@ -122,14 +121,11 @@ use placement::{placement_driver, PlacementDriverDeps, BOOTSTRAP_TIMEOUT};
 pub mod drain;
 mod drain_persistence;
 pub mod peer_authority;
-mod peer_frame;
 use peer_authority::PeerAuthority;
 pub use peer_authority::{
-    AuthorizedPeerGeneration, PeerAuthorityOptions, PeerAuthoritySnapshot, PeerCredential,
-    PeerFenceError, PeerFenceOptions, PeerFencePhase, PeerFenceReport, PeerFenceStage,
-    PeerFenceStatus, PeerIdentity,
+    AuthorizedPeerGeneration, PeerAuthorityOptions, PeerAuthoritySnapshot, PeerFenceError,
+    PeerFenceOptions, PeerFencePhase, PeerFenceReport, PeerFenceStage, PeerFenceStatus,
 };
-use peer_frame::{FrameSigningState, FrameVerifier};
 mod lifecycle;
 pub use drain::{
     DrainCutoff, DrainDiagnostics, DrainDurability, DrainError, DrainOptions, DrainPhase,
@@ -182,64 +178,15 @@ pub use recovery::RecoveryOptions;
 pub mod scan;
 pub use scan::{ScanError, MAX_SCAN_TOTAL_MATCHES};
 
-/// Current peer wire protocol version. Hello ranges must include this value.
-/// Version 5 carries independent physical/logical record timestamps and the
-/// 0.8 logical-table rollout. Older
-/// peers cannot preserve their ordering and are rejected during negotiation.
-/// It retains v3 byte-bounded, cursor-correlated reconciliation.
-pub const WIRE_PROTOCOL_VERSION: u32 = 5;
-/// The peer returns exact forwarded-mutation outcomes.
-pub const CAPABILITY_MUTATION_RESULTS: u64 = 1 << 0;
-/// Replication ACKs carry an explicit receiver durability fence.
-pub const CAPABILITY_DURABILITY_ACKS: u64 = 1 << 1;
-/// Reconciliation frames carry session/round/chunk correlation.
-pub const CAPABILITY_CORRELATED_RECONCILIATION: u64 = 1 << 2;
-/// The handshake uses independent fresh challenges and mutual transcript
-/// proofs before publishing either side of a connection.
-pub const CAPABILITY_CHALLENGE_AUTH: u64 = 1 << 3;
-/// Anti-entropy uses stable cursor pages with exact encoded-byte bounds.
-pub const CAPABILITY_PAGED_ANTI_ENTROPY: u64 = 1 << 4;
-/// Aggregate batch requests and replies are exact-byte-bounded. Batch-get
-/// replies may contain an ordered prefix that the caller resumes explicitly.
-pub const CAPABILITY_BYTE_BOUNDED_BATCHES: u64 = 1 << 5;
-/// Replication ACKs can report an explicit stable-storage fence independently
-/// of ordinary store-commit policy.
-pub const CAPABILITY_STABLE_DURABILITY_ACKS: u64 = 1 << 6;
-/// Optional distributed scan support.
-pub const CAPABILITY_SCAN: u64 = 1 << 7;
-/// Optional revision-guarded, bounded SQL query pages.
-pub const CAPABILITY_QUERY_PAGES: u64 = 1 << 8;
-/// Optional durable-record metadata columns in SQL query pages.
-pub const CAPABILITY_QUERY_METADATA: u64 = 1 << 12;
-/// Forwarded writes carry explicit acknowledgement policy and progress.
-pub const CAPABILITY_WRITE_CONCERNS: u64 = 1 << 9;
-/// Summaries carry content digests and reject equal-version divergent contents.
-pub const CAPABILITY_RECORD_CONTENT_DIGEST: u64 = 1 << 10;
-/// Mutation replies preserve uncertain outcomes instead of definite rejection.
-pub const CAPABILITY_TYPED_UNKNOWN_MUTATION: u64 = 1 << 11;
-/// Replicated records carry the deterministic logical-table namespace used by
-/// the 0.8 shared-node table views.
-pub const CAPABILITY_TABLE_NAMESPACES: u64 = 1 << 13;
-/// Per-process credentials authenticate generations and every session frame.
-pub const CAPABILITY_AUTHENTICATED_PEER_GENERATIONS: u64 = 1 << 14;
-/// Capabilities required by this binary before it installs a peer connection.
-pub const REQUIRED_WIRE_CAPABILITIES: u64 = CAPABILITY_MUTATION_RESULTS
-    | CAPABILITY_DURABILITY_ACKS
-    | CAPABILITY_CORRELATED_RECONCILIATION
-    | CAPABILITY_CHALLENGE_AUTH
-    | CAPABILITY_PAGED_ANTI_ENTROPY
-    | CAPABILITY_BYTE_BOUNDED_BATCHES
-    | CAPABILITY_STABLE_DURABILITY_ACKS
-    | CAPABILITY_WRITE_CONCERNS
-    | CAPABILITY_RECORD_CONTENT_DIGEST
-    | CAPABILITY_TYPED_UNKNOWN_MUTATION
-    | CAPABILITY_TABLE_NAMESPACES;
+/// Exact peer wire protocol version. Every current feature is mandatory;
+/// older and newer versions are rejected rather than negotiated.
+pub const WIRE_PROTOCOL_VERSION: u32 = 6;
 
 /// Outbound queue depth per peer connection.
 const PEER_CHANNEL_DEPTH: usize = 256;
 /// Encoded bytes admitted to one peer's writer pipeline, including the frame
 /// currently blocked on the socket.
-const PEER_CHANNEL_BYTE_CAPACITY: usize = 2 * MAX_TRANSPORT_FRAME_BYTES;
+const PEER_CHANNEL_BYTE_CAPACITY: usize = 2 * MAX_FRAME_BYTES;
 /// Bound control preference so sustained replies cannot starve ordinary RPC
 /// and replication traffic on the shared socket.
 const PEER_RESPONSE_BURST_LIMIT: usize = 16;
@@ -247,9 +194,8 @@ const PEER_RESPONSE_BURST_LIMIT: usize = 16;
 /// response can still enter the priority lane under load. Most aggregate
 /// responses target one MiB, but one individually valid record may approach
 /// the hard frame limit.
-const PEER_RESPONSE_BYTE_RESERVE: usize = MAX_TRANSPORT_FRAME_BYTES;
-const MIN_PEER_CHANNEL_BYTE_CAPACITY: usize =
-    MAX_TRANSPORT_FRAME_BYTES + PEER_RESPONSE_BYTE_RESERVE;
+const PEER_RESPONSE_BYTE_RESERVE: usize = MAX_FRAME_BYTES;
+const MIN_PEER_CHANNEL_BYTE_CAPACITY: usize = MAX_FRAME_BYTES + PEER_RESPONSE_BYTE_RESERVE;
 /// Soft encoded-byte target for aggregate request and response frames. One
 /// individually valid item may exceed this target up to `MAX_FRAME_BYTES`.
 const WIRE_BATCH_PAGE_BYTES: usize = ANTI_ENTROPY_PAGE_BYTES;
@@ -268,7 +214,7 @@ const INBOUND_CONNECTION_CAPACITY: usize = 1024;
 /// Node-wide raw receive bodies, including handshakes and outbound-dialed
 /// connections. Four maximum frames fit without allowing the socket count to
 /// multiply incomplete-body allocations into gigabytes.
-const RECEIVE_BYTE_CAPACITY: usize = 4 * MAX_TRANSPORT_FRAME_BYTES;
+const RECEIVE_BYTE_CAPACITY: usize = 4 * MAX_FRAME_BYTES;
 const RELAY_CAPACITY: usize = 1024;
 const RELAY_KEY_BYTE_CAPACITY: usize = 64 * 1024 * 1024;
 /// Total budget for both flights of the peer handshake.
@@ -923,10 +869,7 @@ fn validate_batch_get_results(
     Ok(())
 }
 
-fn validate_legacy_get_response(
-    expected_key: &str,
-    response: &GetResponse,
-) -> Result<(), NodeError> {
+fn validate_get_response(expected_key: &str, response: &GetResponse) -> Result<(), NodeError> {
     if response.shed {
         if response.found
             || !response.value.is_empty()
@@ -1269,7 +1212,6 @@ pub struct Node {
     /// Compatibility counter for the retired full-state sync protocol.
     /// Protocol v3 leaves it at zero; sender reconciliation metrics report
     /// anti-entropy progress.
-    sync_entries_applied: Arc<AtomicU64>,
     /// Coalesced wakeup for the placement driver on membership change (Phase 8).
     membership_tx: Option<watch::Sender<u64>>,
     /// Pre-shared cluster secret for the challenge-bound Hello transcript proof.
@@ -1411,7 +1353,7 @@ impl NodeRuntimeOptions {
     }
     /// Set aggregate encoded-body admission across every physical peer writer.
     /// Default 256 MiB; minimum 32 MiB + 144 bytes. Ordinary producers leave one maximum
-    /// 16 MiB + 72-byte signed priority response reserved across the Node. This does not include
+    /// 16 MiB priority response reserved across the Node. This does not include
     /// protobuf objects, frame/task overhead, caches, or kernel socket buffers.
     pub fn with_node_peer_queue_byte_capacity(mut self, capacity: usize) -> Self {
         self.node_peer_queue_byte_capacity = capacity;
@@ -1556,8 +1498,8 @@ impl NodeRuntimeOptions {
     /// Set retained decoded read-key bytes per priority across this Node.
     /// Charges String buffer capacities and Vec/String allocation headers.
     /// This budget is separate from raw receive bodies, returned values, and
-    /// per-connection encoded writer queues. The minimum is 16 MiB + 72 bytes
-    /// so one maximum signed physical body always fits.
+    /// per-connection encoded writer queues. The minimum is 16 MiB so one
+    /// maximum physical body always fits.
     pub fn with_serving_read_key_byte_capacity(mut self, capacity: usize) -> Self {
         self.serving_read_key_byte_capacity = capacity;
         self
@@ -1900,7 +1842,7 @@ impl NodeRuntimeOptions {
                 "peer queue frame capacity must be at least 2".to_string(),
             ));
         }
-        if self.node_peer_queue_byte_capacity < 2 * MAX_TRANSPORT_FRAME_BYTES
+        if self.node_peer_queue_byte_capacity < 2 * MAX_FRAME_BYTES
             || self.node_peer_queue_byte_capacity > u32::MAX as usize
             || self.node_peer_queue_byte_capacity > Semaphore::MAX_PERMITS
         {
@@ -1921,9 +1863,9 @@ impl NodeRuntimeOptions {
                 "inbound connection capacity must be non-zero".to_string(),
             ));
         }
-        if self.receive_byte_capacity < MAX_TRANSPORT_FRAME_BYTES {
+        if self.receive_byte_capacity < MAX_FRAME_BYTES {
             return Err(NodeError::Actor(format!(
-                "receive byte capacity must be at least {MAX_TRANSPORT_FRAME_BYTES}"
+                "receive byte capacity must be at least {MAX_FRAME_BYTES}"
             )));
         }
         if self.receive_byte_capacity > tokio::sync::Semaphore::MAX_PERMITS {
@@ -2134,7 +2076,7 @@ pub struct NodeConfig {
     #[builder(default = Duration::from_secs(300))]
     pub max_clock_skew: Duration,
     /// Pre-shared secret for mutual HMAC proofs over both peers' fresh
-    /// challenges, identities, protocol ranges, capabilities, and connection
+    /// challenges, identities, exact protocol versions, and connection
     /// roles. A captured handshake cannot be replayed against a new challenge.
     /// This is cluster-wide membership authentication, not per-node keys, and
     /// plaintext TCP still provides neither confidentiality nor integrity for
@@ -3302,13 +3244,6 @@ impl Node {
     pub async fn peer_count(&self) -> usize {
         self.peers.lock().await.len()
     }
-
-    /// Compatibility counter for the retired `SyncResponse` protocol.
-    /// Protocol v3 uses correlated reconciliation for every placement mode,
-    /// so this always remains zero.
-    pub fn sync_entries_applied(&self) -> u64 {
-        self.sync_entries_applied.load(Ordering::Relaxed)
-    }
 }
 
 #[cfg(test)]
@@ -4032,7 +3967,7 @@ mod tests {
                 .is_err());
         }
         assert!(NodeRuntimeOptions::default()
-            .with_receive_byte_capacity(MAX_TRANSPORT_FRAME_BYTES)
+            .with_receive_byte_capacity(MAX_FRAME_BYTES)
             .validate()
             .is_ok());
         assert!(NodeRuntimeOptions::default()
@@ -4066,41 +4001,16 @@ mod tests {
     }
 
     #[test]
-    fn clock_only_v4_peer_is_rejected_before_digest_reconciliation() {
-        let mut hello = Hello {
-            node_id: "peer".into(),
-            auth_tag: Vec::new(),
-            min_protocol_version: WIRE_PROTOCOL_VERSION,
-            max_protocol_version: WIRE_PROTOCOL_VERSION,
-            capabilities: REQUIRED_WIRE_CAPABILITIES,
-            challenge: vec![1; HANDSHAKE_CHALLENGE_BYTES],
-            process_generation: 0,
-        };
+    fn peer_hello_requires_exact_current_protocol() {
+        let mut hello = fresh_hello("peer").unwrap();
         assert_eq!(validate_peer_hello("local", Some("peer"), &hello), Ok(()));
-        hello.capabilities &= !CAPABILITY_RECORD_CONTENT_DIGEST;
-        assert_eq!(
-            validate_peer_hello("local", Some("peer"), &hello),
-            Err("peer omitted required wire capabilities")
-        );
-    }
-
-    #[test]
-    fn v4_peer_without_typed_unknown_outcomes_is_rejected_at_hello() {
-        let mut hello = Hello {
-            node_id: "peer".into(),
-            auth_tag: Vec::new(),
-            min_protocol_version: WIRE_PROTOCOL_VERSION,
-            max_protocol_version: WIRE_PROTOCOL_VERSION,
-            capabilities: REQUIRED_WIRE_CAPABILITIES,
-            challenge: vec![1; HANDSHAKE_CHALLENGE_BYTES],
-            process_generation: 0,
-        };
-        assert_eq!(validate_peer_hello("local", Some("peer"), &hello), Ok(()));
-        hello.capabilities &= !CAPABILITY_TYPED_UNKNOWN_MUTATION;
-        assert_eq!(
-            validate_peer_hello("local", Some("peer"), &hello),
-            Err("peer omitted required wire capabilities")
-        );
+        for version in (0..WIRE_PROTOCOL_VERSION).chain([WIRE_PROTOCOL_VERSION + 1]) {
+            hello.protocol_version = version;
+            assert_eq!(
+                validate_peer_hello("local", Some("peer"), &hello),
+                Err("peer must use the exact current wire protocol version"),
+            );
+        }
     }
 
     #[tokio::test]
@@ -4425,7 +4335,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_get_response_shapes_fail_closed() {
+    fn scalar_get_response_shapes_fail_closed() {
         let not_found = GetResponse {
             req_id: 1,
             found: false,
@@ -4437,7 +4347,7 @@ mod tests {
             is_tombstone: false,
             shed: false,
         };
-        assert!(validate_legacy_get_response("key", &not_found).is_ok());
+        assert!(validate_get_response("key", &not_found).is_ok());
 
         let found = GetResponse {
             found: true,
@@ -4447,13 +4357,13 @@ mod tests {
             node_id: "owner".to_string(),
             ..not_found.clone()
         };
-        assert!(validate_legacy_get_response("key", &found).is_ok());
+        assert!(validate_get_response("key", &found).is_ok());
 
         let shed = GetResponse {
             shed: true,
             ..not_found.clone()
         };
-        assert!(validate_legacy_get_response("key", &shed).is_ok());
+        assert!(validate_get_response("key", &shed).is_ok());
 
         for malformed in [
             GetResponse {
@@ -4475,7 +4385,7 @@ mod tests {
                 ..not_found
             },
         ] {
-            assert!(validate_legacy_get_response("key", &malformed).is_err());
+            assert!(validate_get_response("key", &malformed).is_err());
         }
     }
 

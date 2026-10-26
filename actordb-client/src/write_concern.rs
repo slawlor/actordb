@@ -138,11 +138,6 @@ impl Client {
             ),
             _ => unreachable!("single mutation concern request"),
         };
-        if self.inner.capabilities & actordb_protocol::CLIENT_CAPABILITY_WRITE_CONCERNS == 0 {
-            return Err(WriteConcernClientError::Unsupported(
-                "server did not negotiate write concerns".into(),
-            ));
-        }
         let mut response = self
             .request_with_timeout(operation, true, options.timeout())
             .await?;

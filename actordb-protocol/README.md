@@ -1,37 +1,40 @@
 # ActorDB protocol
 
-<p align="center">
-  <img src="https://raw.githubusercontent.com/slawlor/actordb/main/docs/assets/actordb-logo-draft.svg" alt="ActorDB distributed Ferris graph" width="360">
-</p>
+`proto/meta.proto` is the canonical peer schema. Peer protocol 6 and application
+protocol 4 require an exact current version; there are no negotiated capability
+bits, downgrade paths, or compatibility message bindings. The standalone
+`actordb-protocol` crate provides the public Rust bindings. Bindings are committed
+so normal consumers do not compile protobuf or RocksDB.
 
-`proto/meta.proto` is the canonical peer schema, preserving all existing message
-numbers. The standalone `actordb-protocol` crate is the supported public Rust
-binding for compatible peers and SDKs; `actordb::proto` is only a hidden
-compatibility reexport. Peer protocol v5 remains separate from
-`proto/client.proto`, application protocol v3. Rust bindings are committed so
-normal client builds do not compile protobuf or RocksDB.
+Regenerate or check the packaged schemas:
 
-Regenerate bindings:
-
-```
+```sh
 cargo run -p actordb-protocol --features codegen --bin generate
 cargo run -p actordb-protocol --features codegen --bin generate -- --check
 ```
 
-The optional `codegen` feature builds bundled protoc through `protobuf-src` 2.1
-and requires CMake and a C/C++ toolchain. It is unnecessary for consumers.
-Other language SDKs should generate bindings from these packaged schemas.
-Integers in query cells are canonical signed decimal
-strings, preserving i128 precision. Keys are UTF-8 strings; values are arbitrary
-bytes. Framing is a four-byte big-endian body length, capped at 16 MiB.
+The optional `codegen` feature builds bundled protoc and requires CMake and a
+C/C++ toolchain. Other language SDKs should generate from these schemas.
 
-Application Hello/Auth negotiate version and optional capabilities before requests.
-Application requests must carry a logical `table` name. Named tables reuse the
-same listener while isolating their key, cache, query, and durable namespaces;
-an empty table is rejected as an invalid request.
-Challenge proofs use `actordb-client-proof-v1\0`, proving role, and both ordered
-Hello offers; they are independent of peer credentials and membership. Byte
-lengths are u64 big-endian, versions u32 big-endian, capabilities u64 big-endian.
-Unknown operations must fail explicitly. Never recycle retired field numbers or
-silently change enum/absence meanings. New peer scan/query messages require their
-negotiated capability bits before sending to old v3 nodes.
+Framing is a four-byte big-endian body length followed by a single protobuf
+frame, capped at 16 MiB. Values are arbitrary bytes; keys are UTF-8. Query integer
+cells use canonical decimal strings to preserve i128 precision. Paginated
+reconciliation, bounded batches, scalar RPCs, tables, scans, queries, and
+durability acknowledgements are current mandatory contracts.
+
+Application requests require a logical `table` name. Empty tables and unknown
+operations are rejected explicitly. Never reuse reserved field numbers or
+silently alter enum/absence meanings.
+
+Application Hello contains identity, fresh challenge, and exact version.
+The optional shared-secret proof uses HMAC-SHA256 over
+`actordb-client-proof-v4\0`, proving role (`client` or `server`), and both
+ordered Hellos: identity length (u64), identity bytes, exact version (u32),
+challenge length (u64), and challenge bytes. Integers are big-endian.
+Application and peer proofs use distinct domains. See
+[peer generation fencing](../docs/peer-authority.md) for the peer transcript and
+the operational-versus-transport authentication boundary.
+
+Transport trust, TLS verification, and credential revocation belong to the
+application. A shared-secret handshake alone does not protect post-handshake
+plaintext frames.

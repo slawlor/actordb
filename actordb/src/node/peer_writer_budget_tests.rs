@@ -7,7 +7,7 @@ use std::task::{Context, Poll};
 use tokio::sync::Notify;
 
 use super::*;
-use crate::wire::MAX_TRANSPORT_FRAME_BYTES as MAX_FRAME_BYTES;
+use crate::wire::MAX_FRAME_BYTES;
 
 fn envelope() -> Envelope {
     Envelope {
@@ -192,7 +192,6 @@ async fn writer_cancel_and_abort_release_queued_and_active_global_body_permits()
                 entered: entered.clone(),
             },
             PeerWriterPipeline {
-                frame_auth: None,
                 data_rx: data,
                 response_rx: responses,
                 byte_budget: a.outbound.byte_budget.clone(),
@@ -249,19 +248,18 @@ fn aggregate_writer_budget_validation_rejects_impossible_limits() {
 }
 
 #[tokio::test]
-async fn signed_producer_and_response_charge_integrity_header_until_queue_release() {
+async fn producer_and_response_charge_encoded_body_until_queue_release() {
     let budget = NodePeerByteBudget::new(2 * MAX_FRAME_BYTES);
-    let (mut channel, mut data, mut responses) = peer(&budget);
-    channel.outbound.frame_overhead = 72;
+    let (channel, mut data, mut responses) = peer(&budget);
     let bytes = envelope().encoded_len();
     assert!(try_send_envelope(&channel, envelope()).await);
     assert!(try_send_envelope_immediate(&channel, envelope()));
-    assert_eq!(budget.diagnostics().admitted_bytes(), 2 * (bytes + 72));
-    assert_eq!(budget.diagnostics().producer_admitted_bytes(), bytes + 72);
+    assert_eq!(budget.diagnostics().admitted_bytes(), 2 * (bytes));
+    assert_eq!(budget.diagnostics().producer_admitted_bytes(), bytes);
     let frame = data.recv().await.unwrap();
     assert_eq!(frame.len(), bytes);
     drop(frame);
-    assert_eq!(budget.diagnostics().admitted_bytes(), bytes + 72);
+    assert_eq!(budget.diagnostics().admitted_bytes(), bytes);
     drop(responses.recv().await.unwrap());
     assert_eq!(budget.diagnostics().admitted_bytes(), 0);
 }

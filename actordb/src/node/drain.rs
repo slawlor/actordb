@@ -825,7 +825,7 @@ mod tests {
                     chunk_seq: fetch.chunk_seq,
                     page_seq: 0,
                     done: true,
-                    entries: vec![SyncEntry {
+                    entries: vec![ReconcileEntry {
                         key,
                         value: value.value,
                         timestamp_ms: 1,

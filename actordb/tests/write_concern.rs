@@ -235,7 +235,7 @@ async fn nonlocal_concern_requires_configured_replicas_before_application() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[tracing_test::traced_test]
 async fn forwarded_concern_accepts_replication_ack_on_the_same_peer_connection() {
-    use actordb::node::{REQUIRED_WIRE_CAPABILITIES, WIRE_PROTOCOL_VERSION};
+    use actordb::node::WIRE_PROTOCOL_VERSION;
     use actordb_protocol::meta::{
         envelope::Msg as EnvelopeMsg, Envelope, ForwardedPut, Hello, HelloAuth, ReplicationAckLevel,
     };
@@ -264,12 +264,9 @@ async fn forwarded_concern_accepts_replication_ack_on_the_same_peer_connection()
         Envelope {
             msg: Some(EnvelopeMsg::Hello(Hello {
                 node_id: plan.ids[1].clone(),
-                min_protocol_version: WIRE_PROTOCOL_VERSION,
-                max_protocol_version: WIRE_PROTOCOL_VERSION,
-                capabilities: REQUIRED_WIRE_CAPABILITIES,
+                protocol_version: WIRE_PROTOCOL_VERSION,
                 challenge: vec![1; 32],
                 process_generation: 0,
-                auth_tag: vec![],
             })),
         },
     )

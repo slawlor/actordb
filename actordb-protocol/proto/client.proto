@@ -6,9 +6,10 @@ import "meta.proto";
 message Hello {
   string identity = 1;
   bytes challenge = 2;
-  uint32 min_version = 3;
-  uint32 max_version = 4;
-  uint64 capabilities = 5;
+  reserved 4, 5;
+  reserved "min_version", "max_version", "capabilities";
+  // Exact application protocol version; older and newer binaries fail closed.
+  uint32 protocol_version = 3;
 }
 message Auth { bytes proof = 1; }
 message Frame {
@@ -94,7 +95,8 @@ message FragmentHealth {
   uint64 worker_count = 2;
   repeated string worker_names = 3;
   map<string, uint64> restarts = 4;
-  uint64 last_reaped = 5;
+  reserved 5;
+  reserved "last_reaped";
   uint64 shed_high = 6;
   uint64 shed_default = 7;
   uint64 shed_background = 8;

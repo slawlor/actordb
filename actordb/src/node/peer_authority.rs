@@ -1,153 +1,56 @@
 // Copyright (c) Sean Lawlor
 // Licensed under the MIT license in the repository root.
 
-//! Authenticated process generation authority and hot receiver fencing.
+//! Operational process generation allowlists and hot receiver fencing.
 //!
-//! Credentials and generation allocation belong to the application. A fence
-//! retires this receiver's sessions and joins their actual owned work; it does
-//! not establish consensus, revoke credentials at other receivers, or elect a
-//! writer. Historical record writer IDs remain independent of session trust.
+//! Generation allocation belongs to the application. A fence retires this
+//! receiver's sessions and joins their actual owned work; it establishes neither
+//! consensus nor cryptographic process ownership. TLS/shared-secret credential
+//! revocation must exclude a process that can otherwise claim an allowed ID and
+//! generation. Historical record writer IDs remain independent of session trust.
 
 use super::*;
-use ring::signature::{Ed25519KeyPair, KeyPair, UnparsedPublicKey, ED25519};
 
-/// Public-key tombstones are retained for the receiver's whole lifetime.
-/// Exhaustion rejects new keys before closing admission; no entry is evicted.
-pub const MAX_HISTORICAL_PEER_KEYS: usize = 65_536;
-
-/// One externally allocated process generation and its independent random key.
-#[derive(Clone, PartialEq, Eq)]
-pub struct PeerCredential {
-    generation: u64,
-    signing_seed: [u8; 32],
-}
-impl std::fmt::Debug for PeerCredential {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PeerCredential")
-            .field("generation", &self.generation)
-            .field("secret", &"[REDACTED]")
-            .finish()
-    }
-}
-impl PeerCredential {
-    /// Supply 32 independently generated random seed bytes. Generation
-    /// must be nonzero; replacing a process requires a fresh key and generation.
-    pub fn new(generation: u64, signing_seed: [u8; 32]) -> Self {
-        Self {
-            generation,
-            signing_seed,
-        }
-    }
-    pub fn generation(&self) -> u64 {
-        self.generation
-    }
-    /// Distribute only this public identity to verifying peers. Never share
-    /// the process signing seed with another process or retired instance.
-    pub fn public_identity(&self) -> PeerIdentity {
-        let pair =
-            Ed25519KeyPair::from_seed_unchecked(&self.signing_seed).expect("32-byte Ed25519 seed");
-        PeerIdentity {
-            generation: self.generation,
-            public_key: pair
-                .public_key()
-                .as_ref()
-                .try_into()
-                .expect("32-byte public key"),
-        }
-    }
-    pub(super) fn sign(&self, prover_is_dialer: bool, dialer: &Hello, listener: &Hello) -> Vec<u8> {
-        Ed25519KeyPair::from_seed_unchecked(&self.signing_seed)
-            .expect("32-byte Ed25519 seed")
-            .sign(&proof_bytes(prover_is_dialer, dialer, listener))
-            .as_ref()
-            .to_vec()
-    }
-}
-
-/// Expected public identity of one externally authorized process generation.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PeerIdentity {
-    generation: u64,
-    public_key: [u8; 32],
-}
-impl PeerIdentity {
-    pub fn new(generation: u64, public_key: [u8; 32]) -> Self {
-        Self {
-            generation,
-            public_key,
-        }
-    }
-    pub fn generation(&self) -> u64 {
-        self.generation
-    }
-    pub fn public_key(&self) -> &[u8; 32] {
-        &self.public_key
-    }
-    pub(super) fn verify(
-        &self,
-        prover_is_dialer: bool,
-        dialer: &Hello,
-        listener: &Hello,
-        proof: &[u8],
-    ) -> bool {
-        UnparsedPublicKey::new(&ED25519, &self.public_key)
-            .verify(&proof_bytes(prover_is_dialer, dialer, listener), proof)
-            .is_ok()
-    }
-}
-fn proof_bytes(prover_is_dialer: bool, dialer: &Hello, listener: &Hello) -> Vec<u8> {
-    let mut bytes = b"actordb-process-generation-signature-v1\0".to_vec();
-    bytes.extend_from_slice(if prover_is_dialer {
-        b"dialer"
-    } else {
-        b"listener"
-    });
-    bytes.extend_from_slice(&super::connection::handshake_transcript(dialer, listener));
-    bytes
-}
-
-/// Local proof key and exact authorized remote identities/process keys.
-/// All keys must be distinct. Sharing keys would allow one process to claim
-/// another identity, so it is rejected. Debug output never includes signing seeds.
+/// Exact local generation and permitted remote process generations.
+/// Generations are cooperative identifiers, not credentials. Transport trust and
+/// credential revocation belong to the application's TLS/network configuration.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PeerAuthorityOptions {
-    local: PeerCredential,
-    peers: HashMap<String, PeerIdentity>,
+    local_generation: u64,
+    peers: HashMap<String, u64>,
 }
 impl PeerAuthorityOptions {
-    pub fn new(local: PeerCredential, peers: HashMap<String, PeerIdentity>) -> Self {
-        Self { local, peers }
+    pub fn new(local_generation: u64, peers: HashMap<String, u64>) -> Self {
+        Self {
+            local_generation,
+            peers,
+        }
     }
     pub fn local_generation(&self) -> u64 {
-        self.local.generation
+        self.local_generation
     }
-    pub fn local_public_identity(&self) -> PeerIdentity {
-        self.local.public_identity()
-    }
-    /// Expected public identities; contains no peer signing secrets.
-    pub fn peer_identities(&self) -> &HashMap<String, PeerIdentity> {
+    pub fn peer_generations(&self) -> &HashMap<String, u64> {
         &self.peers
     }
-    pub fn with_peer(mut self, id: impl Into<String>, identity: PeerIdentity) -> Self {
-        self.peers.insert(id.into(), identity);
+    pub fn with_peer(mut self, id: impl Into<String>, generation: u64) -> Self {
+        self.peers.insert(id.into(), generation);
         self
     }
     pub fn without_peer(mut self, id: &str) -> Self {
         self.peers.remove(id);
         self
     }
-    pub fn with_local_credential(mut self, local: PeerCredential) -> Self {
-        self.local = local;
+    pub fn with_local_generation(mut self, generation: u64) -> Self {
+        self.local_generation = generation;
         self
     }
-    /// Exact expected peer generations. Returned values contain no credentials.
-    pub fn peer_generations(&self) -> Vec<AuthorizedPeerGeneration> {
+    fn authorized_peers(&self) -> Vec<AuthorizedPeerGeneration> {
         let mut peers: Vec<_> = self
             .peers
             .iter()
-            .map(|(id, credential)| AuthorizedPeerGeneration {
+            .map(|(id, generation)| AuthorizedPeerGeneration {
                 peer_id: id.clone(),
-                generation: credential.generation,
+                generation: *generation,
             })
             .collect();
         peers.sort_by(|a, b| a.peer_id.cmp(&b.peer_id));
@@ -157,18 +60,8 @@ impl PeerAuthorityOptions {
         if self.peers.len() > 1024 {
             return Err("peer authority supports at most 1024 authorized peers".into());
         }
-        let mut keys = HashSet::new();
-        let local = self.local.public_identity();
-        for identity in std::iter::once(&local).chain(self.peers.values()) {
-            if identity.generation == 0 || identity.public_key.iter().all(|byte| *byte == 0) {
-                return Err(
-                    "peer identities require nonzero generations and valid 32-byte public keys"
-                        .into(),
-                );
-            }
-            if !keys.insert(&identity.public_key) {
-                return Err("each process must have an independent peer signing key".into());
-            }
+        if self.local_generation == 0 || self.peers.values().any(|generation| *generation == 0) {
+            return Err("configured process generations must be nonzero".into());
         }
         if self
             .peers
@@ -213,17 +106,16 @@ pub enum PeerFenceStage {
     Blocked,
 }
 
-/// Public cryptographic identity of this receiver's exact configured cohort.
-/// Keys here verify signatures; they do not grant signing authority. A local
-/// revision is scoped to one receiver process, not an external membership epoch.
+/// Exact operational generation policy captured at this receiver.
+/// A local revision is scoped to one receiver process, not an external epoch.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PeerAuthoritySnapshot {
     receiver_id: String,
     node_boot_id: u64,
     revision: u64,
     phase: PeerFencePhase,
-    local: PeerIdentity,
-    peers: HashMap<String, PeerIdentity>,
+    local_generation: u64,
+    peers: HashMap<String, u64>,
 }
 impl PeerAuthoritySnapshot {
     pub fn node_boot_id(&self) -> u64 {
@@ -238,10 +130,10 @@ impl PeerAuthoritySnapshot {
     pub fn phase(&self) -> PeerFencePhase {
         self.phase
     }
-    pub fn local_public_identity(&self) -> &PeerIdentity {
-        &self.local
+    pub fn local_generation(&self) -> u64 {
+        self.local_generation
     }
-    pub fn peer_identities(&self) -> &HashMap<String, PeerIdentity> {
+    pub fn peer_generations(&self) -> &HashMap<String, u64> {
         &self.peers
     }
 }
@@ -270,7 +162,6 @@ pub struct PeerFenceStatus {
     completed_frames: u64,
     rejected_frames: u64,
     rejected_handshakes: u64,
-    historical_key_count: usize,
 }
 impl PeerFenceStatus {
     pub fn phase(&self) -> PeerFencePhase {
@@ -300,8 +191,8 @@ impl PeerFenceStatus {
     pub fn pending_authorized_peers(&self) -> Option<&[AuthorizedPeerGeneration]> {
         self.pending_authorized_peers.as_deref()
     }
-    /// Configured peers without a current eligible live session. Empty in
-    /// legacy mode, where expected membership is not configured by this API.
+    /// Configured peers without a current eligible live session. Empty when
+    /// this API does not configure an expected membership.
     pub fn missing_peers(&self) -> &[String] {
         &self.missing_peers
     }
@@ -315,8 +206,8 @@ impl PeerFenceStatus {
     pub fn blocking_error(&self) -> Option<&str> {
         self.blocking_error.as_deref()
     }
-    /// Cumulative session frame admissions before protobuf decoding. Process
-    /// sessions first verify integrity; terminal codec errors still release
+    /// Cumulative session frame admissions before protobuf decoding.
+    /// Terminal codec errors still release
     /// their admission ownership and are included in completion counts.
     pub fn accepted_frames(&self) -> u64 {
         self.accepted_frames
@@ -330,12 +221,6 @@ impl PeerFenceStatus {
     }
     pub fn rejected_handshakes(&self) -> u64 {
         self.rejected_handshakes
-    }
-    pub fn historical_key_count(&self) -> usize {
-        self.historical_key_count
-    }
-    pub fn historical_key_limit(&self) -> usize {
-        MAX_HISTORICAL_PEER_KEYS
     }
 }
 
@@ -391,8 +276,8 @@ impl PeerFenceReport {
     pub fn authorized_peers(&self) -> &[AuthorizedPeerGeneration] {
         &self.authorized_peers
     }
-    /// Exact completed policy, including public keys for external manifest
-    /// qualification. Check current Node authority separately before activation.
+    /// Exact completed generation policy for external manifest qualification.
+    /// Check current Node authority separately before activation.
     pub fn public_authority(&self) -> &PeerAuthoritySnapshot {
         &self.public_authority
     }
@@ -452,29 +337,7 @@ impl AuthorityEra {
     pub(super) fn local_generation(&self) -> u64 {
         self.options
             .as_ref()
-            .map_or(0, |options| options.local.generation)
-    }
-    pub(super) fn frame_signer(
-        &self,
-        role: bool,
-        dialer: &Hello,
-        listener: &Hello,
-    ) -> Option<super::peer_frame::FrameSigner> {
-        self.options.as_ref().map(|options| {
-            super::peer_frame::FrameSigner::new(&options.local.signing_seed, role, dialer, listener)
-        })
-    }
-    pub(super) fn frame_verifier(
-        &self,
-        peer: &Hello,
-        role: bool,
-        dialer: &Hello,
-        listener: &Hello,
-    ) -> Option<FrameVerifier> {
-        self.expected_identity(peer)
-            .ok()
-            .flatten()
-            .map(|identity| FrameVerifier::new(identity.public_key, role, dialer, listener))
+            .map_or(0, PeerAuthorityOptions::local_generation)
     }
     fn public_snapshot(
         &self,
@@ -487,62 +350,37 @@ impl AuthorityEra {
             node_boot_id,
             revision: self.revision,
             phase,
-            local: options.local.public_identity(),
+            local_generation: options.local_generation,
             peers: options.peers.clone(),
         })
     }
-    fn expected_identity(&self, peer: &Hello) -> Result<Option<&PeerIdentity>, ()> {
+    pub(super) fn accepts(&self, peer: &Hello) -> bool {
         match &self.options {
-            None if peer.process_generation == 0 => Ok(None),
-            None => Err(()),
-            Some(options) => options
-                .peers
-                .get(&peer.node_id)
-                .filter(|credential| {
-                    credential.generation == peer.process_generation
-                        && peer.capabilities & CAPABILITY_AUTHENTICATED_PEER_GENERATIONS != 0
-                })
-                .map(Some)
-                .ok_or(()),
+            None => peer.process_generation == 0,
+            Some(options) => options.peers.get(&peer.node_id) == Some(&peer.process_generation),
         }
     }
-    pub(super) fn accepts(&self, peer: &Hello) -> bool {
-        self.expected_identity(peer).is_ok()
-    }
-    pub(super) fn sign(
+    pub(super) fn proof(
         &self,
-        legacy_secret: Option<&[u8]>,
+        secret: Option<&[u8]>,
         role: bool,
         dialer: &Hello,
         listener: &Hello,
     ) -> Vec<u8> {
-        match &self.options {
-            Some(options) => options.local.sign(role, dialer, listener),
-            None => legacy_secret
-                .map(|key| super::connection::handshake_auth_tag(key, role, dialer, listener))
-                .unwrap_or_default(),
-        }
+        secret
+            .map(|key| super::connection::handshake_auth_tag(key, role, dialer, listener))
+            .unwrap_or_default()
     }
     pub(super) fn verify(
         &self,
-        legacy_secret: Option<&[u8]>,
+        secret: Option<&[u8]>,
         role: bool,
         dialer: &Hello,
         listener: &Hello,
         proof: &[u8],
     ) -> bool {
-        let peer = if role { dialer } else { listener };
-        match self.expected_identity(peer) {
-            Ok(Some(identity)) => identity.verify(role, dialer, listener, proof),
-            Ok(None) => super::connection::verify_handshake_auth(
-                legacy_secret,
-                role,
-                dialer,
-                listener,
-                proof,
-            ),
-            Err(_) => false,
-        }
+        self.accepts(if role { dialer } else { listener })
+            && super::connection::verify_handshake_auth(secret, role, dialer, listener, proof)
     }
     fn cancel_connections(&self) {
         self.gate.begin_shutdown();
@@ -582,8 +420,7 @@ struct AuthorityState {
     era: Arc<AuthorityEra>,
     pending: Option<Arc<PendingFence>>,
     stopped: bool,
-    high_water: HashMap<String, PeerIdentity>,
-    seen_public_keys: HashSet<[u8; 32]>,
+    high_water: HashMap<String, u64>,
     last_report: Option<PeerFenceReport>,
 }
 pub(super) struct PeerAuthority {
@@ -608,20 +445,15 @@ impl PeerAuthority {
     pub(super) fn new(node_id: String, options: Option<PeerAuthorityOptions>) -> Arc<Self> {
         let high_water = options.as_ref().map_or_else(HashMap::new, |options| {
             let mut peers = options.peers.clone();
-            peers.insert(node_id.clone(), options.local.public_identity());
+            peers.insert(node_id.clone(), options.local_generation);
             peers
         });
-        let seen_public_keys = high_water
-            .values()
-            .map(|identity| identity.public_key)
-            .collect();
         Arc::new(Self {
             state: StdMutex::new(AuthorityState {
                 era: AuthorityEra::new(1, options),
                 pending: None,
                 stopped: false,
                 high_water,
-                seen_public_keys,
                 last_report: None,
             }),
             coordinator: Mutex::new(()),
@@ -641,9 +473,6 @@ impl PeerAuthority {
     }
     pub(super) fn reject_handshake(&self) {
         self.rejected_handshakes.fetch_add(1, Ordering::Relaxed);
-    }
-    pub(super) fn reject_frame_integrity(&self) {
-        self.rejected_frames.fetch_add(1, Ordering::Relaxed);
     }
     pub(super) fn register(
         &self,
@@ -733,26 +562,19 @@ impl PeerAuthority {
                     "authority revision exhausted".into(),
                 ));
             }
-            let new_ids = next
-                .peers
-                .keys()
-                .filter(|id| !state.high_water.contains_key(*id))
-                .count();
+            let new_ids = usize::from(!state.high_water.contains_key(&self.node_id))
+                + next
+                    .peers
+                    .keys()
+                    .filter(|id| !state.high_water.contains_key(*id))
+                    .count();
             if state.high_water.len().saturating_add(new_ids) > 65_536 {
                 return Err(PeerFenceError::InvalidOptions(
                     "peer authority historical identity limit (65536) exhausted".into(),
                 ));
             }
-            let local = next.local.public_identity();
-            let new_keys = std::iter::once(&local)
-                .chain(next.peers.values())
-                .filter(|identity| !state.seen_public_keys.contains(&identity.public_key))
-                .count();
-            if state.seen_public_keys.len().saturating_add(new_keys) > MAX_HISTORICAL_PEER_KEYS {
-                return Err(PeerFenceError::InvalidOptions("peer authority historical public-key limit exhausted; key tombstones cannot be evicted".into()));
-            }
-            for (id, credential) in
-                std::iter::once((&self.node_id, &local)).chain(next.peers.iter())
+            for (id, generation) in
+                std::iter::once((&self.node_id, &next.local_generation)).chain(next.peers.iter())
             {
                 if let Some(previous) = state.high_water.get(id) {
                     let still_present = id == &self.node_id
@@ -761,22 +583,14 @@ impl PeerAuthority {
                             .options
                             .as_ref()
                             .is_some_and(|options| options.peers.contains_key(id));
-                    if credential == previous && still_present {
+                    if generation == previous && still_present {
                         continue;
                     }
-                    if credential.generation <= previous.generation {
-                        return Err(PeerFenceError::InvalidOptions("replaced or readded processes require a newer generation and a fresh independent key".into()));
+                    if generation <= previous {
+                        return Err(PeerFenceError::InvalidOptions(
+                            "replaced or readded processes require a newer generation".into(),
+                        ));
                     }
-                }
-                // Any historical key, even one retired several rotations ago
-                // or formerly owned by another ID, grants its old signer the
-                // ability to impersonate this new generation. Only the exact
-                // unchanged current ID/generation exception above is allowed.
-                if state.seen_public_keys.contains(&credential.public_key) {
-                    return Err(PeerFenceError::InvalidOptions(
-                        "a historically admitted peer signing key cannot be reused or reassigned"
-                            .into(),
-                    ));
                 }
             }
             let old = state.era.clone();
@@ -847,11 +661,11 @@ impl PeerAuthority {
                 .era
                 .options
                 .as_ref()
-                .map_or_else(Vec::new, PeerAuthorityOptions::peer_generations),
+                .map_or_else(Vec::new, PeerAuthorityOptions::authorized_peers),
             pending_authorized_peers: state
                 .pending
                 .as_ref()
-                .map(|pending| pending.next.peer_generations()),
+                .map(|pending| pending.next.authorized_peers()),
             missing_peers,
             retired_sessions: if state.stopped || state.pending.is_some() {
                 connections.len()
@@ -864,14 +678,13 @@ impl PeerAuthority {
             completed_frames: self.completed_frames.load(Ordering::Relaxed),
             rejected_frames: self.rejected_frames.load(Ordering::Relaxed),
             rejected_handshakes: self.rejected_handshakes.load(Ordering::Relaxed),
-            historical_key_count: state.seen_public_keys.len(),
         }
     }
 }
 
 impl Node {
-    /// Exact current public identity policy. None denotes an era with no native
-    /// identity; check `peer_fence_status` to distinguish unconfigured legacy
+    /// Exact current generation policy. None denotes an unconfigured allowlist;
+    /// check `peer_fence_status` to distinguish unconfigured admission
     /// from an enabling fence. Fencing/Stopped confer no current eligibility.
     pub fn peer_authority_snapshot(&self) -> Option<PeerAuthoritySnapshot> {
         let state = self.peer_authority.state.lock().unwrap();
@@ -995,26 +808,22 @@ impl Node {
                 local_generation: pending.next.local_generation(),
                 completed_frames: pending.old.gate.completed.load(Ordering::Relaxed),
                 local_durability: durability,
-                authorized_peers: pending.next.peer_generations(),
+                authorized_peers: pending.next.authorized_peers(),
                 public_authority: PeerAuthoritySnapshot {
                     receiver_id: self.node_id.clone(),
                     node_boot_id: self.boot_id,
                     revision,
                     phase: PeerFencePhase::Ready,
-                    local: pending.next.local.public_identity(),
+                    local_generation: pending.next.local_generation,
                     peers: pending.next.peers.clone(),
                 },
             };
-            for (id, credential) in &pending.next.peers {
-                state.high_water.insert(id.clone(), credential.clone());
-                state.seen_public_keys.insert(credential.public_key);
+            for (id, generation) in &pending.next.peers {
+                state.high_water.insert(id.clone(), *generation);
             }
             state
-                .seen_public_keys
-                .insert(pending.next.local.public_identity().public_key);
-            state
                 .high_water
-                .insert(self.node_id.clone(), pending.next.local.public_identity());
+                .insert(self.node_id.clone(), pending.next.local_generation);
             state.era = AuthorityEra::new(revision, Some(pending.next.clone()));
             state.pending = None;
             state.last_report = Some(report.clone());
@@ -1042,17 +851,14 @@ impl Node {
 mod tests {
     use super::*;
     use crate::proto::{ReplicateBatch, ReplicateOp, SessionStart};
-    use crate::store::{StoreBinding, StoreError};
+    use crate::store::{StoreBinding, StoreCommitDurability, StoreError};
     use std::sync::{atomic::AtomicBool, Condvar};
 
-    fn credential(generation: u64, byte: u8) -> PeerCredential {
-        PeerCredential::new(generation, [byte; 32])
-    }
-    fn authority(peer: Option<PeerCredential>) -> PeerAuthorityOptions {
+    fn authority(peer: Option<u64>) -> PeerAuthorityOptions {
         PeerAuthorityOptions::new(
-            credential(1, 1),
-            peer.map_or_else(HashMap::new, |peer| {
-                HashMap::from([("peer".into(), peer.public_identity())])
+            1,
+            peer.map_or_else(HashMap::new, |generation| {
+                HashMap::from([("peer".into(), generation)])
             }),
         )
     }
@@ -1062,8 +868,7 @@ mod tests {
                 "local".into(),
                 "127.0.0.1:0".parse().unwrap(),
                 config,
-                NodeRuntimeOptions::default()
-                    .with_peer_authority(authority(Some(credential(1, 2)))),
+                NodeRuntimeOptions::default().with_peer_authority(authority(Some(1))),
             )
             .await
             .unwrap(),
@@ -1077,56 +882,23 @@ mod tests {
     }
     struct TestPeer {
         stream: tokio::io::DuplexStream,
-        signer: Option<super::super::peer_frame::FrameSigner>,
-        verifier: Option<FrameVerifier>,
-        next: Option<u64>,
-        hellos: Option<(Hello, Hello)>,
     }
     async fn receive(peer: &mut TestPeer) -> Option<Envelope> {
         let length = peer.stream.read_u32().await.ok()?;
         let mut bytes = vec![0; length as usize];
         peer.stream.read_exact(&mut bytes).await.ok()?;
-        let payload = match peer.verifier.as_mut() {
-            Some(verifier) => verifier.verify(&bytes).ok()?,
-            None => bytes.as_slice(),
-        };
-        Envelope::decode(payload).ok()
+        Envelope::decode(bytes.as_slice()).ok()
     }
     async fn send(peer: &mut TestPeer, msg: EnvelopeMsg) -> bool {
         let body = Envelope { msg: Some(msg) }.encode_to_vec();
-        let header = peer.signer.as_ref().map(|signer| {
-            let sequence = peer.next.unwrap();
-            peer.next = sequence.checked_add(1);
-            signer.header(sequence, &body)
-        });
-        if peer
-            .stream
-            .write_u32((body.len() + header.as_ref().map_or(0, |_| 72)) as u32)
-            .await
-            .is_err()
-        {
+        if peer.stream.write_u32(body.len() as u32).await.is_err() {
             return false;
-        }
-        if let Some(header) = header {
-            if peer.stream.write_all(&header).await.is_err() {
-                return false;
-            }
         }
         peer.stream.write_all(&body).await.is_ok()
     }
-    async fn connection(
-        node: &Node,
-        generation: u64,
-        key: u8,
-    ) -> (TestPeer, tokio::task::JoinHandle<bool>) {
+    async fn connection(node: &Node, generation: u64) -> (TestPeer, tokio::task::JoinHandle<bool>) {
         let (stream, server) = tokio::io::duplex(64 * 1024);
-        let mut peer = TestPeer {
-            stream,
-            signer: None,
-            verifier: None,
-            next: Some(1),
-            hellos: None,
-        };
+        let mut peer = TestPeer { stream };
         let context = node.connection_context();
         let task = tokio::spawn(async move {
             handle_connection(context, Box::pin(server), false, None, None)
@@ -1149,30 +921,22 @@ mod tests {
             else {
                 return;
             };
-            assert!(credential(1, 1).public_identity().verify(
+            assert!(super::super::connection::verify_handshake_auth(
+                None,
                 false,
                 &remote,
                 &local,
                 &proof.auth_tag
             ));
-            let proof = credential(generation, key).sign(true, &remote, &local);
             assert!(
                 send(
                     &mut peer,
-                    EnvelopeMsg::HelloAuth(HelloAuth { auth_tag: proof })
+                    EnvelopeMsg::HelloAuth(HelloAuth {
+                        auth_tag: Vec::new()
+                    })
                 )
                 .await
             );
-            peer.signer = Some(super::super::peer_frame::FrameSigner::new(
-                &[key; 32], true, &remote, &local,
-            ));
-            peer.verifier = Some(FrameVerifier::new(
-                *credential(1, 1).public_identity().public_key(),
-                false,
-                &remote,
-                &local,
-            ));
-            peer.hellos = Some((remote, local));
         };
         tokio::time::timeout(Duration::from_secs(2), handshake)
             .await
@@ -1208,7 +972,7 @@ mod tests {
     #[tokio::test]
     async fn live_old_high_clock_and_old_reconnect_are_fenced_but_historical_rows_are_valid() {
         let node = node(local_only()).await;
-        let (mut old, old_task) = connection(&node, 1, 2).await;
+        let (mut old, old_task) = connection(&node, 1).await;
         established(&node, &old_task).await;
         node.begin_peer_fence(authority(None)).unwrap();
         let high = SystemTime::now()
@@ -1223,7 +987,7 @@ mod tests {
         old_task.await.unwrap();
         assert!(node.get("poison".into()).await.unwrap().is_none());
         assert!(node.hlc.lock().await.tick().unwrap().timestamp_ms < high);
-        let (old_reconnect, old_reconnect_task) = connection(&node, 1, 2).await;
+        let (old_reconnect, old_reconnect_task) = connection(&node, 1).await;
         assert!(
             !tokio::time::timeout(Duration::from_secs(2), old_reconnect_task)
                 .await
@@ -1231,19 +995,10 @@ mod tests {
                 .unwrap()
         );
         drop(old_reconnect);
-        node.advance_peer_authority(
-            authority(Some(credential(2, 3))),
-            PeerFenceOptions::default(),
-        )
-        .await
-        .unwrap();
-        let (forged, forged_task) = connection(&node, 2, 2).await;
-        assert!(!tokio::time::timeout(Duration::from_secs(2), forged_task)
+        node.advance_peer_authority(authority(Some(2)), PeerFenceOptions::default())
             .await
-            .unwrap()
-            .unwrap());
-        drop(forged);
-        let (mut current, current_task) = connection(&node, 2, 3).await;
+            .unwrap();
+        let (mut current, current_task) = connection(&node, 2).await;
         established(&node, &current_task).await;
         assert!(
             send(
@@ -1328,7 +1083,7 @@ mod tests {
         let _release = ReleaseActor(gate.clone());
         let (actor, _) = Gate::spawn(None, Gate, gate.clone()).await.unwrap();
         node.router.insert(FragmentId(0), actor.clone());
-        let (mut old, old_task) = connection(&node, 1, 2).await;
+        let (mut old, old_task) = connection(&node, 1).await;
         established(&node, &old_task).await;
         send(
             &mut old,
@@ -1345,7 +1100,7 @@ mod tests {
         drop(old);
         old_task.abort();
         assert!(old_task.await.unwrap_err().is_cancelled());
-        let next = authority(Some(credential(2, 3)));
+        let next = authority(Some(2));
         let mut waiting =
             Box::pin(node.advance_peer_authority(next.clone(), PeerFenceOptions::default()));
         assert!(
@@ -1360,7 +1115,7 @@ mod tests {
             node.begin_peer_fence(authority(None)),
             Err(PeerFenceError::DifferentPendingAuthority)
         ));
-        let (new_early, new_task) = connection(&node, 2, 3).await;
+        let (new_early, new_task) = connection(&node, 2).await;
         assert!(!new_task.await.unwrap());
         drop(new_early);
         assert!(matches!(
@@ -1395,7 +1150,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn authenticated_reconcile_data_retains_old_frame_after_validation_and_imports_history() {
+    async fn reconcile_data_retains_old_frame_after_validation_and_imports_history() {
         let node = node(NodeConfig::default()).await;
         let gate = Arc::new(GatedActor {
             actual: node.router.route_for_fragment(FragmentId(0)).unwrap(),
@@ -1406,7 +1161,7 @@ mod tests {
         let _release = ReleaseActor(gate.clone());
         let (actor, _) = Gate::spawn(None, Gate, gate.clone()).await.unwrap();
         node.router.insert(FragmentId(0), actor.clone());
-        let (mut peer, task) = connection(&node, 1, 2).await;
+        let (mut peer, task) = connection(&node, 1).await;
         established(&node, &task).await;
         let mut session = 0;
         let round = tokio::time::timeout(Duration::from_secs(2), async {
@@ -1465,7 +1220,7 @@ mod tests {
                 chunk_seq: fetch.chunk_seq,
                 page_seq: 0,
                 done: true,
-                entries: vec![SyncEntry {
+                entries: vec![ReconcileEntry {
                     key,
                     value: value.value,
                     timestamp_ms: 1,
@@ -1483,7 +1238,7 @@ mod tests {
         drop(peer);
         task.abort();
         let _ = task.await;
-        let next = authority(Some(credential(2, 3)));
+        let next = authority(Some(2));
         assert!(matches!(
             node.advance_peer_authority(
                 next.clone(),
@@ -1507,27 +1262,6 @@ mod tests {
         actor.wait(None).await.unwrap();
     }
 
-    #[test]
-    fn public_keys_cannot_forge_signatures_and_generation_or_role_changes_invalidate_proof() {
-        let signer = credential(1, 2);
-        let identity = signer.public_identity();
-        let mut peer = super::super::connection::fresh_hello("peer").unwrap();
-        peer.process_generation = 1;
-        let mut local = super::super::connection::fresh_hello("local").unwrap();
-        local.process_generation = 1;
-        let proof = signer.sign(true, &peer, &local);
-        assert!(identity.verify(true, &peer, &local, &proof));
-        assert!(!identity.verify(false, &peer, &local, &proof));
-        peer.process_generation = 2;
-        assert!(!identity.verify(true, &peer, &local, &proof));
-        peer.process_generation = 1;
-        local.process_generation = 2;
-        assert!(!identity.verify(true, &peer, &local, &proof));
-        local.process_generation = 1;
-        let forged = PeerCredential::new(1, *identity.public_key()).sign(true, &peer, &local);
-        assert!(!identity.verify(true, &peer, &local, &forged));
-    }
-
     #[tokio::test]
     async fn retained_old_session_context_cannot_admit_after_cutoff_or_completed_fence() {
         let node = node(local_only()).await;
@@ -1549,7 +1283,7 @@ mod tests {
         let old_session = node.peer_authority.register(&era, "peer", channel).unwrap();
         assert!(node.peer_fence_status().missing_peers().is_empty());
         let work = node.peer_authority.admit(&old_session).unwrap();
-        let next = authority(Some(credential(2, 3)));
+        let next = authority(Some(2));
         let status = node.begin_peer_fence(next.clone()).unwrap();
         assert_eq!(status.outstanding_frames(), 1);
         assert_eq!(status.retired_sessions(), 1);
@@ -1584,10 +1318,7 @@ mod tests {
             report.public_authority(),
             &node.peer_authority_snapshot().unwrap()
         );
-        assert_eq!(
-            report.public_authority().peer_identities()["peer"],
-            credential(2, 3).public_identity()
-        );
+        assert_eq!(report.public_authority().peer_generations()["peer"], 2);
         drop(old_session);
         node.shutdown().await.unwrap();
     }
@@ -1605,7 +1336,7 @@ mod tests {
             let _release = ReleaseActor(gate.clone());
             let (actor, _) = Gate::spawn(None, Gate, gate.clone()).await.unwrap();
             node.router.insert(FragmentId(0), actor.clone());
-            let (mut old, task) = connection(&node, 1, 2).await;
+            let (mut old, task) = connection(&node, 1).await;
             established(&node, &task).await;
             let request = if sql {
                 EnvelopeMsg::QueryPageRequest(crate::proto::QueryPageRequest {
@@ -1629,7 +1360,7 @@ mod tests {
             drop(old);
             task.abort();
             let _ = task.await;
-            let next = authority(Some(credential(2, 3)));
+            let next = authority(Some(2));
             assert!(matches!(
                 node.advance_peer_authority(
                     next.clone(),
@@ -1672,6 +1403,15 @@ mod tests {
         fn load(&self) -> Result<Vec<(Vec<u8>, VersionedValue)>, StoreError> {
             Ok(Vec::new())
         }
+        fn load_prefix(&self, _: &[u8]) -> Result<Vec<(Vec<u8>, VersionedValue)>, StoreError> {
+            Ok(Vec::new())
+        }
+        fn commit_durability(&self) -> StoreCommitDurability {
+            StoreCommitDurability::Buffered
+        }
+        fn stable_fence(&self) -> Result<StoreCommitDurability, StoreError> {
+            Ok(StoreCommitDurability::Buffered)
+        }
         fn write_batch(&self, writes: &[(Vec<u8>, VersionedValue)]) -> Result<(), StoreError> {
             self.entered.notify_one();
             let mut release = self.release.0.lock().unwrap();
@@ -1691,6 +1431,18 @@ mod tests {
 
     struct FailingStore(AtomicBool);
     impl KvStore for FailingStore {
+        fn bind(&self, _: &StoreIdentity) -> Result<StoreBinding, StoreError> {
+            Ok(StoreBinding::unmanaged())
+        }
+        fn load_prefix(&self, _: &[u8]) -> Result<Vec<(Vec<u8>, VersionedValue)>, StoreError> {
+            Ok(Vec::new())
+        }
+        fn commit_durability(&self) -> StoreCommitDurability {
+            StoreCommitDurability::Buffered
+        }
+        fn stable_fence(&self) -> Result<StoreCommitDurability, StoreError> {
+            Ok(StoreCommitDurability::Buffered)
+        }
         fn load(&self) -> Result<Vec<(Vec<u8>, VersionedValue)>, StoreError> {
             Ok(Vec::new())
         }
@@ -1711,7 +1463,7 @@ mod tests {
         config.flush_interval = Duration::from_secs(3600);
         config.snapshot_interval = Duration::from_secs(3600);
         let node = node(config).await;
-        let (mut old, task) = connection(&node, 1, 2).await;
+        let (mut old, task) = connection(&node, 1).await;
         established(&node, &task).await;
         send(
             &mut old,
@@ -1726,7 +1478,7 @@ mod tests {
             receive(&mut old).await.unwrap().msg,
             Some(EnvelopeMsg::BatchAck(_))
         ));
-        let next = authority(Some(credential(2, 3)));
+        let next = authority(Some(2));
         assert!(matches!(
             node.advance_peer_authority(next.clone(), PeerFenceOptions::default())
                 .await,
@@ -1768,7 +1520,7 @@ mod tests {
         config.store = Some(store.clone());
         config.flush_batch_size = 1;
         let node = node(config).await;
-        let (mut old, old_task) = connection(&node, 1, 2).await;
+        let (mut old, old_task) = connection(&node, 1).await;
         established(&node, &old_task).await;
         send(
             &mut old,
@@ -1788,7 +1540,7 @@ mod tests {
         drop(old);
         old_task.abort();
         let _ = old_task.await;
-        let next = authority(Some(credential(2, 3)));
+        let next = authority(Some(2));
         assert!(matches!(
             node.advance_peer_authority(
                 next.clone(),
@@ -1830,7 +1582,7 @@ mod tests {
         config.flush_interval = Duration::from_secs(3600);
         config.snapshot_interval = Duration::from_secs(3600);
         let node = node(config).await;
-        let (mut old, old_task) = connection(&node, 1, 2).await;
+        let (mut old, old_task) = connection(&node, 1).await;
         established(&node, &old_task).await;
         send(
             &mut old,
@@ -1849,7 +1601,7 @@ mod tests {
             receive(&mut old).await.unwrap().msg,
             Some(EnvelopeMsg::BatchAck(_))
         ));
-        let next = authority(Some(credential(2, 3)));
+        let next = authority(Some(2));
         let fencing = node.clone();
         let next_wait = next.clone();
         let waiter = tokio::spawn(async move {
@@ -1893,305 +1645,35 @@ mod tests {
     }
 
     #[test]
-    fn invalid_credentials_and_reused_generations_are_rejected_before_cutoff() {
-        let authority = PeerAuthority::new("local".into(), Some(authority(Some(credential(1, 2)))));
-        assert!(matches!(
-            authority.begin(PeerAuthorityOptions::new(
-                credential(1, 1),
-                HashMap::from([("peer".into(), credential(2, 2).public_identity())])
-            )),
-            Err(PeerFenceError::InvalidOptions(_))
-        ));
-        assert_eq!(authority.status().phase(), PeerFencePhase::Ready);
-        assert!(matches!(
-            authority.begin(PeerAuthorityOptions::new(
-                credential(1, 1),
-                HashMap::from([("peer".into(), credential(1, 3).public_identity())])
-            )),
-            Err(PeerFenceError::InvalidOptions(_))
-        ));
-        assert!(authority.handshake_era().is_some());
-        let invalid = PeerAuthorityOptions::new(credential(0, 1), HashMap::new());
-        assert!(invalid.validate().is_err());
-        let shared = PeerAuthorityOptions::new(
-            credential(1, 1),
-            HashMap::from([("peer".into(), credential(1, 1).public_identity())]),
-        );
-        assert!(shared.validate().is_err());
-        assert!(!format!("{:?}", credential(123, 73)).contains("73"));
-    }
-
-    #[tokio::test]
-    async fn signing_key_from_multiple_rotations_ago_cannot_be_reintroduced() {
-        let node = node(local_only()).await;
-        node.advance_peer_authority(
-            authority(Some(credential(2, 3))),
-            PeerFenceOptions::default(),
-        )
-        .await
-        .unwrap();
-        node.advance_peer_authority(
-            authority(Some(credential(3, 4))),
-            PeerFenceOptions::default(),
-        )
-        .await
-        .unwrap();
-        let before = node.peer_authority_snapshot().unwrap();
-        let old_key_with_new_generation = authority(Some(credential(4, 2)));
-        assert!(matches!(
-            node.begin_peer_fence(old_key_with_new_generation),
-            Err(PeerFenceError::InvalidOptions(_))
-        ));
-        assert_eq!(node.peer_authority_snapshot().unwrap(), before);
-        assert_eq!(node.peer_fence_status().phase(), PeerFencePhase::Ready);
-        assert_eq!(node.peer_fence_status().historical_key_count(), 4);
-        // Exact unchanged current identities remain eligible, while keys are
-        // never recycled after either a generation rotation or revocation.
-        let (current, task) = connection(&node, 3, 4).await;
-        established(&node, &task).await;
-        drop(current);
-        task.await.unwrap();
-        node.shutdown().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn historical_signing_keys_cannot_be_reassigned_to_a_different_identity() {
-        let node = node(local_only()).await;
-        node.advance_peer_authority(
-            authority(Some(credential(2, 3))),
-            PeerFenceOptions::default(),
-        )
-        .await
-        .unwrap();
-        node.advance_peer_authority(authority(None), PeerFenceOptions::default())
-            .await
-            .unwrap();
-        let before = node.peer_authority_snapshot().unwrap();
-        for old_key in [2, 3] {
-            let renamed = PeerAuthorityOptions::new(
-                credential(1, 1),
-                HashMap::from([(
-                    "new-peer-id".into(),
-                    credential(99, old_key).public_identity(),
-                )]),
-            );
-            assert!(matches!(
-                node.begin_peer_fence(renamed),
-                Err(PeerFenceError::InvalidOptions(_))
-            ));
-            assert_eq!(node.peer_authority_snapshot().unwrap(), before);
+    fn invalid_and_reused_generations_are_rejected_before_cutoff() {
+        let runtime = PeerAuthority::new("local".into(), Some(authority(Some(1))));
+        assert!(PeerAuthorityOptions::new(0, HashMap::new())
+            .validate()
+            .is_err());
+        assert!(authority(Some(0)).validate().is_err());
+        assert!(runtime.begin(authority(Some(0))).is_err());
+        assert!(runtime.handshake_era().is_some());
+        runtime.begin(authority(None)).unwrap();
+        {
+            let mut state = runtime.state.lock().unwrap();
+            state.era = AuthorityEra::new(2, Some(authority(None)));
+            state.pending = None;
         }
-        // A former local signing key cannot become a newly named peer key.
-        let swapped_local = PeerAuthorityOptions::new(
-            credential(2, 5),
-            HashMap::from([("new-peer-id".into(), credential(99, 1).public_identity())]),
-        );
-        assert!(matches!(
-            node.begin_peer_fence(swapped_local),
-            Err(PeerFenceError::InvalidOptions(_))
-        ));
-        assert_eq!(node.peer_authority_snapshot().unwrap(), before);
-        node.shutdown().await.unwrap();
-    }
-
-    async fn write_raw_body(peer: &mut TestPeer, body: &[u8]) {
-        peer.stream.write_u32(body.len() as u32).await.unwrap();
-        peer.stream.write_all(body).await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn old_process_proxy_cannot_modify_or_inject_after_current_peer_handshake() {
-        for wrong_signer in [false, true] {
-            let node = node(local_only()).await;
-            // The legitimate current peer supplies its fresh HelloAuth. The
-            // proxy can relay that proof, but does not gain its signing seed.
-            let (mut current, task) = connection(&node, 1, 2).await;
-            established(&node, &task).await;
-            let high = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_millis() as u64
-                + 60_000;
-            let harmless = Envelope {
-                msg: Some(EnvelopeMsg::ForwardedPut(ForwardedPut {
-                    req_id: 1,
-                    key: Node::qualify_key("poison".into()),
-                    value: vec![1],
-                    timestamp_ms: 1,
-                    node_id: "peer".into(),
-                    ..Default::default()
-                })),
-            }
-            .encode_to_vec();
-            let injected = Envelope {
-                msg: Some(EnvelopeMsg::ForwardedPut(ForwardedPut {
-                    req_id: 1,
-                    key: Node::qualify_key("poison".into()),
-                    value: vec![9],
-                    timestamp_ms: high,
-                    node_id: "peer".into(),
-                    ..Default::default()
-                })),
-            }
-            .encode_to_vec();
-            let (dialer, listener) = current.hellos.as_ref().unwrap();
-            let header = if wrong_signer {
-                // Retired process uses its own key, even with the exact fresh
-                // transcript and valid sequence learned through the proxy.
-                super::super::peer_frame::FrameSigner::new(&[9; 32], true, dialer, listener)
-                    .header(1, &injected)
-            } else {
-                // Legitimate signed payload is modified in transit.
-                current.signer.as_ref().unwrap().header(1, &harmless)
-            };
-            let mut body = header.to_vec();
-            body.extend_from_slice(&injected);
-            write_raw_body(&mut current, &body).await;
-            assert!(tokio::time::timeout(Duration::from_secs(2), task)
-                .await
-                .unwrap()
-                .unwrap());
-            assert_eq!(node.peer_fence_status().accepted_frames(), 0);
-            assert_eq!(node.peer_fence_status().rejected_frames(), 1);
-            assert!(node.get("poison".into()).await.unwrap().is_none());
-            assert!(node.hlc.lock().await.tick().unwrap().timestamp_ms < high);
-            node.shutdown().await.unwrap();
-        }
-    }
-
-    #[tokio::test]
-    async fn proxy_frame_replay_is_rejected_on_same_and_fresh_authenticated_sessions() {
-        let node = node(local_only()).await;
-        let (mut first, first_task) = connection(&node, 1, 2).await;
-        established(&node, &first_task).await;
-        let payload = Envelope {
-            msg: Some(EnvelopeMsg::SessionStart(SessionStart {
-                fragment: 0,
-                session_id: 7,
-            })),
-        }
-        .encode_to_vec();
-        let mut captured = first.signer.as_ref().unwrap().header(1, &payload).to_vec();
-        captured.extend_from_slice(&payload);
-        write_raw_body(&mut first, &captured).await;
-        write_raw_body(&mut first, &captured).await; // Repeated sequence 1.
-        assert!(tokio::time::timeout(Duration::from_secs(2), first_task)
-            .await
-            .unwrap()
-            .unwrap());
-        assert_eq!(node.peer_fence_status().accepted_frames(), 1);
-        let (mut fresh, fresh_task) = connection(&node, 1, 2).await;
-        established(&node, &fresh_task).await;
-        write_raw_body(&mut fresh, &captured).await; // Sequence 1, wrong fresh transcript.
-        assert!(tokio::time::timeout(Duration::from_secs(2), fresh_task)
-            .await
-            .unwrap()
-            .unwrap());
-        assert_eq!(node.peer_fence_status().accepted_frames(), 1);
-        assert_eq!(node.peer_fence_status().rejected_frames(), 2);
-        node.shutdown().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn ordinary_tcp_nodes_replicate_signed_frames_in_both_directions() {
-        let a_key = credential(1, 1);
-        let b_key = credential(1, 2);
-        let a_policy = PeerAuthorityOptions::new(
-            a_key.clone(),
-            HashMap::from([("b".into(), b_key.public_identity())]),
-        );
-        let b_policy = PeerAuthorityOptions::new(
-            b_key,
-            HashMap::from([("a".into(), a_key.public_identity())]),
-        );
-        let a = Node::start_with_options(
-            "a".into(),
-            "127.0.0.1:0".parse().unwrap(),
-            NodeConfig::default(),
-            NodeRuntimeOptions::default().with_peer_authority(a_policy),
-        )
-        .await
-        .unwrap();
-        let b = Node::start_with_options(
-            "b".into(),
-            "127.0.0.1:0".parse().unwrap(),
-            NodeConfig::default(),
-            NodeRuntimeOptions::default().with_peer_authority(b_policy),
-        )
-        .await
-        .unwrap();
-        a.connect(b.addr()).await.unwrap();
-        tokio::time::timeout(Duration::from_secs(3), async {
-            while a.peer_count().await != 1 || b.peer_count().await != 1 {
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .unwrap();
-        a.put("from-a".into(), vec![1]).await.unwrap();
-        b.put("from-b".into(), vec![2]).await.unwrap();
-        tokio::time::timeout(Duration::from_secs(3), async {
-            loop {
-                if b.get("from-a".into())
-                    .await
-                    .unwrap()
-                    .is_some_and(|value| value.value == vec![1])
-                    && a.get("from-b".into())
-                        .await
-                        .unwrap()
-                        .is_some_and(|value| value.value == vec![2])
-                {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .unwrap();
-        assert!(a.peer_fence_status().accepted_frames() > 0);
-        assert!(b.peer_fence_status().accepted_frames() > 0);
-        assert_eq!(a.peer_fence_status().rejected_frames(), 0);
-        assert_eq!(b.peer_fence_status().rejected_frames(), 0);
-        a.shutdown().await.unwrap();
-        b.shutdown().await.unwrap();
+        assert!(runtime.begin(authority(Some(1))).is_err());
+        assert!(runtime.handshake_era().is_some());
+        assert!(runtime.begin(authority(Some(2))).is_ok());
     }
 
     #[test]
-    fn historical_key_capacity_exhaustion_rejects_new_keys_without_evicting_tombstones() {
-        let registry = PeerAuthority::new("local".into(), Some(authority(Some(credential(1, 2)))));
-        let initial_key = credential(1, 2).public_identity().public_key;
-        {
-            let mut state = registry.state.lock().unwrap();
-            let mut value = 0u64;
-            while state.seen_public_keys.len() < MAX_HISTORICAL_PEER_KEYS {
-                let mut historical = [0; 32];
-                historical[..8].copy_from_slice(&value.to_be_bytes());
-                state.seen_public_keys.insert(historical);
-                value += 1;
-            }
-        }
-        assert!(matches!(
-            registry.begin(authority(Some(credential(2, 3)))),
-            Err(PeerFenceError::InvalidOptions(_))
-        ));
-        assert_eq!(registry.status().phase(), PeerFencePhase::Ready);
-        assert_eq!(
-            registry.status().historical_key_count(),
-            MAX_HISTORICAL_PEER_KEYS
-        );
-        assert!(registry
-            .state
-            .lock()
-            .unwrap()
-            .seen_public_keys
-            .contains(&initial_key));
-        // Revocation introduces no new trust key and must remain possible at
-        // capacity. It never makes historical keys available for future reuse.
-        registry.begin(authority(None)).unwrap();
-        assert_eq!(registry.status().phase(), PeerFencePhase::Fencing);
-        assert_eq!(
-            registry.status().historical_key_count(),
-            MAX_HISTORICAL_PEER_KEYS
-        );
+    fn generation_allowlist_does_not_authenticate_process_credential_ownership() {
+        let era = AuthorityEra::new(1, Some(authority(Some(2))));
+        let mut claimed = super::super::connection::fresh_hello("peer").unwrap();
+        claimed.process_generation = 1;
+        assert!(!era.accepts(&claimed));
+        claimed.process_generation = 2;
+        // A cooperative generation gate cannot distinguish two processes
+        // able to authenticate using the same externally trusted credentials.
+        assert!(era.accepts(&claimed));
+        assert!(!era.accepts(&super::super::connection::fresh_hello("other").unwrap()));
     }
 }
