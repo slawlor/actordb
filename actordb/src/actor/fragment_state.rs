@@ -72,8 +72,8 @@ fn query_page_limits(work: &crate::query::QueryPageWork) -> Result<(usize, usize
     }
     Ok((max_rows, max_visits, max_bytes))
 }
-/// The fragment's shared state: one in-memory cache, one persistence
-/// buffer, one [`KvStore`].
+/// Shared fragment/cache state. Named-table cache and ordered flush partitions
+/// share one fragment-wide persistence admission allowance and node executor.
 ///
 /// Workers, the dispatcher, and background maintenance share this cache.
 /// The lock serializes winning merges with the ordered index and snapshot
@@ -104,7 +104,8 @@ pub struct FragmentState {
     /// Buffered writes awaiting flush.
     flush: Arc<Mutex<FlushBuffer>>,
     executor: Arc<crate::store::executor::StorageExecutor>,
-    /// Allows exactly one store write at a time for this fragment. The
+    persistence: Arc<FragmentPersistenceResources>,
+    /// Allows exactly one store write at a time for this cache/table partition. The
     /// buffered batch remains recorded while the write is in progress, so a
     /// cancelled or failed flush can be retried without losing it.
     flush_in_progress: Arc<Mutex<()>>,
@@ -112,7 +113,7 @@ pub struct FragmentState {
     flush_interval: Duration,
     expiry_publisher: Option<(FragmentId, ExpiryPublisher)>,
     /// Independently cached and persisted table partitions. Table children
-    /// are created lazily and share the backend/executor and snapshot metadata.
+    /// are created lazily and share fragment admission, backend/executor and snapshot metadata.
     table_children: Arc<RwLock<BTreeMap<String, Arc<FragmentState>>>>,
     partitioned: bool,
     persistence_template: Option<PersistenceConfig>,
@@ -214,6 +215,9 @@ pub(crate) struct ExpiryPass {
     after_table: Option<String>,
     active_table: Option<Arc<FragmentState>>,
     partition_done: bool,
+    /// Explicit full passes can release shared admission between attempts.
+    /// Automatic pages keep their finite skip-on-saturation behavior.
+    retry_saturation: bool,
 }
 
 impl ExpiryPass {
@@ -228,6 +232,7 @@ impl ExpiryPass {
             after_table: None,
             active_table: None,
             partition_done: false,
+            retry_saturation: false,
         }
     }
 
@@ -276,6 +281,25 @@ struct PendingWrite {
     value: VersionedValue,
     local: BytePermit,
     aggregate: BytePermit,
+    /// Pending and immutable active representations each retain one record.
+    _record: BytePermit,
+}
+
+struct FragmentPersistenceResources {
+    records: Arc<ByteBudget>,
+    bytes: Arc<ByteBudget>,
+    aggregate: Arc<ByteBudget>,
+    executor: Arc<crate::store::executor::StorageExecutor>,
+}
+impl FragmentPersistenceResources {
+    fn new(config: &PersistenceConfig) -> Arc<Self> {
+        Arc::new(Self {
+            records: ByteBudget::new(config.max_records()),
+            bytes: ByteBudget::new(config.max_bytes()),
+            aggregate: config.aggregate(),
+            executor: config.executor(),
+        })
+    }
 }
 struct FlushBuffer {
     pending: HashMap<String, PendingWrite>,
@@ -283,7 +307,7 @@ struct FlushBuffer {
     in_flight: Option<Arc<HashMap<String, PendingWrite>>>,
     local_budget: Arc<ByteBudget>,
     aggregate_budget: Arc<ByteBudget>,
-    max_records: usize,
+    record_budget: Arc<ByteBudget>,
     last_flush: Instant,
     failed: bool,
 }
@@ -327,13 +351,11 @@ impl FragmentState {
                 let store = kvstore.as_ref().map(|inner| {
                     Arc::new(TableStore::new(inner.clone(), &table)) as Arc<dyn KvStore>
                 });
-                (
-                    table,
-                    Arc::new(
-                        Self::new_local(cache, store, flush_batch_size, flush_interval)
-                            .with_summary_state(&state),
-                    ),
-                )
+                let mut child = Self::new_local(cache, store, flush_batch_size, flush_interval);
+                child
+                    .share_persistence(state.persistence.clone())
+                    .expect("startup table persistence is unshared and empty");
+                (table, Arc::new(child.with_summary_state(&state)))
             })
             .collect();
         state.table_children = Arc::new(RwLock::new(children));
@@ -364,6 +386,7 @@ impl FragmentState {
                     .map(|deadline| (deadline, key.clone()))
             })
             .collect();
+        let persistence = FragmentPersistenceResources::new(&PersistenceConfig::default());
         Self {
             cache: RwLock::new(FragmentCache {
                 values: cache,
@@ -384,13 +407,14 @@ impl FragmentState {
             flush: Arc::new(Mutex::new(FlushBuffer {
                 pending: HashMap::new(),
                 in_flight: None,
-                local_budget: ByteBudget::new(PersistenceConfig::default().max_bytes()),
-                aggregate_budget: ByteBudget::new(PersistenceConfig::default().node_max_bytes()),
-                max_records: PersistenceConfig::default().max_records(),
+                local_budget: persistence.bytes.clone(),
+                aggregate_budget: persistence.aggregate.clone(),
+                record_budget: persistence.records.clone(),
                 last_flush: Instant::now(),
                 failed: false,
             })),
-            executor: crate::store::executor::StorageExecutor::new(4),
+            executor: persistence.executor.clone(),
+            persistence,
             flush_in_progress: Arc::new(Mutex::new(())),
             flush_batch_size,
             flush_interval,
@@ -440,14 +464,14 @@ impl FragmentState {
         config.validate()?;
         self.configure_persistence(&config)?;
         self.persistence_template = Some(config.clone());
-        if self.partitioned {
+        {
             let children = Arc::get_mut(&mut self.table_children)
                 .ok_or_else(|| "table partitions are already shared".to_string())?
                 .get_mut();
             for child in children.values_mut() {
                 let child = Arc::get_mut(child)
                     .ok_or_else(|| "table partition is already shared".to_string())?;
-                child.configure_persistence(&config)?;
+                child.share_persistence(self.persistence.clone())?;
                 child.persistence_template = Some(config.clone());
             }
         }
@@ -489,37 +513,33 @@ impl FragmentState {
         self.table_pool_capacity
     }
     fn configure_persistence(&mut self, config: &PersistenceConfig) -> Result<(), String> {
+        self.share_persistence(FragmentPersistenceResources::new(config))
+    }
+
+    fn share_persistence(
+        &mut self,
+        resources: Arc<FragmentPersistenceResources>,
+    ) -> Result<(), String> {
         let flush = Arc::get_mut(&mut self.flush)
             .ok_or_else(|| "persistence work is already shared".to_string())?
             .get_mut();
         if flush.record_count() != 0 {
             return Err("persistence configuration requires an empty backlog".to_string());
         }
-        flush.local_budget = ByteBudget::new(config.max_bytes());
-        flush.max_records = config.max_records();
-        flush.aggregate_budget = config.aggregate();
-        self.executor = config.executor();
+        flush.local_budget = resources.bytes.clone();
+        flush.record_budget = resources.records.clone();
+        flush.aggregate_budget = resources.aggregate.clone();
+        self.executor = resources.executor.clone();
+        self.persistence = resources;
         Ok(())
     }
 
     /// Charged authoritative pending/active bytes and retained records.
     pub async fn persistence_backlog(&self) -> (usize, usize) {
-        if self.partitioned {
-            let (mut records, mut bytes) = self.persistence_backlog_local().await;
-            let children = self.table_children.read().await.clone();
-            for child in children.values() {
-                let (child_records, child_bytes) = child.persistence_backlog_local().await;
-                records = records.saturating_add(child_records);
-                bytes = bytes.saturating_add(child_bytes);
-            }
-            return (records, bytes);
-        }
-        self.persistence_backlog_local().await
-    }
-
-    async fn persistence_backlog_local(&self) -> (usize, usize) {
-        let flush = self.flush.lock().await;
-        (flush.record_count(), flush.local_budget.used())
+        (
+            self.persistence.records.used(),
+            self.persistence.bytes.used(),
+        )
     }
 
     pub(crate) fn with_expiry_publisher(
@@ -589,22 +609,21 @@ impl FragmentState {
                 child.pool_timing = self.pool_timing.clone();
                 child.table_pool_capacity = self.table_pool_capacity;
                 child.expiry_publisher = self.expiry_publisher.clone();
-                if let Some(config) = &self.persistence_template {
-                    child = child.with_persistence_config(config.clone())?;
-                }
+                child.share_persistence(self.persistence.clone())?;
+                child.persistence_template = self.persistence_template.clone();
                 children.insert(table, Arc::new(child));
             }
         }
         self.partitioned = true;
-        if let Some(config) = self.persistence_template.clone() {
+        {
             let children = Arc::get_mut(&mut self.table_children)
                 .ok_or_else(|| "table partitions are already shared".to_string())?
                 .get_mut();
             for child in children.values_mut() {
                 let child = Arc::get_mut(child)
                     .ok_or_else(|| "table partition is already shared".to_string())?;
-                child.configure_persistence(&config)?;
-                child.persistence_template = Some(config.clone());
+                child.share_persistence(self.persistence.clone())?;
+                child.persistence_template = self.persistence_template.clone();
             }
         }
         Ok(self)
@@ -636,11 +655,10 @@ impl FragmentState {
         state.expiry_publisher = self.expiry_publisher.clone();
         state.pool_timing = self.pool_timing.clone();
         state.table_pool_capacity = self.table_pool_capacity;
-        if let Some(config) = &self.persistence_template {
-            state = state
-                .with_persistence_config(config.clone())
-                .expect("validated persistence configuration");
-        }
+        state
+            .share_persistence(self.persistence.clone())
+            .expect("new table persistence is unshared and empty");
+        state.persistence_template = self.persistence_template.clone();
         let state = Arc::new(state.with_summary_state(self));
         if table != "KV" {
             empty.insert(table.to_string());
@@ -966,24 +984,32 @@ impl FragmentState {
 
     /// Write the currently buffered writes to the store in one batch.
     ///
-    /// At most one write is in progress per fragment. The authoritative copy
+    /// At most one write is in progress per table/cache partition. Partitions
+    /// share the fragment record/byte allowance and node executor. The authoritative copy
     /// of the batch remains in the buffer's in-flight slot until the write
     /// succeeds, so failure or cancellation cannot make a later flush forget
     /// it. Writes that arrive during the store call remain pending for the
     /// next flush.
     pub async fn flush(&self) -> Result<(), ActorProcessingErr> {
-        self.reclaim_empty_tables().await;
         if self.partitioned {
-            self.flush_local().await?;
-            let children = self.table_children.read().await.clone();
-            for child in children.values() {
-                child.flush_local().await?;
-            }
-            drop(children);
-            self.reclaim_empty_tables().await;
-            return Ok(());
+            return self.flush_from_actor().await;
         }
+        self.reclaim_empty_tables().await;
         self.flush_local().await
+    }
+
+    /// Managed actors resolve child tables even when public direct state
+    /// operations deliberately retain unpartitioned base-cache semantics.
+    pub(crate) async fn flush_from_actor(&self) -> Result<(), ActorProcessingErr> {
+        self.reclaim_empty_tables().await;
+        self.flush_local().await?;
+        let children = self.table_children.read().await.clone();
+        for child in children.values() {
+            child.flush_local().await?;
+        }
+        drop(children);
+        self.reclaim_empty_tables().await;
+        Ok(())
     }
 
     async fn flush_local(&self) -> Result<(), ActorProcessingErr> {
@@ -994,26 +1020,33 @@ impl FragmentState {
     /// the same ordering guard. The accepted operation remains owned when its
     /// waiter is canceled; safe teardown still waits for backend completion.
     pub async fn flush_stable(&self) -> Result<ApplyDurability, ActorProcessingErr> {
-        self.reclaim_empty_tables().await;
         if self.partitioned {
-            let mut durability = self.flush_stable_local().await?;
-            let children = self.table_children.read().await.clone();
-            for child in children.values() {
-                durability = match (durability, child.flush_stable_local().await?) {
-                    (ApplyDurability::MemoryApplied, _) | (_, ApplyDurability::MemoryApplied) => {
-                        ApplyDurability::MemoryApplied
-                    }
-                    (ApplyDurability::StableCommitted, ApplyDurability::StableCommitted) => {
-                        ApplyDurability::StableCommitted
-                    }
-                    _ => ApplyDurability::StoreCommitted,
-                };
-            }
-            drop(children);
-            self.reclaim_empty_tables().await;
-            return Ok(durability);
+            return self.flush_stable_from_actor().await;
         }
+        self.reclaim_empty_tables().await;
         self.flush_stable_local().await
+    }
+
+    pub(crate) async fn flush_stable_from_actor(
+        &self,
+    ) -> Result<ApplyDurability, ActorProcessingErr> {
+        self.reclaim_empty_tables().await;
+        let mut durability = self.flush_stable_local().await?;
+        let children = self.table_children.read().await.clone();
+        for child in children.values() {
+            durability = match (durability, child.flush_stable_local().await?) {
+                (ApplyDurability::MemoryApplied, _) | (_, ApplyDurability::MemoryApplied) => {
+                    ApplyDurability::MemoryApplied
+                }
+                (ApplyDurability::StableCommitted, ApplyDurability::StableCommitted) => {
+                    ApplyDurability::StableCommitted
+                }
+                _ => ApplyDurability::StoreCommitted,
+            };
+        }
+        drop(children);
+        self.reclaim_empty_tables().await;
+        Ok(durability)
     }
 
     async fn flush_stable_local(&self) -> Result<ApplyDurability, ActorProcessingErr> {
@@ -1984,18 +2017,60 @@ impl FragmentState {
     /// the finite pass. Persistence admission failure keeps the deadline indexed
     /// and returns an error so shutdown can retry its final expiry fence.
     pub async fn expire_values(&self, now_ms: u64) -> Result<usize, ActorProcessingErr> {
-        self.reclaim_empty_tables().await;
         if self.partitioned {
-            let mut converted = self.expire_values_local(now_ms).await?;
-            let children = self.table_children.read().await.clone();
-            for child in children.values() {
-                converted = converted.saturating_add(child.expire_values_local(now_ms).await?);
-            }
-            drop(children);
-            self.reclaim_empty_tables().await;
-            return Ok(converted);
+            return self.expire_values_from_actor(now_ms).await;
         }
+        self.reclaim_empty_tables().await;
         self.expire_values_local(now_ms).await
+    }
+
+    pub(crate) async fn expire_values_from_actor(
+        &self,
+        now_ms: u64,
+    ) -> Result<usize, ActorProcessingErr> {
+        self.reclaim_empty_tables().await;
+        {
+            // This is an explicitly full/manual or terminal pass, not one
+            // bounded automatic Cleaner page. A different dirty table can
+            // own the shared allowance needed for this table's first expiry
+            // marker. Retry those authoritative batches before expiry, or a
+            // healthy shutdown retry could forever saturate the empty table
+            // without reaching the failed dirty partition's final flush.
+            self.flush_from_actor().await?;
+            let mut pass = ExpiryPass::new(now_ms);
+            pass.retry_saturation = true;
+            let mut converted = 0usize;
+            let mut retried_without_conversion = false;
+            loop {
+                let page = self.expire_values_page_partitioned(&mut pass).await?;
+                converted = converted.saturating_add(page.converted);
+                if page.saturated {
+                    // Retry the same deadline after freeing other tables'
+                    // pending/active charges. An irreducible marker or ongoing
+                    // contention gets one zero-progress retry, never a spin.
+                    if page.converted == 0 && retried_without_conversion {
+                        return Err(ActorProcessingErr::from(
+                            "expiry persistence admission remains saturated after full flush",
+                        ));
+                    }
+                    retried_without_conversion = page.converted == 0;
+                    // The bounded page may already have flushed its own
+                    // converted markers. Do not walk every table again for
+                    // each such page when no shared backlog remains.
+                    if self.persistence.records.used() != 0 || self.persistence.bytes.used() != 0 {
+                        self.flush_from_actor().await?;
+                    }
+                } else {
+                    retried_without_conversion = false;
+                }
+                if page.done {
+                    self.flush_from_actor().await?;
+                    self.reclaim_empty_tables().await;
+                    return Ok(converted);
+                }
+                tokio::task::yield_now().await;
+            }
+        }
     }
 
     async fn expire_values_local(&self, now_ms: u64) -> Result<usize, ActorProcessingErr> {
@@ -2028,10 +2103,17 @@ impl FragmentState {
         &self,
         pass: &mut ExpiryPass,
     ) -> Result<ExpiryPage, ActorProcessingErr> {
-        use std::ops::Bound::{Excluded, Unbounded};
         if !self.partitioned {
             return self.expire_values_page_local(pass).await;
         }
+        self.expire_values_page_partitioned(pass).await
+    }
+
+    async fn expire_values_page_partitioned(
+        &self,
+        pass: &mut ExpiryPass,
+    ) -> Result<ExpiryPage, ActorProcessingErr> {
+        use std::ops::Bound::{Excluded, Unbounded};
         let mut page = ExpiryPage {
             visited: 0,
             converted: 0,
@@ -2109,6 +2191,11 @@ impl FragmentState {
                 }
                 pass.reset_deadlines();
             }
+            if next.saturated && pass.retry_saturation {
+                // The explicit driver can free another table's shared charge
+                // outside the bounded page before retrying this same deadline.
+                break;
+            }
             if pass.root_done && pass.active_table.is_none() && pass.tables_remaining == Some(0) {
                 pass.partition_done = true;
                 break;
@@ -2185,6 +2272,13 @@ impl FragmentState {
                     .is_some_and(|flush| !flush.enqueue(key, &tombstone))
                 {
                     page.saturated = true;
+                    if pass.retry_saturation {
+                        // The explicit caller will flush shared dirty batches
+                        // outside this bounded page and retry this exact key.
+                        // A failed attempt charges work but consumes no cursor
+                        // or original deadline quota.
+                        break;
+                    }
                     pass.after_deadline = Some(entry);
                     continue;
                 }
@@ -2208,7 +2302,8 @@ impl FragmentState {
                 pass.after_deadline = Some(entry);
                 page.converted += 1;
             }
-            pass.remaining -= page.visited;
+            let consumed = page.visited - usize::from(page.saturated && pass.retry_saturation);
+            pass.remaining -= consumed;
             page.done |= pass.remaining == 0;
             // A quota larger than the due set must finish on this page, even
             // when the page ends exactly at a visit/work boundary.
@@ -2274,9 +2369,9 @@ impl FlushBuffer {
             existing.value = value.clone();
             return true;
         }
-        if self.record_count() >= self.max_records {
+        let Some(record) = self.record_budget.reserve(1) else {
             return false;
-        }
+        };
         let Some(local) = self.local_budget.reserve(bytes) else {
             return false;
         };
@@ -2289,6 +2384,7 @@ impl FlushBuffer {
                 value: value.clone(),
                 local,
                 aggregate,
+                _record: record,
             },
         );
         true
@@ -2337,6 +2433,10 @@ impl FragmentState {
         self.cache.write().await
     }
 }
+
+#[cfg(test)]
+#[path = "fragment_persistence_tests.rs"]
+mod persistence_limit_tests;
 
 #[cfg(test)]
 mod flush_tests {
