@@ -86,10 +86,18 @@ reply port for reply-bearing calls and is surfaced as an actor/network
 failure, not backpressure. Fire-and-forget actor messages have no result
 channel to report that failure.
 
-Local `put_multi` / `get_multi` fan-out is issued in windows of at most 1024
+Local `put_multi` fan-out is issued in windows of at most the smaller of 1024
+and `embedded_operation_capacity`; `get_multi` uses windows of at most 1024
 calls. This is a pre-admission bound: it prevents an arbitrary caller vector
 from queueing without limit in the shared dispatcher mailbox, while every item
 still consumes its normal pool token and exact worker-generation reservation.
+An already-admitted local write batch waits fairly for its point-completion
+slots, bounded by `local_work_timeout` and shutdown. It does not reserve a set
+of slots permanently or overload itself when a previous reply wakes before
+its completion owner releases the slot. External point and whole-batch
+count/byte admission remain nonwaiting. A point which times out before slot
+admission reports backpressure and does not apply; an already-submitted
+mutation retains its exact completion ownership after its user waiter ends.
 Remote `BatchGet` uses one aggregate continuation but admits only its next
 ordered key. A worker releases the completed reservation before the
 continuation can reserve another, and exact encoded-byte sizing stops before

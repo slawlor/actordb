@@ -2685,7 +2685,7 @@ impl Node {
                     .collect()
             }
         };
-        let retention = match self.embedded_operations.admit_owned(
+        let retention = match self.embedded_operations.admit_batch_owned(
             embedded_operations::batch_put_request_bytes(&kvs),
             Some(operation.clone()),
         ) {
@@ -2727,8 +2727,10 @@ impl Node {
         // active/worker-queued work, not an arbitrary backlog already sitting
         // in the shared dispatcher mailbox.
         let mut local = local.into_iter();
+        let local_window =
+            MAX_LOCAL_BATCH_IN_FLIGHT.min(self.runtime_options.embedded_operation_capacity());
         loop {
-            let chunk: Vec<_> = local.by_ref().take(MAX_LOCAL_BATCH_IN_FLIGHT).collect();
+            let chunk: Vec<_> = local.by_ref().take(local_window).collect();
             if chunk.is_empty() {
                 break;
             }
