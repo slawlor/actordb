@@ -92,15 +92,17 @@ impl CheckpointRecord {
         let fragment = u32::from_be_bytes(fragment.try_into().unwrap());
         let physical = std::str::from_utf8(&self.key[4..])
             .map_err(|_| CheckpointError::Invalid("physical key is not UTF-8".into()))?;
+        let logical = crate::table_key::logical_record_key(physical)
+            .map_err(|error| CheckpointError::Invalid(error.into()))?;
         if fragment >= identity.fragment_count()
-            || fragment_of(physical, identity.fragment_count() as usize).0 != fragment
+            || fragment_of(logical, identity.fragment_count() as usize).0 != fragment
         {
             return Err(CheckpointError::Invalid(
                 "physical key has a different fragment layout".into(),
             ));
         }
         crate::wire::check_record_budget(
-            physical.len(),
+            logical.len(),
             self.value.value.len(),
             self.value.node_id.len(),
         )
@@ -109,24 +111,6 @@ impl CheckpointRecord {
             return Err(CheckpointError::Invalid(
                 "zero expiry is reserved by the durable/wire codecs".into(),
             ));
-        }
-        if physical.starts_with("\u{001d}actordb.table.store.v1:") {
-            let logical =
-                crate::table_key::strip_storage_prefix(&self.key[4..]).ok_or_else(|| {
-                    CheckpointError::Invalid("invalid physical table namespace".into())
-                })?;
-            let logical = std::str::from_utf8(&logical)
-                .map_err(|_| CheckpointError::Invalid("table key is not UTF-8".into()))?;
-            let table = crate::table_key::table_name(logical).ok_or_else(|| {
-                CheckpointError::Invalid("physical table record lacks logical namespace".into())
-            })?;
-            if !self.key[4..].starts_with(&crate::table_key::table_storage_prefix(&table))
-                || crate::table_key::decode_table_key(&table, logical).is_none()
-            {
-                return Err(CheckpointError::Invalid(
-                    "physical/logical table identities disagree".into(),
-                ));
-            }
         }
         Ok(())
     }
