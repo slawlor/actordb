@@ -299,17 +299,20 @@ async fn unknown_application_operation_is_explicitly_unsupported_without_closing
         receive(&mut stream).await.message,
         Some(wire::frame::Message::Auth(_))
     ));
-    send(
-        &mut stream,
-        wire::Frame {
-            message: Some(wire::frame::Message::Request(wire::Request {
-                id: 10,
-                table: "KV".into(),
-                operation: None,
-            })),
-        },
-    )
-    .await;
+    let mut request = wire::Request {
+        id: 10,
+        table: "KV".into(),
+        operation: None,
+    }
+    .encode_to_vec();
+    // Unknown request-operation field 11, empty length-delimited payload.
+    // Prost discards the field, but the server must still return Unsupported.
+    request.extend_from_slice(&[0x5a, 0]);
+    let mut frame = vec![0x1a]; // Frame.request
+    prost::encoding::encode_varint(request.len() as u64, &mut frame);
+    frame.extend_from_slice(&request);
+    stream.write_u32(frame.len() as u32).await.unwrap();
+    stream.write_all(&frame).await.unwrap();
     assert!(
         matches!(receive(&mut stream).await.message, Some(wire::frame::Message::Response(wire::Response { id: 10, error: Some(error), .. })) if error.code == wire::ErrorCode::Unsupported as i32)
     );
