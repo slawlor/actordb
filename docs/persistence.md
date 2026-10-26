@@ -164,6 +164,13 @@ deleted or migrated by these rejection paths.
 Keys in the offered RocksDB data CF are always a 4-byte big-endian fragment id
 followed by a table-store partition prefix and logical table key. Every
 Node record belongs to an explicit named table.
+Record admission uses the exact logical replicated table key. The four-byte
+fragment prefix and matched physical table-store namespace do not consume that
+wire-record allowance. RocksDB write/load validation and checkpoint export/import
+share the same logical-key extraction, retaining strict physical/logical table
+identity, encoded UTF-8 key and fragment-layout validation. Namespace mismatches
+are rejected, not stripped permissively. A record accepted at the wire boundary
+therefore does not become unflushable solely because durable prefixes were added.
 Values are encoded as:
 
 ```

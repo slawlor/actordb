@@ -28,7 +28,9 @@ use super::{
 /// Fragment data lives in the default column family; an independent metadata
 /// column family holds the node/layout manifest. Data operations require a
 /// live [`StoreBinding`], and physical keys must begin with their four-byte
-/// fragment id followed by the UTF-8 logical key.
+/// fragment id followed by a UTF-8 logical key, or a validated physical table
+/// prefix and its matching encoded logical table key. Record wire admission
+/// measures the logical key, not additional durable namespace bytes.
 pub struct RocksDbStore {
     db: Arc<rocksdb_engine::DBWithThreadMode<rocksdb_engine::MultiThreaded>>,
     options: RocksDbOptions,
@@ -448,8 +450,10 @@ impl RocksDbStore {
         identity: &StoreIdentity,
     ) -> Result<&'a str, StoreError> {
         let fragment = Self::validate_fragment_prefix(key, identity)?;
-        let logical_key = std::str::from_utf8(&key[4..])
+        let physical_key = std::str::from_utf8(&key[4..])
             .map_err(|error| StoreError(format!("RocksDB logical key is not UTF-8: {error}")))?;
+        let logical_key = crate::table_key::logical_record_key(physical_key)
+            .map_err(|error| StoreError(error.into()))?;
         let expected = fragment_of(logical_key, identity.fragment_count as usize);
         if expected.0 != fragment {
             return Err(StoreError(format!(
@@ -666,6 +670,191 @@ mod tests {
 
     use crate::shard::FragmentId;
     use crate::store::PrefixedStore;
+
+    fn largest_admitted_payload(key_len: usize, writer_len: usize) -> usize {
+        let mut low = 0;
+        let mut high = crate::wire::MAX_FRAME_BYTES;
+        while low < high {
+            let middle = low + (high - low).div_ceil(2);
+            if check_record_budget(key_len, middle, writer_len).is_ok() {
+                low = middle;
+            } else {
+                high = middle - 1;
+            }
+        }
+        low
+    }
+
+    #[tokio::test]
+    async fn admitted_record_boundaries_roundtrip_native_nodes_and_checkpoints() {
+        use crate::checkpoint::{CheckpointImporter, CheckpointOptions, MAX_CHUNK_BYTES};
+        use crate::node::{Node, NodeConfig};
+        for (table, writer, key_boundary) in [
+            ("KV".to_string(), "writer".to_string(), false),
+            ("T".repeat(255), "w".repeat(255), false),
+            ("T".repeat(255), "writer".to_string(), true),
+        ] {
+            let mut user_len = 1;
+            if key_boundary {
+                let namespace_len = crate::table_key::table_prefix(&table).len();
+                let mut low = 0;
+                let mut high = crate::wire::MAX_FRAME_BYTES / 2;
+                while low < high {
+                    let middle = low + (high - low).div_ceil(2);
+                    if check_record_budget(namespace_len + middle * 2, 0, writer.len()).is_ok() {
+                        low = middle;
+                    } else {
+                        high = middle - 1;
+                    }
+                }
+                user_len = low;
+            }
+            let user_key = "k".repeat(user_len);
+            let logical = crate::table_key::encode_table_key(&table, &user_key);
+            let payload_len = largest_admitted_payload(logical.len(), writer.len());
+            if key_boundary {
+                assert!(check_record_budget(logical.len() + 2, 0, writer.len()).is_err());
+            }
+            let payload = vec![7; payload_len];
+            assert!(check_record_budget(logical.len(), payload_len, writer.len()).is_ok());
+            assert!(check_record_budget(logical.len(), payload_len + 1, writer.len()).is_err());
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("source");
+            let store = Arc::new(RocksDbStore::open(&path).unwrap());
+            let node = Node::start(
+                writer.clone(),
+                "127.0.0.1:0".parse().unwrap(),
+                NodeConfig::builder()
+                    .store(store.clone())
+                    .flush_batch_size(1)
+                    .build(),
+            )
+            .await
+            .unwrap();
+            node.table(&table)
+                .unwrap()
+                .put(user_key.clone(), payload.clone())
+                .await
+                .unwrap();
+            assert_eq!(
+                node.table(&table)
+                    .unwrap()
+                    .get(user_key.clone())
+                    .await
+                    .unwrap()
+                    .map(|record| record.value),
+                Some(payload.clone())
+            );
+            node.shutdown().await.unwrap();
+            let bundle = directory.path().join("bundle");
+            let manifest = node
+                .export_checkpoint(&bundle, CheckpointOptions::new(MAX_CHUNK_BYTES, 1).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(manifest.records(), 1);
+            drop(node);
+            drop(store);
+            let reopened = Arc::new(RocksDbStore::open(&path).unwrap());
+            let node = Node::start(
+                writer.clone(),
+                "127.0.0.1:0".parse().unwrap(),
+                NodeConfig::builder().store(reopened).build(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                node.table(&table)
+                    .unwrap()
+                    .get(user_key.clone())
+                    .await
+                    .unwrap()
+                    .map(|record| record.value),
+                Some(payload.clone())
+            );
+            node.shutdown().await.unwrap();
+            let target = Arc::new(RocksDbStore::open(directory.path().join("target")).unwrap());
+            let receipt = CheckpointImporter::open(
+                target.clone(),
+                StoreIdentity::new("restored".into(), 1),
+                &bundle,
+            )
+            .unwrap()
+            .finish()
+            .unwrap();
+            assert_eq!(receipt.records(), 1);
+            let restored = Node::start(
+                "restored".into(),
+                "127.0.0.1:0".parse().unwrap(),
+                NodeConfig::builder().store(target.clone()).build(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                restored
+                    .table(&table)
+                    .unwrap()
+                    .get(user_key)
+                    .await
+                    .unwrap()
+                    .map(|record| record.value),
+                Some(payload)
+            );
+            restored.shutdown().await.unwrap();
+            let binding = target
+                .bind(&StoreIdentity::new("restored".into(), 1))
+                .unwrap();
+            let records = target.load().unwrap();
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0].1.node_id, writer);
+            drop(binding);
+        }
+    }
+
+    #[test]
+    fn mismatched_physical_namespaces_reject_writes_and_reopen_without_mutation() {
+        let directory = tempfile::tempdir().unwrap();
+        let identity = StoreIdentity::new("owner".into(), 1);
+        let value = VersionedValue::new(vec![1], 1, "writer".into());
+        let malformed = [
+            format!(
+                "{}{}",
+                String::from_utf8(crate::table_key::table_storage_prefix("A")).unwrap(),
+                crate::table_key::encode_table_key("B", "k")
+            ),
+            format!(
+                "{}{}ff",
+                String::from_utf8(crate::table_key::table_storage_prefix("A")).unwrap(),
+                crate::table_key::table_prefix("A")
+            ),
+        ];
+        for (index, key) in malformed.into_iter().enumerate() {
+            let path = directory.path().join(format!("case-{index}"));
+            let store = RocksDbStore::open(&path).unwrap();
+            let binding = store.bind(&identity).unwrap();
+            let mut physical = 0u32.to_be_bytes().to_vec();
+            physical.extend_from_slice(key.as_bytes());
+            assert!(store
+                .write_batch(&[(physical.clone(), value.clone())])
+                .is_err());
+            assert!(store.load().unwrap().is_empty());
+            assert!(crate::checkpoint::CheckpointRecord {
+                key: physical.clone(),
+                value: value.clone()
+            }
+            .validate(&identity)
+            .is_err());
+            // Inject malformed persisted bytes only into this owned test DB.
+            store
+                .db
+                .put(&physical, RocksDbStore::encode(&value))
+                .unwrap();
+            drop(binding);
+            drop(store);
+            let before = directory_snapshot(&path);
+            assert!(RocksDbStore::open(&path).is_err());
+            assert_eq!(directory_snapshot(&path), before);
+        }
+    }
 
     #[test]
     fn old_storage_formats_are_rejected_without_changing_any_database_file() {
