@@ -122,7 +122,6 @@ pub(super) async fn test_connection_context(
             dynamic_placement,
             pending_gets: Arc::new(StdMutex::new(HashMap::new())),
             pending_batch_gets: Arc::new(StdMutex::new(HashMap::new())),
-            pending_scans: Arc::new(StdMutex::new(HashMap::new())),
             pending_query_pages: Arc::new(StdMutex::new(HashMap::new())),
             query_admission: crate::query::QueryAdmission::new(),
             pending_mutations: Arc::new(StdMutex::new(HashMap::new())),

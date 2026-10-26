@@ -647,6 +647,41 @@ pub(crate) fn preflight_envelope_decode(frame: &[u8]) -> Result<(), WireDecodeEr
     }
 }
 
+/// Validate and borrow the envelope without materializing nested messages.
+/// This permits unsolicited response rejection before Prost allocates a Vec.
+/// Unknown outer messages, duplicate oneof messages, and malformed outer
+/// framing use the same fail-closed policy as the ordinary decode preflight.
+pub(crate) fn peek_envelope_message(frame: &[u8]) -> Result<(u32, &[u8]), WireDecodeError> {
+    let mut cursor = 0;
+    let mut message = None;
+    while cursor < frame.len() {
+        let key = read_varint(frame, &mut cursor)?;
+        let field = u32::try_from(key >> 3)
+            .map_err(|_| WireDecodeError::Malformed("field number overflows u32"))?;
+        let wire_type = (key & 7) as u8;
+        if field == 0 {
+            return Err(WireDecodeError::Malformed("field number is zero"));
+        }
+        if field == 1 || (5..=24).contains(&field) {
+            if message.is_some() {
+                return Err(WireDecodeError::MultipleMessages);
+            }
+            if wire_type != 2 {
+                return Err(WireDecodeError::Malformed(
+                    "envelope message has the wrong wire type",
+                ));
+            }
+            message = Some((field, take_length_delimited(frame, &mut cursor)?));
+        } else {
+            if wire_type == 2 {
+                return Err(WireDecodeError::UnsupportedMessage);
+            }
+            skip_field(frame, &mut cursor, wire_type)?;
+        }
+    }
+    message.ok_or(WireDecodeError::MissingMessage)
+}
+
 /// Exact protobuf body length, excluding the transport's four-byte prefix.
 pub(crate) fn envelope_encoded_len(envelope: &Envelope) -> usize {
     envelope.encoded_len()
@@ -1021,6 +1056,28 @@ mod tests {
         push_varint(payload.len() as u64, &mut frame);
         frame.extend_from_slice(payload);
         frame
+    }
+
+    #[test]
+    fn borrowed_envelope_identity_validates_outer_framing_without_nested_decode() {
+        let invalid_nested = raw_envelope(22, &[0]);
+        let (field, payload) = peek_envelope_message(&invalid_nested).unwrap();
+        assert_eq!(field, 22);
+        assert_eq!(payload, [0]);
+        assert!(Envelope::decode(invalid_nested.as_slice()).is_err());
+        for frame in [
+            Vec::new(),
+            vec![178, 1, 1],
+            vec![176, 1, 0],
+            vec![178, 1, 0, 178, 1, 0],
+            vec![178, 1, 0, 202, 1, 0],
+        ] {
+            assert!(peek_envelope_message(&frame).is_err());
+        }
+        // Scalar unknown outer fields retain the existing skip policy.
+        let mut frame = vec![24, 7];
+        frame.extend_from_slice(&raw_envelope(21, &[]));
+        assert_eq!(peek_envelope_message(&frame).unwrap(), (21, &[][..]));
     }
 
     #[test]

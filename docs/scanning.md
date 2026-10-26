@@ -146,10 +146,15 @@ next holder, exactly like `ForwardedGet`.
 
 ### Wire size
 
-The scan response is a single envelope per fragment, so the
-per-fragment `limit` is also the wire-size safety: `limit` × average
-value size must stay comfortably under the 16 MiB frame cap. Keep limits
-tight and prefer `KeyOnly`/`PrefixBytes` transforms for wide scans.
+`Node::scan` coordinates bounded local or remote query pages, with an aggregate
+16 MiB result-storage allowance and a one-million-record work allowance.
+Prefer `KeyOnly`/`PrefixBytes` transforms for wide scans. The separate raw peer
+`ScanRequest` service still emits a single bounded `ScanResponse`; Nodes never
+originate that request family themselves. All incoming peer `ScanResponse`
+envelopes are therefore unsolicited and discarded after validating their outer
+message structure, before decoding matches or error metadata. A healthy
+session remains usable for subsequent requests. See
+[backpressure](backpressure.md) for the independent raw receive-body budget.
 
 ## Future work
 

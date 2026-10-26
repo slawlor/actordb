@@ -8,14 +8,14 @@
 //!
 //! The client talks to any one node; that node coordinates the whole scan.
 //! For each fragment the coordinator scans in-process when it holds the
-//! fragment locally (via `KvMessage::Scan` on the fragment's background
-//! pool), and otherwise forwards a `ScanRequest` to one replica holder from
+//! fragment locally through bounded query pages on the fragment's background
+//! pool, and otherwise forwards `QueryPageRequest` to one replica holder from
 //! `replica_order(frag)` — the same pattern as `ForwardedGet`. Holders are
 //! retried in order on failure; exactly one holder is contacted per
 //! fragment, so replicas (which converge via LWW) never double-count.
 //!
 //! If no holder is reachable for a fragment, the whole scan fails naming
-//! the fragment ([`ScanError::FragmentsUnavailable`]). v1 never returns
+//! the fragment ([`ScanError::FragmentsUnavailable`]). Scans never return
 //! silent partial results.
 //!
 //! The default configuration is **full replication** (no `fragment_map`),
@@ -25,8 +25,10 @@
 //! ## Wire size
 //!
 //! Embedded scans use bounded query pages with a 16 MiB aggregate result
-//! budget and a one-million-record work budget. Compatibility peer requests
-//! also execute bounded pages before encoding their single response. Wide
+//! budget and a one-million-record work budget. Inbound raw peer `ScanRequest`
+//! also executes bounded pages before encoding its single response. Nodes do
+//! not originate `ScanRequest`, so incoming `ScanResponse` is always unsolicited
+//! and discarded before protobuf decoding. Wide
 //! replies fail completely; prefer `KeyOnly`/`PrefixBytes` transforms.
 //!
 //! ## Consistency

@@ -176,6 +176,20 @@ decoded/actor/cache/relay/caller copies, kernel socket buffers, or total heap
 use. `with_receive_byte_capacity` configures this encoded-body budget and must
 fit at least one maximum frame. Request execution remains inline.
 
+Nodes coordinate scans with bounded `QueryPageRequest`/`QueryPageResponse`
+pages; they never originate peer `ScanRequest`. Consequently every incoming
+peer `ScanResponse` is unsolicited. After checking the complete outer envelope
+identity, length, and oneof structure, an established connection discards that
+borrowed response body **before Prost decoding**: no match Vec, row headers,
+keys, values, or error string are materialized. This also avoids tiny-row
+decoded-object amplification without adding an unused pending registry or
+runtime allowance. Before handshake establishment, application responses still
+fail closed; malformed/duplicate/unsupported outer envelopes also fail closed.
+Raw receive-body allocation remains covered by the independent budget above.
+Inbound `ScanRequest` serving and its bounded outgoing `ScanResponse` remain
+supported, and discarding an unsolicited response does not close a healthy
+session or interrupt subsequent requests.
+
 Non-serving nodes also have aggregate, node-wide relay admission: 1024 live
 read/mutation relays and 64 MiB of retained request-key storage by default,
 configured with `with_relay_capacity` and `with_relay_key_byte_capacity`.
