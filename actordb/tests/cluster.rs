@@ -6141,7 +6141,9 @@ async fn session_started_before_actor_installation_survives_placement_race() {
         }
     }
     assert_eq!(
-        node.get(batch.ops[0].key.clone())
+        // The wire operation uses a physical key; the public Node API takes
+        // the original literal, not an already-qualified internal address.
+        node.get("early-session-key".to_string())
             .await
             .unwrap()
             .unwrap()

@@ -2149,17 +2149,13 @@ impl NodeConfig {
 }
 
 impl Node {
-    /// Normalize direct node operations into the built-in `KV` named table.
-    /// Table views pass already-qualified logical keys through unchanged.
+    /// Encode a public literal into KV. Internal qualification is selected by
+    /// private entrypoint, never by recognizing authority in String syntax.
     fn qualify_key(key: String) -> String {
-        if crate::table_key::table_name(&key).is_some() {
-            key
-        } else {
-            let original_capacity = key.capacity();
-            let mut encoded = crate::table_key::encode_table_key("KV", &key);
-            encoded.reserve(original_capacity);
-            encoded
-        }
+        let original_capacity = key.capacity();
+        let mut encoded = crate::table_key::encode_table_key("KV", &key);
+        encoded.reserve(original_capacity);
+        encoded
     }
 
     /// Aggregate encoded-body reservations and saturation across all peers.
@@ -2275,13 +2271,7 @@ impl Node {
     /// supersession are typed errors. `Ok` does not force a persistence flush
     /// or await asynchronous fan-out to the other replicas.
     pub async fn put(&self, key: String, value: Vec<u8>) -> Result<(), NodeError> {
-        let key = Self::qualify_key(key);
-        let operation = self.admit_key_operation(&key)?;
-        let retention = self.embedded_operations.admit_owned(
-            embedded_operations::single_request_bytes(&key, Some(&value)),
-            Some(operation.clone()),
-        )?;
-        self.put_with_ttl_and_priority(key, value, None, OpPriority::Default, retention)
+        self.put_qualified_with_options(Self::qualify_key(key), value, None, OpPriority::Default)
             .await
     }
 
@@ -2299,13 +2289,7 @@ impl Node {
         value: Vec<u8>,
         priority: OpPriority,
     ) -> Result<(), NodeError> {
-        let key = Self::qualify_key(key);
-        let operation = self.admit_key_operation(&key)?;
-        let retention = self.embedded_operations.admit_owned(
-            embedded_operations::single_request_bytes(&key, Some(&value)),
-            Some(operation.clone()),
-        )?;
-        self.put_with_ttl_and_priority(key, value, None, priority, retention)
+        self.put_qualified_with_options(Self::qualify_key(key), value, None, priority)
             .await
     }
 
@@ -2317,7 +2301,17 @@ impl Node {
         ttl: Option<Duration>,
         priority: OpPriority,
     ) -> Result<(), NodeError> {
-        let key = Self::qualify_key(key);
+        self.put_qualified_with_options(Self::qualify_key(key), value, ttl, priority)
+            .await
+    }
+
+    pub(super) async fn put_qualified_with_options(
+        &self,
+        key: String,
+        value: Vec<u8>,
+        ttl: Option<Duration>,
+        priority: OpPriority,
+    ) -> Result<(), NodeError> {
         let operation = self.admit_key_operation(&key)?;
         let retention = self.embedded_operations.admit_owned(
             embedded_operations::single_request_bytes(&key, Some(&value)),
@@ -2396,13 +2390,7 @@ impl Node {
         value: Vec<u8>,
         ttl: Option<Duration>,
     ) -> Result<(), NodeError> {
-        let key = Self::qualify_key(key);
-        let operation = self.admit_key_operation(&key)?;
-        let retention = self.embedded_operations.admit_owned(
-            embedded_operations::single_request_bytes(&key, Some(&value)),
-            Some(operation.clone()),
-        )?;
-        self.put_with_ttl_and_priority(key, value, ttl, OpPriority::Default, retention)
+        self.put_qualified_with_options(Self::qualify_key(key), value, ttl, OpPriority::Default)
             .await
     }
 
@@ -2411,8 +2399,8 @@ impl Node {
     /// tombstones so deletes survive node restarts and re-joins. A later
     /// `put` with a higher timestamp resurrects the key.
     pub async fn delete(&self, key: String) -> Result<(), NodeError> {
-        let key = Self::qualify_key(key);
-        self.delete_with_priority(key, OpPriority::Default).await
+        self.delete_qualified_with_priority(Self::qualify_key(key), OpPriority::Default)
+            .await
     }
 
     /// Delete a key through the selected priority pool.
@@ -2421,7 +2409,15 @@ impl Node {
         key: String,
         priority: OpPriority,
     ) -> Result<(), NodeError> {
-        let key = Self::qualify_key(key);
+        self.delete_qualified_with_priority(Self::qualify_key(key), priority)
+            .await
+    }
+
+    pub(super) async fn delete_qualified_with_priority(
+        &self,
+        key: String,
+        priority: OpPriority,
+    ) -> Result<(), NodeError> {
         let operation = self.admit_key_operation(&key)?;
         let retention = self.embedded_operations.admit_owned(
             embedded_operations::single_request_bytes(&key, None),
@@ -2464,13 +2460,7 @@ impl Node {
     /// the configured replica holders in placement order. An unavailable
     /// holder is distinct from a valid not-found response.
     pub async fn get(&self, key: String) -> Result<Option<VersionedValue>, NodeError> {
-        let key = Self::qualify_key(key);
-        let operation = self.admit_key_operation(&key)?;
-        let retention = self.embedded_operations.admit_owned(
-            embedded_operations::single_request_bytes(&key, None),
-            Some(operation.clone()),
-        )?;
-        self.get_with_priority_admitted(key, OpPriority::Default, retention)
+        self.get_qualified_with_priority(Self::qualify_key(key), OpPriority::Default)
             .await
     }
 
@@ -2486,7 +2476,15 @@ impl Node {
         key: String,
         priority: OpPriority,
     ) -> Result<Option<VersionedValue>, NodeError> {
-        let key = Self::qualify_key(key);
+        self.get_qualified_with_priority(Self::qualify_key(key), priority)
+            .await
+    }
+
+    pub(super) async fn get_qualified_with_priority(
+        &self,
+        key: String,
+        priority: OpPriority,
+    ) -> Result<Option<VersionedValue>, NodeError> {
         let operation = self.admit_key_operation(&key)?;
         let retention = self.embedded_operations.admit_owned(
             embedded_operations::single_request_bytes(&key, None),
@@ -2634,14 +2632,16 @@ impl Node {
         })??;
         // Hide tombstones from user reads (sync needs them, users don't), and
         // present the built-in KV table's keys in its user-facing form.
-        Ok(all
-            .into_iter()
-            .filter(|(_, v)| !v.is_tombstone)
-            .map(|(key, value)| {
-                let key = crate::table_key::decode_table_key("KV", &key).unwrap_or(key);
-                (key, value)
-            })
-            .collect())
+        let mut displayed = HashMap::new();
+        for (key, value) in all.into_iter().filter(|(_, value)| !value.is_tombstone) {
+            let key = crate::table_key::decode_table_key("KV", &key).unwrap_or(key);
+            if displayed.insert(key, value).is_some() {
+                return Err(NodeError::Codec(
+                    "ambiguous all-table display key; use per-table queries".into(),
+                ));
+            }
+        }
+        Ok(displayed)
     }
 
     /// Put multiple keys with an explicit priority (Phase 7). Bulk
@@ -2668,6 +2668,14 @@ impl Node {
             .into_iter()
             .map(|(key, value)| (Self::qualify_key(key), value))
             .collect();
+        self.put_multi_qualified_with_priority(kvs, priority).await
+    }
+
+    pub(super) async fn put_multi_qualified_with_priority(
+        &self,
+        kvs: Vec<(String, Vec<u8>)>,
+        priority: OpPriority,
+    ) -> Vec<Result<(), NodeError>> {
         let operation = match self.admit_batch_operation(kvs.iter().map(|(key, _)| key.as_str())) {
             Ok(operation) => operation,
             Err(_) => {
@@ -2917,27 +2925,7 @@ impl Node {
     /// explicit priority. Local and remote keys both return exact per-key
     /// outcomes from the serving fragment.
     pub async fn put_multi(&self, kvs: Vec<(String, Vec<u8>)>) -> Vec<Result<(), NodeError>> {
-        let kvs: Vec<(String, Vec<u8>)> = kvs
-            .into_iter()
-            .map(|(key, value)| (Self::qualify_key(key), value))
-            .collect();
-        let operation = match self.admit_batch_operation(kvs.iter().map(|(key, _)| key.as_str())) {
-            Ok(operation) => operation,
-            Err(_) => {
-                return kvs
-                    .into_iter()
-                    .map(|_| Err(NodeError::ShuttingDown))
-                    .collect()
-            }
-        };
-        let retention = match self.embedded_operations.admit_owned(
-            embedded_operations::batch_put_request_bytes(&kvs),
-            Some(operation.clone()),
-        ) {
-            Ok(retention) => retention,
-            Err(error) => return embedded_operations::reject_batch(kvs, error),
-        };
-        self.put_multi_with_priority_admitted(kvs, OpPriority::Background, retention)
+        self.put_multi_with_priority(kvs, OpPriority::Background)
             .await
     }
 
@@ -2966,6 +2954,14 @@ impl Node {
         priority: OpPriority,
     ) -> Vec<Result<Option<VersionedValue>, NodeError>> {
         let keys: Vec<String> = keys.into_iter().map(Self::qualify_key).collect();
+        self.get_multi_qualified_with_priority(keys, priority).await
+    }
+
+    pub(super) async fn get_multi_qualified_with_priority(
+        &self,
+        keys: Vec<String>,
+        priority: OpPriority,
+    ) -> Vec<Result<Option<VersionedValue>, NodeError>> {
         let operation = match self.admit_batch_operation(keys.iter().map(String::as_str)) {
             Ok(operation) => operation,
             Err(_) => {
@@ -3192,24 +3188,7 @@ impl Node {
         &self,
         keys: Vec<String>,
     ) -> Vec<Result<Option<VersionedValue>, NodeError>> {
-        let keys: Vec<String> = keys.into_iter().map(Self::qualify_key).collect();
-        let operation = match self.admit_batch_operation(keys.iter().map(String::as_str)) {
-            Ok(operation) => operation,
-            Err(_) => {
-                return keys
-                    .into_iter()
-                    .map(|_| Err(NodeError::ShuttingDown))
-                    .collect()
-            }
-        };
-        let retention = match self.embedded_operations.admit_owned(
-            embedded_operations::batch_get_request_bytes(&keys),
-            Some(operation.clone()),
-        ) {
-            Ok(retention) => retention,
-            Err(error) => return embedded_operations::reject_batch(keys, error),
-        };
-        self.get_multi_with_priority_admitted(keys, OpPriority::Background, retention)
+        self.get_multi_with_priority(keys, OpPriority::Background)
             .await
     }
 

@@ -34,6 +34,8 @@ pub fn hash_key(key: &[u8]) -> u64 {
 
 /// The fragment owning `key`. `frag_count` must match the cluster's
 /// configured fragment count (see `NodeConfig.fragment_count`).
+/// This recognizes physical table/storage namespace encoding. For a public
+/// Node literal key (including namespace-looking text), use [`fragment_of_literal`].
 ///
 /// # Panics
 ///
@@ -41,6 +43,13 @@ pub fn hash_key(key: &[u8]) -> u64 {
 pub fn fragment_of(key: &str, frag_count: usize) -> FragmentId {
     assert!(frag_count > 0, "fragment count must be non-zero");
     FragmentId((crate::table_key::routing_hash(key) % frag_count as u64) as u32)
+}
+
+/// Owning fragment for a literal public Node key. Does not interpret String
+/// syntax as an internal namespace. Panics when `frag_count` is zero.
+pub fn fragment_of_literal(key: &str, frag_count: usize) -> FragmentId {
+    assert!(frag_count > 0, "fragment count must be non-zero");
+    FragmentId((hash_key(key.as_bytes()) % frag_count as u64) as u32)
 }
 
 #[cfg(test)]

@@ -60,6 +60,12 @@ pub(crate) fn decode_table_key(name: &str, key: &str) -> Option<String> {
     String::from_utf8(decode_hex(encoded)?).ok()
 }
 
+pub(crate) fn decode_table_prefix(name: &str, prefix: &[u8]) -> Option<Vec<u8>> {
+    let namespace = table_prefix(name);
+    let encoded = std::str::from_utf8(prefix).ok()?.strip_prefix(&namespace)?;
+    decode_hex(encoded)
+}
+
 /// Return the table identity embedded in a logical key.
 pub(crate) fn table_name(key: &str) -> Option<String> {
     let encoded = key.strip_prefix(TABLE_PREFIX_MARKER)?;

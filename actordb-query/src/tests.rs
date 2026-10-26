@@ -81,6 +81,39 @@ fn projection_value_contract_covers_metadata_ranges_and_nullable_aggregates() {
 }
 
 #[test]
+fn namespace_limits_are_bounded_and_do_not_change_default_user_limits() {
+    assert!(QueryLimits::for_namespace_encoding(1025).is_err());
+    let limits = QueryLimits::for_namespace_encoding(40).unwrap();
+    assert_eq!(QueryLimits::default().max_predicates(), 32);
+    assert_eq!(QueryLimits::default().max_literal_bytes(), 16384);
+    assert_eq!(QueryLimits::default().max_sql_bytes(), 65536);
+    let large = "k".repeat(MAX_QUERY_LITERAL_BYTES + 1);
+    let sql = format!("SELECT key FROM kv WHERE key = '{large}'");
+    assert!(parse(&sql).is_err());
+    assert!(parse_with_limits(&sql, limits).is_ok());
+    let mut plan = parse("SELECT key FROM kv").unwrap();
+    plan.predicates = std::iter::repeat_n(KeyPredicate::GreaterOrEqual("a".into()), 33).collect();
+    assert!(plan.validate().is_err());
+    assert!(plan.validate_with_limits(limits).is_ok());
+}
+
+#[test]
+fn maximum_user_predicates_with_fragment_scope_round_trip_canonically() {
+    let mut plan = parse("SELECT COUNT(*) FROM kv").unwrap();
+    plan.metadata_predicates = std::iter::repeat_n(
+        MetadataPredicate::Tombstone(MetadataOp::Equal, false),
+        MAX_QUERY_EXPRESSIONS,
+    )
+    .collect();
+    plan.fragments = Some(vec![0, 3]);
+    plan.validate().unwrap();
+    assert_eq!(parse(&plan.to_sql()).unwrap(), plan);
+    let mut aggregate = QueryAccumulator::new(&plan);
+    aggregate.push("row", b"value", 0).unwrap();
+    assert_eq!(aggregate.finish().rows, vec![vec![QueryValue::Integer(1)]]);
+}
+
+#[test]
 fn parameters_are_typed_literals_and_fragment_scopes_intersect() {
     let plan = parse_with_params(
         "select key, value, frag, PREFIX_BYTES(value, ?), OCTET_LENGTH(value) from kv \
@@ -476,18 +509,31 @@ fn invalid_programmatic_aggregate_shapes_fail_validation() {
 }
 
 #[test]
-fn bound_plans_must_fit_the_portable_canonical_sql_limit() {
+fn bound_plan_serialization_is_bounded_independently_of_raw_sql() {
     let bound = vec![QueryValue::Text("'".repeat(MAX_QUERY_LITERAL_BYTES)); 3];
-    assert!(matches!(
-        parse_with_params(
-            "SELECT key FROM kv WHERE key = ? AND key = ? AND key = ?",
-            &bound
-        ),
-        Err(QueryError::ResourceLimit {
-            resource: "canonical SQL bytes",
-            ..
-        })
-    ));
+    let plan = parse_with_params(
+        "SELECT key FROM kv WHERE key = ? AND key = ? AND key = ?",
+        &bound,
+    )
+    .unwrap();
+    assert!(plan.to_sql().len() > MAX_SQL_BYTES);
+    assert!(parse(&plan.to_sql()).is_err());
+    assert_eq!(
+        parse_with_limits(&plan.to_sql(), QueryLimits::for_plan_serialization()).unwrap(),
+        plan
+    );
+    let sql = format!(
+        "SELECT key FROM kv WHERE {}",
+        std::iter::repeat_n("key = ?", MAX_QUERY_EXPRESSIONS)
+            .collect::<Vec<_>>()
+            .join(" AND ")
+    );
+    let params = vec![QueryValue::Text("x".repeat(MAX_QUERY_LITERAL_BYTES)); MAX_QUERY_EXPRESSIONS];
+    let plan = parse_with_params(&sql, &params).unwrap();
+    assert_eq!(
+        parse_with_limits(&plan.to_sql(), QueryLimits::for_plan_serialization()).unwrap(),
+        plan
+    );
 }
 
 #[test]

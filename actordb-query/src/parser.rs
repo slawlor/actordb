@@ -1,7 +1,7 @@
 use crate::{
     check_len, AggregateFunction, AggregateInput, KeyPredicate, MetadataOp, MetadataPredicate,
-    Projection, QueryError, QueryPlan, QueryValue, MAX_QUERY_EXPRESSIONS, MAX_QUERY_FRAGMENTS,
-    MAX_QUERY_LITERAL_BYTES, MAX_QUERY_TOKENS, MAX_SQL_BYTES,
+    Projection, QueryError, QueryLimits, QueryPlan, QueryValue, MAX_QUERY_EXPRESSIONS,
+    MAX_QUERY_FRAGMENTS, MAX_QUERY_TOKENS,
 };
 
 /// Parse one literal SQL statement. An optional terminal semicolon is accepted;
@@ -15,15 +15,31 @@ pub fn parse(sql: &str) -> Result<QueryPlan, QueryError> {
 /// Every parameter must be consumed exactly once. Bound values never become SQL
 /// syntax and canonical serialization escapes them as literals.
 pub fn parse_with_params(sql: &str, params: &[QueryValue]) -> Result<QueryPlan, QueryError> {
-    check_len("SQL bytes", sql.len(), MAX_SQL_BYTES)?;
+    parse_with_params_and_limits(sql, params, QueryLimits::default())
+}
+
+/// Parse an execution representation with bounded syntax allowances.
+pub fn parse_with_limits(sql: &str, limits: QueryLimits) -> Result<QueryPlan, QueryError> {
+    parse_with_params_and_limits(sql, &[], limits)
+}
+
+/// Parse and bind with bounded execution allowances. This is not validation
+/// of a decoded logical client plan when namespace allowances are selected.
+pub fn parse_with_params_and_limits(
+    sql: &str,
+    params: &[QueryValue],
+    limits: QueryLimits,
+) -> Result<QueryPlan, QueryError> {
+    check_len("SQL bytes", sql.len(), limits.max_sql_bytes())?;
     check_len("parameters", params.len(), MAX_QUERY_TOKENS)?;
-    let tokens = tokenize(sql)?;
+    let tokens = tokenize(sql, limits)?;
     Parser {
         tokens,
         cursor: 0,
         sql_len: sql.len(),
         params,
         param_cursor: 0,
+        limits,
     }
     .plan()
 }
@@ -53,7 +69,7 @@ struct Token {
     offset: usize,
 }
 
-fn tokenize(sql: &str) -> Result<Vec<Token>, QueryError> {
+fn tokenize(sql: &str, limits: QueryLimits) -> Result<Vec<Token>, QueryError> {
     let bytes = sql.as_bytes();
     let mut offset = 0;
     let mut tokens = Vec::new();
@@ -112,10 +128,10 @@ fn tokenize(sql: &str) -> Result<Vec<Token>, QueryError> {
                     (false, false) => Kind::Greater,
                 }
             }
-            b'\'' => Kind::Text(quoted(sql, &mut offset, MAX_QUERY_LITERAL_BYTES)?),
+            b'\'' => Kind::Text(quoted(sql, &mut offset, limits.max_literal_bytes())?),
             b'x' | b'X' if bytes.get(offset + 1) == Some(&b'\'') => {
                 offset += 1;
-                let hex = quoted(sql, &mut offset, MAX_QUERY_LITERAL_BYTES * 2)?;
+                let hex = quoted(sql, &mut offset, limits.max_literal_bytes() * 2)?;
                 if hex.len() % 2 != 0 || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
                     return Err(parse_error(
                         start,
@@ -211,6 +227,7 @@ struct Parser<'a> {
     sql_len: usize,
     params: &'a [QueryValue],
     param_cursor: usize,
+    limits: QueryLimits,
 }
 
 impl Parser<'_> {
@@ -252,7 +269,9 @@ impl Parser<'_> {
             let mut expressions = 0;
             loop {
                 expressions += 1;
-                check_len("predicates", expressions, MAX_QUERY_EXPRESSIONS)?;
+                // A fragment scope is independently bounded and canonicalizes
+                // to one clause in addition to the key/metadata predicates.
+                check_len("WHERE terms", expressions, self.limits.max_predicates() + 1)?;
                 self.predicate(&mut plan)?;
                 if !self.eat_word("AND") {
                     break;
@@ -284,7 +303,7 @@ impl Parser<'_> {
                 "aggregates cannot have ORDER BY or OFFSET".into(),
             ));
         }
-        plan.validate()?;
+        plan.validate_with_limits(self.limits)?;
         Ok(plan)
     }
 
@@ -377,7 +396,11 @@ impl Parser<'_> {
                 QueryValue::Bytes(bytes) => bytes,
                 _ => return Err(self.error("key prefixes require a text or bytes literal")),
             };
-            check_len("literal bytes", bytes.len(), MAX_QUERY_LITERAL_BYTES)?;
+            check_len(
+                "literal bytes",
+                bytes.len(),
+                self.limits.max_literal_bytes(),
+            )?;
             self.expect(&Kind::Right)?;
             plan.predicates.push(KeyPredicate::Prefix(bytes));
             return Ok(());
@@ -396,7 +419,7 @@ impl Parser<'_> {
                 QueryValue::Text(text) => text,
                 _ => return Err(self.error("key comparisons require text literals")),
             };
-            check_len("literal bytes", text.len(), MAX_QUERY_LITERAL_BYTES)?;
+            check_len("literal bytes", text.len(), self.limits.max_literal_bytes())?;
             let predicate = match comparison {
                 Kind::Equal => KeyPredicate::Equal(text),
                 Kind::Less => KeyPredicate::LessThan(text),
@@ -550,11 +573,13 @@ impl Parser<'_> {
                 // Check before cloning application-provided values.
                 match value {
                     QueryValue::Text(text) => {
-                        check_len("literal bytes", text.len(), MAX_QUERY_LITERAL_BYTES)?
+                        check_len("literal bytes", text.len(), self.limits.max_literal_bytes())?
                     }
-                    QueryValue::Bytes(bytes) => {
-                        check_len("literal bytes", bytes.len(), MAX_QUERY_LITERAL_BYTES)?
-                    }
+                    QueryValue::Bytes(bytes) => check_len(
+                        "literal bytes",
+                        bytes.len(),
+                        self.limits.max_literal_bytes(),
+                    )?,
                     _ => {}
                 }
                 Ok(value.clone())

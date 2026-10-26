@@ -214,6 +214,7 @@ pub struct QueryPageWork {
     pub(crate) plan: Arc<QueryPlan>,
     pub(crate) request: QueryPageRequest,
     pub(crate) retention: Option<Arc<QueryRetention>>,
+    pub(crate) validation_limits: actordb_query::QueryLimits,
 }
 impl QueryPageWork {
     /// Construct a low-level bounded page request. Runtime validates every limit.
@@ -222,8 +223,78 @@ impl QueryPageWork {
             plan,
             request,
             retention: None,
+            validation_limits: actordb_query::QueryLimits::default(),
         }
     }
+    pub(crate) fn physical(
+        plan: Arc<QueryPlan>,
+        request: QueryPageRequest,
+    ) -> Result<Self, QueryExecutionError> {
+        let validation_limits = validate_physical_plan(&plan)?;
+        Ok(Self {
+            plan,
+            request,
+            retention: None,
+            validation_limits,
+        })
+    }
+}
+
+/// Physical peer SQL retains encoded-key semantics. Validate its bounded
+/// representation and decoded logical plan, rather than granting larger user
+/// inputs merely because execution adds a namespace.
+pub(crate) fn validate_physical_plan(
+    plan: &QueryPlan,
+) -> Result<actordb_query::QueryLimits, QueryExecutionError> {
+    use actordb_query::KeyPredicate;
+    let table = plan.table.to_ascii_uppercase();
+    let prefix = crate::table_key::table_prefix(&table);
+    let limits = actordb_query::QueryLimits::for_namespace_encoding(prefix.len())?;
+    plan.validate_with_limits(limits)?;
+    let mut logical = plan.clone();
+    let mut namespace_removed = false;
+    logical.predicates = plan
+        .predicates
+        .iter()
+        .filter_map(|predicate| {
+            Some(match predicate {
+                KeyPredicate::Prefix(bytes)
+                    if bytes.as_slice() == prefix.as_bytes() && !namespace_removed =>
+                {
+                    namespace_removed = true;
+                    return None;
+                }
+                KeyPredicate::Prefix(bytes) => KeyPredicate::Prefix(
+                    crate::table_key::decode_table_prefix(&table, bytes)
+                        .unwrap_or_else(|| bytes.clone()),
+                ),
+                KeyPredicate::Equal(key) => KeyPredicate::Equal(
+                    crate::table_key::decode_table_key(&table, key).unwrap_or_else(|| key.clone()),
+                ),
+                KeyPredicate::LessThan(key) => KeyPredicate::LessThan(
+                    crate::table_key::decode_table_key(&table, key).unwrap_or_else(|| key.clone()),
+                ),
+                KeyPredicate::LessOrEqual(key) => KeyPredicate::LessOrEqual(
+                    crate::table_key::decode_table_key(&table, key).unwrap_or_else(|| key.clone()),
+                ),
+                KeyPredicate::GreaterThan(key) => KeyPredicate::GreaterThan(
+                    crate::table_key::decode_table_key(&table, key).unwrap_or_else(|| key.clone()),
+                ),
+                KeyPredicate::GreaterOrEqual(key) => KeyPredicate::GreaterOrEqual(
+                    crate::table_key::decode_table_key(&table, key).unwrap_or_else(|| key.clone()),
+                ),
+            })
+        })
+        .collect();
+    logical.validate()?;
+    Ok(limits)
+}
+
+pub(crate) fn parse_physical_plan(sql: &str) -> Result<QueryPlan, QueryExecutionError> {
+    let limits = actordb_query::QueryLimits::for_namespace_encoding(1024)?;
+    let plan = actordb_query::parse_with_limits(sql, limits)?;
+    validate_physical_plan(&plan)?;
+    Ok(plan)
 }
 
 pub(crate) fn value_to_cell(value: QueryValue) -> QueryCell {
@@ -475,6 +546,40 @@ mod key_bound_tests {
     use super::*;
     use actordb_query::{KeyPredicate, Projection};
     use std::collections::BTreeSet;
+
+    #[test]
+    fn physical_allowances_require_a_valid_decoded_user_plan() {
+        let mut plan = actordb_query::parse("SELECT key FROM kv").unwrap();
+        let key = crate::table_key::encode_table_key("KV", "a");
+        plan.predicates =
+            std::iter::repeat_n(KeyPredicate::GreaterOrEqual(key.clone()), 33).collect();
+        assert!(
+            parse_physical_plan(&plan.to_sql()).is_err(),
+            "no grant of a 33rd user predicate"
+        );
+        plan.predicates.pop();
+        plan.predicates.push(KeyPredicate::Prefix(
+            crate::table_key::table_prefix("KV").into_bytes(),
+        ));
+        assert!(parse_physical_plan(&plan.to_sql()).is_ok());
+        let oversized = "x".repeat(actordb_query::MAX_QUERY_LITERAL_BYTES + 1);
+        plan.predicates = vec![
+            KeyPredicate::Equal(crate::table_key::encode_table_key("KV", &oversized)),
+            KeyPredicate::Prefix(crate::table_key::table_prefix("KV").into_bytes()),
+        ];
+        assert!(
+            parse_physical_plan(&plan.to_sql()).is_err(),
+            "no grant of a larger logical literal"
+        );
+        plan.predicates = vec![KeyPredicate::Equal(crate::table_key::encode_table_key(
+            "USERS",
+            &"x".repeat(10000),
+        ))];
+        assert!(
+            parse_physical_plan(&plan.to_sql()).is_err(),
+            "expanded key must belong to its declared table"
+        );
+    }
 
     #[test]
     fn conjunctive_bounds_select_exact_range_and_binary_prefixes() {

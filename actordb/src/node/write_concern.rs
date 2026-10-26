@@ -52,7 +52,24 @@ impl Node {
         priority: OpPriority,
         options: WriteConcernOptions,
     ) -> Result<WriteConcernReceipt, WriteConcernError> {
-        let key = Self::qualify_key(key);
+        self.put_qualified_with_write_concern_options(
+            Self::qualify_key(key),
+            value,
+            ttl,
+            priority,
+            options,
+        )
+        .await
+    }
+
+    pub(super) async fn put_qualified_with_write_concern_options(
+        &self,
+        key: String,
+        value: Vec<u8>,
+        ttl: Option<Duration>,
+        priority: OpPriority,
+        options: WriteConcernOptions,
+    ) -> Result<WriteConcernReceipt, WriteConcernError> {
         let operation = self.admit_key_operation(&key)?;
         let retention = self.embedded_operations.admit_owned(
             embedded_operations::single_concern_request_bytes(&key, Some(&value)),
@@ -108,7 +125,16 @@ impl Node {
         priority: OpPriority,
         options: WriteConcernOptions,
     ) -> Result<WriteConcernReceipt, WriteConcernError> {
-        let key = Self::qualify_key(key);
+        self.delete_qualified_with_write_concern_options(Self::qualify_key(key), priority, options)
+            .await
+    }
+
+    pub(super) async fn delete_qualified_with_write_concern_options(
+        &self,
+        key: String,
+        priority: OpPriority,
+        options: WriteConcernOptions,
+    ) -> Result<WriteConcernReceipt, WriteConcernError> {
         let operation = self.admit_key_operation(&key)?;
         let retention = self.embedded_operations.admit_owned(
             embedded_operations::single_concern_request_bytes(&key, None),
