@@ -50,7 +50,7 @@ pub use write_concern::WriteConcernClientError;
 ///     .priority(Priority::High)
 ///     .build();
 /// ```
-#[derive(Debug, Clone, bon::Builder)]
+#[derive(Clone, bon::Builder)]
 #[non_exhaustive]
 pub struct ClientOptions {
     /// Application authentication identity, 1 to 255 UTF-8 bytes.
@@ -71,6 +71,21 @@ pub struct ClientOptions {
     /// Encoded request bytes retained by admitted requests. Default 32 MiB.
     #[builder(default = 32 * 1024 * 1024)]
     pub max_queued_bytes: usize,
+}
+impl std::fmt::Debug for ClientOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClientOptions")
+            .field("identity", &self.identity)
+            .field("table", &self.table)
+            .field(
+                "credential",
+                &self.credential.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("timeout", &self.timeout)
+            .field("max_queued_requests", &self.max_queued_requests)
+            .field("max_queued_bytes", &self.max_queued_bytes)
+            .finish()
+    }
 }
 impl Default for ClientOptions {
     fn default() -> Self {
@@ -903,4 +918,38 @@ async fn read_frame(stream: &mut BoxStream, max: usize) -> Result<wire::Frame, C
     actordb_protocol::preflight_client_frame(&bytes)
         .map_err(|e| ClientError::Protocol(e.into()))?;
     wire::Frame::decode(bytes.as_slice()).map_err(|e| ClientError::Protocol(e.to_string()))
+}
+
+#[cfg(test)]
+mod credential_debug_tests {
+    use super::*;
+
+    #[test]
+    fn client_options_debug_redacts_credentials_and_preserves_nonsecret_fields() {
+        let secret: Vec<u8> = (201..233).collect();
+        let options = ClientOptions::builder()
+            .identity("debug-client")
+            .table("customers")
+            .credential(secret.clone())
+            .timeout(Duration::from_secs(7))
+            .max_queued_requests(17)
+            .max_queued_bytes(8192)
+            .build();
+        for output in [format!("{options:?}"), format!("{options:#?}")] {
+            assert!(output.contains("[REDACTED]"));
+            assert!(!output.contains("201") && !output.contains("232"));
+            assert!(!output.contains(&format!("{secret:?}")));
+            for field in [
+                "identity: \"debug-client\"",
+                "table: \"customers\"",
+                "timeout: 7s",
+                "max_queued_requests: 17",
+                "max_queued_bytes: 8192",
+            ] {
+                assert!(output.contains(field), "missing nonsecret field {field}");
+            }
+        }
+        assert!(format!("{:?}", ClientOptions::default()).contains("credential: None"));
+        assert_eq!(options.credential.as_deref(), Some(secret.as_slice()));
+    }
 }

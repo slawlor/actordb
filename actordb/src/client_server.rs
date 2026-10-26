@@ -20,13 +20,27 @@ use tokio::sync::{watch, Semaphore};
 use tokio::task::{JoinHandle, JoinSet};
 
 /// Resource limits and optional application credential. Never reuse a cluster key.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct ClientServerOptions {
     pub credential: Option<Vec<u8>>,
     pub max_connections: usize,
     pub max_in_flight_requests: usize,
     pub receive_bytes: usize,
     pub timeout: Duration,
+}
+impl std::fmt::Debug for ClientServerOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClientServerOptions")
+            .field(
+                "credential",
+                &self.credential.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("max_connections", &self.max_connections)
+            .field("max_in_flight_requests", &self.max_in_flight_requests)
+            .field("receive_bytes", &self.receive_bytes)
+            .field("timeout", &self.timeout)
+            .finish()
+    }
 }
 impl Default for ClientServerOptions {
     fn default() -> Self {
@@ -39,6 +53,7 @@ impl Default for ClientServerOptions {
         }
     }
 }
+
 /// Owned application listener. Drop requests cancellation; [`Self::shutdown`]
 /// additionally joins the listener and all application connection tasks.
 pub struct ClientServer {
@@ -1084,5 +1099,37 @@ mod outcome_mapping_tests {
         drop(client);
         session.await.unwrap();
         node.finish_shutdown(DrainOptions::default()).await.unwrap();
+    }
+}
+
+#[cfg(test)]
+mod credential_debug_tests {
+    use super::*;
+
+    #[test]
+    fn client_server_options_debug_redacts_credentials_and_preserves_nonsecret_fields() {
+        let secret: Vec<u8> = (201..233).collect();
+        let options = ClientServerOptions {
+            credential: Some(secret.clone()),
+            max_connections: 17,
+            max_in_flight_requests: 3,
+            receive_bytes: 8192,
+            timeout: Duration::from_secs(7),
+        };
+        for output in [format!("{options:?}"), format!("{options:#?}")] {
+            assert!(output.contains("[REDACTED]"));
+            assert!(!output.contains("201") && !output.contains("232"));
+            assert!(!output.contains(&format!("{secret:?}")));
+            for field in [
+                "max_connections: 17",
+                "max_in_flight_requests: 3",
+                "receive_bytes: 8192",
+                "timeout: 7s",
+            ] {
+                assert!(output.contains(field), "missing nonsecret field {field}");
+            }
+        }
+        assert!(format!("{:?}", ClientServerOptions::default()).contains("credential: None"));
+        assert_eq!(options.credential.as_deref(), Some(secret.as_slice()));
     }
 }
