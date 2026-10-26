@@ -216,6 +216,16 @@ version floor and previous charges unchanged. The separate node-wide byte cap
 remains shared across fragments. Table worker pools and ordered flush buffers
 remain independent; fragment admission adds no global backend serialization.
 
+Explicit full expiry and final shutdown first retry dirty partitions which may
+hold another table's marker allowance. A finite, pinned pass then retains a
+saturated deadline for retry after flushing shared charges; accepted deadlines
+consume the original quota. Repeated zero-progress saturation returns an error
+instead of spinning, and the returned conversion count includes each successful
+transition once. Automatic Cleaner pages still perform only bounded visits and
+partition-local flushes. Managed `KvActor` Flush/FlushStable/drain fences cover
+all managed children even for a standalone unpartitioned root; direct public
+base-state operations retain their base-cache view.
+
 The buffer is pushed to the store when:
 
 - it reaches `flush_batch_size` (default 1000 ops; ignored when `store` is `None`), or

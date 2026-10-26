@@ -215,6 +215,9 @@ pub(crate) struct ExpiryPass {
     after_table: Option<String>,
     active_table: Option<Arc<FragmentState>>,
     partition_done: bool,
+    /// Explicit full passes can release shared admission between attempts.
+    /// Automatic pages keep their finite skip-on-saturation behavior.
+    retry_saturation: bool,
 }
 
 impl ExpiryPass {
@@ -229,6 +232,7 @@ impl ExpiryPass {
             after_table: None,
             active_table: None,
             partition_done: false,
+            retry_saturation: false,
         }
     }
 
@@ -987,18 +991,25 @@ impl FragmentState {
     /// it. Writes that arrive during the store call remain pending for the
     /// next flush.
     pub async fn flush(&self) -> Result<(), ActorProcessingErr> {
-        self.reclaim_empty_tables().await;
         if self.partitioned {
-            self.flush_local().await?;
-            let children = self.table_children.read().await.clone();
-            for child in children.values() {
-                child.flush_local().await?;
-            }
-            drop(children);
-            self.reclaim_empty_tables().await;
-            return Ok(());
+            return self.flush_from_actor().await;
         }
+        self.reclaim_empty_tables().await;
         self.flush_local().await
+    }
+
+    /// Managed actors resolve child tables even when public direct state
+    /// operations deliberately retain unpartitioned base-cache semantics.
+    pub(crate) async fn flush_from_actor(&self) -> Result<(), ActorProcessingErr> {
+        self.reclaim_empty_tables().await;
+        self.flush_local().await?;
+        let children = self.table_children.read().await.clone();
+        for child in children.values() {
+            child.flush_local().await?;
+        }
+        drop(children);
+        self.reclaim_empty_tables().await;
+        Ok(())
     }
 
     async fn flush_local(&self) -> Result<(), ActorProcessingErr> {
@@ -1009,26 +1020,33 @@ impl FragmentState {
     /// the same ordering guard. The accepted operation remains owned when its
     /// waiter is canceled; safe teardown still waits for backend completion.
     pub async fn flush_stable(&self) -> Result<ApplyDurability, ActorProcessingErr> {
-        self.reclaim_empty_tables().await;
         if self.partitioned {
-            let mut durability = self.flush_stable_local().await?;
-            let children = self.table_children.read().await.clone();
-            for child in children.values() {
-                durability = match (durability, child.flush_stable_local().await?) {
-                    (ApplyDurability::MemoryApplied, _) | (_, ApplyDurability::MemoryApplied) => {
-                        ApplyDurability::MemoryApplied
-                    }
-                    (ApplyDurability::StableCommitted, ApplyDurability::StableCommitted) => {
-                        ApplyDurability::StableCommitted
-                    }
-                    _ => ApplyDurability::StoreCommitted,
-                };
-            }
-            drop(children);
-            self.reclaim_empty_tables().await;
-            return Ok(durability);
+            return self.flush_stable_from_actor().await;
         }
+        self.reclaim_empty_tables().await;
         self.flush_stable_local().await
+    }
+
+    pub(crate) async fn flush_stable_from_actor(
+        &self,
+    ) -> Result<ApplyDurability, ActorProcessingErr> {
+        self.reclaim_empty_tables().await;
+        let mut durability = self.flush_stable_local().await?;
+        let children = self.table_children.read().await.clone();
+        for child in children.values() {
+            durability = match (durability, child.flush_stable_local().await?) {
+                (ApplyDurability::MemoryApplied, _) | (_, ApplyDurability::MemoryApplied) => {
+                    ApplyDurability::MemoryApplied
+                }
+                (ApplyDurability::StableCommitted, ApplyDurability::StableCommitted) => {
+                    ApplyDurability::StableCommitted
+                }
+                _ => ApplyDurability::StoreCommitted,
+            };
+        }
+        drop(children);
+        self.reclaim_empty_tables().await;
+        Ok(durability)
     }
 
     async fn flush_stable_local(&self) -> Result<ApplyDurability, ActorProcessingErr> {
@@ -1999,18 +2017,60 @@ impl FragmentState {
     /// the finite pass. Persistence admission failure keeps the deadline indexed
     /// and returns an error so shutdown can retry its final expiry fence.
     pub async fn expire_values(&self, now_ms: u64) -> Result<usize, ActorProcessingErr> {
-        self.reclaim_empty_tables().await;
         if self.partitioned {
-            let mut converted = self.expire_values_local(now_ms).await?;
-            let children = self.table_children.read().await.clone();
-            for child in children.values() {
-                converted = converted.saturating_add(child.expire_values_local(now_ms).await?);
-            }
-            drop(children);
-            self.reclaim_empty_tables().await;
-            return Ok(converted);
+            return self.expire_values_from_actor(now_ms).await;
         }
+        self.reclaim_empty_tables().await;
         self.expire_values_local(now_ms).await
+    }
+
+    pub(crate) async fn expire_values_from_actor(
+        &self,
+        now_ms: u64,
+    ) -> Result<usize, ActorProcessingErr> {
+        self.reclaim_empty_tables().await;
+        {
+            // This is an explicitly full/manual or terminal pass, not one
+            // bounded automatic Cleaner page. A different dirty table can
+            // own the shared allowance needed for this table's first expiry
+            // marker. Retry those authoritative batches before expiry, or a
+            // healthy shutdown retry could forever saturate the empty table
+            // without reaching the failed dirty partition's final flush.
+            self.flush_from_actor().await?;
+            let mut pass = ExpiryPass::new(now_ms);
+            pass.retry_saturation = true;
+            let mut converted = 0usize;
+            let mut retried_without_conversion = false;
+            loop {
+                let page = self.expire_values_page_partitioned(&mut pass).await?;
+                converted = converted.saturating_add(page.converted);
+                if page.saturated {
+                    // Retry the same deadline after freeing other tables'
+                    // pending/active charges. An irreducible marker or ongoing
+                    // contention gets one zero-progress retry, never a spin.
+                    if page.converted == 0 && retried_without_conversion {
+                        return Err(ActorProcessingErr::from(
+                            "expiry persistence admission remains saturated after full flush",
+                        ));
+                    }
+                    retried_without_conversion = page.converted == 0;
+                    // The bounded page may already have flushed its own
+                    // converted markers. Do not walk every table again for
+                    // each such page when no shared backlog remains.
+                    if self.persistence.records.used() != 0 || self.persistence.bytes.used() != 0 {
+                        self.flush_from_actor().await?;
+                    }
+                } else {
+                    retried_without_conversion = false;
+                }
+                if page.done {
+                    self.flush_from_actor().await?;
+                    self.reclaim_empty_tables().await;
+                    return Ok(converted);
+                }
+                tokio::task::yield_now().await;
+            }
+        }
     }
 
     async fn expire_values_local(&self, now_ms: u64) -> Result<usize, ActorProcessingErr> {
@@ -2043,10 +2103,17 @@ impl FragmentState {
         &self,
         pass: &mut ExpiryPass,
     ) -> Result<ExpiryPage, ActorProcessingErr> {
-        use std::ops::Bound::{Excluded, Unbounded};
         if !self.partitioned {
             return self.expire_values_page_local(pass).await;
         }
+        self.expire_values_page_partitioned(pass).await
+    }
+
+    async fn expire_values_page_partitioned(
+        &self,
+        pass: &mut ExpiryPass,
+    ) -> Result<ExpiryPage, ActorProcessingErr> {
+        use std::ops::Bound::{Excluded, Unbounded};
         let mut page = ExpiryPage {
             visited: 0,
             converted: 0,
@@ -2124,6 +2191,11 @@ impl FragmentState {
                 }
                 pass.reset_deadlines();
             }
+            if next.saturated && pass.retry_saturation {
+                // The explicit driver can free another table's shared charge
+                // outside the bounded page before retrying this same deadline.
+                break;
+            }
             if pass.root_done && pass.active_table.is_none() && pass.tables_remaining == Some(0) {
                 pass.partition_done = true;
                 break;
@@ -2200,6 +2272,13 @@ impl FragmentState {
                     .is_some_and(|flush| !flush.enqueue(key, &tombstone))
                 {
                     page.saturated = true;
+                    if pass.retry_saturation {
+                        // The explicit caller will flush shared dirty batches
+                        // outside this bounded page and retry this exact key.
+                        // A failed attempt charges work but consumes no cursor
+                        // or original deadline quota.
+                        break;
+                    }
                     pass.after_deadline = Some(entry);
                     continue;
                 }
@@ -2223,7 +2302,8 @@ impl FragmentState {
                 pass.after_deadline = Some(entry);
                 page.converted += 1;
             }
-            pass.remaining -= page.visited;
+            let consumed = page.visited - usize::from(page.saturated && pass.retry_saturation);
+            pass.remaining -= consumed;
             page.done |= pass.remaining == 0;
             // A quota larger than the due set must finish on this page, even
             // when the page ends exactly at a visit/work boundary.
