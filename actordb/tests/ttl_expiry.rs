@@ -19,6 +19,34 @@ struct Store {
     loads: AtomicUsize,
 }
 impl KvStore for Store {
+    fn bind(
+        &self,
+        _identity: &actordb::store::StoreIdentity,
+    ) -> Result<actordb::store::StoreBinding, actordb::store::StoreError> {
+        Ok(actordb::store::StoreBinding::unmanaged())
+    }
+
+    fn load_prefix(
+        &self,
+        prefix: &[u8],
+    ) -> Result<Vec<(Vec<u8>, actordb::actor::VersionedValue)>, actordb::store::StoreError> {
+        // This fixture owns a bounded in-memory dataset, not a production prefix scan.
+        Ok(self
+            .load()?
+            .into_iter()
+            .filter(|(key, _)| key.starts_with(prefix))
+            .collect())
+    }
+
+    fn commit_durability(&self) -> actordb::store::StoreCommitDurability {
+        actordb::store::StoreCommitDurability::Buffered
+    }
+
+    fn stable_fence(
+        &self,
+    ) -> Result<actordb::store::StoreCommitDurability, actordb::store::StoreError> {
+        Ok(self.commit_durability())
+    }
     fn load(&self) -> Result<Vec<(Vec<u8>, VersionedValue)>, StoreError> {
         self.loads.fetch_add(1, Ordering::SeqCst);
         Ok(self

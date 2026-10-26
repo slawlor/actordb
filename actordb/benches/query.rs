@@ -8,6 +8,22 @@ use std::sync::Arc;
 
 struct FixtureStore(Vec<(Vec<u8>, VersionedValue)>);
 impl KvStore for FixtureStore {
+    fn bind(
+        &self,
+        _identity: &actordb::store::StoreIdentity,
+    ) -> Result<actordb::store::StoreBinding, actordb::store::StoreError> {
+        Ok(actordb::store::StoreBinding::unmanaged())
+    }
+
+    fn commit_durability(&self) -> actordb::store::StoreCommitDurability {
+        actordb::store::StoreCommitDurability::Buffered
+    }
+
+    fn stable_fence(
+        &self,
+    ) -> Result<actordb::store::StoreCommitDurability, actordb::store::StoreError> {
+        Ok(self.commit_durability())
+    }
     fn load(&self) -> Result<Vec<(Vec<u8>, VersionedValue)>, StoreError> {
         Ok(self.0.clone())
     }

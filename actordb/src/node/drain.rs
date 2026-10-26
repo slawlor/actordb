@@ -474,6 +474,18 @@ mod tests {
         }
     }
     impl KvStore for BlockingStore {
+        fn load_prefix(
+            &self,
+            prefix: &[u8],
+        ) -> Result<Vec<(Vec<u8>, crate::actor::VersionedValue)>, crate::store::StoreError>
+        {
+            // This fixture owns a bounded in-memory dataset, not a production prefix scan.
+            Ok(self
+                .load()?
+                .into_iter()
+                .filter(|(key, _)| key.starts_with(prefix))
+                .collect())
+        }
         fn bind(&self, _: &StoreIdentity) -> Result<StoreBinding, StoreError> {
             let detached = self.detached.clone();
             Ok(StoreBinding::managed(move || {
