@@ -17,6 +17,9 @@ use crate::placement::{validate_placement, ManualPlacement, PlacementController}
 use crate::shard::FragmentId;
 
 const MAX_STATE_BYTES: usize = 32 * 1024 * 1024;
+mod journal;
+#[cfg(test)]
+mod journal_tests;
 pub(crate) mod native;
 pub use native::{MembershipFenceObservation, MembershipShutdownObservation};
 pub type MembershipMap = HashMap<FragmentId, Vec<String>>;
@@ -204,6 +207,9 @@ impl MembershipAuthority {
 /// Durable transition coordinator. Its file stores proposal, source manifest
 /// generations, target import evidence and explicit authorizations. Live
 /// readiness is deliberately re-observed after every coordinator restart.
+/// Mutations commit to memory only after their journal write and durability
+/// barriers succeed. A failed write may nevertheless have replaced the file;
+/// retry the same operation or reopen its exact proposal before proceeding.
 pub struct MembershipTransition {
     path: PathBuf,
     epoch: [u8; 32],
@@ -358,8 +364,12 @@ impl MembershipTransition {
         // committed final intent stays idempotently publishable.
         if result.stage == MembershipStage::ReadyToRetire {
             result.stage = MembershipStage::Joint;
-            result.persist()?;
         }
+        // A prior attempt may have renamed a valid candidate into place but
+        // failed its directory durability barrier. Reading that candidate is
+        // not proof that its write succeeded: establish a fresh barrier before
+        // returning a coordinator whose identical-evidence retries can no-op.
+        result.persist()?;
         Ok(result)
     }
     pub fn epoch(&self) -> &[u8; 32] {
@@ -473,12 +483,13 @@ impl MembershipTransition {
                 "source evidence exceeds bounded transition metadata".into(),
             ));
         }
-        self.sources.insert(id, manifest);
-        self.ready.clear();
-        if self.stage == MembershipStage::ReadyToRetire {
-            self.stage = MembershipStage::Joint;
-        }
-        self.persist()
+        self.commit_update(move |candidate| {
+            candidate.sources.insert(id, manifest);
+            candidate.ready.clear();
+            if candidate.stage == MembershipStage::ReadyToRetire {
+                candidate.stage = MembershipStage::Joint;
+            }
+        })
     }
     pub fn record_import(&mut self, receipt: ImportReceipt) -> Result<(), MembershipError> {
         if self.stage == MembershipStage::Complete {
@@ -517,18 +528,13 @@ impl MembershipTransition {
                 "import evidence exceeds bounded transition metadata".into(),
             ));
         }
-        self.imports.insert(
-            (
-                receipt.target().node_id().to_owned(),
-                receipt.source().node_id().to_owned(),
-            ),
-            receipt,
-        );
-        self.ready.clear();
-        if self.stage == MembershipStage::ReadyToRetire {
-            self.stage = MembershipStage::Joint;
-        }
-        self.persist()
+        self.commit_update(move |candidate| {
+            candidate.imports.insert(key, receipt);
+            candidate.ready.clear();
+            if candidate.stage == MembershipStage::ReadyToRetire {
+                candidate.stage = MembershipStage::Joint;
+            }
+        })
     }
     /// Explicit application acceptance of permanent data-source loss. This
     /// alone does not elect a writer: a separately fenced joint authority and
@@ -549,11 +555,12 @@ impl MembershipTransition {
                 "loss decision does not match missing retiring holders in prepared proposal".into(),
             ));
         }
-        self.loss = Some(authorization);
-        self.joint_authority = None;
-        self.final_authority = None;
-        self.ready.clear();
-        self.persist()
+        self.commit_update(move |candidate| {
+            candidate.loss = Some(authorization);
+            candidate.joint_authority = None;
+            candidate.final_authority = None;
+            candidate.ready.clear();
+        })
     }
     /// Record the application's completed authority fence. The nonzero
     /// decision ID identifies externally persisted fencing evidence; it is
@@ -575,13 +582,14 @@ impl MembershipTransition {
         if self.joint_authority.is_some() {
             return Err(MembershipError::Invalid("joint authority decision is immutable; use a fresh transition epoch for changed process authority".into()));
         }
-        self.joint_authority = Some(authority);
-        self.final_authority = None;
-        self.ready.clear();
-        if self.stage == MembershipStage::ReadyToRetire {
-            self.stage = MembershipStage::Joint;
-        }
-        self.persist()
+        self.commit_update(move |candidate| {
+            candidate.joint_authority = Some(authority);
+            candidate.final_authority = None;
+            candidate.ready.clear();
+            if candidate.stage == MembershipStage::ReadyToRetire {
+                candidate.stage = MembershipStage::Joint;
+            }
+        })
     }
     /// Record completed final process fencing separately from joint overlap.
     /// Retired processes must be absent; retained generations may keep their
@@ -650,10 +658,11 @@ impl MembershipTransition {
                 ));
             }
         }
-        self.final_authority = Some(authority);
-        self.ready.clear();
-        self.stage = MembershipStage::Joint;
-        self.persist()
+        self.commit_update(move |candidate| {
+            candidate.final_authority = Some(authority);
+            candidate.ready.clear();
+            candidate.stage = MembershipStage::Joint;
+        })
     }
     /// Idempotently publish the overlap map to the supplied supported manual
     /// controller. A stale controller/proposal is rejected before mutation.
@@ -674,8 +683,7 @@ impl MembershipTransition {
                     .into(),
             ));
         }
-        self.stage = MembershipStage::Joint;
-        self.persist()?;
+        self.commit_update(|candidate| candidate.stage = MembershipStage::Joint)?;
         controller.set_placement(joint);
         Ok(())
     }
@@ -704,11 +712,12 @@ impl MembershipTransition {
                 "live readiness belongs to another joint proposal or target".into(),
             ));
         }
-        self.ready.insert(evidence.node_id.clone(), evidence);
-        if self.check_retirement().is_ok() {
-            self.stage = MembershipStage::ReadyToRetire;
-        }
-        self.persist()
+        self.commit_update(move |candidate| {
+            candidate.ready.insert(evidence.node_id.clone(), evidence);
+            if candidate.check_retirement().is_ok() {
+                candidate.stage = MembershipStage::ReadyToRetire;
+            }
+        })
     }
     pub fn check_retirement(&self) -> Result<(), MembershipError> {
         if self.joint_authority.is_none() || self.final_authority.is_none() {
@@ -764,6 +773,10 @@ impl MembershipTransition {
                     "controller diverged after final intent".into(),
                 ));
             }
+            // Replay must not require fresh readiness from already retired
+            // processes. It does still require a successful durability barrier
+            // before exposing the recorded final map to this controller.
+            self.persist()?;
         } else {
             self.check_retirement()?;
             if map_digest(&observed) != self.joint_digest() {
@@ -771,8 +784,7 @@ impl MembershipTransition {
                     "controller is not at the captured joint map".into(),
                 ));
             }
-            self.stage = MembershipStage::Complete;
-            self.persist()?;
+            self.commit_update(|candidate| candidate.stage = MembershipStage::Complete)?;
         }
         controller.set_placement(self.desired.clone());
         Ok(())
@@ -816,6 +828,29 @@ impl MembershipTransition {
                 ));
             }
         }
+        Ok(())
+    }
+    fn commit_update(&mut self, update: impl FnOnce(&mut Self)) -> Result<(), MembershipError> {
+        // Keep this private rather than making independently writable public
+        // clones of one journal coordinator. Both copies retain only bounded
+        // proposal/evidence metadata, never checkpoint record payloads.
+        let mut candidate = Self {
+            path: self.path.clone(),
+            epoch: self.epoch,
+            current: self.current.clone(),
+            desired: self.desired.clone(),
+            minimum_replicas: self.minimum_replicas,
+            stage: self.stage,
+            sources: self.sources.clone(),
+            imports: self.imports.clone(),
+            ready: self.ready.clone(),
+            loss: self.loss.clone(),
+            joint_authority: self.joint_authority.clone(),
+            final_authority: self.final_authority.clone(),
+        };
+        update(&mut candidate);
+        candidate.persist()?;
+        *self = candidate;
         Ok(())
     }
     fn persist(&self) -> Result<(), MembershipError> {
@@ -864,7 +899,7 @@ impl MembershipTransition {
                 "transition evidence exceeds supported bounded metadata".into(),
             ));
         }
-        crate::checkpoint::atomic_write(&self.path, &out.0)?;
+        journal::atomic_write(&self.path, &out.0)?;
         Ok(())
     }
     fn encoded_size_estimate(&self) -> usize {

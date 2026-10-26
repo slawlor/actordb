@@ -1,6 +1,6 @@
 [package]
 name = "actordb"
-version = "0.9.0"
+version = "0.9.1"
 authors = ["Sean Lawlor"]
 description = "An actor-first distributed database"
 documentation = "https://docs.rs/actordb"
@@ -28,8 +28,8 @@ tls = ["dep:tokio-rustls"]
 toml = ["dep:serde", "dep:toml", "tokio/fs"]
 
 [dependencies]
-actordb-protocol = { version = "0.9.0", path = "../actordb-protocol" }
-actordb-query = { version = "0.9.0", path = "../actordb-query" }
+actordb-protocol = { version = "0.9.1", path = "../actordb-protocol" }
+actordb-query = { version = "0.9.1", path = "../actordb-query" }
 # Required dependencies
 bon = { version = "3.10.2" }
 bytes = { version = "1" }

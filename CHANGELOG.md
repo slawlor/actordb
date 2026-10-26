@@ -1,6 +1,12 @@
 # Release notes
 
-## 0.9.0 (draft)
+## 0.9.1 (unreleased)
+
+Corrective patch preparation for the P1 findings in #142 and #143. Peer protocol
+6, application protocol 4 and existing storage/checkpoint/journal formats remain
+unchanged. No new release is published by these pull requests.
+
+## 0.9.0
 
 This is a fresh-deployment release. Deploy the database, protocol, query and SDK
 crates together at `0.9.0`; there is no rolling upgrade, old-store adoption or
