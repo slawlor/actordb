@@ -198,12 +198,12 @@ pub(super) async fn ensure_sender_entry(
     }));
     let peer_failures = deps.peer_failures.clone();
     let expected_peer = peer.to_string();
-    let runtime = deps
-        .runtime
-        .clone()
-        .with_queue_failure_handler(Arc::new(move |failed_tx| {
-            peer_failures.signal(expected_peer.clone(), failed_tx);
-        }));
+    let runtime =
+        deps.runtime
+            .clone()
+            .with_queue_failure_handler(Arc::new(move |failed_connection| {
+                peer_failures.signal(expected_peer.clone(), failed_connection);
+            }));
     let sender = spawn_node_sender(
         fragment,
         peer.to_string(),
@@ -2059,14 +2059,14 @@ impl Node {
                 for (peer, channel) in &peers {
                     for ((_, sender_peer), sender) in senders.iter() {
                         if sender_peer == peer {
-                            targets.push((sender.clone(), channel.raw_sender()));
+                            targets.push((sender.clone(), channel.connection_id()));
                         }
                     }
                 }
                 targets
             };
-            for (sender, peer_tx) in disconnected_targets {
-                let _ = sender.send(SenderMsg::PeerDisconnected { peer_tx });
+            for (sender, connection_id) in disconnected_targets {
+                let _ = sender.send(SenderMsg::PeerDisconnected { connection_id });
             }
             self.peer_changes.send_modify(|generation| {
                 *generation = generation.wrapping_add(1);

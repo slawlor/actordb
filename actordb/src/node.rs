@@ -61,8 +61,8 @@ use crate::proto::{
     ReconcileEntry, ReconcileFetch, ReconcileResponse, ReplicationAckLevel,
 };
 use crate::replication::{
-    spawn_node_sender, NodeSender, NodeSenderDrain, NodeSenderSendError, ReplicationAckDurability,
-    SenderConfig, SenderDeps, SenderMsg, SenderRuntimeOptions, SenderStateReport,
+    spawn_node_sender, NodeSender, NodeSenderDrain, ReplicationAckDurability, SenderConfig,
+    SenderDeps, SenderIngressError, SenderMsg, SenderRuntimeOptions, SenderStateReport,
 };
 use crate::runtime_tasks::RuntimeTasks;
 use crate::shard::{fragment_of, FragmentId};

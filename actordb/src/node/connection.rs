@@ -7,7 +7,7 @@
 //! after releasing it. Physical channel identity pins pending replies and
 //! replacement cleanup. The task manager owns both socket halves; cancellation
 //! closes the channel before sender/relay cleanup and never detaches writers.
-//! Legacy disconnect acquires peers, senders, then sender reports in that order;
+//! Full-replication disconnect acquires peers, senders, then sender reports in that order;
 //! the registries are released before waiting for retiring sender joins.
 
 use super::*;
@@ -38,22 +38,22 @@ impl PeerChannel {
         &self,
         sender: &NodeSender,
         control: SenderMsg,
-    ) -> Result<(), NodeSenderSendError> {
+    ) -> Result<(), SenderIngressError> {
         match &self.work_retention {
             Some(retention) => sender.send_retained(control, retention.clone()),
             None => sender.send(control),
         }
     }
-    pub(super) fn same_channel(&self, other: &Self) -> bool {
-        self.outbound.same_channel(&other.outbound)
+    pub(super) fn same_connection(&self, other: &Self) -> bool {
+        self.outbound.same_connection(&other.outbound)
     }
 
-    pub(super) fn same_sender(&self, other: &mpsc::Sender<Vec<u8>>) -> bool {
-        self.outbound.identity.same_channel(other)
+    pub(super) fn is_connection(&self, other: &crate::network::PeerConnectionId) -> bool {
+        &self.outbound.connection_id == other
     }
 
-    pub(super) fn raw_sender(&self) -> mpsc::Sender<Vec<u8>> {
-        self.outbound.identity.clone()
+    pub(super) fn connection_id(&self) -> crate::network::PeerConnectionId {
+        self.outbound.connection_id.clone()
     }
 
     pub(super) fn budgeted_sender(&self) -> BudgetedPeerTx {
@@ -83,7 +83,8 @@ pub(super) struct ConnectionRank {
 /// peer node_id -> outbound frame queue
 pub(super) type PeerMap = Arc<Mutex<HashMap<String, PeerChannel>>>;
 
-pub(super) type PeerFailurePending = Arc<StdMutex<HashMap<String, Vec<mpsc::Sender<Vec<u8>>>>>>;
+pub(super) type PeerFailurePending =
+    Arc<StdMutex<HashMap<String, Vec<crate::network::PeerConnectionId>>>>;
 
 /// Synchronous signal path from replication sender callbacks to one Node-owned
 /// async worker. Duplicate signals for the same physical channel coalesce, but
@@ -96,14 +97,14 @@ pub(super) struct PeerFailureSignals {
 }
 
 impl PeerFailureSignals {
-    pub(super) fn signal(&self, peer: String, failed_tx: mpsc::Sender<Vec<u8>>) {
+    pub(super) fn signal(&self, peer: String, failed_connection: crate::network::PeerConnectionId) {
         let mut pending = self.pending.lock().unwrap();
         let channels = pending.entry(peer).or_default();
         if !channels
             .iter()
-            .any(|channel| channel.same_channel(&failed_tx))
+            .any(|connection| connection == &failed_connection)
         {
-            channels.push(failed_tx);
+            channels.push(failed_connection);
         }
         drop(pending);
         self.notify.notify_one();
@@ -118,7 +119,7 @@ impl PeerFailureSignals {
                 if let Some(current) = current {
                     if failed_channels
                         .iter()
-                        .any(|failed_tx| current.same_sender(failed_tx))
+                        .any(|failed_tx| current.is_connection(failed_tx))
                     {
                         current.cancel();
                     }
@@ -639,10 +640,7 @@ pub(super) async fn handle_connection(
     let producer_frame_capacity = peer_queue_frame_capacity - response_frame_capacity;
     let (frame_tx, rx) = mpsc::channel::<BudgetedFrame>(producer_frame_capacity);
     let (response_tx, response_rx) = mpsc::channel::<BudgetedFrame>(response_frame_capacity);
-    // `SenderMsg::PeerDisconnected` is public and historically identifies a
-    // transport with Sender<Vec<u8>>. Keep a live, unsent compatibility token;
-    // Node frames exclusively use the budgeted channel above.
-    let (identity, _identity_rx) = mpsc::channel::<Vec<u8>>(1);
+    let identity = crate::network::PeerConnectionId::new();
     let (cancel, _) = watch::channel(false);
     let byte_budget = Arc::new(Semaphore::new(peer_queue_byte_capacity));
     let producer_byte_budget = Arc::new(Semaphore::new(
@@ -657,7 +655,7 @@ pub(super) async fn handle_connection(
             byte_budget: byte_budget.clone(),
             producer_byte_budget: producer_byte_budget.clone(),
             reconcile_gate: ReconcileGate::new(),
-            identity,
+            connection_id: identity,
         },
         cancel: cancel.clone(),
         queue_admission_timeout: runtime_options.queue_admission_timeout,
@@ -881,7 +879,7 @@ pub(super) async fn handle_connection(
                 let (won_election, previous) = {
                     let mut peer_guard = peers.lock().await;
                     match peer_guard.get(&peer) {
-                        Some(current) if current.same_channel(&tx) => (true, None),
+                        Some(current) if current.same_connection(&tx) => (true, None),
                         Some(current) if *current.cancel.borrow() => {
                             (true, peer_guard.insert(peer.clone(), tx.clone()))
                         }
@@ -963,7 +961,7 @@ pub(super) async fn handle_connection(
                     let peers_guard = peers.lock().await;
                     if !peers_guard
                         .get(&peer)
-                        .is_some_and(|current| current.same_channel(&tx))
+                        .is_some_and(|current| current.same_connection(&tx))
                     {
                         break;
                     }
@@ -1770,7 +1768,7 @@ pub(super) async fn handle_connection(
                             // lookup above. That is a stale local consumer,
                             // not a protocol failure on this multiplexed peer
                             // connection.
-                            Err(NodeSenderSendError::Closed) => {
+                            Err(SenderIngressError::Closed) => {
                                 let still_current =
                                     sender_task_is_current(&senders, &sender_key, &tx).await;
                                 if still_current {
@@ -1778,7 +1776,7 @@ pub(super) async fn handle_connection(
                                 }
                                 continue;
                             }
-                            Err(NodeSenderSendError::Full) => {
+                            Err(SenderIngressError::Full) => {
                                 let still_current =
                                     sender_task_is_current(&senders, &sender_key, &tx).await;
                                 if still_current {
@@ -1871,7 +1869,7 @@ pub(super) async fn handle_connection(
                             apply_retention,
                         ) {
                             Ok(()) => {}
-                            Err(NodeSenderSendError::Closed) => {
+                            Err(SenderIngressError::Closed) => {
                                 let still_current =
                                     sender_task_is_current(&senders, &sender_key, &tx).await;
                                 if still_current {
@@ -1879,7 +1877,7 @@ pub(super) async fn handle_connection(
                                 }
                                 continue;
                             }
-                            Err(NodeSenderSendError::Full) => {
+                            Err(SenderIngressError::Full) => {
                                 let still_current =
                                     sender_task_is_current(&senders, &sender_key, &tx).await;
                                 if still_current {
@@ -2064,14 +2062,13 @@ pub(super) async fn handle_connection(
                 let relay_validation = {
                     let relays = pending_relays.lock().unwrap();
                     relays.get(&r.req_id).and_then(|relay| {
-                        (relay.expected_peer == peer && relay.expected_tx.same_channel(&tx)).then(
-                            || {
+                        (relay.expected_peer == peer && relay.expected_tx.same_connection(&tx))
+                            .then(|| {
                                 (
                                     relay._admission.clone(),
                                     validate_get_response(&relay.expected_key, &r),
                                 )
-                            },
-                        )
+                            })
                     })
                 };
                 let pending_expected_key = {
@@ -2178,8 +2175,8 @@ pub(super) async fn handle_connection(
                 let relay_validation = {
                     let relays = pending_mutation_relays.lock().unwrap();
                     relays.get(&response.req_id).and_then(|relay| {
-                        (relay.expected_peer == peer && relay.expected_tx.same_channel(&tx)).then(
-                            || {
+                        (relay.expected_peer == peer && relay.expected_tx.same_connection(&tx))
+                            .then(|| {
                                 (
                                     relay._admission.clone(),
                                     validate_mutation_results(
@@ -2187,8 +2184,7 @@ pub(super) async fn handle_connection(
                                         &response.results,
                                     ),
                                 )
-                            },
-                        )
+                            })
                     })
                 };
                 let relay_admission = relay_validation
@@ -2587,7 +2583,7 @@ pub(super) async fn handle_connection(
                     let mut pending = pending_query_pages.lock().unwrap();
                     if pending
                         .get(&response.req_id)
-                        .is_some_and(|request| request.channel.same_channel(&tx))
+                        .is_some_and(|request| request.channel.same_connection(&tx))
                     {
                         pending.remove(&response.req_id)
                     } else {
@@ -2686,7 +2682,7 @@ pub(super) async fn handle_connection(
     pending_query_pages
         .lock()
         .unwrap()
-        .retain(|_, request| !request.channel.same_channel(&tx));
+        .retain(|_, request| !request.channel.same_connection(&tx));
     // Connection dropped: forget the peer only if this exact physical channel
     // is still current. Legacy full-replication peers are discovered at
     // runtime, so reap their per-fragment senders on disconnect rather than
@@ -2705,7 +2701,7 @@ pub(super) async fn handle_connection(
         // Only remove if it's still our entry (a newer connection may
         // have replaced it).
         if let Some(tx_existing) = guard.get(&peer) {
-            if tx_existing.same_channel(&tx) {
+            if tx_existing.same_connection(&tx) {
                 guard.remove(&peer);
                 let legacy_full_replication = placement.read().unwrap().is_empty();
                 if legacy_full_replication && operation_gate.is_running() {
@@ -2737,7 +2733,7 @@ pub(super) async fn handle_connection(
                         .collect();
                     for sender_tx in peer_senders {
                         let _ = sender_tx.send(SenderMsg::PeerDisconnected {
-                            peer_tx: tx.raw_sender(),
+                            connection_id: tx.connection_id(),
                         });
                     }
                 }
@@ -3339,7 +3335,7 @@ mod tests {
     use super::*;
     use crate::proto::ReconcileRequest;
     use crate::proto::SessionStart;
-    use crate::replication::spawn_bounded_sender;
+    use crate::replication::{spawn_bounded_sender, ReplicationPeer};
 
     #[tokio::test]
     async fn receive_byte_permit_follows_completed_frame_and_releases_on_eof() {
@@ -4860,8 +4856,10 @@ mod tests {
         // Queue both before the worker starts so the stale signal is
         // guaranteed to arrive last. A single-value map used to lose the
         // current-channel failure here and leave replication disconnected.
-        failures.signal("peer".to_string(), current.raw_sender());
-        failures.signal("peer".to_string(), stale.raw_sender());
+        failures.signal("peer".to_string(), current.connection_id());
+        failures.signal("peer".to_string(), current.connection_id());
+        failures.signal("peer".to_string(), stale.connection_id());
+        assert_eq!(failures.pending.lock().unwrap()["peer"].len(), 2);
         let worker = tokio::spawn(failures.run(peers));
 
         tokio::time::timeout(Duration::from_secs(1), cancelled.changed())
@@ -5072,7 +5070,7 @@ mod tests {
         let encoded_len = envelope.encoded_len();
         let (frame_tx, frame_rx) = mpsc::channel(8);
         let (response_tx, _response_rx) = mpsc::channel(8);
-        let (identity, _) = mpsc::channel(1);
+        let identity = crate::network::PeerConnectionId::new();
         let (cancel_tx, _) = watch::channel(false);
         let byte_budget = Arc::new(Semaphore::new(encoded_len * 3));
         let producer_byte_budget = Arc::new(Semaphore::new(encoded_len * 2));
@@ -5085,7 +5083,7 @@ mod tests {
                 byte_budget,
                 producer_byte_budget,
                 reconcile_gate: ReconcileGate::new(),
-                identity,
+                connection_id: identity,
             },
             cancel: cancel_tx,
             queue_admission_timeout: Duration::from_millis(10),
@@ -5112,7 +5110,7 @@ mod tests {
         let encoded_len = envelope.encoded_len();
         let (frame_tx, mut frame_rx) = mpsc::channel(1);
         let (response_tx, mut response_rx) = mpsc::channel(1);
-        let (identity, _) = mpsc::channel(1);
+        let identity = crate::network::PeerConnectionId::new();
         let (cancel_tx, _) = watch::channel(false);
         let byte_budget = Arc::new(Semaphore::new(encoded_len * 2));
         let producer_byte_budget = Arc::new(Semaphore::new(encoded_len));
@@ -5125,7 +5123,7 @@ mod tests {
                 byte_budget: byte_budget.clone(),
                 producer_byte_budget: producer_byte_budget.clone(),
                 reconcile_gate: ReconcileGate::new(),
-                identity,
+                connection_id: identity,
             },
             cancel: cancel_tx,
             queue_admission_timeout: Duration::from_millis(10),
@@ -5176,11 +5174,14 @@ mod tests {
         )
         .unwrap();
         let (old_tx, mut old_rx) = mpsc::channel(4);
+        let old_tx = ReplicationPeer::new(old_tx);
         let (new_tx, mut new_rx) = mpsc::channel(4);
+        let new_tx = ReplicationPeer::new(new_tx);
+        assert_ne!(old_tx.connection_id(), new_tx.connection_id());
 
         sender
             .send(SenderMsg::PeerConnected {
-                peer_tx: old_tx.clone(),
+                peer: old_tx.clone(),
             })
             .unwrap();
         let old_session = match Envelope::decode(old_rx.recv().await.unwrap().as_slice())
@@ -5192,7 +5193,18 @@ mod tests {
         };
         sender
             .send(SenderMsg::PeerConnected {
-                peer_tx: new_tx.clone(),
+                peer: old_tx.clone(),
+            })
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), old_rx.recv())
+                .await
+                .is_err(),
+            "a cloned connection handle must not rotate its session"
+        );
+        sender
+            .send(SenderMsg::PeerConnected {
+                peer: new_tx.clone(),
             })
             .unwrap();
         let new_session = match Envelope::decode(new_rx.recv().await.unwrap().as_slice())
@@ -5205,7 +5217,9 @@ mod tests {
         assert_ne!(old_session, new_session);
 
         sender
-            .send(SenderMsg::PeerDisconnected { peer_tx: old_tx })
+            .send(SenderMsg::PeerDisconnected {
+                connection_id: old_tx.connection_id(),
+            })
             .unwrap();
         common_wait_for_sender_report(&report, |state| {
             state.state == "connected" && state.session_id == new_session
@@ -5213,7 +5227,9 @@ mod tests {
         .await;
 
         sender
-            .send(SenderMsg::PeerDisconnected { peer_tx: new_tx })
+            .send(SenderMsg::PeerDisconnected {
+                connection_id: new_tx.connection_id(),
+            })
             .unwrap();
         common_wait_for_sender_report(&report, |state| state.state == "disconnected").await;
     }
@@ -5266,7 +5282,10 @@ mod tests {
         .await;
 
         let (peer_tx, mut peer_rx) = mpsc::channel(1);
-        sender.send(SenderMsg::PeerConnected { peer_tx }).unwrap();
+        let peer_tx = ReplicationPeer::new(peer_tx);
+        sender
+            .send(SenderMsg::PeerConnected { peer: peer_tx })
+            .unwrap();
 
         // The SessionStart fills the only queue slot. The sender publishes
         // this session only after the immediate ReconcileRequest admission
@@ -5340,9 +5359,10 @@ mod tests {
         .expect("sender options are valid");
 
         let (old_tx, mut old_rx) = mpsc::channel(4);
+        let old_tx = ReplicationPeer::new(old_tx);
         sender
             .send(SenderMsg::PeerConnected {
-                peer_tx: old_tx.clone(),
+                peer: old_tx.clone(),
             })
             .unwrap();
         let old_session = match Envelope::decode(old_rx.recv().await.unwrap().as_slice())
@@ -5374,7 +5394,9 @@ mod tests {
             }))
             .unwrap();
         sender
-            .send(SenderMsg::PeerDisconnected { peer_tx: old_tx })
+            .send(SenderMsg::PeerDisconnected {
+                connection_id: old_tx.connection_id(),
+            })
             .unwrap();
         common_wait_for_sender_report(&report, |state| {
             state.state == "disconnected" && state.buffered == 1
@@ -5382,8 +5404,9 @@ mod tests {
         .await;
 
         let (new_tx, mut new_rx) = mpsc::channel(4);
+        let new_tx = ReplicationPeer::new(new_tx);
         sender
-            .send(SenderMsg::PeerConnected { peer_tx: new_tx })
+            .send(SenderMsg::PeerConnected { peer: new_tx })
             .unwrap();
         let new_session = match Envelope::decode(new_rx.recv().await.unwrap().as_slice())
             .unwrap()
@@ -5468,9 +5491,10 @@ mod tests {
         .expect("sender options are valid");
 
         let (old_tx, mut old_rx) = mpsc::channel(4);
+        let old_tx = ReplicationPeer::new(old_tx);
         sender
             .send(SenderMsg::PeerConnected {
-                peer_tx: old_tx.clone(),
+                peer: old_tx.clone(),
             })
             .unwrap();
         let old_session = match Envelope::decode(old_rx.recv().await.unwrap().as_slice())
@@ -5505,7 +5529,9 @@ mod tests {
         // replay work, rather than preserving a pause that skips the replay.
         sender.send(SenderMsg::ReconcileNow).unwrap();
         sender
-            .send(SenderMsg::PeerDisconnected { peer_tx: old_tx })
+            .send(SenderMsg::PeerDisconnected {
+                connection_id: old_tx.connection_id(),
+            })
             .unwrap();
         common_wait_for_sender_report(&report, |state| {
             state.state == "disconnected" && state.buffered == 1 && state.in_flight == 0
@@ -5514,8 +5540,9 @@ mod tests {
         assert!(old_rx.try_recv().is_err());
 
         let (new_tx, mut new_rx) = mpsc::channel(4);
+        let new_tx = ReplicationPeer::new(new_tx);
         sender
-            .send(SenderMsg::PeerConnected { peer_tx: new_tx })
+            .send(SenderMsg::PeerConnected { peer: new_tx })
             .unwrap();
         let new_session = match Envelope::decode(new_rx.recv().await.unwrap().as_slice())
             .unwrap()
@@ -5609,9 +5636,10 @@ mod tests {
         .expect("sender options are valid");
 
         let (old_tx, mut old_rx) = mpsc::channel(4);
+        let old_tx = ReplicationPeer::new(old_tx);
         sender
             .send(SenderMsg::PeerConnected {
-                peer_tx: old_tx.clone(),
+                peer: old_tx.clone(),
             })
             .unwrap();
         let old_session = match Envelope::decode(old_rx.recv().await.unwrap().as_slice())
@@ -5650,13 +5678,16 @@ mod tests {
         common_wait_for_sender_report(&report, |state| state.buffered == 1 && state.in_flight == 0)
             .await;
         sender
-            .send(SenderMsg::PeerDisconnected { peer_tx: old_tx })
+            .send(SenderMsg::PeerDisconnected {
+                connection_id: old_tx.connection_id(),
+            })
             .unwrap();
         common_wait_for_sender_report(&report, |state| state.state == "disconnected").await;
 
         let (new_tx, mut new_rx) = mpsc::channel(4);
+        let new_tx = ReplicationPeer::new(new_tx);
         sender
-            .send(SenderMsg::PeerConnected { peer_tx: new_tx })
+            .send(SenderMsg::PeerConnected { peer: new_tx })
             .unwrap();
         let new_session = match Envelope::decode(new_rx.recv().await.unwrap().as_slice())
             .unwrap()
@@ -5723,9 +5754,10 @@ mod tests {
         .expect("sender options are valid");
 
         let (timed_out_tx, mut timed_out_rx) = mpsc::channel(4);
+        let timed_out_tx = ReplicationPeer::new(timed_out_tx);
         sender
             .send(SenderMsg::PeerConnected {
-                peer_tx: timed_out_tx.clone(),
+                peer: timed_out_tx.clone(),
             })
             .unwrap();
         let initial_session = match Envelope::decode(timed_out_rx.recv().await.unwrap().as_slice())
@@ -5762,13 +5794,14 @@ mod tests {
 
         sender
             .send(SenderMsg::PeerDisconnected {
-                peer_tx: timed_out_tx,
+                connection_id: timed_out_tx.connection_id(),
             })
             .unwrap();
         common_wait_for_sender_report(&report, |state| state.state == "disconnected").await;
         let (new_tx, mut new_rx) = mpsc::channel(4);
+        let new_tx = ReplicationPeer::new(new_tx);
         sender
-            .send(SenderMsg::PeerConnected { peer_tx: new_tx })
+            .send(SenderMsg::PeerConnected { peer: new_tx })
             .unwrap();
         let new_session = match Envelope::decode(new_rx.recv().await.unwrap().as_slice())
             .unwrap()
@@ -5863,7 +5896,10 @@ mod tests {
         .expect("sender options are valid");
 
         let (peer_tx, mut peer_rx) = mpsc::channel(4);
-        sender.send(SenderMsg::PeerConnected { peer_tx }).unwrap();
+        let peer_tx = ReplicationPeer::new(peer_tx);
+        sender
+            .send(SenderMsg::PeerConnected { peer: peer_tx })
+            .unwrap();
         let first_session = match Envelope::decode(peer_rx.recv().await.unwrap().as_slice())
             .unwrap()
             .msg

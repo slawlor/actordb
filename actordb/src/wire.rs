@@ -135,7 +135,7 @@ pub(crate) struct BudgetedPeerTx {
     /// One anti-entropy round at a time per physical connection. This bounds
     /// responder work independently of the configured fragment count.
     pub(crate) reconcile_gate: ReconcileGate,
-    pub(crate) identity: mpsc::Sender<Vec<u8>>,
+    pub(crate) connection_id: crate::network::PeerConnectionId,
 }
 
 #[derive(Default)]
@@ -272,8 +272,8 @@ impl Drop for ReconcilePermit {
 }
 
 impl BudgetedPeerTx {
-    pub(crate) fn same_channel(&self, other: &Self) -> bool {
-        self.tx.same_channel(&other.tx)
+    pub(crate) fn same_connection(&self, other: &Self) -> bool {
+        self.connection_id == other.connection_id
     }
 
     pub(crate) async fn acquire_global_producer(

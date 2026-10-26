@@ -48,6 +48,7 @@ use tokio::time::Instant;
 use crate::actor::{
     ApplyDurability, HlcClock, KvMessage, OpPriority, SnapshotSummary, VersionedValue,
 };
+use crate::network::PeerConnectionId;
 use crate::node::FragmentRouter;
 use crate::proto::{
     Envelope, EnvelopeMsg, KeySummary, ReconcileEntry, ReconcileFetch, ReconcileRequest,
@@ -72,14 +73,12 @@ fn deadline_after(timeout: Duration) -> Instant {
     now.checked_add(timeout).unwrap_or(now)
 }
 
-type QueueFailureHandler = Arc<dyn Fn(mpsc::Sender<Vec<u8>>) + Send + Sync>;
+type QueueFailureHandler = Arc<dyn Fn(PeerConnectionId) + Send + Sync>;
 
 /// Runtime-only liveness policy for a replication sender.
 ///
-/// These settings live outside [`SenderConfig`] so existing exhaustive
-/// `SenderConfig` literals remain source-compatible. Use
-/// [`spawn_bounded_sender`] to override the defaults.
-/// The builder exposes only the existing public timeout policies, not the
+/// Use [`spawn_bounded_sender`] to choose this sender's liveness policy.
+/// The builder exposes public timeout policies, not the
 /// Node's internal ingress capacity or transport-failure callback.
 #[derive(Clone, bon::Builder)]
 pub struct SenderRuntimeOptions {
@@ -547,10 +546,10 @@ pub enum SenderMsg {
     /// operation before its local merge has completed.
     Enqueue(crate::actor::ReplicatedOp),
     /// The peer (re)connected; start a new session on this channel.
-    PeerConnected { peer_tx: mpsc::Sender<Vec<u8>> },
+    PeerConnected { peer: ReplicationPeer },
     /// One peer connection dropped. Ignore it if a newer channel has already
     /// replaced it; otherwise retain the buffer for reconnect.
-    PeerDisconnected { peer_tx: mpsc::Sender<Vec<u8>> },
+    PeerDisconnected { connection_id: PeerConnectionId },
     /// The peer acked a batch after reaching the reported durability fence.
     Ack {
         session_id: u64,
@@ -603,7 +602,7 @@ struct NodeSenderSignals {
     reconcile_generation: u64,
     drain: Option<NodeSenderDrainRequest>,
     peer_generation: u64,
-    peer: Option<NodeSenderPeer>,
+    peer: Option<ReplicationPeer>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -612,10 +611,65 @@ struct NodeSenderDrainRequest {
     required_ack_durability: ReplicationAckDurability,
 }
 
+/// One bounded standalone peer transport binding. Create once per physical
+/// connection and clone for duplicate notifications; replacing the connection
+/// creates a new identity even when the peer name remains unchanged.
+/// The embedding owns the output receiver and its transport byte budget.
 #[derive(Clone)]
-struct NodeSenderPeer {
-    tx: mpsc::Sender<Vec<u8>>,
-    budgeted: Option<BudgetedPeerTx>,
+pub struct ReplicationPeer {
+    transport: SenderTransport,
+}
+
+#[derive(Clone)]
+enum SenderTransport {
+    Standalone {
+        connection_id: PeerConnectionId,
+        tx: mpsc::Sender<Vec<u8>>,
+    },
+    NodeBudgeted(BudgetedPeerTx),
+}
+
+impl ReplicationPeer {
+    /// Bind a caller-owned bounded output queue to one fresh connection ID.
+    /// Reuse clones of this handle for all notifications about that connection.
+    ///
+    /// ```
+    /// use actordb::replication::{ReplicationPeer, SenderMsg};
+    /// let (output, _frames) = tokio::sync::mpsc::channel(8);
+    /// let peer = ReplicationPeer::new(output);
+    /// let _connected = SenderMsg::PeerConnected { peer: peer.clone() };
+    /// let _disconnected = SenderMsg::PeerDisconnected {
+    ///     connection_id: peer.connection_id(),
+    /// };
+    /// ```
+    pub fn new(tx: mpsc::Sender<Vec<u8>>) -> Self {
+        Self {
+            transport: SenderTransport::Standalone {
+                connection_id: PeerConnectionId::new(),
+                tx,
+            },
+        }
+    }
+    pub fn connection_id(&self) -> PeerConnectionId {
+        self.id().clone()
+    }
+    fn id(&self) -> &PeerConnectionId {
+        match &self.transport {
+            SenderTransport::Standalone { connection_id, .. } => connection_id,
+            SenderTransport::NodeBudgeted(peer) => &peer.connection_id,
+        }
+    }
+    fn from_budgeted(peer: BudgetedPeerTx) -> Self {
+        Self {
+            transport: SenderTransport::NodeBudgeted(peer),
+        }
+    }
+    fn node_transport(&self) -> Option<&BudgetedPeerTx> {
+        match &self.transport {
+            SenderTransport::NodeBudgeted(peer) => Some(peer),
+            SenderTransport::Standalone { .. } => None,
+        }
+    }
 }
 
 struct NodeSenderIngress {
@@ -659,8 +713,6 @@ pub enum SenderIngressError {
     Full,
     Closed,
 }
-
-pub(crate) type NodeSenderSendError = SenderIngressError;
 
 /// Bounded standalone ingress observations for this sender's lifetime.
 /// Independent atomic/channel reads are approximate, not a transaction.
@@ -790,19 +842,19 @@ impl NodeSender {
         self.control_tx.capacity()
     }
 
-    pub(crate) fn send(&self, msg: SenderMsg) -> Result<(), NodeSenderSendError> {
+    pub(crate) fn send(&self, msg: SenderMsg) -> Result<(), SenderIngressError> {
         if self.is_closed() {
-            return Err(NodeSenderSendError::Closed);
+            return Err(SenderIngressError::Closed);
         }
         match msg {
             SenderMsg::Enqueue(op) => self.send_data(op),
-            SenderMsg::PeerConnected { peer_tx } => self.set_peer(peer_tx, None),
-            SenderMsg::PeerDisconnected { peer_tx } => {
+            SenderMsg::PeerConnected { peer } => self.set_peer(peer),
+            SenderMsg::PeerDisconnected { connection_id } => {
                 self.signals_tx.send_if_modified(|signals| {
                     if !signals
                         .peer
                         .as_ref()
-                        .is_some_and(|current| current.tx.same_channel(&peer_tx))
+                        .is_some_and(|current| current.id() == &connection_id)
                     {
                         return false;
                     }
@@ -823,55 +875,39 @@ impl NodeSender {
     }
 
     /// Install a Node-owned transport together with its encoded-byte budget.
-    /// Standalone senders accept caller-owned `PeerConnected` channels and therefore
-    /// have no producer-side byte gate; every Node connection uses this path.
-    pub(crate) fn connect_peer(&self, peer: BudgetedPeerTx) -> Result<(), NodeSenderSendError> {
+    /// Standalone senders use `ReplicationPeer` bounded output handles and
+    /// caller-owned transport byte budgets; every Node connection uses this
+    /// fully byte-gated path.
+    pub(crate) fn connect_peer(&self, peer: BudgetedPeerTx) -> Result<(), SenderIngressError> {
         if self.is_closed() {
-            return Err(NodeSenderSendError::Closed);
+            return Err(SenderIngressError::Closed);
         }
-        self.set_peer(peer.identity.clone(), Some(peer))
+        self.set_peer(ReplicationPeer::from_budgeted(peer))
     }
 
-    fn set_peer(
-        &self,
-        peer_tx: mpsc::Sender<Vec<u8>>,
-        budgeted: Option<BudgetedPeerTx>,
-    ) -> Result<(), NodeSenderSendError> {
+    fn set_peer(&self, peer: ReplicationPeer) -> Result<(), SenderIngressError> {
         self.signals_tx.send_if_modified(|signals| {
             if let Some(current) = signals.peer.as_ref() {
-                if current.tx.same_channel(&peer_tx) {
-                    // Never let a duplicate raw-channel notification remove the
-                    // Node transport's hard producer-side byte gate.
-                    if budgeted.is_none()
-                        || current
-                            .budgeted
-                            .as_ref()
-                            .zip(budgeted.as_ref())
-                            .is_some_and(|(current, next)| current.same_channel(next))
-                    {
-                        return false;
-                    }
+                if current.id() == peer.id() {
+                    return false;
                 }
             }
             signals.peer_generation = next_generation(signals.peer_generation);
-            signals.peer = Some(NodeSenderPeer {
-                tx: peer_tx,
-                budgeted,
-            });
+            signals.peer = Some(peer);
             true
         });
         Ok(())
     }
 
-    fn send_data(&self, op: crate::actor::ReplicatedOp) -> Result<(), NodeSenderSendError> {
+    fn send_data(&self, op: crate::actor::ReplicatedOp) -> Result<(), SenderIngressError> {
         self.offer(&op)
     }
 
     /// Charge both sender and node byte allowances before cloning fanout data.
-    pub(crate) fn offer(&self, op: &crate::actor::ReplicatedOp) -> Result<(), NodeSenderSendError> {
+    pub(crate) fn offer(&self, op: &crate::actor::ReplicatedOp) -> Result<(), SenderIngressError> {
         let draining = self.ingress.draining.lock().unwrap();
         if *draining || self.is_closed() {
-            return Err(NodeSenderSendError::Closed);
+            return Err(SenderIngressError::Closed);
         }
         let Some(mut op) = self.ingress.retention.borrowed(op) else {
             crate::node::observability::add_saturating(&self.ingress.shed_operations, 1);
@@ -898,14 +934,14 @@ impl NodeSender {
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
                 self.ingress.pending_data.fetch_sub(1, Ordering::AcqRel);
-                Err(NodeSenderSendError::Closed)
+                Err(SenderIngressError::Closed)
             }
         };
         drop(draining);
         result
     }
 
-    fn send_control(&self, control: SenderMsg) -> Result<(), NodeSenderSendError> {
+    fn send_control(&self, control: SenderMsg) -> Result<(), SenderIngressError> {
         self.send_control_retained(control, None)
     }
 
@@ -914,9 +950,9 @@ impl NodeSender {
         &self,
         control: SenderMsg,
         retention: Arc<dyn Send + Sync>,
-    ) -> Result<(), NodeSenderSendError> {
+    ) -> Result<(), SenderIngressError> {
         if self.is_closed() {
-            return Err(NodeSenderSendError::Closed);
+            return Err(SenderIngressError::Closed);
         }
         self.send_control_retained(control, Some(retention))
     }
@@ -925,14 +961,14 @@ impl NodeSender {
         &self,
         control: SenderMsg,
         apply_retention: Option<Arc<dyn Send + Sync>>,
-    ) -> Result<(), NodeSenderSendError> {
+    ) -> Result<(), SenderIngressError> {
         let Some(lease) = self
             .ingress
             .retention
             .reserve(retained_control_bytes(&control))
         else {
             self.schedule_reset();
-            return Err(NodeSenderSendError::Full);
+            return Err(SenderIngressError::Full);
         };
         match self.control_tx.try_send(RetainedControl {
             msg: control,
@@ -940,8 +976,8 @@ impl NodeSender {
             apply_retention,
         }) {
             Ok(()) => Ok(()),
-            Err(mpsc::error::TrySendError::Full(_)) => Err(NodeSenderSendError::Full),
-            Err(mpsc::error::TrySendError::Closed(_)) => Err(NodeSenderSendError::Closed),
+            Err(mpsc::error::TrySendError::Full(_)) => Err(SenderIngressError::Full),
+            Err(mpsc::error::TrySendError::Closed(_)) => Err(SenderIngressError::Closed),
         }
     }
 
@@ -968,7 +1004,7 @@ impl NodeSender {
     /// the configured receiver durability barrier. The generation is private
     /// to this exact sender task, so replacing a sender cannot satisfy an old
     /// shutdown fence.
-    pub(crate) fn request_drain(&self) -> Result<NodeSenderDrain, NodeSenderSendError> {
+    pub(crate) fn request_drain(&self) -> Result<NodeSenderDrain, SenderIngressError> {
         self.request_drain_at(self.configured_ack_durability)
     }
 
@@ -978,13 +1014,13 @@ impl NodeSender {
     pub(crate) fn request_drain_at(
         &self,
         required_ack_durability: ReplicationAckDurability,
-    ) -> Result<NodeSenderDrain, NodeSenderSendError> {
+    ) -> Result<NodeSenderDrain, SenderIngressError> {
         // Serialize with data try_send so every accepted item is either ahead
         // of this fence or rejected after it. The task consumes the admitted
         // lane before taking its authoritative reconciliation snapshot.
         let mut draining = self.ingress.draining.lock().unwrap();
         if self.is_closed() {
-            return Err(NodeSenderSendError::Closed);
+            return Err(SenderIngressError::Closed);
         }
         *draining = true;
         let mut generation = 0;
@@ -1051,7 +1087,7 @@ enum SenderInput {
     Data(RetainedOp, Arc<NodeSenderIngress>),
     Control(RetainedControl),
     Overflow(u64, Arc<NodeSenderIngress>),
-    PeerChanged(Option<NodeSenderPeer>),
+    PeerChanged(Option<ReplicationPeer>),
     ReconcileNow,
     Drain(NodeSenderDrainRequest),
     Closed,
@@ -1239,8 +1275,7 @@ impl ActiveConnection {
 
 #[derive(Clone)]
 struct SenderPeer {
-    tx: mpsc::Sender<Vec<u8>>,
-    budgeted: Option<BudgetedPeerTx>,
+    peer: ReplicationPeer,
     queue_admission_timeout: Duration,
     local_work_timeout: Duration,
     reconciliation_result_budget: Arc<ByteBudget>,
@@ -1249,17 +1284,9 @@ struct SenderPeer {
 }
 
 impl SenderPeer {
-    fn new(
-        tx: mpsc::Sender<Vec<u8>>,
-        budgeted: Option<BudgetedPeerTx>,
-        options: &SenderRuntimeOptions,
-    ) -> Self {
-        debug_assert!(budgeted
-            .as_ref()
-            .is_none_or(|peer| peer.identity.same_channel(&tx)));
+    fn new(peer: ReplicationPeer, options: &SenderRuntimeOptions) -> Self {
         Self {
-            tx,
-            budgeted,
+            peer,
             queue_admission_timeout: options.queue_admission_timeout,
             local_work_timeout: options.local_work_timeout,
             reconciliation_result_budget: options.reconciliation_result_budget.clone(),
@@ -1268,21 +1295,21 @@ impl SenderPeer {
         }
     }
 
-    fn same_channel(&self, other: &mpsc::Sender<Vec<u8>>) -> bool {
-        self.tx.same_channel(other)
+    fn same_connection(&self, other: &PeerConnectionId) -> bool {
+        self.peer.id() == other
     }
 
     fn report_failure(&self) {
         if let Some(handler) = &self.queue_failure_handler {
-            handler(self.tx.clone());
+            handler(self.peer.connection_id());
         }
     }
 
     fn must_disconnect_after_failure(&self) -> bool {
-        self.budgeted
-            .as_ref()
-            .map_or_else(|| self.tx.is_closed(), |peer| peer.tx.is_closed())
-            || self.queue_failure_handler.is_some()
+        (match &self.peer.transport {
+            SenderTransport::Standalone { tx, .. } => tx.is_closed(),
+            SenderTransport::NodeBudgeted(peer) => peer.tx.is_closed(),
+        }) || self.queue_failure_handler.is_some()
     }
 }
 
@@ -1672,94 +1699,97 @@ async fn send_envelope(
         peer.report_failure();
         return false;
     }
-    if let Some(outbound) = &peer.budgeted {
-        let charged_len = encoded_len;
-        let frame_permit =
-            match tokio::time::timeout_at(admission_deadline, outbound.tx.reserve()).await {
-                Ok(Ok(permit)) => permit,
-                Ok(Err(_)) | Err(_) => {
-                    peer.report_failure();
-                    return false;
-                }
-            };
-        let producer_byte_permit = match tokio::time::timeout_at(
-            admission_deadline,
-            outbound
-                .producer_byte_budget
-                .clone()
-                .acquire_many_owned(charged_len as u32),
-        )
-        .await
-        {
-            Ok(Ok(permit)) => permit,
-            Ok(Err(_)) | Err(_) => {
-                peer.report_failure();
-                return false;
-            }
-        };
-        let byte_permit = match tokio::time::timeout_at(
-            admission_deadline,
-            outbound
-                .byte_budget
-                .clone()
-                .acquire_many_owned(charged_len as u32),
-        )
-        .await
-        {
-            Ok(Ok(permit)) => permit,
-            Ok(Err(_)) | Err(_) => {
-                peer.report_failure();
-                return false;
-            }
-        };
-        let global_permits = match outbound
-            .acquire_global_producer(charged_len as u32, admission_deadline)
+    match &peer.peer.transport {
+        SenderTransport::NodeBudgeted(outbound) => {
+            let charged_len = encoded_len;
+            let frame_permit =
+                match tokio::time::timeout_at(admission_deadline, outbound.tx.reserve()).await {
+                    Ok(Ok(permit)) => permit,
+                    Ok(Err(_)) | Err(_) => {
+                        peer.report_failure();
+                        return false;
+                    }
+                };
+            let producer_byte_permit = match tokio::time::timeout_at(
+                admission_deadline,
+                outbound
+                    .producer_byte_budget
+                    .clone()
+                    .acquire_many_owned(charged_len as u32),
+            )
             .await
-        {
-            Ok(permits) => permits,
-            Err(()) => {
-                peer.report_failure();
-                return false;
-            }
-        };
-        if Instant::now() >= admission_deadline {
-            peer.report_failure();
-            return false;
-        }
-        let buf = match encode_envelope(&envelope) {
-            Ok(buf) => buf,
-            Err(error) => {
-                tracing::warn!(%error, "failed to encode preflighted outbound replication frame");
-                return false;
-            }
-        };
-        frame_permit.send(
-            BudgetedFrame::new_producer(buf, byte_permit, producer_byte_permit)
-                .with_global_permits(global_permits),
-        );
-        true
-    } else {
-        let frame_permit =
-            match tokio::time::timeout_at(admission_deadline, peer.tx.reserve()).await {
+            {
                 Ok(Ok(permit)) => permit,
                 Ok(Err(_)) | Err(_) => {
                     peer.report_failure();
                     return false;
                 }
             };
-        if Instant::now() >= admission_deadline {
-            peer.report_failure();
-            return false;
-        }
-        let buf = match encode_envelope(&envelope) {
-            Ok(buf) => buf,
-            Err(error) => {
-                tracing::warn!(%error, "failed to encode preflighted outbound replication frame");
+            let byte_permit = match tokio::time::timeout_at(
+                admission_deadline,
+                outbound
+                    .byte_budget
+                    .clone()
+                    .acquire_many_owned(charged_len as u32),
+            )
+            .await
+            {
+                Ok(Ok(permit)) => permit,
+                Ok(Err(_)) | Err(_) => {
+                    peer.report_failure();
+                    return false;
+                }
+            };
+            let global_permits = match outbound
+                .acquire_global_producer(charged_len as u32, admission_deadline)
+                .await
+            {
+                Ok(permits) => permits,
+                Err(()) => {
+                    peer.report_failure();
+                    return false;
+                }
+            };
+            if Instant::now() >= admission_deadline {
+                peer.report_failure();
                 return false;
             }
-        };
-        frame_permit.send(buf);
-        true
+            let buf = match encode_envelope(&envelope) {
+                Ok(buf) => buf,
+                Err(error) => {
+                    tracing::warn!(%error, "failed to encode preflighted outbound replication frame");
+                    return false;
+                }
+            };
+            frame_permit.send(
+                BudgetedFrame::new_producer(buf, byte_permit, producer_byte_permit)
+                    .with_global_permits(global_permits),
+            );
+            true
+        }
+        SenderTransport::Standalone { tx, .. } => {
+            let frame_permit = match tokio::time::timeout_at(admission_deadline, tx.reserve()).await
+            {
+                Ok(Ok(permit)) => permit,
+                Ok(Err(_)) | Err(_) => {
+                    peer.report_failure();
+                    return false;
+                }
+            };
+            if Instant::now() >= admission_deadline {
+                peer.report_failure();
+                return false;
+            }
+            let buf = match encode_envelope(&envelope) {
+                Ok(buf) => buf,
+                Err(error) => {
+                    tracing::warn!(%error, "failed to encode preflighted outbound replication frame");
+                    return false;
+                }
+            };
+            frame_permit.send(buf);
+            true
+        }
     }
 }
 
@@ -1986,7 +2016,6 @@ async fn sender_task(
                 let mut retained_enqueue = None;
                 let mut control_lease = None;
                 let mut apply_retention = None;
-                let mut budgeted_peer = None;
                 let msg = match input {
                     SenderInput::Control(control) => {
                         control_lease = Some(control.lease);
@@ -2003,12 +2032,11 @@ async fn sender_task(
                         None
                     }
                     SenderInput::PeerChanged(Some(peer)) => {
-                        budgeted_peer = peer.budgeted;
-                        Some(SenderMsg::PeerConnected { peer_tx: peer.tx })
+                        Some(SenderMsg::PeerConnected { peer })
                     }
                     SenderInput::PeerChanged(None) => connection.as_ref().map(|current| {
                         SenderMsg::PeerDisconnected {
-                            peer_tx: current.peer_tx.tx.clone(),
+                            connection_id: current.peer_tx.peer.connection_id(),
                         }
                     }),
                     SenderInput::ReconcileNow => Some(SenderMsg::ReconcileNow),
@@ -2110,10 +2138,10 @@ async fn sender_task(
                 let Some(msg) = msg else { continue };
                 match msg {
                     SenderMsg::Enqueue(_) => unreachable!("mutations use the bounded data lane"),
-                    SenderMsg::PeerConnected { peer_tx: tx } => {
+                    SenderMsg::PeerConnected { peer } => {
                         if connection
                             .as_ref()
-                            .is_some_and(|current| current.peer_tx.same_channel(&tx))
+                            .is_some_and(|current| current.peer_tx.same_connection(peer.id()))
                         {
                             // Dynamic placement polls and duplicate
                             // notifications must not rotate live sessions.
@@ -2133,11 +2161,10 @@ async fn sender_task(
                         }
                         last_ack_durability = None;
                         ack_durability_mismatch = false;
-                        reconcile_credit_rx = budgeted_peer
-                            .as_ref()
+                        reconcile_credit_rx = peer.node_transport()
                             .map(BudgetedPeerTx::reconcile_change_receiver);
                         let mut conn = ActiveConnection {
-                            peer_tx: SenderPeer::new(tx, budgeted_peer, &runtime),
+                            peer_tx: SenderPeer::new(peer, &runtime),
                             session_id: rand_session_id(),
                             session_ready: false,
                             next_batch_seq: 0,
@@ -2212,10 +2239,10 @@ async fn sender_task(
                         }
                         connection = Some(conn);
                     }
-                    SenderMsg::PeerDisconnected { peer_tx } => {
+                    SenderMsg::PeerDisconnected { connection_id } => {
                         if connection
                             .as_ref()
-                            .is_none_or(|current| !current.peer_tx.same_channel(&peer_tx))
+                            .is_none_or(|current| !current.peer_tx.same_connection(&connection_id))
                         {
                             continue;
                         }
@@ -3477,7 +3504,7 @@ async fn begin_reconcile(
     next_round_id: &mut u64,
     phase_timeout: Duration,
 ) -> Result<Option<ReconcileRound>, ()> {
-    let connection_permit = match connection.peer_tx.budgeted.as_ref() {
+    let connection_permit = match connection.peer_tx.peer.node_transport() {
         Some(peer) => match peer.try_acquire_reconcile(reconcile_ticket)? {
             Some(permit) => Some(permit),
             None => return Ok(None),
@@ -4497,7 +4524,7 @@ mod tests {
         assert_eq!(retention.aggregate.used(), charge);
         let (tx, _rx) = mpsc::channel(1);
         let mut connection = ActiveConnection {
-            peer_tx: SenderPeer::new(tx, None, &SenderRuntimeOptions::default()),
+            peer_tx: SenderPeer::new(ReplicationPeer::new(tx), &SenderRuntimeOptions::default()),
             session_id: 1,
             session_ready: true,
             next_batch_seq: 2,
@@ -4813,7 +4840,10 @@ mod tests {
         let router = FragmentRouter::new(1, 0);
         let (peer_tx, mut peer_rx) = mpsc::channel(2);
         let connection = ActiveConnection {
-            peer_tx: SenderPeer::new(peer_tx, None, &SenderRuntimeOptions::default()),
+            peer_tx: SenderPeer::new(
+                ReplicationPeer::new(peer_tx),
+                &SenderRuntimeOptions::default(),
+            ),
             session_id: 1,
             session_ready: true,
             next_batch_seq: 0,
@@ -5009,29 +5039,33 @@ mod tests {
                 batch_seq: 2,
                 durability: ReplicationAckDurability::MemoryApplied,
             }),
-            Err(NodeSenderSendError::Full)
+            Err(SenderIngressError::Full)
         );
 
         let (old_peer, _old_rx) = mpsc::channel(1);
+        let old_peer = ReplicationPeer::new(old_peer);
         let (new_peer, _new_rx) = mpsc::channel(1);
+        let new_peer = ReplicationPeer::new(new_peer);
         sender
             .send(SenderMsg::PeerConnected {
-                peer_tx: old_peer.clone(),
+                peer: old_peer.clone(),
             })
             .unwrap();
         sender
             .send(SenderMsg::PeerConnected {
-                peer_tx: new_peer.clone(),
+                peer: new_peer.clone(),
             })
             .unwrap();
         sender
-            .send(SenderMsg::PeerDisconnected { peer_tx: old_peer })
+            .send(SenderMsg::PeerDisconnected {
+                connection_id: old_peer.connection_id(),
+            })
             .unwrap();
         sender.send(SenderMsg::ReconcileNow).unwrap();
         let signals = signals_rx.borrow().clone();
         assert!(signals
             .peer
-            .is_some_and(|current| current.tx.same_channel(&new_peer)));
+            .is_some_and(|current| current.id() == new_peer.id()));
         assert_eq!(signals.reconcile_generation, 1);
 
         assert_eq!(data_rx.recv().await.unwrap().key, "queued");
@@ -5047,7 +5081,7 @@ mod tests {
         drop(data_rx);
         assert_eq!(
             sender.send_data(op("closed-data")),
-            Err(NodeSenderSendError::Closed)
+            Err(SenderIngressError::Closed)
         );
         assert_eq!(
             sender.ingress.pending_data.load(Ordering::Acquire),
@@ -5064,14 +5098,14 @@ mod tests {
                 batch_seq: 3,
                 durability: ReplicationAckDurability::MemoryApplied,
             }),
-            Err(NodeSenderSendError::Closed)
+            Err(SenderIngressError::Closed)
         );
         finish_tx.send(()).unwrap();
         task.await.unwrap();
         sender.stop().await;
         assert_eq!(
             sender.send(SenderMsg::ReconcileNow),
-            Err(NodeSenderSendError::Closed)
+            Err(SenderIngressError::Closed)
         );
     }
 
@@ -5114,7 +5148,10 @@ mod tests {
 
         let (peer_tx, mut peer_rx) = mpsc::channel(1);
         let mut connection = ActiveConnection {
-            peer_tx: SenderPeer::new(peer_tx, None, &SenderRuntimeOptions::default()),
+            peer_tx: SenderPeer::new(
+                ReplicationPeer::new(peer_tx),
+                &SenderRuntimeOptions::default(),
+            ),
             session_id: 7,
             session_ready: true,
             next_batch_seq: 0,
@@ -5192,7 +5229,10 @@ mod tests {
 
         let (peer_tx, mut peer_rx) = mpsc::channel(2);
         let connection = ActiveConnection {
-            peer_tx: SenderPeer::new(peer_tx, None, &SenderRuntimeOptions::default()),
+            peer_tx: SenderPeer::new(
+                ReplicationPeer::new(peer_tx),
+                &SenderRuntimeOptions::default(),
+            ),
             session_id: 41,
             session_ready: true,
             next_batch_seq: 0,
@@ -5256,7 +5296,9 @@ mod tests {
         let (signals_tx, signals_rx) = watch::channel(NodeSenderSignals::default());
         let ingress = Arc::new(NodeSenderIngress::default());
         let (first_peer, _first_peer_rx) = mpsc::channel(1);
+        let first_peer = ReplicationPeer::new(first_peer);
         let (latest_peer, _latest_peer_rx) = mpsc::channel(1);
+        let latest_peer = ReplicationPeer::new(latest_peer);
         let mut inbox = SenderInbox {
             data_rx,
             control_rx,
@@ -5271,10 +5313,7 @@ mod tests {
         signals_tx.send_modify(|signals| {
             signals.overflow_generation = 1;
             signals.peer_generation = 1;
-            signals.peer = Some(NodeSenderPeer {
-                tx: first_peer,
-                budgeted: None,
-            });
+            signals.peer = Some(first_peer);
             signals.reconcile_generation = 1;
         });
         assert!(matches!(
@@ -5286,14 +5325,11 @@ mod tests {
         // still-undelivered reconcile generation from the prior snapshot.
         signals_tx.send_modify(|signals| {
             signals.peer_generation = 2;
-            signals.peer = Some(NodeSenderPeer {
-                tx: latest_peer.clone(),
-                budgeted: None,
-            });
+            signals.peer = Some(latest_peer.clone());
         });
         assert!(matches!(
             inbox.recv().await,
-            SenderInput::PeerChanged(Some(peer)) if peer.tx.same_channel(&latest_peer)
+            SenderInput::PeerChanged(Some(peer)) if peer.id() == latest_peer.id()
         ));
         assert!(matches!(
             tokio::time::timeout(Duration::from_secs(1), inbox.recv()).await,
@@ -5513,7 +5549,7 @@ mod tests {
     fn batch_sequence_allocator_never_emits_reserved_repair_sentinel() {
         let (tx, _rx) = mpsc::channel(1);
         let mut connection = ActiveConnection {
-            peer_tx: SenderPeer::new(tx, None, &SenderRuntimeOptions::default()),
+            peer_tx: SenderPeer::new(ReplicationPeer::new(tx), &SenderRuntimeOptions::default()),
             session_id: 1,
             session_ready: true,
             next_batch_seq: u64::MAX - 1,
@@ -5661,7 +5697,7 @@ mod tests {
             .with_queue_failure_handler(Arc::new(move |_| {
                 observed.store(true, Ordering::SeqCst);
             }));
-        let peer = SenderPeer::new(tx, None, &options);
+        let peer = SenderPeer::new(ReplicationPeer::new(tx), &options);
         assert!(
             !send_envelope(
                 &peer,
@@ -5689,7 +5725,7 @@ mod tests {
         let encoded_len = Envelope { msg: Some(msg()) }.encoded_len();
         let (frame_tx, mut frame_rx) = mpsc::channel(4);
         let (response_tx, _response_rx) = mpsc::channel(4);
-        let (identity, _identity_rx) = mpsc::channel(1);
+        let identity = crate::network::PeerConnectionId::new();
         let budget = Arc::new(tokio::sync::Semaphore::new(encoded_len * 2));
         let producer_budget = Arc::new(tokio::sync::Semaphore::new(encoded_len * 2));
         let outbound = BudgetedPeerTx {
@@ -5701,12 +5737,12 @@ mod tests {
             byte_budget: budget.clone(),
             producer_byte_budget: producer_budget,
             reconcile_gate: crate::wire::ReconcileGate::new(),
-            identity: identity.clone(),
+            connection_id: identity.clone(),
         };
         let options =
             SenderRuntimeOptions::default().with_queue_admission_timeout(Duration::from_millis(10));
-        let first = SenderPeer::new(identity.clone(), Some(outbound.clone()), &options);
-        let second = SenderPeer::new(identity, Some(outbound), &options);
+        let first = SenderPeer::new(ReplicationPeer::from_budgeted(outbound.clone()), &options);
+        let second = SenderPeer::new(ReplicationPeer::from_budgeted(outbound), &options);
 
         assert!(send_envelope(&first, None, msg()).await);
         assert!(send_envelope(&second, None, msg()).await);
@@ -5741,18 +5777,21 @@ mod tests {
         let make_peer = || {
             let (tx, rx) = mpsc::channel(4);
             let (response_tx, _response_rx) = mpsc::channel(4);
-            let (identity, _identity_rx) = mpsc::channel(1);
+            let identity = crate::network::PeerConnectionId::new();
             let outbound = BudgetedPeerTx {
                 tx,
                 response_tx,
-                identity: identity.clone(),
+                connection_id: identity.clone(),
                 byte_budget: Arc::new(tokio::sync::Semaphore::new(4096)),
                 producer_byte_budget: Arc::new(tokio::sync::Semaphore::new(4096)),
                 node_byte_budget: budget.clone(),
                 reconcile_gate: crate::wire::ReconcileGate::new(),
             };
             (
-                SenderPeer::new(identity, Some(outbound), &SenderRuntimeOptions::default()),
+                SenderPeer::new(
+                    ReplicationPeer::from_budgeted(outbound),
+                    &SenderRuntimeOptions::default(),
+                ),
                 rx,
             )
         };
@@ -5779,7 +5818,7 @@ mod tests {
     async fn node_reconciliation_rounds_share_one_connection_credit() {
         let (frame_tx, mut frame_rx) = mpsc::channel(4);
         let (response_tx, _response_rx) = mpsc::channel(4);
-        let (identity, _identity_rx) = mpsc::channel(1);
+        let identity = crate::network::PeerConnectionId::new();
         let reconcile_gate = crate::wire::ReconcileGate::new();
         let outbound = BudgetedPeerTx {
             node_byte_budget: crate::wire::NodePeerByteBudget::new(
@@ -5790,9 +5829,12 @@ mod tests {
             byte_budget: Arc::new(tokio::sync::Semaphore::new(4096)),
             producer_byte_budget: Arc::new(tokio::sync::Semaphore::new(4096)),
             reconcile_gate: reconcile_gate.clone(),
-            identity: identity.clone(),
+            connection_id: identity.clone(),
         };
-        let peer = SenderPeer::new(identity, Some(outbound), &SenderRuntimeOptions::default());
+        let peer = SenderPeer::new(
+            ReplicationPeer::from_budgeted(outbound),
+            &SenderRuntimeOptions::default(),
+        );
         let connection = ActiveConnection {
             peer_tx: peer,
             session_id: 7,
@@ -5903,7 +5945,11 @@ mod tests {
         )
         .unwrap();
         let (peer_tx, mut peer_rx) = mpsc::channel(1);
-        sender.send(SenderMsg::PeerConnected { peer_tx }).unwrap();
+        sender
+            .send(SenderMsg::PeerConnected {
+                peer: ReplicationPeer::new(peer_tx),
+            })
+            .unwrap();
         wait_for_sender_report(&report, |state| state.state == "connected").await;
         peer_rx.recv().await.expect("initial SessionStart missing");
 
@@ -5942,7 +5988,11 @@ mod tests {
         )
         .unwrap();
         let (peer_tx, mut peer_rx) = mpsc::channel(1);
-        sender.send(SenderMsg::PeerConnected { peer_tx }).unwrap();
+        sender
+            .send(SenderMsg::PeerConnected {
+                peer: ReplicationPeer::new(peer_tx),
+            })
+            .unwrap();
         let connected = wait_for_sender_report(&report, |state| state.state == "connected").await;
 
         // Leave the initial SessionStart queued so the reset SessionStart
@@ -5964,7 +6014,7 @@ mod tests {
     #[tokio::test]
     async fn expired_replication_deadline_never_admits_to_an_empty_queue() {
         let (tx, mut rx) = mpsc::channel(1);
-        let peer = SenderPeer::new(tx, None, &SenderRuntimeOptions::default());
+        let peer = SenderPeer::new(ReplicationPeer::new(tx), &SenderRuntimeOptions::default());
         let expired = Instant::now();
         tokio::task::yield_now().await;
         assert!(

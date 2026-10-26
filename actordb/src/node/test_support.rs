@@ -58,7 +58,7 @@ pub(super) fn test_peer_channel(
 ) {
     let (tx, rx) = mpsc::channel(capacity);
     let (response_tx, response_rx) = mpsc::channel(capacity);
-    let (identity, _) = mpsc::channel(1);
+    let identity = crate::network::PeerConnectionId::new();
     let (cancel, _) = watch::channel(false);
     (
         PeerChannel {
@@ -72,7 +72,7 @@ pub(super) fn test_peer_channel(
                     PEER_CHANNEL_BYTE_CAPACITY - PEER_RESPONSE_BYTE_RESERVE,
                 )),
                 reconcile_gate: ReconcileGate::new(),
-                identity,
+                connection_id: identity,
             },
             cancel,
             queue_admission_timeout: Duration::from_millis(10),

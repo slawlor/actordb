@@ -763,7 +763,9 @@ mod tests {
             .insert((FragmentId(0), "replica".into()), sender.clone());
         let (peer, mut outbound) = mpsc::channel(16);
         sender
-            .send(SenderMsg::PeerConnected { peer_tx: peer })
+            .send(SenderMsg::PeerConnected {
+                peer: crate::replication::ReplicationPeer::new(peer),
+            })
             .unwrap();
         sender.send(SenderMsg::ReconcileNow).unwrap();
         let mut session = 0;
