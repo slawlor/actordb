@@ -200,6 +200,11 @@ that fence, and joins every worker before the final fragment flush. Replacing
 the remaining custom lifecycle with ractor `Factory` admission and an explicit
 discard/requeue policy is still required for lossless restart.
 
+A handled storage error is a request outcome and does not trigger worker
+restart. The worker returns that error, retains the authoritative persistence
+state, and continues its admitted mailbox. This includes backend panics caught
+by the storage executor; actual actor failures retain the restart behavior above.
+
 ## Node-owned serving reads
 
 Serving `ForwardedGet` and `BatchGet` jobs leave the socket reader through

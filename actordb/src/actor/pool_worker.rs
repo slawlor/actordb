@@ -15,7 +15,7 @@ use ractor::{Actor, ActorProcessingErr, ActorRef};
 use super::fragment_state::FragmentState;
 use super::kv_worker::handle_worker_message;
 use super::pool::release_pending;
-use super::protocol::{ApplyError, KvMessage};
+use super::protocol::KvMessage;
 /// Worker used internally by [`super::pool::WorkerPool`]. The pool-wide count enforces the
 /// configured cap, while the slot-local count lets supervision reclaim only
 /// the work abandoned by one failed worker.
@@ -127,21 +127,14 @@ impl Actor for PoolWorker {
                             Ok(())
                         }
                         Err(error) => {
-                            let fatal = match &error {
-                                ApplyError::Storage(message) => {
-                                    Some(ActorProcessingErr::from(message.clone()))
-                                }
-                                ApplyError::Backpressure
-                                | ApplyError::InvalidInput(_)
-                                | ApplyError::VersionConflict { .. } => None,
-                            };
+                            // A handled backend error leaves authoritative cache
+                            // and persistence ownership available for retry. It
+                            // is a request outcome, not an actor failure: killing
+                            // this worker would discard unrelated admitted jobs.
                             if let Some(reply) = reply {
                                 let _ = reply.send(Err(error));
                             }
-                            match fatal {
-                                Some(error) => Err(error),
-                                None => Ok(()),
-                            }
+                            Ok(())
                         }
                     }
                 }
@@ -237,3 +230,7 @@ fn release_pool_reservation(state: &PoolWorkerArgs) {
     release_pending(&state.slot_pending, 1);
     release_pending(&state.pool_pending, 1);
 }
+
+#[cfg(test)]
+#[path = "pool_worker_tests.rs"]
+mod tests;
