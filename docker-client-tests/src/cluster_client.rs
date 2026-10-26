@@ -620,13 +620,20 @@ impl Harness {
                 .await
                 .map_err(|e| e.to_string())?;
             require(
-                result.iter().all(std::result::Result::is_ok),
+                result.len() == chunk.len() && result.iter().all(std::result::Result::is_ok),
                 "partition burst not acknowledged",
             )?;
         }
         let isolated = snapshot(&c).await?;
         c.close().await;
-        for record in isolated.values().filter(|r| r.key.starts_with("overflow:")) {
+        for (key, value) in &burst {
+            let record = isolated
+                .get(&format!("KV\0{key}"))
+                .ok_or("acknowledged overflow key missing before recovery")?;
+            require(
+                record.value == *value && !record.tombstone && record.expires.is_none(),
+                "overflow content differs from independently generated write",
+            )?;
             self.ledger.add(record.clone());
         }
         require(
