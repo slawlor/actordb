@@ -37,7 +37,7 @@ create several clients. Incoming frames retain their fixed 16 MiB wire cap.
 Before decoding, aggregate headers, cells, map entries, payloads and nested
 write-concern evidence must also fit `ClientOptions::max_decoded_response_bytes`
 (64 MiB by default). This stricter default can reject formerly accepted wide
-responses. For a trusted workload needing wider supported results, opt in with
+responses or near-server-limit narrow text results. For such a trusted workload, opt in with
 `.max_decoded_response_bytes(512 * 1024 * 1024)`; increasing that allowance does
 not increase the wire limit. Exceeding decoded admission retires the connection
 with `Protocol` (or `UnknownOutcome` for a possibly dispatched mutation).

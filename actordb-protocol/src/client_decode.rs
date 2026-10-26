@@ -1,4 +1,9 @@
-//! Allocation-free decoded-object admission, separate from encoded framing.
+//! Decoded-object admission, separate from encoded framing.
+//!
+//! The budget, header/payload and pending-shape walk is allocation-free and
+//! precedes all message/collection materialization. The existing typed receipt
+//! validator can allocate bounded error metadata on malformed receipts; that
+//! rejection does not materialize their decoded messages or payloads.
 
 use std::mem::size_of;
 
@@ -97,10 +102,15 @@ impl ClientResponseShape {
     }
 }
 
+/// Validate before message/collection materialization using the default budget.
+/// The accounting/shape pass allocates no owned data. Malformed typed receipt
+/// validation can allocate a bounded error string before returning rejection.
 pub fn preflight_client_frame(bytes: &[u8]) -> Result<(), &'static str> {
     preflight_client_frame_with_budget(bytes, DEFAULT_MAX_DECODED_RESPONSE_BYTES).map(|_| ())
 }
 
+/// As [`preflight_client_frame`], with an explicit accounted allowance and report.
+/// Successful preflight does not materialize messages, collections or payloads.
 pub fn preflight_client_frame_with_budget(
     bytes: &[u8],
     max_accounted_bytes: usize,
@@ -126,6 +136,8 @@ pub fn preflight_client_frame_kind(
     preflight(bytes, max_accounted_bytes, None, Some(kind))
 }
 
+/// Additionally validate the actual pending request before materialization.
+/// The same bounded malformed-receipt error-metadata caveat applies.
 pub fn preflight_client_response(
     bytes: &[u8],
     max_accounted_bytes: usize,

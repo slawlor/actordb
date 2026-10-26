@@ -90,9 +90,10 @@ pub fn valid_client_hello(hello: &client::Hello) -> bool {
         && hello.protocol_version == CLIENT_PROTOCOL_VERSION
 }
 
-/// Allocation-free protobuf preflight. Bounds repeated fields before Prost
+/// Structural protobuf preflight. Bounds repeated fields before Prost
 /// materializes empty nested messages. Rejects duplicate envelope/operation
 /// variants rather than accepting protobuf's last-one-wins interpretation.
+/// Malformed typed receipts can allocate bounded error metadata on rejection.
 fn validate_client_frame_structure(bytes: &[u8]) -> Result<(), &'static str> {
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum Context {

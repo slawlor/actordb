@@ -21,7 +21,8 @@ record/manifest format **3**. There is no rolling wire upgrade, old-store
 adoption, compatibility API alias or automatic data conversion. Current-format
 `0.9.0` deployments require no data conversion; non-current formats require a
 fresh deployment. The SDK's new decoded-response allowance defaults to 64 MiB;
-configure a larger allowance explicitly for supported wide responses.
+configure a larger allowance explicitly for supported wide responses or
+near-server-limit narrow text results.
 
 ```toml
 [dependencies]

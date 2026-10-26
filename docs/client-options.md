@@ -52,7 +52,8 @@ let options = ClientOptions::builder()
     .build();
 ```
 
-Choose a larger allowance explicitly for trusted wide results. Increasing it
+Choose a larger allowance explicitly for trusted wide or near-server-limit narrow
+text results. Increasing it
 does not increase the wire limit or existing row/column/receipt limits. Values
 below 4 KiB are invalid. Exceeding admission fails before decoded collections
 are constructed and closes that connection; a possibly dispatched write has
@@ -66,6 +67,11 @@ validation copies and nested receipt expansion. This is not an allocator or RSS
 bound. Caller-retained results, outgoing request storage, transport buffers and
 allocator slack are outside this allowance. Separate client connections have
 separate allowances.
+
+The budget/header/payload and shape walk is allocation-free. Successful preflight
+does not materialize decoded messages or payloads. Malformed typed receipt
+validation may allocate bounded error metadata before returning rejection; this
+does not waive or bypass admission.
 
 All clones/table views share one decode/conversion owner. It is acquired before
 socket transfer or raw-body allocation and retained until public conversion

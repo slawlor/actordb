@@ -30,6 +30,9 @@ charged before Prost materializes them. `preflight_client_frame_with_budget`
 returns the `ClientDecodeReport`; `preflight_client_response` additionally checks
 the actual pending request ID, operation counts and trusted query width/limit.
 Handshake phases can require an exact `ClientFrameKind` before materialization.
+The budget/header/payload and shape walk itself is allocation-free. Successful
+preflight constructs no decoded messages or collections; malformed typed receipt
+validation can allocate bounded error metadata before returning rejection.
 Returned caller-owned data, allocator slack and transport buffers are not an RSS
 guarantee. This admission policy changes no protocol tags or value encodings.
 

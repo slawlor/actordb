@@ -338,3 +338,25 @@ fn all_known_nested_payloads_and_raw_bytes_are_accounted_and_malformed_shapes_fa
         assert!(preflight_client_frame(&malformed).is_err());
     }
 }
+
+#[test]
+fn malformed_receiving_node_allocates_only_bounded_receipt_error_metadata() {
+    let mut receipt = Vec::new();
+    field(&mut receipt, 2, &[b'x'; 256]);
+    let mut mutation = Vec::new();
+    field(&mut mutation, 3, &receipt);
+    let mut body = vec![8, 1];
+    field(&mut body, 4, &mutation);
+    let bytes = response(&body);
+    let scope = AllocationScope::start();
+    let error = preflight_client_frame(&bytes);
+    let allocation = scope.finish();
+    assert_eq!(error, Err("invalid write concern receipt"));
+    assert!(allocation.calls > 0 && allocation.calls <= 2);
+    assert!(
+        allocation.peak <= 256,
+        "only bounded error metadata, never decoded receipt/response payloads"
+    );
+    assert_eq!(allocation.live, 0);
+    eprintln!("malformed256-byte receiving_node: preflight error allocations={}, Rust-allocation-request peak={} bytes (not RSS); no decoded messages", allocation.calls, allocation.peak);
+}
