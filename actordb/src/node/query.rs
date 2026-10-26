@@ -49,6 +49,7 @@ struct FragmentCursor {
     initialized: bool,
     done: bool,
     rows: VecDeque<crate::proto::QueryPageRow>,
+    row_storage_bytes: usize,
 }
 
 impl FragmentCursor {
@@ -63,6 +64,7 @@ impl FragmentCursor {
             initialized: false,
             done: false,
             rows: VecDeque::new(),
+            row_storage_bytes: 0,
         }
     }
     fn storage(&self) -> usize {
@@ -74,8 +76,80 @@ impl FragmentCursor {
                     .capacity()
                     .saturating_mul(std::mem::size_of::<crate::proto::QueryPageRow>()),
             )
-            .saturating_add(self.rows.iter().map(row_storage).sum::<usize>())
+            .saturating_add(self.row_storage_bytes)
     }
+
+    fn accept_page(
+        &mut self,
+        page: QueryPageResponse,
+        buffer: &mut QueryBufferUsage,
+    ) -> Result<(), QueryExecutionError> {
+        let previous = self.storage();
+        self.revision = page.revision;
+        self.time = page.snapshot_time_ms;
+        self.incarnation = page.incarnation;
+        self.after_key = page.next_after_key;
+        self.done = page.done;
+        self.initialized = true;
+        self.row_storage_bytes = page.rows.iter().try_fold(0usize, |bytes, row| {
+            bytes
+                .checked_add(row_storage(row))
+                .ok_or_else(buffer_overflow)
+        })?;
+        self.rows = page.rows.into();
+        buffer.replace(previous, self.storage())
+    }
+
+    fn pop_row(
+        &mut self,
+        buffer: &mut QueryBufferUsage,
+        options: &QueryOptions,
+    ) -> Result<crate::proto::QueryPageRow, QueryExecutionError> {
+        let previous = self.storage();
+        let row = self.rows.pop_front().expect("selected head exists");
+        self.row_storage_bytes = self
+            .row_storage_bytes
+            .checked_sub(row_storage(&row))
+            .ok_or_else(buffer_overflow)?;
+        buffer.replace(previous, self.storage())?;
+        // The next head can be larger than the consumed row. Its conservative
+        // heap-copy reservation may increase even without a refill, so reject
+        // before the merge loop clones that next head.
+        check_buffer(buffer, options)?;
+        Ok(row)
+    }
+}
+
+// One initial O(fragments) sum, followed only by deltas for the cursor that
+// changed. Rows are measured once on arrival and once on consumption; no merge
+// step walks other cursors or already-buffered rows. Cursor storage still
+// conservatively reserves deque backing headers and the heap's cloned head key.
+struct QueryBufferUsage {
+    bytes: usize,
+}
+
+impl QueryBufferUsage {
+    fn new(cursors: &[FragmentCursor], sql_bytes: usize) -> Result<Self, QueryExecutionError> {
+        let bytes = cursors.iter().try_fold(sql_bytes, |bytes, cursor| {
+            bytes
+                .checked_add(cursor.storage())
+                .ok_or_else(buffer_overflow)
+        })?;
+        Ok(Self { bytes })
+    }
+
+    fn replace(&mut self, previous: usize, current: usize) -> Result<(), QueryExecutionError> {
+        self.bytes = self
+            .bytes
+            .checked_sub(previous)
+            .and_then(|bytes| bytes.checked_add(current))
+            .ok_or_else(buffer_overflow)?;
+        Ok(())
+    }
+}
+
+fn buffer_overflow() -> QueryExecutionError {
+    QueryExecutionError::BudgetExceeded("query buffer accounting overflow".into())
 }
 
 impl Node {
@@ -274,6 +348,8 @@ impl Node {
             );
         }
         let options = &merge_options;
+        let mut buffer = QueryBufferUsage::new(cursors, sql.len())?;
+        check_buffer(&buffer, options)?;
         let mut visited = 0u64;
         if plan.is_aggregate() {
             let mut aggregate = QueryAccumulator::new_with_limits(
@@ -282,11 +358,11 @@ impl Node {
             );
             // One active fragment page keeps aggregate memory independent of
             // record count; the accumulator merges exact partial states.
-            for index in 0..cursors.len() {
-                while !cursors[index].done {
-                    let page_options = options_for_page(cursors, index, options, sql.len())?;
+            for cursor in cursors.iter_mut() {
+                while !cursor.done {
+                    let page_options = options_for_page(cursor, &buffer, options)?;
                     self.fetch_query_page(
-                        &mut cursors[index],
+                        cursor,
                         &plan,
                         sql,
                         &page_options,
@@ -294,17 +370,21 @@ impl Node {
                         deadline,
                         false,
                         &mut visited,
+                        &mut buffer,
                     )
                     .await?;
-                    check_buffer(cursors, options, sql.len())?;
+                    check_buffer(&buffer, options)?;
+                    let previous = cursor.storage();
                     let partial = QueryResult {
                         columns: plan.columns(),
-                        rows: cursors[index]
+                        rows: cursor
                             .rows
                             .drain(..)
                             .map(|row| row.cells.into_iter().map(cell_to_value).collect())
                             .collect::<Result<_, _>>()?,
                     };
+                    cursor.row_storage_bytes = 0;
+                    buffer.replace(previous, cursor.storage())?;
                     aggregate.merge(&partial)?;
                 }
             }
@@ -316,20 +396,21 @@ impl Node {
             let mut heads = BinaryHeap::with_capacity(cursors.len());
             // Obtain one bounded head page from each selected fragment. No
             // fragment-wide Vec or unbounded concurrent RPC fan-out is used.
-            for index in 0..cursors.len() {
-                let page_options = options_for_page(cursors, index, options, sql.len())?;
+            for (index, cursor) in cursors.iter_mut().enumerate() {
+                let page_options = options_for_page(cursor, &buffer, options)?;
                 self.fill_query_head(
-                    &mut cursors[index],
+                    cursor,
                     &plan,
                     sql,
                     &page_options,
                     retention.clone(),
                     deadline,
                     &mut visited,
+                    &mut buffer,
                 )
                 .await?;
-                check_buffer(cursors, options, sql.len())?;
-                if let Some(row) = cursors[index].rows.front() {
+                check_buffer(&buffer, options)?;
+                if let Some(row) = cursor.rows.front() {
                     heads.push(Reverse((row.key.clone(), index)));
                 }
             }
@@ -337,10 +418,7 @@ impl Node {
             let mut payload_bytes = 0usize;
             while let Some(Reverse((key, index))) = heads.pop() {
                 drop(key);
-                let row = cursors[index]
-                    .rows
-                    .pop_front()
-                    .expect("selected head exists");
+                let row = cursors[index].pop_row(&mut buffer, options)?;
                 if skipped < plan.offset {
                     skipped += 1;
                 } else {
@@ -366,18 +444,21 @@ impl Node {
                         break;
                     }
                 }
-                let page_options = options_for_page(cursors, index, options, sql.len())?;
-                self.fill_query_head(
-                    &mut cursors[index],
-                    &plan,
-                    sql,
-                    &page_options,
-                    retention.clone(),
-                    deadline,
-                    &mut visited,
-                )
-                .await?;
-                check_buffer(cursors, options, sql.len())?;
+                if cursors[index].rows.is_empty() && !cursors[index].done {
+                    let page_options = options_for_page(&cursors[index], &buffer, options)?;
+                    self.fill_query_head(
+                        &mut cursors[index],
+                        &plan,
+                        sql,
+                        &page_options,
+                        retention.clone(),
+                        deadline,
+                        &mut visited,
+                        &mut buffer,
+                    )
+                    .await?;
+                    check_buffer(&buffer, options)?;
+                }
                 if let Some(row) = cursors[index].rows.front() {
                     heads.push(Reverse((row.key.clone(), index)));
                 }
@@ -386,13 +467,13 @@ impl Node {
         // Recheck every accepted contribution, including completed fragments,
         // before releasing a successful result. This is per-fragment checking;
         // the check instants do not create a distributed atomic snapshot.
-        for index in 0..cursors.len() {
-            if !cursors[index].initialized {
+        for cursor in cursors.iter_mut() {
+            if !cursor.initialized {
                 continue;
             }
-            let page_options = options_for_page(cursors, index, options, sql.len())?;
+            let page_options = options_for_page(cursor, &buffer, options)?;
             self.fetch_query_page(
-                &mut cursors[index],
+                cursor,
                 &plan,
                 sql,
                 &page_options,
@@ -400,6 +481,7 @@ impl Node {
                 deadline,
                 true,
                 &mut visited,
+                &mut buffer,
             )
             .await?;
         }
@@ -428,6 +510,7 @@ impl Node {
         retention: Arc<QueryRetention>,
         deadline: Instant,
         visited: &mut u64,
+        buffer: &mut QueryBufferUsage,
     ) -> Result<(), QueryExecutionError> {
         while cursor.rows.is_empty() && !cursor.done {
             let available = options.max_buffer_bytes.saturating_sub(cursor.storage());
@@ -447,6 +530,7 @@ impl Node {
                 deadline,
                 false,
                 visited,
+                buffer,
             )
             .await?;
         }
@@ -464,6 +548,7 @@ impl Node {
         deadline: Instant,
         verify: bool,
         visited: &mut u64,
+        buffer: &mut QueryBufferUsage,
     ) -> Result<(), QueryExecutionError> {
         let remaining_visits = options.max_scanned_rows.saturating_sub(*visited);
         if !verify && remaining_visits == 0 {
@@ -576,14 +661,7 @@ impl Node {
                 "visited record limit".into(),
             ));
         }
-        cursor.revision = page.revision;
-        cursor.time = page.snapshot_time_ms;
-        cursor.incarnation = page.incarnation;
-        cursor.after_key = page.next_after_key;
-        cursor.done = page.done;
-        cursor.initialized = true;
-        cursor.rows = page.rows.into();
-        Ok(())
+        cursor.accept_page(page, buffer)
     }
 
     async fn query_page_from_holder(
@@ -653,17 +731,11 @@ impl Node {
 }
 
 fn options_for_page(
-    cursors: &[FragmentCursor],
-    index: usize,
+    cursor: &FragmentCursor,
+    buffer: &QueryBufferUsage,
     options: &QueryOptions,
-    sql_bytes: usize,
 ) -> Result<QueryOptions, QueryExecutionError> {
-    let retained = cursors
-        .iter()
-        .map(FragmentCursor::storage)
-        .sum::<usize>()
-        .saturating_add(sql_bytes);
-    let available = options.max_buffer_bytes.saturating_sub(retained);
+    let available = options.max_buffer_bytes.saturating_sub(buffer.bytes);
     // Minimum protobuf row encodings can amplify into String/Vec/enum headers.
     // 32 times encoded bytes plus fixed metadata conservatively covers the
     // bounded 256-row/32-column shape and temporary validation copies.
@@ -676,22 +748,15 @@ fn options_for_page(
     let mut page_options = options.clone();
     page_options.page_bytes = options.page_bytes.min(wire_budget);
     // Sparse continuation pages may grow their own cursor between reads.
-    page_options.max_buffer_bytes = available.saturating_add(cursors[index].storage());
+    page_options.max_buffer_bytes = available.saturating_add(cursor.storage());
     Ok(page_options)
 }
 
 fn check_buffer(
-    cursors: &[FragmentCursor],
+    buffer: &QueryBufferUsage,
     options: &QueryOptions,
-    sql_bytes: usize,
 ) -> Result<(), QueryExecutionError> {
-    if cursors
-        .iter()
-        .map(FragmentCursor::storage)
-        .sum::<usize>()
-        .saturating_add(sql_bytes)
-        > options.max_buffer_bytes
-    {
+    if buffer.bytes > options.max_buffer_bytes {
         return Err(QueryExecutionError::BudgetExceeded(
             "fragment merge pages".into(),
         ));
@@ -956,6 +1021,180 @@ pub(super) fn reserve_inbound(
 mod page_validation_tests {
     use super::*;
     use crate::query::value_to_cell;
+
+    fn reference_storage(cursor: &FragmentCursor) -> usize {
+        std::mem::size_of::<FragmentCursor>()
+            + cursor.after_key.capacity()
+            + cursor.rows.front().map_or(0, |row| row.key.capacity())
+            + cursor.rows.capacity() * std::mem::size_of::<crate::proto::QueryPageRow>()
+            + cursor.rows.iter().map(row_storage).sum::<usize>()
+    }
+
+    fn assert_reference(cursors: &[FragmentCursor], sql_bytes: usize, buffer: &QueryBufferUsage) {
+        for cursor in cursors {
+            assert_eq!(cursor.storage(), reference_storage(cursor));
+            assert_eq!(
+                cursor.row_storage_bytes,
+                cursor.rows.iter().map(row_storage).sum::<usize>()
+            );
+        }
+        assert_eq!(
+            buffer.bytes,
+            sql_bytes + cursors.iter().map(reference_storage).sum::<usize>()
+        );
+    }
+
+    fn accounting_page(seed: usize, count: usize) -> QueryPageResponse {
+        let rows = (0..count)
+            .map(|index| {
+                let mut key = String::with_capacity(40 + seed + index);
+                key.push_str(&format!("key:{seed}:{index}"));
+                let mut text = String::with_capacity(60 + seed);
+                text.push_str("projected text");
+                let mut bytes = Vec::with_capacity(80 + seed);
+                bytes.extend_from_slice(&[1, 2, 3]);
+                crate::proto::QueryPageRow {
+                    key,
+                    cells: vec![
+                        value_to_cell(QueryValue::Text(text)),
+                        value_to_cell(QueryValue::Bytes(bytes)),
+                        value_to_cell(QueryValue::Integer(index as i128)),
+                        value_to_cell(QueryValue::Null),
+                    ],
+                }
+            })
+            .collect();
+        let mut next_after_key = String::with_capacity(100 + seed);
+        next_after_key.push_str(&format!("continuation:{seed}"));
+        QueryPageResponse {
+            rows,
+            next_after_key,
+            revision: 7,
+            incarnation: 8,
+            snapshot_time_ms: 9,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn incremental_buffer_matches_reference_across_pages_rows_and_sparse_continuations() {
+        let sql_bytes = 97;
+        let mut cursors: Vec<_> = (0..64).map(FragmentCursor::new).collect();
+        let mut buffer = QueryBufferUsage::new(&cursors, sql_bytes).unwrap();
+        assert_reference(&cursors, sql_bytes, &buffer);
+        for index in 0..cursors.len() {
+            cursors[index]
+                .accept_page(accounting_page(index, index % 5 + 1), &mut buffer)
+                .unwrap();
+            assert_reference(&cursors, sql_bytes, &buffer);
+        }
+        // Interleaved consumption changes head-key reservation but retains the
+        // deque backing capacity, even after its final row is consumed.
+        for _ in 0..5 {
+            for index in 0..cursors.len() {
+                if !cursors[index].rows.is_empty() {
+                    cursors[index]
+                        .pop_row(&mut buffer, &QueryOptions::default())
+                        .unwrap();
+                    assert_reference(&cursors, sql_bytes, &buffer);
+                }
+            }
+        }
+        for index in 0..cursors.len() {
+            cursors[index]
+                .accept_page(accounting_page(index + 300, 0), &mut buffer)
+                .unwrap();
+            assert_reference(&cursors, sql_bytes, &buffer);
+        }
+        cursors[0]
+            .accept_page(accounting_page(1, 256), &mut buffer)
+            .unwrap();
+        let previous = cursors[0].storage();
+        let partial: Vec<_> = cursors[0].rows.drain(..).collect();
+        cursors[0].row_storage_bytes = 0;
+        buffer.replace(previous, cursors[0].storage()).unwrap();
+        assert_eq!(partial.len(), 256);
+        assert_reference(&cursors, sql_bytes, &buffer);
+    }
+
+    #[test]
+    fn next_heap_key_growth_is_rejected_before_cloning_despite_no_refill() {
+        let sql_bytes = 97;
+        let mut cursors = vec![FragmentCursor::new(0)];
+        let mut buffer = QueryBufferUsage::new(&cursors, sql_bytes).unwrap();
+        let page = QueryPageResponse {
+            rows: vec![
+                crate::proto::QueryPageRow {
+                    key: "a".into(),
+                    cells: vec![value_to_cell(QueryValue::Null)],
+                },
+                crate::proto::QueryPageRow {
+                    key: "b".repeat(8192),
+                    cells: vec![value_to_cell(QueryValue::Null)],
+                },
+            ],
+            next_after_key: "b".repeat(8192),
+            done: true,
+            ..Default::default()
+        };
+        cursors[0].accept_page(page, &mut buffer).unwrap();
+        assert_reference(&cursors, sql_bytes, &buffer);
+        let options = QueryOptions {
+            max_buffer_bytes: buffer.bytes,
+            ..Default::default()
+        };
+        assert!(check_buffer(&buffer, &options).is_ok());
+        assert!(matches!(
+            cursors[0].pop_row(&mut buffer, &options),
+            Err(QueryExecutionError::BudgetExceeded(_))
+        ));
+        assert_reference(&cursors, sql_bytes, &buffer);
+        assert!(buffer.bytes > options.max_buffer_bytes);
+        assert!(!cursors[0].rows.is_empty());
+        assert!(cursors[0].done, "this cursor does not require a refill");
+        assert!(matches!(
+            check_buffer(&buffer, &options),
+            Err(QueryExecutionError::BudgetExceeded(_))
+        ));
+        // Checking only after a later pop would hide the transient overrun.
+        cursors[0].pop_row(&mut buffer, &options).unwrap();
+        assert_reference(&cursors, sql_bytes, &buffer);
+        assert!(check_buffer(&buffer, &options).is_ok());
+    }
+
+    #[test]
+    fn incremental_buffer_preserves_page_allowance_and_rejects_overflow() {
+        let mut cursors = vec![FragmentCursor::new(0), FragmentCursor::new(1)];
+        let mut buffer = QueryBufferUsage::new(&cursors, 111).unwrap();
+        cursors[0]
+            .accept_page(accounting_page(30, 32), &mut buffer)
+            .unwrap();
+        let options = QueryOptions {
+            max_buffer_bytes: 256 * 1024,
+            ..Default::default()
+        };
+        let page_options = options_for_page(&cursors[1], &buffer, &options).unwrap();
+        let available =
+            options.max_buffer_bytes - 111 - cursors.iter().map(reference_storage).sum::<usize>();
+        assert_eq!(
+            page_options.page_bytes,
+            options.page_bytes.min(available.saturating_sub(4096) / 32)
+        );
+        assert_eq!(
+            page_options.max_buffer_bytes,
+            available + reference_storage(&cursors[1])
+        );
+        let mut exact = options.clone();
+        exact.max_buffer_bytes = buffer.bytes;
+        assert!(check_buffer(&buffer, &exact).is_ok());
+        exact.max_buffer_bytes -= 1;
+        assert!(check_buffer(&buffer, &exact).is_err());
+        assert!(options_for_page(&cursors[1], &buffer, &exact).is_err());
+        let mut overflow = QueryBufferUsage { bytes: usize::MAX };
+        assert!(overflow.replace(0, 1).is_err());
+        let mut underflow = QueryBufferUsage { bytes: 0 };
+        assert!(underflow.replace(1, 0).is_err());
+    }
 
     #[test]
     fn inbound_pages_share_runtime_admission_and_release_on_completion() {
