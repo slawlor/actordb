@@ -47,6 +47,10 @@ checked wide integers. Empty `COUNT(*)` is zero; empty `SUM`, `MIN`, and `MAX`
 are null. Query cells preserve text, bytes, integer, and null types.
 
 Durable metadata is returned without decoding the opaque application payload.
+The Rust SDK validates these projections using the portable query contract:
+unsigned metadata integers, nullable expiry, writer-ID text and a tombstone
+integer of zero or one. Valid metadata results keep the connection usable;
+malformed cell encodings or out-of-range results fail closed.
 `timestamp_ms`, `logical_counter`, and `expires_at_ms` are unsigned integer
 values; `expires_at_ms` is `NULL` when no TTL is set. `node_id` is text and
 `is_tombstone` is an integer flag (`0` or `1`). Without

@@ -466,6 +466,54 @@ impl QueryPlan {
 }
 
 impl Projection {
+    /// Whether a cell has this projection's portable type and numeric range.
+    ///
+    /// This does not validate a wire encoding, a requested fragment scope, or
+    /// an application's writer-identity policy. Those remain the transport or
+    /// executor's responsibility. Metadata follows [`RecordMetadata`], including
+    /// nullable expiry and the tombstone bit's integer representation.
+    pub fn accepts_value(&self, value: &QueryValue) -> bool {
+        match self {
+            Self::Key | Self::NodeId => matches!(value, QueryValue::Text(_)),
+            Self::Value => matches!(value, QueryValue::Bytes(_)),
+            Self::PrefixBytes(count) => {
+                matches!(value, QueryValue::Bytes(bytes) if bytes.len() <= *count as usize)
+            }
+            Self::Fragment => {
+                matches!(value, QueryValue::Integer(value) if u32::try_from(*value).is_ok())
+            }
+            Self::TimestampMs | Self::LogicalCounter | Self::OctetLength => {
+                matches!(value, QueryValue::Integer(value) if u64::try_from(*value).is_ok())
+            }
+            Self::ExpiresAtMs => {
+                matches!(value, QueryValue::Null)
+                    || matches!(value, QueryValue::Integer(value) if u64::try_from(*value).is_ok())
+            }
+            Self::Tombstone => matches!(value, QueryValue::Integer(0 | 1)),
+            Self::Aggregate {
+                function: AggregateFunction::Count,
+                ..
+            } => matches!(value, QueryValue::Integer(value) if u64::try_from(*value).is_ok()),
+            Self::Aggregate {
+                input: AggregateInput::OctetLength,
+                ..
+            } => {
+                matches!(value, QueryValue::Null)
+                    || matches!(value, QueryValue::Integer(value) if *value >= 0)
+            }
+            Self::Aggregate {
+                function: AggregateFunction::Min | AggregateFunction::Max,
+                input: AggregateInput::BigInt,
+            } => {
+                matches!(value, QueryValue::Null)
+                    || matches!(value, QueryValue::Integer(value) if i64::try_from(*value).is_ok())
+            }
+            Self::Aggregate { .. } => {
+                matches!(value, QueryValue::Integer(_) | QueryValue::Null)
+            }
+        }
+    }
+
     fn sql(&self) -> String {
         match self {
             Self::Key => "key".into(),

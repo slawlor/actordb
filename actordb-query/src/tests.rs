@@ -1,6 +1,86 @@
 use super::*;
 
 #[test]
+fn projection_value_contract_covers_metadata_ranges_and_nullable_aggregates() {
+    let unsigned = [
+        Projection::TimestampMs,
+        Projection::LogicalCounter,
+        Projection::OctetLength,
+    ];
+    for projection in unsigned {
+        for value in [0, u64::MAX as i128] {
+            assert!(projection.accepts_value(&QueryValue::Integer(value)));
+        }
+        for value in [-1, u64::MAX as i128 + 1] {
+            assert!(!projection.accepts_value(&QueryValue::Integer(value)));
+        }
+        assert!(!projection.accepts_value(&QueryValue::Null));
+        assert!(!projection.accepts_value(&QueryValue::Text("1".into())));
+    }
+    assert!(Projection::NodeId.accepts_value(&QueryValue::Text("writer".into())));
+    assert!(!Projection::NodeId.accepts_value(&QueryValue::Bytes(b"writer".to_vec())));
+    assert!(Projection::ExpiresAtMs.accepts_value(&QueryValue::Null));
+    assert!(Projection::ExpiresAtMs.accepts_value(&QueryValue::Integer(u64::MAX as i128)));
+    assert!(!Projection::ExpiresAtMs.accepts_value(&QueryValue::Integer(-1)));
+    assert!(!Projection::ExpiresAtMs.accepts_value(&QueryValue::Integer(u64::MAX as i128 + 1)));
+    for value in [0, 1] {
+        assert!(Projection::Tombstone.accepts_value(&QueryValue::Integer(value)));
+    }
+    for value in [-1, 2] {
+        assert!(!Projection::Tombstone.accepts_value(&QueryValue::Integer(value)));
+    }
+    for projection in [
+        Projection::Aggregate {
+            function: AggregateFunction::Sum,
+            input: AggregateInput::OctetLength,
+        },
+        Projection::Aggregate {
+            function: AggregateFunction::Min,
+            input: AggregateInput::BigInt,
+        },
+        Projection::Aggregate {
+            function: AggregateFunction::Max,
+            input: AggregateInput::BigInt,
+        },
+        Projection::Aggregate {
+            function: AggregateFunction::Sum,
+            input: AggregateInput::BigInt,
+        },
+    ] {
+        assert!(projection.accepts_value(&QueryValue::Null));
+    }
+    assert!(!Projection::Aggregate {
+        function: AggregateFunction::Count,
+        input: AggregateInput::All
+    }
+    .accepts_value(&QueryValue::Null));
+    // Every output of the portable projector obeys the same contract used by
+    // companion SDKs, including maximal metadata and nullable expiry.
+    let plan = parse("SELECT key, value, frag, timestamp_ms, logical_counter, node_id, expires_at_ms, is_tombstone, PREFIX_BYTES(value, 2), OCTET_LENGTH(value) FROM kv").unwrap();
+    for expiry in [None, Some(u64::MAX)] {
+        let values = plan
+            .project_with_metadata(
+                "key",
+                b"opaque",
+                u32::MAX,
+                &RecordMetadata {
+                    timestamp_ms: u64::MAX,
+                    logical_counter: u64::MAX,
+                    node_id: "writer".into(),
+                    expires_at_ms: expiry,
+                    is_tombstone: true,
+                },
+            )
+            .unwrap();
+        assert!(plan
+            .projections
+            .iter()
+            .zip(values)
+            .all(|(projection, value)| projection.accepts_value(&value)));
+    }
+}
+
+#[test]
 fn parameters_are_typed_literals_and_fragment_scopes_intersect() {
     let plan = parse_with_params(
         "select key, value, frag, PREFIX_BYTES(value, ?), OCTET_LENGTH(value) from kv \
