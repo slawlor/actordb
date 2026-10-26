@@ -103,6 +103,7 @@ impl FragmentCursor {
     fn pop_row(
         &mut self,
         buffer: &mut QueryBufferUsage,
+        options: &QueryOptions,
     ) -> Result<crate::proto::QueryPageRow, QueryExecutionError> {
         let previous = self.storage();
         let row = self.rows.pop_front().expect("selected head exists");
@@ -111,6 +112,10 @@ impl FragmentCursor {
             .checked_sub(row_storage(&row))
             .ok_or_else(buffer_overflow)?;
         buffer.replace(previous, self.storage())?;
+        // The next head can be larger than the consumed row. Its conservative
+        // heap-copy reservation may increase even without a refill, so reject
+        // before the merge loop clones that next head.
+        check_buffer(buffer, options)?;
         Ok(row)
     }
 }
@@ -413,7 +418,7 @@ impl Node {
             let mut payload_bytes = 0usize;
             while let Some(Reverse((key, index))) = heads.pop() {
                 drop(key);
-                let row = cursors[index].pop_row(&mut buffer)?;
+                let row = cursors[index].pop_row(&mut buffer, options)?;
                 if skipped < plan.offset {
                     skipped += 1;
                 } else {
@@ -1088,7 +1093,9 @@ mod page_validation_tests {
         for _ in 0..5 {
             for index in 0..cursors.len() {
                 if !cursors[index].rows.is_empty() {
-                    cursors[index].pop_row(&mut buffer).unwrap();
+                    cursors[index]
+                        .pop_row(&mut buffer, &QueryOptions::default())
+                        .unwrap();
                     assert_reference(&cursors, sql_bytes, &buffer);
                 }
             }
@@ -1108,6 +1115,51 @@ mod page_validation_tests {
         buffer.replace(previous, cursors[0].storage()).unwrap();
         assert_eq!(partial.len(), 256);
         assert_reference(&cursors, sql_bytes, &buffer);
+    }
+
+    #[test]
+    fn next_heap_key_growth_is_rejected_before_cloning_despite_no_refill() {
+        let sql_bytes = 97;
+        let mut cursors = vec![FragmentCursor::new(0)];
+        let mut buffer = QueryBufferUsage::new(&cursors, sql_bytes).unwrap();
+        let page = QueryPageResponse {
+            rows: vec![
+                crate::proto::QueryPageRow {
+                    key: "a".into(),
+                    cells: vec![value_to_cell(QueryValue::Null)],
+                },
+                crate::proto::QueryPageRow {
+                    key: "b".repeat(8192),
+                    cells: vec![value_to_cell(QueryValue::Null)],
+                },
+            ],
+            next_after_key: "b".repeat(8192),
+            done: true,
+            ..Default::default()
+        };
+        cursors[0].accept_page(page, &mut buffer).unwrap();
+        assert_reference(&cursors, sql_bytes, &buffer);
+        let options = QueryOptions {
+            max_buffer_bytes: buffer.bytes,
+            ..Default::default()
+        };
+        assert!(check_buffer(&buffer, &options).is_ok());
+        assert!(matches!(
+            cursors[0].pop_row(&mut buffer, &options),
+            Err(QueryExecutionError::BudgetExceeded(_))
+        ));
+        assert_reference(&cursors, sql_bytes, &buffer);
+        assert!(buffer.bytes > options.max_buffer_bytes);
+        assert!(!cursors[0].rows.is_empty());
+        assert!(cursors[0].done, "this cursor does not require a refill");
+        assert!(matches!(
+            check_buffer(&buffer, &options),
+            Err(QueryExecutionError::BudgetExceeded(_))
+        ));
+        // Checking only after a later pop would hide the transient overrun.
+        cursors[0].pop_row(&mut buffer, &options).unwrap();
+        assert_reference(&cursors, sql_bytes, &buffer);
+        assert!(check_buffer(&buffer, &options).is_ok());
     }
 
     #[test]
