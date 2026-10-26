@@ -95,6 +95,11 @@ count/byte-bounded summaries and compares the two streams:
 - A local winner is sent as a repair.
 - Keys present on only one side are transferred as appropriate.
 
+The ordered metadata index publishes cached digests and mutation revisions
+before cache writes become visible, without copying payloads per page. See
+[reconciliation snapshots](reconciliation-snapshots.md) for pinned TTL behavior,
+local revision guarantees, resident index overhead and full diagnostic snapshots.
+
 Fetches are bounded by exact encoded bytes and at most 256 keys. Responders read
 incremental versioned pages and emit `ReconcileEntry` payloads, preserving writer
 provenance, logical counters, tombstones and expiry. No record exceeds the
