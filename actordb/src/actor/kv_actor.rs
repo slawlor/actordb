@@ -438,7 +438,11 @@ impl Actor for KvActor {
             pools.default_pool.shutdown().await;
             pools.background_pool.shutdown().await;
         }
-        state.shared.flush().await
+        state
+            .shared
+            .expire_values_from_actor(crate::actor::now_ms())
+            .await?;
+        state.shared.flush_from_actor().await
     }
 
     async fn handle(
@@ -730,7 +734,7 @@ impl Actor for KvActor {
             KvMessage::Flush { reply } => {
                 let result = state
                     .shared
-                    .flush()
+                    .flush_from_actor()
                     .await
                     .map(|()| state.shared.durability())
                     .map_err(|error| ApplyError::Storage(error.to_string()));
@@ -743,7 +747,7 @@ impl Actor for KvActor {
             KvMessage::FlushStable { reply } => {
                 let result = state
                     .shared
-                    .flush_stable()
+                    .flush_stable_from_actor()
                     .await
                     .map_err(|error| ApplyError::Storage(error.to_string()));
                 let _ = reply.send(result);
