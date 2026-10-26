@@ -13,6 +13,7 @@ on:
       - 'docker/**'
       - 'docker-compose.yml'
       - 'docker-compose.client.yml'
+      - 'docker-compose.hardening.yml'
       - '.dockerignore'
       - '.github/workflows/docker-integration.yaml'
   pull_request:
@@ -27,6 +28,7 @@ on:
       - 'docker/**'
       - 'docker-compose.yml'
       - 'docker-compose.client.yml'
+      - 'docker-compose.hardening.yml'
       - '.dockerignore'
       - '.github/workflows/docker-integration.yaml'
 
@@ -34,9 +36,12 @@ jobs:
   docker-tests:
     name: Dockerized multi-node scenarios
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v7
+
+      - name: Verify hardening harness invariants
+        run: python3 -m unittest discover -s docker -p 'test_cluster_hardening.py' -v
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
@@ -76,3 +81,17 @@ jobs:
 
       - name: External SDK client across sharded nodes and ingress restart
         run: bash docker/client-test.sh
+
+      - name: Durable growth, partitions, repeated outages and shrink matrix
+        run: python3 docker/cluster-hardening.py --cycles 3 --records-per-fragment 128
+
+      - name: Retain hardening diagnostics even on failure
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cluster-hardening-${{ github.run_id }}
+          path: |
+            test-artifacts/cluster-hardening/*.log
+            test-artifacts/cluster-hardening/*.json
+          if-no-files-found: ignore
+          retention-days: 14

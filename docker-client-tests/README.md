@@ -26,3 +26,10 @@ Every transition requires observed state; polling does not substitute elapsed
 time for a successful assertion. The entire scenario has a configurable deadline
 of at most 180 seconds. Mutations are issued once; reads and queries are polled
 for eventual convergence. The driver owns node lifetimes and cleanup.
+
+The second executable, actordb-docker-cluster-client, is the SDK-only checker
+for the four-node [failure matrix](../docs/docker-hardening.md). It additionally
+uses Serde/JSON for a persisted exact version/value oracle and PRIVATE harness
+control. It does not link database implementation code. The matrix covers
+grow/shrink, real peer partitions, repeated crashes, full-outage recovery,
+backend faults, unknown outcomes and completed shutdown ownership.

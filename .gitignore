@@ -17,3 +17,7 @@ debug/
 coverage/
 **/*.profraw
 **/.DS_Store
+
+# Owned cluster-harness diagnostics and Python bytecode.
+/test-artifacts/
+/docker/__pycache__/

@@ -18,6 +18,7 @@
 //! the driver scripts grep for them.
 
 mod client_node;
+mod cluster_node;
 
 use std::future::Future;
 use std::net::SocketAddr;
@@ -46,6 +47,21 @@ struct Args {
 
 #[derive(Subcommand, Debug)]
 enum Command {
+    /// Durable, dynamically placed server with a PRIVATE test-control socket.
+    ClusterNode {
+        #[arg(long, value_parser = ["node-a", "node-b", "node-c", "node-d"])]
+        node_id: String,
+        #[arg(long, default_value_t = 7447)]
+        peer_port: u16,
+        #[arg(long, default_value_t = 7449)]
+        client_port: u16,
+        #[arg(long, default_value_t = 7450)]
+        control_port: u16,
+        #[arg(long, required = true)]
+        peer: Vec<String>,
+        #[arg(long)]
+        db_path: PathBuf,
+    },
     /// Serve a sharded database node and its separate application listener.
     ClientNode {
         #[arg(long, value_parser = ["node-a", "node-b", "node-c"])]
@@ -467,8 +483,10 @@ async fn restart_survivor(
         put_key(&ctx, key.clone(), expect_value.into_bytes()),
     )
     .await?;
+    println!("SURVIVOR_READY");
     ctx.log("waiting for peer to die (SIGKILL)");
     phase(&ctx, "wait-peer-death", wait_for_peer_death(&ctx)).await?;
+    println!("PEER_DIED");
     ctx.log("PEER_DIED: waiting for it to return");
     phase(&ctx, "wait-peer-return", wait_for_peers(&ctx, 1)).await?;
     ctx.log("PEER_RETURNED: letting post-restart sync settle");
@@ -499,6 +517,14 @@ async fn wait_for_peer_death(ctx: &Ctx) -> TestResult {
 async fn main() {
     let args = Args::parse();
     let result = match args.command {
+        Command::ClusterNode {
+            node_id,
+            peer_port,
+            client_port,
+            control_port,
+            peer,
+            db_path,
+        } => cluster_node::run(node_id, peer_port, client_port, control_port, peer, db_path).await,
         Command::ClientNode {
             node_id,
             peer_port,

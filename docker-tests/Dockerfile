@@ -35,6 +35,9 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends cmake build-essential clang \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=planner /usr/src/app/recipe.json recipe.json
+# Native RocksDB compilation follows Cargo's parallel job count. Bound it on
+# memory-limited Docker Desktop VMs; callers can override this build argument.
+ARG CARGO_BUILD_JOBS=4
 # Compile third-party dependencies only. A compatible cache can retain an older
 # resolution; rebuilding without that cache resolves the manifest ranges anew.
 RUN cargo chef cook --release --recipe-path recipe.json
@@ -42,7 +45,8 @@ COPY . .
 # Now compile just our workspace crates on top of the cached dependencies.
 RUN cargo build --release --package docker-tests --package docker-client-tests \
     && cp target/release/actordb-docker-test /usr/local/bin/actordb-docker-test \
-    && cp target/release/actordb-docker-client-test /usr/local/bin/actordb-docker-client-test
+    && cp target/release/actordb-docker-client-test /usr/local/bin/actordb-docker-client-test \
+    && cp target/release/actordb-docker-cluster-client /usr/local/bin/actordb-docker-cluster-client
 
 FROM debian:trixie-slim AS runtime
 # NOTE: this must match the Debian release underlying rust:latest
@@ -67,6 +71,7 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates libgcc-s1 \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /usr/local/bin/actordb-docker-client-test /usr/local/bin/actordb-docker-client-test
+COPY --from=builder /usr/local/bin/actordb-docker-cluster-client /usr/local/bin/actordb-docker-cluster-client
 WORKDIR /usr/local/bin
 ENTRYPOINT ["actordb-docker-client-test"]
 

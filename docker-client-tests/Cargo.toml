@@ -11,8 +11,14 @@ description = "External-process SDK scenarios for ActorDB"
 name = "actordb-docker-client-test"
 path = "src/main.rs"
 
+[[bin]]
+name = "actordb-docker-cluster-client"
+path = "src/cluster_client.rs"
+
 [dependencies]
 actordb-client = { version = "0.10.0", path = "../actordb-client" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "net"] }
 clap = { version = "4", features = ["derive"] }
 seahash = "4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
