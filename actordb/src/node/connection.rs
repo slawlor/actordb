@@ -204,8 +204,7 @@ pub(super) struct ConnContext {
     pub(super) dynamic_placement: bool,
     pub(super) pending_gets: PendingGets,
     pub(super) pending_batch_gets: PendingBatchGets,
-    /// In-flight distributed scan requests (coordinator side).
-    pub(super) pending_scans: PendingScans,
+    /// In-flight distributed query and scan pages (coordinator side).
     pub(super) pending_query_pages: query::PendingQueryPages,
     pub(super) query_admission: Arc<crate::query::QueryAdmission>,
     pub(super) pending_mutations: PendingMutations,
@@ -565,7 +564,6 @@ pub(super) async fn handle_connection(
         dynamic_placement,
         pending_gets,
         pending_batch_gets,
-        pending_scans,
         pending_query_pages,
         query_admission,
         pending_mutations,
@@ -802,6 +800,25 @@ pub(super) async fn handle_connection(
                 Ok(retention) => Some(retention),
                 Err(_) => break,
             };
+        }
+        let message = match crate::wire::peek_envelope_message(payload) {
+            Ok((message, _)) => message,
+            Err(error) => {
+                tracing::warn!(%error, "rejecting malformed peer envelope before allocation");
+                break;
+            }
+        };
+        if message == 22 {
+            if !handshake.is_established() {
+                // Application responses cannot relax the handshake state
+                // machine merely because the Node has no requester for them.
+                break;
+            }
+            // Node scans originate QueryPageRequest, never ScanRequest.
+            // Every ScanResponse is unsolicited: discard its borrowed body
+            // before Prost allocates any matches, keys, values, or errors.
+            // Still serve inbound ScanRequest and emit its bounded response.
+            continue;
         }
         if let Err(error) = preflight_envelope_decode(payload) {
             tracing::warn!(%error, "rejecting inbound peer frame before protobuf allocation");
@@ -2622,28 +2639,8 @@ pub(super) async fn handle_connection(
                     break;
                 }
             }
-            Some(EnvelopeMsg::ScanResponse(resp)) => {
-                let Some(peer) = peer_node_id.clone() else {
-                    continue;
-                };
-                let pending = {
-                    let mut pending = pending_scans.lock().unwrap();
-                    match pending.get(&resp.req_id) {
-                        Some(request) if request.expected_peer == peer => {
-                            pending.remove(&resp.req_id)
-                        }
-                        _ => None,
-                    }
-                };
-                if let Some(pending) = pending {
-                    let result = if resp.error.is_empty() {
-                        Ok(resp.matches)
-                    } else {
-                        Err(resp.error)
-                    };
-                    let _ = pending.reply.send(result);
-                }
-            }
+            // Filtered by borrowed envelope identity before decoding.
+            Some(EnvelopeMsg::ScanResponse(_)) => {}
             None => {}
         }
     }
@@ -3227,7 +3224,6 @@ impl Node {
             dynamic_placement: self.placement_controller.is_some(),
             pending_gets: self.pending_gets.clone(),
             pending_batch_gets: self.pending_batch_gets.clone(),
-            pending_scans: self.pending_scans.clone(),
             pending_query_pages: self.pending_query_pages.clone(),
             query_admission: self.query_admission.clone(),
             pending_mutations: self.pending_mutations.clone(),
@@ -3307,6 +3303,168 @@ mod tests {
     use crate::proto::ReconcileRequest;
     use crate::proto::SessionStart;
     use crate::replication::{spawn_bounded_sender, ReplicationPeer};
+
+    #[tokio::test]
+    async fn unsolicited_scan_responses_never_decode_and_live_scan_requests_still_serve() {
+        use crate::actor::{KeyMatcher, ScanSpec, ValueTransform};
+        let node = Node::start(
+            "scan-server".into(),
+            "127.0.0.1:0".parse().unwrap(),
+            NodeConfig::builder()
+                .fragment_count(1)
+                .fragment_map(HashMap::from([(FragmentId(0), vec!["scan-server".into()])]))
+                .build(),
+        )
+        .await
+        .unwrap();
+        node.put("key-λ".into(), vec![255, 0, 1]).await.unwrap();
+        let raw_budget = node.receive_byte_budget.clone();
+        let (mut client, server) = tokio::io::duplex(4096);
+        let connection = tokio::spawn(handle_connection(
+            node.connection_context(),
+            Box::pin(server),
+            false,
+            None,
+            None,
+        ));
+        complete_test_handshake(&mut client, "peer").await;
+
+        // A 2 MiB body that would allocate ~48 MiB of row headers alone.
+        // No Node API originates this message family: all replies are unsolicited.
+        let mut payload = vec![8, 7];
+        for _ in 0..1_000_000 {
+            payload.extend_from_slice(&[18, 0]);
+        }
+        let mut frame = vec![178, 1];
+        let mut length = payload.len();
+        while length >= 128 {
+            frame.push((length as u8 & 127) | 128);
+            length >>= 7;
+        }
+        frame.push(length as u8);
+        frame.extend_from_slice(&payload);
+        client.write_u32(frame.len() as u32).await.unwrap();
+        client.write_all(&frame).await.unwrap();
+        // Even a nested payload that Prost cannot parse is never decoded.
+        // Its outer message identity/length is valid and can safely be ignored.
+        client.write_u32(4).await.unwrap();
+        client.write_all(&[178, 1, 1, 0]).await.unwrap();
+
+        for (id, transform, expected) in [
+            (1, ValueTransform::Identity, vec![255, 0, 1]),
+            (2, ValueTransform::KeyOnly, Vec::new()),
+            (3, ValueTransform::PrefixBytes(2), vec![255, 0]),
+        ] {
+            let request = ScanSpec {
+                matcher: KeyMatcher::All,
+                transform,
+                limit: 10,
+                offset: 0,
+            }
+            .to_scan_request(id, 0);
+            write_test_envelope(
+                &mut client,
+                Envelope {
+                    msg: Some(EnvelopeMsg::ScanRequest(request)),
+                },
+            )
+            .await;
+            let Some(EnvelopeMsg::ScanResponse(response)) =
+                read_test_envelope(&mut client).await.msg
+            else {
+                panic!("live ScanRequest must still receive ScanResponse")
+            };
+            assert_eq!(response.req_id, id);
+            assert!(response.error.is_empty(), "{}", response.error);
+            assert_eq!(response.matches.len(), 1);
+            assert_eq!(
+                response.matches[0].key,
+                crate::table_key::encode_table_key("KV", "key-λ")
+            );
+            assert_eq!(response.matches[0].value, expected);
+        }
+        let mut request = ScanSpec {
+            matcher: KeyMatcher::All,
+            transform: ValueTransform::Identity,
+            limit: 1,
+            offset: 0,
+        }
+        .to_scan_request(4, 0);
+        request.transform_kind = u32::MAX;
+        write_test_envelope(
+            &mut client,
+            Envelope {
+                msg: Some(EnvelopeMsg::ScanRequest(request)),
+            },
+        )
+        .await;
+        assert!(matches!(read_test_envelope(&mut client).await.msg,
+            Some(EnvelopeMsg::ScanResponse(response)) if response.req_id == 4
+                && response.matches.is_empty() && response.error.contains("invalid scan spec")));
+        // Invalid input does not prevent a later valid request on the same duplex connection.
+        write_test_envelope(
+            &mut client,
+            Envelope {
+                msg: Some(EnvelopeMsg::BatchGet(BatchGet {
+                    req_id: 5,
+                    keys: Vec::new(),
+                    priority: 0,
+                })),
+            },
+        )
+        .await;
+        assert!(matches!(read_test_envelope(&mut client).await.msg,
+            Some(EnvelopeMsg::BatchGetResponse(response)) if response.req_id == 5));
+        drop(client);
+        tokio::time::timeout(Duration::from_secs(1), connection)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(raw_budget.available_permits(), RECEIVE_BYTE_CAPACITY);
+        node.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn unsolicited_scan_response_cannot_bypass_handshake_or_outer_validation() {
+        for (established, frame) in [
+            (false, vec![178, 1, 0]),
+            (true, vec![178, 1, 0, 178, 1, 0]), // duplicate oneof
+            (true, vec![178, 1, 0, 202, 1, 0]), // unknown message
+            (true, vec![178, 1, 1]),            // truncated body
+            (true, vec![176, 1, 0]),            // wrong wire type
+        ] {
+            let (ctx, tasks) = test_connection_context(
+                FragmentRouter::new(1, 0),
+                Arc::new(RwLock::new(HashSet::new())),
+                Arc::new(RwLock::new(HashMap::new())),
+                true,
+                Arc::new(Mutex::new(HashMap::new())),
+                Arc::new(Mutex::new(HashMap::new())),
+                Arc::new(Mutex::new(HashMap::new())),
+            )
+            .await;
+            let budget = ctx.receive_byte_budget.clone();
+            let (mut client, server) = tokio::io::duplex(4096);
+            let connection =
+                tokio::spawn(handle_connection(ctx, Box::pin(server), false, None, None));
+            if established {
+                complete_test_handshake(&mut client, "peer").await;
+            } else {
+                assert!(matches!(
+                    read_test_envelope(&mut client).await.msg,
+                    Some(EnvelopeMsg::Hello(_))
+                ));
+            }
+            client.write_u32(frame.len() as u32).await.unwrap();
+            client.write_all(&frame).await.unwrap();
+            tokio::time::timeout(Duration::from_secs(1), connection)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(budget.available_permits(), RECEIVE_BYTE_CAPACITY);
+            tasks.shutdown().await;
+        }
+    }
 
     #[tokio::test]
     async fn receive_byte_permit_follows_completed_frame_and_releases_on_eof() {

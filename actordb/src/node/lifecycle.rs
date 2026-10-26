@@ -1644,7 +1644,6 @@ impl Node {
             members: config.members.clone(),
             pending_gets: Arc::new(StdMutex::new(HashMap::new())),
             pending_batch_gets: Arc::new(StdMutex::new(HashMap::new())),
-            pending_scans: Arc::new(StdMutex::new(HashMap::new())),
             pending_query_pages: Arc::new(StdMutex::new(HashMap::new())),
             query_admission: crate::query::QueryAdmission::with_runtime_capacity(
                 runtime_options.query_runtime_byte_capacity,

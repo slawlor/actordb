@@ -253,10 +253,6 @@ type PendingBatchGets = Arc<StdMutex<HashMap<u64, PendingBatchGet>>>;
 /// Pending single or batched forwarded mutations. Results preserve request
 /// order and cardinality.
 type PendingMutations = Arc<StdMutex<HashMap<u64, PendingMutation>>>;
-/// Pending distributed scan requests: req_id -> reply channel. The expected
-/// responder is retained so a colliding reply cannot complete another
-/// peer's scan.
-type PendingScans = Arc<StdMutex<HashMap<u64, PendingScan>>>;
 
 struct PendingMutation {
     expected_peer: String,
@@ -274,11 +270,6 @@ struct PendingBatchGet {
     expected_peer: String,
     expected_keys: Vec<String>,
     reply: oneshot::Sender<Result<Vec<BatchKeyValue>, NodeError>>,
-}
-
-struct PendingScan {
-    expected_peer: String,
-    reply: oneshot::Sender<Result<Vec<crate::proto::ScanMatchProto>, String>>,
 }
 
 /// Removes a pending request even if its future is cancelled while waiting
@@ -1178,7 +1169,6 @@ pub struct Node {
     /// In-flight batched forwarded reads: req_id -> reply channel.
     pending_batch_gets: PendingBatchGets,
     /// In-flight distributed scan requests: req_id -> reply channel.
-    pending_scans: PendingScans,
     pending_query_pages: query::PendingQueryPages,
     query_admission: Arc<crate::query::QueryAdmission>,
     /// In-flight single and batched forwarded mutation outcomes.
