@@ -94,6 +94,10 @@ store. It cannot rebind an existing different node manifest or change the
 fragment count/partitioner. Retained named-table physical prefixes, binary values,
 timestamps, logical counters, origins, tombstones and TTL deadlines are copied
 without application decoding. The existing reserved `Some(0)` expiry is rejected.
+Checkpoint record validation uses the same logical wire-key allowance as actor
+and RocksDB admission. Physical durable namespace bytes remain preserved in the
+bundle, but are excluded from that logical record limit only after the physical
+and logical table identities and encoded UTF-8 key have been validated together.
 Actor startup still observes the imported clock floor and applies normal expiry
 normalization before serving. Old record origins do not become trusted peers.
 
