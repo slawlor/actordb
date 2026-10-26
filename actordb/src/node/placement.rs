@@ -38,10 +38,12 @@ pub(super) struct PlacementDriverDeps {
     /// consumes this set into explicit gain/loss transitions.
     pub(super) preloaded_fragments: Arc<StdMutex<HashSet<FragmentId>>>,
     /// Increments only when the published placement map actually changes.
-    /// A global generation is conservative: unrelated fragment movement can
-    /// retry an in-flight bootstrap, but a P -> Q -> P ABA cannot publish work
-    /// completed against the first P.
+    /// Whole-node status and membership evidence use this coarse generation.
     pub(super) placement_generation: Arc<AtomicU64>,
+    /// Fragment transitions pin only their own replica-vector epoch. Advancing
+    /// it is ordered with publication under placement_states -> placement;
+    /// unrelated movement cannot reset a stable gain or certified handoff.
+    pub(super) fragment_generations: Arc<StdMutex<HashMap<FragmentId, u64>>>,
     pub(super) senders: SenderMap,
     pub(super) finalizing_senders: Arc<SenderFinalizationRegistry>,
     pub(super) retiring_senders: Arc<RetiringSenderRegistry>,
@@ -62,6 +64,15 @@ pub(super) struct PlacementDriverDeps {
 }
 
 impl PlacementDriverDeps {
+    pub(super) fn fragment_generation(&self, fragment: FragmentId) -> u64 {
+        self.fragment_generations
+            .lock()
+            .unwrap()
+            .get(&fragment)
+            .copied()
+            .unwrap_or(0)
+    }
+
     /// Idempotent sender spawn for (`fragment`, `peer`).
     pub(super) async fn ensure_sender(&self, fragment: FragmentId, peer: &str) {
         ensure_sender_entry(
@@ -172,6 +183,20 @@ pub(super) async fn placement_tick(deps: &PlacementDriverDeps) {
             .map(|(f, _)| *f)
             .collect();
         if *published != desired {
+            let mut generations = deps.fragment_generations.lock().unwrap();
+            for (fragment, replicas) in &desired {
+                if published.get(fragment) != Some(replicas) {
+                    let generation = generations.entry(*fragment).or_default();
+                    *generation = generation.wrapping_add(1);
+                }
+            }
+            for fragment in published
+                .keys()
+                .filter(|fragment| !desired.contains_key(fragment))
+            {
+                let generation = generations.entry(*fragment).or_default();
+                *generation = generation.wrapping_add(1);
+            }
             *published = desired.clone();
             deps.placement_generation.fetch_add(1, Ordering::AcqRel);
         }
@@ -384,9 +409,7 @@ pub(super) async fn commit_fragment_gain(
         deps.lifecycle_observation.changed();
         return FragmentGainCommit::Revoked;
     }
-    if current != expected_replicas
-        || deps.placement_generation.load(Ordering::Acquire) != expected_generation
-    {
+    if current != expected_replicas || deps.fragment_generation(fragment) != expected_generation {
         states.insert(fragment, FragmentPlacementState::Bootstrapping);
         drop(states);
         deps.lifecycle_observation.changed();
@@ -411,8 +434,9 @@ pub(super) async fn converge_fragment_gain(
     loop {
         let (desired, replicas, generation) = {
             let mut states = deps.placement_states.lock().await;
-            let desired = deps.placement.read().unwrap().clone();
-            let generation = deps.placement_generation.load(Ordering::Acquire);
+            let published = deps.placement.read().unwrap();
+            let desired = published.clone();
+            let generation = deps.fragment_generation(fragment);
             let replicas = desired.get(&fragment).cloned().unwrap_or_default();
             if !replicas.iter().any(|node| node == &deps.node_id) {
                 states.insert(fragment, FragmentPlacementState::Draining);
@@ -777,9 +801,10 @@ pub(super) fn fragment_placement_snapshot(
     deps: &PlacementDriverDeps,
     fragment: FragmentId,
 ) -> (HashMap<FragmentId, Vec<String>>, Vec<String>, u64) {
-    let desired = deps.placement.read().unwrap().clone();
+    let published = deps.placement.read().unwrap();
+    let desired = published.clone();
     let replicas = desired.get(&fragment).cloned().unwrap_or_default();
-    let generation = deps.placement_generation.load(Ordering::Acquire);
+    let generation = deps.fragment_generation(fragment);
     (desired, replicas, generation)
 }
 
@@ -789,12 +814,11 @@ pub(super) fn fragment_placement_matches(
     expected_replicas: &[String],
     expected_generation: u64,
 ) -> bool {
-    deps.placement
-        .read()
-        .unwrap()
+    let published = deps.placement.read().unwrap();
+    published
         .get(&fragment)
         .is_some_and(|replicas| replicas == expected_replicas)
-        && deps.placement_generation.load(Ordering::Acquire) == expected_generation
+        && deps.fragment_generation(fragment) == expected_generation
 }
 
 pub(super) async fn routed_fragment_revision(
@@ -1192,7 +1216,7 @@ pub(super) async fn lose_fragment_with_prefix_retirement(
 
         // Placement publication remained available during the potentially
         // slow joins/RPC. Revalidate its exact generation before committing
-        // route removal; P -> Q -> P is rejected by placement_generation.
+        // route removal; P -> Q -> P is rejected by the fragment epoch.
         let states = deps.placement_states.lock().await;
         if !fragment_placement_matches(deps, fragment, &replicas, generation) {
             drop(states);
@@ -1495,6 +1519,10 @@ impl Node {
 }
 
 #[cfg(test)]
+#[path = "placement_epoch_tests.rs"]
+mod epoch_tests;
+
+#[cfg(test)]
 #[path = "placement_retirement_tests.rs"]
 mod retirement_tests;
 
@@ -1647,7 +1675,16 @@ mod tests {
             Arc::new(Mutex::new(HashMap::new())),
             Arc::new(Mutex::new(HashMap::new())),
         );
-        deps.placement_generation.store(2, Ordering::Release);
+        let controller = Arc::new(crate::placement::ManualPlacement::new(HashMap::from([(
+            fragment,
+            vec!["node-a".to_string(), "node-c".to_string()],
+        )])));
+        let mut deps = deps;
+        deps.controller = controller.clone();
+        placement_tick(&deps).await;
+        controller.set_placement(HashMap::from([(fragment, replicas.clone())]));
+        placement_tick(&deps).await;
+        assert_eq!(deps.fragment_generation(fragment), 2);
 
         assert_eq!(
             commit_fragment_gain(&deps, fragment, &replicas, 0).await,
@@ -2286,6 +2323,7 @@ mod tests {
             prefix_retirements: Arc::new(SenderFinalizationRegistry::default()),
             preloaded_fragments: Arc::new(StdMutex::new(HashSet::new())),
             placement_generation: Arc::new(AtomicU64::new(0)),
+            fragment_generations: Arc::new(StdMutex::new(HashMap::new())),
             senders,
             finalizing_senders: Arc::new(SenderFinalizationRegistry::default()),
             retiring_senders: Arc::new(RetiringSenderRegistry::default()),

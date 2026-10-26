@@ -110,11 +110,15 @@ authoritative and tears down local state for revoked fragments.
    before the counter can advance. On timeout the fragment remains
    non-authoritative and is retried; it never goes `Serving` with unverified
    state. Before publication, the driver verifies that both the placement
-   generation and complete replica list still match the snapshot used for
+   fragment-scoped placement generation and complete replica list still match the snapshot used for
    sender alignment and bootstrap. If placement changed — including a
    `P -> Q -> P` change back to the same list — the fragment remains
    non-authoritative and repeats these steps; if this node was removed, it
    transitions to draining.
+   Unrelated fragment publications do not invalidate this fragment's work.
+   Each affected replica vector advances its own epoch, so a same-fragment
+   ABA still forces fresh reconciliation. Whole-node status and membership
+   evidence retain a separate global placement generation.
 5. Mark `Serving`, add to the serving set, call
    `controller.on_fragment_ready(fragment)` so an in-process controller can
    sequence the next step (revoking the old owner).
@@ -138,7 +142,7 @@ one another's empty state.
    namespace. This preserves existing custom-store behavior.
 3. A store which opts into `Supported` deletion takes the stronger path. The
    driver snapshots the exact replacement replica vector and placement
-   generation, seals every corresponding sender, and requires a fresh stable
+   fragment-scoped generation, seals every corresponding sender, and requires a fresh stable
    full reconciliation plus `StableCommitted` barrier from every target. All
    certificates must cover one unchanged source revision; a fetched winner or
    sender replacement restarts the complete set. Queue emptiness alone never
