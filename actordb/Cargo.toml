@@ -45,7 +45,7 @@ seahash = { version = "4" }
 sha2 = { version = "0.11.1" }
 tokio = { version = "1", features = ["sync", "time", "net", "io-util"] }
 tokio-rustls = { version = "0.26", optional = true, default-features = false, features = ["ring", "tls12"] }
-toml = { version = "0.9", optional = true }
+toml = { version = "1.1", optional = true }
 tracing = "0.1"
 # Optional dependencies
 
