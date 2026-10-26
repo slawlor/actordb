@@ -4,28 +4,16 @@
 pub struct Hello {
     #[prost(string, tag = "1")]
     pub node_id: ::prost::alloc::string::String,
-    /// Retained at its original field number for safe protobuf field evolution.
-    /// Since protocol v2 this field must be empty; the challenge-bound proof is
-    /// carried in HelloAuth.
-    #[prost(bytes = "vec", tag = "2")]
-    pub auth_tag: ::prost::alloc::vec::Vec<u8>,
-    /// Inclusive wire-version range understood by this peer. Both are nonzero;
-    /// a connection proceeds only when the ranges overlap.
+    /// Exact peer protocol version. No range negotiation or downgrade path.
     #[prost(uint32, tag = "3")]
-    pub min_protocol_version: u32,
-    #[prost(uint32, tag = "4")]
-    pub max_protocol_version: u32,
-    /// Feature bitset. Required bits are checked before either side installs the
-    /// connection, so mixed binaries fail closed rather than mis-acknowledging
-    /// mutations or replication.
-    #[prost(uint64, tag = "5")]
-    pub capabilities: u64,
+    pub protocol_version: u32,
     /// Fresh 256-bit challenge generated independently for every physical
     /// connection. Both peers' complete Hellos are bound into each HelloAuth.
     #[prost(bytes = "vec", tag = "6")]
     pub challenge: ::prost::alloc::vec::Vec<u8>,
-    /// Externally allocated process generation, authenticated by the configured
-    /// independent process credential. Zero denotes legacy cluster authentication.
+    /// Externally allocated operational generation checked by a receiver policy.
+    /// Zero means no managed generation policy. TLS/shared-secret credential
+    /// ownership and revocation remain external to this claim.
     #[prost(uint64, tag = "8")]
     pub process_generation: u64,
 }
@@ -33,10 +21,6 @@ pub struct Hello {
 /// HMAC-SHA256 over the ordered dialer/listener Hello transcript and the
 /// proving role. Without a secret it is empty, but the flight still makes
 /// handshake completion explicit before either peer publishes the connection.
-/// With authenticated process-generation authority, auth_tag instead carries
-/// an Ed25519 signature under that process's configured public identity.
-/// Subsequent process-session frames use the capability-14 signed sequence
-/// header before their protobuf Envelope bodies; see docs/peer-authority.md.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct HelloAuth {
     #[prost(bytes = "vec", tag = "1")]
@@ -154,21 +138,9 @@ pub struct GetResponse {
     #[prost(uint64, tag = "9")]
     pub logical_counter: u64,
 }
-/// Retired protocol-v1/v2 full-state frames. They remain generated for source
-/// compatibility, but a protocol-v3 connection closes if either is received.
+/// A value page entry used only by correlated, bounded reconciliation.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct SyncRequest {
-    #[prost(uint32, repeated, tag = "1")]
-    pub fragments: ::prost::alloc::vec::Vec<u32>,
-}
-/// Retired peer full-state response; see SyncRequest above.
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct SyncResponse {
-    #[prost(message, repeated, tag = "1")]
-    pub entries: ::prost::alloc::vec::Vec<SyncEntry>,
-}
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct SyncEntry {
+pub struct ReconcileEntry {
     #[prost(string, tag = "1")]
     pub key: ::prost::alloc::string::String,
     #[prost(bytes = "vec", tag = "2")]
@@ -332,7 +304,7 @@ pub struct ReconcileData {
     #[prost(uint32, tag = "1")]
     pub fragment: u32,
     #[prost(message, repeated, tag = "2")]
-    pub entries: ::prost::alloc::vec::Vec<SyncEntry>,
+    pub entries: ::prost::alloc::vec::Vec<ReconcileEntry>,
     #[prost(uint64, tag = "3")]
     pub session_id: u64,
     #[prost(uint64, tag = "4")]
@@ -490,7 +462,7 @@ pub struct BatchGet {
 pub struct BatchGetResponse {
     #[prost(uint64, tag = "1")]
     pub req_id: u64,
-    /// With CAPABILITY_BYTE_BOUNDED_BATCHES, a non-empty request returns either
+    /// A non-empty request returns either
     /// an empty unavailable response or a non-empty ordered prefix. The caller
     /// resumes an omitted suffix under a fresh request id.
     #[prost(message, repeated, tag = "2")]
@@ -526,7 +498,7 @@ pub mod batch_get_response {
 pub struct Envelope {
     #[prost(
         oneof = "envelope::Msg",
-        tags = "1, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24"
+        tags = "1, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24"
     )]
     pub msg: ::core::option::Option<envelope::Msg>,
 }
@@ -536,11 +508,6 @@ pub mod envelope {
     pub enum Msg {
         #[prost(message, tag = "1")]
         Hello(super::Hello),
-        /// Phase 5: ReplicateOp (2) retired; batches carry Repeated ReplicateOp.
-        #[prost(message, tag = "3")]
-        SyncRequest(super::SyncRequest),
-        #[prost(message, tag = "4")]
-        SyncResponse(super::SyncResponse),
         #[prost(message, tag = "5")]
         ForwardedPut(super::ForwardedPut),
         #[prost(message, tag = "6")]

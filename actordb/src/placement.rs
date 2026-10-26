@@ -83,8 +83,7 @@ pub trait PlacementController: Debug + Send + Sync {
 
 /// Static placement as a controller: always returns the configured
 /// map. Used internally so the dynamic code path can share validation
-/// logic; nodes without an explicit controller keep the legacy static
-/// startup path untouched.
+/// logic; nodes without an explicit controller use static startup.
 #[derive(Debug, Clone)]
 pub struct StaticPlacement {
     map: HashMap<FragmentId, Vec<String>>,

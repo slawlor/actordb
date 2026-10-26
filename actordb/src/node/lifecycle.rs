@@ -198,12 +198,12 @@ pub(super) async fn ensure_sender_entry(
     }));
     let peer_failures = deps.peer_failures.clone();
     let expected_peer = peer.to_string();
-    let runtime = deps
-        .runtime
-        .clone()
-        .with_queue_failure_handler(Arc::new(move |failed_tx| {
-            peer_failures.signal(expected_peer.clone(), failed_tx);
-        }));
+    let runtime =
+        deps.runtime
+            .clone()
+            .with_queue_failure_handler(Arc::new(move |failed_connection| {
+                peer_failures.signal(expected_peer.clone(), failed_connection);
+            }));
     let sender = spawn_node_sender(
         fragment,
         peer.to_string(),
@@ -1272,12 +1272,7 @@ impl Node {
         if runtime_options
             .peer_authority
             .as_ref()
-            .is_some_and(|authority| {
-                authority
-                    .peer_generations()
-                    .iter()
-                    .any(|peer| peer.peer_id() == node_id)
-            })
+            .is_some_and(|authority| authority.peer_generations().contains_key(&node_id))
         {
             return Err(NodeError::Codec(
                 "local identity must not appear in authorized remote peers".into(),
@@ -1317,10 +1312,6 @@ impl Node {
         config
             .replication
             .validate()
-            .map_err(|error| NodeError::Actor(error.to_string()))?;
-        config
-            .replication
-            .validate_node_ingress()
             .map_err(|error| NodeError::Actor(error.to_string()))?;
         // Validate before binding storage or transport. Maintenance actors
         // construct interval timers during startup and placement can construct
@@ -1362,10 +1353,10 @@ impl Node {
             ));
         }
         if runtime_options.peer_authority.is_some() {
-            tracing::info!("independent process credentials authenticate peer generations and every session frame; use a protected Network transport when payload confidentiality is required");
+            tracing::info!("peer generation allowlists fence accepted work; TLS and shared-secret credential authentication, frame integrity and revocation remain transport/deployment responsibilities");
         } else if config.cluster_secret.is_none() {
             tracing::warn!(
-                "no cluster_secret configured: anyone with TCP reachability can join the peer mesh"
+                "no cluster_secret configured: peer authentication depends on the supplied transport; use verified TLS outside local testing"
             );
         } else {
             tracing::warn!(
@@ -1669,7 +1660,6 @@ impl Node {
             storage_executor: config.persistence.executor(),
             persistence_budget: config.persistence.aggregate(),
             sender_reports: Arc::new(Mutex::new(HashMap::new())),
-            sync_entries_applied: Arc::new(AtomicU64::new(0)),
             membership_tx: membership_tx.clone(),
             cluster_secret: config.cluster_secret.clone(),
             placement_tasks,
@@ -1871,7 +1861,7 @@ impl Node {
 
         startup_supervisors.disarm();
         observation.initialization_done();
-        observation.ready(node.status_snapshot().node_lifecycle);
+        observation.ready(node.status_snapshot().lifecycle);
         Ok(node)
     }
     pub(super) async fn replication_drain_targets(&self) -> Vec<ReplicationDrainTarget> {
@@ -2069,14 +2059,14 @@ impl Node {
                 for (peer, channel) in &peers {
                     for ((_, sender_peer), sender) in senders.iter() {
                         if sender_peer == peer {
-                            targets.push((sender.clone(), channel.raw_sender()));
+                            targets.push((sender.clone(), channel.connection_id()));
                         }
                     }
                 }
                 targets
             };
-            for (sender, peer_tx) in disconnected_targets {
-                let _ = sender.send(SenderMsg::PeerDisconnected { peer_tx });
+            for (sender, connection_id) in disconnected_targets {
+                let _ = sender.send(SenderMsg::PeerDisconnected { connection_id });
             }
             self.peer_changes.send_modify(|generation| {
                 *generation = generation.wrapping_add(1);
@@ -3104,7 +3094,6 @@ mod tests {
                     worker_count: 0,
                     worker_names: Vec::new(),
                     restarts: HashMap::new(),
-                    last_reaped: 0,
                     shed_counts: (7, 11, 13),
                 });
             }
@@ -3132,6 +3121,35 @@ mod tests {
     }
 
     impl KvStore for BlockingLoadStore {
+        fn bind(
+            &self,
+            _identity: &crate::store::StoreIdentity,
+        ) -> Result<crate::store::StoreBinding, crate::store::StoreError> {
+            Ok(crate::store::StoreBinding::unmanaged())
+        }
+
+        fn load_prefix(
+            &self,
+            prefix: &[u8],
+        ) -> Result<Vec<(Vec<u8>, crate::actor::VersionedValue)>, crate::store::StoreError>
+        {
+            // This fixture owns a bounded in-memory dataset, not a production prefix scan.
+            Ok(self
+                .load()?
+                .into_iter()
+                .filter(|(key, _)| key.starts_with(prefix))
+                .collect())
+        }
+
+        fn commit_durability(&self) -> crate::store::StoreCommitDurability {
+            crate::store::StoreCommitDurability::Buffered
+        }
+
+        fn stable_fence(
+            &self,
+        ) -> Result<crate::store::StoreCommitDurability, crate::store::StoreError> {
+            Ok(self.commit_durability())
+        }
         fn load(&self) -> Result<Vec<(Vec<u8>, VersionedValue)>, StoreError> {
             self.entered.store(true, Ordering::SeqCst);
             let mut released = self.release.0.lock().unwrap();
@@ -3172,6 +3190,28 @@ mod tests {
     }
 
     impl KvStore for BlockingExclusiveLoadStore {
+        fn load_prefix(
+            &self,
+            prefix: &[u8],
+        ) -> Result<Vec<(Vec<u8>, crate::actor::VersionedValue)>, crate::store::StoreError>
+        {
+            // This fixture owns a bounded in-memory dataset, not a production prefix scan.
+            Ok(self
+                .load()?
+                .into_iter()
+                .filter(|(key, _)| key.starts_with(prefix))
+                .collect())
+        }
+
+        fn commit_durability(&self) -> crate::store::StoreCommitDurability {
+            crate::store::StoreCommitDurability::Buffered
+        }
+
+        fn stable_fence(
+            &self,
+        ) -> Result<crate::store::StoreCommitDurability, crate::store::StoreError> {
+            Ok(self.commit_durability())
+        }
         fn bind(&self, _identity: &StoreIdentity) -> Result<StoreBinding, StoreError> {
             self.attached
                 .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -3222,6 +3262,28 @@ mod tests {
     }
 
     impl KvStore for FailFirstLoadExclusiveStore {
+        fn load_prefix(
+            &self,
+            prefix: &[u8],
+        ) -> Result<Vec<(Vec<u8>, crate::actor::VersionedValue)>, crate::store::StoreError>
+        {
+            // This fixture owns a bounded in-memory dataset, not a production prefix scan.
+            Ok(self
+                .load()?
+                .into_iter()
+                .filter(|(key, _)| key.starts_with(prefix))
+                .collect())
+        }
+
+        fn commit_durability(&self) -> crate::store::StoreCommitDurability {
+            crate::store::StoreCommitDurability::Buffered
+        }
+
+        fn stable_fence(
+            &self,
+        ) -> Result<crate::store::StoreCommitDurability, crate::store::StoreError> {
+            Ok(self.commit_durability())
+        }
         fn bind(&self, _identity: &StoreIdentity) -> Result<StoreBinding, StoreError> {
             self.attached
                 .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -3280,7 +3342,6 @@ mod tests {
                         worker_count: 0,
                         worker_names: Vec::new(),
                         restarts: HashMap::new(),
-                        last_reaped: 0,
                         shed_counts: (0, 0, 0),
                     });
                 }

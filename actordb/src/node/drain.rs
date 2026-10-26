@@ -474,6 +474,18 @@ mod tests {
         }
     }
     impl KvStore for BlockingStore {
+        fn load_prefix(
+            &self,
+            prefix: &[u8],
+        ) -> Result<Vec<(Vec<u8>, crate::actor::VersionedValue)>, crate::store::StoreError>
+        {
+            // This fixture owns a bounded in-memory dataset, not a production prefix scan.
+            Ok(self
+                .load()?
+                .into_iter()
+                .filter(|(key, _)| key.starts_with(prefix))
+                .collect())
+        }
         fn bind(&self, _: &StoreIdentity) -> Result<StoreBinding, StoreError> {
             let detached = self.detached.clone();
             Ok(StoreBinding::managed(move || {
@@ -751,7 +763,9 @@ mod tests {
             .insert((FragmentId(0), "replica".into()), sender.clone());
         let (peer, mut outbound) = mpsc::channel(16);
         sender
-            .send(SenderMsg::PeerConnected { peer_tx: peer })
+            .send(SenderMsg::PeerConnected {
+                peer: crate::replication::ReplicationPeer::new(peer),
+            })
             .unwrap();
         sender.send(SenderMsg::ReconcileNow).unwrap();
         let mut session = 0;
@@ -813,7 +827,7 @@ mod tests {
                     chunk_seq: fetch.chunk_seq,
                     page_seq: 0,
                     done: true,
-                    entries: vec![SyncEntry {
+                    entries: vec![ReconcileEntry {
                         key,
                         value: value.value,
                         timestamp_ms: 1,
@@ -986,8 +1000,8 @@ mod tests {
             Err(DrainError::Timeout { .. })
         ));
         let metrics = node.metrics_snapshot();
-        assert_eq!(metrics.status.lifecycle.cutoff(), cutoff);
-        assert!(metrics.status.lifecycle.active_requests() > 0);
+        assert_eq!(metrics.status.drain.cutoff(), cutoff);
+        assert!(metrics.status.drain.active_requests() > 0);
         assert_eq!(metrics.status.tables[0].active, 1);
         assert_eq!(metrics.status.storage.active_jobs, 1);
         assert_eq!(
@@ -1261,13 +1275,7 @@ mod tests {
                 .await,
             Err(DrainError::Timeout { .. })
         ));
-        assert!(
-            node.metrics_snapshot()
-                .status
-                .lifecycle
-                .awaiting_responses()
-                > 0
-        );
+        assert!(node.metrics_snapshot().status.drain.awaiting_responses() > 0);
         drop(peer);
         node.drain_requests(DrainOptions::default()).await.unwrap();
         assert_eq!(node.drain_status().awaiting_responses(), 0);

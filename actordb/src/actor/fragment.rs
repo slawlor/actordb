@@ -42,9 +42,6 @@ pub struct FragmentHealth {
     /// Restart counts per child (`dispatcher`, `cleaner`, `snapshotter`,
     /// `worker-<slot>`).
     pub restarts: HashMap<String, u64>,
-    /// Legacy compatibility field. Always zero because the unsafe time-based
-    /// tombstone collector has been removed.
-    pub last_reaped: usize,
     /// Ops shed by backpressure, per pool (high, default, background).
     /// Explicit and counted, never silent (Phase 7).
     pub shed_counts: (u64, u64, u64),
@@ -404,7 +401,6 @@ async fn probe_health(
         worker_count: worker_names.len(),
         worker_names,
         restarts: restarts.clone(),
-        last_reaped: 0,
         shed_counts,
     })
 }
@@ -812,6 +808,35 @@ mod tests {
         }
 
         impl KvStore for RestartRecordingStore {
+            fn bind(
+                &self,
+                _identity: &crate::store::StoreIdentity,
+            ) -> Result<crate::store::StoreBinding, crate::store::StoreError> {
+                Ok(crate::store::StoreBinding::unmanaged())
+            }
+
+            fn load_prefix(
+                &self,
+                prefix: &[u8],
+            ) -> Result<Vec<(Vec<u8>, crate::actor::VersionedValue)>, crate::store::StoreError>
+            {
+                // This fixture owns a bounded in-memory dataset, not a production prefix scan.
+                Ok(self
+                    .load()?
+                    .into_iter()
+                    .filter(|(key, _)| key.starts_with(prefix))
+                    .collect())
+            }
+
+            fn commit_durability(&self) -> crate::store::StoreCommitDurability {
+                crate::store::StoreCommitDurability::Buffered
+            }
+
+            fn stable_fence(
+                &self,
+            ) -> Result<crate::store::StoreCommitDurability, crate::store::StoreError> {
+                Ok(self.commit_durability())
+            }
             fn load(&self) -> Result<Vec<(Vec<u8>, VersionedValue)>, StoreError> {
                 Ok(self
                     .entries
@@ -1336,6 +1361,35 @@ mod tests {
         struct DropSignalStore(Option<std::sync::mpsc::Sender<()>>);
 
         impl KvStore for DropSignalStore {
+            fn bind(
+                &self,
+                _identity: &crate::store::StoreIdentity,
+            ) -> Result<crate::store::StoreBinding, crate::store::StoreError> {
+                Ok(crate::store::StoreBinding::unmanaged())
+            }
+
+            fn load_prefix(
+                &self,
+                prefix: &[u8],
+            ) -> Result<Vec<(Vec<u8>, crate::actor::VersionedValue)>, crate::store::StoreError>
+            {
+                // This fixture owns a bounded in-memory dataset, not a production prefix scan.
+                Ok(self
+                    .load()?
+                    .into_iter()
+                    .filter(|(key, _)| key.starts_with(prefix))
+                    .collect())
+            }
+
+            fn commit_durability(&self) -> crate::store::StoreCommitDurability {
+                crate::store::StoreCommitDurability::Buffered
+            }
+
+            fn stable_fence(
+                &self,
+            ) -> Result<crate::store::StoreCommitDurability, crate::store::StoreError> {
+                Ok(self.commit_durability())
+            }
             fn load(&self) -> Result<Vec<(Vec<u8>, VersionedValue)>, StoreError> {
                 Ok(Vec::new())
             }
@@ -1730,6 +1784,35 @@ mod persistence_validation_tests {
 
     struct StartupStore(AtomicUsize);
     impl KvStore for StartupStore {
+        fn bind(
+            &self,
+            _identity: &crate::store::StoreIdentity,
+        ) -> Result<crate::store::StoreBinding, crate::store::StoreError> {
+            Ok(crate::store::StoreBinding::unmanaged())
+        }
+
+        fn load_prefix(
+            &self,
+            prefix: &[u8],
+        ) -> Result<Vec<(Vec<u8>, crate::actor::VersionedValue)>, crate::store::StoreError>
+        {
+            // This fixture owns a bounded in-memory dataset, not a production prefix scan.
+            Ok(self
+                .load()?
+                .into_iter()
+                .filter(|(key, _)| key.starts_with(prefix))
+                .collect())
+        }
+
+        fn commit_durability(&self) -> crate::store::StoreCommitDurability {
+            crate::store::StoreCommitDurability::Buffered
+        }
+
+        fn stable_fence(
+            &self,
+        ) -> Result<crate::store::StoreCommitDurability, crate::store::StoreError> {
+            Ok(self.commit_durability())
+        }
         fn load(&self) -> Result<Vec<(Vec<u8>, VersionedValue)>, crate::store::StoreError> {
             self.0.fetch_add(1, Ordering::Relaxed);
             Ok(Vec::new())

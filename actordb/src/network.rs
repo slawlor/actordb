@@ -37,6 +37,9 @@ use std::pin::Pin;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
 
+mod connection_id;
+pub use connection_id::PeerConnectionId;
+
 #[cfg(feature = "tls")]
 mod tls;
 #[cfg(feature = "tls")]

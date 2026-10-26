@@ -221,7 +221,7 @@ impl NodeStartup {
         if snapshot.stage == StartupStage::Ready && !snapshot.cancellation_requested {
             if let Ok(outcome) = self.outcome.try_lock() {
                 if let Some(Ok(node)) = outcome.as_ref() {
-                    snapshot.lifecycle = node.status_snapshot().node_lifecycle;
+                    snapshot.lifecycle = node.status_snapshot().lifecycle;
                 }
             }
         }

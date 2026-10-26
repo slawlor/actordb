@@ -188,7 +188,7 @@ pub(super) async fn send_reconcile_data_pages(
         }
         next_key_index = value_page.next_index;
         for (key, value) in value_page.entries {
-            let entry = SyncEntry {
+            let entry = ReconcileEntry {
                 key,
                 value: value.value,
                 timestamp_ms: value.timestamp_ms,
@@ -444,7 +444,7 @@ mod tests {
             let base_payload_len = reconcile_data_reserved_base_len(&page);
             let mut sizing = RepeatedFieldSizer::new(14, 2, base_payload_len);
             for value_len in [0, 1, 127, 128, 16_383, 16_384] {
-                let entry = SyncEntry {
+                let entry = ReconcileEntry {
                     key: format!("key-{value_len}"),
                     value: vec![7; value_len],
                     timestamp_ms: u64::MAX,

@@ -83,6 +83,6 @@ active.
 
 ## Version requirements
 
-This additive API was introduced in `0.5.0`. The current release uses compatible
-`0.9.0` dependency minimums across all four public crates so an upgrade resolves
-the matching database, protocol, query, and SDK revisions.
+Use `0.9.0` across the database, protocol, query and SDK crates. Peer protocol 6
+and application protocol 4 require matching current participants; there is no
+mixed-version negotiation or fallback.

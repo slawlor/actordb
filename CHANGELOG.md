@@ -2,221 +2,39 @@
 
 ## 0.9.0 (draft)
 
-- Complete authenticated peer/process generation fencing, bounded stable
-  checkpoint export/import and qualified staged membership support, and typed
-  per-write durability/replica-set/version-floor evidence.
-- Request draining now defaults to the configured local persistence boundary,
-  with explicit execution-only and stable options. Retained fence tickets
-  preserve actual storage ownership through caller cancellation and retry.
-- Extend backend-neutral collection with deliberately registered table scopes,
-  request/storage timing and queue pressure, and lifecycle/recovery blockers.
-- Use `0.9.0` for public protocol/actor schema additions and stronger drain
-  semantics. The unpublished `0.8.1` implementation stages are included here.
+This is a fresh-deployment release. Deploy the database, protocol, query and SDK
+crates together at `0.9.0`; there is no rolling upgrade, old-store adoption or
+backwards-compatible wire mode.
 
-- Add explicit application admission/draining APIs with bounded retryable
-  waits, status and outstanding-work reporting. Accepted work retains
-  completion ownership after request waiter cancellation.
-- Retain already dispatched peer replication/reconciliation applies through
-  execution and join them during full shutdown before releasing storage.
-  Application drain and full receive/apply shutdown are separate barriers.
-- Add bounded typed node/fragment/replication snapshots and backend-neutral
-  metrics collection without exporter dependencies. Partial observations and
-  unmeasured progress remain explicit.
-- Add opt-in strict write-concern acknowledgement requirements. Operational
-  caps that would lower the requested threshold fail before apply; embedded,
-  forwarded and client receipt validation preserves the constraint.
-- Include authenticated hot fencing, stable checkpoints and native staged
-  membership validation with actual source/target and receiver evidence.
-- Bump all four published crates and compatible dependency minimums to
-  `0.9.0`. Existing default wire encodings retain their meaning; enabled new
-  requirements fail closed on older peers. Public schema/actor literals and
-  matching assumptions need the documented migration.
+- Add cancellation-safe admission draining, configured/stable local persistence
+  fences, queued response ownership and receive/apply shutdown barriers.
+- Add owned startup, typed lifecycle/readiness/blockers, replication progress and
+  bounded backend-neutral node/table/fragment/peer/pool/worker observations.
+- Add generation allowlist changes that close old sessions and drain accepted
+  work before publishing a new receiver policy.
+- Add stable bounded checkpoint export/import, authenticated chunks, durable
+  resumable cursors, replica floor evidence and guarded staged membership.
+- Add strict acknowledgement policies and actual memory/store/stable evidence
+  tied to frozen replica identities and operation/version floors.
+- Use exact peer protocol 6 and application protocol 4. Remove capability and
+  version-range negotiation, retired messages and unused wire fields.
+- Use RocksDB record/manifest format 3, checkpoint format ACTCP003 and membership
+  journal ACTMEM04. Non-current formats fail closed without adoption or repair.
+- Remove Ed25519 process keys, frame signatures and their extra frame overhead.
+  Authentication uses the transport's TLS policy and optional shared-secret
+  challenge/response. Generation checks are operational controls, not proof of
+  credential revocation.
+- Remove compatibility reexports, unbounded replication entry points, no-op
+  tombstone collection, always-zero counters and unimplemented status fields.
+  Use the canonical actor/protocol APIs and bounded sender constructor.
+- Keep one typed node lifecycle, separate drain ownership, and an always-present
+  shutdown stage. Retain explicit omissions only for genuinely unavailable data.
+- Update all documentation and examples to the current APIs and fresh-deployment
+  contract.
 
-See [migration](docs/support-api-migration.md),
-[draining](docs/draining.md), [metrics](docs/metrics.md), and
-[status](docs/status.md), [peer authority](docs/peer-authority.md),
-[checkpoints](docs/stable-checkpoints.md), [membership](docs/staged-membership.md),
-and [write durability](docs/write-concerns.md). Acceptance coverage is mapped in the
-[support API roadmap](docs/support-api-roadmap.md).
+See [deployment](docs/support-api-migration.md), [draining](docs/draining.md),
+[observations](docs/observability.md), [peer authority](docs/peer-authority.md),
+[checkpoints](docs/stable-checkpoints.md), [membership](docs/staged-membership.md)
+and [write evidence](docs/write-concerns.md).
 
-## 0.8.0
-
-- Add shared-node logical table views. Tables reuse the node listener and peer
-  channels while isolating keys, scans, SQL queries, cache/flush state, and
-  durable iteration groups in per-table partitions. Equal user keys hash to
-  the same fragment across tables for future local key joins.
-- Bump the peer protocol to v5 and the application protocol to v3 for the
-  multi-table rollout.
-- SQL now names its relation explicitly (`FROM users`), and named table
-  handles reject mismatched SQL.
-- Hide the raw generated `actordb::proto` compatibility module from generated
-  documentation and establish `actordb-protocol` as the supported wire-schema
-  boundary.
-
-## 0.7.1
-
-- Extend bounded SQL inspection with durable-record metadata projections and
-  typed metadata predicates.
-- Add `INCLUDING TOMBSTONES` for explicitly querying retained tombstones;
-  ordinary SQL visibility remains live-record-only.
-- Negotiate the metadata-aware query capability before selecting remote holders.
-- Update the four public crates and their workspace dependency minimums to
-  `0.7.1`.
-
-## 0.7.0
-
-- Add an optional `actordb/tls` rustls transport with caller-supplied client/server certificate policies, server-name validation, and bounded per-connection handshakes. Plain TCP and custom `Network` implementations remain available.
-
-- Use physical/logical record versions to prevent high throughput from creating
-  future clock skew and blocking replication or immediate restart. Peer protocol
-  v4 and application protocol v2 carry the logical counter; upgrade participants
-  together. RocksDB data format v2 reads legacy counters as zero and upgrades
-  validated v1 manifests before writing new records. Back up stores before upgrade.
-- Expose `RecordVersion` and version-aware constructors; `HlcClock::tick` now
-  returns a fallible physical/logical timestamp. Expiry event identities include
-  both components, and application state must compare the complete version.
-
-- Add optional best-effort local TTL expiry callbacks with owned opaque values,
-  original LWW versions, stable replica-deduplication identities and batch context.
-- Add an async closure adapter and bounded serial dispatcher with batching,
-  count/byte admission, handler deadlines, panic/error isolation and bounded
-  shutdown draining with drop/abandonment and latency diagnostics.
-- Preserve expiry tombstones, snapshot/read visibility, replication and persistence;
-  report eligible startup conversions without promising notification replay.
-- Include a bounded application-worker example and deterministic expiry/race and
-  dispatcher lifecycle tests. See `docs/ttl-expiry-callbacks.md` for delivery limits.
-- Move the four public crates and compatible internal dependency requirements
-  to `0.7.0`. Full NodeConfig/SupervisorArgs literals need the added defaults;
-  wire protocol versions and stored record formats are unchanged.
-
-## 0.6.0
-
-- Upgrade the optional protobuf generator dependency to `protobuf-src` 2.1.
-  Code generation requires CMake and a C/C++ toolchain.
-- Add caller-supplied application transports with `Client::from_stream`,
-  `ClientServer::bind_with_network`, and `ClientServer::from_acceptor`, preserving
-  plain TCP defaults and the existing wire protocols. Flush complete peer and
-  application frames for buffered streams; include a caller-configured mTLS
-  example and transport lifecycle/conformance tests.
-- Move all four public crates and internal dependency minimums to compatible
-  `0.6.0` ranges. See `docs/transports.md` for the new application extension points.
-
-## 0.5.0
-
-- Add per-write `Local`, `Count(n)`, and `Majority` acknowledgement policies
-  to Node and Rust client single-key put/delete APIs, including TTL/priority.
-- Return explicit acknowledgement receipts and partial progress on timeout;
-  updates continue through the normal asynchronous replication path.
-- Count only validated, distinct processing ACKs for the stamped update and
-  captured replica set. Keep local acknowledgement as the ordinary default.
-- Isolate acknowledgement waits from forwarded apply workers and keep peer
-  readers available for ACKs during forwarded writes.
-- Add per-write requirements for a processed acknowledgement from another
-  configured region, with validated region maps and frozen replica eligibility.
-  Preserve the region requirement when the numeric threshold is one and report
-  region progress in success and timeout receipts. Reject incomplete region
-  configuration before apply and missing or malformed required region progress
-  in routed and SDK receipts.
-- Add explicit per-node acknowledgement caps with validated startup
-  configuration and runtime set/clear controls. Receipts report requested and
-  effective thresholds; existing plans retain their captured thresholds.
-  Validate requested counts before overrides and preserve region requirements
-  independently of numeric caps.
-- Reject contradictory operation/receipt replies and preserve unknown outcomes
-  after lost forwarded responses, including subsequent pre-apply rejection.
-- Extend generated public wire structs with optional concern fields, require
-  peer capability support, and move all four public crate versions and inter-crate
-  minimums to compatible 0.5.0 ranges.
-
-Write concern policies, region requirements, and operational caps are included
-in this single release. See `docs/write-concern.md`,
-`docs/write-concern-regions.md`, and `docs/write-concern-overrides.md` for support,
-semantics, and migration.
-
-## 0.4.0
-
-- Add a Rust companion SDK and a separate application listener, with point and
-  batch operations, TTL, priorities, scans, queries, and read-only inspection.
-- Add bounded SQL queries over the virtual `kv` table: key and fragment filters,
-  global row pagination, byte projections, and exact integer aggregates.
-  Joins, subqueries, multiple statements, and grouping remain unsupported.
-- Share generated protocol bindings through `actordb-protocol`; ordinary library
-  builds no longer compile protobuf tooling. Negotiate peer scan and query
-  capabilities explicitly.
-- Keep mutation retries explicit: a lost application response can have an
-  unknown outcome; the SDK does not replay a mutation with a fresh version.
-
-## 0.3.0
-
-- Stabilize tests around asynchronous worker health, relay/ACK deadlines, and TTL expiry;
-  expiry during admission remains an explicit supported outcome, not a failure
-  of scan visibility.
-- Fence supervised restarts by actor identity, bound the complete integration
-  polling operation, and replace a shared-runner latency threshold with a
-  correctness check that completes both bulk-write and high-priority workloads.
-- Remove duplicate native RocksDB package builds and tests from publishing.
-  Normal CI retains backend-free, memory-only, and all-feature validation; release
-  validation retains backend-free and memory-only package checks and tests.
-- Update installation examples and release instructions for the 0.3 series.
-
-- Add `Node::scan` for distributed key filtering and value projections, with
-  background-pool admission, per-fragment bounds, replica failover, and explicit
-  failure rather than silent partial results. Scans use per-fragment views,
-  not a globally isolated snapshot; see the [scan guide](docs/scanning.md).
-- Add scan request/response messages to the peer protocol and deterministic
-  local scan ordering. Upgrade peers together when adopting the scan API.
-- Use the protobuf-src 1.1 release series for protobuf generation.
-
-## 0.2.0
-
-The next pre-1.0 release replaces the original prototype with the current
-actor-first, sharded database implementation. This is a breaking upgrade from
-`0.1.0`, not a declaration of production readiness.
-
-- Per-fragment actor supervision, local and forwarded mutation outcomes,
-  batched routing, and bounded request, response, relay, and replication work.
-- Protocol-v3 peer compatibility checks, authenticated identities, paginated
-  reconciliation, placement epochs, bootstrap-before-serving, and explicit
-  replication/durability acknowledgements. Do not mix incompatible protocol
-  versions in a live mesh.
-- Versioned TTL deletion and retained tombstones, checked wall-clock deadlines,
-  restart-safe logical clocks, serialized persistence, and cancellation-aware
-  drain and shutdown. `Node::shutdown` now returns a result; callers must
-  handle persistence failures instead of treating shutdown as infallible.
-- The officially supported RocksDB backend has isolated `store::rocksdb`
-  implementation modules, configurable WAL durability, prefix isolation, and
-  fail-closed identity/layout manifests. Legacy stores require deliberate
-  adoption; review the persistence guide and back up data before upgrading.
-- Bounded truthful health probes, coalesced automatic maintenance, and Bon
-  builders for public configuration and actor arguments. Required identities
-  and shared dependencies remain required; runtime validation remains at
-  startup.
-- Backend-free default crate with independent opt-in `rocksdb` and `memory`
-  features. `MemoryStore` is a no-op test double, not a database; custom
-  `KvStore` implementations and storeless nodes need neither feature.
-- Rust 1.88 minimum support, backend-free/memory/full-feature CI, package
-  verification, and version/tag-checked crates.io release automation.
-- Actor-per-file runtime organization under `actor`, with `supervision`
-  compatibility reexports preserving public imports and Bon
-  builder paths; shared cache, clock, protocol, pool, and maintenance helpers
-  have separate modules. Unit tests remain inline in the owning source files;
-  real-node integration tests stay separate. Redundant generated-builder and
-  alias/default smoke tests are omitted; regressions focus on runtime behavior
-  and fail-closed validation rather than coverage percentages.
-- Consolidated `getrandom` 0.4, `hmac` 0.13, `sha2` 0.11, and `tracing-glog` 0.4
-  upgrades, current compatible dependency patches, and grouped future Dependabot
-  updates. OS challenge generation and constant-time handshake verification
-  retain the existing protocol, pinned by independent crypto test vectors.
-  The internal xtask uses Clap 4 without the obsolete `atty` dependency, while
-  preserving its existing commands and coverage flags.
-- No committed dependency lockfile or frozen-resolution CI/release commands.
-  Fresh resolution prefers dependencies compatible with each crate's declared
-  Rust minimum; Cargo-generated local and packaged lockfiles remain normal.
-
-See the [API guide](docs/api.md), [persistence guide](docs/persistence.md),
-[replication guide](docs/replication.md), and
-[consistency model](docs/consistency.md) for the actual guarantees and migration
-requirements. The [hardening backlog](https://github.com/slawlor/actordb/issues/49)
-still includes factory routing, cache architecture benchmarks, ordered runtime
-execution, and node/replication module cleanup. Transport-specific TLS remains
-application-owned.
+Previous release notes are available in Git history.

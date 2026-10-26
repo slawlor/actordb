@@ -8,9 +8,7 @@
 //! [`Client::connect`] uses plain TCP; [`Client::from_stream`] accepts a
 //! caller-established stream, including TLS, with the same application protocol.
 
-use actordb_protocol::{
-    client as wire, CLIENT_CAPABILITIES, CLIENT_PROTOCOL_VERSION, MAX_FRAME_BYTES,
-};
+use actordb_protocol::{client as wire, CLIENT_PROTOCOL_VERSION, MAX_FRAME_BYTES};
 use prost::Message;
 use std::fmt;
 use std::net::SocketAddr;
@@ -52,7 +50,7 @@ pub use write_concern::WriteConcernClientError;
 ///     .priority(Priority::High)
 ///     .build();
 /// ```
-#[derive(Debug, Clone, bon::Builder)]
+#[derive(Clone, bon::Builder)]
 #[non_exhaustive]
 pub struct ClientOptions {
     /// Application authentication identity, 1 to 255 UTF-8 bytes.
@@ -73,6 +71,21 @@ pub struct ClientOptions {
     /// Encoded request bytes retained by admitted requests. Default 32 MiB.
     #[builder(default = 32 * 1024 * 1024)]
     pub max_queued_bytes: usize,
+}
+impl std::fmt::Debug for ClientOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClientOptions")
+            .field("identity", &self.identity)
+            .field("table", &self.table)
+            .field(
+                "credential",
+                &self.credential.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("timeout", &self.timeout)
+            .field("max_queued_requests", &self.max_queued_requests)
+            .field("max_queued_bytes", &self.max_queued_bytes)
+            .finish()
+    }
 }
 impl Default for ClientOptions {
     fn default() -> Self {
@@ -137,7 +150,6 @@ struct Inner {
     count: Semaphore,
     bytes: Arc<Semaphore>,
     options: ClientOptions,
-    capabilities: u64,
     closing: watch::Sender<bool>,
 }
 #[derive(Clone)]
@@ -210,15 +222,13 @@ impl Client {
         deadline: Instant,
     ) -> Result<Self, ClientError> {
         let table = options.table.clone();
-        let (stream, capabilities) = timeout_at(deadline, async {
+        let stream = timeout_at(deadline, async {
             let mut challenge = vec![0; 32];
             getrandom::fill(&mut challenge).map_err(|e| ClientError::Protocol(e.to_string()))?;
             let hello = wire::Hello {
                 identity: options.identity.clone(),
                 challenge,
-                min_version: CLIENT_PROTOCOL_VERSION,
-                max_version: CLIENT_PROTOCOL_VERSION,
-                capabilities: CLIENT_CAPABILITIES,
+                protocol_version: CLIENT_PROTOCOL_VERSION,
             };
             send_frame(
                 &mut stream,
@@ -264,7 +274,7 @@ impl Client {
                     ) => {}
                 _ => return Err(ClientError::Authentication),
             }
-            Ok((stream, hello.capabilities & server.capabilities))
+            Ok(stream)
         })
         .await
         .map_err(|_| ClientError::Timeout)??;
@@ -275,7 +285,6 @@ impl Client {
                 count: Semaphore::new(options.max_queued_requests),
                 bytes: Arc::new(Semaphore::new(options.max_queued_bytes)),
                 options,
-                capabilities,
                 closing: watch::channel(false).0,
             }),
             table,
@@ -663,11 +672,6 @@ impl Client {
                 "query parameters exceed frame limit".into(),
             ));
         }
-        if self.inner.capabilities & actordb_protocol::CLIENT_CAPABILITY_QUERY == 0 {
-            return Err(ClientError::Invalid(
-                "server does not support queries".into(),
-            ));
-        }
         let params = params.iter().map(encode_cell).collect();
         let response = self
             .request(
@@ -702,9 +706,6 @@ impl Client {
         &self,
         spec: wire::Scan,
     ) -> Result<Vec<actordb_protocol::meta::ScanMatch>, ClientError> {
-        if self.inner.capabilities & actordb_protocol::CLIENT_CAPABILITY_SCAN == 0 {
-            return Err(ClientError::Invalid("server does not support scans".into()));
-        }
         Ok(self
             .request(wire::request::Operation::Scan(spec), false)
             .await?
@@ -917,4 +918,38 @@ async fn read_frame(stream: &mut BoxStream, max: usize) -> Result<wire::Frame, C
     actordb_protocol::preflight_client_frame(&bytes)
         .map_err(|e| ClientError::Protocol(e.into()))?;
     wire::Frame::decode(bytes.as_slice()).map_err(|e| ClientError::Protocol(e.to_string()))
+}
+
+#[cfg(test)]
+mod credential_debug_tests {
+    use super::*;
+
+    #[test]
+    fn client_options_debug_redacts_credentials_and_preserves_nonsecret_fields() {
+        let secret: Vec<u8> = (201..233).collect();
+        let options = ClientOptions::builder()
+            .identity("debug-client")
+            .table("customers")
+            .credential(secret.clone())
+            .timeout(Duration::from_secs(7))
+            .max_queued_requests(17)
+            .max_queued_bytes(8192)
+            .build();
+        for output in [format!("{options:?}"), format!("{options:#?}")] {
+            assert!(output.contains("[REDACTED]"));
+            assert!(!output.contains("201") && !output.contains("232"));
+            assert!(!output.contains(&format!("{secret:?}")));
+            for field in [
+                "identity: \"debug-client\"",
+                "table: \"customers\"",
+                "timeout: 7s",
+                "max_queued_requests: 17",
+                "max_queued_bytes: 8192",
+            ] {
+                assert!(output.contains(field), "missing nonsecret field {field}");
+            }
+        }
+        assert!(format!("{:?}", ClientOptions::default()).contains("credential: None"));
+        assert_eq!(options.credential.as_deref(), Some(secret.as_slice()));
+    }
 }

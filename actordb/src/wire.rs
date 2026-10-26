@@ -23,10 +23,6 @@ pub(crate) use peer_budget::{
 
 /// Existing protobuf/record budget, unchanged for opaque persisted values.
 pub(crate) const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
-pub(crate) const PEER_SIGNATURE_HEADER_BYTES: usize = 8 + 64;
-/// Signed physical bodies reserve a fixed integrity header in addition to the
-/// unchanged envelope budget. Legacy physical bodies remain MAX_FRAME_BYTES.
-pub(crate) const MAX_TRANSPORT_FRAME_BYTES: usize = MAX_FRAME_BYTES + PEER_SIGNATURE_HEADER_BYTES;
 
 /// Soft target for one anti-entropy page. A single individually valid entry
 /// may exceed this target, but no encoded envelope may exceed
@@ -124,8 +120,6 @@ impl BudgetedFrame {
 /// frame-count nor encoded-byte budget can be bypassed or mismatched.
 #[derive(Clone)]
 pub(crate) struct BudgetedPeerTx {
-    /// Signed sessions reserve header bytes before queue/encoding admission.
-    pub(crate) frame_overhead: usize,
     /// Ordinary producer traffic. Reader-generated protocol responses have a
     /// separate priority lane so a full data queue cannot make both peers
     /// stop reading while they wait to acknowledge one another.
@@ -141,7 +135,7 @@ pub(crate) struct BudgetedPeerTx {
     /// One anti-entropy round at a time per physical connection. This bounds
     /// responder work independently of the configured fragment count.
     pub(crate) reconcile_gate: ReconcileGate,
-    pub(crate) identity: mpsc::Sender<Vec<u8>>,
+    pub(crate) connection_id: crate::network::PeerConnectionId,
 }
 
 #[derive(Default)]
@@ -278,8 +272,8 @@ impl Drop for ReconcilePermit {
 }
 
 impl BudgetedPeerTx {
-    pub(crate) fn same_channel(&self, other: &Self) -> bool {
-        self.tx.same_channel(&other.tx)
+    pub(crate) fn same_connection(&self, other: &Self) -> bool {
+        self.connection_id == other.connection_id
     }
 
     pub(crate) async fn acquire_global_producer(
@@ -371,7 +365,7 @@ pub(crate) enum WireDecodeError {
     Malformed(&'static str),
     MultipleMessages,
     MissingMessage,
-    RetiredMessage,
+    UnsupportedMessage,
     TooManyItems { message: &'static str, limit: usize },
 }
 
@@ -381,7 +375,9 @@ impl fmt::Display for WireDecodeError {
             Self::Malformed(reason) => write!(f, "malformed protobuf envelope: {reason}"),
             Self::MultipleMessages => write!(f, "protobuf envelope contains multiple messages"),
             Self::MissingMessage => write!(f, "protobuf envelope contains no supported message"),
-            Self::RetiredMessage => write!(f, "protobuf envelope contains a retired message"),
+            Self::UnsupportedMessage => {
+                write!(f, "protobuf envelope contains an unsupported message")
+            }
             Self::TooManyItems { message, limit } => {
                 write!(f, "{message} exceeds the {limit}-item wire limit")
             }
@@ -554,7 +550,11 @@ pub(crate) fn preflight_envelope_decode(frame: &[u8]) -> Result<(), WireDecodeEr
             return Err(WireDecodeError::Malformed("field number is zero"));
         }
         let wire_type = (key & 7) as u8;
-        if (1..=24).contains(&field) {
+        let supported_message = field == 1 || (5..=24).contains(&field);
+        if !supported_message && wire_type == 2 {
+            return Err(WireDecodeError::UnsupportedMessage);
+        }
+        if supported_message {
             messages += 1;
             if messages > 1 {
                 return Err(WireDecodeError::MultipleMessages);
@@ -567,8 +567,6 @@ pub(crate) fn preflight_envelope_decode(frame: &[u8]) -> Result<(), WireDecodeEr
             let payload = take_length_delimited(frame, &mut cursor)?;
             match field {
                 5 => preflight_concern_field(payload, 12, false)?,
-                // Retired ReplicateOp, SyncRequest, and SyncResponse.
-                2..=4 => return Err(WireDecodeError::RetiredMessage),
                 9 => preflight_repeated_field(
                     payload,
                     4,
@@ -982,16 +980,16 @@ mod tests {
     use crate::actor::VersionedValue;
     use crate::proto::{
         BatchGet, BatchGetResponse, BatchKeyValue, BatchPut, EnvelopeMsg, ForwardedPut, KeySummary,
-        MutationResponse, MutationResult, MutationStatus, ReconcileData, ReconcileFetch,
-        ReconcileResponse, ReplicateBatch, ReplicateOp as ProtoReplicateOp, ReplicationAckLevel,
-        SyncEntry,
+        MutationResponse, MutationResult, MutationStatus, ReconcileData, ReconcileEntry,
+        ReconcileFetch, ReconcileResponse, ReplicateBatch, ReplicateOp as ProtoReplicateOp,
+        ReplicationAckLevel,
     };
 
     fn data_envelope(value_len: usize) -> Envelope {
         Envelope {
             msg: Some(EnvelopeMsg::ReconcileData(ReconcileData {
                 fragment: 7,
-                entries: vec![SyncEntry {
+                entries: vec![ReconcileEntry {
                     key: "key".to_string(),
                     value: vec![0; value_len],
                     timestamp_ms: 11,
@@ -1136,7 +1134,7 @@ mod tests {
             },
         );
 
-        let entry = SyncEntry::default();
+        let entry = ReconcileEntry::default();
         assert_single_repeated_item_size(
             14,
             2,
@@ -1303,11 +1301,19 @@ mod tests {
     }
 
     #[test]
-    fn decode_preflight_rejects_retired_and_ambiguous_envelopes() {
-        assert_eq!(
-            preflight_envelope_decode(&raw_envelope(3, &[])),
-            Err(WireDecodeError::RetiredMessage)
-        );
+    fn decode_preflight_rejects_unsupported_and_ambiguous_envelopes() {
+        for field in [2, 3, 4, 25, 100] {
+            assert_eq!(
+                preflight_envelope_decode(&raw_envelope(field, &[])),
+                Err(WireDecodeError::UnsupportedMessage)
+            );
+            let mut mixed = raw_envelope(1, &[]);
+            mixed.extend_from_slice(&raw_envelope(field, &[]));
+            assert_eq!(
+                preflight_envelope_decode(&mixed),
+                Err(WireDecodeError::UnsupportedMessage)
+            );
+        }
 
         let mut duplicate = raw_envelope(1, &[]);
         duplicate.extend_from_slice(&raw_envelope(20, &[]));
@@ -1376,7 +1382,7 @@ mod tests {
             expires_at_ms: u64::MAX,
             is_tombstone: false,
         };
-        let entry = SyncEntry {
+        let entry = ReconcileEntry {
             key: op.key.clone(),
             value: op.value.value.clone(),
             timestamp_ms: u64::MAX,

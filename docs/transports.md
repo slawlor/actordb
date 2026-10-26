@@ -5,10 +5,9 @@ application connections. Plain TCP remains the default. Enable the optional
 `actordb/tls` feature to use the built-in rustls `TlsNetwork`, or implement
 `Network` with another TLS library or transport policy.
 
-The application extension points are available in `0.6.0`. Update the database,
-protocol, query, and SDK dependency requirements to the `0.6` series together.
-This release preserves the peer/application wire versions and stored record
-format; the version change covers the public Rust crate release.
+Use the database, protocol, query and SDK crates at `0.9.0`. Peer protocol 6 and
+application protocol 4 are exact contracts, not negotiated version ranges.
+Fresh deployments use new stores; see [deployment](support-api-migration.md).
 
 ## Peer mesh
 
@@ -95,14 +94,12 @@ normal dependency on `actordb` or a TLS library.
 
 ## Transport contract
 
-Configured process-generation peers sign every post-handshake frame with
-sequence and fresh-session binding, so plain TCP provides peer payload integrity
-and replay rejection. This mode preserves the 16 MiB envelope/record limit and
-adds a 72-byte physical header charged to queue admission. See
-[peer-authority.md](peer-authority.md) for the exact format and test vector.
-It does not encrypt values; TLS remains appropriate for confidentiality.
-Legacy generation-zero cluster-secret peers retain their original framing and
-rely on a protected transport when channel integrity is required.
+Peer/application frames are ordinary length-prefixed protobuf bodies, capped at
+16 MiB. There are no process signatures or additional signed-frame headers.
+An optional shared secret authenticates challenge-bound possession, not an
+individual member or subsequent frame contents. The supplied TLS transport
+must establish peer authentication, payload integrity and confidentiality.
+Generation checks and drain barriers do not replace credential revocation.
 
 - Deliver reliable, ordered bytes and support concurrent reads and writes.
   Propagate backpressure and connection errors. ActorDB flushes each complete

@@ -24,7 +24,7 @@ use format::{hash, Decoder, Encoder};
 pub const MAX_CHUNK_BYTES: usize = 32 * 1024 * 1024;
 const MAX_METADATA_BYTES: usize = 2 * 1024 * 1024;
 const CHUNK_HEADER_BYTES: usize = 8 + 8 + 32 + 4;
-const FORMAT_MAGIC: &[u8; 8] = b"ACTCP001";
+const FORMAT_MAGIC: &[u8; 8] = b"ACTCP003";
 
 #[derive(Debug)]
 #[non_exhaustive]
@@ -1271,9 +1271,32 @@ fn validate_index_prefix(
 mod tests {
     use super::*;
     #[test]
+    fn old_bundle_manifest_is_rejected_without_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("manifest");
+        for magic in [b"ACTCP001", b"ACTCP002"] {
+            std::fs::write(&path, magic).unwrap();
+            let before = std::fs::read(&path).unwrap();
+            assert!(CheckpointManifest::read(dir.path()).is_err());
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+        }
+    }
+    #[test]
     fn unsupported_backend_never_uses_full_load_or_creates_transfer_files() {
-        struct Legacy;
-        impl KvStore for Legacy {
+        struct UnsupportedStore;
+        impl KvStore for UnsupportedStore {
+            fn bind(&self, _: &StoreIdentity) -> Result<crate::store::StoreBinding, StoreError> {
+                Ok(crate::store::StoreBinding::unmanaged())
+            }
+            fn load_prefix(&self, _: &[u8]) -> Result<Vec<(Vec<u8>, VersionedValue)>, StoreError> {
+                panic!("unsupported checkpoint must not load namespaces")
+            }
+            fn commit_durability(&self) -> StoreCommitDurability {
+                StoreCommitDurability::Buffered
+            }
+            fn stable_fence(&self) -> Result<StoreCommitDurability, StoreError> {
+                Ok(StoreCommitDurability::Buffered)
+            }
             fn load(&self) -> Result<Vec<(Vec<u8>, VersionedValue)>, StoreError> {
                 panic!("unbounded load fallback must never run")
             }
@@ -1285,8 +1308,8 @@ mod tests {
         let bundle = directory.path().join("unsupported");
         assert!(matches!(
             CheckpointExporter::open(
-                Arc::new(Legacy),
-                StoreIdentity::new("legacy".into(), 1),
+                Arc::new(UnsupportedStore),
+                StoreIdentity::new("unsupported".into(), 1),
                 &bundle,
                 CheckpointOptions::default()
             ),

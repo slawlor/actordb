@@ -70,8 +70,7 @@ async fn replication_reports_real_success_timestamps_and_enabled_queue_ages() {
         vec![5]
     );
     let snapshot = source.status_snapshot();
-    assert_eq!(snapshot.node_lifecycle, NodeLifecycle::Serving);
-    assert!(snapshot.replication[0].lag.is_none());
+    assert_eq!(snapshot.lifecycle, NodeLifecycle::Serving);
     source.shutdown().await.unwrap();
     peer.shutdown().await.unwrap();
 }
@@ -88,6 +87,21 @@ impl LoadingStore {
     }
 }
 impl KvStore for LoadingStore {
+    fn load_prefix(
+        &self,
+        prefix: &[u8],
+    ) -> Result<Vec<(Vec<u8>, actordb::actor::VersionedValue)>, actordb::store::StoreError> {
+        // This fixture owns a bounded in-memory dataset, not a production prefix scan.
+        Ok(self
+            .load()?
+            .into_iter()
+            .filter(|(key, _)| key.starts_with(prefix))
+            .collect())
+    }
+
+    fn commit_durability(&self) -> actordb::store::StoreCommitDurability {
+        actordb::store::StoreCommitDurability::Buffered
+    }
     fn bind(&self, _: &StoreIdentity) -> Result<StoreBinding, StoreError> {
         let detached = self.detached.clone();
         Ok(StoreBinding::managed(move || {
@@ -138,11 +152,10 @@ async fn explicit_recovery_reports_missing_candidates_without_premature_serving(
     .await
     .unwrap();
     let status = node.status_snapshot();
-    assert_eq!(status.node_lifecycle, NodeLifecycle::Recovering);
+    assert_eq!(status.lifecycle, NodeLifecycle::Recovering);
     assert_eq!(status.readiness, Readiness::NotReady);
     assert!(!status.initial_readiness_established);
     assert_eq!(status.fragments[0].missing_peers, &["missing"]);
-    assert!(status.fragments[0].catch_up_fraction.is_none());
     node.shutdown().await.unwrap();
 }
 
@@ -157,6 +170,34 @@ impl ShutdownStore {
     }
 }
 impl KvStore for ShutdownStore {
+    fn bind(
+        &self,
+        _identity: &actordb::store::StoreIdentity,
+    ) -> Result<actordb::store::StoreBinding, actordb::store::StoreError> {
+        Ok(actordb::store::StoreBinding::unmanaged())
+    }
+
+    fn load_prefix(
+        &self,
+        prefix: &[u8],
+    ) -> Result<Vec<(Vec<u8>, actordb::actor::VersionedValue)>, actordb::store::StoreError> {
+        // This fixture owns a bounded in-memory dataset, not a production prefix scan.
+        Ok(self
+            .load()?
+            .into_iter()
+            .filter(|(key, _)| key.starts_with(prefix))
+            .collect())
+    }
+
+    fn commit_durability(&self) -> actordb::store::StoreCommitDurability {
+        actordb::store::StoreCommitDurability::Buffered
+    }
+
+    fn stable_fence(
+        &self,
+    ) -> Result<actordb::store::StoreCommitDurability, actordb::store::StoreError> {
+        Ok(self.commit_durability())
+    }
     fn load(&self) -> Result<Vec<(Vec<u8>, VersionedValue)>, StoreError> {
         Ok(Vec::new())
     }
@@ -203,12 +244,11 @@ async fn active_shutdown_stage_remains_observable_through_lock_ownership_and_can
         .await
         .unwrap();
     let status = node.status_snapshot();
-    assert_eq!(status.node_lifecycle, NodeLifecycle::Stopping);
+    assert_eq!(status.lifecycle, NodeLifecycle::Stopping);
     assert_eq!(
         status.shutdown_stage,
-        Some(actordb::node::status::ShutdownStage::QuiescingFragments)
+        actordb::node::status::ShutdownStage::QuiescingFragments
     );
-    assert!(!status.observation.shutdown_stage_unavailable);
     assert!(status.storage.active_jobs > 0);
     shutdown.abort();
     assert!(shutdown.await.unwrap_err().is_cancelled());
@@ -217,7 +257,7 @@ async fn active_shutdown_stage_remains_observable_through_lock_ownership_and_can
     node.shutdown().await.unwrap();
     assert_eq!(
         node.status_snapshot().shutdown_stage,
-        Some(actordb::node::status::ShutdownStage::Stopped)
+        actordb::node::status::ShutdownStage::Stopped
     );
 }
 
@@ -283,10 +323,7 @@ async fn startup_validation_failure_is_observable_and_cancel_after_handoff_is_in
     let node = startup.wait().await.unwrap();
     startup.cancel();
     assert!(!startup.snapshot().cancellation_requested);
-    assert_eq!(
-        node.status_snapshot().node_lifecycle,
-        NodeLifecycle::Serving
-    );
+    assert_eq!(node.status_snapshot().lifecycle, NodeLifecycle::Serving);
     node.shutdown().await.unwrap();
 }
 
@@ -331,12 +368,11 @@ async fn established_serving_boundary_survives_background_gain_and_fresh_learner
     let status = node.status_snapshot();
     assert!(status.initial_readiness_established);
     assert_eq!(status.readiness, Readiness::Ready);
-    assert_eq!(status.node_lifecycle, NodeLifecycle::Serving);
+    assert_eq!(status.lifecycle, NodeLifecycle::Serving);
     assert!(status.capacity_partial);
     assert_eq!(status.desired_local_fragments, 2);
     assert_eq!(status.available_fragments, Some(1));
     assert!(!status.fragments[1].serving);
-    assert!(status.fragments[1].catch_up_fraction.is_none());
     assert!(matches!(
         status.fragments[1].activity,
         FragmentActivity::Acquiring | FragmentActivity::Stalled
@@ -363,7 +399,7 @@ async fn established_serving_boundary_survives_background_gain_and_fresh_learner
     let status = learner.status_snapshot();
     assert!(!status.initial_readiness_established);
     assert_eq!(status.readiness, Readiness::NotReady);
-    assert_eq!(status.node_lifecycle, NodeLifecycle::Initializing);
+    assert_eq!(status.lifecycle, NodeLifecycle::Initializing);
     assert!(!status.fragments[0].serving);
     assert_eq!(status.fragments[0].missing_peers, &["offline"]);
     learner.shutdown().await.unwrap();

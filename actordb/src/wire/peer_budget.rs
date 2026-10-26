@@ -6,14 +6,14 @@ use std::sync::Arc;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError};
 use tokio::time::{timeout_at, Instant};
 
-use super::MAX_TRANSPORT_FRAME_BYTES as MAX_FRAME_BYTES;
+use super::MAX_FRAME_BYTES;
 
 pub(crate) const NODE_PEER_QUEUE_BYTE_CAPACITY: usize = 256 * 1024 * 1024;
 
 /// Approximate node-wide encoded peer-writer admission usage.
 ///
 /// Counts include reservations before encoding and bodies queued or currently
-/// being written, including process integrity headers. They exclude protobuf objects, length prefixes, allocator and
+/// being written. They exclude protobuf objects, length prefixes, allocator and
 /// task overhead, cache/storage/replication payloads, and kernel socket buffers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PeerWriterDiagnostics {

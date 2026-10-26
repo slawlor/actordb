@@ -235,9 +235,9 @@ async fn nonlocal_concern_requires_configured_replicas_before_application() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[tracing_test::traced_test]
 async fn forwarded_concern_accepts_replication_ack_on_the_same_peer_connection() {
-    use actordb::node::{REQUIRED_WIRE_CAPABILITIES, WIRE_PROTOCOL_VERSION};
-    use actordb::proto::{
-        Envelope, EnvelopeMsg, ForwardedPut, Hello, HelloAuth, ReplicationAckLevel,
+    use actordb::node::WIRE_PROTOCOL_VERSION;
+    use actordb_protocol::meta::{
+        envelope::Msg as EnvelopeMsg, Envelope, ForwardedPut, Hello, HelloAuth, ReplicationAckLevel,
     };
     use prost::Message;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -264,12 +264,9 @@ async fn forwarded_concern_accepts_replication_ack_on_the_same_peer_connection()
         Envelope {
             msg: Some(EnvelopeMsg::Hello(Hello {
                 node_id: plan.ids[1].clone(),
-                min_protocol_version: WIRE_PROTOCOL_VERSION,
-                max_protocol_version: WIRE_PROTOCOL_VERSION,
-                capabilities: REQUIRED_WIRE_CAPABILITIES,
+                protocol_version: WIRE_PROTOCOL_VERSION,
                 challenge: vec![1; 32],
                 process_generation: 0,
-                auth_tag: vec![],
             })),
         },
     )
@@ -312,7 +309,7 @@ async fn forwarded_concern_accepts_replication_ack_on_the_same_peer_connection()
                     for op in batch.ops {
                         summaries.insert(
                             op.key.clone(),
-                            actordb::proto::KeySummary {
+                            actordb_protocol::meta::KeySummary {
                                 content_digest: content_digest(&op.value, op.expires_at_ms),
                                 key: op.key,
                                 timestamp_ms: op.timestamp_ms,
@@ -326,12 +323,14 @@ async fn forwarded_concern_accepts_replication_ack_on_the_same_peer_connection()
                         send(
                             &mut peer,
                             Envelope {
-                                msg: Some(EnvelopeMsg::BatchAck(actordb::proto::BatchAck {
-                                    session_id: batch.session_id,
-                                    batch_seq: batch.batch_seq,
-                                    fragment: batch.fragment,
-                                    level: ReplicationAckLevel::Applied as i32,
-                                })),
+                                msg: Some(EnvelopeMsg::BatchAck(
+                                    actordb_protocol::meta::BatchAck {
+                                        session_id: batch.session_id,
+                                        batch_seq: batch.batch_seq,
+                                        fragment: batch.fragment,
+                                        level: ReplicationAckLevel::Applied as i32,
+                                    },
+                                )),
                             },
                         )
                         .await;
@@ -351,7 +350,7 @@ async fn forwarded_concern_accepts_replication_ack_on_the_same_peer_connection()
                         &mut peer,
                         Envelope {
                             msg: Some(EnvelopeMsg::ReconcileResponse(
-                                actordb::proto::ReconcileResponse {
+                                actordb_protocol::meta::ReconcileResponse {
                                     fragment: request.fragment,
                                     session_id: request.session_id,
                                     round_id: request.round_id,

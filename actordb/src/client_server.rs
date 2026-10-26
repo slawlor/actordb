@@ -9,9 +9,7 @@
 use crate::actor::{OpPriority, VersionedValue};
 use crate::network::{Acceptor, BoxStream, Network};
 use crate::node::{Node, NodeError, Table};
-use actordb_protocol::{
-    client as wire, CLIENT_CAPABILITIES, CLIENT_PROTOCOL_VERSION, MAX_FRAME_BYTES,
-};
+use actordb_protocol::{client as wire, CLIENT_PROTOCOL_VERSION, MAX_FRAME_BYTES};
 use prost::Message;
 use std::collections::HashSet;
 use std::net::SocketAddr;
@@ -22,13 +20,27 @@ use tokio::sync::{watch, Semaphore};
 use tokio::task::{JoinHandle, JoinSet};
 
 /// Resource limits and optional application credential. Never reuse a cluster key.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct ClientServerOptions {
     pub credential: Option<Vec<u8>>,
     pub max_connections: usize,
     pub max_in_flight_requests: usize,
     pub receive_bytes: usize,
     pub timeout: Duration,
+}
+impl std::fmt::Debug for ClientServerOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClientServerOptions")
+            .field(
+                "credential",
+                &self.credential.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("max_connections", &self.max_connections)
+            .field("max_in_flight_requests", &self.max_in_flight_requests)
+            .field("receive_bytes", &self.receive_bytes)
+            .field("timeout", &self.timeout)
+            .finish()
+    }
 }
 impl Default for ClientServerOptions {
     fn default() -> Self {
@@ -41,6 +53,7 @@ impl Default for ClientServerOptions {
         }
     }
 }
+
 /// Owned application listener. Drop requests cancellation; [`Self::shutdown`]
 /// additionally joins the listener and all application connection tasks.
 pub struct ClientServer {
@@ -205,9 +218,7 @@ async fn serve_connection(
         let server = wire::Hello {
             identity: node.id().into(),
             challenge,
-            min_version: CLIENT_PROTOCOL_VERSION,
-            max_version: CLIENT_PROTOCOL_VERSION,
-            capabilities: CLIENT_CAPABILITIES,
+            protocol_version: CLIENT_PROTOCOL_VERSION,
         };
         send(
             &mut stream,
@@ -245,13 +256,13 @@ async fn serve_connection(
             },
         )
         .await?;
-        Some(client.capabilities & server.capabilities)
+        Some(())
     };
     let completed = tokio::select! {
         _ = cancellation.changed() => None,
         result = tokio::time::timeout(options.timeout.min(Duration::from_secs(5)), handshake) => result.ok().flatten(),
     };
-    let Some(capabilities) = completed else {
+    let Some(()) = completed else {
         return;
     };
     loop {
@@ -300,45 +311,6 @@ async fn serve_connection(
         };
         if *cancellation.borrow() {
             return;
-        }
-        let optional_capability = match request.operation {
-            Some(wire::request::Operation::Put(ref put)) if put.write_concern.is_some() => {
-                actordb_protocol::CLIENT_CAPABILITY_WRITE_CONCERNS
-            }
-            Some(wire::request::Operation::Delete(ref delete))
-                if delete.write_concern.is_some() =>
-            {
-                actordb_protocol::CLIENT_CAPABILITY_WRITE_CONCERNS
-            }
-            Some(wire::request::Operation::Query(_)) => actordb_protocol::CLIENT_CAPABILITY_QUERY,
-            Some(wire::request::Operation::Scan(_)) => actordb_protocol::CLIENT_CAPABILITY_SCAN,
-            _ => 0,
-        };
-        if optional_capability & capabilities != optional_capability {
-            let response = wire::Response {
-                id: request.id,
-                error: Some(error(
-                    wire::ErrorCode::Unsupported,
-                    "operation capability was not negotiated",
-                )),
-                ..Default::default()
-            };
-            if !matches!(
-                tokio::time::timeout(
-                    options.timeout,
-                    send(
-                        &mut stream,
-                        wire::Frame {
-                            message: Some(wire::frame::Message::Response(response))
-                        }
-                    )
-                )
-                .await,
-                Ok(Some(()))
-            ) {
-                return;
-            }
-            continue;
         }
         let mutation = matches!(
             request.operation,
@@ -719,7 +691,6 @@ async fn dispatch(node: &Node, request: wire::Request) -> wire::Response {
                         worker_count: item.worker_count as u64,
                         worker_names: item.worker_names,
                         restarts: item.restarts,
-                        last_reaped: item.last_reaped as u64,
                         shed_high: item.shed_counts.0,
                         shed_default: item.shed_counts.1,
                         shed_background: item.shed_counts.2,
@@ -987,9 +958,7 @@ mod outcome_mapping_tests {
                 message: Some(wire::frame::Message::Hello(wire::Hello {
                     identity: "drain-client".into(),
                     challenge: vec![1; 32],
-                    min_version: CLIENT_PROTOCOL_VERSION,
-                    max_version: CLIENT_PROTOCOL_VERSION,
-                    capabilities: CLIENT_CAPABILITIES,
+                    protocol_version: CLIENT_PROTOCOL_VERSION,
                 })),
             },
         )
@@ -1130,5 +1099,37 @@ mod outcome_mapping_tests {
         drop(client);
         session.await.unwrap();
         node.finish_shutdown(DrainOptions::default()).await.unwrap();
+    }
+}
+
+#[cfg(test)]
+mod credential_debug_tests {
+    use super::*;
+
+    #[test]
+    fn client_server_options_debug_redacts_credentials_and_preserves_nonsecret_fields() {
+        let secret: Vec<u8> = (201..233).collect();
+        let options = ClientServerOptions {
+            credential: Some(secret.clone()),
+            max_connections: 17,
+            max_in_flight_requests: 3,
+            receive_bytes: 8192,
+            timeout: Duration::from_secs(7),
+        };
+        for output in [format!("{options:?}"), format!("{options:#?}")] {
+            assert!(output.contains("[REDACTED]"));
+            assert!(!output.contains("201") && !output.contains("232"));
+            assert!(!output.contains(&format!("{secret:?}")));
+            for field in [
+                "max_connections: 17",
+                "max_in_flight_requests: 3",
+                "receive_bytes: 8192",
+                "timeout: 7s",
+            ] {
+                assert!(output.contains(field), "missing nonsecret field {field}");
+            }
+        }
+        assert!(format!("{:?}", ClientServerOptions::default()).contains("credential: None"));
+        assert_eq!(options.credential.as_deref(), Some(secret.as_slice()));
     }
 }

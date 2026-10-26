@@ -240,6 +240,35 @@ mod tests {
     use std::time::Duration;
     struct OutageStore(std::sync::atomic::AtomicBool);
     impl crate::store::KvStore for OutageStore {
+        fn bind(
+            &self,
+            _identity: &crate::store::StoreIdentity,
+        ) -> Result<crate::store::StoreBinding, crate::store::StoreError> {
+            Ok(crate::store::StoreBinding::unmanaged())
+        }
+
+        fn load_prefix(
+            &self,
+            prefix: &[u8],
+        ) -> Result<Vec<(Vec<u8>, crate::actor::VersionedValue)>, crate::store::StoreError>
+        {
+            // This fixture owns a bounded in-memory dataset, not a production prefix scan.
+            Ok(self
+                .load()?
+                .into_iter()
+                .filter(|(key, _)| key.starts_with(prefix))
+                .collect())
+        }
+
+        fn commit_durability(&self) -> crate::store::StoreCommitDurability {
+            crate::store::StoreCommitDurability::Buffered
+        }
+
+        fn stable_fence(
+            &self,
+        ) -> Result<crate::store::StoreCommitDurability, crate::store::StoreError> {
+            Ok(self.commit_durability())
+        }
         fn load(&self) -> Result<Vec<(Vec<u8>, VersionedValue)>, crate::store::StoreError> {
             Ok(Vec::new())
         }

@@ -1004,7 +1004,7 @@ impl Node {
         };
         node_point(
             &ADMISSION_OPEN,
-            MetricValue::Gauge(u64::from(status.lifecycle.phase() == DrainPhase::Running)),
+            MetricValue::Gauge(u64::from(status.drain.phase() == DrainPhase::Running)),
         );
         node_point(
             &INITIAL_READY,
@@ -1027,11 +1027,11 @@ impl Node {
         }
         node_point(
             &ACTIVE_REQUESTS,
-            MetricValue::Gauge(status.lifecycle.active_requests() as u64),
+            MetricValue::Gauge(status.drain.active_requests() as u64),
         );
         node_point(
             &RECEIVE_APPLIES,
-            MetricValue::Gauge(status.lifecycle.active_replication_applies() as u64),
+            MetricValue::Gauge(status.drain.active_replication_applies() as u64),
         );
         node_point(
             &REQUEST_TIMEOUTS,
@@ -1039,7 +1039,7 @@ impl Node {
         );
         node_point(
             &LOCAL_FENCES_ACTIVE,
-            MetricValue::Gauge(status.lifecycle.active_persistence_fences() as u64),
+            MetricValue::Gauge(status.drain.active_persistence_fences() as u64),
         );
         node_point(
             &LOCAL_FENCES_COMPLETED,
@@ -1098,7 +1098,7 @@ impl Node {
                 status.queues.queued_forwarded_reads,
             ),
             (&FORWARDED_READ_SLOTS, status.queues.forwarded_read_slots),
-            (&AWAITING_RESPONSES, status.lifecycle.awaiting_responses()),
+            (&AWAITING_RESPONSES, status.drain.awaiting_responses()),
         ] {
             node_point(descriptor, MetricValue::Gauge(value as u64));
         }

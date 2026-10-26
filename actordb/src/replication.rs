@@ -6,7 +6,7 @@
 //! Phase 5: async sender/receiver replication.
 //!
 //! Replication moves off the write path. Per fragment, per replication
-//! peer, a `ReplicationSender` (the task spawned by `spawn_sender`) task owns a state machine:
+//! peer, a `ReplicationSender` (the task spawned by `spawn_bounded_sender`) task owns a state machine:
 //!
 //! ```text
 //!   Disconnected ──PeerConnected──▶ Connected ⇄ (batching, acks)
@@ -19,8 +19,8 @@
 //! - **Connected**: dequeued mutations (writes + tombstoned deletes)
 //!   accumulate in a bounded local buffer. A [`crate::node::Node`] feeds it
 //!   through separate bounded data/control lanes plus persistent coalesced
-//!   recovery signals. The public standalone constructors retain their
-//!   source-compatible unbounded command channel. The sender ships batches on
+//!   recovery signals. Standalone senders use those same bounded ingress
+//!   lanes. The sender ships batches on
 //!   a timer, keeps a bounded number of batches in flight, and drops acked
 //!   records. Each sender↔receiver pairing gets a fresh `session_id`; the
 //!   receiver discards batches from stale sessions.
@@ -48,10 +48,11 @@ use tokio::time::Instant;
 use crate::actor::{
     ApplyDurability, HlcClock, KvMessage, OpPriority, SnapshotSummary, VersionedValue,
 };
+use crate::network::PeerConnectionId;
 use crate::node::FragmentRouter;
 use crate::proto::{
-    Envelope, EnvelopeMsg, KeySummary, ReconcileFetch, ReconcileRequest, ReplicateBatch,
-    ReplicateOp as ProtoReplicateOp, ReplicationAckLevel, SessionStart, SyncEntry,
+    Envelope, EnvelopeMsg, KeySummary, ReconcileEntry, ReconcileFetch, ReconcileRequest,
+    ReplicateBatch, ReplicateOp as ProtoReplicateOp, ReplicationAckLevel, SessionStart,
 };
 use crate::retained::{ByteBudget, BytePermit};
 use crate::shard::FragmentId;
@@ -72,14 +73,12 @@ fn deadline_after(timeout: Duration) -> Instant {
     now.checked_add(timeout).unwrap_or(now)
 }
 
-type QueueFailureHandler = Arc<dyn Fn(mpsc::Sender<Vec<u8>>) + Send + Sync>;
+type QueueFailureHandler = Arc<dyn Fn(PeerConnectionId) + Send + Sync>;
 
 /// Runtime-only liveness policy for a replication sender.
 ///
-/// These settings live outside [`SenderConfig`] so existing exhaustive
-/// `SenderConfig` literals remain source-compatible. Use
-/// [`spawn_sender_with_options`] to override the defaults.
-/// The builder exposes only the existing public timeout policies, not the
+/// Use [`spawn_bounded_sender`] to choose this sender's liveness policy.
+/// The builder exposes public timeout policies, not the
 /// Node's internal ingress capacity or transport-failure callback.
 #[derive(Clone, bon::Builder)]
 pub struct SenderRuntimeOptions {
@@ -121,7 +120,7 @@ impl Default for SenderRuntimeOptions {
     }
 }
 
-/// Invalid sender configuration passed to [`spawn_sender_with_options`].
+/// Invalid sender configuration passed to [`spawn_bounded_sender`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum SenderOptionsError {
@@ -418,6 +417,9 @@ impl SenderConfig {
         if self.buffer_capacity == 0 {
             return Err(SenderOptionsError::ZeroBufferCapacity);
         }
+        if self.buffer_capacity > tokio::sync::Semaphore::MAX_PERMITS {
+            return Err(SenderOptionsError::BufferCapacityTooLarge);
+        }
         if self.consistency_interval.is_zero() {
             return Err(SenderOptionsError::ZeroConsistencyInterval);
         }
@@ -433,13 +435,6 @@ impl SenderConfig {
         }
         if now.checked_add(self.reconcile_timeout).is_none() {
             return Err(SenderOptionsError::ReconcileTimeoutTooLarge);
-        }
-        Ok(())
-    }
-
-    pub(crate) fn validate_node_ingress(&self) -> Result<(), SenderOptionsError> {
-        if self.buffer_capacity > tokio::sync::Semaphore::MAX_PERMITS {
-            return Err(SenderOptionsError::BufferCapacityTooLarge);
         }
         Ok(())
     }
@@ -462,14 +457,6 @@ impl SenderRetention {
             _aggregate: self.aggregate.reserve(bytes)?,
         })
     }
-    fn owned(&self, op: crate::actor::ReplicatedOp) -> Option<RetainedOp> {
-        let lease = self.reserve(retained_op_bytes(&op))?;
-        Some(RetainedOp {
-            op,
-            _lease: lease,
-            enqueued_at: None,
-        })
-    }
     fn borrowed(&self, op: &crate::actor::ReplicatedOp) -> Option<RetainedOp> {
         // Reserve before fanout clones a payload for this replica.
         let lease = self.reserve(retained_borrowed_op_bytes(op))?;
@@ -479,14 +466,6 @@ impl SenderRetention {
             enqueued_at: None,
         })
     }
-}
-fn retained_op_bytes(op: &crate::actor::ReplicatedOp) -> usize {
-    3usize.saturating_mul(
-        256usize
-            .saturating_add(op.key.capacity())
-            .saturating_add(op.value.node_id.capacity())
-            .saturating_add(op.value.value.capacity()),
-    )
 }
 fn retained_borrowed_op_bytes(op: &crate::actor::ReplicatedOp) -> usize {
     // Clones own only initialized data, not spare capacity of the caller.
@@ -546,7 +525,7 @@ fn retained_control_bytes(msg: &SenderMsg) -> usize {
             })),
         SenderMsg::ReconcileData { entries, .. } => entries
             .capacity()
-            .saturating_mul(std::mem::size_of::<SyncEntry>())
+            .saturating_mul(std::mem::size_of::<ReconcileEntry>())
             .saturating_add(entries.iter().fold(0usize, |bytes, s| {
                 bytes
                     .saturating_add(128)
@@ -560,17 +539,17 @@ fn retained_control_bytes(msg: &SenderMsg) -> usize {
     2usize.saturating_mul(256usize.saturating_add(owned))
 }
 
-/// Messages driving a `ReplicationSender` (the task spawned by `spawn_sender`).
+/// Messages driving a `ReplicationSender` (the task spawned by [`spawn_bounded_sender`]).
 pub enum SenderMsg {
     /// An already-applied mutation to replicate. Buffer-reset recovery reads
     /// the authoritative fragment snapshot, so callers must not enqueue an
     /// operation before its local merge has completed.
     Enqueue(crate::actor::ReplicatedOp),
     /// The peer (re)connected; start a new session on this channel.
-    PeerConnected { peer_tx: mpsc::Sender<Vec<u8>> },
+    PeerConnected { peer: ReplicationPeer },
     /// One peer connection dropped. Ignore it if a newer channel has already
     /// replaced it; otherwise retain the buffer for reconnect.
-    PeerDisconnected { peer_tx: mpsc::Sender<Vec<u8>> },
+    PeerDisconnected { connection_id: PeerConnectionId },
     /// The peer acked a batch after reaching the reported durability fence.
     Ack {
         session_id: u64,
@@ -608,7 +587,7 @@ pub enum SenderMsg {
         chunk_seq: u64,
         page_seq: u64,
         done: bool,
-        entries: Vec<SyncEntry>,
+        entries: Vec<ReconcileEntry>,
         connection_valid: oneshot::Sender<bool>,
     },
     /// Trigger an anti-entropy reconcile round now (if connected).
@@ -623,7 +602,7 @@ struct NodeSenderSignals {
     reconcile_generation: u64,
     drain: Option<NodeSenderDrainRequest>,
     peer_generation: u64,
-    peer: Option<NodeSenderPeer>,
+    peer: Option<ReplicationPeer>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -632,10 +611,65 @@ struct NodeSenderDrainRequest {
     required_ack_durability: ReplicationAckDurability,
 }
 
+/// One bounded standalone peer transport binding. Create once per physical
+/// connection and clone for duplicate notifications; replacing the connection
+/// creates a new identity even when the peer name remains unchanged.
+/// The embedding owns the output receiver and its transport byte budget.
 #[derive(Clone)]
-struct NodeSenderPeer {
-    tx: mpsc::Sender<Vec<u8>>,
-    budgeted: Option<BudgetedPeerTx>,
+pub struct ReplicationPeer {
+    transport: SenderTransport,
+}
+
+#[derive(Clone)]
+enum SenderTransport {
+    Standalone {
+        connection_id: PeerConnectionId,
+        tx: mpsc::Sender<Vec<u8>>,
+    },
+    NodeBudgeted(BudgetedPeerTx),
+}
+
+impl ReplicationPeer {
+    /// Bind a caller-owned bounded output queue to one fresh connection ID.
+    /// Reuse clones of this handle for all notifications about that connection.
+    ///
+    /// ```
+    /// use actordb::replication::{ReplicationPeer, SenderMsg};
+    /// let (output, _frames) = tokio::sync::mpsc::channel(8);
+    /// let peer = ReplicationPeer::new(output);
+    /// let _connected = SenderMsg::PeerConnected { peer: peer.clone() };
+    /// let _disconnected = SenderMsg::PeerDisconnected {
+    ///     connection_id: peer.connection_id(),
+    /// };
+    /// ```
+    pub fn new(tx: mpsc::Sender<Vec<u8>>) -> Self {
+        Self {
+            transport: SenderTransport::Standalone {
+                connection_id: PeerConnectionId::new(),
+                tx,
+            },
+        }
+    }
+    pub fn connection_id(&self) -> PeerConnectionId {
+        self.id().clone()
+    }
+    fn id(&self) -> &PeerConnectionId {
+        match &self.transport {
+            SenderTransport::Standalone { connection_id, .. } => connection_id,
+            SenderTransport::NodeBudgeted(peer) => &peer.connection_id,
+        }
+    }
+    fn from_budgeted(peer: BudgetedPeerTx) -> Self {
+        Self {
+            transport: SenderTransport::NodeBudgeted(peer),
+        }
+    }
+    fn node_transport(&self) -> Option<&BudgetedPeerTx> {
+        match &self.transport {
+            SenderTransport::NodeBudgeted(peer) => Some(peer),
+            SenderTransport::Standalone { .. } => None,
+        }
+    }
 }
 
 struct NodeSenderIngress {
@@ -643,6 +677,9 @@ struct NodeSenderIngress {
     reconciliation_result_budget: Arc<ByteBudget>,
     draining: StdMutex<bool>,
     pending_data: AtomicUsize,
+    shed_operations: AtomicU64,
+    reset_requests: AtomicU64,
+    recovery_active: std::sync::atomic::AtomicBool,
     issued_overflow_generation: AtomicU64,
     settled_overflow_generation: AtomicU64,
 }
@@ -657,6 +694,9 @@ impl Default for NodeSenderIngress {
             reconciliation_result_budget: ByteBudget::new(64 * 1024 * 1024),
             draining: StdMutex::new(false),
             pending_data: AtomicUsize::new(0),
+            shed_operations: AtomicU64::new(0),
+            reset_requests: AtomicU64::new(0),
+            recovery_active: std::sync::atomic::AtomicBool::new(false),
             issued_overflow_generation: AtomicU64::new(0),
             settled_overflow_generation: AtomicU64::new(0),
         }
@@ -674,7 +714,30 @@ pub enum SenderIngressError {
     Closed,
 }
 
-pub(crate) type NodeSenderSendError = SenderIngressError;
+/// Bounded standalone ingress observations for this sender's lifetime.
+/// Independent atomic/channel reads are approximate, not a transaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct SenderIngressDiagnostics {
+    /// Admitted mutations not yet incorporated into a published sender state.
+    /// This includes a dequeued item while its state publication is pending.
+    pub pending_operations: usize,
+    pub queued_controls: usize,
+    /// Payload charges across ingress, buffered operations, in-flight batches,
+    /// and admitted protocol controls; not allocator resident bytes.
+    pub retained_bytes: usize,
+    pub reconciliation_retained_bytes: usize,
+    /// Incoming applied-operation deltas shed at count or byte saturation.
+    /// Does not count all prior buffered deltas discarded by a snapshot reset.
+    /// Recovery reads their equal-or-newer authoritative LWW floors.
+    pub shed_operations: u64,
+    /// Requested snapshot resets, including control-payload saturation.
+    pub reset_requests: u64,
+    /// A requested reset has not obtained its correlated recovery ACK fence.
+    /// Can remain true after stop: stopping is not successful delivery.
+    pub recovery_pending: bool,
+    pub closed: bool,
+}
 
 /// Bounded standalone replication ingress with independent control signals.
 /// Locally merged mutations may be shed into visible snapshot reset recovery
@@ -684,7 +747,11 @@ pub struct BoundedSender {
     inner: NodeSender,
 }
 impl BoundedSender {
-    /// Enqueue an already-applied operation or protocol/lifecycle message.
+    /// Submit an already-applied operation or protocol/lifecycle message.
+    /// `Enqueue` returning `Ok` means bounded delta admission OR visible
+    /// snapshot-reset recovery, not delivery or a durability acknowledgement.
+    /// Saturated protocol controls return `Full` and must be retried or cause
+    /// the embedding to close that connection.
     pub fn send(&self, message: SenderMsg) -> Result<(), SenderIngressError> {
         self.inner.send(message)
     }
@@ -696,15 +763,31 @@ impl BoundedSender {
     pub fn reconciliation_retained_bytes(&self) -> usize {
         self.inner.ingress.reconciliation_result_budget.used()
     }
+    pub fn ingress_diagnostics(&self) -> SenderIngressDiagnostics {
+        let ingress = &self.inner.ingress;
+        SenderIngressDiagnostics {
+            pending_operations: ingress.pending_data.load(Ordering::Acquire),
+            queued_controls: self.inner.control_tx.max_capacity()
+                - self.inner.control_tx.capacity(),
+            retained_bytes: self.retained_bytes(),
+            reconciliation_retained_bytes: self.reconciliation_retained_bytes(),
+            shed_operations: ingress.shed_operations.load(Ordering::Relaxed),
+            reset_requests: ingress.reset_requests.load(Ordering::Relaxed),
+            recovery_pending: ingress.recovery_active.load(Ordering::Acquire)
+                || ingress.issued_overflow_generation.load(Ordering::Acquire)
+                    != ingress.settled_overflow_generation.load(Ordering::Acquire),
+            closed: self.inner.is_closed(),
+        }
+    }
     /// Close admission, stop the sender and release its owned queue permits.
+    /// This local cancellation does not certify remote delivery or durability.
     pub async fn stop(&self) {
         self.inner.stop().await;
     }
 }
 
 /// Spawn a standalone sender whose ingress and retained payloads are bounded.
-/// Use this constructor for sustained workloads; the legacy unbounded channel
-/// constructors bound only work already consumed by their sender task.
+/// Invalid count, byte, and timeout limits fail before spawning a task.
 pub fn spawn_bounded_sender(
     fragment: FragmentId,
     peer_id: String,
@@ -717,9 +800,7 @@ pub fn spawn_bounded_sender(
 
 /// Node-owned bounded ingress for one replication sender.
 ///
-/// The public standalone sender constructors intentionally keep returning
-/// their original unbounded Tokio sender for source compatibility. Nodes use
-/// this handle instead: locally applied mutations enter a bounded data lane,
+/// Locally applied mutations enter a bounded data lane,
 /// protocol responses enter a separate bounded control lane, and coalescible
 /// lifecycle/recovery signals remain available even when either lane is full.
 #[derive(Clone)]
@@ -761,19 +842,19 @@ impl NodeSender {
         self.control_tx.capacity()
     }
 
-    pub(crate) fn send(&self, msg: SenderMsg) -> Result<(), NodeSenderSendError> {
+    pub(crate) fn send(&self, msg: SenderMsg) -> Result<(), SenderIngressError> {
         if self.is_closed() {
-            return Err(NodeSenderSendError::Closed);
+            return Err(SenderIngressError::Closed);
         }
         match msg {
             SenderMsg::Enqueue(op) => self.send_data(op),
-            SenderMsg::PeerConnected { peer_tx } => self.set_peer(peer_tx, None),
-            SenderMsg::PeerDisconnected { peer_tx } => {
+            SenderMsg::PeerConnected { peer } => self.set_peer(peer),
+            SenderMsg::PeerDisconnected { connection_id } => {
                 self.signals_tx.send_if_modified(|signals| {
                     if !signals
                         .peer
                         .as_ref()
-                        .is_some_and(|current| current.tx.same_channel(&peer_tx))
+                        .is_some_and(|current| current.id() == &connection_id)
                     {
                         return false;
                     }
@@ -794,57 +875,42 @@ impl NodeSender {
     }
 
     /// Install a Node-owned transport together with its encoded-byte budget.
-    /// Standalone senders retain the legacy `PeerConnected` API and therefore
-    /// have no producer-side byte gate; every Node connection uses this path.
-    pub(crate) fn connect_peer(&self, peer: BudgetedPeerTx) -> Result<(), NodeSenderSendError> {
+    /// Standalone senders use `ReplicationPeer` bounded output handles and
+    /// caller-owned transport byte budgets; every Node connection uses this
+    /// fully byte-gated path.
+    pub(crate) fn connect_peer(&self, peer: BudgetedPeerTx) -> Result<(), SenderIngressError> {
         if self.is_closed() {
-            return Err(NodeSenderSendError::Closed);
+            return Err(SenderIngressError::Closed);
         }
-        self.set_peer(peer.identity.clone(), Some(peer))
+        self.set_peer(ReplicationPeer::from_budgeted(peer))
     }
 
-    fn set_peer(
-        &self,
-        peer_tx: mpsc::Sender<Vec<u8>>,
-        budgeted: Option<BudgetedPeerTx>,
-    ) -> Result<(), NodeSenderSendError> {
+    fn set_peer(&self, peer: ReplicationPeer) -> Result<(), SenderIngressError> {
         self.signals_tx.send_if_modified(|signals| {
             if let Some(current) = signals.peer.as_ref() {
-                if current.tx.same_channel(&peer_tx) {
-                    // Never let a legacy duplicate notification remove the
-                    // Node transport's hard producer-side byte gate.
-                    if budgeted.is_none()
-                        || current
-                            .budgeted
-                            .as_ref()
-                            .zip(budgeted.as_ref())
-                            .is_some_and(|(current, next)| current.same_channel(next))
-                    {
-                        return false;
-                    }
+                if current.id() == peer.id() {
+                    return false;
                 }
             }
             signals.peer_generation = next_generation(signals.peer_generation);
-            signals.peer = Some(NodeSenderPeer {
-                tx: peer_tx,
-                budgeted,
-            });
+            signals.peer = Some(peer);
             true
         });
         Ok(())
     }
 
-    fn send_data(&self, op: crate::actor::ReplicatedOp) -> Result<(), NodeSenderSendError> {
+    fn send_data(&self, op: crate::actor::ReplicatedOp) -> Result<(), SenderIngressError> {
         self.offer(&op)
     }
 
     /// Charge both sender and node byte allowances before cloning fanout data.
-    pub(crate) fn offer(&self, op: &crate::actor::ReplicatedOp) -> Result<(), NodeSenderSendError> {
+    pub(crate) fn offer(&self, op: &crate::actor::ReplicatedOp) -> Result<(), SenderIngressError> {
         let draining = self.ingress.draining.lock().unwrap();
         if *draining || self.is_closed() {
-            return Err(NodeSenderSendError::Closed);
+            return Err(SenderIngressError::Closed);
         }
         let Some(mut op) = self.ingress.retention.borrowed(op) else {
+            crate::node::observability::add_saturating(&self.ingress.shed_operations, 1);
             tracing::warn!(
                 retained_bytes = self.ingress.retention.local.used(),
                 aggregate_retained_bytes = self.ingress.retention.aggregate.used(),
@@ -862,19 +928,20 @@ impl NodeSender {
             Ok(()) => Ok(()),
             Err(mpsc::error::TrySendError::Full(_)) => {
                 self.ingress.pending_data.fetch_sub(1, Ordering::AcqRel);
+                crate::node::observability::add_saturating(&self.ingress.shed_operations, 1);
                 self.schedule_reset();
                 Ok(())
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
                 self.ingress.pending_data.fetch_sub(1, Ordering::AcqRel);
-                Err(NodeSenderSendError::Closed)
+                Err(SenderIngressError::Closed)
             }
         };
         drop(draining);
         result
     }
 
-    fn send_control(&self, control: SenderMsg) -> Result<(), NodeSenderSendError> {
+    fn send_control(&self, control: SenderMsg) -> Result<(), SenderIngressError> {
         self.send_control_retained(control, None)
     }
 
@@ -883,9 +950,9 @@ impl NodeSender {
         &self,
         control: SenderMsg,
         retention: Arc<dyn Send + Sync>,
-    ) -> Result<(), NodeSenderSendError> {
+    ) -> Result<(), SenderIngressError> {
         if self.is_closed() {
-            return Err(NodeSenderSendError::Closed);
+            return Err(SenderIngressError::Closed);
         }
         self.send_control_retained(control, Some(retention))
     }
@@ -894,14 +961,14 @@ impl NodeSender {
         &self,
         control: SenderMsg,
         apply_retention: Option<Arc<dyn Send + Sync>>,
-    ) -> Result<(), NodeSenderSendError> {
+    ) -> Result<(), SenderIngressError> {
         let Some(lease) = self
             .ingress
             .retention
             .reserve(retained_control_bytes(&control))
         else {
             self.schedule_reset();
-            return Err(NodeSenderSendError::Full);
+            return Err(SenderIngressError::Full);
         };
         match self.control_tx.try_send(RetainedControl {
             msg: control,
@@ -909,8 +976,8 @@ impl NodeSender {
             apply_retention,
         }) {
             Ok(()) => Ok(()),
-            Err(mpsc::error::TrySendError::Full(_)) => Err(NodeSenderSendError::Full),
-            Err(mpsc::error::TrySendError::Closed(_)) => Err(NodeSenderSendError::Closed),
+            Err(mpsc::error::TrySendError::Full(_)) => Err(SenderIngressError::Full),
+            Err(mpsc::error::TrySendError::Closed(_)) => Err(SenderIngressError::Closed),
         }
     }
 
@@ -919,6 +986,8 @@ impl NodeSender {
     }
 
     pub(crate) fn schedule_reset(&self) {
+        crate::node::observability::add_saturating(&self.ingress.reset_requests, 1);
+        self.ingress.recovery_active.store(true, Ordering::Release);
         self.signals_tx.send_modify(|signals| {
             signals.overflow_generation = next_generation(signals.overflow_generation);
             // `send_modify` notifies receivers only after this closure. Keep
@@ -935,7 +1004,7 @@ impl NodeSender {
     /// the configured receiver durability barrier. The generation is private
     /// to this exact sender task, so replacing a sender cannot satisfy an old
     /// shutdown fence.
-    pub(crate) fn request_drain(&self) -> Result<NodeSenderDrain, NodeSenderSendError> {
+    pub(crate) fn request_drain(&self) -> Result<NodeSenderDrain, SenderIngressError> {
         self.request_drain_at(self.configured_ack_durability)
     }
 
@@ -945,13 +1014,13 @@ impl NodeSender {
     pub(crate) fn request_drain_at(
         &self,
         required_ack_durability: ReplicationAckDurability,
-    ) -> Result<NodeSenderDrain, NodeSenderSendError> {
+    ) -> Result<NodeSenderDrain, SenderIngressError> {
         // Serialize with data try_send so every accepted item is either ahead
         // of this fence or rejected after it. The task consumes the admitted
         // lane before taking its authoritative reconciliation snapshot.
         let mut draining = self.ingress.draining.lock().unwrap();
         if self.is_closed() {
-            return Err(NodeSenderSendError::Closed);
+            return Err(SenderIngressError::Closed);
         }
         *draining = true;
         let mut generation = 0;
@@ -1005,112 +1074,105 @@ impl NodeSender {
                 break;
             }
         }
+        // A pre-poll abort still drops the captured exit guard. Its watch
+        // notification can precede the remaining captured inbox fields being
+        // dropped, so also wait for actual task teardown before returning.
+        while !self.abort.is_finished() {
+            tokio::task::yield_now().await;
+        }
     }
 }
 
 enum SenderInput {
-    Message(SenderMsg),
     Data(RetainedOp, Arc<NodeSenderIngress>),
     Control(RetainedControl),
     Overflow(u64, Arc<NodeSenderIngress>),
-    PeerChanged(Option<NodeSenderPeer>),
+    PeerChanged(Option<ReplicationPeer>),
     ReconcileNow,
     Drain(NodeSenderDrainRequest),
     Closed,
 }
 
-enum SenderInbox {
-    Legacy(mpsc::UnboundedReceiver<SenderMsg>),
-    Node {
-        data_rx: mpsc::Receiver<RetainedOp>,
-        control_rx: mpsc::Receiver<RetainedControl>,
-        signals_rx: watch::Receiver<NodeSenderSignals>,
-        delivered_overflow_generation: u64,
-        delivered_reconcile_generation: u64,
-        delivered_drain_generation: u64,
-        delivered_peer_generation: u64,
-        ingress: Arc<NodeSenderIngress>,
-    },
+struct SenderInbox {
+    data_rx: mpsc::Receiver<RetainedOp>,
+    control_rx: mpsc::Receiver<RetainedControl>,
+    signals_rx: watch::Receiver<NodeSenderSignals>,
+    delivered_overflow_generation: u64,
+    delivered_reconcile_generation: u64,
+    delivered_drain_generation: u64,
+    delivered_peer_generation: u64,
+    ingress: Arc<NodeSenderIngress>,
 }
 
 impl SenderInbox {
     fn settle_overflow_through(&mut self, generation: u64) {
-        if let Self::Node {
-            delivered_overflow_generation,
-            ..
-        } = self
-        {
-            *delivered_overflow_generation = generation;
-        }
+        self.delivered_overflow_generation = generation;
     }
 
     async fn recv(&mut self) -> SenderInput {
-        match self {
-            Self::Legacy(rx) => rx
-                .recv()
-                .await
-                .map(SenderInput::Message)
-                .unwrap_or(SenderInput::Closed),
-            Self::Node {
-                data_rx,
-                control_rx,
-                signals_rx,
-                delivered_overflow_generation,
-                delivered_reconcile_generation,
-                delivered_drain_generation,
-                delivered_peer_generation,
-                ingress,
-            } => loop {
-                // Compare and advance each latest-value field independently.
-                // An unrelated update must never erase an overflow reset that
-                // was observed but has not yet reached the state machine.
-                let signals = signals_rx.borrow().clone();
-                if signals.overflow_generation != *delivered_overflow_generation {
-                    *delivered_overflow_generation = signals.overflow_generation;
-                    return SenderInput::Overflow(signals.overflow_generation, ingress.clone());
-                }
-                if signals.peer_generation != *delivered_peer_generation {
-                    *delivered_peer_generation = signals.peer_generation;
-                    return SenderInput::PeerChanged(signals.peer);
-                }
-                if signals.reconcile_generation != *delivered_reconcile_generation {
-                    *delivered_reconcile_generation = signals.reconcile_generation;
-                    return SenderInput::ReconcileNow;
-                }
-                if let Some(drain) = signals
-                    .drain
-                    .filter(|drain| drain.generation != *delivered_drain_generation)
-                {
-                    *delivered_drain_generation = drain.generation;
-                    return SenderInput::Drain(drain);
-                }
-                tokio::select! {
-                    biased;
-                    changed = signals_rx.changed() => {
-                        if changed.is_err() {
-                            return SenderInput::Closed;
-                        }
-                    }
-                    control = control_rx.recv() => {
-                        return control
-                            .map(SenderInput::Control)
-                            .unwrap_or(SenderInput::Closed);
-                    }
-                    data = data_rx.recv() => {
-                        return data
-                            .map(|op| SenderInput::Data(op, ingress.clone()))
-                            .unwrap_or(SenderInput::Closed);
+        let Self {
+            data_rx,
+            control_rx,
+            signals_rx,
+            delivered_overflow_generation,
+            delivered_reconcile_generation,
+            delivered_drain_generation,
+            delivered_peer_generation,
+            ingress,
+        } = self;
+        loop {
+            // Compare and advance each latest-value field independently.
+            // An unrelated update must never erase an overflow reset that
+            // was observed but has not yet reached the state machine.
+            let signals = signals_rx.borrow().clone();
+            if signals.overflow_generation != *delivered_overflow_generation {
+                *delivered_overflow_generation = signals.overflow_generation;
+                return SenderInput::Overflow(signals.overflow_generation, ingress.clone());
+            }
+            if signals.peer_generation != *delivered_peer_generation {
+                *delivered_peer_generation = signals.peer_generation;
+                return SenderInput::PeerChanged(signals.peer);
+            }
+            if signals.reconcile_generation != *delivered_reconcile_generation {
+                *delivered_reconcile_generation = signals.reconcile_generation;
+                return SenderInput::ReconcileNow;
+            }
+            if let Some(drain) = signals
+                .drain
+                .filter(|drain| drain.generation != *delivered_drain_generation)
+            {
+                *delivered_drain_generation = drain.generation;
+                return SenderInput::Drain(drain);
+            }
+            tokio::select! {
+                biased;
+                changed = signals_rx.changed() => {
+                    if changed.is_err() {
+                        return SenderInput::Closed;
                     }
                 }
-            },
+                control = control_rx.recv() => {
+                    return control
+                        .map(SenderInput::Control)
+                        .unwrap_or(SenderInput::Closed);
+                }
+                data = data_rx.recv() => {
+                    return data
+                        .map(|op| SenderInput::Data(op, ingress.clone()))
+                        .unwrap_or(SenderInput::Closed);
+                }
+            }
         }
     }
 }
 
-struct NodeSenderTaskExit(watch::Sender<bool>);
+struct NodeSenderTaskExit(watch::Sender<bool>, Arc<NodeSenderIngress>);
 
 impl Drop for NodeSenderTaskExit {
     fn drop(&mut self) {
+        // The task can stop before queued data is selected. Dropping its
+        // inbox releases those payloads; they are no longer pending ingress.
+        self.1.pending_data.store(0, Ordering::Release);
         let _ = self.0.send(true);
     }
 }
@@ -1213,8 +1275,7 @@ impl ActiveConnection {
 
 #[derive(Clone)]
 struct SenderPeer {
-    tx: mpsc::Sender<Vec<u8>>,
-    budgeted: Option<BudgetedPeerTx>,
+    peer: ReplicationPeer,
     queue_admission_timeout: Duration,
     local_work_timeout: Duration,
     reconciliation_result_budget: Arc<ByteBudget>,
@@ -1223,17 +1284,9 @@ struct SenderPeer {
 }
 
 impl SenderPeer {
-    fn new(
-        tx: mpsc::Sender<Vec<u8>>,
-        budgeted: Option<BudgetedPeerTx>,
-        options: &SenderRuntimeOptions,
-    ) -> Self {
-        debug_assert!(budgeted
-            .as_ref()
-            .is_none_or(|peer| peer.identity.same_channel(&tx)));
+    fn new(peer: ReplicationPeer, options: &SenderRuntimeOptions) -> Self {
         Self {
-            tx,
-            budgeted,
+            peer,
             queue_admission_timeout: options.queue_admission_timeout,
             local_work_timeout: options.local_work_timeout,
             reconciliation_result_budget: options.reconciliation_result_budget.clone(),
@@ -1242,21 +1295,21 @@ impl SenderPeer {
         }
     }
 
-    fn same_channel(&self, other: &mpsc::Sender<Vec<u8>>) -> bool {
-        self.tx.same_channel(other)
+    fn same_connection(&self, other: &PeerConnectionId) -> bool {
+        self.peer.id() == other
     }
 
     fn report_failure(&self) {
         if let Some(handler) = &self.queue_failure_handler {
-            handler(self.tx.clone());
+            handler(self.peer.connection_id());
         }
     }
 
     fn must_disconnect_after_failure(&self) -> bool {
-        self.budgeted
-            .as_ref()
-            .map_or_else(|| self.tx.is_closed(), |peer| peer.tx.is_closed())
-            || self.queue_failure_handler.is_some()
+        (match &self.peer.transport {
+            SenderTransport::Standalone { tx, .. } => tx.is_closed(),
+            SenderTransport::NodeBudgeted(peer) => peer.tx.is_closed(),
+        }) || self.queue_failure_handler.is_some()
     }
 }
 
@@ -1483,58 +1536,6 @@ pub struct SenderDeps {
     pub state_report: Arc<Mutex<SenderStateReport>>,
 }
 
-/// Spawn a replication sender for (`fragment`, `peer_id`).
-///
-/// This standalone compatibility API returns an unbounded command sender.
-/// [`crate::node::Node`] uses an internal bounded ingress handle instead.
-///
-/// # Panics
-///
-/// Panics when `config` contains a zero or unrepresentable limit. Prefer
-/// [`spawn_sender_with_options`] when configuration errors must be handled.
-pub fn spawn_sender(
-    fragment: FragmentId,
-    peer_id: String,
-    config: SenderConfig,
-    deps: SenderDeps,
-) -> mpsc::UnboundedSender<SenderMsg> {
-    spawn_sender_with_options(
-        fragment,
-        peer_id,
-        config,
-        deps,
-        SenderRuntimeOptions::default(),
-    )
-    .expect("sender configuration must be valid")
-}
-
-/// Spawn a replication sender with explicit runtime liveness policy.
-///
-/// [`spawn_sender`] remains the source-compatible default entry point. This
-/// variant validates both `config` and `options` before spawning the task and
-/// retains the same unbounded command-channel return type.
-pub fn spawn_sender_with_options(
-    fragment: FragmentId,
-    peer_id: String,
-    config: SenderConfig,
-    deps: SenderDeps,
-    options: SenderRuntimeOptions,
-) -> Result<mpsc::UnboundedSender<SenderMsg>, SenderOptionsError> {
-    config.validate()?;
-    options.validate()?;
-    let (tx, rx) = mpsc::unbounded_channel();
-    tokio::spawn(sender_task(
-        fragment,
-        peer_id,
-        config,
-        deps,
-        options,
-        SenderInbox::Legacy(rx),
-        None,
-    ));
-    Ok(tx)
-}
-
 pub(crate) fn spawn_node_sender(
     fragment: FragmentId,
     peer_id: String,
@@ -1543,7 +1544,6 @@ pub(crate) fn spawn_node_sender(
     options: SenderRuntimeOptions,
 ) -> Result<NodeSender, SenderOptionsError> {
     config.validate()?;
-    config.validate_node_ingress()?;
     options.validate()?;
     let (data_tx, data_rx) = mpsc::channel(config.buffer_capacity);
     let (control_tx, control_rx) = mpsc::channel(options.control_channel_capacity);
@@ -1561,7 +1561,7 @@ pub(crate) fn spawn_node_sender(
     let configured_ack_durability = config.required_ack_durability;
     let observation_timing = options.observation_timing.clone();
     let task_ingress = ingress.clone();
-    let inbox = SenderInbox::Node {
+    let inbox = SenderInbox {
         data_rx,
         control_rx,
         signals_rx,
@@ -1571,8 +1571,9 @@ pub(crate) fn spawn_node_sender(
         delivered_peer_generation: 0,
         ingress: ingress.clone(),
     };
+    let task_exit = NodeSenderTaskExit(stopped_tx, task_ingress.clone());
     let task = tokio::spawn(async move {
-        let _exit = NodeSenderTaskExit(stopped_tx);
+        let _exit = task_exit;
         sender_task(
             fragment,
             peer_id,
@@ -1580,10 +1581,10 @@ pub(crate) fn spawn_node_sender(
             deps,
             options,
             inbox,
-            Some(NodeSenderDrainRuntime {
+            NodeSenderDrainRuntime {
                 completed: drain_completed_tx,
                 ingress: task_ingress,
-            }),
+            },
         )
         .await;
     });
@@ -1698,94 +1699,97 @@ async fn send_envelope(
         peer.report_failure();
         return false;
     }
-    if let Some(outbound) = &peer.budgeted {
-        let charged_len = encoded_len + outbound.frame_overhead;
-        let frame_permit =
-            match tokio::time::timeout_at(admission_deadline, outbound.tx.reserve()).await {
-                Ok(Ok(permit)) => permit,
-                Ok(Err(_)) | Err(_) => {
-                    peer.report_failure();
-                    return false;
-                }
-            };
-        let producer_byte_permit = match tokio::time::timeout_at(
-            admission_deadline,
-            outbound
-                .producer_byte_budget
-                .clone()
-                .acquire_many_owned(charged_len as u32),
-        )
-        .await
-        {
-            Ok(Ok(permit)) => permit,
-            Ok(Err(_)) | Err(_) => {
-                peer.report_failure();
-                return false;
-            }
-        };
-        let byte_permit = match tokio::time::timeout_at(
-            admission_deadline,
-            outbound
-                .byte_budget
-                .clone()
-                .acquire_many_owned(charged_len as u32),
-        )
-        .await
-        {
-            Ok(Ok(permit)) => permit,
-            Ok(Err(_)) | Err(_) => {
-                peer.report_failure();
-                return false;
-            }
-        };
-        let global_permits = match outbound
-            .acquire_global_producer(charged_len as u32, admission_deadline)
+    match &peer.peer.transport {
+        SenderTransport::NodeBudgeted(outbound) => {
+            let charged_len = encoded_len;
+            let frame_permit =
+                match tokio::time::timeout_at(admission_deadline, outbound.tx.reserve()).await {
+                    Ok(Ok(permit)) => permit,
+                    Ok(Err(_)) | Err(_) => {
+                        peer.report_failure();
+                        return false;
+                    }
+                };
+            let producer_byte_permit = match tokio::time::timeout_at(
+                admission_deadline,
+                outbound
+                    .producer_byte_budget
+                    .clone()
+                    .acquire_many_owned(charged_len as u32),
+            )
             .await
-        {
-            Ok(permits) => permits,
-            Err(()) => {
-                peer.report_failure();
-                return false;
-            }
-        };
-        if Instant::now() >= admission_deadline {
-            peer.report_failure();
-            return false;
-        }
-        let buf = match encode_envelope(&envelope) {
-            Ok(buf) => buf,
-            Err(error) => {
-                tracing::warn!(%error, "failed to encode preflighted outbound replication frame");
-                return false;
-            }
-        };
-        frame_permit.send(
-            BudgetedFrame::new_producer(buf, byte_permit, producer_byte_permit)
-                .with_global_permits(global_permits),
-        );
-        true
-    } else {
-        let frame_permit =
-            match tokio::time::timeout_at(admission_deadline, peer.tx.reserve()).await {
+            {
                 Ok(Ok(permit)) => permit,
                 Ok(Err(_)) | Err(_) => {
                     peer.report_failure();
                     return false;
                 }
             };
-        if Instant::now() >= admission_deadline {
-            peer.report_failure();
-            return false;
-        }
-        let buf = match encode_envelope(&envelope) {
-            Ok(buf) => buf,
-            Err(error) => {
-                tracing::warn!(%error, "failed to encode preflighted outbound replication frame");
+            let byte_permit = match tokio::time::timeout_at(
+                admission_deadline,
+                outbound
+                    .byte_budget
+                    .clone()
+                    .acquire_many_owned(charged_len as u32),
+            )
+            .await
+            {
+                Ok(Ok(permit)) => permit,
+                Ok(Err(_)) | Err(_) => {
+                    peer.report_failure();
+                    return false;
+                }
+            };
+            let global_permits = match outbound
+                .acquire_global_producer(charged_len as u32, admission_deadline)
+                .await
+            {
+                Ok(permits) => permits,
+                Err(()) => {
+                    peer.report_failure();
+                    return false;
+                }
+            };
+            if Instant::now() >= admission_deadline {
+                peer.report_failure();
                 return false;
             }
-        };
-        frame_permit.send(buf);
-        true
+            let buf = match encode_envelope(&envelope) {
+                Ok(buf) => buf,
+                Err(error) => {
+                    tracing::warn!(%error, "failed to encode preflighted outbound replication frame");
+                    return false;
+                }
+            };
+            frame_permit.send(
+                BudgetedFrame::new_producer(buf, byte_permit, producer_byte_permit)
+                    .with_global_permits(global_permits),
+            );
+            true
+        }
+        SenderTransport::Standalone { tx, .. } => {
+            let frame_permit = match tokio::time::timeout_at(admission_deadline, tx.reserve()).await
+            {
+                Ok(Ok(permit)) => permit,
+                Ok(Err(_)) | Err(_) => {
+                    peer.report_failure();
+                    return false;
+                }
+            };
+            if Instant::now() >= admission_deadline {
+                peer.report_failure();
+                return false;
+            }
+            let buf = match encode_envelope(&envelope) {
+                Ok(buf) => buf,
+                Err(error) => {
+                    tracing::warn!(%error, "failed to encode preflighted outbound replication frame");
+                    return false;
+                }
+            };
+            frame_permit.send(buf);
+            true
+        }
     }
 }
 
@@ -1796,17 +1800,11 @@ async fn sender_task(
     deps: SenderDeps,
     runtime: SenderRuntimeOptions,
     mut inbox: SenderInbox,
-    node_drain: Option<NodeSenderDrainRuntime>,
+    node_drain: NodeSenderDrainRuntime,
 ) {
     let mut delivery = DeliveryState::Streaming;
     let mut connection: Option<ActiveConnection> = None;
-    let retention = match &inbox {
-        SenderInbox::Node { ingress, .. } => ingress.retention.clone(),
-        SenderInbox::Legacy(_) => SenderRetention {
-            local: ByteBudget::new(config.retained_byte_capacity),
-            aggregate: runtime.aggregate_retention.clone(),
-        },
-    };
+    let retention = inbox.ingress.retention.clone();
     let mut buffer: VecDeque<RetainedOp> = VecDeque::new();
     // `interval()` ticks immediately once, which made the first batch race
     // sender startup instead of consistently observing `batch_interval`.
@@ -1852,9 +1850,7 @@ async fn sender_task(
             reconcile_credit_rx = None;
             reconcile_ticket = None;
         }
-        if let (Some(drain), Some(node_drain)) =
-            (drain_state.pending_preparation(), node_drain.as_ref())
-        {
+        if let Some(drain) = drain_state.pending_preparation() {
             let ingress = &node_drain.ingress;
             if ingress.pending_data.load(Ordering::Acquire) == 0 {
                 // The cache is the authoritative source for Drain. Once every
@@ -1924,12 +1920,7 @@ async fn sender_task(
                         .and_then(|connection| connection.in_flight.front())
                         .and_then(|batch| batch.ops.first())
                         .or_else(|| buffer.front());
-                    let pending_ingress = match &inbox {
-                        SenderInbox::Node { ingress, .. } => {
-                            ingress.pending_data.load(Ordering::Acquire) != 0
-                        }
-                        SenderInbox::Legacy(inbox) => !inbox.is_empty(),
-                    };
+                    let pending_ingress = inbox.ingress.pending_data.load(Ordering::Acquire) != 0;
                     let oldest_retained_operation_age = if !timing_enabled {
                         None
                     } else {
@@ -2025,16 +2016,7 @@ async fn sender_task(
                 let mut retained_enqueue = None;
                 let mut control_lease = None;
                 let mut apply_retention = None;
-                let mut byte_overflow = false;
-                let mut budgeted_peer = None;
                 let msg = match input {
-                    SenderInput::Message(msg) => {
-                        if !matches!(&msg, SenderMsg::Enqueue(_)) {
-                            control_lease = retention.reserve(retained_control_bytes(&msg));
-                            byte_overflow = control_lease.is_none();
-                        }
-                        Some(msg)
-                    },
                     SenderInput::Control(control) => {
                         control_lease = Some(control.lease);
                         apply_retention = control.apply_retention;
@@ -2050,12 +2032,11 @@ async fn sender_task(
                         None
                     }
                     SenderInput::PeerChanged(Some(peer)) => {
-                        budgeted_peer = peer.budgeted;
-                        Some(SenderMsg::PeerConnected { peer_tx: peer.tx })
+                        Some(SenderMsg::PeerConnected { peer })
                     }
                     SenderInput::PeerChanged(None) => connection.as_ref().map(|current| {
                         SenderMsg::PeerDisconnected {
-                            peer_tx: current.peer_tx.tx.clone(),
+                            connection_id: current.peer_tx.peer.connection_id(),
                         }
                     }),
                     SenderInput::ReconcileNow => Some(SenderMsg::ReconcileNow),
@@ -2065,16 +2046,13 @@ async fn sender_task(
                     }
                     SenderInput::Closed => break,
                 };
-                let msg = match msg {
-                    Some(SenderMsg::Enqueue(op)) => {
-                        retained_enqueue = retention.owned(op);
-                        byte_overflow = retained_enqueue.is_none();
-                        None
-                    }
-                    other => other,
-                };
                 let data_overflow = retained_enqueue.is_some() && buffer.len() >= config.buffer_capacity;
-                if overflow.is_some() || data_overflow || byte_overflow {
+                if data_overflow {
+                    crate::node::observability::add_saturating(&inbox.ingress.shed_operations, 1);
+                    crate::node::observability::add_saturating(&inbox.ingress.reset_requests, 1);
+                    inbox.ingress.recovery_active.store(true, Ordering::Release);
+                }
+                if overflow.is_some() || data_overflow {
                     if let Some(overflow) = overflow {
                         active_ingress_overflow = Some(overflow);
                     }
@@ -2159,16 +2137,11 @@ async fn sender_task(
                 let mut _control_lease = control_lease;
                 let Some(msg) = msg else { continue };
                 match msg {
-                    SenderMsg::Enqueue(op) => {
-                        // During reset these are post-snapshot deltas. If this
-                        // bounded deque fills, the common branch above advances
-                        // the reset epoch and takes a fresh snapshot.
-                        if let Some(op) = retention.owned(op) { buffer.push_back(op); }
-                    }
-                    SenderMsg::PeerConnected { peer_tx: tx } => {
+                    SenderMsg::Enqueue(_) => unreachable!("mutations use the bounded data lane"),
+                    SenderMsg::PeerConnected { peer } => {
                         if connection
                             .as_ref()
-                            .is_some_and(|current| current.peer_tx.same_channel(&tx))
+                            .is_some_and(|current| current.peer_tx.same_connection(peer.id()))
                         {
                             // Dynamic placement polls and duplicate
                             // notifications must not rotate live sessions.
@@ -2188,11 +2161,10 @@ async fn sender_task(
                         }
                         last_ack_durability = None;
                         ack_durability_mismatch = false;
-                        reconcile_credit_rx = budgeted_peer
-                            .as_ref()
+                        reconcile_credit_rx = peer.node_transport()
                             .map(BudgetedPeerTx::reconcile_change_receiver);
                         let mut conn = ActiveConnection {
-                            peer_tx: SenderPeer::new(tx, budgeted_peer, &runtime),
+                            peer_tx: SenderPeer::new(peer, &runtime),
                             session_id: rand_session_id(),
                             session_ready: false,
                             next_batch_seq: 0,
@@ -2222,7 +2194,8 @@ async fn sender_task(
                             DeliveryState::Reset { .. } => None,
                             DeliveryState::Streaming
                                 if retry_due
-                                    && (pause_new_streaming || buffer.is_empty()) =>
+                                    && buffer.is_empty()
+                                    && inbox.ingress.pending_data.load(Ordering::Acquire) == 0 =>
                             {
                                 reconcile_retry.map(|(_, purpose)| purpose)
                             }
@@ -2266,10 +2239,10 @@ async fn sender_task(
                         }
                         connection = Some(conn);
                     }
-                    SenderMsg::PeerDisconnected { peer_tx } => {
+                    SenderMsg::PeerDisconnected { connection_id } => {
                         if connection
                             .as_ref()
-                            .is_none_or(|current| !current.peer_tx.same_channel(&peer_tx))
+                            .is_none_or(|current| !current.peer_tx.same_connection(&connection_id))
                         {
                             continue;
                         }
@@ -2361,19 +2334,18 @@ async fn sender_task(
                                             // request_drain closed ingress.
                                             buffer.clear();
                                             drain_state.complete();
-                                            if let Some(node_drain) = node_drain.as_ref() {
-                                                let issued = node_drain
-                                                    .ingress
-                                                    .issued_overflow_generation
-                                                    .load(Ordering::Acquire);
-                                                node_drain
-                                                    .ingress
-                                                    .settled_overflow_generation
-                                                    .store(issued, Ordering::Release);
-                                                node_drain.completed.send_modify(|current| {
-                                                    *current = (*current).max(generation);
-                                                });
-                                            }
+                                            let issued = node_drain
+                                                .ingress
+                                                .issued_overflow_generation
+                                                .load(Ordering::Acquire);
+                                            node_drain
+                                                .ingress
+                                                .settled_overflow_generation
+                                                .store(issued, Ordering::Release);
+                                            node_drain.ingress.recovery_active.store(false, Ordering::Release);
+                                            node_drain.completed.send_modify(|current| {
+                                                *current = (*current).max(generation);
+                                            });
                                         }
                                     } else if let Some(conn) = connection.as_ref() {
                                         // Fetched winners or a concurrent
@@ -2509,6 +2481,7 @@ async fn sender_task(
                                             if epoch == completed_epoch && snapshot_is_current =>
                                         {
                                             delivery = DeliveryState::Streaming;
+                                            inbox.ingress.recovery_active.store(false, Ordering::Release);
                                             reconcile_rounds = reconcile_rounds.saturating_add(1);
                                             last_successful_reconcile_at = Some(std::time::SystemTime::now());
                                             if let Some((ingress, generation)) =
@@ -2650,12 +2623,21 @@ async fn sender_task(
                             && active_reconcile.is_none()
                         {
                             if let Some(conn) = connection.as_ref() {
-                                if !conn.session_ready || !conn.in_flight.is_empty() {
+                                if !conn.session_ready
+                                    || !conn.in_flight.is_empty()
+                                    || !buffer.is_empty()
+                                    || inbox.ingress.pending_data.load(Ordering::Acquire) != 0
+                                {
                                     reconcile_retry = Some((
                                         deadline_after(NACK_RETRY_DELAY),
                                         ReconcilePurpose::Routine,
                                     ));
-                                    pause_new_streaming = true;
+                                    // Coalesced peer changes may be selected
+                                    // before this request. Buffered replay or
+                                    // admitted ingress must stream and reach
+                                    // its ordinary ACK before routine repair.
+                                    pause_new_streaming = buffer.is_empty()
+                                        && inbox.ingress.pending_data.load(Ordering::Acquire) == 0;
                                     continue;
                                 }
                                 pause_new_streaming = false;
@@ -2695,7 +2677,8 @@ async fn sender_task(
                                 // the request.
                                 reconcile_retry =
                                     Some((Instant::now(), ReconcilePurpose::Routine));
-                                pause_new_streaming = true;
+                                pause_new_streaming = buffer.is_empty()
+                                    && inbox.ingress.pending_data.load(Ordering::Acquire) == 0;
                             }
                         }
                     }
@@ -3521,7 +3504,7 @@ async fn begin_reconcile(
     next_round_id: &mut u64,
     phase_timeout: Duration,
 ) -> Result<Option<ReconcileRound>, ()> {
-    let connection_permit = match connection.peer_tx.budgeted.as_ref() {
+    let connection_permit = match connection.peer_tx.peer.node_transport() {
         Some(peer) => match peer.try_acquire_reconcile(reconcile_ticket)? {
             Some(permit) => Some(permit),
             None => return Ok(None),
@@ -3711,7 +3694,7 @@ fn reconcile_summaries_are_well_formed(
 fn reconcile_entries_are_well_formed(
     fragment: FragmentId,
     router: &FragmentRouter,
-    entries: &[SyncEntry],
+    entries: &[ReconcileEntry],
     expected_keys: &HashSet<String>,
     received_keys: &HashSet<String>,
 ) -> bool {
@@ -4248,7 +4231,7 @@ async fn reconcile_summary_page(
 async fn apply_reconcile_entries(
     fragment: FragmentId,
     router: &FragmentRouter,
-    entries: Vec<SyncEntry>,
+    entries: Vec<ReconcileEntry>,
     timeout: Duration,
     retention: Option<Arc<dyn Send + Sync>>,
 ) -> Result<(), ReconcileError> {
@@ -4406,7 +4389,7 @@ mod tests {
             local: ByteBudget::new(64 * 1024 * 1024),
             aggregate: ByteBudget::new(256 * 1024 * 1024),
         }
-        .owned(op)
+        .borrowed(&op)
         .unwrap()
     }
 
@@ -4456,15 +4439,22 @@ mod tests {
         assert_eq!(sender.inner.data_tx.capacity(), 99);
         assert_eq!(sender.inner.signals_tx.borrow().overflow_generation, 1);
         assert_eq!(sender.inner.ingress.pending_data.load(Ordering::Acquire), 1);
+        let diagnostics = sender.ingress_diagnostics();
+        assert_eq!(diagnostics.pending_operations, 1);
+        assert_eq!(diagnostics.shed_operations, 1);
+        assert_eq!(diagnostics.reset_requests, 1);
+        assert_eq!(diagnostics.retained_bytes, charge);
+        assert!(diagnostics.recovery_pending);
         sender.stop().await;
         assert_eq!(sender.retained_bytes(), 0);
+        assert_eq!(sender.ingress_diagnostics().pending_operations, 0);
     }
 
     #[tokio::test]
     async fn retained_bytes_reset_before_count_saturation_and_release_on_stop() {
         let mut wide = op("wide");
         wide.value.value = vec![7; 128 * 1024];
-        let charge = retained_op_bytes(&wide);
+        let charge = retained_borrowed_op_bytes(&wide);
         let aggregate = ByteBudget::new(charge);
         let report = state_report();
         let sender = spawn_node_sender(
@@ -4516,14 +4506,14 @@ mod tests {
     #[test]
     fn retention_survives_inflight_retry_and_releases_only_after_ack_ownership() {
         let value = op("key");
-        let charge = retained_op_bytes(&value);
+        let charge = retained_borrowed_op_bytes(&value);
         let retention = SenderRetention {
             local: ByteBudget::new(charge),
             aggregate: ByteBudget::new(charge),
         };
         let mut batches = VecDeque::from([InflightBatch {
             batch_seq: 1,
-            ops: vec![retention.owned(value).unwrap()],
+            ops: vec![retention.borrowed(&value).unwrap()],
             kind: InflightKind::Streaming {
                 ack_deadline: Instant::now() + Duration::from_secs(1),
             },
@@ -4534,7 +4524,7 @@ mod tests {
         assert_eq!(retention.aggregate.used(), charge);
         let (tx, _rx) = mpsc::channel(1);
         let mut connection = ActiveConnection {
-            peer_tx: SenderPeer::new(tx, None, &SenderRuntimeOptions::default()),
+            peer_tx: SenderPeer::new(ReplicationPeer::new(tx), &SenderRuntimeOptions::default()),
             session_id: 1,
             session_ready: true,
             next_batch_seq: 2,
@@ -4587,12 +4577,12 @@ mod tests {
     }
 
     #[test]
-    fn owning_legacy_operations_charge_spare_capacity_but_fanout_clones_do_not() {
+    fn fanout_ingress_charges_cloned_payload_not_unretained_spare_capacity() {
         let mut value = op("key");
         value.value.value = Vec::with_capacity(4096);
         value.value.value.push(1);
         let copied = retained_borrowed_op_bytes(&value);
-        assert!(retained_op_bytes(&value) > copied);
+        assert!(value.value.value.capacity() > value.value.value.len());
         let retention = SenderRetention {
             local: ByteBudget::new(copied),
             aggregate: ByteBudget::new(copied),
@@ -4600,7 +4590,7 @@ mod tests {
         let clone = retention.borrowed(&value).unwrap();
         assert_eq!(clone.value.value.capacity(), 1);
         drop(clone);
-        assert!(retention.owned(value).is_none());
+        assert!(retention.borrowed(&value).is_some());
         assert_eq!(retention.local.used(), 0);
     }
 
@@ -4608,7 +4598,7 @@ mod tests {
     fn shared_sender_allowance_bounds_replica_fanout_before_cloning() {
         let mut value = op("wide");
         value.value.value = vec![9; 128 * 1024];
-        let charge = retained_op_bytes(&value);
+        let charge = retained_borrowed_op_bytes(&value);
         let aggregate = ByteBudget::new(charge);
         let first = SenderRetention {
             local: ByteBudget::new(charge * 2),
@@ -4850,7 +4840,10 @@ mod tests {
         let router = FragmentRouter::new(1, 0);
         let (peer_tx, mut peer_rx) = mpsc::channel(2);
         let connection = ActiveConnection {
-            peer_tx: SenderPeer::new(peer_tx, None, &SenderRuntimeOptions::default()),
+            peer_tx: SenderPeer::new(
+                ReplicationPeer::new(peer_tx),
+                &SenderRuntimeOptions::default(),
+            ),
             session_id: 1,
             session_ready: true,
             next_batch_seq: 0,
@@ -5000,8 +4993,9 @@ mod tests {
         let (_drain_completed_tx, drain_completed) = watch::channel(0u64);
         let (started_tx, started_rx) = oneshot::channel();
         let (finish_tx, finish_rx) = oneshot::channel();
+        let task_ingress = ingress.clone();
         let task = tokio::spawn(async move {
-            let _exit = NodeSenderTaskExit(stopped_tx);
+            let _exit = NodeSenderTaskExit(stopped_tx, task_ingress);
             let _ = started_tx.send(());
             let _ = finish_rx.await;
         });
@@ -5045,29 +5039,33 @@ mod tests {
                 batch_seq: 2,
                 durability: ReplicationAckDurability::MemoryApplied,
             }),
-            Err(NodeSenderSendError::Full)
+            Err(SenderIngressError::Full)
         );
 
         let (old_peer, _old_rx) = mpsc::channel(1);
+        let old_peer = ReplicationPeer::new(old_peer);
         let (new_peer, _new_rx) = mpsc::channel(1);
+        let new_peer = ReplicationPeer::new(new_peer);
         sender
             .send(SenderMsg::PeerConnected {
-                peer_tx: old_peer.clone(),
+                peer: old_peer.clone(),
             })
             .unwrap();
         sender
             .send(SenderMsg::PeerConnected {
-                peer_tx: new_peer.clone(),
+                peer: new_peer.clone(),
             })
             .unwrap();
         sender
-            .send(SenderMsg::PeerDisconnected { peer_tx: old_peer })
+            .send(SenderMsg::PeerDisconnected {
+                connection_id: old_peer.connection_id(),
+            })
             .unwrap();
         sender.send(SenderMsg::ReconcileNow).unwrap();
         let signals = signals_rx.borrow().clone();
         assert!(signals
             .peer
-            .is_some_and(|current| current.tx.same_channel(&new_peer)));
+            .is_some_and(|current| current.id() == new_peer.id()));
         assert_eq!(signals.reconcile_generation, 1);
 
         assert_eq!(data_rx.recv().await.unwrap().key, "queued");
@@ -5083,7 +5081,7 @@ mod tests {
         drop(data_rx);
         assert_eq!(
             sender.send_data(op("closed-data")),
-            Err(NodeSenderSendError::Closed)
+            Err(SenderIngressError::Closed)
         );
         assert_eq!(
             sender.ingress.pending_data.load(Ordering::Acquire),
@@ -5100,14 +5098,14 @@ mod tests {
                 batch_seq: 3,
                 durability: ReplicationAckDurability::MemoryApplied,
             }),
-            Err(NodeSenderSendError::Closed)
+            Err(SenderIngressError::Closed)
         );
         finish_tx.send(()).unwrap();
         task.await.unwrap();
         sender.stop().await;
         assert_eq!(
             sender.send(SenderMsg::ReconcileNow),
-            Err(NodeSenderSendError::Closed)
+            Err(SenderIngressError::Closed)
         );
     }
 
@@ -5120,8 +5118,9 @@ mod tests {
         let (stopped_tx, stopped) = watch::channel(false);
         let (_drain_completed_tx, drain_completed) = watch::channel(0u64);
         let (finish_tx, finish_rx) = oneshot::channel();
+        let task_ingress = ingress.clone();
         let task = tokio::spawn(async move {
-            let _exit = NodeSenderTaskExit(stopped_tx);
+            let _exit = NodeSenderTaskExit(stopped_tx, task_ingress);
             let _ = finish_rx.await;
         });
         let sender = NodeSender {
@@ -5149,7 +5148,10 @@ mod tests {
 
         let (peer_tx, mut peer_rx) = mpsc::channel(1);
         let mut connection = ActiveConnection {
-            peer_tx: SenderPeer::new(peer_tx, None, &SenderRuntimeOptions::default()),
+            peer_tx: SenderPeer::new(
+                ReplicationPeer::new(peer_tx),
+                &SenderRuntimeOptions::default(),
+            ),
             session_id: 7,
             session_ready: true,
             next_batch_seq: 0,
@@ -5227,7 +5229,10 @@ mod tests {
 
         let (peer_tx, mut peer_rx) = mpsc::channel(2);
         let connection = ActiveConnection {
-            peer_tx: SenderPeer::new(peer_tx, None, &SenderRuntimeOptions::default()),
+            peer_tx: SenderPeer::new(
+                ReplicationPeer::new(peer_tx),
+                &SenderRuntimeOptions::default(),
+            ),
             session_id: 41,
             session_ready: true,
             next_batch_seq: 0,
@@ -5291,8 +5296,10 @@ mod tests {
         let (signals_tx, signals_rx) = watch::channel(NodeSenderSignals::default());
         let ingress = Arc::new(NodeSenderIngress::default());
         let (first_peer, _first_peer_rx) = mpsc::channel(1);
+        let first_peer = ReplicationPeer::new(first_peer);
         let (latest_peer, _latest_peer_rx) = mpsc::channel(1);
-        let mut inbox = SenderInbox::Node {
+        let latest_peer = ReplicationPeer::new(latest_peer);
+        let mut inbox = SenderInbox {
             data_rx,
             control_rx,
             signals_rx,
@@ -5306,10 +5313,7 @@ mod tests {
         signals_tx.send_modify(|signals| {
             signals.overflow_generation = 1;
             signals.peer_generation = 1;
-            signals.peer = Some(NodeSenderPeer {
-                tx: first_peer,
-                budgeted: None,
-            });
+            signals.peer = Some(first_peer);
             signals.reconcile_generation = 1;
         });
         assert!(matches!(
@@ -5321,14 +5325,11 @@ mod tests {
         // still-undelivered reconcile generation from the prior snapshot.
         signals_tx.send_modify(|signals| {
             signals.peer_generation = 2;
-            signals.peer = Some(NodeSenderPeer {
-                tx: latest_peer.clone(),
-                budgeted: None,
-            });
+            signals.peer = Some(latest_peer.clone());
         });
         assert!(matches!(
             inbox.recv().await,
-            SenderInput::PeerChanged(Some(peer)) if peer.tx.same_channel(&latest_peer)
+            SenderInput::PeerChanged(Some(peer)) if peer.id() == latest_peer.id()
         ));
         assert!(matches!(
             tokio::time::timeout(Duration::from_secs(1), inbox.recv()).await,
@@ -5341,7 +5342,7 @@ mod tests {
         let (data_tx, data_rx) = mpsc::channel(1);
         let (control_tx, control_rx) = mpsc::channel(1);
         let (signals_tx, signals_rx) = watch::channel(NodeSenderSignals::default());
-        let mut inbox = SenderInbox::Node {
+        let mut inbox = SenderInbox {
             data_rx,
             control_rx,
             signals_rx,
@@ -5433,21 +5434,86 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn standalone_sender_api_remains_unbounded() {
-        fn assert_unbounded(_: &mpsc::UnboundedSender<SenderMsg>) {}
-        let sender = spawn_sender(
+    async fn standalone_sender_reports_owned_buffer_overflow_until_recovery_is_certified() {
+        let report = state_report();
+        let sender = spawn_bounded_sender(
+            FragmentId(0),
+            "peer".into(),
+            SenderConfig::builder().buffer_capacity(1).build(),
+            SenderDeps {
+                router: FragmentRouter::new(1, 0),
+                hlc: Arc::new(Mutex::new(HlcClock::new())),
+                state_report: report.clone(),
+            },
+            SenderRuntimeOptions::default(),
+        )
+        .unwrap();
+        sender.send(SenderMsg::Enqueue(op("buffered"))).unwrap();
+        wait_for_sender_report(&report, |state| state.buffered == 1).await;
+        assert_eq!(sender.ingress_diagnostics().reset_requests, 0);
+        sender.send(SenderMsg::Enqueue(op("overflow"))).unwrap();
+        wait_for_sender_report(&report, |state| state.state == "buffer_reset").await;
+        let diagnostics = sender.ingress_diagnostics();
+        assert_eq!(diagnostics.reset_requests, 1);
+        assert_eq!(diagnostics.shed_operations, 1);
+        assert!(diagnostics.recovery_pending);
+        assert_eq!(diagnostics.retained_bytes, 0);
+        sender.stop().await;
+        assert!(sender.ingress_diagnostics().recovery_pending);
+    }
+
+    #[tokio::test]
+    async fn standalone_sender_admission_is_bounded_and_controls_are_independent() {
+        let sender = spawn_bounded_sender(
             FragmentId(0),
             "peer".to_string(),
-            SenderConfig::default(),
+            SenderConfig::builder().buffer_capacity(1).build(),
             SenderDeps {
                 router: crate::node::FragmentRouter::new(1, 0),
                 hlc: Arc::new(Mutex::new(HlcClock::new())),
                 state_report: state_report(),
             },
+            SenderRuntimeOptions::default().with_control_channel_capacity(1),
+        )
+        .unwrap();
+        sender.send(SenderMsg::Enqueue(op("queued"))).unwrap();
+        sender.send(SenderMsg::Enqueue(op("overflow"))).unwrap();
+        sender
+            .send(SenderMsg::Ack {
+                session_id: 1,
+                batch_seq: 1,
+                durability: ReplicationAckDurability::MemoryApplied,
+            })
+            .unwrap();
+        assert_eq!(
+            sender.send(SenderMsg::Ack {
+                session_id: 1,
+                batch_seq: 2,
+                durability: ReplicationAckDurability::MemoryApplied,
+            }),
+            Err(SenderIngressError::Full)
         );
-        assert_unbounded(&sender);
-        drop(sender);
-        tokio::task::yield_now().await;
+        let diagnostics = sender.ingress_diagnostics();
+        assert_eq!(diagnostics.pending_operations, 1);
+        assert_eq!(diagnostics.queued_controls, 1);
+        assert_eq!(diagnostics.shed_operations, 1);
+        assert_eq!(diagnostics.reset_requests, 1);
+        assert!(diagnostics.recovery_pending);
+        assert!(!diagnostics.closed);
+        sender.stop().await;
+        let stopped = sender.ingress_diagnostics();
+        assert_eq!(stopped.pending_operations, 0);
+        assert_eq!(stopped.queued_controls, 0);
+        assert_eq!(stopped.retained_bytes, 0);
+        assert!(stopped.closed);
+        assert!(
+            stopped.recovery_pending,
+            "local stop cannot certify a reset"
+        );
+        assert_eq!(
+            sender.send(SenderMsg::Enqueue(op("after-stop"))),
+            Err(SenderIngressError::Closed)
+        );
     }
 
     #[test]
@@ -5483,7 +5549,7 @@ mod tests {
     fn batch_sequence_allocator_never_emits_reserved_repair_sentinel() {
         let (tx, _rx) = mpsc::channel(1);
         let mut connection = ActiveConnection {
-            peer_tx: SenderPeer::new(tx, None, &SenderRuntimeOptions::default()),
+            peer_tx: SenderPeer::new(ReplicationPeer::new(tx), &SenderRuntimeOptions::default()),
             session_id: 1,
             session_ready: true,
             next_batch_seq: u64::MAX - 1,
@@ -5570,13 +5636,12 @@ mod tests {
             .validate(),
             Err(SenderOptionsError::ZeroBufferCapacity)
         );
-        let legacy_unbounded_capacity = SenderConfig {
+        let oversized_capacity = SenderConfig {
             buffer_capacity: tokio::sync::Semaphore::MAX_PERMITS.saturating_add(1),
             ..SenderConfig::default()
         };
-        assert_eq!(legacy_unbounded_capacity.validate(), Ok(()));
         assert_eq!(
-            legacy_unbounded_capacity.validate_node_ingress(),
+            oversized_capacity.validate(),
             Err(SenderOptionsError::BufferCapacityTooLarge)
         );
         assert_eq!(
@@ -5632,7 +5697,7 @@ mod tests {
             .with_queue_failure_handler(Arc::new(move |_| {
                 observed.store(true, Ordering::SeqCst);
             }));
-        let peer = SenderPeer::new(tx, None, &options);
+        let peer = SenderPeer::new(ReplicationPeer::new(tx), &options);
         assert!(
             !send_envelope(
                 &peer,
@@ -5660,11 +5725,10 @@ mod tests {
         let encoded_len = Envelope { msg: Some(msg()) }.encoded_len();
         let (frame_tx, mut frame_rx) = mpsc::channel(4);
         let (response_tx, _response_rx) = mpsc::channel(4);
-        let (identity, _identity_rx) = mpsc::channel(1);
+        let identity = crate::network::PeerConnectionId::new();
         let budget = Arc::new(tokio::sync::Semaphore::new(encoded_len * 2));
         let producer_budget = Arc::new(tokio::sync::Semaphore::new(encoded_len * 2));
         let outbound = BudgetedPeerTx {
-            frame_overhead: 0,
             node_byte_budget: crate::wire::NodePeerByteBudget::new(
                 crate::wire::NODE_PEER_QUEUE_BYTE_CAPACITY,
             ),
@@ -5673,12 +5737,12 @@ mod tests {
             byte_budget: budget.clone(),
             producer_byte_budget: producer_budget,
             reconcile_gate: crate::wire::ReconcileGate::new(),
-            identity: identity.clone(),
+            connection_id: identity.clone(),
         };
         let options =
             SenderRuntimeOptions::default().with_queue_admission_timeout(Duration::from_millis(10));
-        let first = SenderPeer::new(identity.clone(), Some(outbound.clone()), &options);
-        let second = SenderPeer::new(identity, Some(outbound), &options);
+        let first = SenderPeer::new(ReplicationPeer::from_budgeted(outbound.clone()), &options);
+        let second = SenderPeer::new(ReplicationPeer::from_budgeted(outbound), &options);
 
         assert!(send_envelope(&first, None, msg()).await);
         assert!(send_envelope(&second, None, msg()).await);
@@ -5693,7 +5757,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn replication_peers_share_aggregate_encoded_body_admission() {
-        let physical_max = crate::wire::MAX_TRANSPORT_FRAME_BYTES;
+        let physical_max = crate::wire::MAX_FRAME_BYTES;
         let budget = crate::wire::NodePeerByteBudget::new(2 * physical_max);
         let msg = EnvelopeMsg::SessionStart(SessionStart {
             session_id: 7,
@@ -5713,19 +5777,21 @@ mod tests {
         let make_peer = || {
             let (tx, rx) = mpsc::channel(4);
             let (response_tx, _response_rx) = mpsc::channel(4);
-            let (identity, _identity_rx) = mpsc::channel(1);
+            let identity = crate::network::PeerConnectionId::new();
             let outbound = BudgetedPeerTx {
-                frame_overhead: 0,
                 tx,
                 response_tx,
-                identity: identity.clone(),
+                connection_id: identity.clone(),
                 byte_budget: Arc::new(tokio::sync::Semaphore::new(4096)),
                 producer_byte_budget: Arc::new(tokio::sync::Semaphore::new(4096)),
                 node_byte_budget: budget.clone(),
                 reconcile_gate: crate::wire::ReconcileGate::new(),
             };
             (
-                SenderPeer::new(identity, Some(outbound), &SenderRuntimeOptions::default()),
+                SenderPeer::new(
+                    ReplicationPeer::from_budgeted(outbound),
+                    &SenderRuntimeOptions::default(),
+                ),
                 rx,
             )
         };
@@ -5752,10 +5818,9 @@ mod tests {
     async fn node_reconciliation_rounds_share_one_connection_credit() {
         let (frame_tx, mut frame_rx) = mpsc::channel(4);
         let (response_tx, _response_rx) = mpsc::channel(4);
-        let (identity, _identity_rx) = mpsc::channel(1);
+        let identity = crate::network::PeerConnectionId::new();
         let reconcile_gate = crate::wire::ReconcileGate::new();
         let outbound = BudgetedPeerTx {
-            frame_overhead: 0,
             node_byte_budget: crate::wire::NodePeerByteBudget::new(
                 crate::wire::NODE_PEER_QUEUE_BYTE_CAPACITY,
             ),
@@ -5764,9 +5829,12 @@ mod tests {
             byte_budget: Arc::new(tokio::sync::Semaphore::new(4096)),
             producer_byte_budget: Arc::new(tokio::sync::Semaphore::new(4096)),
             reconcile_gate: reconcile_gate.clone(),
-            identity: identity.clone(),
+            connection_id: identity.clone(),
         };
-        let peer = SenderPeer::new(identity, Some(outbound), &SenderRuntimeOptions::default());
+        let peer = SenderPeer::new(
+            ReplicationPeer::from_budgeted(outbound),
+            &SenderRuntimeOptions::default(),
+        );
         let connection = ActiveConnection {
             peer_tx: peer,
             session_id: 7,
@@ -5859,7 +5927,7 @@ mod tests {
     #[tokio::test]
     async fn live_overflow_handles_reset_reconcile_admission_failure() {
         let report = state_report();
-        let sender = spawn_sender_with_options(
+        let sender = spawn_bounded_sender(
             FragmentId(0),
             "peer".to_string(),
             SenderConfig {
@@ -5877,7 +5945,11 @@ mod tests {
         )
         .unwrap();
         let (peer_tx, mut peer_rx) = mpsc::channel(1);
-        sender.send(SenderMsg::PeerConnected { peer_tx }).unwrap();
+        sender
+            .send(SenderMsg::PeerConnected {
+                peer: ReplicationPeer::new(peer_tx),
+            })
+            .unwrap();
         wait_for_sender_report(&report, |state| state.state == "connected").await;
         peer_rx.recv().await.expect("initial SessionStart missing");
 
@@ -5898,7 +5970,7 @@ mod tests {
     #[tokio::test]
     async fn live_overflow_handles_reset_session_start_admission_failure() {
         let report = state_report();
-        let sender = spawn_sender_with_options(
+        let sender = spawn_bounded_sender(
             FragmentId(0),
             "peer".to_string(),
             SenderConfig {
@@ -5916,7 +5988,11 @@ mod tests {
         )
         .unwrap();
         let (peer_tx, mut peer_rx) = mpsc::channel(1);
-        sender.send(SenderMsg::PeerConnected { peer_tx }).unwrap();
+        sender
+            .send(SenderMsg::PeerConnected {
+                peer: ReplicationPeer::new(peer_tx),
+            })
+            .unwrap();
         let connected = wait_for_sender_report(&report, |state| state.state == "connected").await;
 
         // Leave the initial SessionStart queued so the reset SessionStart
@@ -5938,7 +6014,7 @@ mod tests {
     #[tokio::test]
     async fn expired_replication_deadline_never_admits_to_an_empty_queue() {
         let (tx, mut rx) = mpsc::channel(1);
-        let peer = SenderPeer::new(tx, None, &SenderRuntimeOptions::default());
+        let peer = SenderPeer::new(ReplicationPeer::new(tx), &SenderRuntimeOptions::default());
         let expired = Instant::now();
         tokio::task::yield_now().await;
         assert!(

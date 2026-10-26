@@ -7,9 +7,7 @@ fn hello(identity: &str, byte: u8) -> wire::Hello {
     wire::Hello {
         identity: identity.into(),
         challenge: vec![byte; 32],
-        min_version: 1,
-        max_version: 1,
-        capabilities: 3,
+        protocol_version: CLIENT_PROTOCOL_VERSION,
     }
 }
 #[test]
@@ -20,11 +18,11 @@ fn application_auth_golden_vectors_bind_roles_identity_version_and_challenges() 
     let proof = client_auth_proof(&secret, true, &client, &server);
     assert_eq!(
         hex(&proof),
-        "9366c3660b9ae79b4370fa7d2eb7483afa6c5e6417f61ef837f95b516b5bcc3f"
+        "c00a9f4b19cbf8856f4a07a5f899384ca74b7393715af791be490ee6997d8d57"
     );
     assert_eq!(
         hex(&client_auth_proof(&secret, false, &client, &server)),
-        "ae8a58f928ad17db176af16d217c47f59138e57fde760480c778f61ddcb46075"
+        "39db2a7f94cdcafe9ae0c091b7060def0e7106d1c6e88c0b44f322955173d05a"
     );
     assert!(verify_client_auth(
         Some(&secret),
@@ -61,6 +59,25 @@ fn application_auth_golden_vectors_bind_roles_identity_version_and_challenges() 
         &server,
         &proof[..31]
     ));
+    let mut changed_version = client.clone();
+    changed_version.protocol_version += 1;
+    assert!(!verify_client_auth(
+        Some(&secret),
+        true,
+        &changed_version,
+        &server,
+        &proof
+    ));
+}
+
+#[test]
+fn application_hello_requires_the_exact_current_version() {
+    let mut current = hello("client", 1);
+    assert!(valid_client_hello(&current));
+    for version in (0..CLIENT_PROTOCOL_VERSION).chain([CLIENT_PROTOCOL_VERSION + 1]) {
+        current.protocol_version = version;
+        assert!(!valid_client_hello(&current));
+    }
 }
 #[test]
 fn application_get_golden_frame_and_unknown_fields() {

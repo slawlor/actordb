@@ -221,8 +221,9 @@ pub(super) fn cancel_connection_relays(
         let ids: Vec<_> = reads
             .iter()
             .filter_map(|(id, relay)| {
-                (relay.origin_tx.same_channel(channel) || relay.expected_tx.same_channel(channel))
-                    .then_some(*id)
+                (relay.origin_tx.same_connection(channel)
+                    || relay.expected_tx.same_connection(channel))
+                .then_some(*id)
             })
             .collect();
         ids.into_iter()
@@ -235,8 +236,9 @@ pub(super) fn cancel_connection_relays(
         let ids: Vec<_> = mutations
             .iter()
             .filter_map(|(id, relay)| {
-                (relay.origin_tx.same_channel(channel) || relay.expected_tx.same_channel(channel))
-                    .then_some(*id)
+                (relay.origin_tx.same_connection(channel)
+                    || relay.expected_tx.same_connection(channel))
+                .then_some(*id)
             })
             .collect();
         ids.into_iter()

@@ -124,8 +124,14 @@ impl KvStore for PrefixedStore {
     }
 
     fn load(&self) -> Result<Vec<(Vec<u8>, VersionedValue)>, StoreError> {
+        self.load_prefix(&[])
+    }
+
+    fn load_prefix(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, VersionedValue)>, StoreError> {
+        let mut physical_prefix = self.prefix.to_vec();
+        physical_prefix.extend_from_slice(prefix);
         let mut out = Vec::new();
-        for (key, value) in self.inner.load_prefix(&self.prefix)? {
+        for (key, value) in self.inner.load_prefix(&physical_prefix)? {
             if let Some(stripped) = key.strip_prefix(self.prefix.as_slice()) {
                 out.push((stripped.to_vec(), value));
             }
@@ -180,6 +186,19 @@ mod tests {
             written: std::sync::Mutex<Vec<(Vec<u8>, VersionedValue)>>,
         }
         impl KvStore for Rec {
+            fn bind(&self, _: &StoreIdentity) -> Result<StoreBinding, StoreError> {
+                Ok(StoreBinding::unmanaged())
+            }
+            fn load_prefix(
+                &self,
+                prefix: &[u8],
+            ) -> Result<Vec<(Vec<u8>, VersionedValue)>, StoreError> {
+                Ok(self
+                    .load()?
+                    .into_iter()
+                    .filter(|(key, _)| key.starts_with(prefix))
+                    .collect())
+            }
             fn load(&self) -> Result<Vec<(Vec<u8>, VersionedValue)>, StoreError> {
                 Ok(self.written.lock().unwrap().clone())
             }
@@ -255,6 +274,15 @@ mod tests {
             written: Mutex<Vec<(Vec<u8>, VersionedValue)>>,
         }
         impl KvStore for Rec {
+            fn bind(&self, _: &StoreIdentity) -> Result<StoreBinding, StoreError> {
+                Ok(StoreBinding::unmanaged())
+            }
+            fn commit_durability(&self) -> StoreCommitDurability {
+                StoreCommitDurability::Buffered
+            }
+            fn stable_fence(&self) -> Result<StoreCommitDurability, StoreError> {
+                Ok(StoreCommitDurability::Buffered)
+            }
             fn load(&self) -> Result<Vec<(Vec<u8>, VersionedValue)>, StoreError> {
                 Ok(self.written.lock().unwrap().clone())
             }

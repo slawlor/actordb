@@ -1,37 +1,34 @@
-# Physical/logical version migration
+# Current record and deployment versions
 
-The 0.8 release line uses peer protocol **5**, application protocol **3**, and
-RocksDB data format **2**. Update every peer and application client together
-when migrating from older protocol versions; they are rejected during
-negotiation. The current crate version is 0.9.0. Generation-zero defaults retain
-their wire meaning; enabled process authority uses negotiated per-frame
-signatures. Rust schema/actor extensions and stronger drain defaults require
-the new minor version. See [lifecycle support migration](support-api-migration.md).
+ActorDB `0.9.0` supports fresh deployments only: exact peer protocol **6**,
+application protocol **4**, RocksDB record/manifest format **3**, checkpoint
+**ACTCP003** and membership journal **ACTMEM04**. Deploy matching participants
+and use fresh data directories. There is no old-format reader, manifest adoption,
+wire fallback or automatic record conversion.
 
-Logical table views are namespaced within one node and reuse its peer listener.
-Every operation selects a named table; each table uses independent cache,
-flush, and iteration partitions over the shared durable backend. Physical keys
-retain a deterministic table namespace, while fragment routing hashes only the
-unqualified user key so equal keys co-partition across tables.
+Non-current data and wire versions fail closed. Existing source data must be
+handled through a separately planned application export/re-ingestion workflow;
+do not remove validation metadata or overwrite a source deployment.
 
-Record order is `(timestamp_ms, logical_counter, node_id, is_tombstone)`.
-`timestamp_ms` is physical Unix time. The counter orders same-time events without
-turning event rate into future skew. TTL continues to use `expires_at_ms` against
-wall time. Compare `VersionedValue::version()` or SDK `Value::version()`, followed
-by writer identity; comparing physical milliseconds alone is insufficient.
+## Record ordering
 
-`HlcClock::tick()` returns `Result<RecordVersion, ClockError>`. New records can use
-`VersionedValue::new_version` and `tombstone_version`; existing constructors
-accept physical timestamps and set counter zero. Custom producers must ensure
-unique versions per writer. Include `logical_counter` in full record literals.
+Records are ordered by `(timestamp_ms, logical_counter, node_id, is_tombstone)`.
+Physical time is Unix milliseconds; the logical counter orders events at the
+same physical time without turning write rate into future clock skew. TTL uses
+`expires_at_ms` against wall time.
 
-RocksDB opens valid format-1 manifests, validates their records, and synchronously
-upgrades the manifest before any format-2 writes. Legacy records decode with
-counter zero and coexist with new records. New records use a versioned flag byte
-and an eight-byte logical counter before the writer ID. Older binaries reject
-the upgraded manifest. Back up the database before upgrading; rollback requires
-restoring that backup. Corrupt or unknown formats are rejected without repair.
+Compare complete `RecordVersion` values followed by writer identity and the
+tombstone tie-breaker. Physical milliseconds alone do not establish order.
+`HlcClock::tick()` is fallible. Construct versioned values from explicit complete
+versions; producers are responsible for uniqueness per writer.
 
-Expiry event IDs use the v2 hash domain and include both timestamp components.
-Applications must migrate persisted deduplication state and compare complete
-versions before clearing newer state. Callback delivery remains best effort.
+## Tables and recovery
+
+Each operation names a logical table. Tables share a Node listener and backend,
+but their cache, flush and iteration namespaces are isolated. Routing hashes the
+unqualified key so equal keys co-partition across tables.
+
+Current checkpoint import preserves full versions, writer provenance, table
+namespaces, expiry and tombstones. Stable target floors and readiness evidence
+are distinct from writer authority. See [fresh deployment](support-api-migration.md)
+and [stable checkpoints](stable-checkpoints.md).

@@ -12,7 +12,7 @@ Routing is three deterministic steps, computed locally on every node:
 2. **Fragment → replicas**: looked up in the placement map —
    `HashMap<FragmentId, Vec<String>>` mapping each fragment to its replica node
    ids. In static mode this is `NodeConfig.fragment_map` (empty = this node
-   serves all fragments, i.e. single-node / legacy full replication).
+   serves all fragments, i.e. single-node / full replication).
 3. **Replica preference**: `replica_order(frag)` — this node first *if it
    currently serves the fragment*, then the other replicas in map order.
 
@@ -28,7 +28,7 @@ reports the exact LWW apply outcome (see [Consistency](consistency.md)).
 
 With no `placement_controller` configured, each node routes by its
 `fragment_map`. The map must be **identical on every node**. After the
-protocol-v3 handshake, static mode uses the same correlated, byte-bounded
+protocol-6 handshake, static mode uses the same correlated, byte-bounded
 reconciliation engine as dynamic placement so a late joiner or restarted node
 catches up (see [Replication](replication.md)).
 
@@ -61,7 +61,7 @@ Two implementations ship with the crate:
 
 - **`StaticPlacement`** — wraps a fixed map; exists so the dynamic code path
   shares validation logic. Nodes without an explicit controller keep static
-  routing/lifecycle while sharing the protocol-v3 reconciliation path.
+  routing/lifecycle while sharing the protocol-6 reconciliation path.
 - **`ManualPlacement`** — an `RwLock`-guarded map with `set_placement(map)` /
   `placement()`. Publishing a new map takes effect on the driver's next poll.
   There is no `move_fragment` helper: moves are expressed as full-map
@@ -174,9 +174,8 @@ hop-limited (`MAX_FORWARD_HOPS = 4`, never bounced back to the sender, never
 to self) instead of dropping it. Mutation relays mint a collision-free local
 request id, validate the downstream peer, restore the upstream id, and return
 `Unavailable` on no route, hop exhaustion, admission exhaustion, send failure,
-or the 5-second relay deadline. The Phase 5 reconciler owns anti-entropy in both dynamic and static
-mode. The retired `SyncResponse` compatibility counter,
-`sync_entries_applied()`, remains zero.
+or the 5-second relay deadline. The current reconciler owns anti-entropy in both
+dynamic and static placement; no alternative full-sync engine is retained.
 
 ## `placement_report()`
 

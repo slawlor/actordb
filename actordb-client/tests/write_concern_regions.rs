@@ -8,7 +8,7 @@ use actordb::replication::SenderConfig;
 use actordb::shard::FragmentId;
 use actordb_client::{Client, ClientOptions, WriteConcernClientError, WriteConcernOptions};
 use actordb_protocol::write_concern::{WriteConcernOutcome, WriteConcernReceipt};
-use actordb_protocol::{client as wire, CLIENT_CAPABILITIES, CLIENT_PROTOCOL_VERSION};
+use actordb_protocol::{client as wire, CLIENT_PROTOCOL_VERSION};
 use prost::Message;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -126,9 +126,7 @@ async fn sdk_rejects_success_without_requested_region_progress() {
                 wire::frame::Message::Hello(wire::Hello {
                     identity: "region-mock".into(),
                     challenge: vec![7; 32],
-                    min_version: CLIENT_PROTOCOL_VERSION,
-                    max_version: CLIENT_PROTOCOL_VERSION,
-                    capabilities: CLIENT_CAPABILITIES,
+                    protocol_version: CLIENT_PROTOCOL_VERSION,
                 }),
             )
             .await;

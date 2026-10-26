@@ -129,7 +129,7 @@ Batch write-concern APIs remain unsupported: the supported contract is one
 submitted operation per receipt. Replication batches can contain several
 operations and carry the strongest required ACK fence for their live tickets.
 
-In legacy local mode, `replica_count()` remains unknown and eligible evidence
+In map-empty local mode, `replica_count()` remains unknown and eligible evidence
 names only the receiver; no cluster placement is inferred from connected peers.
 
 `Node::write_concern_diagnostics()` exposes monotonic planning/prepared-ticket outcomes,

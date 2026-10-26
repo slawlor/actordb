@@ -4,14 +4,13 @@ use actordb::checkpoint::{
     CheckpointImporter, CheckpointOptions, CheckpointReplicaCertificate,
     CheckpointReplicaObservation,
 };
-use actordb::membership::MembershipPeerIdentity;
 use actordb::membership::{
     MembershipAuthority, MembershipFenceObservation, MembershipShutdownObservation,
     MembershipStage, MembershipTransition,
 };
 use actordb::node::{
-    DrainOptions, Node, NodeConfig, NodeRuntimeOptions, PeerAuthorityOptions, PeerCredential,
-    PeerFenceOptions, PeerFenceReport, RecoveryOptions,
+    DrainOptions, Node, NodeConfig, NodeRuntimeOptions, PeerAuthorityOptions, PeerFenceOptions,
+    PeerFenceReport, RecoveryOptions,
 };
 use actordb::placement::{FragmentPlacementState, ManualPlacement, PlacementController};
 use actordb::shard::FragmentId;
@@ -21,17 +20,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 fn policy(id: &str, ids: &[String], generation: u64) -> PeerAuthorityOptions {
-    let credential = |id: &str| {
-        let mut seed = [77; 32];
-        seed[0] = id.as_bytes()[0];
-        seed[1] = generation as u8;
-        PeerCredential::new(generation, seed)
-    };
     PeerAuthorityOptions::new(
-        credential(id),
+        generation,
         ids.iter()
             .filter(|peer| peer.as_str() != id)
-            .map(|peer| (peer.clone(), credential(peer).public_identity()))
+            .map(|peer| (peer.clone(), generation))
             .collect(),
     )
 }
@@ -216,15 +209,12 @@ async fn workflow(old: &[&str], desired: &[&str]) {
         old_ready.push(ready.clone());
         transition.record_ready(ready).unwrap();
     }
-    let mut wrong_registry = transition.joint_authority().unwrap().identities().clone();
+    let mut wrong_registry = transition.joint_authority().unwrap().generations().clone();
     let changed_peer = joint_ids
         .iter()
         .find(|id| id.as_str() != desired[0])
         .unwrap();
-    wrong_registry.insert(
-        changed_peer.clone(),
-        MembershipPeerIdentity::new(99, [123; 32]).unwrap(),
-    );
+    wrong_registry.insert(changed_peer.clone(), 99);
     let mut wrong = MembershipTransition::create(
         directory.path().join("wrong"),
         [10; 32],
@@ -243,7 +233,7 @@ async fn workflow(old: &[&str], desired: &[&str]) {
         .certify_membership_ready(&wrong)
         .unwrap_err()
         .to_string()
-        .contains("native public authority"));
+        .contains("native receiver policy"));
     assert!(wrong.record_ready(old_ready[0].clone()).is_err());
     let final_ids = desired
         .iter()
@@ -395,7 +385,7 @@ async fn native_staged_shrink() {
 }
 
 #[tokio::test]
-async fn legacy_to_native_pending_fence_never_certifies_external_readiness() {
+async fn enabling_generation_fence_never_certifies_external_readiness() {
     let directory = tempfile::tempdir().unwrap();
     let epoch = [11; 32];
     let source_store = Arc::new(RocksDbStore::open(directory.path().join("a")).unwrap());
@@ -435,16 +425,7 @@ async fn legacy_to_native_pending_fence_never_certifies_external_readiness() {
     let controller = ManualPlacement::new(map(&["a"]));
     transition.publish_joint(&controller).unwrap();
     let ids = vec!["a".to_owned(), "b".to_owned()];
-    let registry = ids
-        .iter()
-        .map(|id| {
-            let identity = policy(id, &ids, 1).local_public_identity();
-            (
-                id.clone(),
-                MembershipPeerIdentity::new(identity.generation(), *identity.public_key()).unwrap(),
-            )
-        })
-        .collect();
+    let registry = ids.iter().map(|id| (id.clone(), 1)).collect();
     transition
         .record_authority_fence(
             MembershipAuthority::certify_external(epoch, registry, [11; 32]).unwrap(),

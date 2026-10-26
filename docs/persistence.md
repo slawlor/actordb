@@ -39,14 +39,14 @@ pub trait KvStore: Send + Sync + 'static {
 The contract is deliberately narrow:
 
 - `bind` runs once per Node startup after pure configuration/placement
-  validation and before network bind or actor startup. Its default returns an
-  unmanaged binding; custom stores remain source compatible. RocksDB validates
+  validation and before network bind or actor startup. Each backend explicitly
+  declares ownership/exclusivity; there is no default binding. RocksDB validates
   its persistent identity and holds an exclusive live attachment until clean
   Node shutdown.
 - `load` is called **once at actor boot** and returns the full dataset.
   Corrupt entries fail boot loudly — they are not silently skipped.
-- `load_prefix` has a source-compatible default that filters `load`. Ordered
-  stores should override it; `RocksDbStore` seeks to the fragment prefix and
+- `load_prefix` is required and performs namespace-specific access.
+  `RocksDbStore` seeks to the fragment prefix and
   stops when the prefix changes, avoiding one full-database scan per fragment.
 - `write_batch` persists a batch of **winning writes** (post-LWW-merge).
   The actor never calls `get`/`put`/`delete` on the store; it works from the
@@ -56,23 +56,22 @@ The contract is deliberately narrow:
   stores must apply identical key/version writes idempotently.
 - `commit_durability` describes an ordinary successful batch as `Buffered` or
   `Stable`. `stable_fence` runs after actor buffers flush and may strengthen
-  buffered writes; custom stores conservatively default to `Buffered`.
+  buffered writes. Both methods are required explicit backend declarations.
 - `prefix_delete_support` is a non-mutating lifecycle capability. Custom stores
-  default to `Retained`, so upgrading actordb never introduces an unexpected
-  destructive call. `Supported` opts into the deletion contract below.
+  use `Retained` unless they support deletion. `Supported` explicitly opts
+  into the deletion contract below.
 - `delete_prefix` is an idempotent, quiesced-writer namespace operation. The
-  source-compatible custom-store default reports `Retained`; RocksDB commits a
+  unsupported capability reports `Retained`; RocksDB commits a
   prefix range tombstone synchronously and reports `Deleted`.
 - Keys are raw bytes; the actor converts `String` keys at the boundary, so
   non-UTF-8 keys fail boot loudly rather than corrupting the store.
 - Loaded records are preflighted against every required single-record wire
   envelope, including the duplicated summary continuation key. RocksDB performs
   this check from raw lengths before decoding/retaining another value copy. A
-  legacy key/value that exceeds the 16 MiB hard frame limit, or whose provenance
+  persisted key/value that exceeds the 16 MiB hard frame limit, or whose provenance
   node id is empty or exceeds 255 UTF-8 bytes, fails startup rather than entering
-  the cache in a permanently unreplicable state. Migrate or remove that record
-  offline with a compatible older binary before upgrade; actordb never truncates
-  or repairs it automatically.
+  the cache in a permanently unreplicable state. Fresh deployment must supply
+  a valid keyspace; actordb never rewrites, truncates, or repairs invalid data.
 
 ## Implementations
 
@@ -94,11 +93,13 @@ Both backend features are disabled by default and can be enabled independently.
 Add future supported backends in their own opt-in `store` child modules and
 reexport their public entry points from the parent.
 
-`RocksDbStore::open(path)` creates the directory and opens the default CF for
-fragment-prefixed data. Existing initialized stores also open their
-`actordb-metadata` CF; a new or legacy store creates that CF only after the
-first successful identity/data validation in `bind`. `write_batch` builds one
-`rocksdb::WriteBatch`, so a flush is one atomic RocksDB write.
+RocksDbStore opens only the fresh format3 keyspace. A new directory gets
+the default data CF and a metadata CF with an explicit format3 initialization
+marker. Identity is pinned at the first successful bind. Reopening a fresh
+but still-unbound empty store is supported; arbitrary unmanifested databases
+are never adopted. Existing stores are checked read-only before a writable
+engine is opened, with probe logs redirected away from the original directory.
+Old manifests, records and unsupported metadata are rejected without mutation.
 
 RocksDB data operations require the live `StoreBinding` created by
 `Node::start` (or an explicit `KvStore::bind` call). Direct base-store keys use
@@ -131,7 +132,7 @@ as committed. `stable_fence` calls `flush_wal(true)`, so placement handoff can
 establish stable storage even when ordinary writes use `AsyncWal`. Manifest
 writes and prefix deletion are always synchronous regardless of this setting.
 
-### RocksDB manifest and upgrades
+### RocksDB format3 manifest
 
 The first successful storage bind during `Node::start` synchronously stores a
 manifest containing the node id, fragment count, data-format version, and
@@ -152,52 +153,34 @@ startup rollback also releases it. Cancelling startup, or merely dropping a
 Node, keeps the same live store object fail-closed because actor exit was not
 observed.
 
-An empty pre-manifest database is initialized automatically. A non-empty,
-default-CF-only database from an older actordb release has no trustworthy
-original node id or fragment count and is rejected during strict open *before*
-the metadata column family is created, preserving rollback to the old binary.
-Likewise, a non-empty directory with a missing or non-regular RocksDB `CURRENT`
-file is rejected before RocksDB can initialize or mutate it.
-After verifying the path, fragment layout, and a backup, perform the one-time
-explicit adoption:
-
-```rust
-let options = RocksDbOptions::builder()
-    .legacy_manifest_adoption(true)
-    .build();
-let config = NodeConfig::with_rocksdb_options("./data/legacy-node-a", options)?;
-// The first successful storage bind during Node::start writes the manifest.
-```
-
-Adoption validates every legacy key's UTF-8 suffix, stored fragment, hash
-mapping under the claimed fragment count, value encoding, provenance, and wire
-budget before writing the manifest. This detects inconsistent claims but cannot
-recover the original identity from legacy data; the operator remains
-responsible for supplying it. Adoption never overwrites an existing corrupt,
-future, or mismatched manifest. Subsequent opens should remove the flag.
+Fresh deployment uses only format3. There is no manifest-adoption option,
+old record decoder, or automatic upgrade path. Earlier/unmanifested stores
+must not be attached to this crate. A non-empty directory with missing or
+non-regular RocksDB CURRENT is also rejected without initialization. No data is
+deleted or migrated by these rejection paths.
 
 ## On-disk format
 
 Keys in the offered RocksDB data CF are always a 4-byte big-endian fragment id
 followed by a table-store partition prefix and logical table key. Every
-0.8.0 record therefore belongs to an explicit named table; pre-0.8 unnamed
-records require an application-managed migration before opening this format.
+Node record belongs to an explicit named table.
 Values are encoded as:
 
 ```
-[timestamp_ms: u64 BE][expires_at_ms: u64 BE, 0 = none][is_tombstone: u8]
+[ACTVAL03][timestamp_ms: u64 BE][logical_counter: u64 BE]
+[expires_at_ms: u64 BE, 0 = none][is_tombstone: u8]
 [node_id_len: u32 BE][node_id: UTF-8][value bytes...]
 ```
 
-- The fixed header is 21 bytes (8 + 8 + 1 + 4).
+- The fixed header is 37 bytes (8 + 8 + 8 + 8 + 1 + 4), including the exact record format marker.
 - TTLs are stored exactly as `expires_at_ms`; `0` means "no expiry".
 - `is_tombstone` must be exactly `0` or `1`; other bytes are corruption and
-  fail loading/adoption.
+  fail loading.
 - Tombstones are stored as tombstone-flagged entries — deletes and TTL expiry
   markers are durable, not physical removals. An expiry marker keeps the TTL
   write's timestamp, node id, and expiry deadline while clearing its value.
 - The metadata CF's `manifest` record begins with `ACTORDB\0`, independent
-  manifest/data/partitioner versions, the fixed fragment count, and node id.
+  manifest version3, data version3, partitioner version1, the fixed fragment count, and node id.
   Metadata never shares the user-key namespace.
 - Prefix deletion writes a durable RocksDB range tombstone. Successful reads
   and reopens no longer expose the covered keys, but physical bytes are reclaimed

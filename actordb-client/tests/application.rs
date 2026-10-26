@@ -1,7 +1,7 @@
 use actordb::client_server::{ClientServer, ClientServerOptions};
 use actordb::node::{Node, NodeConfig};
 use actordb_client::{Client, ClientError, ClientOptions, Priority, PutOptions, QueryValue};
-use actordb_protocol::{client as wire, CLIENT_CAPABILITIES, CLIENT_PROTOCOL_VERSION};
+use actordb_protocol::{client as wire, CLIENT_PROTOCOL_VERSION};
 use prost::Message;
 use std::sync::Arc;
 use std::time::Duration;
@@ -197,9 +197,7 @@ async fn mock_handshake(stream: &mut TcpStream) {
             message: Some(wire::frame::Message::Hello(wire::Hello {
                 identity: "mock".into(),
                 challenge: vec![7; 32],
-                min_version: CLIENT_PROTOCOL_VERSION,
-                max_version: CLIENT_PROTOCOL_VERSION,
-                capabilities: CLIENT_CAPABILITIES,
+                protocol_version: CLIENT_PROTOCOL_VERSION,
             })),
         },
     )
@@ -215,6 +213,134 @@ async fn mock_handshake(stream: &mut TcpStream) {
         },
     )
     .await;
+}
+
+#[tokio::test]
+async fn application_listener_and_sdk_require_exact_current_versions() {
+    let (node, mut listener) = server(ClientServerOptions::default()).await;
+    for version in (0..CLIENT_PROTOCOL_VERSION).chain([CLIENT_PROTOCOL_VERSION + 1]) {
+        let mut stream = TcpStream::connect(listener.addr()).await.unwrap();
+        send(
+            &mut stream,
+            wire::Frame {
+                message: Some(wire::frame::Message::Hello(wire::Hello {
+                    identity: "wrong-version".into(),
+                    challenge: vec![9; 32],
+                    protocol_version: version,
+                })),
+            },
+        )
+        .await;
+        let mut byte = [0];
+        let result = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut byte))
+            .await
+            .unwrap();
+        assert!(
+            matches!(result, Ok(0))
+                || matches!(result, Err(ref error) if error.kind() == std::io::ErrorKind::ConnectionReset)
+        );
+
+        let mock = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = mock.local_addr().unwrap();
+        let serving = tokio::spawn(async move {
+            let (mut stream, _) = mock.accept().await.unwrap();
+            assert!(
+                matches!(receive(&mut stream).await.message, Some(wire::frame::Message::Hello(hello)) if hello.protocol_version == CLIENT_PROTOCOL_VERSION)
+            );
+            send(
+                &mut stream,
+                wire::Frame {
+                    message: Some(wire::frame::Message::Hello(wire::Hello {
+                        identity: "mock".into(),
+                        challenge: vec![7; 32],
+                        protocol_version: version,
+                    })),
+                },
+            )
+            .await;
+        });
+        assert!(matches!(
+            Client::connect(addr, ClientOptions::default()).await,
+            Err(ClientError::Authentication)
+        ));
+        serving.await.unwrap();
+    }
+    listener.shutdown().await;
+    node.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn unknown_application_operation_is_explicitly_unsupported_without_closing_current_client() {
+    let (node, mut listener) = server(ClientServerOptions::default()).await;
+    let mut stream = TcpStream::connect(listener.addr()).await.unwrap();
+    send(
+        &mut stream,
+        wire::Frame {
+            message: Some(wire::frame::Message::Hello(wire::Hello {
+                identity: "unknown-operation".into(),
+                challenge: vec![8; 32],
+                protocol_version: CLIENT_PROTOCOL_VERSION,
+            })),
+        },
+    )
+    .await;
+    assert!(matches!(
+        receive(&mut stream).await.message,
+        Some(wire::frame::Message::Hello(_))
+    ));
+    send(
+        &mut stream,
+        wire::Frame {
+            message: Some(wire::frame::Message::Auth(wire::Auth { proof: Vec::new() })),
+        },
+    )
+    .await;
+    assert!(matches!(
+        receive(&mut stream).await.message,
+        Some(wire::frame::Message::Auth(_))
+    ));
+    let mut request = wire::Request {
+        id: 10,
+        table: "KV".into(),
+        operation: None,
+    }
+    .encode_to_vec();
+    // Unknown request-operation field 11, empty length-delimited payload.
+    // Prost discards the field, but the server must still return Unsupported.
+    request.extend_from_slice(&[0x5a, 0]);
+    let mut frame = vec![0x1a]; // Frame.request
+    prost::encoding::encode_varint(request.len() as u64, &mut frame);
+    frame.extend_from_slice(&request);
+    stream.write_u32(frame.len() as u32).await.unwrap();
+    stream.write_all(&frame).await.unwrap();
+    assert!(
+        matches!(receive(&mut stream).await.message, Some(wire::frame::Message::Response(wire::Response { id: 10, error: Some(error), .. })) if error.code == wire::ErrorCode::Unsupported as i32)
+    );
+    send(
+        &mut stream,
+        wire::Frame {
+            message: Some(wire::frame::Message::Request(wire::Request {
+                id: 11,
+                table: "KV".into(),
+                operation: Some(wire::request::Operation::Get(wire::Get {
+                    key: "missing".into(),
+                    priority: 0,
+                })),
+            })),
+        },
+    )
+    .await;
+    assert!(matches!(
+        receive(&mut stream).await.message,
+        Some(wire::frame::Message::Response(wire::Response {
+            id: 11,
+            error: None,
+            ..
+        }))
+    ));
+    drop(stream);
+    listener.shutdown().await;
+    node.shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -303,6 +429,35 @@ async fn listener_shutdown_drains_canceled_client_mutation_before_returning() {
         gate: std::sync::Condvar,
     }
     impl KvStore for BlockingStore {
+        fn bind(
+            &self,
+            _identity: &actordb::store::StoreIdentity,
+        ) -> Result<actordb::store::StoreBinding, actordb::store::StoreError> {
+            Ok(actordb::store::StoreBinding::unmanaged())
+        }
+
+        fn load_prefix(
+            &self,
+            prefix: &[u8],
+        ) -> Result<Vec<(Vec<u8>, actordb::actor::VersionedValue)>, actordb::store::StoreError>
+        {
+            // This fixture owns a bounded in-memory dataset, not a production prefix scan.
+            Ok(self
+                .load()?
+                .into_iter()
+                .filter(|(key, _)| key.starts_with(prefix))
+                .collect())
+        }
+
+        fn commit_durability(&self) -> actordb::store::StoreCommitDurability {
+            actordb::store::StoreCommitDurability::Buffered
+        }
+
+        fn stable_fence(
+            &self,
+        ) -> Result<actordb::store::StoreCommitDurability, actordb::store::StoreError> {
+            Ok(self.commit_durability())
+        }
         fn load(&self) -> Result<Vec<(Vec<u8>, VersionedValue)>, StoreError> {
             Ok(Vec::new())
         }
@@ -482,9 +637,7 @@ async fn incomplete_application_prefix_is_timed_out_and_idle_client_survives() {
     let hello = wire::Hello {
         identity: "raw".into(),
         challenge: vec![8; 32],
-        min_version: CLIENT_PROTOCOL_VERSION,
-        max_version: CLIENT_PROTOCOL_VERSION,
-        capabilities: 0,
+        protocol_version: CLIENT_PROTOCOL_VERSION,
     };
     send(
         &mut stream,
@@ -517,7 +670,7 @@ async fn incomplete_application_prefix_is_timed_out_and_idle_client_survives() {
     )
     .await;
     assert!(
-        matches!(receive(&mut stream).await.message, Some(wire::frame::Message::Response(wire::Response { error: Some(error), .. })) if error.code == wire::ErrorCode::Unsupported as i32)
+        matches!(receive(&mut stream).await.message, Some(wire::frame::Message::Response(wire::Response { error: Some(error), .. })) if error.code == wire::ErrorCode::Invalid as i32)
     );
     send(
         &mut stream,

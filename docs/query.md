@@ -39,7 +39,7 @@ functions are unsupported. Named tables are co-partitioned by their user key,
 which is the storage prerequisite for a future local key-join implementation,
 but SQL join planning is not enabled yet. Aggregate and ordinary row projections cannot be
 mixed. Aggregate queries reject row pagination clauses. `LIMIT 0` returns
-zero rows, unlike the legacy scan default-limit convention.
+zero rows, unlike the scan default-limit convention.
 
 Numeric conversion is explicit. `CAST(value AS BIGINT)` accepts signed decimal
 64-bit integers; invalid bytes fail the query. Aggregate arithmetic uses
@@ -94,7 +94,7 @@ SQL and typed parameter surface.
 Rows are ordered by key across fragments; offset and limit apply once to the
 global order. Each fragment contributes from one holder, avoiding replica
 double counting. Aggregates traverse complete qualifying input rather than
-reducing the legacy scan API's capped vectors.
+reducing the scan API's capped vectors.
 
 Execution uses byte/work-bounded background pages, exclusive key cursors,
 pinned TTL visibility, and local revision/incarnation checks. Changes or

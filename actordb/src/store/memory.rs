@@ -11,6 +11,7 @@
 use crate::actor::VersionedValue;
 
 use super::{KvStore, PrefixDeleteOutcome, PrefixDeleteSupport, StoreCommitDurability, StoreError};
+use super::{StoreBinding, StoreIdentity};
 
 /// Test double for [`KvStore`]: records nothing, loads nothing.
 ///
@@ -22,6 +23,12 @@ use super::{KvStore, PrefixDeleteOutcome, PrefixDeleteSupport, StoreCommitDurabi
 pub struct MemoryStore;
 
 impl KvStore for MemoryStore {
+    fn bind(&self, _: &StoreIdentity) -> Result<StoreBinding, StoreError> {
+        Ok(StoreBinding::unmanaged())
+    }
+    fn load_prefix(&self, _: &[u8]) -> Result<Vec<(Vec<u8>, VersionedValue)>, StoreError> {
+        Ok(Vec::new())
+    }
     fn load(&self) -> Result<Vec<(Vec<u8>, VersionedValue)>, StoreError> {
         Ok(Vec::new())
     }

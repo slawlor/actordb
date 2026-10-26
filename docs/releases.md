@@ -50,11 +50,11 @@ The documented high-level APIs are the supported `actordb` surface. Before
 1.0, a breaking Rust API or wire-protocol change requires a new minor version;
 patch releases contain compatible fixes and documentation changes.
 
-The raw generated `actordb::proto` compatibility module is hidden from
-generated documentation and is not a supported application API. The public
-wire-schema boundary is the standalone `actordb-protocol` crate, which carries
-the committed Prost bindings and protocol constants used by compatible peers
-and SDKs.
+The public wire-schema boundary is the standalone `actordb-protocol` crate,
+which carries committed Prost bindings and exact current protocol versions.
+Import `actordb_protocol::meta` directly; the database crate does not expose a
+public wire compatibility module. Fresh deployments must use matching current
+peers and SDKs and new store directories.
 
 The package workflow uploads an `actordb-workspace-VERSION` artifact containing
 the verified library `.crate` files for inspection. An explicit, verified `cargo package` produces
@@ -151,8 +151,8 @@ publish/wait/dependent-publish sequence:
    `actordb-client`.
 
 `.github/scripts/wait_for_crate_dependency.py DEPENDENT TARGET` reads Cargo
-metadata and checks the target's full workspace version, such as `0.4.0`.
-It does not mistake a compatible dependency requirement such as `0.4` for
+metadata and checks the target's full workspace version, such as `0.9.0`.
+It does not mistake a dependency requirement such as `0.9` for
 an exact published version. Only a matching, non-yanked index entry counts.
 The helper checks immediately, then retries every five seconds for up to
 15 minutes per dependency; the release job has a 60-minute overall deadline.

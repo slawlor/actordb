@@ -126,40 +126,14 @@ impl PermanentSourceLoss {
     }
 }
 
-/// Expected process authority, independent of historical record writer IDs.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MembershipPeerIdentity {
-    generation: u64,
-    public_key: [u8; 32],
-}
-impl MembershipPeerIdentity {
-    pub fn new(generation: u64, public_key: [u8; 32]) -> Result<Self, MembershipError> {
-        if generation == 0 || public_key == [0; 32] {
-            return Err(MembershipError::Invalid(
-                "process identity requires positive generation and public key".into(),
-            ));
-        }
-        Ok(Self {
-            generation,
-            public_key,
-        })
-    }
-    pub fn generation(&self) -> u64 {
-        self.generation
-    }
-    pub fn public_key(&self) -> &[u8; 32] {
-        &self.public_key
-    }
-}
-
-/// Application-certified completed fence and its exact expected public
-/// identities. `decision_id` refers to external durable authorization/evidence,
+/// Application-certified completed fence and its exact expected process
+/// generations. `decision_id` refers to external durable authorization/evidence,
 /// not a process-local revision or a checkpoint hash. Native peer fences may
 /// supply this evidence once the application has fenced every affected node.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MembershipAuthority {
     epoch: [u8; 32],
-    identities: BTreeMap<String, MembershipPeerIdentity>,
+    generations: BTreeMap<String, u64>,
     decision_id: [u8; 32],
     pub(crate) native_receivers: BTreeMap<String, NativeMembershipReceiver>,
     pub(crate) native_retired: BTreeMap<String, NativeRetiredReceiver>,
@@ -185,33 +159,28 @@ impl MembershipAuthority {
     }
     pub fn certify_external(
         epoch: [u8; 32],
-        identities: BTreeMap<String, MembershipPeerIdentity>,
+        generations: BTreeMap<String, u64>,
         decision_id: [u8; 32],
     ) -> Result<Self, MembershipError> {
         if epoch == [0; 32]
             || decision_id == [0; 32]
-            || identities.is_empty()
-            || identities.len() > 256
-            || identities.keys().any(|id| id.is_empty() || id.len() > 255)
-            || identities
-                .values()
-                .map(|identity| identity.public_key)
-                .collect::<BTreeSet<_>>()
-                .len()
-                != identities.len()
+            || generations.is_empty()
+            || generations.len() > 256
+            || generations.keys().any(|id| id.is_empty() || id.len() > 255)
+            || generations.values().any(|generation| *generation == 0)
         {
-            return Err(MembershipError::Invalid("authority needs a fresh epoch, bounded unique public identities, and explicit external decision ID".into()));
+            return Err(MembershipError::Invalid("authority needs a fresh epoch, bounded positive process generations, and explicit external decision ID".into()));
         }
         Ok(Self {
             epoch,
-            identities,
+            generations,
             decision_id,
             native_receivers: BTreeMap::new(),
             native_retired: BTreeMap::new(),
         })
     }
-    pub fn identities(&self) -> &BTreeMap<String, MembershipPeerIdentity> {
-        &self.identities
+    pub fn generations(&self) -> &BTreeMap<String, u64> {
+        &self.generations
     }
     pub fn decision_id(&self) -> &[u8; 32] {
         &self.decision_id
@@ -227,13 +196,13 @@ impl MembershipAuthority {
     }
     fn matches(&self, epoch: &[u8; 32], map: &MembershipMap) -> bool {
         &self.epoch == epoch
-            && self.identities.keys().cloned().collect::<BTreeSet<_>>()
+            && self.generations.keys().cloned().collect::<BTreeSet<_>>()
                 == map.values().flatten().cloned().collect()
     }
 }
 
 /// Durable transition coordinator. Its file stores proposal, source manifest
-/// identities, target import evidence and explicit authorizations. Live
+/// generations, target import evidence and explicit authorizations. Live
 /// readiness is deliberately re-observed after every coordinator restart.
 pub struct MembershipTransition {
     path: PathBuf,
@@ -297,7 +266,7 @@ impl MembershipTransition {
         }
         let mut input = Decoder::new(body);
         let version = input.take(8)?;
-        if version != b"ACTMEM02" && version != b"ACTMEM03" {
+        if version != b"ACTMEM04" {
             return Err(MembershipError::Invalid(
                 "unsupported transition state".into(),
             ));
@@ -367,8 +336,8 @@ impl MembershipTransition {
             }
             _ => return Err(MembershipError::Invalid("invalid source-loss flag".into())),
         };
-        let joint_authority = decode_authority(&mut input, epoch, version == b"ACTMEM03")?;
-        let final_authority = decode_authority(&mut input, epoch, version == b"ACTMEM03")?;
+        let joint_authority = decode_authority(&mut input, epoch)?;
+        let final_authority = decode_authority(&mut input, epoch)?;
         input.finish()?;
         let mut result = Self {
             path,
@@ -615,8 +584,9 @@ impl MembershipTransition {
         self.persist()
     }
     /// Record completed final process fencing separately from joint overlap.
-    /// Retired processes must be absent; retained identities may keep their
-    /// keys/generations or advance them with fresh keys, never roll back.
+    /// Retired processes must be absent; retained generations may keep their
+    /// generations or advance them, never roll back. This is an operational
+    /// policy gate; authenticating and revoking credentials belongs to the app.
     pub fn record_final_authority_fence(
         &mut self,
         authority: MembershipAuthority,
@@ -644,9 +614,9 @@ impl MembershipTransition {
         let previous_authority = joint;
         if joint.is_native() && authority.is_native() {
             let retired = joint
-                .identities
+                .generations
                 .keys()
-                .filter(|id| !authority.identities.contains_key(*id))
+                .filter(|id| !authority.generations.contains_key(*id))
                 .cloned()
                 .collect::<BTreeSet<_>>();
             if authority
@@ -668,24 +638,15 @@ impl MembershipTransition {
                 ));
             }
         }
-        for (id, next) in &authority.identities {
-            let previous = previous_authority.identities.get(id).ok_or_else(|| {
+        for (id, generation) in &authority.generations {
+            let previous = previous_authority.generations.get(id).ok_or_else(|| {
                 MembershipError::Invalid(
-                    "final authority has an identity absent from joint stage".into(),
+                    "final policy contains a process absent from the joint stage".into(),
                 )
             })?;
-            if next.generation < previous.generation
-                || (next.generation == previous.generation
-                    && next.public_key != previous.public_key)
-                || (next.generation > previous.generation && next.public_key == previous.public_key)
-                || (next.public_key != previous.public_key
-                    && joint
-                        .identities
-                        .values()
-                        .any(|identity| identity.public_key == next.public_key))
-            {
+            if generation < previous {
                 return Err(MembershipError::Invalid(
-                    "retained process generation/key rolled back or reused".into(),
+                    "retained process generation rolled back".into(),
                 ));
             }
         }
@@ -864,7 +825,7 @@ impl MembershipTransition {
             ));
         }
         let mut out = Encoder::default();
-        out.0.extend(b"ACTMEM03");
+        out.0.extend(b"ACTMEM04");
         out.digest(&self.epoch);
         out.u32(self.minimum_replicas as u32);
         out.u8(match self.stage {
@@ -950,11 +911,10 @@ fn encode_authority(out: &mut Encoder, authority: Option<&MembershipAuthority>) 
         Some(authority) => {
             out.u8(1);
             out.digest(&authority.decision_id);
-            out.u32(authority.identities.len() as u32);
-            for (id, identity) in &authority.identities {
+            out.u32(authority.generations.len() as u32);
+            for (id, identity) in &authority.generations {
                 out.string(id);
-                out.u64(identity.generation);
-                out.digest(&identity.public_key);
+                out.u64(*identity);
             }
             out.u32(authority.native_receivers.len() as u32);
             for (id, receiver) in &authority.native_receivers {
@@ -974,7 +934,6 @@ fn encode_authority(out: &mut Encoder, authority: Option<&MembershipAuthority>) 
 fn decode_authority(
     input: &mut Decoder<'_>,
     epoch: [u8; 32],
-    native_format: bool,
 ) -> Result<Option<MembershipAuthority>, MembershipError> {
     match input.u8()? {
         0 => Ok(None),
@@ -986,18 +945,19 @@ fn decode_authority(
                     "invalid persisted authority count".into(),
                 ));
             }
-            let mut identities = BTreeMap::new();
+            let mut generations = BTreeMap::new();
             for _ in 0..count {
                 let id = input.string(255)?;
-                let identity = MembershipPeerIdentity::new(input.u64()?, input.digest()?)?;
-                if identities.insert(id, identity).is_some() {
+                let identity = input.u64()?;
+                if generations.insert(id, identity).is_some() {
                     return Err(MembershipError::Invalid(
                         "duplicate persisted process identity".into(),
                     ));
                 }
             }
-            let mut authority = MembershipAuthority::certify_external(epoch, identities, decision)?;
-            if native_format {
+            let mut authority =
+                MembershipAuthority::certify_external(epoch, generations, decision)?;
+            {
                 let count = input.u32()? as usize;
                 if count > 256 {
                     return Err(MembershipError::Invalid("too many native receivers".into()));
@@ -1032,7 +992,7 @@ fn decode_authority(
                 }
                 if !authority.native_receivers.is_empty()
                     && authority.native_receivers.keys().collect::<BTreeSet<_>>()
-                        != authority.identities.keys().collect()
+                        != authority.generations.keys().collect()
                 {
                     return Err(MembershipError::Invalid(
                         "native evidence does not cover exact registry".into(),
@@ -1152,98 +1112,36 @@ pub(crate) fn map_digest(map: &MembershipMap) -> [u8; 32] {
 mod tests {
     use super::*;
     #[test]
-    fn final_authority_is_exact_and_rejects_generation_rollback_and_key_reuse() {
+    fn fresh_journal_rejects_old_headers_without_modification_and_roundtrips_generations() {
         let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("transition");
         let current = HashMap::from([(FragmentId(0), vec!["a".into(), "b".into()])]);
         let desired = HashMap::from([(FragmentId(0), vec!["b".into(), "c".into()])]);
-        let controller = ManualPlacement::new(current.clone());
-        let epoch = [7; 32];
-        let mut transition = MembershipTransition::create(
-            directory.path().join("transition"),
-            epoch,
-            current,
-            desired,
-            2,
-        )
-        .unwrap();
-        let registry = [("a", 1, 1), ("b", 2, 2), ("c", 1, 3)]
-            .into_iter()
-            .map(|(id, generation, key)| {
-                (
-                    id.into(),
-                    MembershipPeerIdentity::new(generation, [key; 32]).unwrap(),
-                )
-            })
-            .collect();
-        let joint = MembershipAuthority::certify_external(epoch, registry, [10; 32]).unwrap();
-        transition.record_authority_fence(joint.clone()).unwrap();
-        transition.publish_joint(&controller).unwrap();
-        let old_ready = MembershipReady {
-            node_id: "b".into(),
-            boot_id: 1,
-            placement_generation: 1,
-            joint_digest: transition.joint_digest(),
-            epoch,
-            authority_digest: joint.digest(),
-            native_revision: None,
-        };
-        transition.record_ready(old_ready.clone()).unwrap();
-        assert!(transition.record_final_authority_fence(joint).is_err());
-        for (generation, key) in [(1, 8), (2, 8), (3, 2), (3, 1)] {
-            let registry = [
-                (
-                    "b".into(),
-                    MembershipPeerIdentity::new(generation, [key; 32]).unwrap(),
-                ),
-                ("c".into(), MembershipPeerIdentity::new(1, [3; 32]).unwrap()),
-            ]
+        let mut transition =
+            MembershipTransition::create(&path, [7; 32], current.clone(), desired, 2).unwrap();
+        let registry = [("a".into(), 1), ("b".into(), 2), ("c".into(), 1)]
             .into_iter()
             .collect();
-            assert!(transition
-                .record_final_authority_fence(
-                    MembershipAuthority::certify_external(epoch, registry, [11; 32]).unwrap()
-                )
-                .is_err());
-        }
-        let registry = [
-            ("b".into(), MembershipPeerIdentity::new(3, [8; 32]).unwrap()),
-            ("c".into(), MembershipPeerIdentity::new(1, [3; 32]).unwrap()),
-        ]
-        .into_iter()
-        .collect();
         transition
-            .record_final_authority_fence(
-                MembershipAuthority::certify_external(epoch, registry, [12; 32]).unwrap(),
+            .record_authority_fence(
+                MembershipAuthority::certify_external([7; 32], registry, [10; 32]).unwrap(),
             )
             .unwrap();
-        assert!(transition.ready.is_empty());
-        assert!(transition.record_ready(old_ready.clone()).is_err());
-        let wrong_epoch = MembershipReady {
-            epoch: [8; 32],
-            authority_digest: transition.readiness_authority_digest().unwrap(),
-            ..old_ready
-        };
-        assert!(transition.record_ready(wrong_epoch).is_err());
-        let mut changed_joint = transition.joint_authority().unwrap().clone();
-        changed_joint.decision_id = [20; 32];
-        assert!(transition.record_authority_fence(changed_joint).is_err());
-        let mut changed_final = transition.final_authority().unwrap().clone();
-        changed_final
-            .identities
-            .insert("b".into(), MembershipPeerIdentity::new(4, [2; 32]).unwrap());
-        assert!(transition
-            .record_final_authority_fence(changed_final)
-            .is_err());
-        let reopened = MembershipTransition::reopen(directory.path().join("transition")).unwrap();
-        assert_eq!(
-            reopened.final_authority().unwrap().identities()["b"].generation(),
-            3
-        );
-        assert!(!reopened
-            .final_authority()
-            .unwrap()
-            .identities()
-            .contains_key("a"));
-        assert!(transition.publish_final(&controller).is_err()); // Source/import/readiness still required.
+        transition
+            .publish_joint(&ManualPlacement::new(current))
+            .unwrap();
+        let reopened = MembershipTransition::reopen(&path).unwrap();
+        assert_eq!(reopened.joint_authority().unwrap().generations()["b"], 2);
+        let original = std::fs::read(&path).unwrap();
+        for header in [b"ACTMEM02", b"ACTMEM03"] {
+            let mut obsolete = original.clone();
+            obsolete[..8].copy_from_slice(header);
+            let offset = obsolete.len() - 32;
+            let digest: [u8; 32] = Sha256::digest(&obsolete[..offset]).into();
+            obsolete[offset..].copy_from_slice(&digest);
+            std::fs::write(&path, &obsolete).unwrap();
+            assert!(MembershipTransition::reopen(&path).is_err());
+            assert_eq!(std::fs::read(&path).unwrap(), obsolete);
+        }
     }
 }

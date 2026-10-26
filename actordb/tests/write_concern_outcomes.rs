@@ -7,12 +7,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use actordb::node::{Node, NodeConfig, NodeRuntimeOptions};
-use actordb::proto::{Envelope, EnvelopeMsg, MutationStatus};
 use actordb::replication::SenderConfig;
 use actordb::shard::FragmentId;
 use actordb::write_concern::{
     WriteConcern, WriteConcernError, WriteConcernOptions, WriteConcernOutcome,
 };
+use actordb_protocol::meta::{envelope::Msg as EnvelopeMsg, Envelope, MutationStatus};
 use prost::Message;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};

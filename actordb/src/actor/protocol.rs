@@ -475,7 +475,7 @@ pub enum KvMessage {
     /// Internal Node read admission ownership, retained through actor work.
     #[doc(hidden)]
     GetBatchRetained(RetainedBatchRead),
-    /// Read the full local copy for compatibility and diagnostics. The wire
+    /// Read the full local copy for explicit local diagnostics. The wire
     /// reconciler uses bounded summary pages and exact-key reads instead.
     GetAll {
         reply: RpcReplyPort<HashMap<String, VersionedValue>>,

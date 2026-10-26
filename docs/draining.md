@@ -86,11 +86,11 @@ The server owns its listener independently; call `ClientServer::shutdown` to
 release it. Response bytes already queued to a socket may be lost, including
 after a mutation completed; clients must retry stamped writes idempotently.
 
-These stronger defaults and owned evidence are part of 0.9.0. Existing
-generation-zero wire negotiation remains compatible. The separate
-[peer authority](peer-authority.md) API supports an authenticated hot
-receive/apply fence without stopping the node; application request admission
-itself stays one-way and has no resume operation.
+These defaults and owned evidence are part of the fresh `0.9.0` deployment
+contract. The separate [peer authority](peer-authority.md) API supports a hot
+generation-policy receive/apply barrier without stopping the node. TLS and
+shared-secret credential revocation remain external responsibilities;
+application request admission stays one-way and has no resume operation.
 
 `drain_diagnostics()` reports cumulative accepted/completed/rejected admission
 slots and started/completed/timed-out/failed/cancelled bounded drain calls.

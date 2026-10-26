@@ -165,9 +165,6 @@ pub struct FragmentStatus {
     pub serving: bool,
     /// A published route has a running dispatcher, including during catch-up.
     pub route_available: bool,
-    /// Catch-up percentage is not measured by the reconciliation protocol.
-    /// An absent value must not be interpreted as zero or complete.
-    pub catch_up_fraction: Option<f64>,
 }
 
 /// Typed connection/session state from the sender's existing report.
@@ -226,8 +223,6 @@ pub struct ReplicationStatus {
     /// Most recent ACK's actual receiver fence, not a target's pending fence.
     pub last_ack_durability: Option<ReplicationAckDurability>,
     pub ack_durability_mismatch: bool,
-    /// No replication time/byte lag estimate is currently measured.
-    pub lag: Option<Duration>,
 }
 
 /// Which sections could not be fully observed without waiting.
@@ -249,7 +244,6 @@ pub struct SnapshotObservation {
     pub unavailable_sender_reports: usize,
     pub drain_report_unavailable: bool,
     pub drain_report_truncated: bool,
-    pub shutdown_stage_unavailable: bool,
     /// Published placement generation changed while other sections were read.
     pub placement_changed: bool,
     /// Admission/drain phase changed while other sections were read.
@@ -274,7 +268,6 @@ impl SnapshotObservation {
             && self.unavailable_sender_reports == 0
             && !self.drain_report_unavailable
             && !self.drain_report_truncated
-            && !self.shutdown_stage_unavailable
             && !self.placement_changed
             && !self.lifecycle_changed
     }
@@ -295,7 +288,7 @@ pub struct NodeStatus {
     pub lifecycle_blocker: Option<LifecycleBlocker>,
     pub pools: Vec<super::FragmentPoolObservation>,
     pub detailed: Option<super::DetailedObservation>,
-    pub node_lifecycle: NodeLifecycle,
+    pub lifecycle: NodeLifecycle,
     pub lifecycle_reason: Option<String>,
     pub lifecycle_revision: u64,
     pub node_id: String,
@@ -303,7 +296,7 @@ pub struct NodeStatus {
     pub boot_id: u64,
     pub observed_at: SystemTime,
     pub collection_duration: Duration,
-    pub lifecycle: DrainStatus,
+    pub drain: DrainStatus,
     pub completed_local_persistence_fences: usize,
     pub local_persistence_failure: Option<(FragmentId, String)>,
     pub storage: crate::store::StorageDiagnostics,
@@ -318,7 +311,7 @@ pub struct NodeStatus {
     /// Request draining also waits for this ownership to finish.
     pub query_reserved_runtime_bytes: usize,
     /// Atomically published coordinator stage, readable during active calls.
-    pub shutdown_stage: Option<ShutdownStage>,
+    pub shutdown_stage: ShutdownStage,
     pub readiness: Readiness,
     pub dynamic_placement: bool,
     /// Shared authoritative map generation, sampled with the placement map.
@@ -357,7 +350,7 @@ impl Node {
                 Vec::new()
             }
         };
-        let shutdown_stage = Some(self.lifecycle_observation.observed_shutdown());
+        let shutdown_stage = self.lifecycle_observation.observed_shutdown();
         let mut fragments = Vec::new();
         let mut placement_generation = None;
         let mut readiness = Readiness::Unknown;
@@ -418,7 +411,6 @@ impl Node {
                     placement_state: states.get(&fragment).copied(),
                     serving: is_serving,
                     route_available,
-                    catch_up_fraction: None,
                 });
             }
             serving_count = Some(serving.len());
@@ -606,7 +598,6 @@ impl Node {
                 completed_reconcile_rounds: report_snapshot.reconcile_rounds,
                 last_ack_durability: report_snapshot.last_ack_durability,
                 ack_durability_mismatch: report_snapshot.ack_durability_mismatch,
-                lag: None,
             });
         }
         replication.sort_by(|left, right| {
@@ -664,7 +655,7 @@ impl Node {
             DrainPhase::Stopped => NodeLifecycle::Stopped,
             _ if failure.is_some() => NodeLifecycle::Blocked,
             DrainPhase::Draining | DrainPhase::Drained
-                if shutdown_stage != Some(ShutdownStage::NotStarted) =>
+                if shutdown_stage != ShutdownStage::NotStarted =>
             {
                 NodeLifecycle::Stopping
             }
@@ -712,14 +703,14 @@ impl Node {
             lifecycle_blocker,
             pools: Vec::new(),
             detailed: None,
-            node_lifecycle,
+            lifecycle: node_lifecycle,
             lifecycle_reason: failure,
             lifecycle_revision,
             node_id: self.node_id.clone(),
             boot_id: self.boot_id,
             observed_at,
             collection_duration: started.elapsed(),
-            lifecycle,
+            drain: lifecycle,
             completed_local_persistence_fences: self.local_drain.completed(),
             local_persistence_failure: self.local_drain.failure(),
             storage: self.storage_diagnostics(),
@@ -799,14 +790,13 @@ mod tests {
             std::sync::Arc::new(tokio::sync::Mutex::new(report)),
         );
         let mut status = node.status_snapshot();
-        assert_eq!(status.node_lifecycle, NodeLifecycle::Serving);
+        assert_eq!(status.lifecycle, NodeLifecycle::Serving);
         assert_eq!(status.replication[0].freshness, ObservationFreshness::Stale);
         assert_eq!(status.observation.stale_sender_reports, 1);
         assert_eq!(
             status.replication[0].purpose,
             ReplicationPurpose::Background
         );
-        assert!(status.replication[0].lag.is_none());
         assert!(!status.is_complete());
         status.observed_at = old;
         assert!(status.is_stale(Duration::from_secs(1)));
@@ -853,8 +843,7 @@ mod tests {
         {
             let _shutdown_owner = node.shutdown_state.lock().await;
             let status = node.status_snapshot();
-            assert!(!status.observation.shutdown_stage_unavailable);
-            assert_eq!(status.shutdown_stage, Some(ShutdownStage::NotStarted));
+            assert_eq!(status.shutdown_stage, ShutdownStage::NotStarted);
         }
         let status = node.status_snapshot();
         assert!(status.fragments[0].assigned_locally);

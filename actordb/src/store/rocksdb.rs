@@ -24,7 +24,7 @@ use super::{
 
 /// RocksDB-backed store. Available with the `rocksdb` cargo feature.
 ///
-/// Values are encoded as `[timestamp_ms: u64 BE][expires_at_ms: u64 BE, 0 = none][is_tombstone: u8][node_id_len: u32 BE][node_id][value]`.
+/// Values use format3 only: `[ACTVAL03][physical: u64 BE][logical: u64 BE]\n/// [expiry: u64 BE, 0 = none][tombstone: u8][writer_len: u32 BE][writer][value]`.
 /// Fragment data lives in the default column family; an independent metadata
 /// column family holds the node/layout manifest. Data operations require a
 /// live [`StoreBinding`], and physical keys must begin with their four-byte
@@ -42,24 +42,39 @@ pub struct RocksDbStore {
 const ROCKSDB_METADATA_CF: &str = "actordb-metadata";
 const ROCKSDB_MANIFEST_KEY: &[u8] = b"manifest";
 const ROCKSDB_MANIFEST_MAGIC: &[u8; 8] = b"ACTORDB\0";
-const ROCKSDB_MANIFEST_VERSION: u32 = 1;
-const ROCKSDB_DATA_FORMAT_VERSION: u32 = 2;
+const ROCKSDB_MANIFEST_VERSION: u32 = 3;
+const ROCKSDB_DATA_FORMAT_VERSION: u32 = 3;
 const ROCKSDB_PARTITIONER_VERSION: u32 = 1;
+const ROCKSDB_FORMAT_KEY: &[u8] = b"format";
+const ROCKSDB_RECORD_MAGIC: &[u8; 8] = b"ACTVAL03";
 
 mod checkpoint;
+
+struct ReadOnlyLogs(std::path::PathBuf);
+impl Drop for ReadOnlyLogs {
+    fn drop(&mut self) {
+        if let Ok(entries) = std::fs::read_dir(&self.0) {
+            for entry in entries.flatten() {
+                if entry.file_type().is_ok_and(|kind| kind.is_file()) {
+                    let _ = std::fs::remove_file(entry.path());
+                }
+            }
+        }
+        let _ = std::fs::remove_dir(&self.0);
+    }
+}
 
 impl RocksDbStore {
     /// Open (creating if missing) the RocksDB at `path`.
     ///
-    /// A non-empty default-CF-only legacy database is rejected without adding
-    /// the metadata column family. Use [`RocksDbOptions`] for explicit adoption.
-    /// The metadata column family is created only after a successful
-    /// [`KvStore::bind`] validation.
+    /// Existing databases must carry format3 metadata and records. Older and
+    /// unmanifested databases are rejected by a read-only preflight before any
+    /// writable open. Fresh initialization never adopts existing data.
     pub fn open(path: impl AsRef<std::path::Path>) -> Result<Self, StoreError> {
         Self::open_with_options(path, RocksDbOptions::default())
     }
 
-    /// Open RocksDB with an explicit WAL durability and legacy-manifest policy.
+    /// Open RocksDB with an explicit WAL durability policy.
     /// Unknown column families are rejected instead of silently ignored.
     pub fn open_with_options(
         path: impl AsRef<std::path::Path>,
@@ -102,71 +117,48 @@ impl RocksDbStore {
         let mut db_options = rocksdb_engine::Options::default();
         db_options.create_if_missing(true);
         let db = if has_current {
-            let column_families =
-                rocksdb_engine::DB::list_cf(&rocksdb_engine::Options::default(), path)
-                    .map_err(|error| StoreError(error.to_string()))?;
-            if !column_families
-                .iter()
-                .any(|name| name == rocksdb_engine::DEFAULT_COLUMN_FAMILY_NAME)
-            {
-                return Err(StoreError(
-                    "RocksDB is missing its default column family".to_string(),
-                ));
-            }
-            if let Some(unknown) = column_families.iter().find(|name| {
-                name.as_str() != rocksdb_engine::DEFAULT_COLUMN_FAMILY_NAME
-                    && name.as_str() != ROCKSDB_METADATA_CF
-            }) {
-                return Err(StoreError(format!(
-                    "RocksDB contains unsupported column family {unknown:?}"
-                )));
-            }
-
-            if column_families
-                .iter()
-                .any(|name| name == ROCKSDB_METADATA_CF)
-            {
-                let descriptors = column_families.into_iter().map(|name| {
-                    rocksdb_engine::ColumnFamilyDescriptor::new(
-                        name,
-                        rocksdb_engine::Options::default(),
-                    )
-                });
-                rocksdb_engine::DBWithThreadMode::<rocksdb_engine::MultiThreaded>::open_cf_descriptors(
-                    &db_options,
-                    path,
-                    descriptors,
+            Self::preflight_existing(path)?;
+            let descriptors = [
+                rocksdb_engine::DEFAULT_COLUMN_FAMILY_NAME,
+                ROCKSDB_METADATA_CF,
+            ]
+            .into_iter()
+            .map(|name| {
+                rocksdb_engine::ColumnFamilyDescriptor::new(
+                    name,
+                    rocksdb_engine::Options::default(),
                 )
-                .map_err(|error| StoreError(error.to_string()))?
-            } else {
-                // Probe an old default-CF-only database while holding its lock.
-                // A strict open of non-empty legacy data must not create a
-                // metadata CF and thereby prevent rollback to the old binary.
-                let db = rocksdb_engine::DBWithThreadMode::<rocksdb_engine::MultiThreaded>::open(
-                    &db_options,
-                    path,
-                )
-                .map_err(|error| StoreError(error.to_string()))?;
-                let has_legacy_data = db
-                    .iterator(rocksdb_engine::IteratorMode::Start)
-                    .next()
-                    .transpose()
-                    .map_err(|error| StoreError(error.to_string()))?
-                    .is_some();
-                if has_legacy_data && !options.adopt_legacy_manifest {
-                    return Err(StoreError(
-                        "non-empty RocksDB has no actordb manifest; reopen with explicit legacy manifest adoption after verifying and backing up the database"
-                            .to_string(),
-                    ));
-                }
-                db
-            }
-        } else {
-            rocksdb_engine::DBWithThreadMode::<rocksdb_engine::MultiThreaded>::open(
+            });
+            rocksdb_engine::DBWithThreadMode::<rocksdb_engine::MultiThreaded>::open_cf_descriptors(
                 &db_options,
                 path,
+                descriptors,
             )
             .map_err(|error| StoreError(error.to_string()))?
+        } else {
+            db_options.create_missing_column_families(true);
+            let descriptors = [
+                rocksdb_engine::DEFAULT_COLUMN_FAMILY_NAME,
+                ROCKSDB_METADATA_CF,
+            ]
+            .into_iter()
+            .map(|name| {
+                rocksdb_engine::ColumnFamilyDescriptor::new(
+                    name,
+                    rocksdb_engine::Options::default(),
+                )
+            });
+            let db = rocksdb_engine::DBWithThreadMode::<rocksdb_engine::MultiThreaded>::open_cf_descriptors(&db_options, path, descriptors)
+                .map_err(|error| StoreError(error.to_string()))?;
+            let metadata = db
+                .cf_handle(ROCKSDB_METADATA_CF)
+                .expect("fresh metadata CF");
+            let mut write = rocksdb_engine::WriteOptions::default();
+            write.set_sync(true);
+            db.put_cf_opt(&metadata, ROCKSDB_FORMAT_KEY, Self::format_bytes(), &write)
+                .map_err(|error| StoreError(error.to_string()))?;
+            drop(metadata);
+            db
         };
         let mut ordinary_write_options = rocksdb_engine::WriteOptions::default();
         ordinary_write_options.set_sync(matches!(options.durability, RocksDbDurability::SyncWal));
@@ -232,7 +224,7 @@ impl RocksDbStore {
             )));
         }
         let data_version = u32::from_be_bytes(encoded[12..16].try_into().unwrap());
-        if ![1, ROCKSDB_DATA_FORMAT_VERSION].contains(&data_version) {
+        if data_version != ROCKSDB_DATA_FORMAT_VERSION {
             return Err(StoreError(format!(
                 "unsupported RocksDB data format version {data_version} (expected {ROCKSDB_DATA_FORMAT_VERSION})"
             )));
@@ -268,136 +260,133 @@ impl RocksDbStore {
         Ok(StoreIdentity::new(node_id, fragment_count))
     }
 
-    fn validate_legacy_records(&self, identity: &StoreIdentity) -> Result<(), StoreError> {
-        for item in self.db.iterator(rocksdb_engine::IteratorMode::Start) {
+    fn format_bytes() -> [u8; 12] {
+        let mut bytes = [0; 12];
+        bytes[..4].copy_from_slice(&ROCKSDB_MANIFEST_VERSION.to_be_bytes());
+        bytes[4..8].copy_from_slice(&ROCKSDB_DATA_FORMAT_VERSION.to_be_bytes());
+        bytes[8..].copy_from_slice(&ROCKSDB_PARTITIONER_VERSION.to_be_bytes());
+        bytes
+    }
+    fn validate_metadata(
+        db: &rocksdb_engine::DBWithThreadMode<rocksdb_engine::MultiThreaded>,
+    ) -> Result<Option<StoreIdentity>, StoreError> {
+        let metadata = db.cf_handle(ROCKSDB_METADATA_CF).ok_or_else(|| {
+            StoreError("unmanifested RocksDB is unsupported by fresh format3".into())
+        })?;
+        if db
+            .get_cf(&metadata, ROCKSDB_FORMAT_KEY)
+            .map_err(|error| StoreError(error.to_string()))?
+            .as_deref()
+            != Some(Self::format_bytes().as_slice())
+        {
+            return Err(StoreError(
+                "RocksDB lacks exact format3 initialization metadata".into(),
+            ));
+        }
+        for item in db.iterator_cf(&metadata, rocksdb_engine::IteratorMode::Start) {
+            let (key, _) = item.map_err(|error| StoreError(error.to_string()))?;
+            if key.as_ref() != ROCKSDB_FORMAT_KEY
+                && key.as_ref() != ROCKSDB_MANIFEST_KEY
+                && key.as_ref() != checkpoint::IMPORT_KEY
+                && key.as_ref() != checkpoint::GENERATION_KEY
+                && !key.starts_with(checkpoint::PROVENANCE_PREFIX)
+            {
+                return Err(StoreError(
+                    "RocksDB metadata contains an unsupported key".into(),
+                ));
+            }
+        }
+        db.get_cf(&metadata, ROCKSDB_MANIFEST_KEY)
+            .map_err(|error| StoreError(error.to_string()))?
+            .map(|encoded| Self::decode_manifest(&encoded))
+            .transpose()
+    }
+    fn preflight_existing(path: &std::path::Path) -> Result<(), StoreError> {
+        let names = rocksdb_engine::DB::list_cf(&rocksdb_engine::Options::default(), path)
+            .map_err(|error| StoreError(error.to_string()))?;
+        if names.iter().any(|name| {
+            name != rocksdb_engine::DEFAULT_COLUMN_FAMILY_NAME && name != ROCKSDB_METADATA_CF
+        }) {
+            return Err(StoreError(
+                "RocksDB contains unsupported column family".into(),
+            ));
+        }
+        if !names.iter().any(|name| name == ROCKSDB_METADATA_CF) {
+            return Err(StoreError(
+                "unmanifested RocksDB is unsupported by fresh format3".into(),
+            ));
+        }
+        // Read-only RocksDB may create an informational log. Redirect it to
+        // an owned temporary directory, leaving every existing DB file intact.
+        let mut nonce = [0; 16];
+        getrandom::fill(&mut nonce).map_err(|error| StoreError(error.to_string()))?;
+        let suffix = nonce
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let logs =
+            ReadOnlyLogs(std::env::temp_dir().join(format!("actordb-format-probe-{suffix}")));
+        std::fs::create_dir(&logs.0).map_err(|error| StoreError(error.to_string()))?;
+        let mut options = rocksdb_engine::Options::default();
+        options.set_db_log_dir(&logs.0);
+        options.set_log_level(rocksdb_engine::LogLevel::Fatal);
+        let db = rocksdb_engine::DBWithThreadMode::<rocksdb_engine::MultiThreaded>::open_cf_for_read_only(&options, path, names, false).map_err(|error| StoreError(error.to_string()))?;
+        let identity = Self::validate_metadata(&db)?;
+        for item in db.iterator(rocksdb_engine::IteratorMode::Start) {
             let (key, encoded) = item.map_err(|error| StoreError(error.to_string()))?;
-            let prefix: [u8; 4] = key
-                .get(..4)
-                .ok_or_else(|| {
-                    StoreError(format!(
-                        "legacy RocksDB key is shorter than the 4-byte fragment prefix: {} bytes",
-                        key.len()
-                    ))
-                })?
-                .try_into()
-                .unwrap();
-            Self::preflight_encoded_record(key.len() - 4, &encoded)?;
-            let fragment = u32::from_be_bytes(prefix);
-            if fragment >= identity.fragment_count {
-                return Err(StoreError(format!(
-                    "legacy RocksDB key belongs to fragment {fragment}, outside configured count {}",
-                    identity.fragment_count
-                )));
-            }
-            let logical_key = std::str::from_utf8(&key[4..]).map_err(|error| {
-                StoreError(format!("legacy RocksDB logical key is not UTF-8: {error}"))
-            })?;
-            let expected = fragment_of(logical_key, identity.fragment_count as usize);
-            if expected.0 != fragment {
-                return Err(StoreError(format!(
-                    "legacy RocksDB key is stored under fragment {fragment} but maps to fragment {} for configured count {}",
-                    expected.0, identity.fragment_count
-                )));
-            }
-            Self::decode(&encoded).map_err(StoreError)?;
+            let identity = identity
+                .as_ref()
+                .ok_or_else(|| StoreError("unbound format3 database contains records".into()))?;
+            let logical = Self::validate_physical_key(&key, identity)?;
+            Self::preflight_encoded_record(logical.len(), &encoded)?;
+            let (_, start, end) = Self::encoded_record_layout(&encoded).map_err(StoreError)?;
+            std::str::from_utf8(&encoded[start..end])
+                .map_err(|error| StoreError(format!("record writer is not UTF-8: {error}")))?;
         }
         Ok(())
     }
-
     fn bind_manifest(&self, identity: &StoreIdentity) -> Result<(), StoreError> {
-        check_node_id_budget(identity.node_id.len()).map_err(|error| {
-            StoreError(format!(
-                "requested RocksDB identity has invalid node id: {error}"
-            ))
-        })?;
+        check_node_id_budget(identity.node_id.len())
+            .map_err(|error| StoreError(error.to_string()))?;
         if identity.fragment_count == 0 {
-            return Err(StoreError(
-                "requested RocksDB identity has zero fragments".to_string(),
-            ));
+            return Err(StoreError("requested identity has zero fragments".into()));
         }
-        let _manifest_guard = self
+        let _guard = self
             .manifest_lock
             .lock()
-            .map_err(|_| StoreError("RocksDB manifest lock was poisoned".to_string()))?;
-        if let Some(metadata) = self.db.cf_handle(ROCKSDB_METADATA_CF) {
-            for item in self
-                .db
-                .iterator_cf(&metadata, rocksdb_engine::IteratorMode::Start)
-            {
-                let (key, _) = item.map_err(|error| StoreError(error.to_string()))?;
-                if key.as_ref() == checkpoint::IMPORT_KEY {
-                    return Err(StoreError("checkpoint import is incomplete; resume the exact import before Node startup".into()));
-                }
-                if key.as_ref() != ROCKSDB_MANIFEST_KEY
-                    && key.as_ref() != checkpoint::GENERATION_KEY
-                    && !key.starts_with(checkpoint::PROVENANCE_PREFIX)
-                {
-                    return Err(StoreError(format!(
-                        "RocksDB metadata column family contains an unsupported key ({} bytes)",
-                        key.len()
-                    )));
-                }
-            }
-            if let Some(encoded) = self
-                .db
-                .get_cf(&metadata, ROCKSDB_MANIFEST_KEY)
-                .map_err(|error| StoreError(error.to_string()))?
-            {
-                let actual = Self::decode_manifest(&encoded)?;
-                if &actual != identity {
-                    return Err(StoreError(format!(
-                        "RocksDB identity mismatch: stored node {:?} with {} fragments, requested node {:?} with {} fragments",
-                        actual.node_id,
-                        actual.fragment_count,
-                        identity.node_id,
-                        identity.fragment_count
-                    )));
-                }
-                if u32::from_be_bytes(encoded[12..16].try_into().unwrap()) == 1 {
-                    self.validate_legacy_records(identity)?;
-                    self.db
-                        .put_cf_opt(
-                            &metadata,
-                            ROCKSDB_MANIFEST_KEY,
-                            Self::encode_manifest(identity),
-                            &self.sync_write_options,
-                        )
-                        .map_err(|error| StoreError(error.to_string()))?;
-                }
-                return Ok(());
-            }
+            .map_err(|_| StoreError("manifest lock poisoned".into()))?;
+        let metadata = self.metadata_cf()?;
+        if self
+            .db
+            .get_cf(&metadata, checkpoint::IMPORT_KEY)
+            .map_err(|error| StoreError(error.to_string()))?
+            .is_some()
+        {
+            return Err(StoreError(
+                "checkpoint import is incomplete; resume exact import before startup".into(),
+            ));
         }
-
-        let has_legacy_data = self
+        if let Some(actual) = Self::validate_metadata(&self.db)? {
+            if actual != *identity {
+                return Err(StoreError(format!(
+                    "RocksDB identity mismatch: stored {:?}, requested {:?}",
+                    actual, identity
+                )));
+            }
+            return Ok(());
+        }
+        if self
             .db
             .iterator(rocksdb_engine::IteratorMode::Start)
             .next()
             .transpose()
             .map_err(|error| StoreError(error.to_string()))?
-            .is_some();
-        if has_legacy_data && !self.options.adopt_legacy_manifest {
+            .is_some()
+        {
             return Err(StoreError(
-                "non-empty RocksDB has no actordb manifest; reopen with explicit legacy manifest adoption after verifying and backing up the database"
-                    .to_string(),
+                "unbound format3 database contains records".into(),
             ));
         }
-        if has_legacy_data {
-            self.validate_legacy_records(identity)?;
-        }
-
-        // Do not change a legacy database's column-family layout until its
-        // complete contents have been validated against the requested
-        // identity. This preserves rollback after a failed adoption attempt.
-        if self.db.cf_handle(ROCKSDB_METADATA_CF).is_none() {
-            self.db
-                .create_cf(ROCKSDB_METADATA_CF, &rocksdb_engine::Options::default())
-                .map_err(|error| StoreError(error.to_string()))?;
-        }
-        let metadata = self.metadata_cf()?;
-
-        // Identity metadata is always synchronously committed. Losing a
-        // manifest while retaining its data would make a later mount
-        // ambiguous even when ordinary batches use AsyncWal.
         self.db
             .put_cf_opt(
                 &metadata,
@@ -472,83 +461,52 @@ impl RocksDbStore {
     }
 
     fn encode(v: &VersionedValue) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(29 + v.node_id.len() + v.value.len());
-        buf.extend_from_slice(&v.timestamp_ms.to_be_bytes());
-        // 0 = no expiry.
-        buf.extend_from_slice(&v.expires_at_ms.unwrap_or(0).to_be_bytes());
-        buf.push(0x80 | v.is_tombstone as u8);
-        buf.extend_from_slice(&(v.node_id.len() as u32).to_be_bytes());
-        buf.extend_from_slice(&v.logical_counter.to_be_bytes());
-        buf.extend_from_slice(v.node_id.as_bytes());
-        buf.extend_from_slice(&v.value);
-        buf
+        let mut bytes = Vec::with_capacity(37 + v.node_id.len() + v.value.len());
+        bytes.extend_from_slice(ROCKSDB_RECORD_MAGIC);
+        bytes.extend_from_slice(&v.timestamp_ms.to_be_bytes());
+        bytes.extend_from_slice(&v.logical_counter.to_be_bytes());
+        bytes.extend_from_slice(&v.expires_at_ms.unwrap_or(0).to_be_bytes());
+        bytes.push(u8::from(v.is_tombstone));
+        bytes.extend_from_slice(&(v.node_id.len() as u32).to_be_bytes());
+        bytes.extend_from_slice(v.node_id.as_bytes());
+        bytes.extend_from_slice(&v.value);
+        bytes
     }
-
     fn encoded_record_layout(bytes: &[u8]) -> Result<(bool, usize, usize), String> {
-        if bytes.len() < 21 {
-            return Err(format!("value too short: {} bytes", bytes.len()));
+        if bytes.len() < 37 || bytes.get(..8) != Some(ROCKSDB_RECORD_MAGIC.as_slice()) {
+            return Err("unsupported record format; expected ACTVAL03".into());
         }
-        let is_tombstone = match bytes[16] {
-            0 | 128 => false,
-            1 | 129 => true,
-            flag => return Err(format!("invalid tombstone flag {flag}; expected 0 or 1")),
+        let tombstone = match bytes[32] {
+            0 => false,
+            1 => true,
+            flag => return Err(format!("invalid tombstone flag {flag}")),
         };
-        let node_id_len = u32::from_be_bytes(bytes[17..21].try_into().unwrap()) as usize;
-        let node_offset = if bytes[16] & 0x80 != 0 {
-            29usize
-        } else {
-            21usize
-        };
-        let value_offset = node_offset
-            .checked_add(node_id_len)
-            .ok_or_else(|| "node_id length overflowed usize".to_string())?;
-        if bytes.len() < value_offset {
-            return Err(format!(
-                "node_id overruns value: id_len={node_id_len} total={}",
-                bytes.len()
-            ));
+        let length = u32::from_be_bytes(bytes[33..37].try_into().unwrap()) as usize;
+        let end = 37usize
+            .checked_add(length)
+            .ok_or_else(|| "writer length overflow".to_owned())?;
+        if end > bytes.len() {
+            return Err("writer overruns record".into());
         }
-        Ok((is_tombstone, node_offset, value_offset))
+        Ok((tombstone, 37, end))
     }
-
     fn preflight_encoded_record(logical_key_len: usize, bytes: &[u8]) -> Result<(), StoreError> {
-        let (_, node_offset, value_offset) =
-            Self::encoded_record_layout(bytes).map_err(StoreError)?;
-        let node_id_len = value_offset - node_offset;
-        check_record_budget(logical_key_len, bytes.len() - value_offset, node_id_len).map_err(
-            |error| {
-                StoreError(format!(
-                    "persisted record (key bytes {logical_key_len}) cannot be replicated: {error}"
-                ))
-            },
-        )
+        let (_, start, end) = Self::encoded_record_layout(bytes).map_err(StoreError)?;
+        check_record_budget(logical_key_len, bytes.len() - end, end - start)
+            .map_err(|error| StoreError(format!("persisted record cannot be replicated: {error}")))
     }
-
     fn decode(bytes: &[u8]) -> Result<VersionedValue, String> {
-        let (is_tombstone, node_offset, value_offset) = Self::encoded_record_layout(bytes)?;
-        let logical_counter = if node_offset == 29 {
-            u64::from_be_bytes(bytes[21..29].try_into().unwrap())
-        } else {
-            0
-        };
-        let timestamp_ms = u64::from_be_bytes(bytes[0..8].try_into().unwrap());
-        let expires_raw = u64::from_be_bytes(bytes[8..16].try_into().unwrap());
-        let expires_at_ms = if expires_raw == 0 {
-            None
-        } else {
-            Some(expires_raw)
-        };
-        let node_id = std::str::from_utf8(&bytes[node_offset..value_offset])
-            .map_err(|error| format!("node_id not UTF-8: {error}"))?
-            .to_owned();
-        let value = bytes[value_offset..].to_vec();
+        let (is_tombstone, start, end) = Self::encoded_record_layout(bytes)?;
+        let expires = u64::from_be_bytes(bytes[24..32].try_into().unwrap());
         Ok(VersionedValue {
-            value,
-            timestamp_ms,
-            logical_counter,
-            node_id,
-            expires_at_ms,
+            timestamp_ms: u64::from_be_bytes(bytes[8..16].try_into().unwrap()),
+            logical_counter: u64::from_be_bytes(bytes[16..24].try_into().unwrap()),
+            expires_at_ms: (expires != 0).then_some(expires),
             is_tombstone,
+            node_id: std::str::from_utf8(&bytes[start..end])
+                .map_err(|error| error.to_string())?
+                .to_owned(),
+            value: bytes[end..].to_vec(),
         })
     }
 
@@ -652,6 +610,11 @@ impl KvStore for RocksDbStore {
         let identity = self.attached_identity()?;
         let mut batch = rocksdb_engine::WriteBatch::default();
         for (key, value) in writes {
+            if value.expires_at_ms == Some(0) {
+                return Err(StoreError(
+                    "zero expiry is reserved by record format3".into(),
+                ));
+            }
             let logical_key = Self::validate_physical_key(key, &identity)?;
             check_record_budget(logical_key.len(), value.value.len(), value.node_id.len())
                 .map_err(|error| {
@@ -704,6 +667,87 @@ mod tests {
     use crate::shard::FragmentId;
     use crate::store::PrefixedStore;
 
+    #[test]
+    fn old_storage_formats_are_rejected_without_changing_any_database_file() {
+        for (manifest_version, record_version) in [(1u32, 1u32), (1, 2), (3, 2)] {
+            let dir = tempfile::tempdir().unwrap();
+            let identity = StoreIdentity::new("owner".into(), 1);
+            {
+                let store = RocksDbStore::open(dir.path()).unwrap();
+                let binding = store.bind(&identity).unwrap();
+                let mut manifest = RocksDbStore::encode_manifest(&identity);
+                manifest[8..12].copy_from_slice(&manifest_version.to_be_bytes());
+                manifest[12..16].copy_from_slice(&record_version.to_be_bytes());
+                store
+                    .db
+                    .put_cf(
+                        &store.metadata_cf().unwrap(),
+                        ROCKSDB_MANIFEST_KEY,
+                        manifest,
+                    )
+                    .unwrap();
+                drop(binding);
+            }
+            let before = directory_snapshot(dir.path());
+            assert!(RocksDbStore::open(dir.path()).is_err());
+            assert_eq!(directory_snapshot(dir.path()), before);
+        }
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let old = rocksdb_engine::DB::open_default(dir.path()).unwrap();
+            old.put(b"old", b"record").unwrap();
+        }
+        let before = directory_snapshot(dir.path());
+        assert!(RocksDbStore::open(dir.path()).is_err());
+        assert_eq!(directory_snapshot(dir.path()), before);
+    }
+
+    #[test]
+    fn old_records_inside_new_manifest_are_rejected_before_writable_open() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let store = RocksDbStore::open(dir.path()).unwrap();
+            let binding = store.bind(&StoreIdentity::new("owner".into(), 1)).unwrap();
+            let mut old = Vec::new();
+            old.extend(42u64.to_be_bytes());
+            old.extend(0u64.to_be_bytes());
+            old.push(128);
+            old.extend(5u32.to_be_bytes());
+            old.extend(7u64.to_be_bytes());
+            old.extend(b"owner");
+            old.extend(b"payload");
+            store
+                .db
+                .put([0u32.to_be_bytes().as_slice(), b"key"].concat(), old)
+                .unwrap();
+            drop(binding);
+        }
+        let before = directory_snapshot(dir.path());
+        assert!(RocksDbStore::open(dir.path()).is_err());
+        assert_eq!(directory_snapshot(dir.path()), before);
+    }
+
+    #[test]
+    fn fresh_unbound_initialization_reopens_and_record3_preserves_every_stamp_field() {
+        let dir = tempfile::tempdir().unwrap();
+        drop(RocksDbStore::open(dir.path()).unwrap());
+        let store = RocksDbStore::open(dir.path()).unwrap();
+        let binding = store.bind(&StoreIdentity::new("owner".into(), 1)).unwrap();
+        let mut value = VersionedValue::new(b"opaque\xff".to_vec(), 42, "historical".into());
+        value.logical_counter = 99;
+        value.is_tombstone = true;
+        value.expires_at_ms = Some(100);
+        let key = [0u32.to_be_bytes().as_slice(), b"key"].concat();
+        store.write_batch(&[(key.clone(), value.clone())]).unwrap();
+        drop(binding);
+        drop(store);
+        let reopened = RocksDbStore::open(dir.path()).unwrap();
+        let _binding = reopened
+            .bind(&StoreIdentity::new("owner".into(), 1))
+            .unwrap();
+        assert_eq!(reopened.load().unwrap(), vec![(key, value)]);
+    }
+
     fn directory_snapshot(path: &std::path::Path) -> Vec<(std::ffi::OsString, Option<Vec<u8>>)> {
         let mut entries: Vec<_> = std::fs::read_dir(path)
             .unwrap()
@@ -730,53 +774,6 @@ mod tests {
     }
 
     #[test]
-    fn format_one_records_upgrade_and_preserve_logical_restart_versions() {
-        let dir = tempfile::tempdir().unwrap();
-        let identity = StoreIdentity::new("owner".into(), 1);
-        let key = [0u32.to_be_bytes().as_slice(), b"legacy"].concat();
-        let old = VersionedValue::new(b"old".to_vec(), 42, "owner".into());
-        {
-            let store = RocksDbStore::open(dir.path()).unwrap();
-            let binding = store.bind(&identity).unwrap();
-            let mut legacy = RocksDbStore::encode(&old);
-            legacy.drain(21..29);
-            legacy[16] &= 0x7f;
-            store.db.put(&key, legacy).unwrap();
-            let mut manifest = RocksDbStore::encode_manifest(&identity);
-            manifest[12..16].copy_from_slice(&1u32.to_be_bytes());
-            store
-                .db
-                .put_cf(
-                    &store.metadata_cf().unwrap(),
-                    ROCKSDB_MANIFEST_KEY,
-                    manifest,
-                )
-                .unwrap();
-            drop(binding);
-        }
-        let store = RocksDbStore::open(dir.path()).unwrap();
-        let binding = store.bind(&identity).unwrap();
-        assert_eq!(store.load().unwrap(), vec![(key.clone(), old)]);
-        let manifest = store
-            .db
-            .get_cf(&store.metadata_cf().unwrap(), ROCKSDB_MANIFEST_KEY)
-            .unwrap()
-            .unwrap();
-        assert_eq!(u32::from_be_bytes(manifest[12..16].try_into().unwrap()), 2);
-        let new = VersionedValue::new_version(
-            b"new".to_vec(),
-            actordb_protocol::RecordVersion::new(42, 1_000_000),
-            "owner".into(),
-        );
-        store.write_batch(&[(key.clone(), new.clone())]).unwrap();
-        drop(binding);
-        drop(store);
-        let reopened = RocksDbStore::open(dir.path()).unwrap();
-        let _binding = reopened.bind(&identity).unwrap();
-        assert_eq!(reopened.load().unwrap(), vec![(key, new)]);
-    }
-
-    #[test]
     fn rocksdb_decode_rejects_garbage() {
         assert!(RocksDbStore::decode(&[]).is_err());
         assert!(RocksDbStore::decode(&[0; 11]).is_err());
@@ -787,7 +784,7 @@ mod tests {
 
         let mut invalid_tombstone =
             RocksDbStore::encode(&VersionedValue::new(Vec::new(), 1, "node".to_string()));
-        invalid_tombstone[16] = 2;
+        invalid_tombstone[32] = 2;
         assert!(RocksDbStore::decode(&invalid_tombstone)
             .unwrap_err()
             .contains("invalid tombstone flag 2"));
@@ -821,13 +818,13 @@ mod tests {
     }
 
     #[test]
-    fn rocksdb_rejects_invalid_tombstone_on_load_and_legacy_adoption() {
+    fn rocksdb_rejects_invalid_tombstone_on_load() {
         let mut encoded = RocksDbStore::encode(&VersionedValue::new(
             b"value".to_vec(),
             1,
             "writer".to_string(),
         ));
-        encoded[16] = 2;
+        encoded[32] = 2;
         let mut key = 0u32.to_be_bytes().to_vec();
         key.extend_from_slice(b"key");
 
@@ -841,53 +838,6 @@ mod tests {
             .load()
             .expect_err("an invalid persisted tombstone flag was accepted");
         assert!(error.to_string().contains("invalid tombstone flag 2"));
-
-        let legacy_dir = tempfile::tempdir().unwrap();
-        {
-            let legacy = rocksdb_engine::DB::open_default(legacy_dir.path()).unwrap();
-            legacy.put(&key, &encoded).unwrap();
-        }
-        let adopting = RocksDbStore::open_with_options(
-            legacy_dir.path(),
-            RocksDbOptions::default().with_legacy_manifest_adoption(true),
-        )
-        .unwrap();
-        let error = adopting
-            .bind(&StoreIdentity::new("node".to_string(), 1))
-            .err()
-            .expect("legacy adoption accepted an invalid tombstone flag");
-        assert!(error.to_string().contains("invalid tombstone flag 2"));
-        assert!(adopting.db.cf_handle(ROCKSDB_METADATA_CF).is_none());
-    }
-
-    #[test]
-    fn rocksdb_legacy_adoption_preflights_wire_budget_before_decode() {
-        use crate::wire::MAX_FRAME_BYTES;
-
-        let dir = tempfile::tempdir().unwrap();
-        let mut key = 0u32.to_be_bytes().to_vec();
-        key.extend_from_slice(b"key");
-        let mut encoded = vec![0; 21 + 6 + MAX_FRAME_BYTES];
-        encoded[17..21].copy_from_slice(&6u32.to_be_bytes());
-        encoded[21..27].copy_from_slice(b"writer");
-        encoded[21] = 0xff;
-        {
-            let legacy = rocksdb_engine::DB::open_default(dir.path()).unwrap();
-            legacy.put(key, encoded).unwrap();
-        }
-
-        let adopting = RocksDbStore::open_with_options(
-            dir.path(),
-            RocksDbOptions::default().with_legacy_manifest_adoption(true),
-        )
-        .unwrap();
-        let error = adopting
-            .bind(&StoreIdentity::new("node".to_string(), 1))
-            .err()
-            .expect("an irreducibly large legacy record was adopted");
-        assert!(error.to_string().contains("cannot be replicated"));
-        assert!(!error.to_string().contains("not UTF-8"));
-        assert!(adopting.db.cf_handle(ROCKSDB_METADATA_CF).is_none());
     }
 
     #[test]
@@ -910,7 +860,7 @@ mod tests {
         assert!(store.load().unwrap().is_empty());
 
         let mut corrupt_key = 0u32.to_be_bytes().to_vec();
-        corrupt_key.extend_from_slice(b"legacy-invalid");
+        corrupt_key.extend_from_slice(b"invalid");
         store
             .db
             .put(
@@ -918,9 +868,7 @@ mod tests {
                 RocksDbStore::encode(&VersionedValue::new(Vec::new(), 1, String::new())),
             )
             .unwrap();
-        let error = store
-            .load()
-            .expect_err("invalid legacy provenance was loaded");
+        let error = store.load().expect_err("invalid provenance was loaded");
         assert!(error.to_string().contains("record node id is 0 bytes"));
     }
 
@@ -1015,12 +963,9 @@ mod tests {
         )
         .unwrap();
         let before = directory_snapshot(damaged_dir.path());
-        let error = RocksDbStore::open_with_options(
-            damaged_dir.path(),
-            RocksDbOptions::default().with_legacy_manifest_adoption(true),
-        )
-        .err()
-        .expect("a damaged RocksDB without CURRENT was reinitialized");
+        let error = RocksDbStore::open_with_options(damaged_dir.path(), RocksDbOptions::default())
+            .err()
+            .expect("a damaged RocksDB without CURRENT was reinitialized");
         assert!(error.to_string().contains("without CURRENT"));
         assert_eq!(directory_snapshot(damaged_dir.path()), before);
         assert!(!damaged_dir.path().join("CURRENT").exists());
@@ -1125,108 +1070,6 @@ mod tests {
     }
 
     #[test]
-    fn rocksdb_nonempty_legacy_database_requires_explicit_adoption() {
-        let dir = tempfile::tempdir().unwrap();
-        let identity = StoreIdentity::new("legacy-owner".to_string(), 2);
-        let logical_key = (0..1000)
-            .map(|index| format!("legacy-{index}"))
-            .find(|key| fragment_of(key, 2) == FragmentId(1))
-            .unwrap();
-        let key = {
-            let mut key = 1u32.to_be_bytes().to_vec();
-            key.extend_from_slice(logical_key.as_bytes());
-            key
-        };
-        {
-            let legacy = rocksdb_engine::DB::open_default(dir.path()).unwrap();
-            legacy
-                .put(
-                    &key,
-                    RocksDbStore::encode(&VersionedValue::new(
-                        b"value".to_vec(),
-                        1,
-                        "writer".to_string(),
-                    )),
-                )
-                .unwrap();
-        }
-        let error = RocksDbStore::open(dir.path())
-            .err()
-            .expect("non-empty legacy database was silently mutated and opened");
-        assert!(error
-            .to_string()
-            .contains("explicit legacy manifest adoption"));
-        assert_eq!(
-            rocksdb_engine::DB::list_cf(&rocksdb_engine::Options::default(), dir.path()).unwrap(),
-            vec![rocksdb_engine::DEFAULT_COLUMN_FAMILY_NAME.to_string()]
-        );
-        drop(rocksdb_engine::DB::open_default(dir.path()).unwrap());
-
-        let adopting = RocksDbStore::open_with_options(
-            dir.path(),
-            RocksDbOptions::default().with_legacy_manifest_adoption(true),
-        )
-        .unwrap();
-        assert!(adopting.db.cf_handle(ROCKSDB_METADATA_CF).is_none());
-        let binding = adopting.bind(&identity).unwrap();
-        assert!(adopting.db.cf_handle(ROCKSDB_METADATA_CF).is_some());
-        assert_eq!(adopting.load().unwrap()[0].0, key);
-        drop(binding);
-        drop(adopting);
-
-        let strict = RocksDbStore::open(dir.path()).unwrap();
-        drop(strict.bind(&identity).unwrap());
-    }
-
-    #[test]
-    fn rocksdb_legacy_adoption_rejects_wrong_partition_mapping_without_manifest() {
-        let dir = tempfile::tempdir().unwrap();
-        let logical_key = (0..1000)
-            .map(|index| format!("mismatch-{index}"))
-            .find(|key| fragment_of(key, 2) == FragmentId(1))
-            .unwrap();
-        let mut physical_key = 0u32.to_be_bytes().to_vec();
-        physical_key.extend_from_slice(logical_key.as_bytes());
-        {
-            let legacy = rocksdb_engine::DB::open_default(dir.path()).unwrap();
-            legacy
-                .put(
-                    physical_key,
-                    RocksDbStore::encode(&VersionedValue::new(
-                        b"value".to_vec(),
-                        1,
-                        "writer".to_string(),
-                    )),
-                )
-                .unwrap();
-        }
-
-        let adopting = RocksDbStore::open_with_options(
-            dir.path(),
-            RocksDbOptions::default().with_legacy_manifest_adoption(true),
-        )
-        .unwrap();
-        let error = adopting
-            .bind(&StoreIdentity::new("legacy-owner".to_string(), 2))
-            .err()
-            .expect("legacy data was adopted under an incompatible fragment count");
-        assert!(error.to_string().contains("maps to fragment 1"));
-        assert!(adopting.db.cf_handle(ROCKSDB_METADATA_CF).is_none());
-        drop(adopting);
-
-        let retry = RocksDbStore::open_with_options(
-            dir.path(),
-            RocksDbOptions::default().with_legacy_manifest_adoption(true),
-        )
-        .unwrap();
-        drop(
-            retry
-                .bind(&StoreIdentity::new("legacy-owner".to_string(), 1))
-                .unwrap(),
-        );
-    }
-
-    #[test]
     fn rocksdb_rejects_unknown_column_families_and_metadata_keys() {
         let unknown_cf_dir = tempfile::tempdir().unwrap();
         {
@@ -1241,10 +1084,6 @@ mod tests {
 
         let unknown_metadata_dir = tempfile::tempdir().unwrap();
         let store = RocksDbStore::open(unknown_metadata_dir.path()).unwrap();
-        store
-            .db
-            .create_cf(ROCKSDB_METADATA_CF, &rocksdb_engine::Options::default())
-            .unwrap();
         let metadata = store.metadata_cf().unwrap();
         store.db.put_cf(&metadata, b"future-key", b"value").unwrap();
         let error = store

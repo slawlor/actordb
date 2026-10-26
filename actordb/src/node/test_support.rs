@@ -58,13 +58,12 @@ pub(super) fn test_peer_channel(
 ) {
     let (tx, rx) = mpsc::channel(capacity);
     let (response_tx, response_rx) = mpsc::channel(capacity);
-    let (identity, _) = mpsc::channel(1);
+    let identity = crate::network::PeerConnectionId::new();
     let (cancel, _) = watch::channel(false);
     (
         PeerChannel {
             work_retention: None,
             outbound: BudgetedPeerTx {
-                frame_overhead: 0,
                 node_byte_budget: NodePeerByteBudget::new(NODE_PEER_QUEUE_BYTE_CAPACITY),
                 tx,
                 response_tx,
@@ -73,12 +72,11 @@ pub(super) fn test_peer_channel(
                     PEER_CHANNEL_BYTE_CAPACITY - PEER_RESPONSE_BYTE_RESERVE,
                 )),
                 reconcile_gate: ReconcileGate::new(),
-                identity,
+                connection_id: identity,
             },
             cancel,
             queue_admission_timeout: Duration::from_millis(10),
             rank: None,
-            capabilities: REQUIRED_WIRE_CAPABILITIES,
         },
         rx,
         response_rx,
@@ -172,10 +170,7 @@ pub(super) async fn complete_test_handshake(stream: &mut tokio::io::DuplexStream
         Envelope {
             msg: Some(EnvelopeMsg::Hello(Hello {
                 node_id: peer_id.to_string(),
-                auth_tag: Vec::new(),
-                min_protocol_version: WIRE_PROTOCOL_VERSION,
-                max_protocol_version: WIRE_PROTOCOL_VERSION,
-                capabilities: REQUIRED_WIRE_CAPABILITIES,
+                protocol_version: WIRE_PROTOCOL_VERSION,
                 challenge: vec![7; HANDSHAKE_CHALLENGE_BYTES],
                 process_generation: 0,
             })),

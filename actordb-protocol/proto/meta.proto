@@ -19,23 +19,16 @@ package meta;
 // Handshake: identifies the connecting node
 message Hello {
   string node_id = 1;
-  // Retained at its original field number for safe protobuf field evolution.
-  // Since protocol v2 this field must be empty; the challenge-bound proof is
-  // carried in HelloAuth.
-  bytes auth_tag = 2;
-  // Inclusive wire-version range understood by this peer. Both are nonzero;
-  // a connection proceeds only when the ranges overlap.
-  uint32 min_protocol_version = 3;
-  uint32 max_protocol_version = 4;
-  // Feature bitset. Required bits are checked before either side installs the
-  // connection, so mixed binaries fail closed rather than mis-acknowledging
-  // mutations or replication.
-  uint64 capabilities = 5;
+  reserved 2, 4, 5;
+  reserved "auth_tag", "min_protocol_version", "max_protocol_version", "capabilities";
+  // Exact peer protocol version. No range negotiation or downgrade path.
+  uint32 protocol_version = 3;
   // Fresh 256-bit challenge generated independently for every physical
   // connection. Both peers' complete Hellos are bound into each HelloAuth.
   bytes challenge = 6;
-  // Externally allocated process generation, authenticated by the configured
-  // independent process credential. Zero denotes legacy cluster authentication.
+  // Externally allocated operational generation checked by a receiver policy.
+  // Zero means no managed generation policy. TLS/shared-secret credential
+  // ownership and revocation remain external to this claim.
   uint64 process_generation = 8;
 }
 
@@ -43,10 +36,6 @@ message Hello {
 // HMAC-SHA256 over the ordered dialer/listener Hello transcript and the
 // proving role. Without a secret it is empty, but the flight still makes
 // handshake completion explicit before either peer publishes the connection.
-// With authenticated process-generation authority, auth_tag instead carries
-// an Ed25519 signature under that process's configured public identity.
-// Subsequent process-session frames use the capability-14 signed sequence
-// header before their protobuf Envelope bodies; see docs/peer-authority.md.
 message HelloAuth {
   bytes auth_tag = 1;
 }
@@ -137,18 +126,8 @@ message GetResponse {
   uint64 logical_counter = 9;
 }
 
-// Retired protocol-v1/v2 full-state frames. They remain generated for source
-// compatibility, but a protocol-v3 connection closes if either is received.
-message SyncRequest {
-  repeated uint32 fragments = 1;
-}
-
-// Retired peer full-state response; see SyncRequest above.
-message SyncResponse {
-  repeated SyncEntry entries = 1;
-}
-
-message SyncEntry {
+// A value page entry used only by correlated, bounded reconciliation.
+message ReconcileEntry {
   string key = 1;
   bytes value = 2;
   uint64 timestamp_ms = 3;
@@ -265,7 +244,7 @@ message ReconcileFetch {
 
 message ReconcileData {
   uint32 fragment = 1;
-  repeated SyncEntry entries = 2;
+  repeated ReconcileEntry entries = 2;
   uint64 session_id = 3;
   uint64 round_id = 4;
   uint64 chunk_seq = 5;
@@ -404,18 +383,17 @@ message BatchGetResponse {
     bool shed = 8;
   uint64 logical_counter = 9;
   }
-  // With CAPABILITY_BYTE_BOUNDED_BATCHES, a non-empty request returns either
+  // A non-empty request returns either
   // an empty unavailable response or a non-empty ordered prefix. The caller
   // resumes an omitted suffix under a fresh request id.
   repeated KeyValue results = 2;
 }
 
 message Envelope {
+  reserved 2, 3, 4;
+  reserved "replicate_op", "sync_request", "sync_response";
   oneof msg {
     Hello hello = 1;
-    // Phase 5: ReplicateOp (2) retired; batches carry Repeated ReplicateOp.
-    SyncRequest sync_request = 3;
-    SyncResponse sync_response = 4;
     ForwardedPut forwarded_put = 5;
     ForwardedGet forwarded_get = 6;
     GetResponse get_response = 7;

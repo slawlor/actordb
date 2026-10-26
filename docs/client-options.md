@@ -1,25 +1,11 @@
-# Rust client option construction in 0.8.0
+# Rust client options in 0.9.0
 
-`ClientOptions` and `PutOptions` now expose Bon builders and are
-`non_exhaustive`. This changes external struct-literal construction in the
-0.8.0 release; adding optional settings in later releases can keep
-existing builder calls source compatible. Defaults and public field access are
-preserved.
-
-Replace this construction:
-
-```rust,ignore
-let options = ClientOptions {
-    timeout: Duration::from_secs(5),
-    credential: Some(credential),
-    ..ClientOptions::default()
-};
-```
-
-with:
+Construct `ClientOptions` and `PutOptions` through their Bon builders, or start
+with `Default` and modify public fields. These types are `non_exhaustive`.
 
 ```rust,ignore
 let options = ClientOptions::builder()
+    .table("users")
     .timeout(Duration::from_secs(5))
     .credential(credential)
     .build();
@@ -29,19 +15,11 @@ let put = PutOptions::builder()
     .build();
 ```
 
-Optional fields also provide `maybe_credential(Option<Vec<u8>>)` and
-`maybe_ttl(Option<Duration>)` setters. For incremental configuration, start with
-`ClientOptions::default()` or `PutOptions::default()` and assign public fields.
+Optional fields provide `maybe_credential(Option<Vec<u8>>)` and
+`maybe_ttl(Option<Duration>)` setters. The initial table defaults to `KV`;
+`table("users")` explicitly selects another validated namespace.
 
-In 0.8.0, `ClientOptions::table` selects the initial table view and remains
-required:
-
-```rust,ignore
-let users = ClientOptions::builder().table("users").build();
-```
-
-Additional table views can share that same authenticated connection. They do
-not open another network socket:
+Additional table handles share one authenticated connection:
 
 ```rust,ignore
 let client = Client::connect(addr, ClientOptions::default()).await?;
@@ -51,9 +29,14 @@ users.put("u:1", value).await?;
 events.put("e:1", other_value).await?;
 ```
 
-Connection validation still occurs at `connect`/`from_stream`: identities,
-credentials, timeouts, and queue capacities retain their existing constraints.
-The request timeout remains the default total graceful close budget;
-`close_with_timeout` selects an explicit budget. Closing cancels queued and
-active exchanges across clones; mutations whose write has started retain an
-unknown outcome.
+Connection validation happens at `connect` / `from_stream`, including
+credentials, timeouts and queue capacities. The SDK uses exact application
+protocol **4**; there is no negotiation with non-current listeners.
+
+The request timeout is the default total graceful close budget.
+`close_with_timeout` selects another budget. Closing cancels queued and active
+exchanges across clones; a mutation whose write started has an unknown outcome.
+Closing the SDK never shuts down the database.
+
+See [the client guide](../actordb-client/README.md) and
+[transport configuration](transports.md).
