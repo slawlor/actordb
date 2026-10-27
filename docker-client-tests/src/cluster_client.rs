@@ -866,7 +866,7 @@ impl Harness {
                 self.barrier(&id, "rolling", true).await?;
             }
             "unavailable" => self.unavailable().await?,
-            "survivors-ready" => {
+            "survivors-ready" | "delivery-ready" => {
                 // Exact cached rows do not mean a sender's reset/catch-up lane
                 // has finished. Prove the surviving delivery cohort is ready
                 // before submitting one non-retried strict-majority write.
@@ -877,7 +877,7 @@ impl Harness {
                     .filter(|id| self.args.absent.as_ref() != Some(*id))
                     .cloned()
                     .collect();
-                require(survivors.len() == 3, "expected three bootstrap survivors")?;
+                require(survivors.len() >= 2, "expected a live delivery cohort")?;
                 retry("surviving stable delivery lanes", async || {
                     for id in &survivors {
                         let status =
@@ -890,9 +890,11 @@ impl Harness {
                             status["fragments"].as_array().ok_or("missing fragments")?;
                         require(
                             fragments.len() == FRAGMENTS as usize
-                                && fragments
-                                    .iter()
-                                    .all(|f| f["serving"] == true && f["state"] == "Serving"),
+                                && fragments.iter().all(|f| {
+                                    f["serving"] == true
+                                        && f["state"] == "Serving"
+                                        && f["replicas"] == json!(self.ledger.owners)
+                                }),
                             format!("{id}: surviving authority not ready: {status}"),
                         )?;
                         let senders = status["senders"].as_array().ok_or("missing senders")?;
@@ -904,6 +906,10 @@ impl Harness {
                                             && s["peer"] == *peer
                                             && s["state"] == "Connected"
                                             && s["rounds"].as_u64().unwrap_or(0) > 0
+                                            && s["activity"] == "Steady"
+                                            && s["reconciliation_stage"].is_null()
+                                            && s["buffered"] == 0
+                                            && s["in_flight"] == 0
                                     }),
                                     format!(
                                         "{id}: delivery to {peer}/{fragment} not ready: {status}"

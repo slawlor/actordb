@@ -41,6 +41,10 @@ ready. Mutation timeouts still fail the scenario and are never retried;
 failures retain full receipt diagnostics and live node/sender snapshots.
 The legacy restart scenario also gates the kill on survivor readiness and
 the restart on observed peer death, so a fast reboot cannot hide the outage.
+Rolling failures also wait for no active reconciliation, no retained/in-flight
+operations, and exact current placement on the required live delivery cohort
+before the kill and before the first majority write. Cached rows and a
+historical completed round cannot certify a currently usable quorum path.
 
 ## Control and failure scope
 

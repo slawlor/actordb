@@ -253,8 +253,10 @@ def run(backend, args):
     backend.checker("heal")
     for cycle in range(args.cycles):
         for node in ("node-a", "node-b", "node-c"):
+            backend.checker("delivery-ready")
             old = backend.status(node)["boot_id"]
             backend.stop(node)
+            backend.checker("delivery-ready", absent=node)
             survivor = next(n for n in ("node-a", "node-b", "node-c") if n != node)
             backend.checker("rolling", survivor, round=cycle*3 + NODES.index(node))
             backend.start(node)
