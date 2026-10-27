@@ -33,6 +33,36 @@ Positions never dispatched retain their definite admission/network errors;
 completed positions are not replayed. Do not retry uncertain writes as fresh
 mutations automatically.
 
+## Application RPC batching
+
+The generic application service groups bulk reads by fragment and pulls at most
+256 keys per actor/peer request, targeting 1 MiB pages. Only one page is active
+at a time; a single valid wide entry can exceed that soft target, but the complete
+unary reply still has the 16 MiB RPC limit. The service does not materialize an
+unbounded embedded `get_multi` result before checking the reply.
+
+Bulk reads reserve 64 MiB from the existing node-wide query runtime allowance
+for results, active pages and key/validation copies, plus bounded request metadata.
+The reservation follows local actor work after cancellation and the returned RPC
+reply through adapter encoding. `query_diagnostics` therefore includes application
+bulk-read ownership. Capacity exhaustion is explicit backpressure, not partial
+success or a missing-key result.
+
+Application bulk writes use waves of at most 128 independent keys, further
+bounded by embedded request-byte capacity. A repeated key ends the current wave;
+its later occurrence is stamped/admitted only after its predecessor completes.
+Other keys may execute concurrently through their actor pools or travel in the
+same peer batch. Each item's TTL is anchored once at its originating admission/
+stamp, and its absolute deadline and complete version are reused on failover.
+Bulk write concerns remain explicitly unsupported.
+
+Read and mutation results remain in original input order, including duplicate
+positions. Reply size is measured incrementally from each new encoded result,
+with exact field/delimiter overhead; no append rescans the accumulated reply.
+A read that exceeds the reply limit fails completely. Accepted mutations still
+finish their remaining waves if the reply cannot fit, returning an unknown
+outcome rather than abandoning apply/fan-out.
+
 ## Priority and traffic isolation
 
 - Plain `put_multi`/`get_multi` run at **`OpPriority::Background`** — they are
@@ -96,7 +126,8 @@ excluded from later attempts. This also handles a successful prefix followed
 by actor loss. Filtering preserves duplicate positions and input order, keeps
 every mutation's original stamp, and restarts response indexes at zero for
 each reduced request. If holders are exhausted, only unresolved positions get
-`NodeError::Network(..)`. A fragment with no usable replica is a configuration
+`NodeError::UnknownOutcome(..)` after a possibly dispatched attempt, or
+`NodeError::Network(..)` when unsent. A fragment with no usable replica is a configuration
 `NodeError::Actor(..)`.
 
 Single-key `put` uses the same per-owner deadline and exact mutation result. It

@@ -11,6 +11,8 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Notify, Semaphore};
+mod batch;
+pub(crate) use batch::BatchReply;
 
 #[derive(Debug, Clone, bon::Builder)]
 #[non_exhaustive]
@@ -168,13 +170,14 @@ impl RpcService for NodeRpcService {
             // interrupt an accepted mutation's apply and fan-out.
             tokio::spawn(async move {
                 let _receive_ownership = receive_ownership;
+                let mut reply_ownership = Vec::new();
                 let mut response = if mutation {
-                    dispatch(&inner.node, request).await
+                    dispatch(&inner.node, request, &mut reply_ownership).await
                 } else {
                     let result = tokio::select! {
                         biased;
                         _ = send.closed() => return,
-                        result = tokio::time::timeout(inner.options.timeout, dispatch(&inner.node, request)) => result,
+                        result = tokio::time::timeout(inner.options.timeout, dispatch(&inner.node, request, &mut reply_ownership)) => result,
                     };
                     match result {
                         Ok(response) => response,
@@ -203,7 +206,7 @@ impl RpcService for NodeRpcService {
                     };
                 }
                 operation.mark_responding();
-                let mut reply = RpcReply::new(response);
+                let mut reply = RpcReply::from_parts(response, reply_ownership);
                 reply.retain(operation);
                 reply.retain(lease);
                 let _ = send.send(reply);
@@ -318,7 +321,11 @@ impl DispatchTarget<'_> {
     }
 }
 
-async fn dispatch(node: &Node, request: wire::Request) -> wire::Response {
+async fn dispatch(
+    node: &Node,
+    request: wire::Request,
+    ownership: &mut actordb_protocol::rpc::RpcOwnership,
+) -> wire::Response {
     use wire::request::Operation;
     let mut response = wire::Response {
         ..Default::default()
@@ -420,17 +427,18 @@ async fn dispatch(node: &Node, request: wire::Request) -> wire::Response {
             if batch.keys.len() > actordb_protocol::MAX_BATCH_ITEMS {
                 response.error = Some(error(wire::ErrorCode::ResourceLimit, "too many batch keys"));
             } else {
-                for key in batch.keys {
-                    let result = target.get(key.clone(), priority(batch.priority)).await;
-                    response.reads.push(read_result(key, result));
-                    if response.encoded_len() + 16 > MAX_RPC_MESSAGE_BYTES {
-                        response.reads.clear();
-                        response.error = Some(error(
-                            wire::ErrorCode::ResourceLimit,
-                            "batch result exceeds frame limit",
-                        ));
-                        break;
+                let DispatchTarget::Table(table) = &target;
+                match node
+                    .rpc_batch_get(table.id().name(), batch.keys, priority(batch.priority))
+                    .await
+                {
+                    Ok((reads, retention)) => {
+                        response.reads = reads;
+                        if let Some(retention) = retention {
+                            ownership.push(Box::new(retention));
+                        }
                     }
+                    Err(error) => response.error = Some(error),
                 }
             }
         }
@@ -445,18 +453,13 @@ async fn dispatch(node: &Node, request: wire::Request) -> wire::Response {
             if batch.puts.len() > actordb_protocol::MAX_BATCH_ITEMS {
                 response.error = Some(error(wire::ErrorCode::ResourceLimit, "too many batch puts"));
             } else {
-                // Apply in input order, retaining duplicate positions. The batch
-                // is not a transaction: results describe each individual write.
-                for put in batch.puts {
-                    let result = target
-                        .put(
-                            put.key.clone(),
-                            put.value,
-                            put.ttl_ms.map(Duration::from_millis),
-                            priority(batch.priority),
-                        )
-                        .await;
-                    response.mutations.push(mutation_result(put.key, result));
+                let DispatchTarget::Table(table) = &target;
+                match node
+                    .rpc_batch_put(table.id().name(), batch.puts, priority(batch.priority))
+                    .await
+                {
+                    Ok(results) => response.mutations = results,
+                    Err(error) => response.error = Some(error),
                 }
             }
         }
@@ -581,7 +584,10 @@ fn priority(value: i32) -> OpPriority {
         _ => OpPriority::Default,
     }
 }
-fn read_result(key: String, result: Result<Option<VersionedValue>, NodeError>) -> wire::ReadResult {
+pub(crate) fn read_result(
+    key: String,
+    result: Result<Option<VersionedValue>, NodeError>,
+) -> wire::ReadResult {
     match result {
         Ok(value) => wire::ReadResult {
             key,
@@ -601,7 +607,7 @@ fn read_result(key: String, result: Result<Option<VersionedValue>, NodeError>) -
         },
     }
 }
-fn mutation_result(key: String, result: Result<(), NodeError>) -> wire::MutationResult {
+pub(crate) fn mutation_result(key: String, result: Result<(), NodeError>) -> wire::MutationResult {
     wire::MutationResult {
         key,
         error: result.err().map(|failure| {
@@ -653,7 +659,7 @@ fn concern_mutation_result(
         }
     }
 }
-fn error(code: wire::ErrorCode, message: &str) -> wire::Error {
+pub(crate) fn error(code: wire::ErrorCode, message: &str) -> wire::Error {
     wire::Error {
         code: code as i32,
         message: message.chars().take(1024).collect(),

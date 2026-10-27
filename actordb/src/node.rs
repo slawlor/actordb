@@ -170,6 +170,7 @@ use mutation_service::{
     FORWARDED_MUTATION_CAPACITY,
 };
 mod query;
+mod rpc_batch;
 mod table;
 pub use table::{Table, TableId};
 pub(crate) mod recovery;
@@ -384,6 +385,9 @@ fn ttl_expiry_deadline_ms(wall_ms: u64, ttl: Duration) -> Result<u64, NodeError>
             NodeError::Codec("TTL expiry must fit a nonzero u64 wall-clock deadline".to_string())
         })
 }
+
+type BatchPutItem = (String, Vec<u8>, Option<Duration>);
+type IndexedBatchPutItem = (usize, String, Vec<u8>, Option<Duration>);
 
 /// Map an [`OpPriority`] to its stable wire value (see `Priority` in
 /// `meta.proto`).
@@ -2666,7 +2670,22 @@ impl Node {
         kvs: Vec<(String, Vec<u8>)>,
         priority: OpPriority,
     ) -> Vec<Result<(), NodeError>> {
-        let operation = match self.admit_batch_operation(kvs.iter().map(|(key, _)| key.as_str())) {
+        self.put_multi_qualified_with_options(
+            kvs.into_iter()
+                .map(|(key, value)| (key, value, None))
+                .collect(),
+            priority,
+        )
+        .await
+    }
+
+    pub(super) async fn put_multi_qualified_with_options(
+        &self,
+        kvs: Vec<BatchPutItem>,
+        priority: OpPriority,
+    ) -> Vec<Result<(), NodeError>> {
+        let operation = match self.admit_batch_operation(kvs.iter().map(|(key, _, _)| key.as_str()))
+        {
             Ok(operation) => operation,
             Err(_) => {
                 return kvs
@@ -2676,7 +2695,7 @@ impl Node {
             }
         };
         let retention = match self.embedded_operations.admit_batch_owned(
-            embedded_operations::batch_put_request_bytes(&kvs),
+            embedded_operations::batch_put_options_request_bytes(&kvs),
             Some(operation.clone()),
         ) {
             Ok(retention) => retention,
@@ -2688,19 +2707,19 @@ impl Node {
 
     async fn put_multi_with_priority_admitted(
         &self,
-        kvs: Vec<(String, Vec<u8>)>,
+        kvs: Vec<BatchPutItem>,
         priority: OpPriority,
         retention: Arc<RequestRetention>,
     ) -> Vec<Result<(), NodeError>> {
         // Partition into local ops and remote groups (by fragment).
-        let mut local: Vec<(usize, String, Vec<u8>)> = Vec::new();
-        let mut remote: HashMap<FragmentId, Vec<(usize, String, Vec<u8>)>> = HashMap::new();
+        let mut local = Vec::new();
+        let mut remote: HashMap<FragmentId, Vec<IndexedBatchPutItem>> = HashMap::new();
         let mut results: Vec<Option<Result<(), NodeError>>> =
             (0..kvs.len()).map(|_| None).collect();
 
-        for (i, (key, value)) in kvs.into_iter().enumerate() {
+        for (i, (key, value, ttl)) in kvs.into_iter().enumerate() {
             if self.fragment_actor(&key).is_some() {
-                local.push((i, key, value));
+                local.push((i, key, value, ttl));
             } else {
                 let frag = fragment_of(&key, self.router.fragment_count);
                 if self.replica_order(frag).is_empty() {
@@ -2708,7 +2727,7 @@ impl Node {
                         "no replica for fragment {frag}"
                     ))));
                 } else {
-                    remote.entry(frag).or_default().push((i, key, value));
+                    remote.entry(frag).or_default().push((i, key, value, ttl));
                 }
             }
         }
@@ -2724,12 +2743,12 @@ impl Node {
             if chunk.is_empty() {
                 break;
             }
-            let local_futs = chunk.into_iter().map(|(i, key, value)| {
+            let local_futs = chunk.into_iter().map(|(i, key, value, ttl)| {
                 let this = self;
                 let retention = retention.clone();
                 async move {
                     let r = this
-                        .put_with_ttl_and_priority(key, value, None, priority, retention)
+                        .put_with_ttl_and_priority(key, value, ttl, priority, retention)
                         .await;
                     (i, r)
                 }
@@ -2747,11 +2766,21 @@ impl Node {
         let wire_priority = priority_to_proto(priority);
         for (frag, items) in remote {
             let mut remaining = VecDeque::new();
-            for (index, key, value) in items {
+            for (index, key, value, ttl) in items {
                 if let Err(error) = validate_record_wire_budget(&key, value.len(), &self.node_id) {
                     results[index] = Some(Err(error));
                     continue;
                 }
+                let expires_at_ms = match ttl
+                    .map(|ttl| ttl_expiry_deadline_ms(crate::actor::now_ms(), ttl))
+                    .transpose()
+                {
+                    Ok(expiry) => expiry,
+                    Err(error) => {
+                        results[index] = Some(Err(error));
+                        continue;
+                    }
+                };
                 let seq = {
                     let mut guard = self.next_seq.lock().await;
                     *guard += 1;
@@ -2774,7 +2803,7 @@ impl Node {
                         node_id: self.node_id.clone(),
                         seq,
                         boot_id: self.boot_id,
-                        expires_at_ms: 0,
+                        expires_at_ms: expires_at_ms.unwrap_or(0),
                         is_tombstone: false,
                         priority: wire_priority,
                         hops: 0,
