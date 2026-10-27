@@ -18,6 +18,12 @@ use the new unary `actordb.rpc.v1.ActorDb/Call` contract, not the old TCP protoc
   materialization reservations; lost mutation replies are never replayed.
 - Migrate examples and all Docker scenarios to real gRPC. Keep routing outages,
   partitions, crashes, growth/shrink and explicit full-outage recovery mandatory.
+- Group application bulk reads into bounded actor/peer pages, retaining shared
+  node memory admission through cancellation and reply encoding. Batch independent
+  writes in ordered waves with per-item TTLs and exact-stamp failover, preserving
+  duplicate positions and accepted mutation ownership (#188).
+- Size each bulk reply result once with exact incremental protobuf accounting,
+  removing quadratic response walks without relaxing message limits (#189).
 - Bound incomplete gRPC request bodies by a server-owned receive deadline,
   releasing materialization reservations without cancelling an already
   accepted mutation or its independent concern wait (#185).

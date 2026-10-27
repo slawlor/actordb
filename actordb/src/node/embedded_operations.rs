@@ -306,14 +306,16 @@ pub(super) fn single_concern_request_bytes(key: &String, value: Option<&Vec<u8>>
         .saturating_add(value.map_or(0, Vec::capacity))
         .saturating_add(super::MAX_WIRE_NODE_ID_BYTES)
 }
-pub(super) fn batch_put_request_bytes(values: &Vec<(String, Vec<u8>)>) -> usize {
-    std::mem::size_of::<Vec<(String, Vec<u8>)>>()
-        .saturating_add(
-            values
-                .capacity()
-                .saturating_mul(std::mem::size_of::<(String, Vec<u8>)>()),
-        )
-        .saturating_add(values.iter().fold(0usize, |bytes, (key, value)| {
+pub(super) fn batch_put_options_request_bytes(
+    values: &Vec<(String, Vec<u8>, Option<std::time::Duration>)>,
+) -> usize {
+    std::mem::size_of::<Vec<(String, Vec<u8>, Option<std::time::Duration>)>>()
+        .saturating_add(values.capacity().saturating_mul(std::mem::size_of::<(
+            String,
+            Vec<u8>,
+            Option<std::time::Duration>,
+        )>()))
+        .saturating_add(values.iter().fold(0usize, |bytes, (key, value, _)| {
             bytes.saturating_add(single_request_bytes(key, Some(value)))
         }))
 }

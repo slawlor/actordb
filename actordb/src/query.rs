@@ -99,7 +99,8 @@ pub(crate) const QUERY_WORK_BYTES: usize = 1024 * 1024;
 
 pub(crate) const DEFAULT_QUERY_RUNTIME_BYTES: usize = 256 * 1024 * 1024;
 
-/// Admission counters for active query/scan execution. These are conservative
+/// Admission counters for active query/scan and application bulk-read execution.
+/// These are conservative
 /// reservations, not RSS measurements or storage retained by returned callers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct QueryDiagnostics {
