@@ -87,7 +87,7 @@ jobs:
 
       - name: Retain hardening diagnostics even on failure
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: cluster-hardening-${{ github.run_id }}
           path: |
