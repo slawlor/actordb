@@ -14,27 +14,26 @@ with logical tables, a standalone Rust SDK and opt-in persistence.
 
 ## Current release and deployment
 
-ActorDB `0.10.0` requires Rust **1.88+**. Deploy matching database, protocol,
-query and SDK crates together. Peers use exact
-protocol **6**, application connections exact protocol **4**, and RocksDB
-record/manifest format **3**. There is no rolling wire upgrade, old-store
-adoption, compatibility API alias or automatic data conversion. Current-format
-`0.9.0` deployments require no data conversion; non-current formats require a
-fresh deployment. The SDK's new decoded-response allowance defaults to 64 MiB;
-configure a larger allowance explicitly for supported wide responses or
-near-server-limit narrow text results.
+ActorDB `0.11.0` requires Rust **1.88+**. Deploy matching database, protocol,
+query and SDK crates together. Peers retain exact protocol **6** and RocksDB
+record/manifest format **3**. Application APIs migrate together to typed unary
+`actordb.rpc.v1` RPC: there is no old application listener, handshake or fallback.
+Current-format storage does not need conversion for this RPC change;
+non-current formats still require a fresh deployment. The SDK defaults to
+64 MiB per response and 256 MiB aggregate materialization reservations;
+configure both allowances explicitly for larger trusted workloads.
 
 ```toml
 [dependencies]
-actordb = "0.10.0"
+actordb = "0.11.0"
 ```
 
-The default feature set is empty. The Node uses a volatile actor cache and
+The default feature set enables `grpc`, but includes no storage backend. The Node uses a volatile actor cache and
 provides the `KvStore` interface without enabling a bundled store. RocksDB is
 an independent opt-in:
 
 ```toml
-actordb = { version = "0.10.0", features = ["rocksdb"] }
+actordb = { version = "0.11.0", features = ["rocksdb"] }
 ```
 
 The `memory` feature exposes a no-op test store, not durable storage.
@@ -126,23 +125,29 @@ There are no Ed25519 process keys or signed-frame headers.
 
 ## Rust application SDK
 
-The peer listener is not an application endpoint. Bind a
-`client_server::ClientServer` around an `Arc<Node>` and connect using
-`actordb-client`. Application connections never become replication members.
+The peer listener is not an application endpoint. The default gRPC adapter
+wraps an `Arc<Node>` through `grpc::GrpcServer`; SDK calls use unary
+`actordb.rpc.v1.ActorDb/Call` and never join peer membership.
 
 ```toml
-actordb-client = "0.10.0"
+actordb-client = "0.11.0"
 ```
 
-The SDK supports point and batch operations, TTL, priorities, write concerns,
-logical table views, bounded scans/SQL and read-only local inspection. Clones
-share one serialized connection. Count/byte admission and total request
-deadlines are bounded.
+The SDK supports point/batch operations, TTL, priorities, write concerns,
+table views, scans/SQL and local inspection. Calls run concurrently within
+request and aggregate response-memory budgets; there is no custom client
+handshake, connection identity or request-ID state.
 
-Application credentials are independent of the peer cluster secret.
-`Client::from_stream`, `ClientServer::bind_with_network` and `from_acceptor`
-accept caller-authenticated TLS transports. Closing the SDK does not shut down
-the database. Mutations are not automatically replayed after uncertain delivery.
+gRPC is default-enabled in both crates. Vendors disable default features and
+implement `RpcClient`/`RpcService` using another framework, such as Thrift.
+`NodeRpcService` and the generic SDK do not authenticate clients. TLS,
+credentials and ACLs belong to the chosen RPC adapter. The gRPC implementation
+accepts provisioned tonic TLS configuration and framework-native authorization
+metadata/hooks. HTTP/2 channels are reusable; RPC does not mean dialing per call.
+
+Closing the SDK never shuts down the database. Accepted mutations remain
+owned through apply/fan-out; an uncertain reply is never transparently replayed.
+See [RPC/transports](docs/transports.md) and [client options](docs/client-options.md).
 
 ## Persistence and checkpoints
 

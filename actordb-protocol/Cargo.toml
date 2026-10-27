@@ -1,6 +1,6 @@
 [package]
 name = "actordb-protocol"
-version = "0.10.0"
+version = "0.11.0"
 edition = "2021"
 rust-version = "1.88"
 license = "MIT"
@@ -8,15 +8,17 @@ description = "Language-neutral peer and application wire contracts for ActorDB"
 readme = "README.md"
 
 [features]
-codegen = ["dep:prost-build", "dep:protobuf-src"]
+codegen = ["dep:prost-build", "dep:protoc-bin-vendored"]
+grpc = ["dep:tonic", "dep:bytes"]
 
 [dependencies]
 bon = "3.10.2"
 prost = "0.14"
-hmac = "0.13"
 sha2 = "0.11"
 prost-build = { version = "0.14", optional = true }
-protobuf-src = { version = "2.1", optional = true }
+protoc-bin-vendored = { version = "3", optional = true }
+tonic = { version = "0.14", optional = true, default-features = false, features = ["codegen"] }
+bytes = { version = "1", optional = true }
 
 [[bin]]
 name = "generate"

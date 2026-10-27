@@ -1,6 +1,6 @@
 # Rust client and query companion design
 
-This describes the current ActorDB `0.9.0` architecture. See
+This describes the current ActorDB `0.11.0` architecture. See
 [SQL queries](query.md) and [the Rust SDK](../actordb-client/README.md) for usage.
 
 ## Crate and endpoint boundaries
@@ -20,8 +20,7 @@ Application connections never join peer membership.
   replication.
 
 Use `actordb_protocol` directly for schema consumers. There is no public
-database-crate wire alias. Exact peer protocol **6** and application protocol
-**4** include all current operations without capability negotiation.
+database-crate wire alias. Exact peer protocol **6** and unary `actordb.rpc.v1` application RPC include all current operations without capability negotiation.
 
 ## Current operation coverage
 
@@ -30,7 +29,7 @@ database-crate wire alias. Exact peer protocol **6** and application protocol
 | Point put/delete/read | Server-stamped LWW versions, TTL/priority, typed errors and explicit uncertain mutation outcomes |
 | Ordered batches | Input positions and duplicates preserved; independent per-key outcomes, not transactions |
 | Write concerns | Count/majority/region constraints, strict caps, actual durability and operation-floor evidence |
-| Logical tables | Named namespaces share one authenticated application connection and Node |
+| Logical tables | Named namespaces share an RPC adapter and Node, not client session state |
 | Scans | Bounded filter/transform work with explicitly per-fragment limit/offset semantics |
 | SQL | Named relations, typed parameters, fragment filters, bounded pages, projections and exact aggregates |
 | Inspection | Read-only local health and placement, not authority or a remote durability proof |
@@ -56,7 +55,7 @@ snapshot. A distributed query is not a globally simultaneous read transaction.
 
 ## Application connection behavior
 
-SDK clones share one serialized connection and bounded count/encoded-byte
+SDK clones share an RPC adapter, aggregate response reservations, and bounded count/encoded-byte
 admission. The request deadline includes connection-lock waiting. Use additional
 connections for parallelism; multiplexing, topology discovery, automatic
 mutation replay and remote operator control are not provided.

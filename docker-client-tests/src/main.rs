@@ -12,9 +12,9 @@ struct Arguments {
     /// Application endpoints, in node-a, node-b, node-c order; accepts DNS names.
     #[arg(long, required = true, num_args = 1)]
     endpoint: Vec<String>,
-    /// Public test credential; independently configured on every listener.
+    /// Optional test gRPC bearer token; authentication is adapter-owned.
     #[arg(long)]
-    credential: Option<String>,
+    bearer_token: Option<String>,
     #[arg(long, default_value_t = 180, value_parser = clap::value_parser!(u64).range(1..=180))]
     timeout_secs: u64,
 }
@@ -35,23 +35,28 @@ fn marker(message: &str) -> Result<()> {
     io::stdout().flush()?;
     Ok(())
 }
-fn options(credential: Option<&str>) -> ClientOptions {
+fn options() -> ClientOptions {
     ClientOptions::builder()
-        .identity("external-sdk-scenario")
-        .maybe_credential(credential.map(|secret| secret.as_bytes().to_vec()))
         .timeout(Duration::from_secs(5))
         .build()
 }
-async fn connect(endpoint: &str, credential: Option<&str>) -> Result<Client> {
-    let addr = tokio::net::lookup_host(endpoint)
-        .await?
-        .next()
-        .ok_or("endpoint resolved to no addresses")?;
-    Ok(Client::connect(addr, options(credential)).await?)
+async fn connect(endpoint: &str, bearer_token: Option<&str>) -> Result<Client> {
+    let mut grpc = actordb_client::grpc::GrpcClientOptions::default();
+    if let Some(token) = bearer_token {
+        grpc.metadata
+            .insert("authorization", format!("Bearer {token}").parse()?);
+    }
+    let rpc = actordb_client::grpc::GrpcClient::connect(
+        format!("http://{endpoint}"),
+        grpc,
+        Duration::from_secs(5),
+    )
+    .await?;
+    Ok(Client::from_rpc(std::sync::Arc::new(rpc), options())?)
 }
-async fn wait_connect(endpoint: &str, credential: Option<&str>) -> Client {
+async fn wait_connect(endpoint: &str, bearer_token: Option<&str>) -> Client {
     loop {
-        match connect(endpoint, credential).await {
+        match connect(endpoint, bearer_token).await {
             Ok(client) => return client,
             Err(_) => tokio::time::sleep(POLL).await,
         }
@@ -312,29 +317,27 @@ async fn scenario(arguments: Arguments) -> Result<()> {
         arguments.endpoint.len() == 3,
         "supply exactly3 --endpoint values in node-a,b,c order",
     )?;
-    let credential = arguments.credential.as_deref();
+    let bearer_token = arguments.bearer_token.as_deref();
     check(
-        credential.is_none_or(|value| value.len() >= 32),
-        "test credential must contain at least32bytes",
+        bearer_token.is_none_or(|value| !value.is_empty()),
+        "test bearer token must not be empty",
     )?;
     let mut clients = Vec::new();
     for endpoint in &arguments.endpoint {
-        clients.push(wait_connect(endpoint, credential).await);
+        clients.push(wait_connect(endpoint, bearer_token).await);
     }
-    let mut wrong = options(credential);
-    let mut wrong_key = credential
-        .map(|secret| secret.as_bytes().to_vec())
-        .unwrap_or_else(|| vec![b'!'; 32]);
-    wrong_key[0] ^= 1;
-    wrong.credential = Some(wrong_key);
-    let address = tokio::net::lookup_host(arguments.endpoint[0].as_str())
-        .await?
-        .next()
-        .ok_or("empty endpoint")?;
-    check(
-        Client::connect(address, wrong).await.is_err(),
-        "wrong application credential was accepted",
-    )?;
+    if let Some(token) = bearer_token {
+        let wrong = connect(&arguments.endpoint[0], Some(&format!("{token}-wrong"))).await?;
+        check(
+            wrong.put("must-not-apply", vec![1]).await.is_err(),
+            "wrong gRPC token was accepted",
+        )?;
+        wrong.close().await;
+        check(
+            clients[0].get("must-not-apply").await?.is_none(),
+            "denied RPC applied",
+        )?;
+    }
     let records = expected();
     healthy(&clients, &records).await?;
     marker("CLIENT_HEALTHY_OK")?;
@@ -354,11 +357,8 @@ async fn scenario(arguments: Arguments) -> Result<()> {
         tokio::time::sleep(POLL).await;
     }
     check(
-        matches!(
-            clients[0].get(&records[0].0).await,
-            Err(ClientError::Closed)
-        ),
-        "dead handle did not close after transport failure",
+        clients[0].get(&records[0].0).await.is_err(),
+        "RPC against the stopped ingress falsely succeeded",
     )?;
     loop {
         if clients[1].inspect().await?.peer_count == 1
@@ -368,8 +368,9 @@ async fn scenario(arguments: Arguments) -> Result<()> {
         }
         tokio::time::sleep(POLL).await;
     }
-    // Reconnection is explicit. Never replay a possibly-dispatched mutation.
-    let survivor = connect(&arguments.endpoint[1], credential).await?;
+    // Endpoint failover is explicit. The original gRPC channel can recover
+    // independently, but no possibly-dispatched mutation is replayed.
+    let survivor = connect(&arguments.endpoint[1], bearer_token).await?;
     check(
         full_rows(&survivor).await?.rows == expected_rows(&records),
         "surviving replicas lost baseline rows",
@@ -402,7 +403,7 @@ async fn scenario(arguments: Arguments) -> Result<()> {
     marker("CLIENT_FAILOVER_OK")?;
     // The driver restarts node-a only after the failover marker.
     loop {
-        if let Ok(recovered) = connect(&arguments.endpoint[0], credential).await {
+        if let Ok(recovered) = connect(&arguments.endpoint[0], bearer_token).await {
             let ready = recovered.inspect().await.is_ok_and(|state| {
                 state.peer_count == 2
                     && state.health.len() == 4

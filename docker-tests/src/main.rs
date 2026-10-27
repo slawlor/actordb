@@ -75,9 +75,9 @@ enum Command {
         peer: Vec<String>,
         #[arg(long)]
         db_path: Option<PathBuf>,
-        /// Separate application credential as UTF-8 bytes (at least 32 bytes).
+        /// Optional test-only gRPC bearer token; not a peer secret.
         #[arg(long)]
-        credential: Option<String>,
+        bearer_token: Option<String>,
     },
     /// Wait for peers, write one key, exit 0.
     ReplicateWriter {
@@ -531,8 +531,8 @@ async fn main() {
             client_port,
             peer,
             db_path,
-            credential,
-        } => client_node::run(node_id, peer_port, client_port, peer, db_path, credential).await,
+            bearer_token,
+        } => client_node::run(node_id, peer_port, client_port, peer, db_path, bearer_token).await,
         Command::ReplicateWriter {
             node_id,
             port,

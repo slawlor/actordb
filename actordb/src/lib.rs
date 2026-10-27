@@ -20,8 +20,11 @@ pub mod actor;
 /// one-hop routing.
 pub mod node;
 
-/// Application listener for remote SDKs, independent of the peer mesh.
-pub mod client_server;
+/// Optional default gRPC application adapter.
+#[cfg(feature = "grpc")]
+pub mod grpc;
+/// Framework-neutral application RPC service, independent of the peer mesh.
+pub mod rpc;
 
 /// Bounded SQL query coordination over fragment views.
 pub mod query;

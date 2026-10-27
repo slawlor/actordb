@@ -1,13 +1,9 @@
-# Custom transports and TLS
+# Peer transports and application RPC
 
-ActorDB accepts caller-supplied async byte streams for both peer connections and
-application connections. Plain TCP remains the default. Enable the optional
-`actordb/tls` feature to use the built-in rustls `TlsNetwork`, or implement
-`Network` with another TLS library or transport policy.
-
-Use the database, protocol, query and SDK crates at `0.9.0`. Peer protocol 6 and
-application protocol 4 are exact contracts, not negotiated version ranges.
-Fresh deployments use new stores; see [deployment](support-api-migration.md).
+ActorDB 0.11.0 separates two interfaces. Persistent peer replication uses
+`Network` byte streams and unchanged exact peer protocol 6. Application APIs
+use typed unary RPC traits; default gRPC is a separate framework adapter.
+Neither the generic SDK nor Node RPC service authenticates clients.
 
 ## Peer mesh
 
@@ -53,94 +49,64 @@ configured timeout still bounds each handshake. A single `TlsNetwork` uses one
 outbound server name for all destinations. Deployments that need a different
 name per address can implement `Network` and select names in their adapter.
 
-## Application listener
+## Application RPC
 
-Use `ClientServer::bind_with_network(node, addr, network, options)` to bind through
-the same transport interface. `ClientServer::bind(node, addr, options)` remains
-the plain TCP convenience API.
-
-If the caller already owns a listener, transfer it with
-`ClientServer::from_acceptor(node, bound_addr, acceptor, options)`. The server owns
-the acceptor and accepted streams, applies its normal connection/request/byte
-limits, and reports `bound_addr` through `addr()`. Invalid options drop the supplied
-acceptor; `bind_with_network` validates options before binding. Accept errors retry
-with a short delay, allowing transient transport failures to recover.
-
-Shutdown cancels pending accepts, drops the listener, and joins application
-sessions. Accepted mutations retain their existing completion semantics. The
-underlying Node continues running, and application connections never enter peer
-membership.
-
-## Rust application client
-
-Establish and validate the transport yourself, then call:
+The default `grpc` feature is enabled in both `actordb` and `actordb-client`.
+It provides unary `actordb.rpc.v1.ActorDb/Call` RPCs with committed Prost bindings.
+HTTP/2 channels are reusable; RPC does not require dialing for every operation.
 
 ```rust,ignore
-let stream = connector.connect(server_name, tcp_stream).await?;
-let client = Client::from_stream(stream, client_options).await?;
+let mut server = GrpcServer::bind(node, addr, GrpcServerOptions::default()).await?;
+let client = Client::connect(format!("http://{}", server.addr()), ClientOptions::default()).await?;
 client.put("greeting", b"hello".to_vec()).await?;
 client.close().await;
+server.shutdown().await?;
 ```
 
-`Client::from_stream` owns the supplied stream and performs the normal application
-handshake. `ClientOptions::timeout` bounds that handshake; the caller sets deadlines
-for dialing and TLS negotiation before supplying the stream. Validation failure,
-handshake failure, and cancellation drop the stream. `Client::connect` still uses
-plain TCP with one deadline covering its dial and application handshake.
+Authentication, authorization and TLS belong to this adapter. Supply provisioned
+certificates and CA policy through tonic `ServerTlsConfig`/`ClientTlsConfig`;
+construct `GrpcClient` from the configured channel and provide native metadata
+using `GrpcClientOptions`. `GrpcServerOptions.authorize` runs before Node admission
+and can inspect metadata, TLS certificate/connect info, and actual table/operation.
+Normalize table names appropriately in an ACL policy; the Node canonicalizes them.
 
-All operation methods, serialized request admission, framing limits, credential
-checks, and unknown mutation outcomes remain the same. The SDK does not gain a
-normal dependency on `actordb` or a TLS library.
+For another RPC framework:
 
-## Transport contract
-
-Peer/application frames are ordinary length-prefixed protobuf bodies, capped at
-16 MiB. There are no process signatures or additional signed-frame headers.
-An optional shared secret authenticates challenge-bound possession, not an
-individual member or subsequent frame contents. The supplied TLS transport
-must establish peer authentication, payload integrity and confidentiality.
-Generation checks and drain barriers do not replace credential revocation.
-
-- Deliver reliable, ordered bytes and support concurrent reads and writes.
-  Propagate backpressure and connection errors. ActorDB flushes each complete
-  frame, supporting buffered streams as well as sockets.
-- Dropping a pending bind, connect, or accept future must cancel that operation
-  and release partial resources. Dropping an acceptor releases its listener;
-  dropping a stream releases its connection and owned transport work. Do not
-  detach unowned tasks or replay bytes or operations across reconnects.
-- Bound TLS negotiation and other transport work. Inbound negotiation should
-  run inside admitted sessions, such as through a stream that negotiates on
-  first I/O. Awaiting every TLS handshake serially inside `accept()` can let one
-  slow connection block subsequent accepts and does work before session limits.
-- TLS certificate/name validation belongs to the transport. Application
-  credentials and cluster-secret proofs keep their existing roles; they do not
-  provide transport encryption. The current interface does not expose certificate
-  identities to authorize individual ActorDB node IDs.
-
-Destinations remain `SocketAddr`. ActorDB still uses its length-prefixed protobuf
-peer/application protocols. A custom RPC framework can supply a compatible
-stream adapter; native framework RPC methods and non-socket endpoint addressing
-would require a larger API change.
-
-## Runnable mTLS example
-
-```bash
-cargo run -p actordb-client --example tls_demo
+```toml
+actordb = { version = "0.11.0", default-features = false }
+actordb-client = { version = "0.11.0", default-features = false }
 ```
 
-The [example](../actordb-client/examples/tls_demo.rs) starts two TLS-connected
-nodes, a TLS application listener, and a client created with `from_stream`, then
-verifies replication of a client write. Its
-[transport adapter](../actordb-client/examples/common/tls.rs) accepts caller-created
-rustls client/server configurations and runs inbound TLS negotiation on first
-I/O with a deadline. There are no detached handshake tasks.
+Implement `actordb_protocol::rpc::RpcClient` on the client side and expose
+`actordb::rpc::NodeRpcService` through that framework on the server.
+`RpcRequest` and `RpcReply` carry typed canonical data plus retained ownership.
+The traits do not contain gRPC, sockets, metadata credentials, or auth callbacks.
+A Thrift adapter owns its authentication/ACLs and maps messages into these types.
+It must preserve bounded materialization, deadlines, cancellation and no-retry
+semantics. Dropping a waiter never authorizes abandoning an admitted mutation.
 
-For the localhost demonstration only, fresh self-signed credentials are generated
-and shared by its participants. Real applications should provision their own
-identities and trust policy. For multiple peer names, the adapter should select
-the expected TLS name per destination instead of using the example's single
-`localhost` name.
+The old application length-prefixed listener/hello/auth protocol is removed.
+There is no stream-based compatibility adapter, identity/credential field,
+or ActorDB request ID. See [the RPC migration](rpc-0.11-design.md).
 
-Transport integration tests exercise buffered non-TCP streams, partial I/O,
-replication/reconnects, authentication failures, validation, cancellation,
-listener/stream release, certificate/name validation, and mTLS traffic.
+## Peer transport contract
+
+Peer frames remain four-byte big-endian lengths plus bounded protobuf bodies.
+`Network` owns TLS configuration, reliable ordered bidirectional bytes,
+backpressure, handshake deadlines and cancellation/resource release.
+An optional high-entropy cluster secret proves shared possession, not individual
+identity or post-handshake payload protection. TLS provides peer authentication,
+integrity and confidentiality. These peer mechanisms are unchanged.
+
+## Lifecycle and verification
+
+The Node service owns accepted mutation apply/fan-out and response leases even
+after a caller disappears. Adapter shutdown joins its transport lifecycle before
+Node shutdown; timed-out service shutdown retains owned work for retry.
+RPC loss produces unknown mutation outcomes, never transparent replay.
+
+Run `cargo run -p actordb-client --example tls_demo` for separate peer mTLS
+and gRPC mTLS. The demo generates throwaway self-signed credentials only for
+localhost; real deployments provision their own certificates and trust policy.
+Tests cover adapter ACL/mTLS, custom gRPC-disabled adapters, concurrency,
+bounded raw decoding, lifecycle and independent Docker processes.

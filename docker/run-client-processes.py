@@ -92,14 +92,14 @@ def run(node_bin, client_bin, directory):
             reservations.append(reservation)
         ports = [reservation.getsockname()[1] for reservation in reservations]
         names = ["node-a", "node-b", "node-c"]
-        credential = "0123456789abcdef0123456789abcdef"
+        bearer_token = "0123456789abcdef0123456789abcdef"
 
         def start(index, generation):
             name = names[index]
             command = [str(node_bin), "client-node", "--node-id", name,
                        "--peer-port", str(ports[index * 2]),
                        "--client-port", str(ports[index * 2 + 1]),
-                       "--credential", credential, "--db-path", str(directory / name)]
+                       "--bearer-token", bearer_token, "--db-path", str(directory / name)]
             for peer in range(3):
                 if peer != index:
                     command.extend(["--peer", f"127.0.0.1:{ports[peer * 2]}"])
@@ -114,7 +114,7 @@ def run(node_bin, client_bin, directory):
             start(index, 1)
         for node in nodes.values():
             node.wait_marker("READY", 90)
-        command = [str(client_bin), "--credential", credential, "--timeout-secs", "180"]
+        command = [str(client_bin), "--bearer-token", bearer_token, "--timeout-secs", "180"]
         for index in range(3):
             command.extend(["--endpoint", f"127.0.0.1:{ports[index * 2 + 1]}"])
         client = Process("external-client", command, directory / "client.log")

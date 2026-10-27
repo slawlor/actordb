@@ -21,3 +21,4 @@ coverage/
 # Owned cluster-harness diagnostics and Python bytecode.
 /test-artifacts/
 /docker/__pycache__/
+/.github/scripts/__pycache__/

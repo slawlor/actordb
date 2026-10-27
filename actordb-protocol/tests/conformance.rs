@@ -1,198 +1,120 @@
 use actordb_protocol::{client as wire, *};
 use prost::Message;
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
-}
-fn hello(identity: &str, byte: u8) -> wire::Hello {
-    wire::Hello {
-        identity: identity.into(),
-        challenge: vec![byte; 32],
-        protocol_version: CLIENT_PROTOCOL_VERSION,
-    }
-}
-#[test]
-fn application_auth_golden_vectors_bind_roles_identity_version_and_challenges() {
-    let client = hello("c", 1);
-    let server = hello("s", 2);
-    let secret = vec![42; 32];
-    let proof = client_auth_proof(&secret, true, &client, &server);
-    assert_eq!(
-        hex(&proof),
-        "c00a9f4b19cbf8856f4a07a5f899384ca74b7393715af791be490ee6997d8d57"
-    );
-    assert_eq!(
-        hex(&client_auth_proof(&secret, false, &client, &server)),
-        "39db2a7f94cdcafe9ae0c091b7060def0e7106d1c6e88c0b44f322955173d05a"
-    );
-    assert!(verify_client_auth(
-        Some(&secret),
-        true,
-        &client,
-        &server,
-        &proof
-    ));
-    assert!(!verify_client_auth(
-        Some(&secret),
-        false,
-        &client,
-        &server,
-        &proof
-    ));
-    assert!(!verify_client_auth(
-        Some(&secret),
-        true,
-        &client,
-        &hello("s", 3),
-        &proof
-    ));
-    assert!(!verify_client_auth(
-        Some(&secret),
-        true,
-        &hello("other", 1),
-        &server,
-        &proof
-    ));
-    assert!(!verify_client_auth(
-        Some(&secret),
-        true,
-        &client,
-        &server,
-        &proof[..31]
-    ));
-    let mut changed_version = client.clone();
-    changed_version.protocol_version += 1;
-    assert!(!verify_client_auth(
-        Some(&secret),
-        true,
-        &changed_version,
-        &server,
-        &proof
-    ));
-}
 
 #[test]
-fn application_hello_requires_the_exact_current_version() {
-    let mut current = hello("client", 1);
-    assert!(valid_client_hello(&current));
-    for version in (0..CLIENT_PROTOCOL_VERSION).chain([CLIENT_PROTOCOL_VERSION + 1]) {
-        current.protocol_version = version;
-        assert!(!valid_client_hello(&current));
-    }
-}
-#[test]
-fn application_get_golden_frame_and_unknown_fields() {
-    let frame = wire::Frame {
-        message: Some(wire::frame::Message::Request(wire::Request {
-            id: 1,
-            operation: Some(wire::request::Operation::Get(wire::Get {
-                key: "x".into(),
-                priority: 0,
-            })),
-            table: String::new(),
+fn unary_request_golden_contract_has_no_envelope_handshake_or_id() {
+    let request = wire::Request {
+        table: "KV".into(),
+        operation: Some(wire::request::Operation::Get(wire::Get {
+            key: "x".into(),
+            priority: 0,
         })),
     };
-    let mut bytes = frame.encode_to_vec();
-    assert_eq!(hex(&bytes), "1a07080112030a0178");
-    assert!(preflight_client_frame(&bytes).is_ok());
+    let mut bytes = request.encode_to_vec();
+    assert_eq!(
+        bytes.iter().map(|b| format!("{b:02x}")).collect::<String>(),
+        "0a024b5612030a0178"
+    );
+    preflight_rpc_request(&bytes, DEFAULT_MAX_DECODED_RESPONSE_BYTES).unwrap();
     bytes.extend_from_slice(&[0xa0, 0x06, 1]);
-    assert!(preflight_client_frame(&bytes).is_ok());
-    assert_eq!(wire::Frame::decode(bytes.as_slice()).unwrap(), frame);
-}
-#[test]
-fn preflight_rejects_repeated_amplification_and_duplicate_structured_messages() {
-    let request = wire::Frame {
-        message: Some(wire::frame::Message::Request(wire::Request {
-            id: 1,
-            operation: Some(wire::request::Operation::BatchGet(wire::BatchGet {
-                keys: vec![String::new(); MAX_BATCH_ITEMS + 1],
-                priority: 0,
-            })),
-            table: String::new(),
-        })),
-    };
-    assert!(preflight_client_frame(&request.encode_to_vec()).is_err());
-    // Frame.response { query {}, query {} }. Prost would merge them.
-    assert!(preflight_client_frame(&[0x22, 4, 0x2a, 0, 0x2a, 0]).is_err());
-    let inspection = wire::Frame {
-        message: Some(wire::frame::Message::Response(wire::Response {
-            id: 1,
-            inspection: Some(wire::Inspection {
-                node_id: "n".into(),
-                peer_addr: "127.0.0.1:123".into(),
-                ..Default::default()
-            }),
-            ..Default::default()
-        })),
-    };
-    assert!(preflight_client_frame(&inspection.encode_to_vec()).is_ok());
+    preflight_rpc_request(&bytes, DEFAULT_MAX_DECODED_RESPONSE_BYTES).unwrap();
+    assert_eq!(wire::Request::decode(bytes.as_slice()).unwrap(), request);
+    assert_eq!(RPC_CALL_PATH, "/actordb.rpc.v1.ActorDb/Call");
 }
 
 #[test]
-fn preflight_accepts_query_and_scan_results_larger_than_request_batches() {
-    // Results have a different catalog limit from 4096-item mutation batches.
-    let response = wire::Frame {
-        message: Some(wire::frame::Message::Response(wire::Response {
-            id: 1,
-            query: Some(wire::QueryResult {
-                columns: vec!["key".into()],
-                rows: (0..MAX_BATCH_ITEMS + 1)
-                    .map(|index| meta::QueryPageRow {
-                        key: String::new(),
-                        cells: vec![meta::QueryCell {
-                            value: Some(meta::query_cell::Value::Text(index.to_string())),
-                        }],
-                    })
-                    .collect(),
-            }),
-            ..Default::default()
+fn preflight_rejects_duplicate_operations_structures_and_amplification() {
+    let request = wire::Request {
+        table: "KV".into(),
+        operation: Some(wire::request::Operation::BatchGet(wire::BatchGet {
+            keys: vec![String::new(); MAX_BATCH_ITEMS + 1],
+            priority: 0,
         })),
     };
-    assert!(preflight_client_frame(&response.encode_to_vec()).is_ok());
-    let response = wire::Frame {
-        message: Some(wire::frame::Message::Response(wire::Response {
-            id: 2,
-            scans: (0..10_000)
-                .map(|index| meta::ScanMatch {
-                    key: format!("key:{index}"),
-                    value: Vec::new(),
+    assert!(
+        preflight_rpc_request(&request.encode_to_vec(), DEFAULT_MAX_DECODED_RESPONSE_BYTES)
+            .is_err()
+    );
+    assert!(preflight_rpc_request(&[10, 2, b'K', b'V', 18, 0, 18, 0], 4096).is_err());
+    assert!(preflight_rpc_response_unchecked_shape(&[34, 0, 34, 0], 4096).is_err());
+    assert!(preflight_rpc_request(&[], 4096).is_err());
+}
+
+#[test]
+fn empty_batch_response_is_valid_only_for_the_actual_empty_batch() {
+    let empty = RpcResponseShape::from_request(&wire::Request {
+        table: "KV".into(),
+        operation: Some(wire::request::Operation::BatchGet(wire::BatchGet::default())),
+    });
+    assert!(preflight_rpc_response(&[], 4096, &empty).is_ok());
+    let get = RpcResponseShape::from_request(&wire::Request {
+        table: "KV".into(),
+        operation: Some(wire::request::Operation::Get(wire::Get::default())),
+    });
+    assert!(preflight_rpc_response(&[], 4096, &get).is_err());
+}
+
+#[test]
+fn query_and_scan_results_have_independent_catalog_limits() {
+    let query = wire::Response {
+        query: Some(wire::QueryResult {
+            columns: vec!["key".into()],
+            rows: (0..MAX_BATCH_ITEMS + 1)
+                .map(|i| wire::QueryRow {
+                    cells: vec![meta::QueryCell {
+                        value: Some(meta::query_cell::Value::Text(i.to_string())),
+                    }],
                 })
                 .collect(),
-            ..Default::default()
-        })),
+        }),
+        ..Default::default()
     };
-    assert!(preflight_client_frame(&response.encode_to_vec()).is_ok());
+    assert!(preflight_rpc_response_unchecked_shape(
+        &query.encode_to_vec(),
+        DEFAULT_MAX_DECODED_RESPONSE_BYTES
+    )
+    .is_ok());
+    let scan = wire::Response {
+        scans: (0..10_000)
+            .map(|i| meta::ScanMatch {
+                key: format!("k{i}"),
+                value: Vec::new(),
+            })
+            .collect(),
+        ..Default::default()
+    };
+    assert!(preflight_rpc_response_unchecked_shape(
+        &scan.encode_to_vec(),
+        DEFAULT_MAX_DECODED_RESPONSE_BYTES
+    )
+    .is_ok());
 }
 
 #[test]
-fn inspection_nested_collections_are_checked_without_parsing_strings_as_messages() {
-    let health = wire::FragmentHealth {
-        worker_names: vec!["fragment-0-high-0".into()],
-        restarts: std::collections::HashMap::from([("fragment-0".into(), 1)]),
-        ..Default::default()
-    };
+fn inspection_collections_are_bounded_without_treating_text_as_messages() {
     let mut response = wire::Response {
-        id: 1,
         inspection: Some(wire::Inspection {
             node_id: "node-a".into(),
             peer_addr: "127.0.0.1:7447".into(),
-            health: vec![health],
-            placement: vec![wire::Placement {
-                fragment: 0,
-                replica_ids: vec!["node-a".into(), "node-b".into()],
-                state: "Serving".into(),
+            health: vec![wire::FragmentHealth {
+                worker_names: vec!["worker".into()],
+                restarts: std::collections::HashMap::from([("worker".into(), 1)]),
+                ..Default::default()
             }],
             ..Default::default()
         }),
         ..Default::default()
     };
-    let encode = |response| {
-        wire::Frame {
-            message: Some(wire::frame::Message::Response(response)),
-        }
-        .encode_to_vec()
-    };
-    assert!(preflight_client_frame(&encode(response.clone())).is_ok());
+    assert!(preflight_rpc_response_unchecked_shape(
+        &response.encode_to_vec(),
+        DEFAULT_MAX_DECODED_RESPONSE_BYTES
+    )
+    .is_ok());
     response.inspection.as_mut().unwrap().health[0].worker_names =
         vec![String::new(); MAX_BATCH_ITEMS + 1];
-    assert!(preflight_client_frame(&encode(response)).is_err());
+    assert!(preflight_rpc_response_unchecked_shape(
+        &response.encode_to_vec(),
+        DEFAULT_MAX_DECODED_RESPONSE_BYTES
+    )
+    .is_err());
 }

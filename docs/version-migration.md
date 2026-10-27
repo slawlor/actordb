@@ -1,13 +1,20 @@
 # Current record and deployment versions
 
-ActorDB `0.10.0` keeps the published `0.9.0` wire and data contracts: peer protocol **6**,
-application protocol **4**, RocksDB record/manifest format **3**, checkpoint
-**ACTCP003** and membership journal **ACTMEM04**. Deploy matching participants
-without changing current-format data directories. There is no old-format reader,
-manifest adoption, wire fallback or automatic record conversion. Non-current
-formats require fresh directories. This release's semver break is the SDK's
-configurable decoded-response admission allowance (64 MiB by default); callers
-expecting larger supported responses must explicitly raise that allowance.
+ActorDB `0.11.0` replaces the application TCP protocol with typed unary RPC.
+The default service is `actordb.rpc.v1.ActorDb/Call`; SDK and server both enable
+`grpc` by default, and vendors may disable it and supply another RPC framework.
+
+The former application handshake, identity/credential fields, frame wrapper and
+ActorDB request IDs are removed. There is no compatibility listener or fallback.
+Authentication/TLS/ACLs belong to the RPC adapter, not the Node service or SDK core.
+Migrate clients and servers together; see [RPC configuration](transports.md).
+
+Peer protocol **6**, RocksDB record/manifest format **3**, checkpoint
+**ACTCP003**, and membership journal **ACTMEM04** are unchanged by this API work.
+Current-format data needs no conversion for this RPC migration; unsupported
+formats still require fresh directories. Per-response decode allowance is
+64 MiB and aggregate reservation allowance 256 MiB by default; wide responses
+require explicit compatible per-call/aggregate settings.
 
 Non-current data and wire versions fail closed. Existing source data must be
 handled through a separately planned application export/re-ingestion workflow;

@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use actordb::client_server::{ClientServer, ClientServerOptions};
+use actordb::grpc::{GrpcServer, GrpcServerOptions};
 use actordb::node::{Node, NodeConfig};
 use actordb::shard::FragmentId;
 use actordb::store::{KvStore, RocksDbStore};
@@ -32,7 +32,7 @@ pub(super) async fn run(
     client_port: u16,
     peers: Vec<String>,
     db_path: Option<PathBuf>,
-    credential: Option<String>,
+    bearer_token: Option<String>,
 ) -> TestResult {
     if peers.len() != 2 || peers[0] == peers[1] {
         return Err("client-node requires two distinct --peer addresses".into());
@@ -43,10 +43,19 @@ pub(super) async fn run(
     if peer_port != 0 && peer_port == client_port {
         return Err("peer and application ports must be different".into());
     }
-    let credential = credential.map(String::into_bytes);
-    if credential.as_ref().is_some_and(|value| value.len() < 32) {
-        return Err("application credential must contain at least 32 UTF-8 bytes".into());
-    }
+    let authorize: Option<actordb::grpc::GrpcAuthorizer> = bearer_token.map(|token| {
+        let expected = format!("Bearer {token}");
+        let callback: actordb::grpc::GrpcAuthorizer = Arc::new(move |metadata, _, _| {
+            if metadata.get("authorization").and_then(|v| v.to_str().ok())
+                == Some(expected.as_str())
+            {
+                Ok(())
+            } else {
+                Err(actordb::grpc::Status::unauthenticated("test bearer token"))
+            }
+        });
+        callback
+    });
     let mut shutdown_signal = ShutdownSignal::install()?;
     let started = Instant::now();
     let map = placement();
@@ -72,11 +81,11 @@ pub(super) async fn run(
         .await
         .map_err(|error| format!("start client-node: {error}"))?,
     );
-    let mut listener = match ClientServer::bind(
+    let mut listener = match GrpcServer::bind(
         node.clone(),
         bind(client_port),
-        ClientServerOptions {
-            credential,
+        GrpcServerOptions {
+            authorize,
             ..Default::default()
         },
     )
@@ -144,7 +153,10 @@ pub(super) async fn run(
         "[{:>7.1}s {node_id}] closing application listener and database",
         started.elapsed().as_secs_f64()
     );
-    listener.shutdown().await;
+    listener
+        .shutdown()
+        .await
+        .map_err(|e| format!("gRPC listener shutdown: {e}"))?;
     let shutdown = node
         .shutdown()
         .await

@@ -77,16 +77,19 @@ the same node admission boundary across retries. `Drained` means the selected
 local boundary, and `Stopped` means
 the full local shutdown boundary.
 
-An application `ClientServer` calls the same Node/Table APIs, so new requests
-receive the existing unavailable/shutting-down response during node draining.
-An admitted application session retains its request slot through response send
-or socket failure. A blocked response can therefore exhaust a drain's timeout;
-retry after delivery completes or the client disconnects.
-The server owns its listener independently; call `ClientServer::shutdown` to
-release it. Response bytes already queued to a socket may be lost, including
-after a mutation completed; clients must retry stamped writes idempotently.
+A `NodeRpcService` uses the same Node/Table admission fences. New calls
+receive unavailable/shutting-down responses during draining. Admitted mutations
+retain their request/receive ownership through apply and fan-out even if the
+framework waiter disappears; replies retain drain ownership through adapter
+encoding/body lifecycle.
 
-These defaults and owned evidence are part of the fresh `0.9.0` deployment
+Call `GrpcServer::shutdown` to release and join its transport, then finish Node
+shutdown. Custom frameworks must join their transport and service ownership
+equivalently. A timeout leaves service work owned for a subsequent retry.
+A completed mutation can still lose its reply; callers must not replay it as a
+fresh mutation automatically.
+
+These defaults and owned evidence are part of the current `0.11.0` deployment
 contract. The separate [peer authority](peer-authority.md) API supports a hot
 generation-policy receive/apply barrier without stopping the node. TLS and
 shared-secret credential revocation remain external responsibilities;

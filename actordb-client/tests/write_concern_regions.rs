@@ -1,17 +1,16 @@
+#![cfg(feature = "grpc")]
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use actordb::client_server::{ClientServer, ClientServerOptions};
+use actordb::grpc::{GrpcServer, GrpcServerOptions};
 use actordb::node::{Node, NodeConfig, NodeRuntimeOptions};
 use actordb::replication::SenderConfig;
 use actordb::shard::FragmentId;
 use actordb_client::{Client, ClientOptions, WriteConcernClientError, WriteConcernOptions};
+use actordb_client::{RpcCallOptions, RpcClient, RpcError, RpcFuture, RpcReply};
+use actordb_protocol::client as wire;
 use actordb_protocol::write_concern::{WriteConcernOutcome, WriteConcernReceipt};
-use actordb_protocol::{client as wire, CLIENT_PROTOCOL_VERSION};
-use prost::Message;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
 
 async fn node(id: &str, regions: HashMap<String, String>) -> Arc<Node> {
     Arc::new(
@@ -54,16 +53,19 @@ async fn sdk_routed_put_and_delete_preserve_region_receipts() {
     })
     .await
     .unwrap();
-    let mut server = ClientServer::bind(
+    let mut server = GrpcServer::bind(
         origin.clone(),
         "127.0.0.1:0".parse().unwrap(),
-        ClientServerOptions::default(),
+        GrpcServerOptions::default(),
     )
     .await
     .unwrap();
-    let client = Client::connect(server.addr(), ClientOptions::default())
-        .await
-        .unwrap();
+    let client = Client::connect(
+        format!("http://{}", server.addr()),
+        ClientOptions::default(),
+    )
+    .await
+    .unwrap();
     let options = WriteConcernOptions::default().with_require_other_region(true);
     let receipt = client
         .put_with_write_concern("sdk-region-key", vec![1], options.clone())
@@ -86,87 +88,44 @@ async fn sdk_routed_put_and_delete_preserve_region_receipts() {
     assert!(receipt.other_region_satisfied());
     assert!(b.get("sdk-region-key".into()).await.unwrap().is_none());
     client.close().await;
-    server.shutdown().await;
+    server.shutdown().await.unwrap();
     origin.shutdown().await.unwrap();
     a.shutdown().await.unwrap();
     b.shutdown().await.unwrap();
 }
 
-async fn send(stream: &mut TcpStream, message: wire::frame::Message) {
-    let bytes = wire::Frame {
-        message: Some(message),
-    }
-    .encode_to_vec();
-    stream.write_u32(bytes.len() as u32).await.unwrap();
-    stream.write_all(&bytes).await.unwrap();
-}
-async fn receive(stream: &mut TcpStream) -> wire::frame::Message {
-    let length = stream.read_u32().await.unwrap();
-    let mut bytes = vec![0; length as usize];
-    stream.read_exact(&mut bytes).await.unwrap();
-    wire::Frame::decode(bytes.as_slice())
-        .unwrap()
-        .message
-        .unwrap()
-}
-
-#[tokio::test]
-async fn sdk_rejects_success_without_requested_region_progress() {
-    for malformed_region in [false, true] {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let mock = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            assert!(matches!(
-                receive(&mut stream).await,
-                wire::frame::Message::Hello(_)
-            ));
-            send(
-                &mut stream,
-                wire::frame::Message::Hello(wire::Hello {
-                    identity: "region-mock".into(),
-                    challenge: vec![7; 32],
-                    protocol_version: CLIENT_PROTOCOL_VERSION,
-                }),
-            )
-            .await;
-            assert!(matches!(
-                receive(&mut stream).await,
-                wire::frame::Message::Auth(_)
-            ));
-            send(
-                &mut stream,
-                wire::frame::Message::Auth(wire::Auth { proof: Vec::new() }),
-            )
-            .await;
-            let wire::frame::Message::Request(request) = receive(&mut stream).await else {
-                panic!("expected request")
-            };
+struct BadRegion(bool);
+impl RpcClient for BadRegion {
+    fn call(
+        &self,
+        _: Arc<wire::Request>,
+        _: RpcCallOptions,
+    ) -> RpcFuture<'_, Result<RpcReply, RpcError>> {
+        Box::pin(async move {
             let mut receipt =
                 WriteConcernReceipt::new("region-mock".into(), 2, 1, 1, vec!["region-mock".into()])
                     .unwrap();
-            if malformed_region {
+            if self.0 {
                 receipt = receipt
                     .with_region_progress("west".into(), Vec::new())
                     .unwrap();
             }
-            send(
-                &mut stream,
-                wire::frame::Message::Response(wire::Response {
-                    id: request.id,
-                    mutations: vec![wire::MutationResult {
-                        key: "key".into(),
-                        error: None,
-                        write_concern: Some(WriteConcernOutcome::Satisfied(receipt).encode()),
-                    }],
-                    ..Default::default()
-                }),
-            )
-            .await;
-        });
-        let client = Client::connect(address, ClientOptions::default())
-            .await
-            .unwrap();
+            Ok(RpcReply::new(wire::Response {
+                mutations: vec![wire::MutationResult {
+                    key: "key".into(),
+                    error: None,
+                    write_concern: Some(WriteConcernOutcome::Satisfied(receipt).encode()),
+                }],
+                ..Default::default()
+            }))
+        })
+    }
+}
+#[tokio::test]
+async fn sdk_rejects_success_without_requested_region_progress() {
+    for malformed in [false, true] {
+        let client =
+            Client::from_rpc(Arc::new(BadRegion(malformed)), ClientOptions::default()).unwrap();
         assert!(matches!(
             client
                 .put_with_write_concern(
@@ -178,6 +137,5 @@ async fn sdk_rejects_success_without_requested_region_progress() {
             Err(WriteConcernClientError::UnknownOutcome(_))
         ));
         client.close().await;
-        mock.await.unwrap();
     }
 }

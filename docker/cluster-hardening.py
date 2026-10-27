@@ -22,7 +22,7 @@ def command(argv, timeout=240):
     result = subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                             text=True, timeout=timeout, check=False)
     if result.returncode:
-        raise RuntimeError(f"command failed ({result.returncode}): {argv}\n{result.stdout[-12000:]}")
+        raise RuntimeError(f"command failed ({result.returncode}): {argv}\n{result.stdout}")
     return result.stdout
 
 
@@ -36,6 +36,7 @@ class Backend:
         argv = ["--phase", phase, "--target", target, "--round",
                 str(flags.pop("round", self.phase_number)), "--records-per-fragment",
                 str(self.args.records_per_fragment)]
+        argv += ["--diagnostic-wait-secs", str(getattr(self.args, "diagnostic_wait_secs", 0))]
         for endpoint in self.endpoints:
             argv += ["--node", endpoint]
         for key, value in flags.items():
@@ -252,8 +253,10 @@ def run(backend, args):
     backend.checker("heal")
     for cycle in range(args.cycles):
         for node in ("node-a", "node-b", "node-c"):
+            backend.checker("delivery-ready")
             old = backend.status(node)["boot_id"]
             backend.stop(node)
+            backend.checker("delivery-ready", absent=node)
             survivor = next(n for n in ("node-a", "node-b", "node-c") if n != node)
             backend.checker("rolling", survivor, round=cycle*3 + NODES.index(node))
             backend.start(node)
@@ -310,6 +313,7 @@ def main():
     parser.add_argument("--cycles", type=int, choices=range(1, 6), default=3)
     parser.add_argument("--records-per-fragment", type=int, choices=range(1, 257), default=128)
     parser.add_argument("--timeout-secs", type=int, choices=range(180, 5401), default=2700)
+    parser.add_argument("--diagnostic-wait-secs", type=int, choices=range(46), default=0)
     args = parser.parse_args()
     if args.backend == "process":
         args.node_bin = args.node_bin.resolve(strict=True)

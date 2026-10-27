@@ -1,22 +1,38 @@
 [package]
 name = "actordb-client"
-version = "0.10.0"
+version = "0.11.0"
 edition = "2021"
 rust-version = "1.88"
 license = "MIT"
-description = "Async Rust companion client for ActorDB's application listener"
+description = "Async Rust companion client for ActorDB's RPC interface"
 readme = "README.md"
+
+[[example]]
+name = "query_demo"
+required-features = ["grpc"]
+
+[[example]]
+name = "tls_demo"
+required-features = ["grpc"]
+
+[features]
+default = ["grpc"]
+grpc = ["actordb-protocol/grpc", "dep:tonic", "actordb/grpc"]
 
 [dependencies]
 bon = { version = "3.10.2" }
-actordb-protocol = { version = "0.10.0", path = "../actordb-protocol" }
-actordb-query = { version = "0.10.0", path = "../actordb-query" }
+actordb-protocol = { version = "0.11.0", path = "../actordb-protocol" }
+actordb-query = { version = "0.11.0", path = "../actordb-query" }
 prost = "0.14"
-getrandom = "0.4"
-tokio = { version = "1", features = ["sync", "time", "net", "io-util", "macros"] }
+tokio = { version = "1", features = ["sync", "time", "macros"] }
+
+tonic = { version = "0.14", optional = true, default-features = false, features = ["channel", "tls-ring"] }
 
 [dev-dependencies]
-actordb = { version = "0.10.0", path = "../actordb" }
-rcgen = { version = "0.14", default-features = false, features = ["crypto", "ring"] }
+bytes = "1"
+http-body = "1"
+tokio-stream = { version = "0.1", features = ["net"] }
+actordb = { version = "0.11.0", path = "../actordb", default-features = false }
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "ring", "pem"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "test-util"] }

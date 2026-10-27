@@ -1,88 +1,69 @@
-# Rust client options
+# Rust RPC client options
 
-Construct `ClientOptions` and `PutOptions` through their Bon builders, or start
-with `Default` and modify public fields. These types are `non_exhaustive`.
+Construct `ClientOptions` and `PutOptions` with Bon builders or `Default`.
+They contain database/request policy, not RPC credentials or connection identity.
 
 ```rust,ignore
 let options = ClientOptions::builder()
-    .table("users")
+    .table("USERS")
     .timeout(Duration::from_secs(5))
-    .credential(credential)
+    .max_queued_requests(64)
+    .max_decoded_response_bytes(64 * 1024 * 1024)
+    .max_response_memory_bytes(256 * 1024 * 1024)
     .build();
-let put = PutOptions::builder()
-    .ttl(Duration::from_secs(60))
-    .priority(Priority::High)
-    .build();
+let put = PutOptions::builder().ttl(Duration::from_secs(60))
+    .priority(Priority::High).build();
 ```
 
-Optional fields provide `maybe_credential(Option<Vec<u8>>)` and
-`maybe_ttl(Option<Duration>)` setters. The initial table defaults to `KV`;
-`table("users")` explicitly selects another validated namespace.
-
-Additional table handles share one authenticated connection:
+A table view shares the RPC adapter and budgets:
 
 ```rust,ignore
-let client = Client::connect(addr, ClientOptions::default()).await?;
-let users = client.table("users")?;
-let events = client.table("events")?;
+let client = Client::connect("http://db.example:7449", options).await?;
+let users = client.table("USERS")?;
 users.put("u:1", value).await?;
-events.put("e:1", other_value).await?;
 ```
 
-Connection validation happens at `connect` / `from_stream`, including
-credentials, timeouts and queue capacities. The SDK uses exact application
-protocol **4**; there is no negotiation with non-current listeners.
+For a vendor framework use `Client::from_rpc(Arc::new(adapter), options)` with
+default features disabled. It validates options before dispatch, without dialing
+or performing authentication. The gRPC convenience factory validates before dial.
 
-## Decoded response admission
+## Response admission
 
-The fixed wire-body limit remains 16 MiB. `max_decoded_response_bytes` defaults
-to a separate **64 MiB** accounted allowance, including raw bytes, collection
-capacity/message headers, payloads and portable result/receipt conversion.
-Cells and nested inspection/acknowledgement entries count toward one aggregate
-budget; server errors cannot waive it. This stricter default can reject large
-responses that encoded-framing-only clients accepted.
-It can also reject a near-limit text result produced under the server's default
-result policy: encoded size and server-retained size do not account for the same
-decoded/conversion capacities. It is not a promise that every server-accepted
-result fits the receiving client's default allowance.
+Each call reserves its whole per-response allowance before invoking the RPC
+adapter. Aggregate reservations are shared across clones/table views until
+public conversion finishes. The defaults allow four concurrent 64 MiB calls;
+the request-count limit also bounds callers waiting for a reservation.
+
+The RPC message cap is 16 MiB. Allocation-free Prost preflight additionally
+accounts for raw bytes, collection capacity/headers, payloads, temporary validation
+copies and portable result/receipt conversion. `RpcDecodeReport` exposes these
+charges and query cell counts. Errors cannot bypass admission, and decoded
+responses are pinned to the actual pending operation/query shape, not echoed IDs.
+
+For an explicitly trusted wider result:
 
 ```rust,ignore
 let options = ClientOptions::builder()
     .max_decoded_response_bytes(512 * 1024 * 1024)
+    .max_response_memory_bytes(1024 * 1024 * 1024)
     .build();
 ```
 
-Choose a larger allowance explicitly for trusted wide or near-server-limit narrow
-text results. Increasing it
-does not increase the wire limit or existing row/column/receipt limits. Values
-below 4 KiB are invalid. Exceeding admission fails before decoded collections
-are constructed and closes that connection; a possibly dispatched write has
-an unknown outcome, never an automatic retry. Invalid request/response shape
-and handshake message kinds are also checked before materialization.
+Per-call allowance must be at least 16 MiB and fit the aggregate budget. Raising
+it does not change row/column/receipt or RPC message limits. The accounting is
+not an allocator/RSS or caller-retained-result cap. Custom frameworks must
+provide equivalent bounded decoding before constructing canonical responses.
 
-The protocol's `ClientDecodeReport` exposes conservative accounted raw/header/
-payload bytes and aggregate query cells. Vector charges include minimum and
-geometric growth capacity; byte/string charges include small-buffer capacity,
-validation copies and nested receipt expansion. This is not an allocator or RSS
-bound. Caller-retained results, outgoing request storage, transport buffers and
-allocator slack are outside this allowance. Separate client connections have
-separate allowances.
+## Deadlines and close
 
-The budget/header/payload and shape walk is allocation-free. Successful preflight
-does not materialize decoded messages or payloads. Malformed typed receipt
-validation may allocate bounded error metadata before returning rejection; this
-does not waive or bypass admission.
+Deadlines include admission wait, RPC, validation and conversion. Write-concern
+policy wait is explicitly added to the normal request budget. No mutation is
+replayed after uncertainty. Losing one RPC does not retire unrelated channel calls.
 
-All clones/table views share one decode/conversion owner. It is acquired before
-socket transfer or raw-body allocation and retained until public conversion
-returns. A clone waiting there can time out or be cancelled without taking or
-retiring the aligned transport. Closing wakes all waiting clones. Cancellation,
-errors and Drop release ownership; no detached response-conversion task remains.
+`close` stops admission and cancels local waiters across this client's views.
+Unsent work and active reads return `Closed`; possibly dispatched writes return
+`UnknownOutcome`. Admitted server mutations still finish and retain ownership.
+The Node and independently shared RPC adapters remain running.
 
-The request timeout is the default total graceful close budget.
-`close_with_timeout` selects another budget. Closing cancels queued and active
-exchanges across clones; a mutation whose write started has an unknown outcome.
-Closing the SDK never shuts down the database.
-
-See [the client guide](../actordb-client/README.md) and
-[transport configuration](transports.md).
+Authentication/TLS/ACL configuration belongs only to the adapter:
+`GrpcClientOptions`, a configured tonic channel and `GrpcServerOptions`.

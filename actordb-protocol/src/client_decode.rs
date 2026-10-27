@@ -7,7 +7,7 @@
 
 use std::mem::size_of;
 
-use crate::{client, meta, write_concern, MAX_BATCH_ITEMS, MAX_FRAME_BYTES};
+use crate::{client, meta, write_concern, MAX_BATCH_ITEMS, MAX_RPC_MESSAGE_BYTES};
 
 /// Default accounted response allowance, including raw framing, decoded
 /// collections/payloads and portable conversion work. Not an allocator/RSS cap.
@@ -26,7 +26,7 @@ const MAX_WRITER_BYTES: usize = 255;
 /// slack, transport buffers and outgoing request storage are outside this scope.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
-pub struct ClientDecodeReport {
+pub struct RpcDecodeReport {
     pub accounted_bytes: usize,
     pub raw_bytes: usize,
     pub header_bytes: usize,
@@ -48,14 +48,13 @@ enum Operation {
 /// from data echoed by the server. Use optional query shape from a trusted
 /// locally parsed plan; the protocol preflight does not parse SQL.
 #[derive(Debug, Clone, Copy)]
-pub struct ClientResponseShape {
-    id: u64,
+pub struct RpcResponseShape {
     operation: Operation,
     columns: Option<usize>,
     rows: usize,
     aggregate: bool,
 }
-impl ClientResponseShape {
+impl RpcResponseShape {
     pub fn from_request(request: &client::Request) -> Self {
         use client::request::Operation as Request;
         let operation = match &request.operation {
@@ -69,7 +68,6 @@ impl ClientResponseShape {
             None => Operation::Unsupported,
         };
         Self {
-            id: request.id,
             operation,
             columns: None,
             rows: 100_000,
@@ -102,75 +100,43 @@ impl ClientResponseShape {
     }
 }
 
-/// Validate before message/collection materialization using the default budget.
-/// The accounting/shape pass allocates no owned data. Malformed typed receipt
-/// validation can allocate a bounded error string before returning rejection.
-pub fn preflight_client_frame(bytes: &[u8]) -> Result<(), &'static str> {
-    preflight_client_frame_with_budget(bytes, DEFAULT_MAX_DECODED_RESPONSE_BYTES).map(|_| ())
-}
-
-/// As [`preflight_client_frame`], with an explicit accounted allowance and report.
-/// Successful preflight does not materialize messages, collections or payloads.
-pub fn preflight_client_frame_with_budget(
+/// Allocation-free request preflight before an RPC adapter materializes Prost.
+pub fn preflight_rpc_request(
     bytes: &[u8],
-    max_accounted_bytes: usize,
-) -> Result<ClientDecodeReport, &'static str> {
-    preflight(bytes, max_accounted_bytes, None, None)
+    maximum: usize,
+) -> Result<RpcDecodeReport, &'static str> {
+    preflight(bytes, maximum, Context::Request, None)
 }
 
-/// Exact message expected by the current application handshake/exchange phase.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum ClientFrameKind {
-    Hello,
-    Auth,
-    Request,
-    Response,
-}
-
-pub fn preflight_client_frame_kind(
+/// Allocation-free response admission, pinned to the actual pending request.
+pub fn preflight_rpc_response(
     bytes: &[u8],
-    max_accounted_bytes: usize,
-    kind: ClientFrameKind,
-) -> Result<ClientDecodeReport, &'static str> {
-    preflight(bytes, max_accounted_bytes, None, Some(kind))
+    maximum: usize,
+    shape: &RpcResponseShape,
+) -> Result<RpcDecodeReport, &'static str> {
+    preflight(bytes, maximum, Context::Response, Some(shape))
 }
 
-/// Additionally validate the actual pending request before materialization.
-/// The same bounded malformed-receipt error-metadata caveat applies.
-pub fn preflight_client_response(
+/// Structural response admission for adapters which validate the pending shape separately.
+pub fn preflight_rpc_response_unchecked_shape(
     bytes: &[u8],
-    max_accounted_bytes: usize,
-    shape: &ClientResponseShape,
-) -> Result<ClientDecodeReport, &'static str> {
-    preflight(
-        bytes,
-        max_accounted_bytes,
-        Some(shape),
-        Some(ClientFrameKind::Response),
-    )
+    maximum: usize,
+) -> Result<RpcDecodeReport, &'static str> {
+    preflight(bytes, maximum, Context::Response, None)
 }
 
 fn preflight(
     bytes: &[u8],
     maximum: usize,
-    shape: Option<&ClientResponseShape>,
-    kind: Option<ClientFrameKind>,
-) -> Result<ClientDecodeReport, &'static str> {
-    if bytes.is_empty() || bytes.len() > MAX_FRAME_BYTES {
-        return Err("invalid application frame size");
-    }
-    if bytes.len() > maximum {
-        return Err("decoded application response exceeds admission allowance");
-    }
-    if let Some(expected) = kind {
-        if envelope_kind(bytes)? != expected {
-            return Err("unexpected application message kind");
-        }
+    context: Context,
+    shape: Option<&RpcResponseShape>,
+) -> Result<RpcDecodeReport, &'static str> {
+    if bytes.len() > MAX_RPC_MESSAGE_BYTES || bytes.len() > maximum {
+        return Err("RPC message exceeds admission allowance");
     }
     let mut budget = Budget {
         maximum,
-        report: ClientDecodeReport {
+        report: RpcDecodeReport {
             accounted_bytes: bytes.len(),
             raw_bytes: bytes.len(),
             header_bytes: 0,
@@ -181,18 +147,13 @@ fn preflight(
         rows: 0,
         wrong_row_width: false,
     };
-    budget.charge(0, false)?;
-    walk(bytes, Context::Frame, &mut budget, shape)?;
-    // Preserve every original envelope/oneof/receipt structural constraint.
-    // Admission runs first so dense rejected frames need not traverse every
-    // repeated nested message before the aggregate budget can stop the work.
-    crate::validate_client_frame_structure(bytes)?;
+    walk(bytes, context, &mut budget, shape)?;
     Ok(budget.report)
 }
 
 struct Budget {
     maximum: usize,
-    report: ClientDecodeReport,
+    report: RpcDecodeReport,
     columns: usize,
     rows: usize,
     wrong_row_width: bool,
@@ -252,9 +213,6 @@ impl Budget {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Context {
-    Frame,
-    Hello,
-    Auth,
     Request,
     Get,
     Put,
@@ -286,9 +244,6 @@ impl Context {
     fn size(self) -> usize {
         use Context::*;
         match self {
-            Frame => size_of::<client::Frame>(),
-            Hello => size_of::<client::Hello>(),
-            Auth => size_of::<client::Auth>(),
             Request => size_of::<client::Request>(),
             Get => size_of::<client::Get>(),
             Put => size_of::<client::Put>(),
@@ -304,7 +259,7 @@ impl Context {
             Read => size_of::<client::ReadResult>(),
             Mutation => size_of::<client::MutationResult>(),
             QueryResult => size_of::<client::QueryResult>(),
-            Row => size_of::<meta::QueryPageRow>(),
+            Row => size_of::<client::QueryRow>(),
             Cell => size_of::<meta::QueryCell>(),
             Inspection => size_of::<client::Inspection>(),
             Health => size_of::<client::FragmentHealth>(),
@@ -349,15 +304,7 @@ fn schema(context: Context, field: u64) -> Option<Field> {
         extra: 0,
     };
     Some(match (context, field) {
-        (Frame, 1) => Message(Hello),
-        (Frame, 2) => Message(Auth),
-        (Frame, 3) => Message(Request),
-        (Frame, 4) => Message(Response),
-        (Hello, 1) => Text,
-        (Hello, 2) | (Auth, 1) => Bytes,
-        (Hello, 3) => Scalar,
-        (Request, 1) => Scalar,
-        (Request, 10) => Text,
+        (Request, 1) => Text,
         (Request, 2) => Message(Get),
         (Request, 3) => Message(Put),
         (Request, 4) => Message(Delete),
@@ -380,13 +327,12 @@ fn schema(context: Context, field: u64) -> Option<Field> {
         },
         (Scan, 1 | 3 | 4 | 5 | 6) => Scalar,
         (Scan, 2) => Bytes,
-        (Response, 1) => Scalar,
-        (Response, 2) => Message(Error),
-        (Response, 3) => messages(Read, MAX_BATCH_ITEMS),
-        (Response, 4) => messages(Mutation, MAX_BATCH_ITEMS),
-        (Response, 5) => Message(QueryResult),
-        (Response, 6) => Message(Inspection),
-        (Response, 7) => messages(ScanMatch, 100_000),
+        (Response, 1) => Message(Error),
+        (Response, 2) => messages(Read, MAX_BATCH_ITEMS),
+        (Response, 3) => messages(Mutation, MAX_BATCH_ITEMS),
+        (Response, 4) => Message(QueryResult),
+        (Response, 5) => Message(Inspection),
+        (Response, 6) => messages(ScanMatch, 100_000),
         (Error, 1 | 3 | 5 | 6) => Scalar,
         (Error, 2 | 4) => Text,
         (Value, 1) => Bytes,
@@ -402,8 +348,7 @@ fn schema(context: Context, field: u64) -> Option<Field> {
             limit: 100_000,
             extra: size_of::<Vec<()>>(),
         },
-        (Row, 1) => Text,
-        (Row, 2) => Messages {
+        (Row, 1) => Messages {
             context: Cell,
             limit: 32,
             extra: PORTABLE_CELL_HEADER_CHARGE,
@@ -468,83 +413,29 @@ fn varint(bytes: &[u8], position: &mut usize) -> Result<u64, &'static str> {
     Err("overflowing varint")
 }
 
-fn skip(bytes: &[u8], position: &mut usize, wire: u64) -> Result<(), &'static str> {
-    let length = match wire {
-        0 => {
-            varint(bytes, position)?;
-            return Ok(());
-        }
-        1 => 8,
-        5 => 4,
-        2 => usize::try_from(varint(bytes, position)?).map_err(|_| "overflow")?,
-        _ => return Err("invalid wire type"),
-    };
-    *position = position.checked_add(length).ok_or("overflow")?;
-    if *position > bytes.len() {
-        return Err("truncated field");
-    }
-    Ok(())
-}
-fn envelope_kind(bytes: &[u8]) -> Result<ClientFrameKind, &'static str> {
-    let mut position = 0;
-    let mut kind = None;
-    while position < bytes.len() {
-        let tag = varint(bytes, &mut position)?;
-        let next = match tag >> 3 {
-            1 => Some(ClientFrameKind::Hello),
-            2 => Some(ClientFrameKind::Auth),
-            3 => Some(ClientFrameKind::Request),
-            4 => Some(ClientFrameKind::Response),
-            0 => return Err("invalid field"),
-            _ => None,
-        };
-        if let Some(next) = next {
-            if kind.replace(next).is_some() || tag & 7 != 2 {
-                return Err("duplicate or invalid message");
-            }
-        }
-        skip(bytes, &mut position, tag & 7)?;
-    }
-    kind.ok_or("missing message")
-}
-fn response_id(bytes: &[u8]) -> Result<u64, &'static str> {
-    let mut position = 0;
-    let mut id = 0;
-    while position < bytes.len() {
-        let tag = varint(bytes, &mut position)?;
-        if tag >> 3 == 1 {
-            if tag & 7 != 0 {
-                return Err("invalid response id wire type");
-            }
-            id = varint(bytes, &mut position)?;
-        } else {
-            skip(bytes, &mut position, tag & 7)?;
-        }
-    }
-    Ok(id)
-}
-
 fn walk(
     bytes: &[u8],
     context: Context,
     budget: &mut Budget,
-    shape: Option<&ClientResponseShape>,
+    shape: Option<&RpcResponseShape>,
 ) -> Result<(), &'static str> {
-    if context == Context::Response {
-        if let Some(shape) = shape {
-            if response_id(bytes)? != shape.id {
-                return Err("response id does not match pending request");
-            }
-        }
-    }
     budget.charge(context.size(), false)?;
     let mut position = 0;
     let mut counts = [0usize; 12];
+    let mut variants = 0usize;
     while position < bytes.len() {
         let tag = varint(bytes, &mut position)?;
         let field = tag >> 3;
         if field == 0 {
             return Err("invalid field");
+        }
+        if (context == Context::Request && (2..=9).contains(&field))
+            || (context == Context::Cell && (1..=4).contains(&field))
+        {
+            variants += 1;
+            if variants > 1 {
+                return Err("duplicate RPC oneof");
+            }
         }
         let kind = schema(context, field);
         if let Some(kind) = kind {
@@ -566,13 +457,16 @@ fn walk(
                 Field::Map { limit } => Some((limit, MAP_SLOT_CHARGE)),
                 _ => None,
             };
+            if repeated.is_none() && *count > 1 {
+                return Err("duplicate RPC field");
+            }
             if let Some((limit, element)) = repeated {
                 if *count > limit {
                     return Err("invalid or excessive repeated field");
                 }
                 budget.repeated(*count, element)?;
             }
-            if context == Context::Row && field == 2 {
+            if context == Context::Row && field == 1 {
                 budget.report.query_cells = budget
                     .report
                     .query_cells
@@ -600,7 +494,14 @@ fn walk(
                         std::str::from_utf8(inner).map_err(|_| "invalid application UTF-8")?;
                         budget.payload(inner.len())?;
                     }
-                    Some(Field::Bytes) => budget.payload(inner.len())?,
+                    Some(Field::Bytes) => {
+                        if matches!((context, field), (Context::Put, 5) | (Context::Delete, 3))
+                            && inner.len() > write_concern::MAX_WRITE_CONCERN_POLICY_BYTES
+                        {
+                            return Err("write concern policy exceeds byte limit");
+                        }
+                        budget.payload(inner.len())?;
+                    }
                     Some(
                         Field::Message(nested)
                         | Field::Messages {
@@ -615,6 +516,8 @@ fn walk(
                         // Opaque application receipt bytes are subsequently decoded
                         // by the SDK. Admit that nested materialization as well.
                         walk(inner, Context::Receipt, budget, shape)?;
+                        write_concern::preflight_result(inner)
+                            .map_err(|_| "invalid write concern receipt")?;
                     }
                     _ => {}
                 }
@@ -629,16 +532,16 @@ fn walk(
     if context == Context::Row {
         budget.wrong_row_width |= shape
             .and_then(|shape| shape.columns)
-            .is_some_and(|columns| counts[2] != columns);
+            .is_some_and(|columns| counts[1] != columns);
     }
     if context == Context::QueryResult {
         budget.columns = counts[1];
         budget.rows = counts[2];
     }
-    if context == Context::Frame && shape.is_some() && counts[4] != 1 {
-        return Err("expected pending application response");
+    if context == Context::Request && (variants != 1 || counts[1] != 1) {
+        return Err("RPC request requires a table and exactly one operation");
     }
-    if context == Context::Response && counts[2] == 0 {
+    if context == Context::Response && counts[1] == 0 {
         if let Some(shape) = shape {
             let (reads, mutations, query, inspection, scans) = match shape.operation {
                 Operation::Read(reads) => (reads, 0, 0, 0, false),
@@ -648,11 +551,11 @@ fn walk(
                 Operation::Scan => (0, 0, 0, 0, true),
                 Operation::Unsupported => (0, 0, 0, 0, false),
             };
-            if counts[3] != reads
-                || counts[4] != mutations
-                || counts[5] != query
-                || counts[6] != inspection
-                || (!scans && counts[7] != 0)
+            if counts[2] != reads
+                || counts[3] != mutations
+                || counts[4] != query
+                || counts[5] != inspection
+                || (!scans && counts[6] != 0)
                 || (query == 1
                     && (shape
                         .columns

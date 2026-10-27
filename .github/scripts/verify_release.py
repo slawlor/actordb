@@ -40,8 +40,17 @@ def verify_backends(package):
         for entries in features.values()
     ):
         raise ReleaseError("actordb had an invalid feature list")
-    if features.get("default") != []:
-        raise ReleaseError("actordb default features must remain empty")
+    if features.get("default") != ["grpc"] or "grpc" not in features:
+        raise ReleaseError("actordb default features must only enable grpc")
+    pending, seen = ["grpc"], set()
+    while pending:
+        feature = pending.pop()
+        if feature in seen:
+            continue
+        seen.add(feature)
+        if feature in {"memory", "rocksdb", "dep:rocksdb"}:
+            raise ReleaseError("default RPC features must not enable storage backends")
+        pending.extend(entry for entry in features.get(feature, []) if entry in features or entry == "dep:rocksdb")
     if features.get("memory") != []:
         raise ReleaseError("actordb must provide a dependency-free memory opt-in")
     if features.get("rocksdb") != ["dep:rocksdb"]:

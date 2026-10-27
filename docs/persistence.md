@@ -5,7 +5,7 @@ a purely in-memory node: the fragment cache holds everything and nothing
 touches disk. This default needs no storage-backend feature; it does not use
 `MemoryStore`. Set a durable store to get durability.
 
-The crate's default feature set is empty. Enable the independent `rocksdb`
+The default `grpc` feature enables the application adapter, not a storage backend. Enable the independent `rocksdb`
 feature to use the offered durable backend:
 
 ```toml

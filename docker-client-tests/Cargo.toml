@@ -16,7 +16,7 @@ name = "actordb-docker-cluster-client"
 path = "src/cluster_client.rs"
 
 [dependencies]
-actordb-client = { version = "0.10.0", path = "../actordb-client" }
+actordb-client = { version = "0.11.0", path = "../actordb-client" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "net"] }
 clap = { version = "4", features = ["derive"] }
 seahash = "4"

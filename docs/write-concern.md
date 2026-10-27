@@ -132,7 +132,7 @@ required policy fields before application.
 ## Current deployment contract
 
 Use `0.9.0` database, protocol, query and SDK crates together. Exact peer
-protocol 6 and application protocol 4 include all current concern, region,
+protocol 6 and the unary application RPC contract include all current concern, region,
 strict-policy and durability-evidence messages. There is no capability or
 mixed-version negotiation. Ordinary writes still select local acknowledgement
 by default; this is a current policy choice, not a wire fallback.

@@ -1,90 +1,74 @@
 # ActorDB Rust client
 
-<p align="center">
-  <img src="https://raw.githubusercontent.com/slawlor/actordb/main/docs/assets/actordb-logo-draft.svg" alt="ActorDB distributed Ferris graph" width="360">
-</p>
+The SDK is a typed, transport-neutral unary RPC client. gRPC is enabled by
+default; servers bind `actordb::grpc::GrpcServer` around an existing `Arc<Node>`.
+Peer replication remains separate and application RPCs never join its membership.
 
-Connect to the **application listener**, using `Client::connect(address,
-ClientOptions::default())`. A server explicitly binds
-`actordb::client_server::ClientServer` around an existing `Arc<Node>`.
+```toml
+actordb-client = "0.11.0"
+```
 
-Use `actordb-client = "0.10.0"` with a current application listener. The SDK
-uses exact application protocol 4, without version-range or capability
-negotiation. Construct `ClientOptions` and `PutOptions` with their Bon builders,
-or start with `Default` and modify public fields; these structs are
-`non_exhaustive`. See the [option guide](../docs/client-options.md).
+```rust,ignore
+let client = Client::connect("http://db.example:7449", ClientOptions::default()).await?;
+client.put("greeting", b"hello".to_vec()).await?;
+let value = client.get("greeting").await?;
+client.close().await;
+```
 
-Run the complete TCP and SQL example with
-`cargo run -p actordb-client --example query_demo`. It starts a local listener,
-writes records through the SDK, queries selected fragments, and reduces all
-fragments. For the SQL grammar and budgets, see [the query guide](../docs/query.md).
+For another framework, disable default features in both SDK and database crates,
+implement `RpcClient`, and construct the SDK using `Client::from_rpc`.
+The server-side `RpcService` trait and `NodeRpcService` have no gRPC, sockets,
+credentials, or authentication state. A Thrift or other adapter maps its messages
+into the canonical typed requests and owns its own TLS, authentication and ACLs.
+See [the RPC design](../docs/rpc-0.11-design.md) and [transports](../docs/transports.md).
 
-The client supports point and ordered batch reads/writes, delete tombstones,
-TTL and priority options, value version/expiry metadata, bounded distributed
-scans, SQL queries with typed positional parameters, and local node health and
-placement inspection. SQL is the ActorDB key/value dialect, not arbitrary SQL.
-`ScanOptions` and `ScanMatch` are reexported for callers using the scan API.
-Set `ClientOptions::table` (or use the Bon builder) to bind requests to a
-named logical table. Table clients reuse the same application listener and
-isolate keys and SQL results by table.
-Inspection describes the contacted node; it is not a readiness or durability
-check. Batches are individual operations, not transactions.
+The gRPC adapter uses unary `actordb.rpc.v1.ActorDb/Call` requests over reusable
+HTTP/2 channels, not a fresh TCP connection for each operation. The former
+application byte-stream protocol is removed: there is no compatibility listener,
+application hello/auth exchange, connection identity, or ActorDB request ID.
 
-Clones share one connection and serialize exchanges, decoding and conversion. Count and encoded-byte
-admission are nonwaiting and return `ClientError::Overloaded` at capacity. The
-request deadline includes waiting for the connection. For parallel connections,
-create several clients. Incoming frames retain their fixed 16 MiB wire cap.
-Before decoding, aggregate headers, cells, map entries, payloads and nested
-write-concern evidence must also fit `ClientOptions::max_decoded_response_bytes`
-(64 MiB by default). This stricter default can reject formerly accepted wide
-responses or near-server-limit narrow text results. For such a trusted workload, opt in with
-`.max_decoded_response_bytes(512 * 1024 * 1024)`; increasing that allowance does
-not increase the wire limit. Exceeding decoded admission retires the connection
-with `Protocol` (or `UnknownOutcome` for a possibly dispatched mutation).
-Server-side complete-result exhaustion remains a resource-limit error; reduce
-batch/query size or explicitly configure the receiving budget as appropriate.
-Scan limits/offsets retain per-fragment
-semantics and scans share the query engine's byte bounds.
+The catalog includes point and ordered batch reads/writes, delete tombstones,
+TTL/priorities, version/expiry metadata, table views, scans, distributed SQL,
+write-concern receipts and read-only local inspection. Batches are not
+transactions; inspection is not readiness or durability evidence. Logical table
+views share the adapter and admission limits but isolate their data and queries.
 
-The allowance is conservative allocation accounting, not exact heap usage or
-RSS. It includes the raw body, decoded collection capacity/payloads, temporary
-validation copies and portable result/receipt conversion. A shared owner stays
-held until conversion returns, so the next clone cannot allocate a raw response
-while the previous response is being converted. Caller-retained returned results,
-outgoing request storage, transport buffers and allocator slack are outside this
-scope; independently connected clients each have their own allowance.
+## Bounds and cancellation
 
-No write retries happen automatically. Connection loss or timeout after possible
-dispatch returns `UnknownOutcome`: the write might have committed. Canceling an
-in-flight request closes that connection; later requests return `Closed`.
-`Client::close` stops admission for all clones and cancels active and queued
-requests. An active mutation whose write has started returns `UnknownOutcome`;
-queued operations and cancelled reads return `Closed`. Graceful transport
-shutdown has a total budget of `ClientOptions.timeout`, then the stream is
-dropped. `close_with_timeout` supplies a different budget; zero skips graceful
-shutdown. Transport adapters must release resources on Drop. Closing the client
-never shuts down the database.
+Calls can run concurrently. `max_queued_requests` and `max_queued_bytes` bound
+admitted waiting/active calls. Each RPC reserves its full configured
+`max_decoded_response_bytes` before framework buffering/decoding; the aggregate
+`max_response_memory_bytes` budget bounds concurrent reservations. Defaults are
+64 MiB per response and 256 MiB aggregate, allowing four concurrent RPCs.
+Queued callers retain their request budget and total deadline.
 
-Optional credentials are distinct from cluster secrets and must contain at
-least 32 random bytes. Mutual challenge authentication prevents replay but plain
-TCP does not encrypt traffic. Supply a caller-validated TLS stream with
-`Client::from_stream(stream, options)` and use `ClientServer::bind_with_network`
-or `ClientServer::from_acceptor` on the server. The caller owns TLS configuration
-and transport handshake deadlines; ActorDB retains application authentication,
-request limits, and cancellation semantics. See the [transport guide](../docs/transports.md).
-Run `cargo run -p actordb-client --example tls_demo` for a complete mTLS mesh and
-application example.
-Application connections never become replication peers. Administrative shutdown,
-placement mutation, local debug dumps, and peer replication/reconciliation RPCs
-are deliberately not application operations.
+The fixed RPC message cap is 16 MiB. The Prost codec additionally preflights
+headers, collection growth, nested receipts, payloads and portable conversion
+before materializing collections. Dense wide results can require an explicit
+larger per-response **and aggregate** allowance. These are conservative accounting
+limits, not allocator/RSS or caller-retained result bounds.
 
-This crate's normal dependency tree contains no database actors, native storage
-engine, or protobuf compiler. Integration tests depend on `actordb` only for the
-real application listener.
+No mutation is transparently retried. A timeout/lost reply after possible
+dispatch returns `UnknownOutcome`, even if the server later finishes the write.
+Cancellation affects that RPC, not unrelated calls on the shared channel.
+`close` stops this client's admission and cancels its clones/table views;
+accepted server mutations retain their apply/fan-out ownership. Closing the SDK
+does not close a separately shared custom adapter or shut down the Node.
 
-Per-write acknowledgement counts and region requirements are available through
-`put_with_write_concern` and `delete_with_write_concern`. Install
-`actordb-client = "0.10.0"` for region, strict-policy and durability evidence support; the compatible dependency minimums
-also select the required protocol and query revisions. See the
-[region guide](../docs/write-concern-regions.md) for configuration and receipt
-semantics. Local acknowledgement remains the default.
+## gRPC authentication and TLS
+
+There are no credentials or identity fields in `ClientOptions`.
+Use `grpc::GrpcClientOptions.metadata` for framework-native authorization
+metadata, and `GrpcClient::from_channel` for a caller-configured tonic channel
+with trusted roots/client certificates. Server TLS configuration and its
+`GrpcAuthorizer` hook are gRPC-specific and run before Node admission. ACL hooks
+can inspect actual table/operation, metadata and authenticated TLS connect info.
+
+`cargo run -p actordb-client --example query_demo` demonstrates the catalog.
+`tls_demo` demonstrates caller-configured mTLS on both the independent peer
+transport and gRPC adapter. Production hosts provision their own identities
+and trust policy; ActorDB does not manage credentials.
+
+The SDK's normal dependency tree has no Node/actors, native storage or protobuf
+compiler. Tests use a database only to verify RPC behavior; gRPC-disabled custom
+adapters are tested separately. Normal builds use committed Prost bindings.

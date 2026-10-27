@@ -1,4 +1,5 @@
-use actordb::client_server::{ClientServer, ClientServerOptions};
+#![cfg(feature = "grpc")]
+use actordb::grpc::{GrpcServer, GrpcServerOptions};
 use actordb::node::{Node, NodeConfig};
 use actordb::shard::FragmentId;
 use actordb_client::{
@@ -33,15 +34,15 @@ async fn client_receives_partial_timeout_and_keeps_connection_for_later_operatio
             .await
             .unwrap(),
     );
-    let mut server = ClientServer::bind(
+    let mut server = GrpcServer::bind(
         node.clone(),
         "127.0.0.1:0".parse().unwrap(),
-        ClientServerOptions::default(),
+        GrpcServerOptions::default(),
     )
     .await
     .unwrap();
     let client = Client::connect(
-        server.addr(),
+        format!("http://{}", server.addr()),
         ClientOptions::builder()
             .timeout(Duration::from_millis(150))
             .build(),
@@ -69,6 +70,6 @@ async fn client_receives_partial_timeout_and_keeps_connection_for_later_operatio
     assert_eq!(deleted.required_acknowledgements(), 1);
     assert!(client.get("wait").await.unwrap().is_none());
     client.close().await;
-    server.shutdown().await;
+    server.shutdown().await.unwrap();
     node.shutdown().await.unwrap();
 }

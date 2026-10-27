@@ -42,13 +42,14 @@ and the `PrefixedStore` wrapper are available without either feature.
 The workspace contains `actordb`, its lightweight `actordb-protocol`,
 `actordb-query`, and `actordb-client` companions, the `docker-tests` integration
 crate, the SDK-only `docker-client-tests` scenario executable, and an `xtask`
-for coverage. The client application listener wraps a
+for coverage. The application RPC service wraps a
 Node without creating peer membership or replication senders.
 
 | Module | Role |
 |---|---|
 | `actordb::node` | Public API: `Node`, `NodeConfig`, `NodeError`, peer mesh, routing, forwarding, replication wiring, placement driver |
-| `actordb::client_server` | Separate bounded application TCP listener for SDK connections |
+| `actordb::rpc` | Framework-neutral typed service with bounded request and mutation ownership |
+| `actordb::grpc` | Optional default unary gRPC adapter; TLS/metadata/ACLs stay here |
 | `actordb::query` | SQL execution policy, bounded background pages, and revision-checked fragment coordination |
 | `actordb::actor` | All ractor actors: dispatcher/workers, `FragmentSupervisor`, `Cleaner`, `Snapshotter`; shared cache, clock, and operation/value contracts |
 | `actordb::replication` | Bounded sender/receiver state, sessions, ACKs and current protocol-6 paged `ReconcileRequest/Response/Fetch/Data` anti-entropy |
