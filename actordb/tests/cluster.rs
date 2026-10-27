@@ -6737,12 +6737,9 @@ async fn mixed_batch_put_retries_only_unavailable_positions_with_exact_stamps() 
     assert!(matches!(&results[2], Err(NodeError::Storage(_))));
     assert!(matches!(
         &results[3],
-        Err(NodeError::Superseded {
-            timestamp_ms,
-            logical_counter,
-            node_id,
-            is_tombstone: true,
-        }) if *timestamp_ms == winner_timestamp_ms && node_id == "newer-writer"
+        Err(NodeError::UnknownOutcome(message))
+            if message.contains(&winner_timestamp_ms.to_string())
+                && message.contains("newer-writer")
     ));
     assert!(matches!(&results[4], Err(NodeError::Backpressure(_))));
     assert!(results[5].is_ok());
@@ -6834,9 +6831,11 @@ async fn mixed_batch_put_malformed_subset_exhaustion_preserves_terminal_results(
     .expect("partial batch-put exhaustion exchange timed out");
     assert_eq!(results.len(), 5);
     assert!(results[0].is_ok());
-    assert!(matches!(&results[1], Err(NodeError::Network(_))));
+    // These positions were sent to both holders. A malformed/lost reply
+    // cannot certify that they never applied, unlike an unsent request.
+    assert!(matches!(&results[1], Err(NodeError::UnknownOutcome(_))));
     assert!(matches!(&results[2], Err(NodeError::Storage(_))));
-    assert!(matches!(&results[3], Err(NodeError::Network(_))));
+    assert!(matches!(&results[3], Err(NodeError::UnknownOutcome(_))));
     assert!(matches!(&results[4], Err(NodeError::Backpressure(_))));
 
     drop(first);

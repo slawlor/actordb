@@ -89,11 +89,20 @@ impl KvStore for TableStore {
     }
 
     fn write_batch(&self, writes: &[(Vec<u8>, VersionedValue)]) -> Result<(), StoreError> {
-        let prefixed: Vec<_> = writes
+        let borrowed: Vec<_> = writes
             .iter()
-            .map(|(key, value)| (self.prefixed(key), value.clone()))
+            .map(|(key, value)| (key.as_slice(), value))
             .collect();
-        self.inner.write_batch(&prefixed)
+        self.write_batch_borrowed(&[], &borrowed)
+    }
+
+    fn write_batch_borrowed(
+        &self,
+        prefix: &[u8],
+        writes: &[(&[u8], &VersionedValue)],
+    ) -> Result<(), StoreError> {
+        self.inner
+            .write_batch_borrowed(&self.prefixed(prefix), writes)
     }
 
     fn prefix_delete_support(&self) -> PrefixDeleteSupport {
@@ -148,16 +157,23 @@ impl KvStore for PrefixedStore {
     }
 
     fn write_batch(&self, writes: &[(Vec<u8>, VersionedValue)]) -> Result<(), StoreError> {
-        let prefixed: Vec<(Vec<u8>, VersionedValue)> = writes
+        let borrowed: Vec<_> = writes
             .iter()
-            .map(|(k, v)| {
-                let mut buf = Vec::with_capacity(4 + k.len());
-                buf.extend_from_slice(&self.prefix);
-                buf.extend_from_slice(k);
-                (buf, v.clone())
-            })
+            .map(|(key, value)| (key.as_slice(), value))
             .collect();
-        self.inner.write_batch(&prefixed)
+        self.write_batch_borrowed(&[], &borrowed)
+    }
+
+    fn write_batch_borrowed(
+        &self,
+        prefix: &[u8],
+        writes: &[(&[u8], &VersionedValue)],
+    ) -> Result<(), StoreError> {
+        let mut physical_prefix =
+            Vec::with_capacity(self.prefix.len().saturating_add(prefix.len()));
+        physical_prefix.extend_from_slice(&self.prefix);
+        physical_prefix.extend_from_slice(prefix);
+        self.inner.write_batch_borrowed(&physical_prefix, writes)
     }
 
     fn prefix_delete_support(&self) -> PrefixDeleteSupport {
@@ -175,6 +191,94 @@ impl KvStore for PrefixedStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct BorrowProbe {
+        payload: usize,
+        writer: usize,
+        expected_key: Vec<u8>,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+    impl KvStore for BorrowProbe {
+        fn bind(&self, _: &StoreIdentity) -> Result<StoreBinding, StoreError> {
+            Ok(StoreBinding::unmanaged())
+        }
+        fn load(&self) -> Result<Vec<(Vec<u8>, VersionedValue)>, StoreError> {
+            Ok(Vec::new())
+        }
+        fn load_prefix(&self, _: &[u8]) -> Result<Vec<(Vec<u8>, VersionedValue)>, StoreError> {
+            Ok(Vec::new())
+        }
+        fn commit_durability(&self) -> StoreCommitDurability {
+            StoreCommitDurability::Buffered
+        }
+        fn stable_fence(&self) -> Result<StoreCommitDurability, StoreError> {
+            Ok(StoreCommitDurability::Buffered)
+        }
+        fn write_batch(&self, _: &[(Vec<u8>, VersionedValue)]) -> Result<(), StoreError> {
+            panic!("borrowed backend must not receive an owning wrapper clone")
+        }
+        fn write_batch_borrowed(
+            &self,
+            prefix: &[u8],
+            writes: &[(&[u8], &VersionedValue)],
+        ) -> Result<(), StoreError> {
+            assert_eq!(writes.len(), 1);
+            assert_eq!(writes[0].1.value.as_ptr() as usize, self.payload);
+            assert_eq!(writes[0].1.node_id.as_ptr() as usize, self.writer);
+            assert_eq!([prefix, writes[0].0].concat(), self.expected_key);
+            self.calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn nested_namespace_views_do_not_clone_values_or_materialize_intermediate_keys() {
+        let logical = crate::table_key::encode_table_key("USERS", "wide");
+        let value = VersionedValue::new(vec![7; 8 * 1024 * 1024], 10, "writer".into());
+        let expected_key = [
+            3u32.to_be_bytes().as_slice(),
+            crate::table_key::table_storage_prefix("USERS").as_slice(),
+            b"extra:",
+            logical.as_bytes(),
+        ]
+        .concat();
+        let root = Arc::new(BorrowProbe {
+            payload: value.value.as_ptr() as usize,
+            writer: value.node_id.as_ptr() as usize,
+            expected_key,
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let fragment = Arc::new(PrefixedStore::new(root.clone(), FragmentId(3)));
+        let table = TableStore::new(fragment, "USERS");
+        table
+            .write_batch_borrowed(b"extra:", &[(logical.as_bytes(), &value)])
+            .unwrap();
+        assert_eq!(root.calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn owning_namespace_entrypoint_also_delegates_a_borrowed_value() {
+        let logical = crate::table_key::encode_table_key("KV", "key");
+        let value = VersionedValue::new(vec![8; 1024], 11, "writer".into());
+        let root = Arc::new(BorrowProbe {
+            payload: value.value.as_ptr() as usize,
+            writer: value.node_id.as_ptr() as usize,
+            expected_key: [
+                0u32.to_be_bytes().as_slice(),
+                crate::table_key::table_storage_prefix("KV").as_slice(),
+                logical.as_bytes(),
+            ]
+            .concat(),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let table = TableStore::new(
+            Arc::new(PrefixedStore::new(root.clone(), FragmentId(0))),
+            "KV",
+        );
+        table.write_batch(&[(logical.into_bytes(), value)]).unwrap();
+        assert_eq!(root.calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
 
     #[test]
     fn prefixed_store_isolates_fragments() {

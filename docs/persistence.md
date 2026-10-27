@@ -30,6 +30,9 @@ pub trait KvStore: Send + Sync + 'static {
     fn commit_durability(&self) -> StoreCommitDurability;
     fn stable_fence(&self) -> Result<StoreCommitDurability, StoreError>;
     fn write_batch(&self, writes: &[(Vec<u8>, VersionedValue)]) -> Result<(), StoreError>;
+    // Optional override; the default materializes one owning backend batch.
+    fn write_batch_borrowed(&self, prefix: &[u8], writes: &[(&[u8], &VersionedValue)])
+        -> Result<(), StoreError>;
     fn prefix_delete_support(&self) -> PrefixDeleteSupport;
     fn delete_prefix(&self, prefix: &[u8])
         -> Result<PrefixDeleteOutcome, StoreError>;
@@ -51,6 +54,14 @@ The contract is deliberately narrow:
 - `write_batch` persists a batch of **winning writes** (post-LWW-merge).
   The actor never calls `get`/`put`/`delete` on the store; it works from the
   in-memory `FragmentState` cache and pushes batches down.
+- Actor flushes use `write_batch_borrowed`: the authoritative batch stays owned
+  through completion while table/fragment wrappers combine their namespace
+  prefixes without cloning full values or intermediate record keys. Its default
+  prepends the combined prefix once, materializes one owning backend batch and
+  calls the existing required `write_batch`, so custom stores need no changes.
+  RocksDB overrides the borrowed path to encode directly from the winning values.
+  Backend/returned-data allocations remain separate from the persistence admission
+  allowance; no references may be retained beyond the synchronous method call.
 - Writes are serialized per table/cache partition and each batch contains at most one
   version per key. A failed or cancelled attempt can be retried, so custom
   stores must apply identical key/version writes idempotently.

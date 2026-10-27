@@ -404,6 +404,31 @@ pub trait KvStore: Send + Sync + 'static {
     /// Atomically persist a batch of winning writes. Each key occurs at most
     /// once in a batch.
     fn write_batch(&self, writes: &[(Vec<u8>, VersionedValue)]) -> Result<(), StoreError>;
+    /// Atomically persist a borrowed winning batch, prepending `prefix` to
+    /// every key exactly once. Namespace wrappers combine their prefixes and
+    /// delegate without copying values or materializing intermediate keys.
+    ///
+    /// The default materializes one owned backend batch and calls
+    /// [`Self::write_batch`], so existing custom stores need no changes.
+    /// Backends may override this to encode directly from the borrowed view.
+    /// All data must be consumed synchronously before returning; durability
+    /// and failure semantics are identical to `write_batch`.
+    fn write_batch_borrowed(
+        &self,
+        prefix: &[u8],
+        writes: &[(&[u8], &VersionedValue)],
+    ) -> Result<(), StoreError> {
+        let owned: Vec<_> = writes
+            .iter()
+            .map(|(key, value)| {
+                let mut physical = Vec::with_capacity(prefix.len().saturating_add(key.len()));
+                physical.extend_from_slice(prefix);
+                physical.extend_from_slice(key);
+                (physical, (*value).clone())
+            })
+            .collect();
+        self.write_batch(&owned)
+    }
     /// Declare whether lifecycle code may invoke [`KvStore::delete_prefix`].
     ///
     /// Backends retain namespaces unless they explicitly opt in. Opting in promises

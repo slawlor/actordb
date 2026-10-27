@@ -10,6 +10,7 @@ use actordb_protocol::{
     DEFAULT_MAX_DECODED_RESPONSE_BYTES, MAX_RPC_MESSAGE_BYTES, RPC_CALL_PATH, RPC_SERVICE_NAME,
 };
 use std::convert::Infallible;
+use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -35,6 +36,8 @@ pub type GrpcAuthorizer = Arc<
 
 #[derive(Clone)]
 pub struct GrpcServerOptions {
+    /// Service execution limits. The timeout also bounds reception of each
+    /// complete unary request body, independently of accepted execution.
     pub service: RpcServiceOptions,
     pub tls: Option<ServerTlsConfig>,
     pub authorize: Option<GrpcAuthorizer>,
@@ -104,6 +107,10 @@ impl GrpcServer {
             || options.max_decoded_request_bytes > u32::MAX as usize
             || options.receive_memory_bytes < options.max_decoded_request_bytes
             || options.receive_memory_bytes > Semaphore::MAX_PERMITS
+            || options.service.timeout.is_zero()
+            || tokio::time::Instant::now()
+                .checked_add(options.service.timeout)
+                .is_none()
             || options.shutdown_timeout.is_zero()
             || tokio::time::Instant::now()
                 .checked_add(options.shutdown_timeout)
@@ -129,6 +136,7 @@ impl GrpcServer {
             authorize: options.authorize,
             receive: Arc::new(Semaphore::new(options.receive_memory_bytes)),
             decoded_limit: options.max_decoded_request_bytes,
+            receive_timeout: options.service.timeout,
         };
         let mut builder = Server::builder().max_concurrent_streams(64u32);
         if let Some(tls) = options.tls {
@@ -200,6 +208,7 @@ struct GrpcAdapter {
     authorize: Option<GrpcAuthorizer>,
     receive: Arc<Semaphore>,
     decoded_limit: usize,
+    receive_timeout: Duration,
 }
 impl tonic::server::NamedService for GrpcAdapter {
     const NAME: &'static str = RPC_SERVICE_NAME;
@@ -243,6 +252,11 @@ where
             service: self.service.clone(),
             authorize: self.authorize.clone(),
         };
+        // Bound the body, not the entire exchange: an accepted mutation or
+        // concern wait must retain its independent execution ownership after
+        // reception finishes. The server cap cannot be disabled or extended
+        // by a missing/large grpc-timeout header or a trickling sender.
+        let request = request.map(|body| ReceiveBody::new(body, self.receive_timeout));
         Box::pin(async move {
             let mut grpc = tonic::server::Grpc::new(codec)
                 .max_decoding_message_size(MAX_RPC_MESSAGE_BYTES)
@@ -251,6 +265,65 @@ where
         })
     }
 }
+
+struct ReceiveBody<B> {
+    body: Pin<Box<B>>,
+    deadline: Pin<Box<tokio::time::Sleep>>,
+    finished: bool,
+}
+impl<B> ReceiveBody<B> {
+    fn new(body: B, timeout: Duration) -> Self {
+        Self {
+            body: Box::pin(body),
+            deadline: Box::pin(tokio::time::sleep(timeout)),
+            finished: false,
+        }
+    }
+}
+impl<B> http_body::Body for ReceiveBody<B>
+where
+    B: http_body::Body<Data = tonic::codegen::Bytes>,
+    B::Error: Into<tonic::codegen::StdError>,
+{
+    type Data = tonic::codegen::Bytes;
+    type Error = Status;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        if self.finished {
+            return Poll::Ready(None);
+        }
+        if self.deadline.as_mut().poll(cx).is_ready() {
+            self.finished = true;
+            return Poll::Ready(Some(Err(Status::deadline_exceeded(
+                "gRPC request body receive deadline elapsed",
+            ))));
+        }
+        match self.body.as_mut().poll_frame(cx) {
+            Poll::Ready(Some(Ok(frame))) => Poll::Ready(Some(Ok(frame))),
+            Poll::Ready(Some(Err(error))) => {
+                self.finished = true;
+                Poll::Ready(Some(Err(Status::from_error(error.into()))))
+            }
+            Poll::Ready(None) => {
+                self.finished = true;
+                Poll::Ready(None)
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.finished || self.body.is_end_stream()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.body.size_hint()
+    }
+}
+
 struct Unary {
     service: Arc<dyn RpcService>,
     authorize: Option<GrpcAuthorizer>,

@@ -55,6 +55,13 @@ The default `grpc` feature is enabled in both `actordb` and `actordb-client`.
 It provides unary `actordb.rpc.v1.ActorDb/Call` RPCs with committed Prost bindings.
 HTTP/2 channels are reusable; RPC does not require dialing for every operation.
 
+`GrpcServerOptions.service.timeout` also bounds receiving each complete unary
+request body, including its end-of-stream/trailers. This server-owned cap applies
+even when a client omits `grpc-timeout`, supplies a larger deadline, or trickles
+body data. Expiry releases the request's materialization reservation before Node
+admission. It does not shorten an already-admitted mutation or concern wait:
+body reception and execution have independent ownership/deadlines.
+
 ```rust,ignore
 let mut server = GrpcServer::bind(node, addr, GrpcServerOptions::default()).await?;
 let client = Client::connect(format!("http://{}", server.addr()), ClientOptions::default()).await?;
