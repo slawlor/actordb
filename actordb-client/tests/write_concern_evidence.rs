@@ -1,7 +1,8 @@
+#![cfg(feature = "grpc")]
 #[path = "../../actordb/tests/common/evidence_store.rs"]
 #[allow(dead_code)]
 mod evidence_store;
-use actordb::client_server::{ClientServer, ClientServerOptions};
+use actordb::grpc::{GrpcServer, GrpcServerOptions};
 use actordb::node::{Node, NodeConfig};
 use actordb::shard::FragmentId;
 use actordb_client::{
@@ -48,18 +49,21 @@ async fn sdk_forwarded_put_delete_and_local_fence_failure_preserve_certified_evi
     })
     .await
     .unwrap();
-    let mut server = ClientServer::bind(
+    let mut server = GrpcServer::bind(
         gateway.clone(),
         "127.0.0.1:0".parse().unwrap(),
-        ClientServerOptions::default(),
+        GrpcServerOptions::default(),
     )
     .await
     .unwrap();
-    let client = Client::connect(server.addr(), ClientOptions::default())
-        .await
-        .unwrap()
-        .table("orders")
-        .unwrap();
+    let client = Client::connect(
+        format!("http://{}", server.addr()),
+        ClientOptions::default(),
+    )
+    .await
+    .unwrap()
+    .table("orders")
+    .unwrap();
     let stable = WriteConcernOptions::builder()
         .minimum_durability(WriteDurability::StableCommitted)
         .require_evidence(true)
@@ -109,7 +113,7 @@ async fn sdk_forwarded_put_delete_and_local_fence_failure_preserve_certified_evi
     );
     store.fail_write.store(false, Ordering::SeqCst);
     client.close().await;
-    server.shutdown().await;
+    server.shutdown().await.unwrap();
     gateway.shutdown().await.unwrap();
     receiver.shutdown().await.unwrap();
 }

@@ -2,7 +2,7 @@
 
 For remote application connections, use the companion
 [`actordb-client`](../actordb-client/README.md) and the separate
-`actordb::client_server::ClientServer` listener. For SQL filtering, fragment
+`actordb::grpc::GrpcServer` adapter or a custom `RpcService` framework. For SQL filtering, fragment
 scopes, projections, and exact aggregates, see the [query guide](query.md).
 For caller-supplied streams, application acceptors, and TLS configuration,
 see the [transport guide](transports.md).
@@ -404,7 +404,7 @@ same public `KvMessage` variants to `KvActor`, which owns admission, routing,
 supervision, and exact per-worker accounting.
 
 Protocol implementations import `actordb_protocol::meta` and use exact peer
-protocol 6 with application protocol 4. Reconciliation uses cursor, revision, page-sequence,
+peer protocol 6 with unary `actordb.rpc.v1` application RPC. Reconciliation uses cursor, revision, page-sequence,
 completion, and restart fields; acknowledgement levels explicitly distinguish
 applied, store-committed, and stable-committed evidence. A non-empty
 `BatchGetResponse` may now be an ordered request prefix; an empty response is

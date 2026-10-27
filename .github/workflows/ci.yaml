@@ -18,6 +18,22 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Check SDK without server or native dependencies
         run: cargo check --package actordb-client --lib --no-default-features
+      - name: Check server RPC without gRPC dependencies
+        run: cargo check --package actordb --lib --no-default-features
+      - name: Test vendor RPC adapters with gRPC disabled
+        run: cargo test --package actordb-client --no-default-features --test rpc_migration --test rpc_validation --test close
+      - name: Verify disabled RPC adapters have no gRPC or HTTP stack
+        run: |
+          python3 - <<'PY'
+          import subprocess
+          for package in ['actordb', 'actordb-client']:
+              result = subprocess.run(['cargo', 'tree', '--package', package, '--no-default-features',
+                                       '--edges', 'normal,build', '--prefix', 'none'],
+                                      capture_output=True, text=True, check=True)
+              names = {line.split()[0] for line in result.stdout.splitlines() if line.strip()}
+              forbidden = {'tonic', 'hyper', 'h2', 'axum'}
+              assert not names & forbidden, f'{package}: disabled gRPC still links {names & forbidden}'
+          PY
       - name: Verify the external client cannot link a database node
         run: |
           python3 - <<'PY'

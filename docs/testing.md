@@ -11,7 +11,7 @@ not generated builder plumbing or repetitive default/override assertions.
 Transport coverage in `actordb/tests/network.rs` exercises buffered in-process
 streams, partial I/O, peer replication/reconnects, and listener/stream ownership
 on cancellation and shutdown. `actordb-client/tests/transports.rs` verifies
-injected streams/acceptors, application authentication and validation, transient
+framework-neutral RPC adapters, gRPC-specific ACL/mTLS and validation, transient
 accept failures, handshake cancellation, and caller-configured TLS for both
 application traffic and peer replication. It also checks TLS trust/name failures
 and that unfinished TLS clients do not block healthy sessions. See the
@@ -33,7 +33,7 @@ tag/main provenance, release-event tests, credentials, and publication behavior.
 
 ## CI feature coverage and caches
 
-The crate has an empty default feature set. CI distinguishes the storeless core
+The crate defaults to the optional `grpc` application adapter; storage remains opt-in. CI distinguishes the storeless core
 from the independent no-op `memory` test double and the offered `rocksdb`
 backend:
 

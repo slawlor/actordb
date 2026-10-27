@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use actordb::actor::VersionedValue;
 use actordb::checkpoint::CheckpointBackend;
-use actordb::client_server::{ClientServer, ClientServerOptions};
+use actordb::grpc::{GrpcServer, GrpcServerOptions};
 use actordb::network::{
     AcceptFuture, Acceptor, BindFuture, BoxStream, ConnectFuture, Network, NetworkError, TcpNetwork,
 };
@@ -177,20 +177,30 @@ struct FaultAcceptor {
 struct FaultStream {
     inner: BoxStream,
     faults: Arc<Faults>,
-    changed: Pin<Box<OwnedNotified>>,
+    read_changed: Pin<Box<OwnedNotified>>,
+    write_changed: Pin<Box<OwnedNotified>>,
 }
 impl FaultStream {
     fn boxed(inner: BoxStream, faults: Arc<Faults>) -> BoxStream {
-        let changed = Box::pin(faults.changed.clone().notified_owned());
+        let read_changed = Box::pin(faults.changed.clone().notified_owned());
+        let write_changed = Box::pin(faults.changed.clone().notified_owned());
         Box::pin(Self {
             inner,
             faults,
-            changed,
+            read_changed,
+            write_changed,
         })
     }
-    fn check(&mut self, cx: &mut Context<'_>) -> std::io::Result<()> {
-        while std::future::Future::poll(self.changed.as_mut(), cx).is_ready() {
-            self.changed = Box::pin(self.faults.changed.clone().notified_owned());
+    fn check(&mut self, cx: &mut Context<'_>, reading: bool) -> std::io::Result<()> {
+        // Split readers/writers have different wakers. A successful flush must
+        // not replace the idle reader's notification and hide an outage.
+        let changed = if reading {
+            &mut self.read_changed
+        } else {
+            &mut self.write_changed
+        };
+        while std::future::Future::poll(changed.as_mut(), cx).is_ready() {
+            *changed = Box::pin(self.faults.changed.clone().notified_owned());
         }
         if self.faults.isolated.load(Ordering::Acquire) {
             Err(std::io::Error::new(
@@ -208,7 +218,7 @@ impl AsyncRead for FaultStream {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
-        if let Err(e) = self.check(cx) {
+        if let Err(e) = self.check(cx, true) {
             return Poll::Ready(Err(e));
         }
         self.inner.as_mut().poll_read(cx, buf)
@@ -220,13 +230,13 @@ impl AsyncWrite for FaultStream {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
-        if let Err(e) = self.check(cx) {
+        if let Err(e) = self.check(cx, false) {
             return Poll::Ready(Err(e));
         }
         self.inner.as_mut().poll_write(cx, buf)
     }
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        if let Err(e) = self.check(cx) {
+        if let Err(e) = self.check(cx, false) {
             return Poll::Ready(Err(e));
         }
         self.inner.as_mut().poll_flush(cx)
@@ -327,6 +337,8 @@ impl Control {
                         "fragment": s.fragment.0, "peer": s.peer_id, "state": format!("{:?}",s.connection),
                         "buffered": s.buffered_operations, "in_flight": s.in_flight_batches,
                         "rounds": s.completed_reconcile_rounds, "session": s.session_id,
+                        "activity": format!("{:?}", s.activity),
+                        "reconciliation_stage": s.reconciliation_stage.map(|stage| format!("{stage:?}")),
                     })).collect::<Vec<_>>(),
                 }))
             }
@@ -498,7 +510,7 @@ pub(super) async fn run(
             .await
             .map_err(|e| e.to_string())?,
     );
-    let mut app = ClientServer::bind(node.clone(), bind(app_port), ClientServerOptions::default())
+    let mut app = GrpcServer::bind(node.clone(), bind(app_port), GrpcServerOptions::default())
         .await
         .map_err(|e| e.to_string())?;
     let listener = TcpListener::bind(bind(control_port))
@@ -561,7 +573,7 @@ pub(super) async fn run(
     #[cfg(not(unix))]
     tokio::signal::ctrl_c().await.map_err(|e| e.to_string())?;
     dials.shutdown().await;
-    app.shutdown().await;
+    app.shutdown().await.map_err(|e| e.to_string())?;
     let result = node
         .finish_shutdown(
             DrainOptions::default()
@@ -587,6 +599,45 @@ pub(super) async fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn peer_fault_wakes_idle_readers_after_writer_flush() {
+        struct CountWake(AtomicU64);
+        impl std::task::Wake for CountWake {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let faults = Arc::new(Faults::default());
+        let (local, _remote) = tokio::io::duplex(64);
+        let mut stream = FaultStream::boxed(Box::pin(local), faults.clone());
+        let read = Arc::new(CountWake(AtomicU64::new(0)));
+        let write = Arc::new(CountWake(AtomicU64::new(0)));
+        let read_waker = std::task::Waker::from(read.clone());
+        let write_waker = std::task::Waker::from(write.clone());
+        let mut input = [0u8; 1];
+        let mut buffer = ReadBuf::new(&mut input);
+        assert!(stream
+            .as_mut()
+            .poll_read(&mut Context::from_waker(&read_waker), &mut buffer)
+            .is_pending());
+        assert!(stream
+            .as_mut()
+            .poll_flush(&mut Context::from_waker(&write_waker))
+            .is_ready());
+        faults.isolated.store(true, Ordering::Release);
+        faults.changed.notify_waiters();
+        assert!(
+            read.0.load(Ordering::SeqCst) > 0,
+            "flush stole the reader wakeup"
+        );
+        assert!(write.0.load(Ordering::SeqCst) > 0);
+        assert!(matches!(
+            stream
+                .as_mut()
+                .poll_read(&mut Context::from_waker(&read_waker), &mut buffer),
+            Poll::Ready(Err(_))
+        ));
+    }
     #[test]
     fn controller_shape_and_recovery_epoch_are_strict() {
         assert!(Configuration::default().validate().is_ok());

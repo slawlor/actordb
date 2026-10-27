@@ -1,13 +1,23 @@
 # Release notes
 
-## 0.10.0 (unreleased)
+## 0.11.0 (unreleased)
 
-Corrective release for the P1/P2 findings tracked under #114. Peer protocol
-6, application protocol 4 and existing storage/checkpoint/journal formats remain
-unchanged. The breaking change is the SDK's configurable decoded-response
-admission allowance, defaulting to 64 MiB (#153): responses accepted by 0.9.0
-can now require an explicitly larger allowance. No release is published by these
-pull requests, and current-format stores require no conversion.
+A hard application RPC migration plus the P1/P2 corrective changes tracked
+under #114. All four libraries advance together. The peer protocol (6) and
+current storage/checkpoint/journal formats are unchanged; application clients
+use the new unary `actordb.rpc.v1.ActorDb/Call` contract, not the old TCP protocol.
+
+- Replace the serialized application socket with typed, object-safe RPC client
+  and service traits. gRPC is default-enabled in SDK and server, and removable
+  with `default-features = false` for alternate frameworks.
+- Remove the application hello/auth handshake, connection identity, credentials,
+  frame envelope and request IDs. Authentication, TLS and ACL hooks belong to
+  the selected RPC adapter, not the Node service or generic SDK.
+- Preserve strict write-concern evidence, table/query/scan semantics, bounded
+  decoding and cancellation-safe ownership. Concurrent RPCs use aggregate
+  materialization reservations; lost mutation replies are never replayed.
+- Migrate examples and all Docker scenarios to real gRPC. Keep routing outages,
+  partitions, crashes, growth/shrink and explicit full-outage recovery mandatory.
 
 - Persist membership-transition journal updates before committing in-memory
   state, and re-establish durability barriers on retries/reopen (#142).
@@ -36,7 +46,7 @@ pull requests, and current-format stores require no conversion.
   through actual apply/fanout completion (#152).
 - Admit decoded application responses before materialization, including
   collection growth, nested inspection/receipt data and portable conversion;
-  share one decode/conversion owner across client clones (#153).
+  retain bounded decode/conversion ownership across client clones (#153).
 - Page reconciliation through ordered cached metadata without cloning an
   entire fragment, preserve the pinned TTL view, and atomically pair diagnostic
   snapshots with their corresponding mutation revision (#172, #167, #168).

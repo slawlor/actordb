@@ -1,4 +1,5 @@
-use actordb::client_server::{ClientServer, ClientServerOptions};
+#![cfg(feature = "grpc")]
+use actordb::grpc::{GrpcServer, GrpcServerOptions};
 use actordb::node::{Node, NodeConfig};
 use actordb::shard::FragmentId;
 use actordb_client::{Client, ClientOptions, QueryValue};
@@ -31,16 +32,19 @@ async fn sdk_named_scan_and_query_limits_preserve_namespaces_through_remote_hold
         .unwrap(),
     );
     gateway.connect(holder.addr()).await.unwrap();
-    let mut server = ClientServer::bind(
+    let mut server = GrpcServer::bind(
         gateway.clone(),
         "127.0.0.1:0".parse().unwrap(),
-        ClientServerOptions::default(),
+        GrpcServerOptions::default(),
     )
     .await
     .unwrap();
-    let client = Client::connect(server.addr(), ClientOptions::default())
-        .await
-        .unwrap();
+    let client = Client::connect(
+        format!("http://{}", server.addr()),
+        ClientOptions::default(),
+    )
+    .await
+    .unwrap();
     let users = client.table("USERS").unwrap();
     users.put("a", b"abc".to_vec()).await.unwrap();
     users.put("ab", b"def".to_vec()).await.unwrap();
@@ -151,7 +155,7 @@ async fn sdk_named_scan_and_query_limits_preserve_namespaces_through_remote_hold
         .unwrap();
     assert_eq!(literal_scan[0].key, literal);
     client.close().await;
-    server.shutdown().await;
+    server.shutdown().await.unwrap();
     gateway.shutdown().await.unwrap();
     holder.shutdown().await.unwrap();
 }

@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use actordb::client_server::{ClientServer, ClientServerOptions};
+use actordb::grpc::{GrpcServer, GrpcServerOptions};
 use actordb::node::{Node, NodeConfig};
 use actordb_client::{Client, ClientOptions, QueryValue};
 
@@ -16,13 +16,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .await?,
     );
-    let mut server = ClientServer::bind(
+    let mut server = GrpcServer::bind(
         node.clone(),
         "127.0.0.1:0".parse()?,
-        ClientServerOptions::default(),
+        GrpcServerOptions::default(),
     )
     .await?;
-    let client = Client::connect(server.addr(), ClientOptions::default()).await?;
+    let client = Client::connect(
+        format!("http://{}", server.addr()),
+        ClientOptions::default(),
+    )
+    .await?;
     for index in 0..30 {
         client
             .put(format!("user:{index:03}"), index.to_string().into_bytes())
@@ -44,7 +48,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
     println!("Count and sum across all fragments: {:?}", aggregate.rows);
     client.close().await;
-    server.shutdown().await;
+    server.shutdown().await?;
     node.shutdown().await?;
     Ok(())
 }

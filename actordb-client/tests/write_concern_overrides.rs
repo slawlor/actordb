@@ -1,4 +1,5 @@
-use actordb::client_server::{ClientServer, ClientServerOptions};
+#![cfg(feature = "grpc")]
+use actordb::grpc::{GrpcServer, GrpcServerOptions};
 use actordb::node::{Node, NodeConfig, NodeRuntimeOptions};
 use actordb::shard::FragmentId;
 use actordb_client::{
@@ -28,16 +29,19 @@ async fn sdk_receipt_discloses_receiving_node_acknowledgement_override() {
         .await
         .unwrap(),
     );
-    let mut server = ClientServer::bind(
+    let mut server = GrpcServer::bind(
         node.clone(),
         "127.0.0.1:0".parse().unwrap(),
-        ClientServerOptions::default(),
+        GrpcServerOptions::default(),
     )
     .await
     .unwrap();
-    let client = Client::connect(server.addr(), ClientOptions::default())
-        .await
-        .unwrap();
+    let client = Client::connect(
+        format!("http://{}", server.addr()),
+        ClientOptions::default(),
+    )
+    .await
+    .unwrap();
     let options = WriteConcernOptions::builder()
         .concern(WriteConcern::Majority)
         .build();
@@ -87,6 +91,6 @@ async fn sdk_receipt_discloses_receiving_node_acknowledgement_override() {
     assert!(!receipt.was_overridden());
 
     client.close().await;
-    server.shutdown().await;
+    server.shutdown().await.unwrap();
     node.shutdown().await.unwrap();
 }

@@ -27,7 +27,8 @@ def metadata(version="0.2.0"):
                 "id": "actordb-id",
                 "version": version,
                 "features": {
-                    "default": [],
+                    "default": ["grpc"],
+                    "grpc": ["dep:tonic"],
                     "memory": [],
                     "rocksdb": ["dep:rocksdb"],
                 },
@@ -169,7 +170,7 @@ class MetadataTests(unittest.TestCase):
         value["packages"][0]["features"]["other"] = []
         self.assertEqual(self.resolve(value), "0.2.0")
 
-    def test_rejects_nonempty_or_missing_default_features(self):
+    def test_rejects_wrong_or_missing_default_features(self):
         for defaults in [["memory"], ["rocksdb"], ["other"]]:
             value = metadata()
             value["packages"][0]["features"]["default"] = defaults
@@ -344,7 +345,7 @@ class OutputAndCliTests(unittest.TestCase):
             self.assertEqual(result, 1)
             self.assertEqual(stdout, "")
             self.assertNotIn("private-token", stderr)
-            self.assertIn("default features must remain empty", stderr)
+            self.assertIn("default features must only enable grpc", stderr)
             self.assertFalse(output.exists())
             verify.assert_not_called()
 

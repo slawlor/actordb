@@ -1,25 +1,10 @@
 syntax = "proto3";
-package client;
+package actordb.rpc.v1;
 import "meta.proto";
 
-// Application protocol, independent of the peer mesh version and credentials.
-message Hello {
-  string identity = 1;
-  bytes challenge = 2;
-  reserved 4, 5;
-  reserved "min_version", "max_version", "capabilities";
-  // Exact application protocol version; older and newer binaries fail closed.
-  uint32 protocol_version = 3;
-}
-message Auth { bytes proof = 1; }
-message Frame {
-  oneof message {
-    Hello hello = 1;
-    Auth auth = 2;
-    Request request = 3;
-    Response response = 4;
-  }
-}
+// Typed unary RPC contract. Authentication and authorization belong to adapters.
+service ActorDb { rpc Call(Request) returns (Response); }
+
 message Get { string key = 1; meta.Priority priority = 2; }
 message Put {
   string key = 1;
@@ -42,7 +27,6 @@ message Scan {
   uint64 offset = 6;
 }
 message Request {
-  uint64 id = 1;
   oneof operation {
     Get get = 2;
     Put put = 3;
@@ -55,7 +39,7 @@ message Request {
   }
   // Required logical table namespace. Tables share the node and peer listener
   // while isolating their key, cache, query, and durable storage state.
-  string table = 10;
+  string table = 1;
 }
 enum ErrorCode {
   ERROR_CODE_UNKNOWN = 0;
@@ -89,14 +73,13 @@ message Value {
 }
 message ReadResult { string key = 1; Value value = 2; Error error = 3; }
 message MutationResult { string key = 1; Error error = 2; optional bytes write_concern = 3; }
-message QueryResult { repeated string columns = 1; repeated meta.QueryPageRow rows = 2; }
+message QueryRow { repeated meta.QueryCell cells = 1; }
+message QueryResult { repeated string columns = 1; repeated QueryRow rows = 2; }
 message FragmentHealth {
   uint32 fragment = 1;
   uint64 worker_count = 2;
   repeated string worker_names = 3;
   map<string, uint64> restarts = 4;
-  reserved 5;
-  reserved "last_reaped";
   uint64 shed_high = 6;
   uint64 shed_default = 7;
   uint64 shed_background = 8;
@@ -115,11 +98,10 @@ message Inspection {
   bool dynamic = 6;
 }
 message Response {
-  uint64 id = 1;
-  Error error = 2;
-  repeated ReadResult reads = 3;
-  repeated MutationResult mutations = 4;
-  QueryResult query = 5;
-  Inspection inspection = 6;
-  repeated meta.ScanMatch scans = 7;
+  Error error = 1;
+  repeated ReadResult reads = 2;
+  repeated MutationResult mutations = 3;
+  QueryResult query = 4;
+  Inspection inspection = 5;
+  repeated meta.ScanMatch scans = 6;
 }

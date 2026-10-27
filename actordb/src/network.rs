@@ -6,8 +6,8 @@
 //! Pluggable byte-stream transport for the peer mesh and application listener.
 //!
 //! A [`Network`](crate::network::Network) binds a listen address and dials connections,
-//! producing byte streams. The peer mesh and [`ClientServer`](crate::client_server::ClientServer)
-//! can use the same transport interface. Everything above — framing, handshake, gossip —
+//! producing byte streams for the peer mesh. Application RPC frameworks own
+//! their own transports. Peer framing, handshake, and gossip
 //! operates on those streams generically. The default is [`TcpNetwork`](crate::network::TcpNetwork)
 //! (plain TCP). Enable the crate's `tls` feature for the built-in
 //! [`TlsNetwork`](crate::network::TlsNetwork), or implement [`Network`](crate::network::Network)

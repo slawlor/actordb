@@ -1,6 +1,8 @@
-# ActorDB 0.10.0 deployment
+# ActorDB 0.11.0 deployment
 
-ActorDB `0.10.0` preserves the wire and data formats of the published `0.9.0`.
+ActorDB `0.11.0` preserves the peer wire and data formats, but replaces the
+application protocol with typed unary RPC. Migrate application clients/servers
+together; there is no old application listener or handshake fallback.
 Current-format deployments require no data conversion. The SDK's default 64 MiB
 decoded-response allowance is a breaking admission-policy change; configure
 `ClientOptions::max_decoded_response_bytes` explicitly for larger supported
@@ -14,7 +16,7 @@ automatic conversions.
 ## Deployment contract
 
 - Every peer uses exactly peer protocol **6**.
-- Every application client/listener uses exactly application protocol **4**.
+- Application SDKs/services use typed unary `actordb.rpc.v1` RPCs; the old application byte-stream protocol is removed.
 - RocksDB uses record/manifest format **3** only.
 - Checkpoint bundles use **ACTCP003** and membership journals **ACTMEM04** only.
 - Non-current stores, journals, bundles and wire versions are rejected.
@@ -29,10 +31,10 @@ in-place ActorDB upgrade. Nothing in this release deletes an existing deployment
 
 ## Transport and authentication
 
-Provision TLS certificates and verification policy outside ActorDB. The
-`Network` / `NetStream` interfaces and optional rustls transport accept that
-policy; the SDK can use `Client::from_stream`, and the application listener can
-use `ClientServer::bind_with_network` or `from_acceptor`.
+Provision TLS certificates and verification policy outside ActorDB. The peer
+`Network` / `PeerStream` interfaces accept that policy. Application TLS/authentication
+belongs to the RPC framework: the default gRPC adapter takes tonic TLS config
+and native metadata/ACL hooks; generic RPC client/service traits contain no auth.
 
 An optional high-entropy shared secret provides challenge-bound authentication.
 It does not identify individual secret holders or encrypt subsequent traffic.

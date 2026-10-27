@@ -1,29 +1,23 @@
-//! Async Rust companion for ActorDB's separate application listener.
-//!
-//! Clones share one connection. Requests are serialized on that connection;
-//! frame count, encoded bytes and total deadlines bound queued work. Use separate
-//! Clients for parallel connections. Closing this handle never shuts down a Node.
-//! Writes are never transparently retried: a lost reply after dispatch is an
-//! [`ClientError::UnknownOutcome`], because repeating a write creates a new version.
-//! [`Client::connect`] uses plain TCP; [`Client::from_stream`] accepts a
-//! caller-established stream, including TLS, with the same application protocol.
+//! Transport-neutral ActorDB SDK. The optional default gRPC adapter provides
+//! unary requests; custom RPC frameworks implement `RpcClient` instead.
+//! Requests may execute concurrently. No mutation is transparently retried:
+//! a lost reply after dispatch remains `ClientError::UnknownOutcome`.
 
-use actordb_protocol::{client as wire, CLIENT_PROTOCOL_VERSION, MAX_FRAME_BYTES};
+use actordb_protocol::{client as wire, MAX_RPC_MESSAGE_BYTES};
 use prost::Message;
 use std::fmt;
-use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::TcpStream;
-use tokio::sync::{watch, Mutex, Semaphore};
+use tokio::sync::{watch, Semaphore};
 use tokio::time::{timeout_at, Instant};
 
 pub use actordb_protocol::meta::{Priority, ScanMatch};
+pub use actordb_protocol::rpc::{RpcCallOptions, RpcClient, RpcError, RpcFuture, RpcReply};
 pub use actordb_query::{QueryResult, QueryValue};
 pub use wire::Scan as ScanOptions;
 pub use wire::{Inspection, Value};
+#[cfg(feature = "grpc")]
+pub mod grpc;
 
 mod write_concern;
 pub use actordb_protocol::write_concern::{
@@ -32,83 +26,37 @@ pub use actordb_protocol::write_concern::{
 };
 pub use write_concern::WriteConcernClientError;
 
-/// Connection and queue bounds. Credentials are independent of cluster secrets.
-///
-/// Use [`Self::builder`] to set selected fields or [`Default`] for all defaults.
-/// Public fields remain mutable after construction; external struct literals are
-/// unavailable so later optional settings do not require another source break.
-///
-/// ```
-/// use actordb_client::{ClientOptions, PutOptions, Priority};
-/// use std::time::Duration;
-/// let connection = ClientOptions::builder()
-///     .identity("application")
-///     .timeout(Duration::from_secs(5))
-///     .build();
-/// let put = PutOptions::builder()
-///     .ttl(Duration::from_secs(60))
-///     .priority(Priority::High)
-///     .build();
-/// ```
-#[derive(Clone, bon::Builder)]
+/// RPC admission and materialization limits. Authentication is adapter-owned.
+#[derive(Debug, Clone, bon::Builder)]
 #[non_exhaustive]
 pub struct ClientOptions {
-    /// Application authentication identity, 1 to 255 UTF-8 bytes.
-    #[builder(default = "rust-client".to_string(), into)]
-    pub identity: String,
-    /// Logical table selected for requests. Every connection must select a
-    /// named table; table views share the same application connection.
     #[builder(default = "KV".to_string(), into)]
     pub table: String,
-    /// Optional application credential, independent of the peer cluster secret.
-    pub credential: Option<Vec<u8>>,
-    /// Total request/authentication deadline and default graceful close budget.
     #[builder(default = Duration::from_secs(30))]
     pub timeout: Duration,
-    /// Admitted queued/active requests sharing this connection. Default 64.
+    /// Queued plus active RPC requests sharing this client.
     #[builder(default = 64)]
     pub max_queued_requests: usize,
-    /// Encoded request bytes retained by admitted requests. Default 32 MiB.
     #[builder(default = 32 * 1024 * 1024)]
     pub max_queued_bytes: usize,
-    /// Accounted response admission, including raw framing, decoded headers/
-    /// payloads and portable conversion. Default 64 MiB; separate from the fixed
-    /// 16 MiB wire limit. Larger supported responses require an explicit larger
-    /// allowance. This is not an allocator/RSS or caller-retained result limit.
+    /// Per-response raw/decoded/portable-conversion allowance.
     #[builder(default = actordb_protocol::DEFAULT_MAX_DECODED_RESPONSE_BYTES)]
     pub max_decoded_response_bytes: usize,
-}
-impl std::fmt::Debug for ClientOptions {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ClientOptions")
-            .field("identity", &self.identity)
-            .field("table", &self.table)
-            .field(
-                "credential",
-                &self.credential.as_ref().map(|_| "[REDACTED]"),
-            )
-            .field("timeout", &self.timeout)
-            .field("max_queued_requests", &self.max_queued_requests)
-            .field("max_queued_bytes", &self.max_queued_bytes)
-            .field(
-                "max_decoded_response_bytes",
-                &self.max_decoded_response_bytes,
-            )
-            .finish()
-    }
+    /// Aggregate reservations for response materialization, not caller-retained
+    /// values or allocator RSS. Defaults allow four concurrent 64 MiB RPCs.
+    #[builder(default = 256 * 1024 * 1024)]
+    pub max_response_memory_bytes: usize,
 }
 impl Default for ClientOptions {
     fn default() -> Self {
         Self::builder().build()
     }
 }
-/// Per-put expiry and scheduling priority. Use [`Self::builder`] or [`Default`].
+
 #[derive(Debug, Clone, Default, bon::Builder)]
 #[non_exhaustive]
 pub struct PutOptions {
-    /// Optional wall-clock TTL anchored at the originating server.
     pub ttl: Option<Duration>,
-    /// Scheduling priority, independent of replication acknowledgement concern.
     #[builder(default)]
     pub priority: Priority,
 }
@@ -116,73 +64,39 @@ pub struct PutOptions {
 #[derive(Debug)]
 pub enum ClientError {
     Invalid(String),
-    Authentication,
     Timeout,
     Closed,
-    /// The configured request-count or encoded-byte queue is full.
     Overloaded,
-    Transport(std::io::Error),
+    Transport(String),
     Protocol(String),
     Server(wire::Error),
-    /// The server may have applied the mutation. No automatic retry was made.
     UnknownOutcome(String),
 }
 impl fmt::Display for ClientError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Invalid(e) => write!(f, "invalid request: {e}"),
-            Self::Authentication => write!(f, "application authentication failed"),
-            Self::Timeout => write!(f, "request deadline exceeded"),
-            Self::Closed => write!(f, "client connection closed"),
-            Self::Overloaded => write!(f, "client request queue is full"),
-            Self::Transport(e) => write!(f, "transport: {e}"),
-            Self::Protocol(e) => write!(f, "protocol: {e}"),
+            Self::Timeout => f.write_str("RPC deadline exceeded"),
+            Self::Closed => f.write_str("client closed"),
+            Self::Overloaded => f.write_str("RPC admission full"),
+            Self::Transport(e) => write!(f, "RPC transport: {e}"),
+            Self::Protocol(e) => write!(f, "RPC protocol: {e}"),
             Self::Server(e) => write!(f, "server error {}: {}", e.code, e.message),
             Self::UnknownOutcome(e) => write!(f, "mutation outcome unknown: {e}"),
         }
     }
 }
 impl std::error::Error for ClientError {}
-impl From<std::io::Error> for ClientError {
-    fn from(e: std::io::Error) -> Self {
-        Self::Transport(e)
-    }
-}
-
-trait ClientStream: AsyncRead + AsyncWrite + Send + Unpin + 'static {}
-impl<T: AsyncRead + AsyncWrite + Send + Unpin + 'static> ClientStream for T {}
-
-type BoxStream = Box<dyn ClientStream>;
 
 struct Inner {
-    stream: Mutex<Option<BoxStream>>,
-    next_id: AtomicU64,
-    count: Semaphore,
+    rpc: Mutex<Option<Arc<dyn RpcClient>>>,
+    count: Arc<Semaphore>,
     bytes: Arc<Semaphore>,
-    /// One shared owner spans raw reading, decoding and public conversion.
-    /// Queued clones cannot allocate another raw response while it is held.
-    response_owner: Arc<Semaphore>,
+    responses: Arc<Semaphore>,
     options: ClientOptions,
     closing: watch::Sender<bool>,
 }
-
-struct OwnedResponse {
-    response: wire::Response,
-    // Declared after response so unreturned decoded fields drop before another
-    // clone obtains materialization ownership. Returned values are caller-owned.
-    _owner: tokio::sync::OwnedSemaphorePermit,
-}
-impl std::ops::Deref for OwnedResponse {
-    type Target = wire::Response;
-    fn deref(&self) -> &Self::Target {
-        &self.response
-    }
-}
-impl std::ops::DerefMut for OwnedResponse {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.response
-    }
-}
+type OwnedResponse = RpcReply;
 #[derive(Clone)]
 pub struct Client {
     inner: Arc<Inner>,
@@ -190,153 +104,46 @@ pub struct Client {
 }
 
 impl Client {
-    /// Connect over plain TCP. The timeout includes dialing and authentication.
-    pub async fn connect(addr: SocketAddr, options: ClientOptions) -> Result<Self, ClientError> {
-        let deadline = Self::validate_options(&options)?;
-        timeout_at(deadline, async {
-            let stream = TcpStream::connect(addr).await?;
-            stream.set_nodelay(true)?;
-            Self::from_stream_until(Box::new(stream), options, deadline).await
-        })
-        .await
-        .map_err(|_| ClientError::Timeout)?
-    }
-
-    /// Authenticate an application client over a caller-established stream.
-    ///
-    /// The caller owns dialing, TLS configuration, certificate validation, and
-    /// any transport handshake deadlines before this call. `options.timeout`
-    /// bounds ActorDB authentication. The stream must provide reliable, ordered
-    /// bidirectional bytes and propagate backpressure; writes are flushed after
-    /// each frame. Transport adapters must not transparently replay operations.
-    ///
-    /// Ownership transfers to the client. Failure or cancellation drops the
-    /// stream, which must release its connection and any transport work. Closing
-    /// the client attempts bounded graceful shutdown, then drops the stream. TLS
-    /// does not replace application credentials.
-    pub async fn from_stream<S>(stream: S, options: ClientOptions) -> Result<Self, ClientError>
-    where
-        S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
-    {
-        let deadline = Self::validate_options(&options)?;
-        Self::from_stream_until(Box::new(stream), options, deadline).await
-    }
-
-    fn validate_options(options: &ClientOptions) -> Result<Instant, ClientError> {
-        if options.identity.is_empty()
-            || options.identity.len() > 255
-            || options.table.is_empty()
-            || options.table.len() > 255
-            || options.timeout.is_zero()
-            || options.max_queued_requests == 0
-            || options.max_queued_requests > Semaphore::MAX_PERMITS
-            || options.max_queued_bytes < MAX_FRAME_BYTES
-            || options.max_queued_bytes > u32::MAX as usize
-            || options.max_queued_bytes > Semaphore::MAX_PERMITS
-            || options.max_decoded_response_bytes < actordb_protocol::MAX_HANDSHAKE_BYTES
-            || options
-                .credential
-                .as_ref()
-                .is_some_and(|key| key.len() < 32)
-        {
-            return Err(ClientError::Invalid(
-                "identity, timeout, queue bounds or credential length".into(),
-            ));
-        }
-        Instant::now()
-            .checked_add(options.timeout)
-            .ok_or_else(|| ClientError::Invalid("timeout too large".into()))
-    }
-
-    async fn from_stream_until(
-        mut stream: BoxStream,
-        options: ClientOptions,
-        deadline: Instant,
-    ) -> Result<Self, ClientError> {
+    /// Construct a client for any unary RPC adapter. No authentication, stream,
+    /// handshake, or framework-specific types are involved in this factory.
+    pub fn from_rpc(rpc: Arc<dyn RpcClient>, options: ClientOptions) -> Result<Self, ClientError> {
+        Self::validate_options(&options)?;
         let table = options.table.clone();
-        let stream = timeout_at(deadline, async {
-            let mut challenge = vec![0; 32];
-            getrandom::fill(&mut challenge).map_err(|e| ClientError::Protocol(e.to_string()))?;
-            let hello = wire::Hello {
-                identity: options.identity.clone(),
-                challenge,
-                protocol_version: CLIENT_PROTOCOL_VERSION,
-            };
-            send_frame(
-                &mut stream,
-                &wire::Frame {
-                    message: Some(wire::frame::Message::Hello(hello.clone())),
-                },
-            )
-            .await?;
-            let server = match read_frame(
-                &mut stream,
-                actordb_protocol::MAX_HANDSHAKE_BYTES,
-                options.max_decoded_response_bytes,
-                Incoming::Hello,
-            )
-            .await?
-            .message
-            {
-                Some(wire::frame::Message::Hello(hello))
-                    if actordb_protocol::valid_client_hello(&hello) =>
-                {
-                    hello
-                }
-                _ => return Err(ClientError::Authentication),
-            };
-            let proof = options
-                .credential
-                .as_deref()
-                .map(|key| actordb_protocol::client_auth_proof(key, true, &hello, &server))
-                .unwrap_or_default();
-            send_frame(
-                &mut stream,
-                &wire::Frame {
-                    message: Some(wire::frame::Message::Auth(wire::Auth { proof })),
-                },
-            )
-            .await?;
-            match read_frame(
-                &mut stream,
-                actordb_protocol::MAX_HANDSHAKE_BYTES,
-                options.max_decoded_response_bytes,
-                Incoming::Auth,
-            )
-            .await?
-            .message
-            {
-                Some(wire::frame::Message::Auth(auth))
-                    if actordb_protocol::verify_client_auth(
-                        options.credential.as_deref(),
-                        false,
-                        &hello,
-                        &server,
-                        &auth.proof,
-                    ) => {}
-                _ => return Err(ClientError::Authentication),
-            }
-            Ok(stream)
-        })
-        .await
-        .map_err(|_| ClientError::Timeout)??;
         Ok(Self {
             inner: Arc::new(Inner {
-                stream: Mutex::new(Some(stream)),
-                next_id: AtomicU64::new(1),
-                count: Semaphore::new(options.max_queued_requests),
+                rpc: Mutex::new(Some(rpc)),
+                count: Arc::new(Semaphore::new(options.max_queued_requests)),
                 bytes: Arc::new(Semaphore::new(options.max_queued_bytes)),
-                response_owner: Arc::new(Semaphore::new(1)),
-                options,
+                responses: Arc::new(Semaphore::new(options.max_response_memory_bytes)),
                 closing: watch::channel(false).0,
+                options,
             }),
             table,
         })
     }
-
-    /// Return a table-scoped view sharing this client's authenticated
-    /// connection, request budget, and transport. Creating views does not
-    /// open another network connection.
+    fn validate_options(options: &ClientOptions) -> Result<(), ClientError> {
+        if options.table.is_empty()
+            || options.table.len() > 255
+            || options.timeout.is_zero()
+            || Instant::now().checked_add(options.timeout).is_none()
+            || options.max_queued_requests == 0
+            || options.max_queued_requests > Semaphore::MAX_PERMITS
+            || options.max_queued_bytes < MAX_RPC_MESSAGE_BYTES
+            || options.max_queued_bytes > u32::MAX as usize
+            || options.max_queued_bytes > Semaphore::MAX_PERMITS
+            || options.max_decoded_response_bytes < MAX_RPC_MESSAGE_BYTES
+            || options.max_decoded_response_bytes > u32::MAX as usize
+            || options.max_response_memory_bytes < options.max_decoded_response_bytes
+            || options.max_response_memory_bytes > u32::MAX as usize
+            || options.max_response_memory_bytes > Semaphore::MAX_PERMITS
+        {
+            return Err(ClientError::Invalid(
+                "RPC table, deadline, or admission bounds".into(),
+            ));
+        }
+        Ok(())
+    }
+    /// Share the RPC adapter and all admission budgets with a table-scoped view.
     pub fn table(&self, table: impl Into<String>) -> Result<Self, ClientError> {
         let table = table.into();
         if table.is_empty() || table.len() > 255 {
@@ -347,7 +154,6 @@ impl Client {
             table,
         })
     }
-
     async fn request(
         &self,
         operation: wire::request::Operation,
@@ -356,7 +162,6 @@ impl Client {
         self.request_with_timeout(operation, mutation, Duration::ZERO)
             .await
     }
-
     async fn request_with_timeout(
         &self,
         operation: wire::request::Operation,
@@ -372,8 +177,6 @@ impl Client {
         let deadline = Instant::now()
             .checked_add(request_timeout)
             .ok_or_else(|| ClientError::Invalid("timeout too large".into()))?;
-        // Admission is nonwaiting, so excess callers never retain payloads in
-        // an unaccounted semaphore waiter queue.
         let _count = self.inner.count.try_acquire().map_err(|_| {
             if self.inner.count.is_closed() {
                 ClientError::Closed
@@ -381,17 +184,15 @@ impl Client {
                 ClientError::Overloaded
             }
         })?;
-        let id = self.inner.next_id.fetch_add(1, Ordering::Relaxed);
-        let frame = wire::Frame {
-            message: Some(wire::frame::Message::Request(wire::Request {
-                id,
-                operation: Some(operation),
-                table: self.table.clone(),
-            })),
-        };
-        let length = frame.encoded_len();
-        if length > MAX_FRAME_BYTES {
-            return Err(ClientError::Invalid("request exceeds frame limit".into()));
+        let request = Arc::new(wire::Request {
+            operation: Some(operation),
+            table: self.table.clone(),
+        });
+        let length = request.encoded_len();
+        if length > MAX_RPC_MESSAGE_BYTES {
+            return Err(ClientError::Invalid(
+                "RPC request exceeds byte limit".into(),
+            ));
         }
         let _bytes = self
             .inner
@@ -412,121 +213,96 @@ impl Client {
             }
         };
         tokio::pin!(cancelled);
-        // Acquire before taking the transport or allocating a raw body. A
-        // clone parked here can time out/cancel without retiring a healthy
-        // connection and without overlapping another response conversion.
+        // Reserve the full per-call bound before framework buffering/decoding.
+        // Calls run concurrently within the aggregate reservation, not behind
+        // a shared socket lock or a single response-materialization owner.
         let response_owner = tokio::select! {
             biased;
             _ = &mut cancelled => return Err(ClientError::Closed),
-            owner = timeout_at(deadline, self.inner.response_owner.clone().acquire_owned()) => {
-                owner.map_err(|_| ClientError::Timeout)?.map_err(|_| ClientError::Closed)?
-            }
+            owner = timeout_at(deadline, self.inner.responses.clone()
+                .acquire_many_owned(self.inner.options.max_decoded_response_bytes as u32)) =>
+                owner.map_err(|_| ClientError::Timeout)?.map_err(|_| ClientError::Closed)?,
         };
-        let mut guard = tokio::select! {
-            biased;
-            _ = &mut cancelled => return Err(ClientError::Closed),
-            guard = timeout_at(deadline, self.inner.stream.lock()) => {
-                guard.map_err(|_| ClientError::Timeout)?
-            }
+        let rpc = self
+            .inner
+            .rpc
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or(ClientError::Closed)?;
+        let response_shape = response_shape(&request)?;
+        let call_options = RpcCallOptions {
+            deadline: deadline.into_std(),
+            max_decoded_response_bytes: self.inner.options.max_decoded_response_bytes,
+            response_shape,
         };
-        // Taking ownership makes cancellation close the socket. A partial
-        // prefix/body can never be reused by the next queued request.
-        let mut stream = guard.take().ok_or(ClientError::Closed)?;
         let mut dispatched = false;
-        let response_shape = response_shape(&frame)?;
-        let exchange = timeout_at(deadline, async {
-            // Mark before write: even a failing write can transmit a complete request.
+        let exchange = async {
             dispatched = true;
-            send_frame(&mut stream, &frame).await?;
-            match read_frame(
-                &mut stream,
-                MAX_FRAME_BYTES,
-                self.inner.options.max_decoded_response_bytes,
-                Incoming::Response(&response_shape),
-            )
-            .await?
-            .message
-            {
-                Some(wire::frame::Message::Response(response)) if response.id == id => {
-                    validate_response(&frame, &response)?;
-                    Ok(OwnedResponse {
-                        response,
-                        _owner: response_owner,
-                    })
-                }
-                _ => Err(ClientError::Protocol(
-                    "unexpected response or request id".into(),
-                )),
+            let mut reply = rpc
+                .call(request.clone(), call_options)
+                .await
+                .map_err(|error| match error {
+                    RpcError::NotDispatched(message) => ClientError::Transport(message),
+                    RpcError::Failure(message) => {
+                        if mutation {
+                            ClientError::UnknownOutcome(message)
+                        } else {
+                            ClientError::Transport(message)
+                        }
+                    }
+                    error => {
+                        if mutation {
+                            ClientError::UnknownOutcome(error.to_string())
+                        } else {
+                            ClientError::Transport(error.to_string())
+                        }
+                    }
+                })?;
+            reply.retain(response_owner);
+            if reply.encoded_len() > MAX_RPC_MESSAGE_BYTES {
+                return Err(if mutation {
+                    ClientError::UnknownOutcome("oversized RPC reply".into())
+                } else {
+                    ClientError::Protocol("oversized RPC reply".into())
+                });
             }
-        });
+            validate_response(&request, &reply).map_err(|error| {
+                if mutation {
+                    ClientError::UnknownOutcome(error.to_string())
+                } else {
+                    error
+                }
+            })?;
+            if let Some(error) = reply.error.clone() {
+                Err(server_error(error))
+            } else {
+                Ok(reply)
+            }
+        };
         let result = tokio::select! {
             biased;
             _ = &mut cancelled => Err(ClientError::Closed),
-            result = exchange => result.unwrap_or(Err(ClientError::Timeout)),
+            result = timeout_at(deadline, exchange) => result.unwrap_or(Err(ClientError::Timeout)),
         };
-        match result {
-            Ok(response) => {
-                *guard = Some(stream);
-                if let Some(error) = response.error.clone() {
-                    Err(server_error(error))
-                } else {
-                    Ok(response)
-                }
-            }
-            Err(error) => {
-                *guard = None;
-                if mutation && dispatched {
-                    Err(ClientError::UnknownOutcome(error.to_string()))
-                } else {
-                    Err(error)
-                }
-            }
+        if mutation
+            && dispatched
+            && matches!(result, Err(ClientError::Timeout | ClientError::Closed))
+        {
+            Err(ClientError::UnknownOutcome(result.unwrap_err().to_string()))
+        } else {
+            result
         }
     }
-
-    /// Close the shared connection for this handle and all its clones.
-    ///
-    /// Admission stops immediately. Queued requests return [`ClientError::Closed`],
-    /// and active exchanges are cancelled. A mutation whose write has started
-    /// returns [`ClientError::UnknownOutcome`]: the server may have applied it.
-    /// A cancelled exchange drops the transport rather than reusing partial I/O.
-    ///
-    /// Graceful transport shutdown, including waiting for an active exchange to
-    /// release the connection, is bounded by [`ClientOptions::timeout`]. At the
-    /// deadline the owned stream is dropped. Repeated calls are safe. This does
-    /// not shut down the server Node. Transport adapters must release their
-    /// resources when dropped, even if graceful shutdown requires peer progress.
+    /// Close this client and its table/clone views, cancelling local RPC waiters.
+    /// Accepted server mutations remain owned by the service. Closing this SDK
+    /// never shuts down the Node or a separately shared custom adapter.
     pub async fn close(&self) {
-        self.close_with_timeout(self.inner.options.timeout).await;
-    }
-
-    /// Close with an explicit total graceful-shutdown budget.
-    ///
-    /// Cancellation and mutation outcomes follow [`Self::close`]. A zero budget
-    /// skips graceful shutdown. Cancellation of this future after it takes the
-    /// stream also drops the transport; request admission remains closed.
-    pub async fn close_with_timeout(&self, graceful_timeout: Duration) {
         self.inner.count.close();
         self.inner.bytes.close();
-        self.inner.response_owner.close();
+        self.inner.responses.close();
         self.inner.closing.send_replace(true);
-        let deadline = (!graceful_timeout.is_zero())
-            .then(|| Instant::now().checked_add(graceful_timeout))
-            .flatten();
-        if let Some(deadline) = deadline {
-            let _ = timeout_at(deadline, async {
-                let stream = self.inner.stream.lock().await.take();
-                if let Some(mut stream) = stream {
-                    let _ = stream.shutdown().await;
-                }
-            })
-            .await;
-        }
-        // Also cover a zero/overflowing budget without polling shutdown. Active
-        // requests own their stream and drop it when they observe cancellation.
-        if let Ok(mut guard) = self.inner.stream.try_lock() {
-            guard.take();
-        }
+        self.inner.rpc.lock().unwrap().take();
     }
     pub async fn get(&self, key: impl Into<String>) -> Result<Option<Value>, ClientError> {
         self.get_with_priority(key, Priority::Default).await
@@ -733,7 +509,7 @@ impl Client {
                     };
                     size.checked_add(bytes.saturating_add(16))
                 });
-        if parameter_bytes.is_none_or(|bytes| bytes > MAX_FRAME_BYTES) {
+        if parameter_bytes.is_none_or(|bytes| bytes > MAX_RPC_MESSAGE_BYTES) {
             return Err(ClientError::Invalid(
                 "query parameters exceed frame limit".into(),
             ));
@@ -810,12 +586,9 @@ fn server_error(error: wire::Error) -> ClientError {
 }
 
 fn response_shape(
-    frame: &wire::Frame,
-) -> Result<actordb_protocol::ClientResponseShape, ClientError> {
-    let Some(wire::frame::Message::Request(request)) = &frame.message else {
-        unreachable!()
-    };
-    let mut shape = actordb_protocol::ClientResponseShape::from_request(request);
+    request: &wire::Request,
+) -> Result<actordb_protocol::RpcResponseShape, ClientError> {
+    let mut shape = actordb_protocol::RpcResponseShape::from_request(request);
     if let Some(wire::request::Operation::Query(query)) = &request.operation {
         let params: Vec<_> = query
             .params
@@ -834,11 +607,11 @@ fn response_shape(
     Ok(shape)
 }
 
-fn validate_response(frame: &wire::Frame, response: &wire::Response) -> Result<(), ClientError> {
+fn validate_response(
+    request: &wire::Request,
+    response: &wire::Response,
+) -> Result<(), ClientError> {
     use wire::request::Operation;
-    let Some(wire::frame::Message::Request(request)) = &frame.message else {
-        unreachable!()
-    };
     if response.error.is_some() {
         return Ok(());
     }
@@ -945,254 +718,5 @@ fn decode_cell(cell: actordb_protocol::meta::QueryCell) -> Result<QueryValue, Cl
             Ok(QueryValue::Integer(integer))
         }
         _ => Err(ClientError::Protocol("invalid query cell".into())),
-    }
-}
-
-async fn send_frame(stream: &mut BoxStream, frame: &wire::Frame) -> Result<(), ClientError> {
-    if frame.encoded_len() > MAX_FRAME_BYTES {
-        return Err(ClientError::Invalid("frame exceeds limit".into()));
-    }
-    let bytes = frame.encode_to_vec();
-    stream.write_u32(bytes.len() as u32).await?;
-    stream.write_all(&bytes).await?;
-    stream.flush().await?;
-    Ok(())
-}
-enum Incoming<'a> {
-    Hello,
-    Auth,
-    Response(&'a actordb_protocol::ClientResponseShape),
-}
-
-async fn read_frame(
-    stream: &mut BoxStream,
-    max: usize,
-    max_decoded_bytes: usize,
-    incoming: Incoming<'_>,
-) -> Result<wire::Frame, ClientError> {
-    let length = stream.read_u32().await? as usize;
-    if length == 0 || length > max {
-        return Err(ClientError::Protocol("invalid frame length".into()));
-    }
-    if length > max_decoded_bytes {
-        return Err(ClientError::Protocol(
-            "raw response exceeds decoded admission allowance".into(),
-        ));
-    }
-    let mut bytes = vec![0; length];
-    stream.read_exact(&mut bytes).await?;
-    match incoming {
-        Incoming::Response(shape) => {
-            actordb_protocol::preflight_client_response(&bytes, max_decoded_bytes, shape)
-        }
-        Incoming::Hello => actordb_protocol::preflight_client_frame_kind(
-            &bytes,
-            max_decoded_bytes,
-            actordb_protocol::ClientFrameKind::Hello,
-        ),
-        Incoming::Auth => actordb_protocol::preflight_client_frame_kind(
-            &bytes,
-            max_decoded_bytes,
-            actordb_protocol::ClientFrameKind::Auth,
-        ),
-    }
-    .map_err(|e| ClientError::Protocol(e.into()))?;
-    wire::Frame::decode(bytes.as_slice()).map_err(|e| ClientError::Protocol(e.to_string()))
-}
-
-#[cfg(test)]
-mod credential_debug_tests {
-    use super::*;
-
-    #[test]
-    fn client_options_debug_redacts_credentials_and_preserves_nonsecret_fields() {
-        let secret: Vec<u8> = (201..233).collect();
-        let options = ClientOptions::builder()
-            .identity("debug-client")
-            .table("customers")
-            .credential(secret.clone())
-            .timeout(Duration::from_secs(7))
-            .max_queued_requests(17)
-            .max_queued_bytes(8192)
-            .build();
-        for output in [format!("{options:?}"), format!("{options:#?}")] {
-            assert!(output.contains("[REDACTED]"));
-            assert!(!output.contains("201") && !output.contains("232"));
-            assert!(!output.contains(&format!("{secret:?}")));
-            for field in [
-                "identity: \"debug-client\"",
-                "table: \"customers\"",
-                "timeout: 7s",
-                "max_queued_requests: 17",
-                "max_queued_bytes: 8192",
-            ] {
-                assert!(output.contains(field), "missing nonsecret field {field}");
-            }
-        }
-        assert!(format!("{:?}", ClientOptions::default()).contains("credential: None"));
-        assert_eq!(options.credential.as_deref(), Some(secret.as_slice()));
-    }
-}
-
-#[cfg(test)]
-mod response_owner_tests {
-    use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use tokio::io::DuplexStream;
-
-    async fn receive(stream: &mut DuplexStream) -> wire::Frame {
-        let size = stream.read_u32().await.unwrap() as usize;
-        let mut bytes = vec![0; size];
-        stream.read_exact(&mut bytes).await.unwrap();
-        wire::Frame::decode(bytes.as_slice()).unwrap()
-    }
-    async fn send(stream: &mut DuplexStream, frame: wire::Frame) {
-        let bytes = frame.encode_to_vec();
-        stream.write_u32(bytes.len() as u32).await.unwrap();
-        stream.write_all(&bytes).await.unwrap();
-    }
-    async fn peer(mut stream: DuplexStream, requests: Arc<AtomicUsize>) {
-        assert!(matches!(
-            receive(&mut stream).await.message,
-            Some(wire::frame::Message::Hello(_))
-        ));
-        send(
-            &mut stream,
-            wire::Frame {
-                message: Some(wire::frame::Message::Hello(wire::Hello {
-                    identity: "owner-test".into(),
-                    challenge: vec![1; 32],
-                    protocol_version: CLIENT_PROTOCOL_VERSION,
-                })),
-            },
-        )
-        .await;
-        assert!(matches!(
-            receive(&mut stream).await.message,
-            Some(wire::frame::Message::Auth(_))
-        ));
-        send(
-            &mut stream,
-            wire::Frame {
-                message: Some(wire::frame::Message::Auth(wire::Auth::default())),
-            },
-        )
-        .await;
-        loop {
-            let Ok(size) = stream.read_u32().await else {
-                return;
-            };
-            let mut bytes = vec![0; size as usize];
-            stream.read_exact(&mut bytes).await.unwrap();
-            let Some(wire::frame::Message::Request(request)) =
-                wire::Frame::decode(bytes.as_slice()).unwrap().message
-            else {
-                panic!("request")
-            };
-            let Some(wire::request::Operation::Get(get)) = request.operation else {
-                panic!("no queued mutation may be sent while response ownership is retained")
-            };
-            requests.fetch_add(1, Ordering::Relaxed);
-            send(
-                &mut stream,
-                wire::Frame {
-                    message: Some(wire::frame::Message::Response(wire::Response {
-                        id: request.id,
-                        reads: vec![wire::ReadResult {
-                            key: get.key,
-                            ..Default::default()
-                        }],
-                        ..Default::default()
-                    })),
-                },
-            )
-            .await;
-        }
-    }
-    async fn fixture() -> (Client, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
-        let (local, remote) = tokio::io::duplex(4096);
-        let requests = Arc::new(AtomicUsize::new(0));
-        let peer = tokio::spawn(peer(remote, requests.clone()));
-        let client = Client::from_stream(
-            local,
-            ClientOptions::builder()
-                .timeout(Duration::from_millis(100))
-                .max_queued_requests(3)
-                .build(),
-        )
-        .await
-        .unwrap();
-        (client, requests, peer)
-    }
-    async fn held(client: &Client) -> OwnedResponse {
-        client
-            .request(
-                wire::request::Operation::Get(wire::Get {
-                    key: "held".into(),
-                    priority: 0,
-                }),
-                false,
-            )
-            .await
-            .unwrap()
-    }
-    async fn await_admission(client: &Client) {
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while client.inner.count.available_permits() == 3 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap();
-    }
-
-    #[tokio::test]
-    async fn decoded_owner_spans_conversion_and_queued_timeout_cancel_do_not_take_transport() {
-        assert!(std::mem::size_of::<QueryValue>() <= actordb_protocol::PORTABLE_CELL_HEADER_CHARGE);
-        let (client, requests, peer) = fixture().await;
-        let response = held(&client).await;
-        assert_eq!(client.inner.response_owner.available_permits(), 0);
-        assert!(client.inner.stream.try_lock().unwrap().is_some());
-        let queued = client.clone();
-        let cancelled = tokio::spawn(async move { queued.get("cancelled").await });
-        await_admission(&client).await;
-        cancelled.abort();
-        assert!(cancelled.await.unwrap_err().is_cancelled());
-        assert!(matches!(
-            client.get("timed-out").await,
-            Err(ClientError::Timeout)
-        ));
-        assert!(matches!(
-            client.put("unsent", vec![1]).await,
-            Err(ClientError::Timeout)
-        ));
-        assert_eq!(
-            requests.load(Ordering::Relaxed),
-            1,
-            "queued clones sent no frame and allocated no raw response"
-        );
-        assert_eq!(client.inner.count.available_permits(), 3);
-        assert!(client.inner.stream.try_lock().unwrap().is_some());
-        drop(response);
-        assert_eq!(client.inner.response_owner.available_permits(), 1);
-        assert!(client.get("next").await.unwrap().is_none());
-        assert_eq!(requests.load(Ordering::Relaxed), 2);
-        client.close().await;
-        peer.await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn close_wakes_owner_waiters_and_drop_releases_owner() {
-        let (client, requests, peer) = fixture().await;
-        let response = held(&client).await;
-        let queued = client.clone();
-        let waiting = tokio::spawn(async move { queued.get("never-sent").await });
-        await_admission(&client).await;
-        client.close().await;
-        assert!(matches!(waiting.await.unwrap(), Err(ClientError::Closed)));
-        assert_eq!(requests.load(Ordering::Relaxed), 1);
-        drop(response);
-        assert_eq!(client.inner.response_owner.available_permits(), 1);
-        peer.await.unwrap();
     }
 }

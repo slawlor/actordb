@@ -26,6 +26,9 @@ type Result<T> = std::result::Result<T, String>;
 struct Args {
     #[arg(long)]
     phase: String,
+    /// Read-only live diagnostics after a failed write; never retries it.
+    #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u64).range(0..=45))]
+    diagnostic_wait_secs: u64,
     /// Repeated id@application-host:port@PRIVATE-control-host:port.
     #[arg(long, required = true)]
     node: Vec<String>,
@@ -190,11 +193,8 @@ async fn client(endpoint: &Endpoint, timeout: Duration) -> Result<Client> {
         .next()
         .ok_or("no application address")?;
     Client::connect(
-        address,
-        ClientOptions::builder()
-            .identity("cluster-hardening")
-            .timeout(timeout)
-            .build(),
+        format!("http://{address}"),
+        ClientOptions::builder().timeout(timeout).build(),
     )
     .await
     .map_err(|e| format!("{} application: {e}", endpoint.id))
@@ -444,8 +444,41 @@ impl Harness {
             .put_with_write_concern(&key, value.clone(), concern(majority))
             .await;
         c.close().await;
-        let receipt =
-            result.map_err(|e| format!("{id} {table} key {key:?}: stable write failed: {e:?}"))?;
+        let receipt = match result {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                let until = tokio::time::Instant::now()
+                    + Duration::from_secs(self.args.diagnostic_wait_secs);
+                while tokio::time::Instant::now() < until {
+                    for peer in ["node-a", "node-b", "node-c"] {
+                        if let Ok(mut status) =
+                            control(self.endpoint(peer)?, json!({"command":"status"})).await
+                        {
+                            let fragment = seahash::hash(key.as_bytes()) % u64::from(FRAGMENTS);
+                            if let Some(senders) = status["senders"].as_array_mut() {
+                                senders.retain(|sender| sender["fragment"] == fragment);
+                            }
+                            if let Some(fragments) = status["fragments"].as_array_mut() {
+                                fragments.retain(|status| status["id"] == fragment);
+                            }
+                            eprintln!("FAILED_WRITE_STATUS {peer}: {status}");
+                        }
+                        if let Ok(client) =
+                            client(self.endpoint(peer)?, Duration::from_secs(5)).await
+                        {
+                            let scoped = client.table(table).map_err(|e| e.to_string())?;
+                            let value = scoped.get(&key).await;
+                            eprintln!("FAILED_WRITE_VALUE {peer} {key:?}: {value:?}");
+                            scoped.close().await;
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                }
+                return Err(format!(
+                    "{id} {table} key {key:?}: stable write failed: {error:?}"
+                ));
+            }
+        };
         self.ledger.add(certified(table, &key, value, &receipt)?);
         Ok(())
     }

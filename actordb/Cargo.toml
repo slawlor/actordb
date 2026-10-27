@@ -1,6 +1,6 @@
 [package]
 name = "actordb"
-version = "0.10.0"
+version = "0.11.0"
 authors = ["Sean Lawlor"]
 description = "An actor-first distributed database"
 documentation = "https://docs.rs/actordb"
@@ -14,22 +14,24 @@ categories = ["asynchronous", "concurrency", "database-implementations"]
 rust-version = "1.88"
 
 [features]
-default = []
+default = ["grpc"]
+# Optional application RPC adapter; peer replication is independent.
+grpc = ["actordb-protocol/grpc", "dep:tonic", "dep:tokio-stream", "dep:http-body"]
 # Optional no-op store test double; not a durable database or the Node cache.
 memory = []
 # Opt-in RocksDB-backed durable storage. Independent of the memory feature.
 # librocksdb-sys runs bindgen at build time and needs libclang with working
 # header paths. The default crate includes no bundled store implementation.
 rocksdb = ["dep:rocksdb"]
-# Built-in rustls transport for the pluggable peer/application network.
+# Built-in rustls transport for the peer network.
 tls = ["dep:tokio-rustls"]
 # Optional static configuration-file loader. Dynamic providers only need the
 # always-available async `ConfigurationProvider` trait.
 toml = ["dep:serde", "dep:toml", "tokio/fs"]
 
 [dependencies]
-actordb-protocol = { version = "0.10.0", path = "../actordb-protocol" }
-actordb-query = { version = "0.10.0", path = "../actordb-query" }
+actordb-protocol = { version = "0.11.0", path = "../actordb-protocol" }
+actordb-query = { version = "0.11.0", path = "../actordb-query" }
 # Required dependencies
 bon = { version = "3.10.2" }
 bytes = { version = "1" }
@@ -48,6 +50,10 @@ tokio-rustls = { version = "0.26", optional = true, default-features = false, fe
 toml = { version = "1.1", optional = true }
 tracing = "0.1"
 # Optional dependencies
+
+tonic = { version = "0.14", optional = true, default-features = false, features = ["transport", "router", "tls-ring"] }
+tokio-stream = { version = "0.1", optional = true, features = ["net"] }
+http-body = { version = "1", optional = true }
 
 [dev-dependencies]
 criterion = { version = "0.8.2", features = ["async_tokio"] }

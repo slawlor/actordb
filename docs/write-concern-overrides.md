@@ -84,5 +84,5 @@ active.
 ## Version requirements
 
 Use `0.9.0` across the database, protocol, query and SDK crates. Peer protocol 6
-and application protocol 4 require matching current participants; there is no
+and the unary application RPC contract require matching current participants; there is no
 mixed-version negotiation or fallback.
