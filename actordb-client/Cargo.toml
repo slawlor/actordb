@@ -30,6 +30,7 @@ tonic = { version = "0.14", optional = true, default-features = false, features 
 
 [dev-dependencies]
 bytes = "1"
+h2 = "0.4"
 http-body = "1"
 tokio-stream = { version = "0.1", features = ["net"] }
 actordb = { version = "0.11.0", path = "../actordb", default-features = false }

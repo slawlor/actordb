@@ -611,22 +611,42 @@ impl KvStore for RocksDbStore {
     }
 
     fn write_batch(&self, writes: &[(Vec<u8>, VersionedValue)]) -> Result<(), StoreError> {
+        let borrowed: Vec<_> = writes
+            .iter()
+            .map(|(key, value)| (key.as_slice(), value))
+            .collect();
+        self.write_batch_borrowed(&[], &borrowed)
+    }
+
+    fn write_batch_borrowed(
+        &self,
+        prefix: &[u8],
+        writes: &[(&[u8], &VersionedValue)],
+    ) -> Result<(), StoreError> {
         let identity = self.attached_identity()?;
         let mut batch = rocksdb_engine::WriteBatch::default();
         for (key, value) in writes {
+            let physical: std::borrow::Cow<'_, [u8]> = if prefix.is_empty() {
+                std::borrow::Cow::Borrowed(key)
+            } else {
+                let mut physical = Vec::with_capacity(prefix.len().saturating_add(key.len()));
+                physical.extend_from_slice(prefix);
+                physical.extend_from_slice(key);
+                std::borrow::Cow::Owned(physical)
+            };
             if value.expires_at_ms == Some(0) {
                 return Err(StoreError(
                     "zero expiry is reserved by record format3".into(),
                 ));
             }
-            let logical_key = Self::validate_physical_key(key, &identity)?;
+            let logical_key = Self::validate_physical_key(&physical, &identity)?;
             check_record_budget(logical_key.len(), value.value.len(), value.node_id.len())
                 .map_err(|error| {
                     StoreError(format!(
                         "refusing to persist record which cannot be replicated: {error}"
                     ))
                 })?;
-            batch.put(key, Self::encode(value));
+            batch.put(&*physical, Self::encode(value));
         }
         self.db
             .write_opt(batch, self.write_options(false))

@@ -25,6 +25,14 @@ and results come back in input order.
    `Vec<Result<(), NodeError>>` for puts,
    `Vec<Result<Option<VersionedValue>, NodeError>>` for gets.
 
+An unavailable or lost/malformed bulk-write reply may follow application of
+some positions. Each position retains that uncertainty across exact-stamp
+failover: a later successful apply/already-present response resolves it, but a
+later rejection or exhausted attempts return `NodeError::UnknownOutcome`.
+Positions never dispatched retain their definite admission/network errors;
+completed positions are not replayed. Do not retry uncertain writes as fresh
+mutations automatically.
+
 ## Priority and traffic isolation
 
 - Plain `put_multi`/`get_multi` run at **`OpPriority::Background`** — they are

@@ -37,6 +37,14 @@ impl KvStore for MemoryStore {
         Ok(())
     }
 
+    fn write_batch_borrowed(
+        &self,
+        _prefix: &[u8],
+        _writes: &[(&[u8], &VersionedValue)],
+    ) -> Result<(), StoreError> {
+        Ok(())
+    }
+
     fn commit_durability(&self) -> StoreCommitDurability {
         StoreCommitDurability::Buffered
     }

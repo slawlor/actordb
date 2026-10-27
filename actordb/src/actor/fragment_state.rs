@@ -1078,11 +1078,11 @@ impl FragmentState {
                     // the authoritative batch before this owner restores it.
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         if let Some(batch) = &batch {
-                            let encoded: Vec<_> = batch
+                            let borrowed: Vec<_> = batch
                                 .iter()
-                                .map(|(key, write)| (key.as_bytes().to_vec(), write.value.clone()))
+                                .map(|(key, write)| (key.as_bytes(), &write.value))
                                 .collect();
-                            kvstore.write_batch(&encoded)?;
+                            kvstore.write_batch_borrowed(&[], &borrowed)?;
                         }
                         if stable {
                             Ok(match kvstore.stable_fence()? {
@@ -2344,6 +2344,10 @@ impl FragmentState {
 #[cfg(test)]
 #[path = "summary_revision_tests.rs"]
 mod summary_revision_tests;
+
+#[cfg(test)]
+#[path = "persistence_view_tests.rs"]
+mod persistence_view_tests;
 
 impl FlushBuffer {
     fn should_flush(&self, batch_size: usize, interval: Duration) -> bool {

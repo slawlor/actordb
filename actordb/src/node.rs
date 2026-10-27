@@ -2826,6 +2826,7 @@ impl Node {
                 // A valid response may finish only part of the batch; retry
                 // its unavailable positions without replaying terminal ones.
                 let mut unresolved = chunk;
+                let mut ambiguous_positions = HashSet::new();
                 let mut tried: Vec<String> = Vec::new();
                 for owner in self.replica_order(frag) {
                     tried.push(owner.clone());
@@ -2879,9 +2880,24 @@ impl Node {
                                 if MutationStatus::try_from(result.status)
                                     == Ok(MutationStatus::Unavailable)
                                 {
+                                    // Unavailability can follow a lost actor
+                                    // completion; it does not certify that an
+                                    // admitted stamped operation never applied.
+                                    ambiguous_positions.insert(index);
                                     unavailable.push((index, put));
                                 } else {
-                                    results[index] = Some(decode_mutation_result(result));
+                                    let outcome = decode_mutation_result(result);
+                                    results[index] = Some(match outcome {
+                                        Err(error)
+                                            if ambiguous_positions.contains(&index)
+                                                && !matches!(error, NodeError::UnknownOutcome(_)) =>
+                                        {
+                                            Err(NodeError::UnknownOutcome(format!(
+                                                "an earlier forwarded bulk mutation may have applied; latest attempt returned: {error}"
+                                            )))
+                                        }
+                                        outcome => outcome,
+                                    });
                                 }
                             }
                             unresolved = unavailable;
@@ -2892,14 +2908,23 @@ impl Node {
                         // A timeout or malformed/dropped response may follow a
                         // successful apply. Retrying the exact stamped versions
                         // at another holder is safe under the idempotent merge.
-                        _ => {}
+                        _ => {
+                            ambiguous_positions.extend(unresolved.iter().map(|(index, _)| *index));
+                        }
                     }
                 }
                 for (index, _) in unresolved {
-                    results[index] = Some(Err(NodeError::Network(format!(
+                    let message = format!(
                         "no replica acknowledged batch put for fragment {frag} (tried {})",
                         tried.join(",")
-                    ))));
+                    );
+                    results[index] = Some(Err(if ambiguous_positions.contains(&index) {
+                        NodeError::UnknownOutcome(format!(
+                            "forwarded bulk mutation may have applied; {message}"
+                        ))
+                    } else {
+                        NodeError::Network(message)
+                    }));
                 }
             }
         }
