@@ -12,6 +12,41 @@ pub(super) struct SnapshotPause {
     pub(super) resume: Notify,
 }
 
+/// Keep a real std cache guard on a dedicated thread. A regression that tries
+/// to read the child cache cannot hang the test runtime indefinitely.
+struct BlockingCacheHold {
+    release: std::sync::mpsc::Sender<()>,
+    owner: Option<std::thread::JoinHandle<()>>,
+    timed_out: Arc<AtomicBool>,
+}
+
+impl Drop for BlockingCacheHold {
+    fn drop(&mut self) {
+        let _ = self.release.send(());
+        self.owner.take().unwrap().join().unwrap();
+    }
+}
+
+async fn hold_cache_on_thread(child: Arc<FragmentState>) -> BlockingCacheHold {
+    let (release, released) = std::sync::mpsc::channel();
+    let (ready, acquired) = tokio::sync::oneshot::channel();
+    let timed_out = Arc::new(AtomicBool::new(false));
+    let timeout_flag = timed_out.clone();
+    let owner = std::thread::spawn(move || {
+        let _cache = child.cache.write().unwrap();
+        let _ = ready.send(());
+        if released.recv_timeout(Duration::from_secs(2)).is_err() {
+            timeout_flag.store(true, Ordering::Release);
+        }
+    });
+    acquired.await.unwrap();
+    BlockingCacheHold {
+        release,
+        owner: Some(owner),
+        timed_out,
+    }
+}
+
 // Thread-local measurement excludes unrelated concurrently running tests.
 // Count requested bytes, not allocator slack, live heap, or process RSS.
 thread_local! {
@@ -251,7 +286,7 @@ async fn summaries_and_revision_do_not_wait_for_any_child_cache_or_copy_payloads
             .next()
             .unwrap()
             .clone();
-        let _cache = child.cache.write().await;
+        let held_cache = hold_cache_on_thread(child).await;
         let scope = AllocationScope::start();
         let started = Instant::now();
         let page = state.summary_page(None, None, Some(1), 1).await;
@@ -267,6 +302,10 @@ async fn summaries_and_revision_do_not_wait_for_any_child_cache_or_copy_payloads
         assert_eq!(
             allocated, 0,
             "revision mismatch visited data or allocated metadata"
+        );
+        assert!(
+            !held_cache.timed_out.load(Ordering::Acquire),
+            "summary or revision waited for the child cache"
         );
     }
 }
@@ -311,7 +350,7 @@ async fn full_partitioned_snapshot_fences_other_tables_but_summary_stays_nonbloc
         (b.clone(), value(0)),
     ]));
     let b_child = state.table_children.read().await.get("B").unwrap().clone();
-    let b_cache = b_child.cache.write().await;
+    let b_cache = b_child.pause_cache_for_test().await;
     let reading = state.clone();
     let snapshot = tokio::spawn(async move { reading.snapshot_with_revision().await });
     tokio::time::timeout(Duration::from_secs(2), async {

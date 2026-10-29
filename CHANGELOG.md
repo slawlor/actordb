@@ -2,6 +2,11 @@
 
 ## 0.11.1 (unreleased)
 
+- Use `std::sync::RwLock` for fragment/table caches; cache guards protect
+  synchronous work only. Keep async persistence/publication locks where
+  guards span acquisition or I/O, and migrate contention/snapshot fixtures
+  to preserve cancellation, ordering and revision checks without runtime
+  blocking or a std guard across `.await`.
 - Shorten fragment write critical sections by transferring owned worker values
   into the cache, preparing persistence copies and summary metadata before
   acquiring mutation locks, and releasing replaced payloads after unlocking.

@@ -1,5 +1,16 @@
 # Tokio vs synchronous fragment cache locks
 
+## Production adoption update
+
+PR #195 now adopts the std cache lock. The async unit-test hooks have
+been migrated: cache execution pauses use a test-only async gate,
+snapshot values/revision are captured before the paused-clone await,
+and a dedicated thread retains the real cache guard for the nonblocking
+summary witness. Validation passed 702 default tests, 615 selected memory-
+feature tests, and Clippy with warnings denied. The measurements and build limitations below describe
+the earlier experiment. Replay its patches from commit `f0ff14e`,
+where the cache was still Tokio; they do not target the adopted code.
+
 Local measurements on 2026-10-29, based on the shortened write critical
 sections at commit `97e41592a4b4feb3807010e73add3be3e701ea1e` (0.11.1 PR).
 
@@ -129,7 +140,7 @@ non-Send in test builds. These test hooks need redesign before shipping the
 synchronous implementation; production builds contain no await under a cache
 guard. This experiment does not claim the full unit suite passed for Std.
 
-The active source has been restored to the Tokio implementation. The measured
+At the end of the experiment, the source was restored to Tokio. The measured
 synchronous change is saved in [fragment_cache_std.patch](fragment_cache_std.patch)
 for replay. It deliberately contains the cache experiment rather than an async
 unit-fixture migration.

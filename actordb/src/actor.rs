@@ -18,7 +18,8 @@
 //! cache, one ordered persistence buffer, one [`KvStore`](crate::store::KvStore).
 //! Cache merges and persistence enqueueing happen as one ordered operation,
 //! including when two priority pools update the same key concurrently.
-//! Workers transfer owned values into the cache; payload copies for persistence
+//! Cache reads and mutations use a synchronous `std::sync::RwLock`; guards
+//! never span an async wait. Workers transfer owned values into the cache; payload copies for persistence
 //! are prepared before mutation locks, and replaced payloads drop afterward.
 //! Replication is just
 //! messages: a local write becomes a `ReplicatedOp` which the node's

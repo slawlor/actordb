@@ -1014,7 +1014,7 @@ mod retention_tests {
             )
             .await
             .unwrap();
-            let cache = shared.lock_cache_for_test().await;
+            let cache = shared.pause_cache_for_test().await;
             let admission = Arc::new(Semaphore::new(1));
             let retention: Arc<dyn Send + Sync> =
                 Arc::new(admission.clone().acquire_owned().await.unwrap());

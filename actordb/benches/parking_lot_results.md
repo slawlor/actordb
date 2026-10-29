@@ -1,5 +1,16 @@
 # Parking_lot, std and Tokio fragment cache locks
 
+## Production adoption update
+
+PR #195 now adopts the std cache lock. The async unit-test hooks have
+been migrated: cache execution pauses use a test-only async gate,
+snapshot values/revision are captured before the paused-clone await,
+and a dedicated thread retains the real cache guard for the nonblocking
+summary witness. Validation passed 702 default tests, 615 selected memory-
+feature tests, and Clippy with warnings denied. The measurements and build limitations below describe
+the earlier experiment. Replay its patches from commit `b573c94`,
+where the cache was still Tokio; they do not target the adopted code.
+
 Measured locally on 2026-10-29 against the shortened cache write path at commit
 `f0ff14e55ac2d9fccb889abf1437bc6ce30f641a`.
 
@@ -141,7 +152,7 @@ does not claim the full unit suite passed for the experimental Parking_lot build
 Parking_lot also does not poison its locks; fairness and poisoning differences
 are separate from the throughput measurements here.
 
-The active library and manifest were restored after measurement. The replayable
+At the end of the experiment, the original library and manifest were restored. The replayable
 [Parking_lot patch](fragment_cache_parking_lot.patch) contains the experimental
 dependency/cache change. The [std patch](fragment_cache_std.patch) reproduces the
 other synchronous variant.
