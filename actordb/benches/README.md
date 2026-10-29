@@ -74,6 +74,63 @@ The benchmark also includes direct, uncontended revision reads, 100 B Gets and
 and Parking_lot across these fast paths and the actor workloads, with the
 experimental dependency/cache patch and A/B/C/C/B/A results.
 
+## Fragment-indexed sender registry
+
+An ignored internal release diagnostic measures the production sender lookup
+at 1/64/1,024/8,192 registry fragments, with two targets and 1/32 concurrent
+callers. It also measures completed Node writes with real TCP replication at
+1/64/512 fragments, fixed workers and at most eight active fragments.
+
+A third sweep holds eight real fragments, actors and replication timers fixed,
+then adds synthetic unrelated registry entries. These entries alias real sender
+handles and never receive writes. Both peer Hello handlers finish before the
+entries are added. This isolates registry cardinality from background actor and
+timer load; it is not a simulation of a node hosting 8,192 real fragments.
+
+Each Node case measures 400 batches after 50 warmup batches, with fixed keys,
+100 B or 16 KiB values and 1/32 concurrent writes. Payload preparation and exact
+generation replica catch-up are excluded from the source-completion timer.
+The runtime has four threads; each priority pool has one unlimited worker per
+fragment. No store is attached, so results do not measure durable throughput.
+
+```bash
+cargo test --locked -p actordb --release --lib sender_registry_scaling -- --ignored --nocapture
+
+# Run just one sweep: lookup, node, or isolated.
+ACTORDB_SENDER_BENCH_MODE=isolated cargo test --locked -p actordb --release --lib sender_registry_scaling -- --ignored --nocapture
+
+# Preferred write throughput comparison: switch lookup inside the same nodes.
+ACTORDB_SENDER_BENCH_MODE=paired cargo test --locked -p actordb --release --lib sender_registry_scaling -- --ignored --nocapture
+
+# Identical indexed implementation on both sides measures experimental noise.
+ACTORDB_SENDER_BENCH_MODE=paired ACTORDB_SENDER_BENCH_CONTROL=1 cargo test --locked -p actordb --release --lib sender_registry_scaling -- --ignored --nocapture
+```
+
+The paired comparison waits for every sender's initial reconciliation, then
+warms the same write block shape for at least two seconds. A test-only flat map
+of the same handles lets one executable switch fanout and exact-peer lookup
+while preserving actors, sessions, channels and timer deadlines. It alternates
+ABBA/BAAB across four independent node pairs. Each block runs continuous writes
+before catching up once, checking exact replica values, idle sender ingress,
+empty buffers/in-flight queues and zero cumulative shed/reset counts. This
+avoids starting every measured batch immediately after a replication timer wave.
+The mirror and switch are absent from production builds.
+
+Paired defaults are 512 real fragments, 100 B, concurrency 32, 128 measured
+batches plus 16 untimed batches per block, a 1 ms replication tick, and four
+runtime threads. Overrides use `ACTORDB_SENDER_BENCH_FRAGMENTS`, `BYTES`,
+`CONCURRENCY`, `SAMPLES`, `WARMUP`, `TRIALS`, `TICK_MS`, and `RT_THREADS`, each
+with the same `ACTORDB_SENDER_BENCH_` prefix. `CONTINUOUS=0` restores per-batch
+catch-up for diagnostic comparison. Optional `SAMPLES_DIR` retains raw batch
+durations in an existing directory. Input preparation and final replication
+catch-up remain outside the source-completion timer.
+
+The [sender index results](sender_registry_results.md) record repeated
+before/after measurements, the small-registry cost, investigation of the initial
+512-fragment result, and the limits of the Node throughput measurements.
+This diagnostic uses test fixtures and remains out of
+CI; normal test runs skip it.
+
 Each file has a doc comment explaining what it measures and how to read a
 regression — start there before tuning.
 

@@ -1105,7 +1105,7 @@ mod tests {
             Arc::new(RwLock::new(HashSet::new())),
             Arc::new(RwLock::new(HashMap::new())),
             true,
-            Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(Mutex::new(Default::default())),
             Arc::new(Mutex::new(HashMap::new())),
             Arc::new(Mutex::new(HashMap::new())),
         )
@@ -1505,7 +1505,7 @@ mod tests {
                 vec!["owner".to_string()],
             )]))),
             true,
-            Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(Mutex::new(Default::default())),
             Arc::new(Mutex::new(HashMap::new())),
             Arc::new(Mutex::new(HashMap::new())),
         )
@@ -1659,7 +1659,7 @@ mod tests {
                     vec!["owner".to_string()],
                 )]))),
                 true,
-                Arc::new(Mutex::new(HashMap::new())),
+                Arc::new(Mutex::new(Default::default())),
                 Arc::new(Mutex::new(HashMap::new())),
                 peers,
             )

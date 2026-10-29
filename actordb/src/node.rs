@@ -147,7 +147,7 @@ use lifecycle::{
     ensure_sender_entry, quiesce_fragment_supervisor, register_fragment_dispatcher_monitor,
     spawn_fragment_subtree_registered, OperationGate, OperationPermit, RetiringSenderRegistry,
     RouteMonitorRegistrationGuard, SenderEntryDeps, SenderFinalizationRegistry, SenderMap,
-    SenderReportMap, ShutdownProgress, SupervisorRegistry,
+    SenderRegistry, SenderReportMap, ShutdownProgress, SupervisorRegistry,
 };
 pub use startup::{NodeStartup, NodeStartupSnapshot, StartupStage};
 
@@ -520,16 +520,19 @@ async fn enqueue_to_senders(senders: &SenderMap, frag: FragmentId, op: &Replicat
     // lock to lookup only: a value can approach the wire frame limit, and its
     // per-replica clone plus bounded-mailbox admission must not serialize ACKs
     // or writes for every other fragment.
-    let targets: Vec<NodeSender> = senders
-        .lock()
-        .await
-        .iter()
-        .filter(|((sender_frag, _), _)| *sender_frag == frag)
-        .map(|(_, sender)| sender.clone())
-        .collect();
+    let targets = snapshot_senders_for_fragment(senders, frag).await;
     for sender in targets {
         let _ = sender.offer(op);
     }
+}
+
+async fn snapshot_senders_for_fragment(senders: &SenderMap, frag: FragmentId) -> Vec<NodeSender> {
+    senders
+        .lock()
+        .await
+        .for_fragment(frag)
+        .map(|(_, sender)| sender.clone())
+        .collect()
 }
 
 async fn sender_task_is_current(
@@ -4065,7 +4068,7 @@ mod tests {
             Arc::new(RwLock::new(HashSet::from([fragment]))),
             Arc::new(RwLock::new(HashMap::new())),
             true,
-            Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(Mutex::new(Default::default())),
             Arc::new(Mutex::new(HashMap::new())),
             peers.clone(),
         )
@@ -4155,7 +4158,7 @@ mod tests {
             serving.clone(),
             Arc::new(RwLock::new(HashMap::new())),
             true,
-            Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(Mutex::new(Default::default())),
             Arc::new(Mutex::new(HashMap::new())),
             peers.clone(),
         )
@@ -4340,7 +4343,7 @@ mod tests {
         .await
         .unwrap();
         let _ = supervisor.stop_and_wait(None, None).await;
-        let senders: SenderMap = Arc::new(Mutex::new(HashMap::new()));
+        let senders: SenderMap = Arc::new(Mutex::new(SenderRegistry::default()));
 
         let result = apply_forwarded_mutation(
             &actor,
@@ -4566,3 +4569,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "node/sender_registry_bench.rs"]
+mod sender_registry_bench;

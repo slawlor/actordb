@@ -1000,7 +1000,7 @@ pub(super) async fn handle_connection(
                         .lock()
                         .await
                         .iter()
-                        .filter(|((_, sender_peer), _)| sender_peer == &peer)
+                        .filter(|((_, sender_peer), _)| *sender_peer == &peer)
                         .map(|(_, sender)| sender.clone())
                         .collect();
                     for sender_tx in peer_senders {
@@ -2675,8 +2675,8 @@ pub(super) async fn handle_connection(
                     let mut senders_guard = senders.lock().await;
                     let keys: Vec<(FragmentId, String)> = senders_guard
                         .keys()
-                        .filter(|(_, sender_peer)| sender_peer == &peer)
-                        .cloned()
+                        .filter(|(_, sender_peer)| *sender_peer == &peer)
+                        .map(|(fragment, peer)| (fragment, peer.clone()))
                         .collect();
                     let mut reports_guard = sender_reports.lock().await;
                     for key in keys {
@@ -2695,7 +2695,7 @@ pub(super) async fn handle_connection(
                         .lock()
                         .await
                         .iter()
-                        .filter(|((_, sender_peer), _)| sender_peer == &peer)
+                        .filter(|((_, sender_peer), _)| *sender_peer == &peer)
                         .map(|(_, sender)| sender.clone())
                         .collect();
                     for sender_tx in peer_senders {
@@ -3438,7 +3438,7 @@ mod tests {
                 Arc::new(RwLock::new(HashSet::new())),
                 Arc::new(RwLock::new(HashMap::new())),
                 true,
-                Arc::new(Mutex::new(HashMap::new())),
+                Arc::new(Mutex::new(Default::default())),
                 Arc::new(Mutex::new(HashMap::new())),
                 Arc::new(Mutex::new(HashMap::new())),
             )
@@ -3597,7 +3597,7 @@ mod tests {
             Arc::new(RwLock::new(HashSet::new())),
             Arc::new(RwLock::new(HashMap::new())),
             true,
-            Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(Mutex::new(Default::default())),
             Arc::new(Mutex::new(HashMap::new())),
             peers.clone(),
         )
@@ -3903,7 +3903,7 @@ mod tests {
                 })
                 .unwrap();
 
-            let senders = Arc::new(Mutex::new(HashMap::from([(
+            let senders = Arc::new(Mutex::new(SenderRegistry::from([(
                 (fragment, "peer".to_string()),
                 sender.clone(),
             )])));
@@ -3992,7 +3992,10 @@ mod tests {
                 SenderRuntimeOptions::default().with_control_channel_capacity(1),
             )
             .unwrap();
-            let senders = Arc::new(Mutex::new(HashMap::from([(key.clone(), sender.clone())])));
+            let senders = Arc::new(Mutex::new(SenderRegistry::from([(
+                key.clone(),
+                sender.clone(),
+            )])));
             let sender_reports =
                 Arc::new(Mutex::new(HashMap::from([(key.clone(), report.clone())])));
             let peers: PeerMap = Arc::new(Mutex::new(HashMap::new()));
@@ -4144,7 +4147,10 @@ mod tests {
                 SenderRuntimeOptions::default(),
             )
             .unwrap();
-            let senders = Arc::new(Mutex::new(HashMap::from([(key.clone(), sender.clone())])));
+            let senders = Arc::new(Mutex::new(SenderRegistry::from([(
+                key.clone(),
+                sender.clone(),
+            )])));
             let sender_reports =
                 Arc::new(Mutex::new(HashMap::from([(key.clone(), report.clone())])));
             let peers: PeerMap = Arc::new(Mutex::new(HashMap::new()));
@@ -4281,7 +4287,10 @@ mod tests {
                 drop(report_guard.take());
                 sender.stop().await;
             }
-            let senders = Arc::new(Mutex::new(HashMap::from([(key.clone(), sender.clone())])));
+            let senders = Arc::new(Mutex::new(SenderRegistry::from([(
+                key.clone(),
+                sender.clone(),
+            )])));
             let sender_reports = Arc::new(Mutex::new(HashMap::from([(key, report.clone())])));
             let peers: PeerMap = Arc::new(Mutex::new(HashMap::new()));
             let (ctx, runtime_tasks) = test_connection_context(
@@ -4365,7 +4374,7 @@ mod tests {
                     vec!["local".to_string(), "peer".to_string()],
                 )]))),
                 true,
-                Arc::new(Mutex::new(HashMap::new())),
+                Arc::new(Mutex::new(Default::default())),
                 Arc::new(Mutex::new(HashMap::new())),
                 peers.clone(),
             )
@@ -4469,7 +4478,7 @@ mod tests {
                 Arc::new(RwLock::new(HashSet::from([fragment]))),
                 Arc::new(RwLock::new(HashMap::new())),
                 true,
-                Arc::new(Mutex::new(HashMap::new())),
+                Arc::new(Mutex::new(Default::default())),
                 Arc::new(Mutex::new(HashMap::new())),
                 Arc::new(Mutex::new(HashMap::new())),
             )
@@ -4556,7 +4565,7 @@ mod tests {
         .unwrap();
         router.insert(fragment, dispatcher);
 
-        let senders: SenderMap = Arc::new(Mutex::new(HashMap::new()));
+        let senders: SenderMap = Arc::new(Mutex::new(SenderRegistry::default()));
         let reports: SenderReportMap = Arc::new(Mutex::new(HashMap::new()));
         let peers: PeerMap = Arc::new(Mutex::new(HashMap::new()));
         let placement = Arc::new(RwLock::new(HashMap::from([(
@@ -4615,7 +4624,7 @@ mod tests {
         .unwrap();
         router.insert(fragment, dispatcher);
 
-        let senders: SenderMap = Arc::new(Mutex::new(HashMap::new()));
+        let senders: SenderMap = Arc::new(Mutex::new(SenderRegistry::default()));
         let reports: SenderReportMap = Arc::new(Mutex::new(HashMap::new()));
         let peers: PeerMap = Arc::new(Mutex::new(HashMap::new()));
         let (ctx, runtime_tasks) = test_connection_context(
@@ -4674,7 +4683,7 @@ mod tests {
             Arc::new(RwLock::new(HashSet::new())),
             Arc::new(RwLock::new(HashMap::new())),
             true,
-            Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(Mutex::new(Default::default())),
             Arc::new(Mutex::new(HashMap::new())),
             peers,
         )

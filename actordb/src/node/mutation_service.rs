@@ -723,7 +723,7 @@ mod tests {
         let service =
             MutationService::new_with_tracker(WORKERS_PER_PRIORITY, 128 * 1024, tracker.clone());
         let gate = OperationGate::new();
-        let senders = Arc::new(Mutex::new(HashMap::new()));
+        let senders = Arc::new(Mutex::new(Default::default()));
         let mut responses = Vec::new();
         let mut operations = Vec::new();
         for index in 0..WORKERS_PER_PRIORITY {
@@ -930,7 +930,7 @@ mod tests {
             SenderRuntimeOptions::default(),
         )
         .unwrap();
-        let map = Arc::new(Mutex::new(HashMap::from([(
+        let map = Arc::new(Mutex::new(crate::node::SenderRegistry::from([(
             (FragmentId(0), "replica".to_string()),
             sender.clone(),
         )])));
@@ -1003,7 +1003,7 @@ mod tests {
                 ]))),
                 Arc::new(std::sync::RwLock::new(HashMap::new())),
                 false,
-                Arc::new(Mutex::new(HashMap::new())),
+                Arc::new(Mutex::new(Default::default())),
                 Arc::new(Mutex::new(HashMap::new())),
                 Arc::new(Mutex::new(HashMap::new())),
             )
@@ -1156,7 +1156,7 @@ mod tests {
         let (job, response) = MutationJob::new(
             request,
             actor.clone(),
-            Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(Mutex::new(Default::default())),
             FragmentId(0),
             gate.try_enter().unwrap(),
             Some(authority.clone().read_owned().await),
@@ -1194,7 +1194,7 @@ mod tests {
             ]))),
             Arc::new(std::sync::RwLock::new(HashMap::new())),
             false,
-            Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(Mutex::new(Default::default())),
             Arc::new(Mutex::new(HashMap::new())),
             Arc::new(Mutex::new(HashMap::new())),
         )
@@ -1468,7 +1468,7 @@ mod tests {
             let store = Arc::new(GatedStore::default());
             let _release = ReleaseStore(store.clone());
             let (actor, state) = worker(Some(store.clone())).await;
-            let senders = Arc::new(Mutex::new(HashMap::new()));
+            let senders = Arc::new(Mutex::new(Default::default()));
             let request = MutationRequest::Single(put(1, Priority::Background));
             let bytes = request.payload_bytes();
             let service = MutationService::new(count, bytes);
@@ -1557,7 +1557,7 @@ mod tests {
         let (actor, state) = worker(None).await;
         let gate = OperationGate::new();
         let authority = Arc::new(RwLock::new(()));
-        let senders = Arc::new(Mutex::new(HashMap::new()));
+        let senders = Arc::new(Mutex::new(Default::default()));
         let (unregistered, abandoned) = MutationJob::new(
             MutationRequest::Single(put(1, Priority::Default)),
             actor.clone(),
@@ -1698,7 +1698,7 @@ mod tests {
         let bytes = requests.iter().map(MutationRequest::payload_bytes).sum();
         let service = MutationService::new(count, bytes);
         let gate = OperationGate::new();
-        let senders = Arc::new(Mutex::new(HashMap::new()));
+        let senders = Arc::new(Mutex::new(Default::default()));
         let mut responses = Vec::new();
         for request in requests {
             let (job, response) = job(request, &actor, senders.clone(), &gate);
@@ -1751,7 +1751,7 @@ mod tests {
             ]))),
             Arc::new(std::sync::RwLock::new(HashMap::new())),
             false,
-            Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(Mutex::new(Default::default())),
             Arc::new(Mutex::new(HashMap::new())),
             Arc::new(Mutex::new(HashMap::new())),
         )
