@@ -1,6 +1,24 @@
 # Release notes
 
-## 0.11.0 (unreleased)
+## 0.11.1 (unreleased)
+
+- Use `std::sync::RwLock` for fragment/table caches; cache guards protect
+  synchronous work only. Keep async persistence/publication locks where
+  guards span acquisition or I/O, and migrate contention/snapshot fixtures
+  to preserve cancellation, ordering and revision checks without runtime
+  blocking or a std guard across `.await`.
+- Shorten fragment write critical sections by transferring owned worker values
+  into the cache, preparing persistence copies and summary metadata before
+  acquiring mutation locks, and releasing replaced payloads after unlocking.
+- Compare buffered-write winners by their LWW version without a redundant
+  full-payload equality check, preserving conflict checks, TTL selection,
+  ordered persistence admission and revision publication.
+- Add a mixed-priority fragment write benchmark and recorded before/after
+  results. Local 24-writer, 1 MB throughput improved about 56–60%; smaller and
+  single-writer workloads were mixed. See
+  [benchmark results](actordb/benches/fragment_writes_results.md).
+
+## 0.11.0
 
 A hard application RPC migration plus the P1/P2 corrective changes tracked
 under #114. All four libraries advance together. The peer protocol (6) and

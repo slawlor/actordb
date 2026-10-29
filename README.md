@@ -14,7 +14,7 @@ with logical tables, a standalone Rust SDK and opt-in persistence.
 
 ## Current release and deployment
 
-ActorDB `0.11.0` requires Rust **1.88+**. Deploy matching database, protocol,
+ActorDB `0.11.1` requires Rust **1.88+**. Deploy matching database, protocol,
 query and SDK crates together. Peers retain exact protocol **6** and RocksDB
 record/manifest format **3**. Application APIs migrate together to typed unary
 `actordb.rpc.v1` RPC: there is no old application listener, handshake or fallback.
@@ -25,7 +25,7 @@ configure both allowances explicitly for larger trusted workloads.
 
 ```toml
 [dependencies]
-actordb = "0.11.0"
+actordb = "0.11.1"
 ```
 
 The default feature set enables `grpc`, but includes no storage backend. The Node uses a volatile actor cache and
@@ -33,7 +33,7 @@ provides the `KvStore` interface without enabling a bundled store. RocksDB is
 an independent opt-in:
 
 ```toml
-actordb = { version = "0.11.0", features = ["rocksdb"] }
+actordb = { version = "0.11.1", features = ["rocksdb"] }
 ```
 
 The `memory` feature exposes a no-op test store, not durable storage.
@@ -130,7 +130,7 @@ wraps an `Arc<Node>` through `grpc::GrpcServer`; SDK calls use unary
 `actordb.rpc.v1.ActorDb/Call` and never join peer membership.
 
 ```toml
-actordb-client = "0.11.0"
+actordb-client = "0.11.1"
 ```
 
 The SDK supports point/batch operations, TTL, priorities, write concerns,

@@ -1,6 +1,6 @@
 # Current record and deployment versions
 
-ActorDB `0.11.0` replaces the application TCP protocol with typed unary RPC.
+ActorDB `0.11.1` uses the typed unary RPC introduced in `0.11.0`.
 The default service is `actordb.rpc.v1.ActorDb/Call`; SDK and server both enable
 `grpc` by default, and vendors may disable it and supply another RPC framework.
 

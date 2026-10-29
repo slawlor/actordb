@@ -5,6 +5,7 @@
 
 //! Shared cache, ordered persistence, expiry, and snapshot state.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock as StdRwLock};
@@ -85,8 +86,13 @@ fn query_page_limits(work: &crate::query::QueryPageWork) -> Result<(usize, usize
 /// can lose the unflushed tail of the write buffer; immediate correlated
 /// reconciliation on reconnect repairs it from peers.
 pub struct FragmentState {
-    /// In-memory cache of the fragment: the fast path for all reads.
-    cache: RwLock<FragmentCache>,
+    /// In-memory cache of the fragment. Guards protect synchronous cache work
+    /// only; payload preparation and backend I/O happen outside this lock.
+    cache: StdRwLock<FragmentCache>,
+    /// Async contention fixture; shared access keeps real std-lock contention
+    /// intact when no test has installed an exclusive pause.
+    #[cfg(test)]
+    cache_pause: RwLock<()>,
     /// Optional durable layer behind the cache. `None` = no persistence.
     kvstore: Option<Arc<dyn KvStore>>,
     /// Advances for every winning cache mutation, including replicated
@@ -155,6 +161,56 @@ struct SummaryValue {
     expires_at_ms: Option<u64>,
     is_tombstone: bool,
     digests: CachedDigests,
+}
+
+/// Own payload copies before acquiring mutation locks. TTL is still selected
+/// under those locks; unused candidates and displaced payloads drop afterward.
+struct PreparedApply {
+    key: String,
+    raw: Option<VersionedValue>,
+    expired: Option<VersionedValue>,
+    pending_raw: Option<VersionedValue>,
+    pending_expired: Option<VersionedValue>,
+    summary: Option<SummaryValue>,
+    digests: CachedDigests,
+}
+
+impl PreparedApply {
+    fn new(op: ReplicatedOp, durable: bool, digests: CachedDigests) -> Self {
+        let expired = op.value.expires_at_ms.map(|_| op.value.expiry_tombstone());
+        Self {
+            pending_raw: durable.then(|| op.value.clone()),
+            pending_expired: if durable { expired.clone() } else { None },
+            summary: Some(SummaryValue::new(&op.value, digests)),
+            key: op.key,
+            raw: Some(op.value),
+            expired,
+            digests,
+        }
+    }
+
+    fn value(&self, expired: bool) -> &VersionedValue {
+        if expired { &self.expired } else { &self.raw }
+            .as_ref()
+            .expect("prepared cache candidate")
+    }
+
+    fn digests(&self, expired: bool) -> CachedDigests {
+        let mut digests = self.digests;
+        if expired {
+            digests.expire();
+        }
+        digests
+    }
+
+    fn take_summary(&mut self, expired: bool) -> SummaryValue {
+        let mut summary = self.summary.take().expect("prepared summary");
+        if expired {
+            summary.is_tombstone = true;
+            summary.digests.expire();
+        }
+        summary
+    }
 }
 
 impl SummaryValue {
@@ -388,12 +444,14 @@ impl FragmentState {
             .collect();
         let persistence = FragmentPersistenceResources::new(&PersistenceConfig::default());
         Self {
-            cache: RwLock::new(FragmentCache {
+            cache: StdRwLock::new(FragmentCache {
                 values: cache,
                 ordered_keys,
                 content_digests,
                 expiry_deadlines,
             }),
+            #[cfg(test)]
+            cache_pause: RwLock::new(()),
             kvstore,
             revision: AtomicU64::new(0),
             summary_index: Arc::new(StdRwLock::new(SummaryIndex {
@@ -568,7 +626,7 @@ impl FragmentState {
         // parent still held the durable records.
         let mut grouped = HashMap::<String, HashMap<String, VersionedValue>>::new();
         {
-            let cache = self.cache.get_mut();
+            let cache = self.cache.get_mut().unwrap();
             let mut retained: HashMap<String, VersionedValue> = HashMap::new();
             for (key, value) in std::mem::take(&mut cache.values) {
                 if let Some(table) = crate::table_key::table_name(&key) {
@@ -689,7 +747,11 @@ impl FragmentState {
         let Some(child) = child else {
             return false;
         };
-        let present = !child.cache.read().await.values.is_empty();
+        let present = {
+            #[cfg(test)]
+            let _pause = child.cache_pause.read().await;
+            !child.cache.read().unwrap().values.is_empty()
+        };
         drop(child);
         if !present {
             self.prune_empty_table(table).await;
@@ -799,7 +861,15 @@ impl FragmentState {
         if self.partitioned {
             return self.apply_from_actor(op).await;
         }
-        self.apply_local(op).await
+        self.apply_local(Cow::Borrowed(op)).await
+    }
+
+    /// Low-level workers can transfer the message's payload into the cache.
+    pub(crate) async fn apply_owned(&self, op: ReplicatedOp) -> Result<ApplyOutcome, ApplyError> {
+        if self.partitioned {
+            return self.apply_owned_from_actor(op).await;
+        }
+        self.apply_local(Cow::Owned(op)).await
     }
 
     /// Managed actors resolve encoded table keys even for a standalone public
@@ -808,6 +878,17 @@ impl FragmentState {
         &self,
         op: &ReplicatedOp,
     ) -> Result<ApplyOutcome, ApplyError> {
+        self.apply_routed(Cow::Borrowed(op)).await
+    }
+
+    pub(crate) async fn apply_owned_from_actor(
+        &self,
+        op: ReplicatedOp,
+    ) -> Result<ApplyOutcome, ApplyError> {
+        self.apply_routed(Cow::Owned(op)).await
+    }
+
+    async fn apply_routed(&self, op: Cow<'_, ReplicatedOp>) -> Result<ApplyOutcome, ApplyError> {
         if let Some(table) = crate::table_key::table_name(&op.key) {
             let child = self.table_state(&table).await?;
             let result = child.apply_local(op).await;
@@ -818,7 +899,7 @@ impl FragmentState {
         self.apply_local(op).await
     }
 
-    async fn apply_local(&self, op: &ReplicatedOp) -> Result<ApplyOutcome, ApplyError> {
+    async fn apply_local(&self, op: Cow<'_, ReplicatedOp>) -> Result<ApplyOutcome, ApplyError> {
         check_versioned_value_budget(&op.key, &op.value).map_err(|error| {
             ApplyError::InvalidInput(format!(
                 "key/value cannot fit every required peer frame: {error}"
@@ -827,62 +908,97 @@ impl FragmentState {
         // Hash the raw payload before lock waits; TTL selection only copies
         // its cached live/expired digests inside the mutation critical section.
         let digests = CachedDigests::new(&op.value);
+        let mut prepared = PreparedApply::new(op.into_owned(), self.kvstore.is_some(), digests);
         if self.kvstore.is_none() {
-            let _publication = self.snapshot_fence.read().await;
-            let mut cache = self.cache.write().await;
-            Self::check_version_conflict(&cache, &op.key, &op.value)?;
-            let expired = op.value.is_expired(now_ms());
-            let tombstone = expired.then(|| op.value.expiry_tombstone());
-            let value = tombstone.as_ref().unwrap_or(&op.value);
-            let mut selected_digests = digests;
-            if expired {
-                selected_digests.expire();
-            }
-            let outcome = Self::merge_cache(&mut cache, &op.key, value, selected_digests)?;
-            if outcome == ApplyOutcome::Applied {
-                self.publish_summary(&op.key, value, selected_digests);
-                self.revision.fetch_add(1, Ordering::Release);
-            }
+            let (outcome, expired, retired) = {
+                let _publication = self.snapshot_fence.read().await;
+                #[cfg(test)]
+                let _pause = self.cache_pause.read().await;
+                let mut cache = self.cache.write().unwrap();
+                Self::check_version_conflict(&cache, &prepared.key, prepared.value(false))?;
+                let expired = prepared.value(false).is_expired(now_ms());
+                let selected_digests = prepared.digests(expired);
+                let value = if expired {
+                    &mut prepared.expired
+                } else {
+                    &mut prepared.raw
+                };
+                let (outcome, retired) =
+                    Self::merge_cache(&mut cache, &prepared.key, value, selected_digests)?;
+                if outcome == ApplyOutcome::Applied {
+                    let summary = prepared.take_summary(expired);
+                    self.publish_summary(&prepared.key, summary);
+                    self.revision.fetch_add(1, Ordering::Release);
+                }
+                (outcome, expired, retired)
+            };
+            drop(retired);
             return Ok(Self::reported_outcome(outcome, expired));
         }
 
-        let (outcome, expired, should_flush) = {
+        let (outcome, expired, should_flush, retired_cache, retired_pending) = {
             // Preserve raw and normalized conflict checks before persistence
             // admission. Nothing mutates or awaits after acquiring both locks
             // until the winning merge, durable enqueue, and revision agree.
             let mut flush = self.flush.lock().await;
             let _publication = self.snapshot_fence.read().await;
-            let mut cache = self.cache.write().await;
-            Self::check_version_conflict(&cache, &op.key, &op.value)?;
-            let expired = op.value.is_expired(now_ms());
-            let tombstone = expired.then(|| op.value.expiry_tombstone());
-            let value = tombstone.as_ref().unwrap_or(&op.value);
-            let mut selected_digests = digests;
+            #[cfg(test)]
+            let _pause = self.cache_pause.read().await;
+            let mut cache = self.cache.write().unwrap();
+            Self::check_version_conflict(&cache, &prepared.key, prepared.value(false))?;
+            let expired = prepared.value(false).is_expired(now_ms());
+            let value = prepared.value(expired);
+            let selected_digests = prepared.digests(expired);
             if expired {
-                selected_digests.expire();
-                Self::check_version_conflict(&cache, &op.key, value)?;
+                Self::check_version_conflict(&cache, &prepared.key, value)?;
             }
             let winning = cache
                 .values
-                .get(&op.key)
-                .is_none_or(|existing| value != existing && value.wins_over(existing));
-            if winning && !flush.enqueue(&op.key, value) {
-                tracing::warn!(
-                    records = flush.record_count(),
-                    retained_bytes = flush.local_budget.used(),
-                    "rejecting mutation at persistence admission limit"
-                );
-                return Err(ApplyError::Backpressure);
-            }
-            let outcome = Self::merge_cache(&mut cache, &op.key, value, selected_digests)?;
+                .get(&prepared.key)
+                .is_none_or(|existing| value.wins_over(existing));
+            let retired_pending = if winning {
+                let pending = if expired {
+                    &mut prepared.pending_expired
+                } else {
+                    &mut prepared.pending_raw
+                };
+                flush
+                    .enqueue_prepared(&prepared.key, pending)
+                    .map_err(|()| {
+                        tracing::warn!(
+                            records = flush.record_count(),
+                            retained_bytes = flush.local_budget.used(),
+                            "rejecting mutation at persistence admission limit"
+                        );
+                        ApplyError::Backpressure
+                    })?
+            } else {
+                None
+            };
+            let value = if expired {
+                &mut prepared.expired
+            } else {
+                &mut prepared.raw
+            };
+            let (outcome, retired_cache) =
+                Self::merge_cache(&mut cache, &prepared.key, value, selected_digests)?;
             if outcome != ApplyOutcome::Applied {
                 return Ok(Self::reported_outcome(outcome, expired));
             }
-            self.publish_summary(&op.key, value, selected_digests);
+            let summary = prepared.take_summary(expired);
+            self.publish_summary(&prepared.key, summary);
             self.revision.fetch_add(1, Ordering::Release);
             let should_flush = flush.should_flush(self.flush_batch_size, self.flush_interval);
-            (outcome, expired, should_flush)
+            (
+                outcome,
+                expired,
+                should_flush,
+                retired_cache,
+                retired_pending,
+            )
         };
+        drop(retired_cache);
+        drop(retired_pending);
         if should_flush {
             self.flush()
                 .await
@@ -893,11 +1009,9 @@ impl FragmentState {
 
     /// Called synchronously while cache.write and the publication fence are
     /// held, before exposing the winning cache update or awaiting persistence.
-    fn publish_summary(&self, key: &str, value: &VersionedValue, digests: CachedDigests) {
+    fn publish_summary(&self, key: &str, summary: SummaryValue) {
         let mut index = self.summary_index.write().unwrap();
-        index
-            .values
-            .insert(key.to_string(), SummaryValue::new(value, digests));
+        index.values.insert(key.to_string(), summary);
         index.revision = index.revision.wrapping_add(1);
     }
 
@@ -921,13 +1035,14 @@ impl FragmentState {
     fn merge_cache(
         cache: &mut FragmentCache,
         key: &str,
-        value: &VersionedValue,
+        prepared: &mut Option<VersionedValue>,
         digests: CachedDigests,
-    ) -> Result<ApplyOutcome, ApplyError> {
+    ) -> Result<(ApplyOutcome, Option<VersionedValue>), ApplyError> {
+        let value = prepared.as_ref().expect("prepared cache candidate");
         if let Some(existing) = cache.values.get_mut(key) {
             if existing.same_version(value) {
                 return if existing == value {
-                    Ok(ApplyOutcome::AlreadyPresent)
+                    Ok((ApplyOutcome::AlreadyPresent, None))
                 } else {
                     Err(ApplyError::VersionConflict {
                         key: key.to_string(),
@@ -935,12 +1050,15 @@ impl FragmentState {
                 };
             }
             if !value.wins_over(existing) {
-                return Ok(ApplyOutcome::Superseded {
-                    timestamp_ms: existing.timestamp_ms,
-                    logical_counter: existing.logical_counter,
-                    node_id: existing.node_id.clone(),
-                    is_tombstone: existing.is_tombstone,
-                });
+                return Ok((
+                    ApplyOutcome::Superseded {
+                        timestamp_ms: existing.timestamp_ms,
+                        logical_counter: existing.logical_counter,
+                        node_id: existing.node_id.clone(),
+                        is_tombstone: existing.is_tombstone,
+                    },
+                    None,
+                ));
             }
             if !existing.is_tombstone {
                 if let Some(deadline) = existing.expires_at_ms {
@@ -952,9 +1070,9 @@ impl FragmentState {
                     cache.expiry_deadlines.insert((deadline, key.to_owned()));
                 }
             }
-            *existing = value.clone();
+            let retired = std::mem::replace(existing, prepared.take().unwrap());
             cache.content_digests.insert(key.to_string(), digests);
-            Ok(ApplyOutcome::Applied)
+            Ok((ApplyOutcome::Applied, Some(retired)))
         } else {
             let key = key.to_string();
             cache.ordered_keys.insert(key.clone());
@@ -964,8 +1082,8 @@ impl FragmentState {
                     cache.expiry_deadlines.insert((deadline, key.clone()));
                 }
             }
-            cache.values.insert(key, value.clone());
-            Ok(ApplyOutcome::Applied)
+            cache.values.insert(key, prepared.take().unwrap());
+            Ok((ApplyOutcome::Applied, None))
         }
     }
 
@@ -1160,9 +1278,11 @@ impl FragmentState {
 
     async fn get_local(&self, key: &str) -> Option<VersionedValue> {
         let now = now_ms();
+        #[cfg(test)]
+        let _pause = self.cache_pause.read().await;
         self.cache
             .read()
-            .await
+            .unwrap()
             .values
             .get(key)
             .filter(|v| !v.is_tombstone && !v.is_expired(now))
@@ -1341,7 +1461,14 @@ impl FragmentState {
         let table = work.plan.table.to_ascii_uppercase();
         let child = self.table_children.read().await.get(&table).cloned();
         if let Some(child) = child {
-            if table == "KV" || !child.cache.read().await.values.is_empty() {
+            let present = if table == "KV" {
+                true
+            } else {
+                #[cfg(test)]
+                let _pause = child.cache_pause.read().await;
+                !child.cache.read().unwrap().values.is_empty()
+            };
+            if present {
                 return child.query_page_local(work).await;
             }
             drop(child);
@@ -1424,7 +1551,9 @@ impl FragmentState {
             Ok(limits) => limits,
             Err(error) => return page_error(req, QueryPageStatus::Invalid, error),
         };
-        let cache = self.cache.read().await;
+        #[cfg(test)]
+        let _pause = self.cache_pause.read().await;
+        let cache = self.cache.read().unwrap();
         let revision = self.revision.load(Ordering::Acquire);
         if req.continuation
             && (req.revision != revision || req.incarnation != self.query_incarnation)
@@ -1656,6 +1785,17 @@ impl FragmentState {
             self.reclaim_empty_tables().await;
             return result;
         }
+        // The paused-clone witness uses the async publication fence to keep
+        // writers pending after the synchronous cache guard is released.
+        #[cfg(test)]
+        let _paused_snapshot = {
+            let paused = self.snapshot_pause.lock().unwrap().is_some();
+            if paused {
+                Some(self.snapshot_fence.write().await)
+            } else {
+                None
+            }
+        };
         self.snapshot_local(now_ms()).await
     }
 
@@ -1663,19 +1803,25 @@ impl FragmentState {
         &self,
         snapshot_time_ms: u64,
     ) -> (HashMap<String, VersionedValue>, u64) {
-        let cache = self.cache.read().await;
-        let snapshot = cache
-            .values
-            .iter()
-            .map(|(key, value)| {
-                let value = if value.is_expired(snapshot_time_ms) {
-                    value.expiry_tombstone()
-                } else {
-                    value.clone()
-                };
-                (key.clone(), value)
-            })
-            .collect();
+        let (snapshot, revision) = {
+            #[cfg(test)]
+            let _pause = self.cache_pause.read().await;
+            let cache = self.cache.read().unwrap();
+            let snapshot = cache
+                .values
+                .iter()
+                .map(|(key, value)| {
+                    let value = if value.is_expired(snapshot_time_ms) {
+                        value.expiry_tombstone()
+                    } else {
+                        value.clone()
+                    };
+                    (key.clone(), value)
+                })
+                .collect();
+            // Pair the revision with the values under the same cache guard.
+            (snapshot, self.revision.load(Ordering::Acquire))
+        };
         #[cfg(test)]
         {
             let pause = self.snapshot_pause.lock().unwrap().take();
@@ -1684,9 +1830,7 @@ impl FragmentState {
                 pause.resume.notified().await;
             }
         }
-        // Winning writers advance this counter before releasing cache.write.
-        // Pair it with values under the same read guard, never after cloning.
-        (snapshot, self.revision.load(Ordering::Acquire))
+        (snapshot, revision)
     }
 
     /// Read one lexicographically ordered page of version summaries.
@@ -1775,7 +1919,9 @@ impl FragmentState {
     ) -> SummaryPage {
         use std::ops::Bound::{Excluded, Unbounded};
 
-        let cache = self.cache.read().await;
+        #[cfg(test)]
+        let _pause = self.cache_pause.read().await;
+        let cache = self.cache.read().unwrap();
         let revision = self.revision.load(Ordering::Acquire);
         let snapshot_time_ms = snapshot_time_ms.unwrap_or_else(now_ms);
         if expected_revision.is_some_and(|expected| expected != revision) {
@@ -1868,7 +2014,9 @@ impl FragmentState {
         key: &str,
         snapshot_time_ms: Option<u64>,
     ) -> Option<VersionedValue> {
-        let cache = self.cache.read().await;
+        #[cfg(test)]
+        let _pause = self.cache_pause.read().await;
+        let cache = self.cache.read().unwrap();
         let snapshot_time_ms = snapshot_time_ms.unwrap_or_else(now_ms);
         cache.values.get(key).map(|value| {
             if value.is_expired(snapshot_time_ms) {
@@ -1932,7 +2080,9 @@ impl FragmentState {
         start_index: usize,
         snapshot_time_ms: Option<u64>,
     ) -> VersionedPage {
-        let cache = self.cache.read().await;
+        #[cfg(test)]
+        let _pause = self.cache_pause.read().await;
+        let cache = self.cache.read().unwrap();
         let snapshot_time_ms = snapshot_time_ms.unwrap_or_else(now_ms);
         let mut next_index = start_index.min(keys.len());
         let mut payload_bytes = 0usize;
@@ -2007,7 +2157,9 @@ impl FragmentState {
     }
 
     async fn current_revision_local(&self) -> u64 {
-        let _cache = self.cache.read().await;
+        #[cfg(test)]
+        let _pause = self.cache_pause.read().await;
+        let _cache = self.cache.read().unwrap();
         self.revision.load(Ordering::Acquire)
     }
 
@@ -2229,7 +2381,9 @@ impl FragmentState {
                 None
             };
             let _publication = self.snapshot_fence.read().await;
-            let mut cache = self.cache.write().await;
+            #[cfg(test)]
+            let _pause = self.cache_pause.read().await;
+            let mut cache = self.cache.write().unwrap();
             let mut summary_index = self.summary_index.write().unwrap();
             if !pass.initialized {
                 pass.remaining = cache.expiry_deadlines.len();
@@ -2360,38 +2514,51 @@ impl FlushBuffer {
     /// Reserve only the growth delta when replacing a pending winner. Failed
     /// admission leaves the old value and both accounting reservations intact.
     fn enqueue(&mut self, key: &str, value: &VersionedValue) -> bool {
+        self.enqueue_prepared(key, &mut Some(value.clone())).is_ok()
+    }
+
+    /// Move a preallocated candidate on successful admission, retaining the
+    /// rejected candidate for destruction after the caller releases its locks.
+    fn enqueue_prepared(
+        &mut self,
+        key: &str,
+        prepared: &mut Option<VersionedValue>,
+    ) -> Result<Option<VersionedValue>, ()> {
+        let value = prepared.as_ref().expect("prepared persistence candidate");
         let bytes = persistence_record_bytes(key, value);
         if let Some(existing) = self.pending.get_mut(key) {
             let previous = existing.local.bytes();
             if !existing.local.resize(bytes) {
-                return false;
+                return Err(());
             }
             if !existing.aggregate.resize(bytes) {
                 assert!(existing.local.resize(previous));
-                return false;
+                return Err(());
             }
-            existing.value = value.clone();
-            return true;
+            return Ok(Some(std::mem::replace(
+                &mut existing.value,
+                prepared.take().unwrap(),
+            )));
         }
         let Some(record) = self.record_budget.reserve(1) else {
-            return false;
+            return Err(());
         };
         let Some(local) = self.local_budget.reserve(bytes) else {
-            return false;
+            return Err(());
         };
         let Some(aggregate) = self.aggregate_budget.reserve(bytes) else {
-            return false;
+            return Err(());
         };
         self.pending.insert(
             key.to_string(),
             PendingWrite {
-                value: value.clone(),
+                value: prepared.take().unwrap(),
                 local,
                 aggregate,
                 _record: record,
             },
         );
-        true
+        Ok(None)
     }
     fn restore_batch(&mut self) {
         if let Some(batch) = self.in_flight.take() {
@@ -2431,10 +2598,10 @@ impl FlushBuffer {
 
 #[cfg(test)]
 impl FragmentState {
-    // Test-only contention gates retain the private cache guard without
-    // exposing cache representation to sibling actor modules.
-    pub(super) async fn lock_cache_for_test(&self) -> impl Sized + '_ {
-        self.cache.write().await
+    // Pause cache execution without blocking a runtime thread or retaining a
+    // std guard across an await. Normal operations share this test-only gate.
+    pub(super) async fn pause_cache_for_test(&self) -> impl Sized + '_ {
+        self.cache_pause.write().await
     }
 }
 
@@ -2675,7 +2842,7 @@ mod flush_tests {
             Err(ApplyError::VersionConflict { .. })
         ));
         assert_eq!(state.persistence_backlog().await, (0, 0));
-        let cache = state.cache.read().await;
+        let cache = state.cache.read().unwrap();
         assert_eq!(cache.values["key"], original);
         assert_eq!(cache.content_digests["key"].live, original.content_digest());
         assert_eq!(state.revision.load(Ordering::Acquire), 0);
@@ -2710,7 +2877,7 @@ mod flush_tests {
             .await
             .unwrap();
         assert_eq!(page.converted, 0);
-        let cache = state.cache.read().await;
+        let cache = state.cache.read().unwrap();
         assert_eq!(cache.values["ttl"], expiring);
         assert_eq!(cache.content_digests["ttl"].live, expiring.content_digest());
     }
@@ -3422,7 +3589,7 @@ mod maintenance_diagnostics {
         }
         tokio::time::timeout(Duration::from_secs(60), async {
             loop {
-                if shared.cache.read().await.values["zz-witness"].is_tombstone {
+                if shared.cache.read().unwrap().values["zz-witness"].is_tombstone {
                     break;
                 }
                 tokio::task::yield_now().await;
@@ -3674,9 +3841,9 @@ mod tests {
         future.timestamp_ms = 11;
         let winner_op = test_op("k0256", winner.clone());
         let future_op = test_op("k0257", future);
-        // Register concurrent mutations ahead of the next page on Tokio's
-        // fair write-lock queue, rather than relying on scheduling sleeps.
-        let cache_gate = state.cache.write().await;
+        // Pause cache execution while registering each contender, then drive
+        // the mutations ahead of the next page without scheduling sleeps.
+        let cache_gate = state.pause_cache_for_test().await;
         let mut apply_winner = Box::pin(state.apply(&winner_op));
         let mut apply_future = Box::pin(state.apply(&future_op));
         assert!(futures::poll!(apply_winner.as_mut()).is_pending());
@@ -3690,8 +3857,11 @@ mod tests {
         let second = next_page.await.unwrap();
         assert_eq!((second.visited, second.converted), (256, 256));
         assert_eq!(state.revision.load(Ordering::Acquire), before_second + 256);
-        assert_eq!(state.cache.read().await.values.get("k0256"), Some(&winner));
-        assert!(!state.cache.read().await.values["k0257"].is_tombstone);
+        assert_eq!(
+            state.cache.read().unwrap().values.get("k0256"),
+            Some(&winner)
+        );
+        assert!(!state.cache.read().unwrap().values["k0257"].is_tombstone);
         let summary = state
             .summary_page(Some("k0255"), Some(first_revision), Some(100), 10)
             .await;
@@ -3717,7 +3887,7 @@ mod tests {
                 .apply(&test_op(key, expiring_value(vec![2], u64::MAX)))
                 .await
                 .unwrap();
-            let mut cache = state.cache.write().await;
+            let mut cache = state.cache.write().unwrap();
             cache.expiry_deadlines.remove(&(u64::MAX, key.to_owned()));
             cache.values.get_mut(key).unwrap().expires_at_ms = Some(100);
             let digests = CachedDigests::new(&cache.values[key]);
@@ -3726,15 +3896,16 @@ mod tests {
         }
         let page = state.expire_values_page(&mut pass).await.unwrap();
         assert_eq!((page.visited, page.converted, page.done), (44, 44, true));
-        let cache = state.cache.read().await;
-        assert!(cache.values["k0255-new"].is_tombstone);
-        assert!(!cache.values["a-behind"].is_tombstone);
-        assert!(!cache.values["z-beyond"].is_tombstone);
-        assert!(
-            !cache.values["k0299"].is_tombstone,
-            "insert consumed one original visit"
-        );
-        drop(cache);
+        {
+            let cache = state.cache.read().unwrap();
+            assert!(cache.values["k0255-new"].is_tombstone);
+            assert!(!cache.values["a-behind"].is_tombstone);
+            assert!(!cache.values["z-beyond"].is_tombstone);
+            assert!(
+                !cache.values["k0299"].is_tombstone,
+                "insert consumed one original visit"
+            );
+        }
         // Public full sweep remains authoritative and returns its full count.
         assert_eq!(state.expire_values(100).await.unwrap(), 3);
     }
@@ -3764,7 +3935,7 @@ mod tests {
             Some("key")
         );
         assert_eq!(
-            state.cache.read().await.values["key"],
+            state.cache.read().unwrap().values["key"],
             value.expiry_tombstone()
         );
         assert_eq!(state.revision.load(Ordering::Acquire), 1);
@@ -4143,7 +4314,7 @@ mod query_page_tests {
         )
         .await
         .unwrap();
-        let cache = state.cache.write().await;
+        let cache = state.pause_cache_for_test().await;
         let (reply, response) = tokio::sync::oneshot::channel();
         let mut work = work("SELECT key FROM kv", 1);
         work.retention = Some(retention);
@@ -4153,7 +4324,7 @@ mod query_page_tests {
                 reply: reply.into(),
             })
             .unwrap();
-        // Let the actor enter the read-lock wait, then cancel only its caller.
+        // Let the actor enter the cache-access pause, then cancel its caller.
         tokio::time::sleep(Duration::from_millis(10)).await;
         drop(response);
         assert!(weak.upgrade().is_some());
@@ -4340,7 +4511,7 @@ mod expiry_callback_tests {
         let (snapshot, revision) = state.snapshot_with_revision().await;
         assert!(snapshot["key"].is_tombstone);
         assert_eq!(revision, 0);
-        assert!(!state.cache.read().await.values["key"].is_tombstone);
+        assert!(!state.cache.read().unwrap().values["key"].is_tombstone);
         assert_eq!(runtime.diagnostics().enqueued_events, 0);
         assert_eq!(state.expire_values(100).await.unwrap(), 1);
         assert_eq!(state.expire_values(100).await.unwrap(), 0);
@@ -4446,7 +4617,7 @@ mod expiry_callback_tests {
                         newer.expires_at_ms = Some(u64::MAX);
                     }
                     let op = test_op("key", newer.clone());
-                    let lock = state.cache.write().await;
+                    let lock = state.pause_cache_for_test().await;
                     let mut apply = Box::pin(state.apply(&op));
                     let mut cleanup = Box::pin(state.expire_values(100));
                     if cleanup_first {
@@ -4635,7 +4806,7 @@ mod apply_expiry_contention_tests {
                 let cache_guard = if contend_on_flush {
                     None
                 } else {
-                    Some(state.cache.write().await)
+                    Some(state.pause_cache_for_test().await)
                 };
                 let flush_guard = if contend_on_flush {
                     Some(state.flush.lock().await)
@@ -4665,7 +4836,7 @@ mod apply_expiry_contention_tests {
                     Some(value.expiry_tombstone())
                 );
                 {
-                    let cache = state.cache.read().await;
+                    let cache = state.cache.read().unwrap();
                     assert!(cache.values["ttl"].is_tombstone);
                     assert!(cache.expiry_deadlines.is_empty());
                     assert_eq!(
@@ -4701,7 +4872,7 @@ mod apply_expiry_contention_tests {
                 usize::MAX,
                 Duration::from_secs(3600),
             );
-            let cache_guard = state.cache.write().await;
+            let cache_guard = state.pause_cache_for_test().await;
             let mut conflicting = original.clone();
             conflicting.value = b"conflicting".to_vec();
             let op = ReplicatedOp {
@@ -4722,7 +4893,7 @@ mod apply_expiry_contention_tests {
                 Err(ApplyError::VersionConflict { .. })
             ));
             assert_eq!(state.persistence_backlog().await, (0, 0));
-            let cache = state.cache.read().await;
+            let cache = state.cache.read().unwrap();
             assert_eq!(cache.values["ttl"], original);
             assert_eq!(cache.content_digests["ttl"].live, original.content_digest());
             assert_eq!(cache.expiry_deadlines.len(), 1);
@@ -4747,19 +4918,19 @@ mod expiry_index_tests {
             let mut value = VersionedValue::new(vec![1], version, "n".into());
             value.expires_at_ms = Some(u64::MAX - version);
             state.apply(&test_op("hot", value)).await.unwrap();
-            assert_eq!(state.cache.read().await.expiry_deadlines.len(), 1);
+            assert_eq!(state.cache.read().unwrap().expiry_deadlines.len(), 1);
         }
         let older = VersionedValue::new(vec![2], 1, "n".into());
         assert!(matches!(
             state.apply(&test_op("hot", older)).await.unwrap(),
             ApplyOutcome::Superseded { .. }
         ));
-        assert_eq!(state.cache.read().await.expiry_deadlines.len(), 1);
+        assert_eq!(state.cache.read().unwrap().expiry_deadlines.len(), 1);
         let deleted = VersionedValue::tombstone(501, "n".into());
         state.apply(&test_op("hot", deleted)).await.unwrap();
-        assert!(state.cache.read().await.expiry_deadlines.is_empty());
+        assert!(state.cache.read().unwrap().expiry_deadlines.is_empty());
         assert_eq!(state.expire_values(u64::MAX).await.unwrap(), 0);
-        assert!(state.cache.read().await.values["hot"].is_tombstone);
+        assert!(state.cache.read().unwrap().values["hot"].is_tombstone);
     }
 
     #[tokio::test]
@@ -4790,16 +4961,16 @@ mod expiry_index_tests {
             .await
             .unwrap();
         assert!(state.expire_values(100).await.is_err());
-        assert_eq!(state.cache.read().await.expiry_deadlines.len(), 1);
-        assert!(!state.cache.read().await.values["due"].is_tombstone);
+        assert_eq!(state.cache.read().unwrap().expiry_deadlines.len(), 1);
+        assert!(!state.cache.read().unwrap().values["due"].is_tombstone);
         assert_eq!(
-            state.cache.read().await.content_digests["due"].live,
+            state.cache.read().unwrap().content_digests["due"].live,
             initial_digest
         );
         assert_eq!(state.expire_values(100).await.unwrap(), 1);
-        assert!(state.cache.read().await.expiry_deadlines.is_empty());
-        assert!(state.cache.read().await.values["due"].is_tombstone);
-        let cache = state.cache.read().await;
+        assert!(state.cache.read().unwrap().expiry_deadlines.is_empty());
+        assert!(state.cache.read().unwrap().values["due"].is_tombstone);
+        let cache = state.cache.read().unwrap();
         assert_eq!(
             cache.content_digests["due"].live,
             cache.values["due"].content_digest()
@@ -4928,11 +5099,11 @@ mod partitioned_expiry_tests {
         assert_eq!(converted, 600);
         assert_eq!(pages, 3);
         let children = state.table_children.read().await;
-        assert!(!children["FUTURE"].cache.read().await.values[&future].is_tombstone);
+        assert!(!children["FUTURE"].cache.read().unwrap().values[&future].is_tombstone);
         assert!(children["DUE"]
             .cache
             .read()
-            .await
+            .unwrap()
             .values
             .values()
             .all(|v| v.is_tombstone));

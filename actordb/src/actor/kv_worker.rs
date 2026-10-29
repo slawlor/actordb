@@ -107,7 +107,7 @@ pub(super) async fn handle_worker_message(
             // Storage failures retain their authoritative retry winners.
             // The worker remains healthy and returns the exact storage error
             // instead of restarting and discarding unrelated queued work.
-            match shared.apply(&op).await {
+            match shared.apply_owned(op).await {
                 Ok(outcome) => {
                     if let Some(reply) = reply {
                         let _ = reply.send(Ok(outcome));

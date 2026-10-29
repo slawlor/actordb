@@ -438,7 +438,7 @@ async fn explicit_expiry_retries_dirty_other_table_before_reserving_a_marker() {
             expiring
         );
         let a = state.table_state("A").await.unwrap();
-        assert!(!a.cache.read().await.values[&key("A", "due")].is_tombstone);
+        assert!(!a.cache.read().unwrap().values[&key("A", "due")].is_tombstone);
         assert_eq!(state.expire_values(100).await.unwrap(), 1);
         state.flush().await.unwrap();
         assert_eq!(state.persistence_backlog().await, (0, 0));
@@ -664,7 +664,7 @@ async fn manual_saturation_retry_keeps_original_deadline_and_table_quotas() {
     assert_eq!(converted, 3);
     for table in ["A", "B"] {
         let child = shared.table_state(table).await.unwrap();
-        assert!(!child.cache.read().await.values[&key(table, "z-new")].is_tombstone);
+        assert!(!child.cache.read().unwrap().values[&key(table, "z-new")].is_tombstone);
     }
     shared.flush_from_actor().await.unwrap();
     assert_eq!(shared.expire_values(deadline).await.unwrap(), 2);

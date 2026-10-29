@@ -89,7 +89,7 @@ equivalently. A timeout leaves service work owned for a subsequent retry.
 A completed mutation can still lose its reply; callers must not replay it as a
 fresh mutation automatically.
 
-These defaults and owned evidence are part of the current `0.11.0` deployment
+These defaults and owned evidence are part of the current `0.11.1` deployment
 contract. The separate [peer authority](peer-authority.md) API supports a hot
 generation-policy receive/apply barrier without stopping the node. TLS and
 shared-secret credential revocation remain external responsibilities;

@@ -117,7 +117,7 @@ impl Actor for PoolWorker {
                     is_replication: _,
                     reply,
                 } => {
-                    let result = state.shared.apply_from_actor(&op).await;
+                    let result = state.shared.apply_owned_from_actor(op).await;
                     release_pool_reservation(state);
                     match result {
                         Ok(outcome) => {

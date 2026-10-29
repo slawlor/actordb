@@ -5,7 +5,7 @@ default; servers bind `actordb::grpc::GrpcServer` around an existing `Arc<Node>`
 Peer replication remains separate and application RPCs never join its membership.
 
 ```toml
-actordb-client = "0.11.0"
+actordb-client = "0.11.1"
 ```
 
 ```rust,ignore

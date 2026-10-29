@@ -1268,7 +1268,7 @@ mod tests {
         let pool = WorkerPool::spawn(pool_config(1, None), shared.clone())
             .await
             .unwrap();
-        let cache_guard = shared.lock_cache_for_test().await;
+        let cache_guard = shared.pause_cache_for_test().await;
         let (reply, response) = tokio::sync::oneshot::channel();
         pool.try_reserve("cancelled")
             .await
@@ -1325,7 +1325,7 @@ mod tests {
         // Hold the cache so one read is active and the next remains queued in
         // the same sticky worker. A third read proves both capacity slots are
         // reserved before the kill.
-        let cache_guard = shared.lock_cache_for_test().await;
+        let cache_guard = shared.pause_cache_for_test().await;
         let (first_reply, first_response) = tokio::sync::oneshot::channel();
         let (second_reply, second_response) = tokio::sync::oneshot::channel();
         dispatcher
@@ -1436,7 +1436,7 @@ mod tests {
 
         // Block one admitted read in each worker. The dispatcher health call
         // is a mailbox fence proving both reservations were handed off.
-        let cache_guard = shared.lock_cache_for_test().await;
+        let cache_guard = shared.pause_cache_for_test().await;
         let (dead_reply, dead_response) = tokio::sync::oneshot::channel();
         let (healthy_reply, healthy_response) = tokio::sync::oneshot::channel();
         dispatcher
