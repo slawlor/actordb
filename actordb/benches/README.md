@@ -27,6 +27,7 @@ cargo bench -p actordb --bench fanout
 cargo bench -p actordb --bench replication
 cargo bench -p actordb --bench sender_registry
 cargo bench -p actordb --bench fragment_writes
+cargo bench -p actordb --bench fragment_locks
 ```
 
 Criterion saves results under `target/criterion/` and compares against the
@@ -48,6 +49,7 @@ All configurations still compile the bundled protobuf toolchain from source.
 | `replication.rs`  | 2 nodes, 1 shared fragment         | timer-dominated visibility lag for 10/100/1000 keys; 1 ms-tick disconnected catch-up for 64/256/1024/4096 compact records |
 | `sender_registry.rs` | 2 nodes, 1 or 64 shared fragments | source apply/fan-out at concurrency 1/32/64 with 100 B or 1 MiB values; replica catch-up excluded from timing |
 | `fragment_writes.rs` | 1 fragment dispatcher, 4 workers per unlimited priority pool | Completed writes/s at depths 1/24 and 100 B/10 KB/1 MB; storeless cache and buffered no-op persistence |
+| `fragment_locks.rs` | 1 shared cache, 1/4 runtime threads, unlimited priority pools | Tokio/Std cache lock comparison over 13 write/read conditions, plus timer wakeup delay |
 
 `fragment_writes` excludes input payload allocation and includes actor dispatch,
 payload hashing, cache mutation, and (in buffered mode) persistence enqueue.
@@ -58,6 +60,13 @@ durability. Depth 1 uses only Default priority.
 
 The [2026-10-29 write critical section results](fragment_writes_results.md)
 record before/after measurements, repeated runs, and their limits.
+
+`fragment_locks` compares Tokio and synchronous cache acquisitions across
+runtime thread counts, read/write mixes, payload sizes and buffered persistence,
+with a separate timer responsiveness probe. The
+[2026-10-29 cache lock comparison](fragment_locks_results.md) records all 13
+conditions, A/B/B/A repeats, the synchronous experiment patch and its test-fixture
+migration requirement.
 
 Each file has a doc comment explaining what it measures and how to read a
 regression — start there before tuning.

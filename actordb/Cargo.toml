@@ -92,3 +92,7 @@ harness = false
 [[bench]]
 name = "fragment_writes"
 harness = false
+
+[[bench]]
+name = "fragment_locks"
+harness = false

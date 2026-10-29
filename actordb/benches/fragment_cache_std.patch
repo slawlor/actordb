@@ -1,0 +1,135 @@
+diff --git a/actordb/src/actor/fragment_state.rs b/actordb/src/actor/fragment_state.rs
+index 05716ca..84f7f75 100644
+--- a/actordb/src/actor/fragment_state.rs
++++ b/actordb/src/actor/fragment_state.rs
+@@ -90 +90 @@ pub struct FragmentState {
+-    cache: RwLock<FragmentCache>,
++    cache: StdRwLock<FragmentCache>,
+@@ -442 +442 @@ impl FragmentState {
+-            cache: RwLock::new(FragmentCache {
++            cache: StdRwLock::new(FragmentCache {
+@@ -622 +622 @@ impl FragmentState {
+-            let cache = self.cache.get_mut();
++            let cache = self.cache.get_mut().unwrap();
+@@ -743 +743 @@ impl FragmentState {
+-        let present = !child.cache.read().await.values.is_empty();
++        let present = !child.cache.read().unwrap().values.is_empty();
+@@ -904 +904 @@ impl FragmentState {
+-                let mut cache = self.cache.write().await;
++                let mut cache = self.cache.write().unwrap();
+@@ -932 +932 @@ impl FragmentState {
+-            let mut cache = self.cache.write().await;
++            let mut cache = self.cache.write().unwrap();
+@@ -1268 +1268 @@ impl FragmentState {
+-            .await
++            .unwrap()
+@@ -1447 +1447 @@ impl FragmentState {
+-            if table == "KV" || !child.cache.read().await.values.is_empty() {
++            if table == "KV" || !child.cache.read().unwrap().values.is_empty() {
+@@ -1530 +1530 @@ impl FragmentState {
+-        let cache = self.cache.read().await;
++        let cache = self.cache.read().unwrap();
+@@ -1769 +1769 @@ impl FragmentState {
+-        let cache = self.cache.read().await;
++        let cache = self.cache.read().unwrap();
+@@ -1881 +1881 @@ impl FragmentState {
+-        let cache = self.cache.read().await;
++        let cache = self.cache.read().unwrap();
+@@ -1974 +1974 @@ impl FragmentState {
+-        let cache = self.cache.read().await;
++        let cache = self.cache.read().unwrap();
+@@ -2038 +2038 @@ impl FragmentState {
+-        let cache = self.cache.read().await;
++        let cache = self.cache.read().unwrap();
+@@ -2113 +2113 @@ impl FragmentState {
+-        let _cache = self.cache.read().await;
++        let _cache = self.cache.read().unwrap();
+@@ -2335 +2335 @@ impl FragmentState {
+-            let mut cache = self.cache.write().await;
++            let mut cache = self.cache.write().unwrap();
+@@ -2553 +2553 @@ impl FragmentState {
+-        self.cache.write().await
++        self.cache.write().unwrap()
+@@ -2794 +2794 @@ mod flush_tests {
+-        let cache = state.cache.read().await;
++        let cache = state.cache.read().unwrap();
+@@ -2829 +2829 @@ mod flush_tests {
+-        let cache = state.cache.read().await;
++        let cache = state.cache.read().unwrap();
+@@ -3541 +3541 @@ mod maintenance_diagnostics {
+-                if shared.cache.read().await.values["zz-witness"].is_tombstone {
++                if shared.cache.read().unwrap().values["zz-witness"].is_tombstone {
+@@ -3795 +3795 @@ mod tests {
+-        let cache_gate = state.cache.write().await;
++        let cache_gate = state.cache.write().unwrap();
+@@ -3809,2 +3809,5 @@ mod tests {
+-        assert_eq!(state.cache.read().await.values.get("k0256"), Some(&winner));
+-        assert!(!state.cache.read().await.values["k0257"].is_tombstone);
++        assert_eq!(
++            state.cache.read().unwrap().values.get("k0256"),
++            Some(&winner)
++        );
++        assert!(!state.cache.read().unwrap().values["k0257"].is_tombstone);
+@@ -3836 +3839 @@ mod tests {
+-            let mut cache = state.cache.write().await;
++            let mut cache = state.cache.write().unwrap();
+@@ -3845 +3848 @@ mod tests {
+-        let cache = state.cache.read().await;
++        let cache = state.cache.read().unwrap();
+@@ -3883 +3886 @@ mod tests {
+-            state.cache.read().await.values["key"],
++            state.cache.read().unwrap().values["key"],
+@@ -4262 +4265 @@ mod query_page_tests {
+-        let cache = state.cache.write().await;
++        let cache = state.cache.write().unwrap();
+@@ -4459 +4462 @@ mod expiry_callback_tests {
+-        assert!(!state.cache.read().await.values["key"].is_tombstone);
++        assert!(!state.cache.read().unwrap().values["key"].is_tombstone);
+@@ -4565 +4568 @@ mod expiry_callback_tests {
+-                    let lock = state.cache.write().await;
++                    let lock = state.cache.write().unwrap();
+@@ -4754 +4757 @@ mod apply_expiry_contention_tests {
+-                    Some(state.cache.write().await)
++                    Some(state.cache.write().unwrap())
+@@ -4784 +4787 @@ mod apply_expiry_contention_tests {
+-                    let cache = state.cache.read().await;
++                    let cache = state.cache.read().unwrap();
+@@ -4820 +4823 @@ mod apply_expiry_contention_tests {
+-            let cache_guard = state.cache.write().await;
++            let cache_guard = state.cache.write().unwrap();
+@@ -4841 +4844 @@ mod apply_expiry_contention_tests {
+-            let cache = state.cache.read().await;
++            let cache = state.cache.read().unwrap();
+@@ -4866 +4869 @@ mod expiry_index_tests {
+-            assert_eq!(state.cache.read().await.expiry_deadlines.len(), 1);
++            assert_eq!(state.cache.read().unwrap().expiry_deadlines.len(), 1);
+@@ -4873 +4876 @@ mod expiry_index_tests {
+-        assert_eq!(state.cache.read().await.expiry_deadlines.len(), 1);
++        assert_eq!(state.cache.read().unwrap().expiry_deadlines.len(), 1);
+@@ -4876 +4879 @@ mod expiry_index_tests {
+-        assert!(state.cache.read().await.expiry_deadlines.is_empty());
++        assert!(state.cache.read().unwrap().expiry_deadlines.is_empty());
+@@ -4878 +4881 @@ mod expiry_index_tests {
+-        assert!(state.cache.read().await.values["hot"].is_tombstone);
++        assert!(state.cache.read().unwrap().values["hot"].is_tombstone);
+@@ -4909,2 +4912,2 @@ mod expiry_index_tests {
+-        assert_eq!(state.cache.read().await.expiry_deadlines.len(), 1);
+-        assert!(!state.cache.read().await.values["due"].is_tombstone);
++        assert_eq!(state.cache.read().unwrap().expiry_deadlines.len(), 1);
++        assert!(!state.cache.read().unwrap().values["due"].is_tombstone);
+@@ -4912 +4915 @@ mod expiry_index_tests {
+-            state.cache.read().await.content_digests["due"].live,
++            state.cache.read().unwrap().content_digests["due"].live,
+@@ -4916,3 +4919,3 @@ mod expiry_index_tests {
+-        assert!(state.cache.read().await.expiry_deadlines.is_empty());
+-        assert!(state.cache.read().await.values["due"].is_tombstone);
+-        let cache = state.cache.read().await;
++        assert!(state.cache.read().unwrap().expiry_deadlines.is_empty());
++        assert!(state.cache.read().unwrap().values["due"].is_tombstone);
++        let cache = state.cache.read().unwrap();
+@@ -5047 +5050 @@ mod partitioned_expiry_tests {
+-        assert!(!children["FUTURE"].cache.read().await.values[&future].is_tombstone);
++        assert!(!children["FUTURE"].cache.read().unwrap().values[&future].is_tombstone);
+@@ -5051 +5054 @@ mod partitioned_expiry_tests {
+-            .await
++            .unwrap()
