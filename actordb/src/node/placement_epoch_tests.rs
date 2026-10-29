@@ -21,7 +21,7 @@ async fn unrelated_published_churn_keeps_gain_and_handoff_snapshot_current() {
         Arc::new(RwLock::new(HashSet::new())),
         placement,
         Arc::new(Mutex::new(HashMap::new())),
-        Arc::new(Mutex::new(HashMap::new())),
+        Arc::new(Mutex::new(Default::default())),
         Arc::new(Mutex::new(HashMap::new())),
     );
     deps.fragment_count = 2;

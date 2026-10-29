@@ -133,7 +133,7 @@ async fn retirement_fixture() -> (
         Arc::new(RwLock::new(HashSet::from([revoked]))),
         Arc::new(RwLock::new(map.clone())),
         Arc::new(Mutex::new(HashMap::from([(retiring, supervisor.clone())]))),
-        Arc::new(Mutex::new(HashMap::new())),
+        Arc::new(Mutex::new(Default::default())),
         Arc::new(Mutex::new(HashMap::new())),
     );
     // Production detaches active routing before entering prefix finalization;

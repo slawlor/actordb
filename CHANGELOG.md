@@ -2,6 +2,11 @@
 
 ## 0.11.1 (unreleased)
 
+- Index replication senders by fragment so mutation fanout visits only that
+  fragment's replicas (#190). Preserve exact sender identity, retirement and
+  admission fences under the existing registry mutex, and remove empty buckets.
+  Add repeated lookup and Node write throughput measurements; see
+  [benchmark results](actordb/benches/sender_registry_results.md).
 - Use `std::sync::RwLock` for fragment/table caches; cache guards protect
   synchronous work only. Keep async persistence/publication locks where
   guards span acquisition or I/O, and migrate contention/snapshot fixtures

@@ -13,8 +13,87 @@
 
 use super::*;
 
-/// Phase 5 senders, keyed by (fragment, peer node id).
-pub(super) type SenderMap = Arc<Mutex<HashMap<(FragmentId, String), NodeSender>>>;
+/// One authoritative sender registry. The mutex still orders task replacement
+/// and retirement; indexing by fragment bounds mutation lookup to its replicas.
+pub(super) type SenderMap = Arc<Mutex<SenderRegistry>>;
+
+#[derive(Default)]
+pub(super) struct SenderRegistry {
+    by_fragment: HashMap<FragmentId, HashMap<String, NodeSender>>,
+}
+
+impl SenderRegistry {
+    pub(super) fn get(&self, key: &(FragmentId, String)) -> Option<&NodeSender> {
+        self.by_fragment.get(&key.0)?.get(&key.1)
+    }
+
+    pub(super) fn insert(
+        &mut self,
+        (fragment, peer): (FragmentId, String),
+        sender: NodeSender,
+    ) -> Option<NodeSender> {
+        self.by_fragment
+            .entry(fragment)
+            .or_default()
+            .insert(peer, sender)
+    }
+
+    pub(super) fn remove(&mut self, key: &(FragmentId, String)) -> Option<NodeSender> {
+        let peers = self.by_fragment.get_mut(&key.0)?;
+        let removed = peers.remove(&key.1);
+        if peers.is_empty() {
+            self.by_fragment.remove(&key.0);
+        }
+        removed
+    }
+
+    pub(super) fn for_fragment(
+        &self,
+        fragment: FragmentId,
+    ) -> impl Iterator<Item = (&String, &NodeSender)> {
+        self.by_fragment
+            .get(&fragment)
+            .into_iter()
+            .flat_map(HashMap::iter)
+    }
+
+    pub(super) fn iter(&self) -> impl Iterator<Item = ((FragmentId, &String), &NodeSender)> {
+        self.by_fragment.iter().flat_map(|(&fragment, peers)| {
+            peers
+                .iter()
+                .map(move |(peer, sender)| ((fragment, peer), sender))
+        })
+    }
+
+    pub(super) fn keys(&self) -> impl Iterator<Item = (FragmentId, &String)> {
+        self.iter().map(|(key, _)| key)
+    }
+
+    pub(super) fn values(&self) -> impl Iterator<Item = &NodeSender> {
+        self.by_fragment.values().flat_map(HashMap::values)
+    }
+
+    #[cfg(test)]
+    pub(super) fn is_empty(&self) -> bool {
+        self.by_fragment.is_empty()
+    }
+
+    #[cfg(test)]
+    pub(super) fn contains_key(&self, key: &(FragmentId, String)) -> bool {
+        self.get(key).is_some()
+    }
+}
+
+#[cfg(test)]
+impl<const N: usize> From<[((FragmentId, String), NodeSender); N]> for SenderRegistry {
+    fn from(entries: [((FragmentId, String), NodeSender); N]) -> Self {
+        let mut registry = Self::default();
+        for (key, sender) in entries {
+            registry.insert(key, sender);
+        }
+        registry
+    }
+}
 
 /// Sender state reports, keyed by (fragment, peer node id).
 pub(super) type SenderReportMap =
@@ -1656,7 +1735,7 @@ impl Node {
             peer_failures: PeerFailureSignals::default(),
             next_seq: Arc::new(Mutex::new(0)),
             hlc: hlc.clone(),
-            senders: Arc::new(Mutex::new(HashMap::new())),
+            senders: Arc::new(Mutex::new(SenderRegistry::default())),
             finalizing_senders: Arc::new(SenderFinalizationRegistry::default()),
             retiring_senders: Arc::new(RetiringSenderRegistry::default()),
             sender_config,
@@ -1882,7 +1961,7 @@ impl Node {
                 .await
                 .keys()
                 .map(|(fragment, peer_id)| ReplicationDrainTarget {
-                    fragment: *fragment,
+                    fragment,
                     peer_id: peer_id.clone(),
                 })
                 .collect()
@@ -2512,6 +2591,96 @@ mod tests {
     use ractor::ActorProcessingErr;
     use std::sync::atomic::AtomicBool;
     use std::sync::Condvar;
+
+    #[tokio::test]
+    async fn fragment_fanout_preserves_task_identity_after_bucket_retirement_and_recreation() {
+        let spawn = |fragment, peer: &str| {
+            let report = test_sender_report();
+            let sender = spawn_node_sender(
+                fragment,
+                peer.into(),
+                SenderConfig::default(),
+                SenderDeps {
+                    router: FragmentRouter::new(2, 0),
+                    hlc: Arc::new(Mutex::new(HlcClock::new())),
+                    state_report: report.clone(),
+                },
+                SenderRuntimeOptions::default(),
+            )
+            .unwrap();
+            (sender, report)
+        };
+        let target = FragmentId(0);
+        let other = FragmentId(1);
+        let (first, first_report) = spawn(target, "b");
+        let (second, second_report) = spawn(target, "c");
+        let (unrelated, unrelated_report) = spawn(other, "b");
+        let (replacement, replacement_report) = spawn(target, "b");
+        let key = (target, "b".to_string());
+        let senders: SenderMap = Arc::new(Mutex::new(SenderRegistry::from([
+            (key.clone(), first.clone()),
+            ((target, "c".into()), second.clone()),
+            ((other, "b".into()), unrelated.clone()),
+        ])));
+        let op = ReplicatedOp {
+            key: "fanout-key".into(),
+            value: VersionedValue::new(b"value".to_vec(), 1, "origin".into()),
+            seq: 1,
+            boot_id: 1,
+        };
+        enqueue_to_senders(&senders, target, &op).await;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while first_report.lock().await.buffered != 1
+                || second_report.lock().await.buffered != 1
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(unrelated_report.lock().await.buffered, 0);
+        assert_eq!(replacement_report.lock().await.buffered, 0);
+
+        let stale = snapshot_senders_for_fragment(&senders, target).await;
+        let retiring = Arc::new(RetiringSenderRegistry::default());
+        let detached = {
+            let mut registry = senders.lock().await;
+            let first = retiring.retire(registry.remove(&key).unwrap());
+            let second = retiring.retire(registry.remove(&(target, "c".into())).unwrap());
+            assert!(!registry.by_fragment.contains_key(&target));
+            assert!(registry
+                .get(&(other, "b".into()))
+                .unwrap()
+                .same_task(&unrelated));
+            registry.insert(key.clone(), replacement.clone());
+            vec![first, second]
+        };
+        for sender in detached {
+            sender.join().await;
+        }
+        assert!(stale
+            .iter()
+            .all(|sender| matches!(sender.offer(&op), Err(SenderIngressError::Closed))));
+        assert!(!sender_task_is_current(&senders, &key, &first).await);
+        assert!(sender_task_is_current(&senders, &key, &replacement).await);
+        let current = snapshot_senders_for_fragment(&senders, target).await;
+        assert_eq!(current.len(), 1);
+        assert!(current[0].same_task(&replacement));
+        enqueue_to_senders(&senders, target, &op).await;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while replacement_report.lock().await.buffered != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(unrelated_report.lock().await.buffered, 0);
+        assert!(snapshot_senders_for_fragment(&senders, FragmentId(99))
+            .await
+            .is_empty());
+        replacement.stop().await;
+        unrelated.stop().await;
+    }
 
     #[tokio::test]
     async fn nodes_serve_and_invalid_settings_fail_before_bind() {

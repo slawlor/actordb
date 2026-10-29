@@ -353,11 +353,9 @@ pub(super) async fn ensure_fragment_senders(
         let mut senders = deps.senders.lock().await;
         let mut reports = deps.sender_reports.lock().await;
         let stale: Vec<(FragmentId, String)> = senders
-            .keys()
-            .filter(|(sender_fragment, peer)| {
-                *sender_fragment == fragment && !current_replicas.contains(peer)
-            })
-            .cloned()
+            .for_fragment(fragment)
+            .filter(|(peer, _)| !current_replicas.contains(*peer))
+            .map(|(peer, _)| (fragment, peer.clone()))
             .collect();
         let mut retiring = Vec::with_capacity(stale.len());
         for key in &stale {
@@ -685,17 +683,17 @@ pub(super) struct DrainedFragmentSenderSnapshot {
 
 pub(super) fn snapshot_fragment_sender_set(
     fragment: FragmentId,
-    senders: &HashMap<(FragmentId, String), NodeSender>,
+    senders: &SenderRegistry,
     reports: &HashMap<(FragmentId, String), Arc<Mutex<SenderStateReport>>>,
 ) -> Option<Vec<FragmentSenderSnapshot>> {
     let mut entries: Vec<FragmentSenderSnapshot> = senders
-        .iter()
-        .filter(|((sender_fragment, _), _)| *sender_fragment == fragment)
-        .map(|(key, sender)| {
+        .for_fragment(fragment)
+        .map(|(peer, sender)| {
+            let key = (fragment, peer.clone());
             Some(FragmentSenderSnapshot {
                 key: key.clone(),
                 sender: sender.clone(),
-                report: reports.get(key)?.clone(),
+                report: reports.get(&key)?.clone(),
             })
         })
         .collect::<Option<_>>()?;
@@ -741,14 +739,10 @@ pub(super) async fn lock_drained_fragment_sender_snapshot(
 pub(super) fn fragment_sender_snapshot_is_current(
     fragment: FragmentId,
     snapshot: &[FragmentSenderSnapshot],
-    senders: &HashMap<(FragmentId, String), NodeSender>,
+    senders: &SenderRegistry,
     reports: &HashMap<(FragmentId, String), Arc<Mutex<SenderStateReport>>>,
 ) -> bool {
-    senders
-        .keys()
-        .filter(|(sender_fragment, _)| *sender_fragment == fragment)
-        .count()
-        == snapshot.len()
+    senders.for_fragment(fragment).count() == snapshot.len()
         && reports
             .keys()
             .filter(|(report_fragment, _)| *report_fragment == fragment)
@@ -767,7 +761,7 @@ pub(super) fn fragment_sender_snapshot_is_current(
 #[cfg(test)]
 pub(super) async fn fragment_sender_set_is_drained(
     fragment: FragmentId,
-    senders: &HashMap<(FragmentId, String), NodeSender>,
+    senders: &SenderRegistry,
     reports: &HashMap<(FragmentId, String), Arc<Mutex<SenderStateReport>>>,
 ) -> bool {
     let Some(snapshot) = snapshot_fragment_sender_set(fragment, senders, reports) else {
@@ -851,9 +845,8 @@ pub(super) async fn retire_fragment_senders(deps: &PlacementDriverDeps, fragment
         let mut senders = deps.senders.lock().await;
         let mut reports = deps.sender_reports.lock().await;
         let keys: Vec<(FragmentId, String)> = senders
-            .keys()
-            .filter(|(sender_fragment, _)| *sender_fragment == fragment)
-            .cloned()
+            .for_fragment(fragment)
+            .map(|(peer, _)| (fragment, peer.clone()))
             .collect();
         let mut retiring = Vec::with_capacity(keys.len());
         for key in keys {
@@ -1152,11 +1145,7 @@ pub(super) async fn lose_fragment_with_prefix_retirement(
         }
         let mut senders = deps.senders.lock().await;
         let mut reports = deps.sender_reports.lock().await;
-        let exact_senders = senders
-            .iter()
-            .filter(|((sender_fragment, _), _)| *sender_fragment == fragment)
-            .count()
-            == waiters.len()
+        let exact_senders = senders.for_fragment(fragment).count() == waiters.len()
             && waiters.iter().all(|waiter| {
                 waiter.drain.is_complete()
                     && senders
@@ -1226,9 +1215,7 @@ pub(super) async fn lose_fragment_with_prefix_retirement(
         }
         let senders = deps.senders.lock().await;
         let reports = deps.sender_reports.lock().await;
-        let sender_set_remains_detached = !senders
-            .keys()
-            .any(|(sender_fragment, _)| *sender_fragment == fragment)
+        let sender_set_remains_detached = senders.for_fragment(fragment).next().is_none()
             && !reports
                 .keys()
                 .any(|(report_fragment, _)| *report_fragment == fragment);
@@ -1310,15 +1297,11 @@ pub(super) async fn lose_fragment_retaining_prefix(
             .senders
             .lock()
             .await
-            .iter()
-            .filter_map(|((sender_fragment, peer), sender)| {
-                (*sender_fragment == fragment)
-                    .then(|| {
-                        peers
-                            .get(peer)
-                            .map(|tx| (sender.clone(), tx.budgeted_sender()))
-                    })
-                    .flatten()
+            .for_fragment(fragment)
+            .filter_map(|(peer, sender)| {
+                peers
+                    .get(peer)
+                    .map(|tx| (sender.clone(), tx.budgeted_sender()))
             })
             .collect();
         for (sender, peer_tx) in targets {
@@ -1584,7 +1567,7 @@ mod tests {
         .unwrap();
         sender.schedule_reset();
         let key = (fragment, "peer".to_string());
-        let senders = HashMap::from([(key.clone(), sender.clone())]);
+        let senders = SenderRegistry::from([(key.clone(), sender.clone())]);
         let reports = HashMap::from([(key, report)]);
 
         assert!(!fragment_sender_set_is_drained(fragment, &senders, &reports).await);
@@ -1604,7 +1587,7 @@ mod tests {
             serving.clone(),
             placement,
             Arc::new(Mutex::new(HashMap::new())),
-            Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(Mutex::new(Default::default())),
             Arc::new(Mutex::new(HashMap::new())),
         );
         deps.placement_states
@@ -1635,7 +1618,7 @@ mod tests {
             serving.clone(),
             placement,
             Arc::new(Mutex::new(HashMap::new())),
-            Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(Mutex::new(Default::default())),
             Arc::new(Mutex::new(HashMap::new())),
         );
         deps.placement_states
@@ -1672,7 +1655,7 @@ mod tests {
             serving.clone(),
             placement,
             Arc::new(Mutex::new(HashMap::new())),
-            Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(Mutex::new(Default::default())),
             Arc::new(Mutex::new(HashMap::new())),
         );
         let controller = Arc::new(crate::placement::ManualPlacement::new(HashMap::from([(
@@ -1708,7 +1691,7 @@ mod tests {
                 .await
                 .unwrap();
         router.insert(fragment, dispatcher);
-        let senders: SenderMap = Arc::new(Mutex::new(HashMap::new()));
+        let senders: SenderMap = Arc::new(Mutex::new(SenderRegistry::default()));
         let reports: SenderReportMap = Arc::new(Mutex::new(HashMap::new()));
         let peer_failures = PeerFailureSignals::default();
         let finalizing_senders = Arc::new(SenderFinalizationRegistry::default());
@@ -1859,7 +1842,7 @@ mod tests {
         )
         .unwrap();
         let other_key = (other, "peer".to_string());
-        let mut senders = HashMap::from([(other_key.clone(), other_sender.clone())]);
+        let mut senders = SenderRegistry::from([(other_key.clone(), other_sender.clone())]);
         let reports = HashMap::from([(other_key, other_report)]);
         assert!(fragment_sender_set_is_drained(target, &senders, &reports).await);
 
@@ -1914,7 +1897,10 @@ mod tests {
         )
         .unwrap();
         let key = (fragment, "peer".to_string());
-        let senders = Arc::new(Mutex::new(HashMap::from([(key.clone(), sender.clone())])));
+        let senders = Arc::new(Mutex::new(SenderRegistry::from([(
+            key.clone(),
+            sender.clone(),
+        )])));
         let reports = Arc::new(Mutex::new(HashMap::from([(key, report.clone())])));
         let deps = test_placement_deps(
             router.clone(),
@@ -2008,7 +1994,10 @@ mod tests {
         )
         .unwrap();
         let key = (fragment, "peer".to_string());
-        let senders = Arc::new(Mutex::new(HashMap::from([(key.clone(), sender.clone())])));
+        let senders = Arc::new(Mutex::new(SenderRegistry::from([(
+            key.clone(),
+            sender.clone(),
+        )])));
         let reports = Arc::new(Mutex::new(HashMap::from([(key, report.clone())])));
         let deps = test_placement_deps(
             router.clone(),
@@ -2090,7 +2079,7 @@ mod tests {
             serving.clone(),
             placement,
             supervisors.clone(),
-            Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(Mutex::new(Default::default())),
             Arc::new(Mutex::new(HashMap::new())),
         );
 
@@ -2113,7 +2102,7 @@ mod tests {
     #[tokio::test]
     async fn stale_sender_ensure_refuses_a_removed_router_fragment() {
         let router = FragmentRouter::new(1, 0);
-        let senders: SenderMap = Arc::new(Mutex::new(HashMap::new()));
+        let senders: SenderMap = Arc::new(Mutex::new(SenderRegistry::default()));
         let reports: SenderReportMap = Arc::new(Mutex::new(HashMap::new()));
         let peer_failures = PeerFailureSignals::default();
         let finalizing_senders = Arc::new(SenderFinalizationRegistry::default());
@@ -2157,7 +2146,7 @@ mod tests {
                 .await
                 .unwrap();
         router.insert(fragment, dispatcher);
-        let senders: SenderMap = Arc::new(Mutex::new(HashMap::new()));
+        let senders: SenderMap = Arc::new(Mutex::new(SenderRegistry::default()));
         let reports: SenderReportMap = Arc::new(Mutex::new(HashMap::new()));
         let finalizing_senders = Arc::new(SenderFinalizationRegistry::default());
         let retiring_senders = Arc::new(RetiringSenderRegistry::default());
@@ -2252,8 +2241,10 @@ mod tests {
             SenderRuntimeOptions::default(),
         )
         .unwrap();
-        let senders: SenderMap =
-            Arc::new(Mutex::new(HashMap::from([(key.clone(), sender.clone())])));
+        let senders: SenderMap = Arc::new(Mutex::new(SenderRegistry::from([(
+            key.clone(),
+            sender.clone(),
+        )])));
         let reports: SenderReportMap = Arc::new(Mutex::new(HashMap::from([(key.clone(), report)])));
         assert!(sender_task_is_current(&senders, &key, &sender).await);
         let snapshot = {
