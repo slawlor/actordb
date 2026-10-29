@@ -842,6 +842,14 @@ impl NodeSender {
         self.control_tx.capacity()
     }
 
+    #[cfg(test)]
+    pub(crate) fn ingress_overflow_counts_for_test(&self) -> (u64, u64) {
+        (
+            self.ingress.shed_operations.load(Ordering::Relaxed),
+            self.ingress.reset_requests.load(Ordering::Relaxed),
+        )
+    }
+
     pub(crate) fn send(&self, msg: SenderMsg) -> Result<(), SenderIngressError> {
         if self.is_closed() {
             return Err(SenderIngressError::Closed);

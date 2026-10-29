@@ -20,10 +20,25 @@ pub(super) type SenderMap = Arc<Mutex<SenderRegistry>>;
 #[derive(Default)]
 pub(super) struct SenderRegistry {
     by_fragment: HashMap<FragmentId, HashMap<String, NodeSender>>,
+    // The manual diagnostic can switch lookup implementations without
+    // restarting actors, channels or timers. This mirror is test-only and
+    // updated under the same registry mutex as the authoritative index.
+    #[cfg(test)]
+    flat_benchmark: Option<FlatSenderBenchmark>,
+}
+
+#[cfg(test)]
+struct FlatSenderBenchmark {
+    active: bool,
+    entries: HashMap<(FragmentId, String), NodeSender>,
 }
 
 impl SenderRegistry {
     pub(super) fn get(&self, key: &(FragmentId, String)) -> Option<&NodeSender> {
+        #[cfg(test)]
+        if let Some(flat) = self.flat_benchmark.as_ref().filter(|flat| flat.active) {
+            return flat.entries.get(key);
+        }
         self.by_fragment.get(&key.0)?.get(&key.1)
     }
 
@@ -32,6 +47,11 @@ impl SenderRegistry {
         (fragment, peer): (FragmentId, String),
         sender: NodeSender,
     ) -> Option<NodeSender> {
+        #[cfg(test)]
+        if let Some(flat) = &mut self.flat_benchmark {
+            flat.entries
+                .insert((fragment, peer.clone()), sender.clone());
+        }
         self.by_fragment
             .entry(fragment)
             .or_default()
@@ -39,6 +59,10 @@ impl SenderRegistry {
     }
 
     pub(super) fn remove(&mut self, key: &(FragmentId, String)) -> Option<NodeSender> {
+        #[cfg(test)]
+        if let Some(flat) = &mut self.flat_benchmark {
+            flat.entries.remove(key);
+        }
         let peers = self.by_fragment.get_mut(&key.0)?;
         let removed = peers.remove(&key.1);
         if peers.is_empty() {
@@ -51,10 +75,26 @@ impl SenderRegistry {
         &self,
         fragment: FragmentId,
     ) -> impl Iterator<Item = (&String, &NodeSender)> {
-        self.by_fragment
-            .get(&fragment)
+        #[cfg(test)]
+        let flat = self.flat_benchmark.as_ref().filter(|flat| flat.active);
+        #[cfg(test)]
+        let peers = if flat.is_some() {
+            None
+        } else {
+            self.by_fragment.get(&fragment)
+        };
+        #[cfg(not(test))]
+        let peers = self.by_fragment.get(&fragment);
+        let indexed = peers.into_iter().flat_map(HashMap::iter);
+        #[cfg(test)]
+        return flat
             .into_iter()
-            .flat_map(HashMap::iter)
+            .flat_map(|flat| flat.entries.iter())
+            .filter(move |((sender_fragment, _), _)| *sender_fragment == fragment)
+            .map(|((_, peer), sender)| (peer, sender))
+            .chain(indexed);
+        #[cfg(not(test))]
+        indexed
     }
 
     pub(super) fn iter(&self) -> impl Iterator<Item = ((FragmentId, &String), &NodeSender)> {
@@ -81,6 +121,20 @@ impl SenderRegistry {
     #[cfg(test)]
     pub(super) fn contains_key(&self, key: &(FragmentId, String)) -> bool {
         self.get(key).is_some()
+    }
+
+    #[cfg(test)]
+    pub(super) fn benchmark_flat_lookup(&mut self, active: bool) {
+        if self.flat_benchmark.is_none() {
+            self.flat_benchmark = Some(FlatSenderBenchmark {
+                active: false,
+                entries: self
+                    .iter()
+                    .map(|((fragment, peer), sender)| ((fragment, peer.clone()), sender.clone()))
+                    .collect(),
+            });
+        }
+        self.flat_benchmark.as_mut().unwrap().active = active;
     }
 }
 
@@ -2622,6 +2676,7 @@ mod tests {
             ((target, "c".into()), second.clone()),
             ((other, "b".into()), unrelated.clone()),
         ])));
+        senders.lock().await.benchmark_flat_lookup(true);
         let op = ReplicatedOp {
             key: "fanout-key".into(),
             value: VersionedValue::new(b"value".to_vec(), 1, "origin".into()),
@@ -2663,9 +2718,14 @@ mod tests {
             .all(|sender| matches!(sender.offer(&op), Err(SenderIngressError::Closed))));
         assert!(!sender_task_is_current(&senders, &key, &first).await);
         assert!(sender_task_is_current(&senders, &key, &replacement).await);
-        let current = snapshot_senders_for_fragment(&senders, target).await;
-        assert_eq!(current.len(), 1);
-        assert!(current[0].same_task(&replacement));
+        for flat in [false, true, false] {
+            senders.lock().await.benchmark_flat_lookup(flat);
+            let current = snapshot_senders_for_fragment(&senders, target).await;
+            assert_eq!(current.len(), 1);
+            assert!(current[0].same_task(&replacement));
+            assert!(!sender_task_is_current(&senders, &key, &first).await);
+            assert!(sender_task_is_current(&senders, &key, &replacement).await);
+        }
         enqueue_to_senders(&senders, target, &op).await;
         tokio::time::timeout(Duration::from_secs(2), async {
             while replacement_report.lock().await.buffered != 1 {
