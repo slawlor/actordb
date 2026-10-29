@@ -1,6 +1,6 @@
 # Peer transports and application RPC
 
-ActorDB 0.11.0 separates two interfaces. Persistent peer replication uses
+ActorDB 0.11.1 separates two interfaces. Persistent peer replication uses
 `Network` byte streams and unchanged exact peer protocol 6. Application APIs
 use typed unary RPC traits; default gRPC is a separate framework adapter.
 Neither the generic SDK nor Node RPC service authenticates clients.
@@ -80,8 +80,8 @@ Normalize table names appropriately in an ACL policy; the Node canonicalizes the
 For another RPC framework:
 
 ```toml
-actordb = { version = "0.11.0", default-features = false }
-actordb-client = { version = "0.11.0", default-features = false }
+actordb = { version = "0.11.1", default-features = false }
+actordb-client = { version = "0.11.1", default-features = false }
 ```
 
 Implement `actordb_protocol::rpc::RpcClient` on the client side and expose

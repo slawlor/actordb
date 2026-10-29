@@ -1,6 +1,6 @@
 # Rust client and query companion design
 
-This describes the current ActorDB `0.11.0` architecture. See
+This describes the current ActorDB `0.11.1` architecture. See
 [SQL queries](query.md) and [the Rust SDK](../actordb-client/README.md) for usage.
 
 ## Crate and endpoint boundaries

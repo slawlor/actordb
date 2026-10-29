@@ -5,6 +5,7 @@
 
 //! Shared cache, ordered persistence, expiry, and snapshot state.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock as StdRwLock};
@@ -155,6 +156,56 @@ struct SummaryValue {
     expires_at_ms: Option<u64>,
     is_tombstone: bool,
     digests: CachedDigests,
+}
+
+/// Own payload copies before acquiring mutation locks. TTL is still selected
+/// under those locks; unused candidates and displaced payloads drop afterward.
+struct PreparedApply {
+    key: String,
+    raw: Option<VersionedValue>,
+    expired: Option<VersionedValue>,
+    pending_raw: Option<VersionedValue>,
+    pending_expired: Option<VersionedValue>,
+    summary: Option<SummaryValue>,
+    digests: CachedDigests,
+}
+
+impl PreparedApply {
+    fn new(op: ReplicatedOp, durable: bool, digests: CachedDigests) -> Self {
+        let expired = op.value.expires_at_ms.map(|_| op.value.expiry_tombstone());
+        Self {
+            pending_raw: durable.then(|| op.value.clone()),
+            pending_expired: if durable { expired.clone() } else { None },
+            summary: Some(SummaryValue::new(&op.value, digests)),
+            key: op.key,
+            raw: Some(op.value),
+            expired,
+            digests,
+        }
+    }
+
+    fn value(&self, expired: bool) -> &VersionedValue {
+        if expired { &self.expired } else { &self.raw }
+            .as_ref()
+            .expect("prepared cache candidate")
+    }
+
+    fn digests(&self, expired: bool) -> CachedDigests {
+        let mut digests = self.digests;
+        if expired {
+            digests.expire();
+        }
+        digests
+    }
+
+    fn take_summary(&mut self, expired: bool) -> SummaryValue {
+        let mut summary = self.summary.take().expect("prepared summary");
+        if expired {
+            summary.is_tombstone = true;
+            summary.digests.expire();
+        }
+        summary
+    }
 }
 
 impl SummaryValue {
@@ -799,7 +850,15 @@ impl FragmentState {
         if self.partitioned {
             return self.apply_from_actor(op).await;
         }
-        self.apply_local(op).await
+        self.apply_local(Cow::Borrowed(op)).await
+    }
+
+    /// Low-level workers can transfer the message's payload into the cache.
+    pub(crate) async fn apply_owned(&self, op: ReplicatedOp) -> Result<ApplyOutcome, ApplyError> {
+        if self.partitioned {
+            return self.apply_owned_from_actor(op).await;
+        }
+        self.apply_local(Cow::Owned(op)).await
     }
 
     /// Managed actors resolve encoded table keys even for a standalone public
@@ -808,6 +867,17 @@ impl FragmentState {
         &self,
         op: &ReplicatedOp,
     ) -> Result<ApplyOutcome, ApplyError> {
+        self.apply_routed(Cow::Borrowed(op)).await
+    }
+
+    pub(crate) async fn apply_owned_from_actor(
+        &self,
+        op: ReplicatedOp,
+    ) -> Result<ApplyOutcome, ApplyError> {
+        self.apply_routed(Cow::Owned(op)).await
+    }
+
+    async fn apply_routed(&self, op: Cow<'_, ReplicatedOp>) -> Result<ApplyOutcome, ApplyError> {
         if let Some(table) = crate::table_key::table_name(&op.key) {
             let child = self.table_state(&table).await?;
             let result = child.apply_local(op).await;
@@ -818,7 +888,7 @@ impl FragmentState {
         self.apply_local(op).await
     }
 
-    async fn apply_local(&self, op: &ReplicatedOp) -> Result<ApplyOutcome, ApplyError> {
+    async fn apply_local(&self, op: Cow<'_, ReplicatedOp>) -> Result<ApplyOutcome, ApplyError> {
         check_versioned_value_budget(&op.key, &op.value).map_err(|error| {
             ApplyError::InvalidInput(format!(
                 "key/value cannot fit every required peer frame: {error}"
@@ -827,62 +897,93 @@ impl FragmentState {
         // Hash the raw payload before lock waits; TTL selection only copies
         // its cached live/expired digests inside the mutation critical section.
         let digests = CachedDigests::new(&op.value);
+        let mut prepared = PreparedApply::new(op.into_owned(), self.kvstore.is_some(), digests);
         if self.kvstore.is_none() {
-            let _publication = self.snapshot_fence.read().await;
-            let mut cache = self.cache.write().await;
-            Self::check_version_conflict(&cache, &op.key, &op.value)?;
-            let expired = op.value.is_expired(now_ms());
-            let tombstone = expired.then(|| op.value.expiry_tombstone());
-            let value = tombstone.as_ref().unwrap_or(&op.value);
-            let mut selected_digests = digests;
-            if expired {
-                selected_digests.expire();
-            }
-            let outcome = Self::merge_cache(&mut cache, &op.key, value, selected_digests)?;
-            if outcome == ApplyOutcome::Applied {
-                self.publish_summary(&op.key, value, selected_digests);
-                self.revision.fetch_add(1, Ordering::Release);
-            }
+            let (outcome, expired, retired) = {
+                let _publication = self.snapshot_fence.read().await;
+                let mut cache = self.cache.write().await;
+                Self::check_version_conflict(&cache, &prepared.key, prepared.value(false))?;
+                let expired = prepared.value(false).is_expired(now_ms());
+                let selected_digests = prepared.digests(expired);
+                let value = if expired {
+                    &mut prepared.expired
+                } else {
+                    &mut prepared.raw
+                };
+                let (outcome, retired) =
+                    Self::merge_cache(&mut cache, &prepared.key, value, selected_digests)?;
+                if outcome == ApplyOutcome::Applied {
+                    let summary = prepared.take_summary(expired);
+                    self.publish_summary(&prepared.key, summary);
+                    self.revision.fetch_add(1, Ordering::Release);
+                }
+                (outcome, expired, retired)
+            };
+            drop(retired);
             return Ok(Self::reported_outcome(outcome, expired));
         }
 
-        let (outcome, expired, should_flush) = {
+        let (outcome, expired, should_flush, retired_cache, retired_pending) = {
             // Preserve raw and normalized conflict checks before persistence
             // admission. Nothing mutates or awaits after acquiring both locks
             // until the winning merge, durable enqueue, and revision agree.
             let mut flush = self.flush.lock().await;
             let _publication = self.snapshot_fence.read().await;
             let mut cache = self.cache.write().await;
-            Self::check_version_conflict(&cache, &op.key, &op.value)?;
-            let expired = op.value.is_expired(now_ms());
-            let tombstone = expired.then(|| op.value.expiry_tombstone());
-            let value = tombstone.as_ref().unwrap_or(&op.value);
-            let mut selected_digests = digests;
+            Self::check_version_conflict(&cache, &prepared.key, prepared.value(false))?;
+            let expired = prepared.value(false).is_expired(now_ms());
+            let value = prepared.value(expired);
+            let selected_digests = prepared.digests(expired);
             if expired {
-                selected_digests.expire();
-                Self::check_version_conflict(&cache, &op.key, value)?;
+                Self::check_version_conflict(&cache, &prepared.key, value)?;
             }
             let winning = cache
                 .values
-                .get(&op.key)
-                .is_none_or(|existing| value != existing && value.wins_over(existing));
-            if winning && !flush.enqueue(&op.key, value) {
-                tracing::warn!(
-                    records = flush.record_count(),
-                    retained_bytes = flush.local_budget.used(),
-                    "rejecting mutation at persistence admission limit"
-                );
-                return Err(ApplyError::Backpressure);
-            }
-            let outcome = Self::merge_cache(&mut cache, &op.key, value, selected_digests)?;
+                .get(&prepared.key)
+                .is_none_or(|existing| value.wins_over(existing));
+            let retired_pending = if winning {
+                let pending = if expired {
+                    &mut prepared.pending_expired
+                } else {
+                    &mut prepared.pending_raw
+                };
+                flush
+                    .enqueue_prepared(&prepared.key, pending)
+                    .map_err(|()| {
+                        tracing::warn!(
+                            records = flush.record_count(),
+                            retained_bytes = flush.local_budget.used(),
+                            "rejecting mutation at persistence admission limit"
+                        );
+                        ApplyError::Backpressure
+                    })?
+            } else {
+                None
+            };
+            let value = if expired {
+                &mut prepared.expired
+            } else {
+                &mut prepared.raw
+            };
+            let (outcome, retired_cache) =
+                Self::merge_cache(&mut cache, &prepared.key, value, selected_digests)?;
             if outcome != ApplyOutcome::Applied {
                 return Ok(Self::reported_outcome(outcome, expired));
             }
-            self.publish_summary(&op.key, value, selected_digests);
+            let summary = prepared.take_summary(expired);
+            self.publish_summary(&prepared.key, summary);
             self.revision.fetch_add(1, Ordering::Release);
             let should_flush = flush.should_flush(self.flush_batch_size, self.flush_interval);
-            (outcome, expired, should_flush)
+            (
+                outcome,
+                expired,
+                should_flush,
+                retired_cache,
+                retired_pending,
+            )
         };
+        drop(retired_cache);
+        drop(retired_pending);
         if should_flush {
             self.flush()
                 .await
@@ -893,11 +994,9 @@ impl FragmentState {
 
     /// Called synchronously while cache.write and the publication fence are
     /// held, before exposing the winning cache update or awaiting persistence.
-    fn publish_summary(&self, key: &str, value: &VersionedValue, digests: CachedDigests) {
+    fn publish_summary(&self, key: &str, summary: SummaryValue) {
         let mut index = self.summary_index.write().unwrap();
-        index
-            .values
-            .insert(key.to_string(), SummaryValue::new(value, digests));
+        index.values.insert(key.to_string(), summary);
         index.revision = index.revision.wrapping_add(1);
     }
 
@@ -921,13 +1020,14 @@ impl FragmentState {
     fn merge_cache(
         cache: &mut FragmentCache,
         key: &str,
-        value: &VersionedValue,
+        prepared: &mut Option<VersionedValue>,
         digests: CachedDigests,
-    ) -> Result<ApplyOutcome, ApplyError> {
+    ) -> Result<(ApplyOutcome, Option<VersionedValue>), ApplyError> {
+        let value = prepared.as_ref().expect("prepared cache candidate");
         if let Some(existing) = cache.values.get_mut(key) {
             if existing.same_version(value) {
                 return if existing == value {
-                    Ok(ApplyOutcome::AlreadyPresent)
+                    Ok((ApplyOutcome::AlreadyPresent, None))
                 } else {
                     Err(ApplyError::VersionConflict {
                         key: key.to_string(),
@@ -935,12 +1035,15 @@ impl FragmentState {
                 };
             }
             if !value.wins_over(existing) {
-                return Ok(ApplyOutcome::Superseded {
-                    timestamp_ms: existing.timestamp_ms,
-                    logical_counter: existing.logical_counter,
-                    node_id: existing.node_id.clone(),
-                    is_tombstone: existing.is_tombstone,
-                });
+                return Ok((
+                    ApplyOutcome::Superseded {
+                        timestamp_ms: existing.timestamp_ms,
+                        logical_counter: existing.logical_counter,
+                        node_id: existing.node_id.clone(),
+                        is_tombstone: existing.is_tombstone,
+                    },
+                    None,
+                ));
             }
             if !existing.is_tombstone {
                 if let Some(deadline) = existing.expires_at_ms {
@@ -952,9 +1055,9 @@ impl FragmentState {
                     cache.expiry_deadlines.insert((deadline, key.to_owned()));
                 }
             }
-            *existing = value.clone();
+            let retired = std::mem::replace(existing, prepared.take().unwrap());
             cache.content_digests.insert(key.to_string(), digests);
-            Ok(ApplyOutcome::Applied)
+            Ok((ApplyOutcome::Applied, Some(retired)))
         } else {
             let key = key.to_string();
             cache.ordered_keys.insert(key.clone());
@@ -964,8 +1067,8 @@ impl FragmentState {
                     cache.expiry_deadlines.insert((deadline, key.clone()));
                 }
             }
-            cache.values.insert(key, value.clone());
-            Ok(ApplyOutcome::Applied)
+            cache.values.insert(key, prepared.take().unwrap());
+            Ok((ApplyOutcome::Applied, None))
         }
     }
 
@@ -2360,38 +2463,51 @@ impl FlushBuffer {
     /// Reserve only the growth delta when replacing a pending winner. Failed
     /// admission leaves the old value and both accounting reservations intact.
     fn enqueue(&mut self, key: &str, value: &VersionedValue) -> bool {
+        self.enqueue_prepared(key, &mut Some(value.clone())).is_ok()
+    }
+
+    /// Move a preallocated candidate on successful admission, retaining the
+    /// rejected candidate for destruction after the caller releases its locks.
+    fn enqueue_prepared(
+        &mut self,
+        key: &str,
+        prepared: &mut Option<VersionedValue>,
+    ) -> Result<Option<VersionedValue>, ()> {
+        let value = prepared.as_ref().expect("prepared persistence candidate");
         let bytes = persistence_record_bytes(key, value);
         if let Some(existing) = self.pending.get_mut(key) {
             let previous = existing.local.bytes();
             if !existing.local.resize(bytes) {
-                return false;
+                return Err(());
             }
             if !existing.aggregate.resize(bytes) {
                 assert!(existing.local.resize(previous));
-                return false;
+                return Err(());
             }
-            existing.value = value.clone();
-            return true;
+            return Ok(Some(std::mem::replace(
+                &mut existing.value,
+                prepared.take().unwrap(),
+            )));
         }
         let Some(record) = self.record_budget.reserve(1) else {
-            return false;
+            return Err(());
         };
         let Some(local) = self.local_budget.reserve(bytes) else {
-            return false;
+            return Err(());
         };
         let Some(aggregate) = self.aggregate_budget.reserve(bytes) else {
-            return false;
+            return Err(());
         };
         self.pending.insert(
             key.to_string(),
             PendingWrite {
-                value: value.clone(),
+                value: prepared.take().unwrap(),
                 local,
                 aggregate,
                 _record: record,
             },
         );
-        true
+        Ok(None)
     }
     fn restore_batch(&mut self) {
         if let Some(batch) = self.in_flight.take() {
