@@ -68,6 +68,12 @@ with a separate timer responsiveness probe. The
 conditions, A/B/B/A repeats, the synchronous experiment patch and its test-fixture
 migration requirement.
 
+The benchmark also includes direct, uncontended revision reads, 100 B Gets and
+100 B applies without actor dispatch. The
+[2026-10-29 Parking_lot comparison](parking_lot_results.md) records Tokio, std
+and Parking_lot across these fast paths and the actor workloads, with the
+experimental dependency/cache patch and A/B/C/C/B/A results.
+
 Each file has a doc comment explaining what it measures and how to read a
 regression — start there before tuning.
 

@@ -313,5 +313,64 @@ fn bench_fragment_locks(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_fragment_locks);
+/// Direct public cache methods avoid actor dispatch masking lock fast paths.
+/// One current-thread runtime and one caller make all acquisitions uncontended.
+fn bench_cache_fast_path(c: &mut Criterion) {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let state = FragmentState::new(
+        HashMap::from([(
+            "fast-key".to_string(),
+            VersionedValue::new(vec![0xAB; 100], 0, "writer".into()),
+        )]),
+        None,
+        usize::MAX,
+        Duration::from_secs(24 * 3600),
+    );
+    assert_eq!(rt.block_on(state.get("fast-key")).unwrap().value.len(), 100);
+    let mut group = c.benchmark_group("cache_fast_path");
+    group.sample_size(30);
+    group.warm_up_time(Duration::from_millis(500));
+    group.measurement_time(Duration::from_secs(3));
+    group.throughput(Throughput::Elements(1));
+    group.bench_function("revision_read", |b| {
+        b.to_async(&rt)
+            .iter(|| async { std::hint::black_box(state.current_revision().await) });
+    });
+    group.bench_function("get_100b", |b| {
+        b.to_async(&rt).iter(|| async {
+            std::hint::black_box(state.get("fast-key").await.expect("populated cache"))
+        });
+    });
+    let version = Cell::new(0u64);
+    group.bench_function("apply_100b", |b| {
+        b.to_async(&rt).iter_batched(
+            || {
+                let next = version.get() + 1;
+                version.set(next);
+                ReplicatedOp {
+                    key: "fast-key".into(),
+                    value: VersionedValue::new(vec![0xAB; 100], next, "writer".into()),
+                    seq: next,
+                    boot_id: 1,
+                }
+            },
+            |op| {
+                let state = &state;
+                async move {
+                    assert_eq!(state.apply(&op).await.unwrap(), ApplyOutcome::Applied);
+                }
+            },
+            BatchSize::PerIteration,
+        );
+    });
+    group.finish();
+    let final_value = rt.block_on(state.get("fast-key")).unwrap();
+    assert_eq!(final_value.value.len(), 100);
+    assert_eq!(final_value.timestamp_ms, version.get());
+}
+
+criterion_group!(benches, bench_fragment_locks, bench_cache_fast_path);
 criterion_main!(benches);
