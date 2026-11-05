@@ -204,6 +204,7 @@ percentage/lag fields and no-op tombstone collection are absent.
   [portable planner/CLI](actordb-placement/README.md)
 - [Replication](docs/replication.md), [consistency](docs/consistency.md)
   and [tombstones](docs/tombstones.md)
+- [Regional replication concurrency](docs/regional-replication.md)
 - [Persistence](docs/persistence.md), [checkpoints](docs/stable-checkpoints.md)
   and [staged membership](docs/staged-membership.md)
 - [Draining](docs/draining.md), [status](docs/status.md), [metrics](docs/metrics.md)

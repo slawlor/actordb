@@ -1392,6 +1392,14 @@ impl Node {
             crate::retained::ByteBudget::new(runtime_options.replication_retained_byte_capacity);
         runtime_options.reconciliation_retention =
             crate::retained::ByteBudget::new(runtime_options.reconciliation_retained_byte_capacity);
+        runtime_options.regional_replication_runtime =
+            runtime_options.regional_replication.clone().map(|options| {
+                crate::replication::RegionalReplicationRuntime::new(
+                    node_id.clone(),
+                    runtime_options.regions.clone(),
+                    options,
+                )
+            });
         if config.ttl_expiry_handler.is_some() {
             config
                 .ttl_expiry_options

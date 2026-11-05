@@ -5,6 +5,11 @@ return after their exact local apply outcome; optional write concerns add the
 requested acknowledgement/durability boundary. Background replication is
 bounded, batched and session-correlated.
 
+Optional [regional profiles](regional-replication.md) select higher in-region
+and lower cross-region sender concurrency. Shared outgoing WAN batch/round
+budgets apply across fragments and peers, with separate recovery capacity and
+actual permit-usage inspection.
+
 ## Current peer contract
 
 ActorDB `0.9.0` uses exact peer protocol **6**. A Hello identifies the node,

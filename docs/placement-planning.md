@@ -164,7 +164,8 @@ compare 1/8/32/128 fragments with the raw report available alongside the notes.
 
 Copy the report's `host_profile` into the planner input. Use observed per-fragment
 load overrides for live controllers. The planner reserves headroom and a recovery
-bandwidth allowance; it does not simulate every failure or adjust WAN concurrency.
+bandwidth allowance; it does not simulate every failure. Configure outgoing
+WAN concurrency through [regional replication options](regional-replication.md).
 
 ## Controller integration
 

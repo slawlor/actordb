@@ -70,6 +70,10 @@ read preference as well as optional regional write acknowledgements. The
 [placement planner](placement-planning.md) emits compatible TOML maps and
 separate JSON capacity reports.
 
+`NodeRuntimeOptions::regional_replication` optionally selects distinct sender
+profiles and shared outgoing WAN batch/round limits. See
+[regional replication](regional-replication.md) for defaults and configuration.
+
 The independent `memory` feature only exposes the no-op `MemoryStore` test
 double, not an in-memory database backend or durable storage. Custom `KvStore`
 implementations and the `PrefixedStore` wrapper remain available without

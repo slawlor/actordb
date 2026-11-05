@@ -1273,6 +1273,10 @@ pub struct NodeRuntimeOptions {
     /// they do not change placement or authenticate physical location.
     #[builder(default, into)]
     regions: Arc<HashMap<String, String>>,
+    /// Optional regional sender profiles and shared outgoing WAN limits.
+    regional_replication: Option<crate::replication::RegionalReplicationOptions>,
+    #[builder(skip)]
+    regional_replication_runtime: Option<Arc<crate::replication::RegionalReplicationRuntime>>,
     #[builder(default = PEER_CHANNEL_DEPTH)]
     peer_queue_frame_capacity: usize,
     #[builder(default = NODE_PEER_QUEUE_BYTE_CAPACITY)]
@@ -1416,6 +1420,19 @@ impl NodeRuntimeOptions {
     /// Operator-supplied node-to-region labels.
     pub fn regions(&self) -> &HashMap<String, String> {
         &self.regions
+    }
+
+    pub fn with_regional_replication(
+        mut self,
+        options: crate::replication::RegionalReplicationOptions,
+    ) -> Self {
+        self.regional_replication = Some(options);
+        self
+    }
+
+    /// Configured regional sender profiles; None retains ordinary sender tuning.
+    pub fn regional_replication(&self) -> Option<&crate::replication::RegionalReplicationOptions> {
+        self.regional_replication.as_ref()
     }
 
     /// Set the total number of frames buffered per peer connection. At least
@@ -1722,14 +1739,16 @@ impl NodeRuntimeOptions {
     }
 
     fn sender_options(&self) -> SenderRuntimeOptions {
-        SenderRuntimeOptions::default()
+        let mut options = SenderRuntimeOptions::default()
             .with_observation_timing(self.observation_timing.clone())
             .with_aggregate_retention(self.replication_retention.clone())
             .with_reconciliation_result_budget(self.reconciliation_retention.clone())
             .with_local_work_timeout(self.local_work_timeout)
             .with_ack_timeout(self.replication_ack_timeout)
             .with_queue_admission_timeout(self.queue_admission_timeout)
-            .with_control_channel_capacity(self.replication_control_message_capacity)
+            .with_control_channel_capacity(self.replication_control_message_capacity);
+        options.regional_runtime = self.regional_replication_runtime.clone();
+        options
     }
 
     /// Current charged retained replication work across this node.
@@ -1738,6 +1757,9 @@ impl NodeRuntimeOptions {
     }
 
     fn validate(&self) -> Result<(), NodeError> {
+        if let Some(regional) = &self.regional_replication {
+            regional.validate().map_err(NodeError::Actor)?;
+        }
         if let Some(authority) = &self.peer_authority {
             authority.validate().map_err(NodeError::Codec)?;
         }
@@ -2146,6 +2168,16 @@ impl NodeConfig {
 }
 
 impl Node {
+    /// Actual shared outgoing WAN batch and reconciliation ownership. None
+    /// means regional replication limits were not enabled for this node.
+    pub fn regional_replication_usage(
+        &self,
+    ) -> Option<crate::replication::RegionalReplicationUsage> {
+        self.runtime_options
+            .regional_replication_runtime
+            .as_ref()
+            .map(|regional| regional.usage())
+    }
     /// Encode a public literal into KV. Internal qualification is selected by
     /// private entrypoint, never by recognizing authority in String syntax.
     fn qualify_key(key: String) -> String {
