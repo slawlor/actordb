@@ -63,6 +63,11 @@ use crate::wire::{
     MAX_RECONCILE_PAGE_ITEMS, MAX_WIRE_BATCH_ITEMS,
 };
 
+mod regional;
+pub(crate) use regional::RegionalReplicationRuntime;
+pub use regional::{RegionalReplicationOptions, RegionalReplicationUsage};
+use regional::{TrafficBudget, TrafficPermit, TrafficTicket};
+
 /// Prevent a permanently failing receiver store from becoming a tight
 /// NACK/write/log loop. Full retry policy belongs with ACK timeouts and bounded
 /// ingress; this floor makes the current explicit retry operationally safe.
@@ -82,6 +87,12 @@ type QueueFailureHandler = Arc<dyn Fn(PeerConnectionId) + Send + Sync>;
 /// Node's internal ingress capacity or transport-failure callback.
 #[derive(Clone, bon::Builder)]
 pub struct SenderRuntimeOptions {
+    #[builder(skip)]
+    pub(crate) regional_runtime: Option<Arc<RegionalReplicationRuntime>>,
+    #[builder(skip)]
+    streaming_budget: Option<Arc<TrafficBudget>>,
+    #[builder(skip)]
+    reconcile_budget: Option<Arc<TrafficBudget>>,
     #[builder(skip = Arc::new(std::sync::atomic::AtomicBool::new(false)))]
     observation_timing: Arc<std::sync::atomic::AtomicBool>,
     #[builder(default = Duration::from_secs(30))]
@@ -1211,6 +1222,7 @@ impl ReplicationAckDurability {
 
 /// A batch awaiting its ack.
 struct InflightBatch {
+    _traffic_permit: Option<TrafficPermit>,
     batch_seq: u64,
     ops: Vec<RetainedOp>,
     kind: InflightKind,
@@ -1283,6 +1295,7 @@ impl ActiveConnection {
 
 #[derive(Clone)]
 struct SenderPeer {
+    reconcile_budget: Option<Arc<TrafficBudget>>,
     peer: ReplicationPeer,
     queue_admission_timeout: Duration,
     local_work_timeout: Duration,
@@ -1294,6 +1307,7 @@ struct SenderPeer {
 impl SenderPeer {
     fn new(peer: ReplicationPeer, options: &SenderRuntimeOptions) -> Self {
         Self {
+            reconcile_budget: options.reconcile_budget.clone(),
             peer,
             queue_admission_timeout: options.queue_admission_timeout,
             local_work_timeout: options.local_work_timeout,
@@ -1437,6 +1451,7 @@ enum ReconcilePhase {
 }
 
 struct ReconcileRound {
+    _traffic_permit: Option<TrafficPermit>,
     session_id: u64,
     round_id: u64,
     purpose: ReconcilePurpose,
@@ -1448,6 +1463,22 @@ struct ReconcileRound {
     connection_permit: Option<ReconcilePermit>,
     /// Keep the remote summary charge while derived fetch-key chunks remain.
     control_retention: Option<RetentionLease>,
+}
+
+#[derive(Default)]
+struct ReconcileAdmission {
+    connection_ticket: Option<ReconcileTicket>,
+    connection_permit: Option<ReconcilePermit>,
+    traffic_ticket: Option<TrafficTicket>,
+}
+
+async fn traffic_changed(changes: &mut Option<watch::Receiver<u64>>) {
+    match changes {
+        Some(changes) => {
+            let _ = changes.changed().await;
+        }
+        None => std::future::pending::<()>().await,
+    }
 }
 
 fn requeue_in_flight(in_flight: &mut VecDeque<InflightBatch>, buffer: &mut VecDeque<RetainedOp>) {
@@ -1549,8 +1580,12 @@ pub(crate) fn spawn_node_sender(
     peer_id: String,
     config: SenderConfig,
     deps: SenderDeps,
-    options: SenderRuntimeOptions,
+    mut options: SenderRuntimeOptions,
 ) -> Result<NodeSender, SenderOptionsError> {
+    let config = match options.regional_runtime.clone() {
+        Some(regional) => regional.select(&peer_id, &config, &mut options),
+        None => config,
+    };
     config.validate()?;
     options.validate()?;
     let (data_tx, data_rx) = mpsc::channel(config.buffer_capacity);
@@ -1827,7 +1862,16 @@ async fn sender_task(
 
     let mut active_reconcile: Option<ReconcileRound> = None;
     let mut reconcile_credit_rx: Option<watch::Receiver<u64>> = None;
-    let mut reconcile_ticket: Option<ReconcileTicket> = None;
+    let mut reconcile_ticket = ReconcileAdmission::default();
+    let mut streaming_ticket: Option<TrafficTicket> = None;
+    let mut streaming_changes = runtime
+        .streaming_budget
+        .as_ref()
+        .map(|budget| budget.subscribe());
+    let mut reconcile_changes = runtime
+        .reconcile_budget
+        .as_ref()
+        .map(|budget| budget.subscribe());
     let mut next_round_id = 0_u64;
     let mut next_reset_epoch = 0_u64;
     let mut reconcile_rounds: u64 = 0;
@@ -1854,9 +1898,23 @@ async fn sender_task(
     let mut drain_state = SenderDrainState::default();
 
     loop {
+        // A queued sender must be able to use the next ordinary batch slot.
+        // Cancel its ticket while recovering, backing off or at its local cap;
+        // otherwise an ineligible FIFO head could strand unrelated senders.
+        let streaming_eligible = connection
+            .as_ref()
+            .is_some_and(|conn| conn.session_ready && conn.in_flight.len() < config.max_in_flight)
+            && !buffer.is_empty()
+            && active_reconcile.is_none()
+            && !pause_new_streaming
+            && matches!(delivery, DeliveryState::Streaming)
+            && retry_not_before.is_none_or(|deadline| Instant::now() >= deadline);
+        if !streaming_eligible {
+            streaming_ticket = None;
+        }
         if connection.is_none() {
             reconcile_credit_rx = None;
-            reconcile_ticket = None;
+            reconcile_ticket = ReconcileAdmission::default();
         }
         if let Some(drain) = drain_state.pending_preparation() {
             let ingress = &node_drain.ingress;
@@ -1872,7 +1930,7 @@ async fn sender_task(
                 buffer.clear();
                 active_reconcile = None;
                 reconcile_retry = None;
-                reconcile_ticket = None;
+                reconcile_ticket = ReconcileAdmission::default();
                 retry_not_before = None;
                 pause_new_streaming = false;
                 delivery = DeliveryState::Streaming;
@@ -2155,7 +2213,7 @@ async fn sender_task(
                             // notifications must not rotate live sessions.
                             continue;
                         }
-                        reconcile_ticket = None;
+                        reconcile_ticket = ReconcileAdmission::default();
                         if let Some(round) = active_reconcile.take() {
                             reconcile_retry = Some((Instant::now(), round.purpose));
                         }
@@ -2254,7 +2312,7 @@ async fn sender_task(
                         {
                             continue;
                         }
-                        reconcile_ticket = None;
+                        reconcile_ticket = ReconcileAdmission::default();
                         if let Some(round) = active_reconcile.take() {
                             reconcile_retry = Some((Instant::now(), round.purpose));
                         }
@@ -3141,7 +3199,12 @@ async fn sender_task(
                     }
                 }
             }
-            _ = batch_timer.tick() => {
+            _ = async {
+                tokio::select! {
+                    _ = batch_timer.tick() => {},
+                    _ = traffic_changed(&mut streaming_changes), if streaming_ticket.is_some() => {},
+                }
+            } => {
                 if matches!(delivery, DeliveryState::Reset { .. }) {
                     continue;
                 }
@@ -3181,6 +3244,15 @@ async fn sender_task(
                         (conn.session_id, conn.peer_tx.clone(), tracked_deadline)
                     }
                     _ => continue,
+                };
+                let traffic_permit = match runtime.streaming_budget.as_ref() {
+                    Some(budget) => {
+                        let ticket = streaming_ticket.get_or_insert_with(|| budget.ticket());
+                        let Some(permit) = ticket.try_acquire() else { continue; };
+                        streaming_ticket = None;
+                        Some(permit)
+                    }
+                    None => None,
                 };
                 let batch_seq = match connection.as_mut() {
                     Some(conn) => allocate_batch_seq(conn),
@@ -3223,6 +3295,7 @@ async fn sender_task(
                 if ok {
                     if let Some(conn) = connection.as_mut() {
                         conn.in_flight.push_back(InflightBatch {
+                            _traffic_permit: traffic_permit,
                             batch_seq,
                             ops,
                             kind: InflightKind::Streaming {
@@ -3400,6 +3473,11 @@ async fn sender_task(
                     reconcile_retry = Some((Instant::now(), purpose));
                 }
             }
+            _ = traffic_changed(&mut reconcile_changes), if reconcile_ticket.traffic_ticket.is_some() => {
+                if let Some((_, purpose)) = reconcile_retry {
+                    reconcile_retry = Some((Instant::now(), purpose));
+                }
+            }
             _ = consistency_timer.tick() => {
                 if drain_state.routine_reconcile_allowed()
                     && matches!(delivery, DeliveryState::Streaming)
@@ -3508,20 +3586,39 @@ async fn begin_reconcile(
     fragment: FragmentId,
     purpose: ReconcilePurpose,
     connection: &ActiveConnection,
-    reconcile_ticket: &mut Option<ReconcileTicket>,
+    admission: &mut ReconcileAdmission,
     next_round_id: &mut u64,
     phase_timeout: Duration,
 ) -> Result<Option<ReconcileRound>, ()> {
-    let connection_permit = match connection.peer_tx.peer.node_transport() {
-        Some(peer) => match peer.try_acquire_reconcile(reconcile_ticket)? {
-            Some(permit) => Some(permit),
-            None => return Ok(None),
-        },
-        None => {
-            *reconcile_ticket = None;
-            None
+    match connection.peer_tx.peer.node_transport() {
+        Some(peer) if admission.connection_permit.is_none() => {
+            let Some(permit) = peer.try_acquire_reconcile(&mut admission.connection_ticket)? else {
+                return Ok(None);
+            };
+            // Retain this connection's FIFO credit while waiting for WAN
+            // capacity, so acquisition/drop notifications cannot busy-loop.
+            admission.connection_permit = Some(permit);
         }
+        Some(_) => {}
+        None => {
+            admission.connection_ticket = None;
+            admission.connection_permit = None;
+        }
+    }
+    let traffic_permit = match connection.peer_tx.reconcile_budget.as_ref() {
+        Some(budget) => {
+            let ticket = admission
+                .traffic_ticket
+                .get_or_insert_with(|| budget.ticket());
+            let Some(permit) = ticket.try_acquire() else {
+                return Ok(None);
+            };
+            admission.traffic_ticket = None;
+            Some(permit)
+        }
+        None => None,
     };
+    let connection_permit = admission.connection_permit.take();
     let round_id = next_nonzero(next_round_id);
     let (recovery_epoch, recovery_replica_digest) =
         connection.peer_tx.recovery.as_ref().map_or_else(
@@ -3548,6 +3645,7 @@ async fn begin_reconcile(
         return Err(());
     }
     Ok(Some(ReconcileRound {
+        _traffic_permit: traffic_permit,
         session_id: connection.session_id,
         round_id,
         purpose,
@@ -3600,6 +3698,7 @@ async fn send_reconcile_barrier(
         return Err(());
     }
     connection.in_flight.push_back(InflightBatch {
+        _traffic_permit: None,
         batch_seq,
         ops: Vec::new(),
         kind: InflightKind::ReconcileBarrier,
@@ -4383,6 +4482,135 @@ mod tests {
     use crate::wire::message_field_len;
     use std::sync::atomic::{AtomicBool, Ordering};
 
+    #[test]
+    fn weak_or_missing_ack_cannot_release_wan_batch_ownership() {
+        let budget = TrafficBudget::new(1);
+        let permit = budget.ticket().try_acquire().unwrap();
+        let mut waiter = budget.ticket();
+        let (tx, _rx) = mpsc::channel(1);
+        let mut connection = ActiveConnection {
+            peer_tx: SenderPeer::new(ReplicationPeer::new(tx), &SenderRuntimeOptions::default()),
+            session_id: 1,
+            session_ready: true,
+            next_batch_seq: 2,
+            in_flight: VecDeque::from([InflightBatch {
+                _traffic_permit: Some(permit),
+                batch_seq: 1,
+                ops: vec![retained(op("key"))],
+                kind: InflightKind::Streaming {
+                    ack_deadline: Instant::now() + Duration::from_secs(1),
+                },
+                required_ack_durability: ReplicationAckDurability::StableCommitted,
+            }]),
+        };
+        assert!(matches!(
+            acknowledge_in_flight(
+                &mut connection,
+                99,
+                ReplicationAckDurability::StableCommitted
+            ),
+            InflightAckResult::Missing
+        ));
+        assert!(matches!(
+            acknowledge_in_flight(&mut connection, 1, ReplicationAckDurability::MemoryApplied),
+            InflightAckResult::BelowRequired { .. }
+        ));
+        assert!(waiter.try_acquire().is_none());
+        assert!(matches!(
+            acknowledge_in_flight(
+                &mut connection,
+                1,
+                ReplicationAckDurability::StableCommitted
+            ),
+            InflightAckResult::Accepted { .. }
+        ));
+        assert!(waiter.try_acquire().is_some());
+    }
+
+    #[test]
+    fn retry_releases_batch_credit_without_losing_owned_operations() {
+        let budget = TrafficBudget::new(1);
+        let mut batches = VecDeque::from([InflightBatch {
+            _traffic_permit: budget.ticket().try_acquire(),
+            batch_seq: 1,
+            ops: vec![retained(op("older"))],
+            kind: InflightKind::Streaming {
+                ack_deadline: Instant::now(),
+            },
+            required_ack_durability: ReplicationAckDurability::MemoryApplied,
+        }]);
+        let mut waiting = budget.ticket();
+        assert!(waiting.try_acquire().is_none());
+        let mut buffer = VecDeque::from([retained(op("newer"))]);
+        requeue_in_flight(&mut batches, &mut buffer);
+        assert!(waiting.try_acquire().is_some());
+        assert_eq!(
+            buffer.iter().map(|op| op.key.as_str()).collect::<Vec<_>>(),
+            vec!["older", "newer"]
+        );
+    }
+
+    #[tokio::test]
+    async fn wan_round_credit_is_separate_and_failed_sends_release_it() {
+        let streaming = TrafficBudget::new(1);
+        let _held_batch = streaming.ticket().try_acquire().unwrap();
+        let reconcile = TrafficBudget::new(1);
+        let runtime = SenderRuntimeOptions {
+            reconcile_budget: Some(reconcile.clone()),
+            ..Default::default()
+        };
+        let (tx, mut rx) = mpsc::channel(2);
+        let connection = ActiveConnection {
+            peer_tx: SenderPeer::new(ReplicationPeer::new(tx), &runtime),
+            session_id: 1,
+            session_ready: true,
+            next_batch_seq: 0,
+            in_flight: VecDeque::new(),
+        };
+        let mut admission = ReconcileAdmission::default();
+        let mut next_id = 0;
+        let first = begin_reconcile(
+            FragmentId(0),
+            ReconcilePurpose::Routine,
+            &connection,
+            &mut admission,
+            &mut next_id,
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let mut waiting = ReconcileAdmission::default();
+        assert!(begin_reconcile(
+            FragmentId(1),
+            ReconcilePurpose::Routine,
+            &connection,
+            &mut waiting,
+            &mut next_id,
+            Duration::from_secs(1)
+        )
+        .await
+        .unwrap()
+        .is_none());
+        rx.recv().await.unwrap();
+        drop(first);
+        drop(rx);
+        assert!(begin_reconcile(
+            FragmentId(1),
+            ReconcilePurpose::Routine,
+            &connection,
+            &mut waiting,
+            &mut next_id,
+            Duration::from_secs(1)
+        )
+        .await
+        .is_err());
+        assert!(
+            reconcile.ticket().try_acquire().is_some(),
+            "failed send leaked a round slot"
+        );
+    }
+
     fn op(key: &str) -> crate::actor::ReplicatedOp {
         crate::actor::ReplicatedOp {
             key: key.to_string(),
@@ -4520,6 +4748,7 @@ mod tests {
             aggregate: ByteBudget::new(charge),
         };
         let mut batches = VecDeque::from([InflightBatch {
+            _traffic_permit: None,
             batch_seq: 1,
             ops: vec![retention.borrowed(&value).unwrap()],
             kind: InflightKind::Streaming {
@@ -4537,6 +4766,7 @@ mod tests {
             session_ready: true,
             next_batch_seq: 2,
             in_flight: VecDeque::from([InflightBatch {
+                _traffic_permit: None,
                 batch_seq: 1,
                 ops: buffer.drain(..).collect(),
                 kind: InflightKind::Streaming {
@@ -5246,7 +5476,7 @@ mod tests {
             next_batch_seq: 0,
             in_flight: VecDeque::new(),
         };
-        let mut reconcile_ticket = None;
+        let mut reconcile_ticket = ReconcileAdmission::default();
         let mut next_round_id = 0;
         let mut active_reconcile = None;
         if drain_state.routine_reconcile_allowed() {
@@ -5528,6 +5758,7 @@ mod tests {
     fn requeue_in_flight_preserves_batches_ahead_of_newer_buffered_ops() {
         let mut in_flight = VecDeque::from([
             InflightBatch {
+                _traffic_permit: None,
                 batch_seq: 0,
                 ops: vec![retained(op("a")), retained(op("b"))],
                 kind: InflightKind::Streaming {
@@ -5536,6 +5767,7 @@ mod tests {
                 required_ack_durability: ReplicationAckDurability::MemoryApplied,
             },
             InflightBatch {
+                _traffic_permit: None,
                 batch_seq: 1,
                 ops: vec![retained(op("c"))],
                 kind: InflightKind::Streaming {
@@ -5851,7 +6083,7 @@ mod tests {
             in_flight: VecDeque::new(),
         };
         let mut first_round_id = 0;
-        let mut first_ticket = None;
+        let mut first_ticket = ReconcileAdmission::default();
         let first = begin_reconcile(
             FragmentId(0),
             ReconcilePurpose::Routine,
@@ -5866,7 +6098,7 @@ mod tests {
         assert_eq!(reconcile_gate.available_permits(), 0);
 
         let mut second_round_id = 0;
-        let mut second_ticket = None;
+        let mut second_ticket = ReconcileAdmission::default();
         assert!(
             begin_reconcile(
                 FragmentId(1),
@@ -5885,7 +6117,7 @@ mod tests {
         drop(first);
         assert_eq!(reconcile_gate.available_permits(), 1);
 
-        let mut incumbent_ticket = None;
+        let mut incumbent_ticket = ReconcileAdmission::default();
         assert!(
             begin_reconcile(
                 FragmentId(0),

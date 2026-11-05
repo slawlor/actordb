@@ -2,6 +2,12 @@
 
 ## 0.11.1 (unreleased)
 
+- Add opt-in regional replication profiles with higher in-region concurrency,
+  larger/lower-concurrency WAN batches, fair shared outgoing WAN batch/round
+  budgets, and actual usage inspection. Preserve ACK durability floors and
+  separate reconciliation capacity; stalled-fence tests verify caps across
+  fragments and peers while local replication continues.
+
 - Prefer same-region peers for point/batch reads, scans and SQL, with local
   serving preference and cross-region fallback. Region labels retain their
   write-acknowledgement role.
