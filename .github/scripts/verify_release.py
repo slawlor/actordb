@@ -17,7 +17,7 @@ VERSION_PATTERN = re.compile(
 
 # The workflow publishes these libraries together, in dependency order. Internal
 # workspace utilities must explicitly opt out of registry publication.
-PUBLISHED_PACKAGES = ("actordb-protocol", "actordb-query", "actordb", "actordb-client")
+PUBLISHED_PACKAGES = ("actordb-protocol", "actordb-query", "actordb-placement", "actordb", "actordb-client")
 
 
 class ReleaseError(Exception):

@@ -1399,7 +1399,7 @@ impl NodeRuntimeOptions {
         self.embedded_operation_byte_capacity
     }
 
-    /// Set the node-to-region map used by region acknowledgement requirements.
+    /// Set node-to-region labels for read preference and region acknowledgement requirements.
     /// Node IDs and region labels must each contain 1 to 255 UTF-8 bytes.
     /// Startup validates supplied entries. Ordinary writes permit an empty or
     /// partial map; region-constrained writes additionally validate the serving
@@ -2253,6 +2253,25 @@ impl Node {
         order
     }
 
+    /// Reads prefer this serving node, then peers in this node's configured
+    /// region, then all remaining replicas. Stable ordering within each tier
+    /// preserves placement preference and cross-region fallback.
+    fn read_replica_order(&self, frag: FragmentId) -> Vec<String> {
+        let mut order = self.replica_order(frag);
+        if let Some(region) = self.runtime_options.regions.get(&self.node_id) {
+            order.sort_by_key(|peer| {
+                if peer == &self.node_id {
+                    0
+                } else if self.runtime_options.regions.get(peer) == Some(region) {
+                    1
+                } else {
+                    2
+                }
+            });
+        }
+        order
+    }
+
     /// Outbound channel to `node_id`, if connected.
     async fn peer_sender(&self, node_id: &str) -> Option<PeerChannel> {
         self.peers.lock().await.get(node_id).cloned()
@@ -2454,7 +2473,7 @@ impl Node {
     }
 
     /// Read a key locally when this node serves the fragment; otherwise try
-    /// the configured replica holders in placement order. An unavailable
+    /// the configured replica holders in regional preference order. An unavailable
     /// holder is distinct from a valid not-found response.
     pub async fn get(&self, key: String) -> Result<Option<VersionedValue>, NodeError> {
         self.get_qualified_with_priority(Self::qualify_key(key), OpPriority::Default)
@@ -2539,7 +2558,7 @@ impl Node {
         // maps. Transport, timeout, malformed-response, and actor-unavailable
         // silence retry the next holder; a valid not-found is terminal.
         let frag = fragment_of(&key, self.router.fragment_count);
-        let replicas = self.replica_order(frag);
+        let replicas = self.read_replica_order(frag);
         if replicas.is_empty() {
             return Err(NodeError::Actor(format!("no replica for fragment {frag}")));
         }
@@ -3047,7 +3066,7 @@ impl Node {
                 local.push((i, key));
             } else {
                 let frag = fragment_of(&key, self.router.fragment_count);
-                if self.replica_order(frag).is_empty() {
+                if self.read_replica_order(frag).is_empty() {
                     results[i] = Some(Err(NodeError::Actor(format!(
                         "no replica for fragment {frag}"
                     ))));
@@ -3123,7 +3142,7 @@ impl Node {
 
                 let mut offset = 0usize;
                 let mut tried = Vec::new();
-                for owner in self.replica_order(frag) {
+                for owner in self.read_replica_order(frag) {
                     if offset == chunk.len() {
                         break;
                     }

@@ -45,10 +45,10 @@ def metadata(version="0.2.0"):
             {"name": "docker-tests", "id": "docker-tests-id", "version": "0.1.0", "publish": []},
             *[
                 {"name": name, "id": f"{name}-id", "version": version, "publish": None}
-                for name in ["actordb-protocol", "actordb-query", "actordb-client"]
+                for name in ["actordb-protocol", "actordb-query", "actordb-placement", "actordb-client"]
             ],
         ],
-        "workspace_members": ["actordb-id", "xtask-id", "docker-tests-id", "actordb-protocol-id", "actordb-query-id", "actordb-client-id"],
+        "workspace_members": ["actordb-id", "xtask-id", "docker-tests-id", "actordb-protocol-id", "actordb-query-id", "actordb-placement-id", "actordb-client-id"],
     }
 
 
@@ -103,7 +103,7 @@ class MetadataTests(unittest.TestCase):
         )
 
     def test_companions_must_match_the_core_version(self):
-        for name in ["actordb-protocol", "actordb-query", "actordb-client"]:
+        for name in ["actordb-protocol", "actordb-query", "actordb-placement", "actordb-client"]:
             for version in ["0.1.0", "0.2.0-rc.1", "0.2.0+build", None, "private-token\n"]:
                 value = metadata()
                 next(package for package in value["packages"] if package["name"] == name)["version"] = version
@@ -112,7 +112,7 @@ class MetadataTests(unittest.TestCase):
                 self.assertNotIn("private-token", str(caught.exception))
 
     def test_companions_must_be_present_once_and_in_the_workspace(self):
-        for name in ["actordb-protocol", "actordb-query", "actordb-client"]:
+        for name in ["actordb-protocol", "actordb-query", "actordb-placement", "actordb-client"]:
             for mutation in ["missing", "duplicate", "outside_workspace"]:
                 value = metadata()
                 package = next(package for package in value["packages"] if package["name"] == name)

@@ -599,7 +599,7 @@ impl Node {
                     holders.push(Holder::Local(actor));
                 }
             }
-            for owner in self.replica_order(fragment) {
+            for owner in self.read_replica_order(fragment) {
                 if owner == self.node_id {
                     continue;
                 }

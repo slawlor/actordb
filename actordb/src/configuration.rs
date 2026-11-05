@@ -107,7 +107,7 @@ struct TomlNodeConfig {
     table_pool_capacity: Option<usize>,
     replication: Option<TomlReplicationConfig>,
     members: std::collections::HashMap<String, String>,
-    fragment_map: std::collections::HashMap<u32, Vec<String>>,
+    fragment_map: std::collections::HashMap<String, Vec<String>>,
 }
 
 #[cfg(feature = "toml")]
@@ -221,8 +221,18 @@ impl ConfigurationProvider for TomlConfigProvider {
         config.fragment_map = values
             .fragment_map
             .into_iter()
-            .map(|(fragment, replicas)| (crate::shard::FragmentId(fragment), replicas))
-            .collect();
+            .map(|(fragment, replicas)| {
+                let id = fragment.parse::<u32>().map_err(|error| {
+                    ConfigurationError::Invalid(format!("fragment id {fragment:?}: {error}"))
+                })?;
+                if fragment != id.to_string() {
+                    return Err(ConfigurationError::Invalid(format!(
+                        "fragment id {fragment:?} must be a canonical unsigned integer"
+                    )));
+                }
+                Ok((crate::shard::FragmentId(id), replicas))
+            })
+            .collect::<Result<_, ConfigurationError>>()?;
         Ok(config)
     }
 }

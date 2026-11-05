@@ -1,0 +1,26 @@
+[package]
+name = "actordb-placement"
+version = "0.11.1"
+edition = "2021"
+rust-version = "1.88"
+description = "Portable workload sizing and regional placement planning for ActorDB"
+license = "MIT"
+repository = "https://github.com/slawlor/actordb"
+readme = "README.md"
+
+[features]
+default = []
+cli = ["dep:serde_json", "dep:toml"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", optional = true }
+toml = { version = "1.1", optional = true }
+
+[dev-dependencies]
+tempfile = "3"
+
+[[bin]]
+name = "actordb-plan"
+path = "src/main.rs"
+required-features = ["cli"]

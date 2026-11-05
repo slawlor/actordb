@@ -10,7 +10,7 @@
 //! For each fragment the coordinator scans in-process when it holds the
 //! fragment locally through bounded query pages on the fragment's background
 //! pool, and otherwise forwards `QueryPageRequest` to one replica holder from
-//! `replica_order(frag)` — the same pattern as `ForwardedGet`. Holders are
+//! `read_replica_order(frag)` — the same pattern as `ForwardedGet`. Holders are
 //! retried in order on failure; exactly one holder is contacted per
 //! fragment, so replicas (which converge via LWW) never double-count.
 //!
@@ -207,7 +207,7 @@ impl Node {
     /// This node coordinates: each fragment is scanned once, from a single
     /// holder — in-process through bounded query pages when held locally,
     /// otherwise via forwarded query pages to the first reachable
-    /// holder in `replica_order` (same pattern as `ForwardedGet`). Remote
+    /// holder in `read_replica_order` (same pattern as `ForwardedGet`). Remote
     /// holders are retried in order; if none answers, the whole scan fails
     /// with [`ScanError::FragmentsUnavailable`]. v1 never returns partial
     /// results.

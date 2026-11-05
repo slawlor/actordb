@@ -7,9 +7,9 @@ does not upload anything. GitHub prereleases are intentionally excluded.
 
 ## Prepare a version PR
 
-1. Bump all four library manifests (`actordb`, `actordb-protocol`,
-   `actordb-query`, and `actordb-client`) together and update their version
-   requirements. The current workflow publishes all four selected packages;
+1. Bump all five library manifests (`actordb`, `actordb-protocol`,
+   `actordb-query`, `actordb-placement`, and `actordb-client`) together and update their version
+   requirements. The current workflow publishes all five selected packages;
    every selected version must be new because crates.io versions are immutable.
    Dependency requirements remain compatible semver
    ranges; this library workspace does not commit `Cargo.lock`. The internal `xtask`
@@ -27,9 +27,9 @@ does not upload anything. GitHub prereleases are intentionally excluded.
    python3 -m unittest discover -s .github/scripts -p 'test_*.py' -v
    python3 .github/scripts/verify_release.py
    package_target_dir=$(mktemp -d)
-   cargo publish --dry-run --package actordb-protocol --package actordb-query --package actordb --package actordb-client --registry crates-io --target-dir "$package_target_dir"
-   cargo publish --dry-run --package actordb-protocol --package actordb-query --package actordb --package actordb-client --registry crates-io --features actordb/memory --target-dir "$package_target_dir"
-   cargo package --package actordb-protocol --package actordb-query --package actordb --package actordb-client --target-dir "$package_target_dir"
+   cargo publish --dry-run --package actordb-protocol --package actordb-query --package actordb-placement --package actordb --package actordb-client --registry crates-io --target-dir "$package_target_dir"
+   cargo publish --dry-run --package actordb-protocol --package actordb-query --package actordb-placement --package actordb --package actordb-client --registry crates-io --features actordb/memory --target-dir "$package_target_dir"
+   cargo package --package actordb-protocol --package actordb-query --package actordb-placement --package actordb --package actordb-client --target-dir "$package_target_dir"
    ```
 
    These commands do not publish and need no registry token. Cargo verifies the
@@ -144,8 +144,8 @@ verify the registry before retrying; use a new version for content changes.
 Release uploads use explicit index-readiness barriers, following ractor's
 publish/wait/dependent-publish sequence:
 
-1. Publish `actordb-protocol` and `actordb-query`.
-2. Wait until both exact release versions appear in the public Cargo index.
+1. Publish `actordb-protocol`, `actordb-query`, and `actordb-placement`.
+2. Wait until all three exact release versions appear in the public Cargo index.
 3. Publish `actordb`.
 4. Verify protocol, query, and database versions are indexed, then publish
    `actordb-client`.
@@ -161,5 +161,5 @@ Transient registry errors are retried; an unavailable version fails the job.
 These barriers and uploads run only on a published release. PR/main jobs
 perform package dry-runs and exercise the guards with simulated registry
 responses. No credential is supplied to index polling. The release guard
-requires all four published libraries to share the release version and keeps
+requires all five published libraries to share the release version and keeps
 internal workspace tools nonpublishable.

@@ -1,5 +1,10 @@
 # actordb benchmarks
 
+The process-isolated `fragment_capacity` example adds manual host/fragment
+calibration with idle/loaded memory, CPU, latency, query and replication
+measurements. See [placement planning](../../docs/placement-planning.md) for
+commands and the limits of its generated host profile.
+
 Criterion benchmarks for operation performance. These are **manual/local only**
 — deliberately not in CI (too heavy, too noisy for shared runners).
 

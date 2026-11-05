@@ -2,6 +2,18 @@
 
 ## 0.11.1 (unreleased)
 
+- Prefer same-region peers for point/batch reads, scans and SQL, with local
+  serving preference and cross-region fallback. Region labels retain their
+  write-acknowledgement role.
+- Add the portable `actordb-placement` workload/capacity library and optional
+  `actordb-plan` CLI: regional/zone placement, explicit coverage gaps, estimated
+  host fragment limits, resource/traffic reports, observed-load rebalancing,
+  and bounded readiness-gated overlap transitions. Add host calibration and
+  [local smoke measurements](docs/benchmarks/fragment-capacity-smoke.md).
+- Fix TOML fragmap loading to parse canonical decimal string table keys; the
+  planner exports compatible TOML and separate JSON reports. Include the new
+  library in workspace validation and dependency-ordered release checks.
+
 - Index replication senders by fragment so mutation fanout visits only that
   fragment's replicas (#190). Preserve exact sender identity, retirement and
   admission fences under the existing registry mutex, and remove empty buckets.

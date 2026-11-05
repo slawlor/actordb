@@ -44,6 +44,24 @@ use std::sync::RwLock;
 use crate::shard::FragmentId;
 use crate::wire::MAX_WIRE_NODE_ID_BYTES;
 
+/// Portable capacity estimates, regional placement recommendations, and
+/// readiness-gated transitions for external placement controllers.
+pub use actordb_placement as planner;
+
+/// Convert a planner map into the map accepted by NodeConfig and controllers.
+pub fn from_planner_map(map: &planner::FragmentMap) -> HashMap<FragmentId, Vec<String>> {
+    map.iter()
+        .map(|(fragment, replicas)| (FragmentId(*fragment), replicas.clone()))
+        .collect()
+}
+
+/// Convert an observed or configured placement into a portable planner map.
+pub fn to_planner_map(map: &HashMap<FragmentId, Vec<String>>) -> planner::FragmentMap {
+    map.iter()
+        .map(|(fragment, replicas)| (fragment.0, replicas.clone()))
+        .collect()
+}
+
 /// Source of truth for fragment placement.
 ///
 /// Implement this to drive placement from outside the node: a cluster
