@@ -13,8 +13,11 @@ Routing is three deterministic steps, computed locally on every node:
    `HashMap<FragmentId, Vec<String>>` mapping each fragment to its replica node
    ids. In static mode this is `NodeConfig.fragment_map` (empty = this node
    serves all fragments, i.e. single-node / full replication).
-3. **Replica preference**: `replica_order(frag)` — this node first *if it
-   currently serves the fragment*, then the other replicas in map order.
+3. **Replica preference**: reads use `read_replica_order(frag)` — this node
+   first *if it currently serves the fragment*, then other replicas in its
+   configured region, then remaining replicas. Map order is stable within
+   each tier. Missing the current node's region retains ordinary map order.
+   Writes use `replica_order(frag)`: serving local node, then map order.
 
 There is **no consistent hashing** anywhere in the codebase — no hash ring, no
 rendezvous hashing, no virtual nodes. The keyspace split is plain
@@ -25,6 +28,12 @@ Within a priority pool, a key's operations sticky-route to one worker
 reports the exact LWW apply outcome (see [Consistency](consistency.md)).
 
 ## Static placement (default)
+
+The map is a Rust `HashMap<FragmentId, Vec<String>>`; the optional TOML provider
+loads decimal keys under `[fragment_map]`. The portable `actordb-placement`
+library and CLI recommend or evaluate regional assignments from workload and
+host estimates. See [placement planning](placement-planning.md) for formats,
+read locality, fragment sizing, calibration and controller integration.
 
 With no `placement_controller` configured, each node routes by its
 `fragment_map`. The map must be **identical on every node**. After the

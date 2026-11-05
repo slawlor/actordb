@@ -4,6 +4,7 @@ members = [
     "actordb-protocol",
     "actordb-query",
     "actordb-client",
+    "actordb-placement",
     "docker-tests",
     "docker-client-tests",
     "xtask"

@@ -53,10 +53,22 @@ batch_interval_ms = 100
 
 [members]
 node-b = "127.0.0.1:7447"
+
+[fragment_map]
+0 = ["node-a", "node-b"]
+1 = ["node-a", "node-b"]
+2 = ["node-a", "node-b"]
+3 = ["node-a", "node-b"]
 ```
 
 The TOML adapter is intentionally static; implement `ConfigurationProvider`
 directly when configuration must be fetched or refreshed dynamically.
+
+Fragment map keys are canonical decimal u32 IDs. Region labels remain runtime
+options supplied through `NodeRuntimeOptions::with_regions`; they now influence
+read preference as well as optional regional write acknowledgements. The
+[placement planner](placement-planning.md) emits compatible TOML maps and
+separate JSON capacity reports.
 
 The independent `memory` feature only exposes the no-op `MemoryStore` test
 double, not an in-memory database backend or durable storage. Custom `KvStore`

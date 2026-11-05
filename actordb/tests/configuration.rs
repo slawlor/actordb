@@ -35,3 +35,32 @@ async fn toml_provider_overlays_defaults_and_parses_members() {
     assert_eq!(config.replication.batch_size, 200);
     assert_eq!(config.members.len(), 1);
 }
+
+#[cfg(feature = "toml")]
+#[tokio::test]
+async fn toml_fragment_map_accepts_numeric_table_keys_and_rejects_aliases() {
+    use actordb::configuration::TomlConfigProvider;
+    use actordb::shard::FragmentId;
+    use std::io::Write;
+    let mut file = tempfile::NamedTempFile::new().unwrap();
+    file.write_all(b"fragment_count = 2\n[fragment_map]\n0 = [\"east-a\", \"west-a\"]\n1 = [\"east-b\", \"west-b\"]\n").unwrap();
+    let config = TomlConfigProvider::from_path(file.path())
+        .resolve()
+        .await
+        .unwrap();
+    assert_eq!(
+        config.fragment_map[&FragmentId(0)],
+        vec!["east-a", "west-a"]
+    );
+    assert_eq!(config.fragment_map.len(), 2);
+    file.as_file_mut().set_len(0).unwrap();
+    std::fs::write(
+        file.path(),
+        "fragment_count = 1\n[fragment_map]\n\"00\" = [\"a\"]\n",
+    )
+    .unwrap();
+    assert!(TomlConfigProvider::from_path(file.path())
+        .resolve()
+        .await
+        .is_err());
+}

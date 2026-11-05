@@ -200,6 +200,8 @@ percentage/lag fields and no-op tombstone collection are absent.
 - [Architecture](docs/architecture.md) and [API](docs/api.md)
 - [Configuration](docs/configuration.md), [routing/placement](docs/routing-placement.md)
   and [operations](docs/operations.md)
+- [Regional placement and workload sizing](docs/placement-planning.md),
+  [portable planner/CLI](actordb-placement/README.md)
 - [Replication](docs/replication.md), [consistency](docs/consistency.md)
   and [tombstones](docs/tombstones.md)
 - [Persistence](docs/persistence.md), [checkpoints](docs/stable-checkpoints.md)

@@ -48,7 +48,7 @@ jobs:
           print('External client links only SDK dependencies.')
           PY
       - name: Test portable query and protocol contracts
-        run: cargo test --package actordb-query --package actordb-protocol
+        run: cargo test --package actordb-query --package actordb-protocol --package actordb-placement --features actordb-placement/cli
       - name: Verify generated protocol bindings match the schemas
         run: cargo run --package actordb-protocol --features codegen --bin generate -- --check
 
