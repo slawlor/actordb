@@ -55,6 +55,14 @@ fn validate_profile(p: &HostProfile) -> Result<(), PlannerError> {
 fn validate_input(input: &PlannerInput) -> Result<(), PlannerError> {
     let w = &input.workload;
     let p = &input.policy;
+    // Even before table/version/framing overhead, this average geometry could
+    // not fit ActorDB's 16 MiB replicated-record envelope. Smaller averages do
+    // not certify that every individual record fits the actual wire encoding.
+    if w.average_key_bytes.saturating_add(w.average_value_bytes) >= 16 * 1024 * 1024 {
+        return Err(error(
+            "average key/value geometry cannot fit the 16 MiB replication envelope",
+        ));
+    }
     validate_profile(&input.host_profile)?;
     if p.regions.is_empty()
         || p.replicas_per_region == 0
@@ -442,14 +450,29 @@ pub fn recommend(input: &PlannerInput) -> Result<Plan, PlannerError> {
         let proposed_peak = peak(&plan);
         let repairs = coverage_score(&plan) < coverage_score(&previous)
             || unavailable_replicas(current, &hosts)
-                > unavailable_replicas(&plan.fragment_map, &hosts);
+                > unavailable_replicas(&plan.fragment_map, &hosts)
+            || replica_deviation(
+                current,
+                plan.replica_count
+                    .min(hosts.iter().filter(|h| h.available).count()),
+            ) > replica_deviation(
+                &plan.fragment_map,
+                plan.replica_count
+                    .min(hosts.iter().filter(|h| h.available).count()),
+            );
         let improvement = if previous_peak > 0.0 {
             (previous_peak - proposed_peak) / previous_peak
         } else {
             0.0
         };
+        let overloaded = previous_peak > 1.0 - input.policy.spare_capacity_fraction
+            || previous
+                .host_estimates
+                .iter()
+                .any(|h| h.fragments > h.recommended_fragment_limit);
         if !repairs
-            && (improvement <= input.policy.rebalance_improvement || proposed_peak >= previous_peak)
+            && (proposed_peak >= previous_peak
+                || (!overloaded && improvement <= input.policy.rebalance_improvement))
         {
             return Ok(previous);
         }
@@ -487,6 +510,12 @@ pub fn recommend(input: &PlannerInput) -> Result<Plan, PlannerError> {
 fn same_replicas(a: &[String], b: &[String]) -> bool {
     a.iter().collect::<BTreeSet<_>>() == b.iter().collect::<BTreeSet<_>>()
 }
+
+fn replica_deviation(map: &FragmentMap, desired: usize) -> usize {
+    map.values()
+        .map(|replicas| replicas.len().abs_diff(desired))
+        .sum()
+}
 fn unavailable_replicas(map: &FragmentMap, hosts: &[Host]) -> usize {
     map.values()
         .flatten()
@@ -513,6 +542,155 @@ fn coverage_score(plan: &Plan) -> (usize, usize) {
     )
 }
 
+#[derive(Clone, Copy, Default)]
+struct ResourceLoad {
+    memory: f64,
+    cpu: f64,
+    disk: f64,
+    network: f64,
+    disk_writes: f64,
+}
+
+impl ResourceLoad {
+    fn add(self, other: Self) -> Self {
+        Self {
+            memory: self.memory + other.memory,
+            cpu: self.cpu + other.cpu,
+            disk: self.disk + other.disk,
+            network: self.network + other.network,
+            disk_writes: self.disk_writes + other.disk_writes,
+        }
+    }
+
+    fn peak(self, profile: &HostProfile) -> f64 {
+        (self.memory / profile.ram_bytes as f64)
+            .max(self.cpu / profile.cpu_cores)
+            .max(self.disk / profile.disk_bytes as f64)
+            .max(self.network / profile.network_bytes_per_second)
+            .max(self.disk_writes / profile.disk_write_bytes_per_second)
+    }
+}
+
+/// Account for all placement resources, including actual regional ingress.
+/// Provisional choices reserve read shares for the remaining planned regional
+/// copies. Completed fragments use their actual replica set, so subsequent
+/// choices see the same resource model as the final assessment.
+struct ResourceEstimator<'a> {
+    input: &'a PlannerInput,
+    hosts: &'a [Host],
+    count: u32,
+    traffic_weights: BTreeMap<String, f64>,
+}
+
+impl ResourceEstimator<'_> {
+    fn fragment(
+        &self,
+        fragment: u32,
+        replicas: &[usize],
+        expected_copies: usize,
+        regional_goals: Option<&BTreeMap<&str, usize>>,
+    ) -> Vec<(usize, ResourceLoad)> {
+        let input = self.input;
+        let hosts = self.hosts;
+        let count = self.count;
+        let traffic_weights = &self.traffic_weights;
+        let units: Vec<Unit> = replicas
+            .iter()
+            .map(|i| unit(input, fragment, count, profile(input, &hosts[*i])))
+            .collect();
+        let mut loads: Vec<ResourceLoad> = replicas
+            .iter()
+            .enumerate()
+            .map(|(position, i)| {
+                let p = profile(input, &hosts[*i]);
+                let u = units[position];
+                ResourceLoad {
+                    memory: u.data
+                        + fixed_bytes(input, p, expected_copies)
+                        + u.writes
+                            * write_wire(input, p)
+                            * p.replication_backlog_seconds
+                            * expected_copies.saturating_sub(1) as f64,
+                    cpu: u.writes * write_cpu(input, p) / 1_000_000.0 + p.fragment_idle_cpu_cores,
+                    disk: if durable(input) {
+                        u.data / p.resident_data_multiplier * p.disk_data_multiplier
+                    } else {
+                        0.0
+                    },
+                    disk_writes: if durable(input) {
+                        u.writes * write_wire(input, p) * p.disk_data_multiplier
+                    } else {
+                        0.0
+                    },
+                    network: u.data * 2.0 / input.policy.recovery_window_seconds,
+                }
+            })
+            .collect();
+        let mut source_shares = vec![0.0; replicas.len()];
+        for (origin, weight) in traffic_weights {
+            let mut readers: Vec<usize> = replicas
+                .iter()
+                .enumerate()
+                .filter(|(_, i)| &hosts[**i].region == origin)
+                .map(|(position, _)| position)
+                .collect();
+            let planned = regional_goals
+                .and_then(|goals| goals.get(origin.as_str()))
+                .copied()
+                .unwrap_or(0);
+            if readers.is_empty() {
+                if planned > 0 {
+                    continue;
+                }
+                readers.push(0);
+            }
+            let share = weight / readers.len().max(planned) as f64;
+            for position in readers {
+                let p = profile(input, &hosts[replicas[position]]);
+                let u = units[position];
+                source_shares[position] += share;
+                loads[position].cpu += share
+                    * (u.reads * p.point_read_cpu_us
+                        + u.examined * p.examined_record_cpu_us
+                        + u.query_requests * p.query_fragment_cpu_us)
+                    / 1_000_000.0;
+                loads[position].network += share
+                    * (u.reads * write_wire(input, p)
+                        + u.writes * write_wire(input, p)
+                        + u.query_result)
+                    + 2.0
+                        * share
+                        * (u.query_internal_result
+                            + u.query_requests * p.wire_overhead_bytes as f64);
+            }
+        }
+        let missing_share = (1.0 - source_shares.iter().sum::<f64>()).max(0.0);
+        let source_bytes: Vec<f64> = replicas
+            .iter()
+            .enumerate()
+            .map(|(position, i)| {
+                source_shares[position]
+                    * units[position].writes
+                    * write_wire(input, profile(input, &hosts[*i]))
+            })
+            .collect();
+        let total_source_bytes: f64 = source_bytes.iter().sum();
+        for (position, i) in replicas.iter().enumerate() {
+            let outgoing = source_bytes[position] * expected_copies.saturating_sub(1) as f64;
+            let incoming = if expected_copies > 1 {
+                total_source_bytes - source_bytes[position]
+                    + missing_share
+                        * units[position].writes
+                        * write_wire(input, profile(input, &hosts[*i]))
+            } else {
+                0.0
+            };
+            loads[position].network += outgoing + incoming;
+        }
+        replicas.iter().copied().zip(loads).collect()
+    }
+}
+
 fn build_map(input: &PlannerInput, hosts: &[Host], count: u32) -> FragmentMap {
     let live: Vec<usize> = hosts
         .iter()
@@ -522,7 +700,19 @@ fn build_map(input: &PlannerInput, hosts: &[Host], count: u32) -> FragmentMap {
         .collect();
     let count_copies = copies(input).min(live.len());
     let mut assigned = vec![0u32; hosts.len()];
-    let mut scores = vec![0.0; hosts.len()];
+    let mut loads: Vec<ResourceLoad> = hosts
+        .iter()
+        .map(|host| ResourceLoad {
+            memory: profile(input, host).node_overhead_bytes as f64,
+            ..ResourceLoad::default()
+        })
+        .collect();
+    let estimator = ResourceEstimator {
+        input,
+        hosts,
+        count,
+        traffic_weights: weights(input),
+    };
     let mut map = FragmentMap::new();
     let mut fragments: Vec<u32> = (0..count).collect();
     // Place measured large/hot fragments first, retaining stable ID tie breaks.
@@ -546,62 +736,66 @@ fn build_map(input: &PlannerInput, hosts: &[Host], count: u32) -> FragmentMap {
                 );
             }
         }
+        let mut regional_goals: BTreeMap<&str, usize> = BTreeMap::new();
+        for region in desired_regions.iter().take(count_copies) {
+            let available = live
+                .iter()
+                .filter(|i| hosts[**i].region.as_str() == region.as_str())
+                .count();
+            let copies = regional_goals.entry(region.as_str()).or_default();
+            if *copies < available {
+                *copies += 1;
+            }
+        }
         for slot in 0..count_copies {
             let desired = desired_regions.get(slot).copied();
-            let cost = |i: usize| {
-                let p = profile(input, &hosts[i]);
-                let u = unit(input, fragment, count, p);
-                let memory = (u.data
-                    + fixed_bytes(input, p, count_copies)
-                    + u.writes
-                        * write_wire(input, p)
-                        * p.replication_backlog_seconds
-                        * count_copies.saturating_sub(1) as f64)
-                    / p.ram_bytes as f64;
-                let cpu = (u.writes * write_cpu(input, p)
-                    + u.reads * p.point_read_cpu_us / count_copies as f64
-                    + u.examined * p.examined_record_cpu_us / count_copies as f64
-                    + u.query_requests * p.query_fragment_cpu_us / count_copies as f64)
-                    / 1_000_000.0
-                    + p.fragment_idle_cpu_cores;
-                let network =
-                    u.writes * write_wire(input, p) * count_copies.saturating_sub(1) as f64
-                        + u.data * 2.0 / input.policy.recovery_window_seconds;
-                memory
-                    .max(cpu / p.cpu_cores)
-                    .max(network / p.network_bytes_per_second)
-            };
             let target = 1.0 - input.policy.spare_capacity_fraction;
             let best = live
                 .iter()
                 .copied()
                 .filter(|i| !chosen.contains(i))
+                .map(|i| {
+                    let h = &hosts[i];
+                    let mut candidate = chosen.clone();
+                    candidate.push(i);
+                    let resources = estimator.fragment(
+                        fragment,
+                        &candidate,
+                        count_copies,
+                        Some(&regional_goals),
+                    );
+                    let mut projected = 0.0_f64;
+                    let mut exceeds = false;
+                    for (owner, cost) in resources {
+                        let p = profile(input, &hosts[owner]);
+                        let peak = loads[owner].add(cost).peak(p);
+                        projected = projected.max(peak);
+                        exceeds |= peak > target || assigned[owner] >= p.max_fragments_per_host;
+                    }
+                    let wrong_region = desired.is_some_and(|r| &h.region != r);
+                    let repeated_zone = h.zone.as_ref().is_none_or(|z| {
+                        chosen.iter().any(|j| {
+                            hosts[*j].region == h.region && hosts[*j].zone.as_ref() == Some(z)
+                        })
+                    });
+                    (i, (exceeds, wrong_region, repeated_zone, projected))
+                })
                 .min_by(|a, b| {
-                    let rank = |i: usize| {
-                        let h = &hosts[i];
-                        let p = profile(input, h);
-                        let projected = scores[i] + cost(i);
-                        let exceeds = projected > target || assigned[i] >= p.max_fragments_per_host;
-                        let wrong_region = desired.is_some_and(|r| &h.region != r);
-                        let repeated_zone = h.zone.as_ref().is_none_or(|z| {
-                            chosen.iter().any(|j| {
-                                hosts[*j].region == h.region && hosts[*j].zone.as_ref() == Some(z)
-                            })
-                        });
-                        (exceeds, wrong_region, repeated_zone, projected, &h.id)
-                    };
-                    let ra = rank(*a);
-                    let rb = rank(*b);
+                    let ra = a.1;
+                    let rb = b.1;
                     ra.0.cmp(&rb.0)
                         .then(ra.1.cmp(&rb.1))
                         .then(ra.2.cmp(&rb.2))
                         .then(ra.3.total_cmp(&rb.3))
-                        .then(ra.4.cmp(rb.4))
+                        .then(hosts[a.0].id.cmp(&hosts[b.0].id))
                 })
-                .expect("available unique replicas");
-            scores[best] += cost(best);
-            assigned[best] += 1;
+                .expect("available unique replicas")
+                .0;
             chosen.push(best);
+        }
+        for (owner, cost) in estimator.fragment(fragment, &chosen, count_copies, None) {
+            loads[owner] = loads[owner].add(cost);
+            assigned[owner] += 1;
         }
         map.insert(
             fragment,
@@ -652,7 +846,11 @@ fn assess(
         .map(|h| HostEstimate {
             id: h.id.clone(),
             region: h.region.clone(),
-            resident_bytes: profile(input, h).node_overhead_bytes as f64,
+            resident_bytes: if h.available {
+                profile(input, h).node_overhead_bytes as f64
+            } else {
+                0.0
+            },
             ..HostEstimate::default()
         })
         .collect();
@@ -860,6 +1058,13 @@ fn assess(
     }
     if map.values().any(|replicas| replicas.len() < copies(input)) {
         warnings.push("Insufficient distinct hosts for the requested total replica count.".into());
+    }
+    let excess = map
+        .values()
+        .filter(|replicas| replicas.len() > copies(input))
+        .count();
+    if excess > 0 {
+        warnings.push(format!("{excess} fragment replica sets exceed the {}-copy limit; finish bounded placement transitions before reevaluating.",copies(input)));
     }
     if unavailable_replicas(&map, hosts) > 0 {
         warnings.push("Placement contains unavailable replicas; their copies do not count toward reliability.".into());
