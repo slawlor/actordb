@@ -132,6 +132,10 @@ into your workload input first. The JSON report is not a Node configuration file
 
 ## Fragments per host and calibration
 
+The [M4 laptop calibration](benchmarks/laptop-sizing.md) contains repeatable RAM,
+CPU, RPC and real RocksDB measurements, independent holdouts, and named profiles
+loadable with `actordb-plan --profile`. Portable sizing defaults remain assumptions.
+
 With current Node defaults, one fragment starts 16 worker actors (base and KV
 pool sets, each with 2 high + 4 normal + 2 background workers) and four actors for
 supervision, dispatch and maintenance. Each additional resident named table adds

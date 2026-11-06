@@ -71,6 +71,16 @@ fragment-query overhead, and a 128-fragment policy ceiling. These are editable
 planning assumptions, not measured ActorDB throughput or supported maximums.
 The report retains the complete profile and workload used for its estimates.
 
+The [laptop sizing measurements](../docs/benchmarks/laptop-sizing.md) provide
+hardware-specific templates. Add `--profile PROFILE.json` to recommend/evaluate
+to load one without rewriting the workload. Per-host overrides remain explicit.
+Calibrated profiles separate resident key/index copies from physical storage
+encoding, charge fixed backend disk reserves, and can limit immediate committed
+write throughput independently of CPU and byte bandwidth. Measured mean
+`replication_batch_operations` reduces peer fence demand; the default one is
+conservative. `queries[].examined_record_cpu_us` optionally supplies a measured
+cost for a specific query/hardware shape.
+
 Average key/value geometry that cannot fit the 16 MiB replication envelope is
 rejected before sizing. Smaller averages still require per-record wire checks;
 large keys/table names and size-distribution tails consume additional overhead.

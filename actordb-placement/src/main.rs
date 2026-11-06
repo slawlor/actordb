@@ -6,12 +6,13 @@ use std::io::Read;
 
 const USAGE: &str = "Usage:
   actordb-plan example
-  actordb-plan recommend INPUT.json [--json | --toml]
-  actordb-plan evaluate INPUT.json MAP_OR_PLAN.json [--json | --toml]
+  actordb-plan recommend INPUT.json [--profile PROFILE.json] [--json | --toml]
+  actordb-plan evaluate INPUT.json MAP_OR_PLAN.json [--profile PROFILE.json] [--json | --toml]
 
 Without a format flag, prints a readable capacity and placement report.
 --toml emits NodeConfig fragment_count and [fragment_map] only.
 --json emits the complete report, including generated hosts and assumptions.
+--profile replaces the input's default host profile; per-host overrides remain.
 The tool recommends offline; it never connects to or changes a database.";
 
 fn read_json<T: serde::de::DeserializeOwned>(path: &str) -> Result<T, Box<dyn Error>> {
@@ -45,14 +46,23 @@ fn run() -> Result<(), Box<dyn Error>> {
         "evaluate" => 3,
         _ => return Err(USAGE.into()),
     };
-    if args.len() < positional || args.len() > positional + 1 {
+    if args.len() < positional {
         return Err(USAGE.into());
     }
-    let format = args.get(positional).map(String::as_str).unwrap_or("text");
-    if !["text", "--json", "--toml"].contains(&format) {
-        return Err(USAGE.into());
+    let mut format = "text";
+    let mut profile = None;
+    let mut flags = args[positional..].iter();
+    while let Some(flag) = flags.next() {
+        match flag.as_str() {
+            "--json" | "--toml" if format == "text" => format = flag.as_str(),
+            "--profile" if profile.is_none() => profile = Some(flags.next().ok_or(USAGE)?),
+            _ => return Err(USAGE.into()),
+        }
     }
-    let input: PlannerInput = read_json(&args[1])?;
+    let mut input: PlannerInput = read_json(&args[1])?;
+    if let Some(profile) = profile {
+        input.host_profile = read_json(profile)?;
+    }
     let plan = if args[0] == "recommend" {
         recommend(&input)?
     } else {

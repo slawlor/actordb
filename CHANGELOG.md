@@ -2,6 +2,13 @@
 
 ## 0.11.1 (unreleased)
 
+- Add repeatable laptop sizing probes and calibrated M4 profiles with independent
+  memory holdouts, direct/RPC CPU measurements and real RocksDB WAL fences.
+  Separate encoded-key/index memory from physical storage, charge backend disk
+  reserves, and model measured store/stable write completion limits and observed
+  replication batch sizes. Add query-specific record CPU overrides and CLI
+  `--profile` loading; keep portable defaults uncalibrated.
+
 - Complete planner capacity constraints with disk/disk-write-aware and regional
   traffic-aware placement scoring. Apply bounded copy-count and overloaded-host
   repairs despite ordinary rebalance hysteresis, and exclude unavailable hosts

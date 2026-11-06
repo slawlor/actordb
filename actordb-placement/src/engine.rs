@@ -33,9 +33,17 @@ fn validate_profile(p: &HostProfile) -> Result<(), PlannerError> {
         ("examined_record_cpu_us", p.examined_record_cpu_us),
         ("query_fragment_cpu_us", p.query_fragment_cpu_us),
         ("resident_data_multiplier", p.resident_data_multiplier),
+        ("key_memory_multiplier", p.key_memory_multiplier),
+        ("storage_key_multiplier", p.storage_key_multiplier),
         ("disk_data_multiplier", p.disk_data_multiplier),
     ] {
         positive(name, value)?;
+    }
+    for capacity in [p.store_write_ops_per_second, p.stable_write_ops_per_second]
+        .into_iter()
+        .flatten()
+    {
+        positive("committed-write throughput", capacity)?;
     }
     nonnegative("stable_write_cpu_us", p.stable_write_cpu_us)?;
     nonnegative("fragment_idle_cpu_cores", p.fragment_idle_cpu_cores)?;
@@ -100,6 +108,15 @@ fn validate_input(input: &PlannerInput) -> Result<(), PlannerError> {
             return Err(error(format!("{name} must be at least one")));
         }
     }
+    positive(
+        "replication_batch_operations",
+        w.replication_batch_operations,
+    )?;
+    if w.replication_batch_operations < 1.0 {
+        return Err(error(
+            "replication batches must average at least one operation",
+        ));
+    }
     if w.resident_tables == 0 || w.resident_tables > 4096 {
         return Err(error("resident_tables must be between 1 and 4096"));
     }
@@ -119,6 +136,9 @@ fn validate_input(input: &PlannerInput) -> Result<(), PlannerError> {
     }
     positive("recovery_window_seconds", p.recovery_window_seconds)?;
     for q in &w.queries {
+        if let Some(cost) = q.examined_record_cpu_us {
+            positive("query record CPU cost", cost)?;
+        }
         nonnegative("query qps", q.qps)?;
         if !q.fragment_fraction.is_finite()
             || !(0.0..=1.0).contains(&q.fragment_fraction)
@@ -251,9 +271,11 @@ fn fixed_count(input: &PlannerInput) -> Result<Option<u32>, PlannerError> {
 fn resident_dataset(input: &PlannerInput, p: &HostProfile) -> f64 {
     let w = &input.workload;
     let records = w.record_count as f64 * w.growth_factor;
-    let live =
-        w.average_key_bytes as f64 + w.average_value_bytes as f64 + p.record_metadata_bytes as f64;
-    let tombstone = w.average_key_bytes as f64 + p.record_metadata_bytes as f64;
+    let live = w.average_key_bytes as f64 * p.key_memory_multiplier
+        + w.average_value_bytes as f64
+        + p.record_metadata_bytes as f64;
+    let tombstone =
+        w.average_key_bytes as f64 * p.key_memory_multiplier + p.record_metadata_bytes as f64;
     records * (live + w.tombstone_ratio * tombstone) * p.resident_data_multiplier
 }
 
@@ -275,6 +297,7 @@ struct Unit {
     reads: f64,
     writes: f64,
     examined: f64,
+    examined_cpu_us: f64,
     query_requests: f64,
     query_result: f64,
     query_internal_result: f64,
@@ -315,6 +338,9 @@ fn unit(input: &PlannerInput, fragment: u32, count: u32, p: &HostProfile) -> Uni
             |n| n as f64,
         );
         u.examined += q.qps * examined / divisor * skew;
+        u.examined_cpu_us += q.qps * examined / divisor
+            * skew
+            * q.examined_record_cpu_us.unwrap_or(p.examined_record_cpu_us);
         // Average touched-fragment count includes at least one per request.
         let touched = (divisor * q.fragment_fraction).max(1.0);
         u.query_requests += q.qps * touched / divisor * skew;
@@ -338,6 +364,7 @@ fn unit(input: &PlannerInput, fragment: u32, count: u32, p: &HostProfile) -> Uni
         }
         if let Some(n) = load.records_examined_per_second {
             u.examined = n;
+            u.examined_cpu_us = n * p.examined_record_cpu_us;
         }
     }
     u
@@ -348,11 +375,72 @@ fn write_cpu(input: &PlannerInput, p: &HostProfile) -> f64 {
         + if matches!(
             input.workload.write_durability,
             WriteDurability::StableCommitted
-        ) {
+        ) && p.store_write_ops_per_second.is_none()
+            && p.stable_write_ops_per_second.is_none()
+        {
             p.stable_write_cpu_us
         } else {
             0.0
         }
+}
+fn storage_row_bytes(input: &PlannerInput, p: &HostProfile) -> f64 {
+    input.workload.average_value_bytes as f64
+        + input.workload.average_key_bytes as f64 * p.storage_key_multiplier
+        + p.storage_record_metadata_bytes
+            .unwrap_or(p.record_metadata_bytes) as f64
+}
+fn storage_write_bytes(input: &PlannerInput, p: &HostProfile) -> f64 {
+    if p.storage_record_metadata_bytes.is_some() {
+        storage_row_bytes(input, p)
+    } else {
+        write_wire(input, p)
+    }
+}
+fn storage_ratio(input: &PlannerInput, p: &HostProfile) -> f64 {
+    let w = &input.workload;
+    let memory = w.average_value_bytes as f64
+        + w.average_key_bytes as f64 * p.key_memory_multiplier
+        + p.record_metadata_bytes as f64
+        + w.tombstone_ratio
+            * (w.average_key_bytes as f64 * p.key_memory_multiplier
+                + p.record_metadata_bytes as f64);
+    let storage = storage_row_bytes(input, p)
+        + w.tombstone_ratio
+            * (w.average_key_bytes as f64 * p.storage_key_multiplier
+                + p.storage_record_metadata_bytes
+                    .unwrap_or(p.record_metadata_bytes) as f64);
+    p.disk_data_multiplier / p.resident_data_multiplier
+        * if memory > 0.0 { storage / memory } else { 1.0 }
+}
+fn committed_capacity(input: &PlannerInput, p: &HostProfile) -> Option<f64> {
+    match input.workload.write_durability {
+        WriteDurability::MemoryApplied => None,
+        WriteDurability::StoreCommitted => p.store_write_ops_per_second,
+        WriteDurability::StableCommitted => {
+            match (p.store_write_ops_per_second, p.stable_write_ops_per_second) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (a, b) => a.or(b),
+            }
+        }
+    }
+}
+fn committed_demand(input: &PlannerInput, writes: f64, source_share: f64) -> f64 {
+    if matches!(
+        input.workload.write_durability,
+        WriteDurability::MemoryApplied
+    ) {
+        return 0.0;
+    }
+    writes
+        * (source_share
+            + (1.0 - source_share).max(0.0) / input.workload.replication_batch_operations)
+}
+fn calibrated_commit_cpu(p: &HostProfile, demand: f64) -> f64 {
+    if p.store_write_ops_per_second.is_some() || p.stable_write_ops_per_second.is_some() {
+        demand * p.stable_write_cpu_us / 1e6
+    } else {
+        0.0
+    }
 }
 fn durable(input: &PlannerInput) -> bool {
     input.workload.durable_storage
@@ -549,6 +637,7 @@ struct ResourceLoad {
     disk: f64,
     network: f64,
     disk_writes: f64,
+    committed_writes: f64,
 }
 
 impl ResourceLoad {
@@ -559,15 +648,17 @@ impl ResourceLoad {
             disk: self.disk + other.disk,
             network: self.network + other.network,
             disk_writes: self.disk_writes + other.disk_writes,
+            committed_writes: self.committed_writes + other.committed_writes,
         }
     }
 
-    fn peak(self, profile: &HostProfile) -> f64 {
+    fn peak(self, profile: &HostProfile, committed_limit: Option<f64>) -> f64 {
         (self.memory / profile.ram_bytes as f64)
             .max(self.cpu / profile.cpu_cores)
             .max(self.disk / profile.disk_bytes as f64)
             .max(self.network / profile.network_bytes_per_second)
             .max(self.disk_writes / profile.disk_write_bytes_per_second)
+            .max(committed_limit.map_or(0.0, |limit| self.committed_writes / limit))
     }
 }
 
@@ -613,16 +704,17 @@ impl ResourceEstimator<'_> {
                             * expected_copies.saturating_sub(1) as f64,
                     cpu: u.writes * write_cpu(input, p) / 1_000_000.0 + p.fragment_idle_cpu_cores,
                     disk: if durable(input) {
-                        u.data / p.resident_data_multiplier * p.disk_data_multiplier
+                        u.data * storage_ratio(input, p)
                     } else {
                         0.0
                     },
                     disk_writes: if durable(input) {
-                        u.writes * write_wire(input, p) * p.disk_data_multiplier
+                        u.writes * storage_write_bytes(input, p) * p.disk_data_multiplier
                     } else {
                         0.0
                     },
                     network: u.data * 2.0 / input.policy.recovery_window_seconds,
+                    committed_writes: 0.0,
                 }
             })
             .collect();
@@ -651,7 +743,7 @@ impl ResourceEstimator<'_> {
                 source_shares[position] += share;
                 loads[position].cpu += share
                     * (u.reads * p.point_read_cpu_us
-                        + u.examined * p.examined_record_cpu_us
+                        + u.examined_cpu_us
                         + u.query_requests * p.query_fragment_cpu_us)
                     / 1_000_000.0;
                 loads[position].network += share
@@ -686,6 +778,10 @@ impl ResourceEstimator<'_> {
                 0.0
             };
             loads[position].network += outgoing + incoming;
+            loads[position].committed_writes =
+                committed_demand(input, units[position].writes, source_shares[position]);
+            loads[position].cpu +=
+                calibrated_commit_cpu(profile(input, &hosts[*i]), loads[position].committed_writes);
         }
         replicas.iter().copied().zip(loads).collect()
     }
@@ -704,6 +800,11 @@ fn build_map(input: &PlannerInput, hosts: &[Host], count: u32) -> FragmentMap {
         .iter()
         .map(|host| ResourceLoad {
             memory: profile(input, host).node_overhead_bytes as f64,
+            disk: if durable(input) {
+                profile(input, host).disk_overhead_bytes as f64
+            } else {
+                0.0
+            },
             ..ResourceLoad::default()
         })
         .collect();
@@ -768,7 +869,7 @@ fn build_map(input: &PlannerInput, hosts: &[Host], count: u32) -> FragmentMap {
                     let mut exceeds = false;
                     for (owner, cost) in resources {
                         let p = profile(input, &hosts[owner]);
-                        let peak = loads[owner].add(cost).peak(p);
+                        let peak = loads[owner].add(cost).peak(p, committed_capacity(input, p));
                         projected = projected.max(peak);
                         exceeds |= peak > target || assigned[owner] >= p.max_fragments_per_host;
                     }
@@ -851,6 +952,11 @@ fn assess(
             } else {
                 0.0
             },
+            disk_bytes: if h.available && durable(input) {
+                profile(input, h).disk_overhead_bytes as f64
+            } else {
+                0.0
+            },
             ..HostEstimate::default()
         })
         .collect();
@@ -910,9 +1016,9 @@ fn assess(
                     * replicas.len().saturating_sub(1) as f64;
             e.cpu_cores += u.writes * write_cpu(input, p) / 1_000_000.0 + p.fragment_idle_cpu_cores;
             if durable(input) {
-                e.disk_bytes += u.data / p.resident_data_multiplier * p.disk_data_multiplier;
+                e.disk_bytes += u.data * storage_ratio(input, p);
                 e.disk_write_bytes_per_second +=
-                    u.writes * write_wire(input, p) * p.disk_data_multiplier;
+                    u.writes * storage_write_bytes(input, p) * p.disk_data_multiplier;
             }
             let recovery = u.data / input.policy.recovery_window_seconds;
             e.traffic.recovery_bytes_per_second += recovery;
@@ -923,6 +1029,7 @@ fn assess(
         if live.is_empty() {
             continue;
         }
+        let mut source_shares = vec![0.0; hosts.len()];
         for (origin, weight) in &traffic_weights {
             let local: Vec<usize> = live
                 .iter()
@@ -938,6 +1045,7 @@ fn assess(
             };
             let share = weight / readers.len() as f64;
             for i in readers {
+                source_shares[i] += share;
                 let p = profile(input, &hosts[i]);
                 let u = unit(input, *fragment, count, p);
                 let app = share
@@ -950,7 +1058,7 @@ fn assess(
                 let e = &mut estimates[i];
                 e.cpu_cores += share
                     * (u.reads * p.point_read_cpu_us
-                        + u.examined * p.examined_record_cpu_us
+                        + u.examined_cpu_us
                         + u.query_requests * p.query_fragment_cpu_us)
                     / 1_000_000.0;
                 e.network_bytes_per_second += app + query * 2.0;
@@ -983,6 +1091,16 @@ fn assess(
                 }
             }
         }
+        for owner in &live {
+            let p = profile(input, &hosts[*owner]);
+            let demand = committed_demand(
+                input,
+                unit(input, *fragment, count, p).writes,
+                source_shares[*owner],
+            );
+            estimates[*owner].committed_write_ops_per_second += demand;
+            estimates[*owner].cpu_cores += calibrated_commit_cpu(p, demand);
+        }
     }
     let mut warnings = Vec::new();
     let mut hosts_per_region = BTreeMap::new();
@@ -997,6 +1115,8 @@ fn assess(
         e.disk_utilization = e.disk_bytes / p.disk_bytes as f64;
         e.network_utilization = e.network_bytes_per_second / p.network_bytes_per_second;
         e.disk_write_utilization = e.disk_write_bytes_per_second / p.disk_write_bytes_per_second;
+        e.committed_write_utilization =
+            committed_capacity(input, p).map_or(0.0, |cap| e.committed_write_ops_per_second / cap);
         // Average assigned-fragment cost gives a useful host-specific ceiling.
         // Hot-fragment imbalance can still make the average ceiling optimistic.
         let mut limit = p.max_fragments_per_host;
@@ -1008,7 +1128,20 @@ fn assess(
                     p.node_overhead_bytes as f64,
                 ),
                 (e.cpu_cores, p.cpu_cores, 0.0),
-                (e.disk_bytes, p.disk_bytes as f64, 0.0),
+                (
+                    e.committed_write_ops_per_second,
+                    committed_capacity(input, p).unwrap_or(f64::MAX),
+                    0.0,
+                ),
+                (
+                    e.disk_bytes,
+                    p.disk_bytes as f64,
+                    if durable(input) {
+                        p.disk_overhead_bytes as f64
+                    } else {
+                        0.0
+                    },
+                ),
                 (e.network_bytes_per_second, p.network_bytes_per_second, 0.0),
                 (
                     e.disk_write_bytes_per_second,
@@ -1044,6 +1177,8 @@ fn assess(
             e.disk_utilization,
             e.network_utilization,
             e.disk_write_utilization,
+            e.committed_write_utilization,
+            e.committed_write_ops_per_second,
         ] {
             if !value.is_finite() {
                 return Err(error("workload produces non-finite resource estimates"));
@@ -1091,6 +1226,8 @@ fn assess(
         "SQL/scan CPU uses examined records; aggregates return compact final results but partials from touched fragments. Query traffic conservatively assumes remote fragment/coordinator exchanges.".into(),
         "Traffic includes estimated framing; replication is direct sender-to-replica fanout. Recovery reserves symmetric full-copy bandwidth over the configured window; retries/anti-entropy scans and failure-load redistribution require measured headroom.".into(),
         "Reliability describes available provisioned copies, not acknowledged-write survival, version equality, consensus or writer authority. Configure replication ACK/write concern and backend durability separately.".into(),
+        format!("Replicated fences use an observed mean batch of {} operations; local committed writes each consume an equivalent fence. Unspecified completion limits remain unmeasured.",input.workload.replication_batch_operations),
+        "Resident key/index amplification and physical storage encoding are separate; configured backend disk reserves are charged once per available Node.".into(),
         "The fragment limit is based on average assigned load and the host profile; a single hot key or fragment can exceed latency targets before the host average fills.".into(),
     ];
     Ok(Plan {
