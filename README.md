@@ -12,6 +12,109 @@ with logical tables, a standalone Rust SDK and opt-in persistence.
 · [docs.rs](https://docs.rs/actordb)
 · [coverage](https://codecov.io/gh/slawlor/actordb)
 
+## Why choose ActorDB?
+
+**High-throughput state access inside your Rust service, nearby replicas, and
+explicit durability for each write.** ActorDB combines resident KV reads,
+supervised actor execution, convergent replication, optional RocksDB persistence
+and programmable placement in one Rust integration. Use embedded calls for local
+access or the standalone SDK for remote callers.
+
+The strongest fit is a dataset that fits in RAM and represents **latest-known
+state**: service/session snapshots, device state, restartable caches and derived
+projections. Hybrid logical clocks and last-writer-wins merging give replicas a
+deterministic way to converge. Applications that need source-event ordering must
+preserve that ordering before submitting updates.
+
+### Performance: over one million embedded point reads per second
+
+The [M4 Max laptop checks](docs/benchmarks/laptop-sizing.md) measured the following
+throughput in separate 30-second phases ([raw results](docs/benchmarks/laptop-sizing/sustained-qps.json)):
+
+| Access path / completion boundary | Total operations/s | Average operations/s per fragment |
+|---|---:|---:|
+| **Embedded point reads** | **1,149,024** | **35,907** |
+| **Embedded point reads, RocksDB enabled** | **1,146,396** | **35,825** |
+| **Embedded in-memory writes** | **585,382** | **18,293** |
+| Loopback gRPC point reads | 55,634 | 1,739 |
+| Loopback gRPC writes | 55,127 | 1,723 |
+| RocksDB buffered/applied writes | 531,837 | 16,620 |
+| RocksDB local `StoreCommitted` writes | 28,168 | 880 |
+| RocksDB local `StableCommitted` writes | 25,309 | 791 |
+
+**Performance is a reason to prefer ActorDB for hot, application-owned KV state.**
+The embedded path avoids an RPC hop and its serialization work for locally held
+keys. Reads use the resident cache, including with RocksDB enabled. Fragment
+workers spread work across runtime threads; priority pools and admission limits
+let the application control competing work. Regional routing prefers nearby
+replicas, reducing exposure to cross-region round trips. Write policies let each
+operation request memory application, store completion or a stable fence according
+to its durability needs.
+
+Compared with a remote KV service such as Redis/Valkey, the embedded integration
+removes the client/server transport from local operations. Compared with using
+RocksDB directly, ActorDB adds replication, placement and lifecycle controls while
+serving reads from resident state. These are design advantages for the workloads
+below; the measurements establish ActorDB's throughput on the tested paths.
+Competitive QPS rankings require matched workloads, hardware and completion
+boundaries; no such comparison has been measured here.
+
+The checks used a 16-core M4 Max with 64 GiB RAM, four runtime threads, 16 callers,
+32 fragments, 20,000 hot keys and 1 KiB values, with no replica fanout. RPC client
+and server shared the laptop, using a reused plaintext channel and receive
+admission sized for 16 callers. Per-fragment rates are totals divided by 32;
+CPU, WAL and storage execution remain shared. Point-operation QPS does not
+represent scan/SQL throughput or a production latency guarantee. The placement
+planner models examined records and touched fragments for those query workloads.
+
+### Strongest use cases and industry alternatives
+
+| Use case | Prefer ActorDB for | Why this design helps | Relevant alternatives |
+|---|---|---|---|
+| **High-QPS state inside a Rust service or stateful worker** | Hot KV access where the application can hold the serving fragments locally and wants replication in the same integration. | The embedded path measured 1.15M point reads/s and 585k in-memory writes/s. Fragment supervision, execution pools and shutdown ownership integrate with the service lifecycle. | Plain RocksDB, sled, SQLite; external Redis/Valkey |
+| **Restartable caches and materialized projections** | Read-heavy derived state with TTL, peer recovery and persistent local restart. | Resident reads keep RocksDB off the read path; named tables separate data and execution pools. Committed state survives restart, and reconciliation restores peer versions. | Redis/Valkey; PostgreSQL projection tables; application-built KV caches |
+| **Latest-known entity, session or device state** | Frequent last-value updates from multiple serving replicas with explicit application outcomes. | Serving replicas accept writes and converge through LWW. Per-key ordering within a priority pool and selectable completion boundaries make execution and durability observable. | Redis/Valkey; Cassandra/ScyllaDB; DynamoDB |
+| **Region-local application state with remote copies** | Keeping query traffic near callers while independently pacing replication across regions. | Reads prefer the serving local Node, then same-region replicas. The planner targets regional fragment coverage; WAN batch/round limits pace outgoing replication, and writes can require an outside-region ACK. | Cassandra/ScyllaDB datacenter replication; DynamoDB Global Tables; regional Redis deployments |
+| **Foreground requests alongside bulk work** | Services that own traffic priorities, table admission and bounded query/batch execution. | High/Default/Background pools separate scheduling; table-local admission controls incoming work. Batches retain per-key outcomes, and scans/SQL use bounded pages. Cache locks, storage and hardware remain shared. | Redis/Valkey; general database servers; custom actor/cache layers |
+| **A custom placement and replacement controller** | Building workload-aware replica placement and maintenance directly into the service's control plane. | Portable planning, observed-load overrides, bounded replica changes, readiness-gated overlap, checkpoints and guarded membership workflows provide reusable building blocks. | Plain RocksDB plus custom distribution code; FoundationDB; CockroachDB |
+| **Operational inspection of KV state** | Key/range/prefix queries and exact aggregates over the same named tables serving application traffic. | Projections and pagination inspect data across fragments through the existing Node/SDK. Execution uses bounded background pages. | Plain KV scans; SQLite/PostgreSQL; DuckDB |
+
+**ActorDB's advantage is the combination of throughput, locality and control.**
+Teams building a stateful Rust service can integrate data access, replica topology,
+durability policy and maintenance as programmable parts of that service. The
+current pre-1.0 design uses eventual LWW consistency, keeps the live dataset in
+RAM and treats regional coverage as a soft goal. Its SQL surface covers bounded
+KV queries and aggregates; reads can observe older replica versions.
+
+### What persistent RocksDB adds
+
+| Capability | What you get with RocksDB | Completion boundary |
+|---|---|---|
+| **Committed state survives a Node restart** | Retained winners, TTL deadlines and tombstones reload from local storage; durable clock floors prevent restarted writers from reusing older versions. | Only persisted state is recoverable from that disk. Ordinary cached puts can return while persistence is still buffered. |
+| **Synchronous WAL commits by default** | Flushed batches use `SyncWal`; `AsyncWal` is an explicit alternative for workloads accepting a weaker ordinary backend boundary. | `StoreCommitted` waits for actor buffers to flush and the backend to accept the batch. `StableCommitted` additionally waits for the backend's explicit stable fence. |
+| **Durable replica acknowledgements** | Write concerns can require actual store/stable evidence from eligible replicas, including a separately requested outside-region ACK. | Numeric/majority ACKs and storage durability are independent policies. Completion evidence reports the achieved boundary; replica convergence remains eventual LWW. |
+| **Stable, resumable checkpoints** | Native immutable snapshots back bounded export; integrity-checked chunks and atomic record/import-cursor batches support retryable import while preserving versions and namespaces. | Incomplete import blocks ordinary access until the exact retry completes. Checkpoints need a trusted source; integrity digests are not signatures or writer authority. |
+| **Safer replacement and retention workflows** | Store identity/layout validation, stable target floors and guarded handoff help a controller sequence replacement and retire durable prefixes. | Controllers own live readiness evidence, overlap capacity and application writer authority. Disk alone does not certify that every replica has the newest value. |
+
+RocksDB **adds durable backing while preserving the resident read path**. Size
+RAM for the live dataset and disk for persistent records, WAL and compaction
+headroom. For authoritative mutations, request the required durability/write
+concern explicitly. These policies certify write completion within ActorDB's
+per-key, eventually consistent model. See [persistence](docs/persistence.md),
+[write evidence](docs/write-concerns.md) and [checkpoints](docs/stable-checkpoints.md).
+
+### Tooling that makes the design practical
+
+| Tool or feature | Why you would use it |
+|---|---|
+| **`actordb-plan` and portable placement library** | Turn expected records, key/value sizes, regions, QPS and query work into a proposed fragmap and per-host resource/traffic estimates. Evaluate an existing map, expose coverage gaps and load observed fragment costs. Export JSON reports or compatible TOML. |
+| **Sizing and calibration probes** | Measure record/index memory, fragment/table overhead, embedded/RPC CPU, WAL fences, visibility lag and restart recovery. Load hardware-specific templates with `--profile`; generic defaults and laptop measurements are estimates, not universal host limits. |
+| **Placement and membership APIs** | Publish static maps or integrate your controller, add overlap before removing replicas, and use verified readiness and stable handoff evidence for planned changes. |
+| **Drain and shutdown APIs** | Close admission and retain accepted application, response and storage work through timeout/cancellation. Choose a local stable boundary and, separately, per-target replication drain evidence. |
+| **Typed status and bounded metrics** | Inspect lifecycle, readiness/blockers, node/table/fragment/peer/pool/worker activity and actual WAN permit usage. Freshness and omitted observations remain explicit. |
+| **Standalone SDK and replaceable RPC/peer transports** | Use reusable gRPC channels or implement `RpcClient`/`RpcService` for a framework such as Thrift. Supply TLS, credentials and ACLs through the selected adapters; the SDK does not join peer membership. |
+| **Docker and release verification** | Exercise partitions, SIGKILL/restart, cluster growth/shrink and SDK scenarios. CI checks the feature matrix, Rust minimum version and dependency-ordered package publication. |
+
 ## Current release and deployment
 
 ActorDB `0.11.2` requires Rust **1.88+**. Deploy matching database, protocol,

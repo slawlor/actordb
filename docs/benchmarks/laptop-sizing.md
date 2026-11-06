@@ -75,6 +75,7 @@ fanout and no rejected operation. RPC client and server share this laptop.
 | Operation | Total operations/s | Average per fragment/s |
 |---|---:|---:|
 | Embedded point reads | 1,149,024 | 35,907 |
+| Embedded point reads, RocksDB enabled | 1,146,396 | 35,825 |
 | Embedded in-memory writes | 585,382 | 18,293 |
 | Loopback RPC reads | 55,634 | 1,739 |
 | Loopback RPC writes | 55,127 | 1,723 |
