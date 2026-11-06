@@ -70,6 +70,7 @@ fn query_cost_depends_on_examined_records_and_aggregate_partials() {
     let mut i = input();
     i.workload.queries = vec![QueryWorkload {
         kind: QueryKind::Aggregate,
+        examined_record_cpu_us: None,
         qps: 10.0,
         records_examined: Some(10),
         rows_returned: Some(1),

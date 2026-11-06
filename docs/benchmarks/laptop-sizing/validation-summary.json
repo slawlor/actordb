@@ -1,0 +1,18 @@
+[
+  {
+    "records": 200000,
+    "key_bytes": 32,
+    "value_bytes": 1024,
+    "measured_rss_bytes": 448053248,
+    "predicted_rss_bytes": 501564416.00000006,
+    "overestimate_percent": 11.943037627527708
+  },
+  {
+    "records": 200000,
+    "key_bytes": 128,
+    "value_bytes": 1024,
+    "measured_rss_bytes": 640729088,
+    "predicted_rss_bytes": 691644416.0,
+    "overestimate_percent": 7.946467384355738
+  }
+]

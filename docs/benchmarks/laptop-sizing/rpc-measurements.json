@@ -1,0 +1,250 @@
+[
+  {
+    "client_response_reservation_bytes": 16777216,
+    "concurrency": 1,
+    "idle_cpu_cores": 6.785876893710663e-05,
+    "key_bytes": 32,
+    "phases": [
+      {
+        "combined_cpu_us_per_operation": 103.18880487309549,
+        "kind": "read",
+        "operations": 21913,
+        "operations_per_second": 10956.396829089259,
+        "p50_us": 88.291,
+        "p99_us": 204.833
+      },
+      {
+        "combined_cpu_us_per_operation": 106.17200812373468,
+        "kind": "write",
+        "operations": 25233,
+        "operations_per_second": 12616.36279705458,
+        "p50_us": 79.208,
+        "p99_us": 124.666
+      }
+    ],
+    "records": 20000,
+    "runtime_threads": 4,
+    "server_receive_allowance_bytes": 536870912,
+    "server_request_reservation_bytes": 16777216,
+    "transport": "plaintext loopback gRPC, reused channel, client and server CPU combined",
+    "value_bytes": 1024,
+    "repeat": 0
+  },
+  {
+    "client_response_reservation_bytes": 16777216,
+    "concurrency": 16,
+    "idle_cpu_cores": 6.187152890551558e-05,
+    "key_bytes": 32,
+    "phases": [
+      {
+        "combined_cpu_us_per_operation": 59.14544399741807,
+        "kind": "read",
+        "operations": 109934,
+        "operations_per_second": 54959.65829648595,
+        "p50_us": 289.16700000000003,
+        "p99_us": 485.333
+      },
+      {
+        "combined_cpu_us_per_operation": 60.49969158391193,
+        "kind": "write",
+        "operations": 109458,
+        "operations_per_second": 54722.12326229706,
+        "p50_us": 291.0,
+        "p99_us": 444.167
+      }
+    ],
+    "records": 20000,
+    "runtime_threads": 4,
+    "server_receive_allowance_bytes": 536870912,
+    "server_request_reservation_bytes": 16777216,
+    "transport": "plaintext loopback gRPC, reused channel, client and server CPU combined",
+    "value_bytes": 1024,
+    "repeat": 0
+  },
+  {
+    "client_response_reservation_bytes": 16777216,
+    "concurrency": 1,
+    "idle_cpu_cores": 5.6882617996480706e-05,
+    "key_bytes": 32,
+    "phases": [
+      {
+        "combined_cpu_us_per_operation": 109.1607288704626,
+        "kind": "read",
+        "operations": 20676,
+        "operations_per_second": 10337.578526585892,
+        "p50_us": 92.75,
+        "p99_us": 225.042
+      },
+      {
+        "combined_cpu_us_per_operation": 121.94187482506491,
+        "kind": "write",
+        "operations": 21054,
+        "operations_per_second": 10526.796701238707,
+        "p50_us": 93.292,
+        "p99_us": 129.667
+      }
+    ],
+    "records": 20000,
+    "runtime_threads": 4,
+    "server_receive_allowance_bytes": 536870912,
+    "server_request_reservation_bytes": 16777216,
+    "transport": "plaintext loopback gRPC, reused channel, client and server CPU combined",
+    "value_bytes": 16384,
+    "repeat": 0
+  },
+  {
+    "client_response_reservation_bytes": 16777216,
+    "concurrency": 16,
+    "idle_cpu_cores": 6.184934785330021e-05,
+    "key_bytes": 32,
+    "phases": [
+      {
+        "combined_cpu_us_per_operation": 73.27097923260229,
+        "kind": "read",
+        "operations": 88923,
+        "operations_per_second": 44456.10785199447,
+        "p50_us": 362.41700000000003,
+        "p99_us": 543.084
+      },
+      {
+        "combined_cpu_us_per_operation": 72.87816787054449,
+        "kind": "write",
+        "operations": 93372,
+        "operations_per_second": 46681.88809590991,
+        "p50_us": 336.125,
+        "p99_us": 532.916
+      }
+    ],
+    "records": 20000,
+    "runtime_threads": 4,
+    "server_receive_allowance_bytes": 536870912,
+    "server_request_reservation_bytes": 16777216,
+    "transport": "plaintext loopback gRPC, reused channel, client and server CPU combined",
+    "value_bytes": 16384,
+    "repeat": 0
+  },
+  {
+    "client_response_reservation_bytes": 16777216,
+    "concurrency": 1,
+    "idle_cpu_cores": 6.193346543549034e-05,
+    "key_bytes": 32,
+    "phases": [
+      {
+        "combined_cpu_us_per_operation": 99.9284919232861,
+        "kind": "read",
+        "operations": 22597,
+        "operations_per_second": 11298.40161351875,
+        "p50_us": 86.833,
+        "p99_us": 192.875
+      },
+      {
+        "combined_cpu_us_per_operation": 104.89339058981952,
+        "kind": "write",
+        "operations": 25550,
+        "operations_per_second": 12774.639116444961,
+        "p50_us": 77.5,
+        "p99_us": 100.292
+      }
+    ],
+    "records": 20000,
+    "runtime_threads": 4,
+    "server_receive_allowance_bytes": 536870912,
+    "server_request_reservation_bytes": 16777216,
+    "transport": "plaintext loopback gRPC, reused channel, client and server CPU combined",
+    "value_bytes": 1024,
+    "repeat": 1
+  },
+  {
+    "client_response_reservation_bytes": 16777216,
+    "concurrency": 16,
+    "idle_cpu_cores": 5.6889818643770927e-05,
+    "key_bytes": 32,
+    "phases": [
+      {
+        "combined_cpu_us_per_operation": 58.84890706428971,
+        "kind": "read",
+        "operations": 110520,
+        "operations_per_second": 55254.35828137486,
+        "p50_us": 287.125,
+        "p99_us": 467.20799999999997
+      },
+      {
+        "combined_cpu_us_per_operation": 60.40681457324704,
+        "kind": "write",
+        "operations": 109473,
+        "operations_per_second": 54732.36997746005,
+        "p50_us": 290.33299999999997,
+        "p99_us": 442.41700000000003
+      }
+    ],
+    "records": 20000,
+    "runtime_threads": 4,
+    "server_receive_allowance_bytes": 536870912,
+    "server_request_reservation_bytes": 16777216,
+    "transport": "plaintext loopback gRPC, reused channel, client and server CPU combined",
+    "value_bytes": 1024,
+    "repeat": 1
+  },
+  {
+    "client_response_reservation_bytes": 16777216,
+    "concurrency": 1,
+    "idle_cpu_cores": 5.78802385515206e-05,
+    "key_bytes": 32,
+    "phases": [
+      {
+        "combined_cpu_us_per_operation": 105.67950363997497,
+        "kind": "read",
+        "operations": 21285,
+        "operations_per_second": 10642.082074794842,
+        "p50_us": 92.292,
+        "p99_us": 254.459
+      },
+      {
+        "combined_cpu_us_per_operation": 121.97525698089517,
+        "kind": "write",
+        "operations": 21249,
+        "operations_per_second": 10624.138779281504,
+        "p50_us": 91.792,
+        "p99_us": 113.458
+      }
+    ],
+    "records": 20000,
+    "runtime_threads": 4,
+    "server_receive_allowance_bytes": 536870912,
+    "server_request_reservation_bytes": 16777216,
+    "transport": "plaintext loopback gRPC, reused channel, client and server CPU combined",
+    "value_bytes": 16384,
+    "repeat": 1
+  },
+  {
+    "client_response_reservation_bytes": 16777216,
+    "concurrency": 16,
+    "idle_cpu_cores": 6.785839080284432e-05,
+    "key_bytes": 32,
+    "phases": [
+      {
+        "combined_cpu_us_per_operation": 73.82564488999243,
+        "kind": "read",
+        "operations": 88020,
+        "operations_per_second": 44003.514981979526,
+        "p50_us": 362.0,
+        "p99_us": 606.292
+      },
+      {
+        "combined_cpu_us_per_operation": 72.72940454187592,
+        "kind": "write",
+        "operations": 93515,
+        "operations_per_second": 46751.47684360807,
+        "p50_us": 334.084,
+        "p99_us": 534.333
+      }
+    ],
+    "records": 20000,
+    "runtime_threads": 4,
+    "server_receive_allowance_bytes": 536870912,
+    "server_request_reservation_bytes": 16777216,
+    "transport": "plaintext loopback gRPC, reused channel, client and server CPU combined",
+    "value_bytes": 16384,
+    "repeat": 1
+  }
+]

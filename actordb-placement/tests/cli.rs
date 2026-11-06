@@ -53,3 +53,35 @@ fn cli_recommend_evaluate_and_toml_exports_round_trip() {
         "typos must not silently become default workload"
     );
 }
+
+#[test]
+fn cli_can_load_a_calibrated_profile_without_rewriting_the_workload() {
+    let directory = tempfile::tempdir().unwrap();
+    let input = directory.path().join("input.json");
+    let profile = directory.path().join("profile.json");
+    std::fs::write(&input, b"{\"workload\":{\"record_count\":1000}}").unwrap();
+    std::fs::write(
+        &profile,
+        b"{\"calibration\":\"test-profile\",\"key_memory_multiplier\":8.0}",
+    )
+    .unwrap();
+    let result = Command::new(env!("CARGO_BIN_EXE_actordb-plan"))
+        .arg("recommend")
+        .arg(&input)
+        .arg("--profile")
+        .arg(&profile)
+        .arg("--json")
+        .output()
+        .unwrap();
+    assert!(result.status.success());
+    let plan: Plan = serde_json::from_slice(&result.stdout).unwrap();
+    assert_eq!(plan.host_profile.key_memory_multiplier, 8.0);
+    assert_eq!(plan.host_profile.calibration, "test-profile");
+    let missing = Command::new(env!("CARGO_BIN_EXE_actordb-plan"))
+        .arg("recommend")
+        .arg(&input)
+        .arg("--profile")
+        .output()
+        .unwrap();
+    assert!(!missing.status.success());
+}
