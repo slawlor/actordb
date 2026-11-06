@@ -1,6 +1,6 @@
-# ActorDB 0.11.1 deployment
+# ActorDB 0.11.2 deployment
 
-ActorDB `0.11.1` uses the peer wire and data formats and typed unary RPC
+ActorDB `0.11.2` uses the peer wire and data formats and typed unary RPC
 introduced in `0.11.0`. For the 0.11 RPC migration, move application clients/servers
 together; there is no old application listener or handshake fallback.
 Current-format deployments require no data conversion. The SDK's default 64 MiB

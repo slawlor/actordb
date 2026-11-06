@@ -1,6 +1,6 @@
 # Release notes
 
-## 0.11.1 (unreleased)
+## 0.11.2 (unreleased)
 
 - Add repeatable laptop sizing probes and calibrated M4 profiles with independent
   memory holdouts, direct/RPC CPU measurements and real RocksDB WAL fences.
@@ -33,6 +33,8 @@
 - Fix TOML fragmap loading to parse canonical decimal string table keys; the
   planner exports compatible TOML and separate JSON reports. Include the new
   library in workspace validation and dependency-ordered release checks.
+
+## 0.11.1
 
 - Index replication senders by fragment so mutation fanout visits only that
   fragment's replicas (#190). Preserve exact sender identity, retirement and
