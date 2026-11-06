@@ -113,6 +113,13 @@ actors/senders, memory, CPU, disk and network use, regional coverage and reliabi
 gaps. JSON retains the input profile/policy/workload for review. TOML output contains
 only `fragment_count` and `fragment_map`; diagnostics go to stderr.
 
+Placement scoring includes memory, CPU, disk capacity, network and disk-write
+throughput, using regional traffic weights for read/query work. Copy-count and
+capacity repairs take precedence over ordinary rebalance hysteresis, while
+retaining the configured movement limit. Bounded changes report any remaining
+replica sets above the requested copy limit. Unavailable hosts do not contribute
+active resource usage.
+
 ```sh
 cargo run -p actordb-placement --features cli --bin actordb-plan -- recommend workload.json
 cargo run -p actordb-placement --features cli --bin actordb-plan -- recommend workload.json --json > plan.json
@@ -148,7 +155,12 @@ cargo run --release -p actordb --example fragment_capacity -- \
 Each fragment-count case runs in a fresh process with real Node defaults and TCP
 replication on loopback. The report measures baseline/idle/loaded RSS, idle CPU,
 point-operation CPU, p50/p99 latency, aggregate CPU/latency, initial replica catchup,
-and concurrent read/write/aggregate latency with query failures counted. Writes
+and concurrent read/write/aggregate latency with query failures counted. It also
+measures exact-version replica visibility and recovery after restarting one
+storeless replica, waiting for every fragment to complete verified reconciliation.
+Idle sampling waits for initial reconciliation; exported CPU costs retain
+conservative default floors. Single-replica runs report visibility/recovery as
+null because no replica is available. Writes
 in the measured phase await every replica's processing ACK. RSS covers all
 in-process replicas and is divided for partial profile calibration.
 
@@ -161,6 +173,8 @@ failure recovery and your chosen persistence/pool configuration on real hosts.
 
 The initial [local smoke measurements](benchmarks/fragment-capacity-smoke.md)
 compare 1/8/32/128 fragments with the raw report available alongside the notes.
+Additional [visibility/restart measurements](benchmarks/fragment-capacity-recovery-smoke.md)
+exercise the completed calibration phases.
 
 Copy the report's `host_profile` into the planner input. Use observed per-fragment
 load overrides for live controllers. The planner reserves headroom and a recovery

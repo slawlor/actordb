@@ -2,6 +2,13 @@
 
 ## 0.11.1 (unreleased)
 
+- Complete planner capacity constraints with disk/disk-write-aware and regional
+  traffic-aware placement scoring. Apply bounded copy-count and overloaded-host
+  repairs despite ordinary rebalance hysteresis, and exclude unavailable hosts
+  from active resource usage. Add regression tests for mixed host profiles and
+  complete calibration with exact-version visibility, verified replica restart
+  recovery and a settled idle baseline.
+
 - Add opt-in regional replication profiles with higher in-region concurrency,
   larger/lower-concurrency WAN batches, fair shared outgoing WAN batch/round
   budgets, and actual usage inspection. Preserve ACK durability floors and

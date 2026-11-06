@@ -38,7 +38,9 @@ assert_eq!(plan.replica_count, 4); // two distinct hosts per region
   `replicas_per_region = 1` for the economical preset, or use `replica_count` to
   cap total copies. Regional coverage is soft; gaps are explicit in the report.
 - Placement favors regional coverage, different known zones within a region,
-  and lower projected dominant-resource load. Host IDs break ties consistently.
+  and lower projected dominant-resource load across RAM, CPU, disk capacity,
+  network and disk-write throughput. Regional traffic weights charge reads and
+  queries to the holders that serve that region. Host IDs break ties consistently.
 - Growth defaults to 1.5, unknown data/traffic skew to 1.2 and resource headroom
   to 30%. RAM includes all resident data even with durable storage, metadata,
   indexes, retained tombstones, worker/runtime overhead and replication backlog.
@@ -69,6 +71,10 @@ fragment-query overhead, and a 128-fragment policy ceiling. These are editable
 planning assumptions, not measured ActorDB throughput or supported maximums.
 The report retains the complete profile and workload used for its estimates.
 
+Average key/value geometry that cannot fit the 16 MiB replication envelope is
+rejected before sizing. Smaller averages still require per-record wire checks;
+large keys/table names and size-distribution tails consume additional overhead.
+
 ## Live controllers
 
 Set `fragment_count` or provide `existing_placement` to keep the deployed hash
@@ -77,10 +83,13 @@ write QPS and examined records/second. Keep failed hosts in inventory with
 `available = false`; their copies do not count toward reliability. Unknown
 replica IDs are errors.
 
-Existing assignments are preserved unless regional/failure coverage improves or
-modeled peak utilization improves by more than `rebalance_improvement` (10% by
-default). At most `max_moved_fragments` (32 by default) replica sets change per
-recommendation. If diagnostics remain, reevaluate after the current moves finish.
+Existing assignments are preserved unless coverage/failure or copy-count goals
+need repair, or modeled utilization improves. Overloaded hosts and host fragment
+limits can be repaired with a smaller improvement; normal balancing requires
+`rebalance_improvement` (10% by default). At most `max_moved_fragments` (32 by
+default) replica sets change per recommendation. Remaining excess copies are
+reported during bounded changes. If diagnostics remain, reevaluate after the
+current moves finish. Unavailable hosts contribute no active resource usage.
 
 A target recommendation must be sequenced through `PlacementTransition`:
 

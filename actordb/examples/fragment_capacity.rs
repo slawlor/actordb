@@ -92,6 +92,30 @@ async fn case(
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
+    // Empty startup reconciliation is real work, not idle maintenance. Wait
+    // for both directions to complete before sampling the idle baseline.
+    loop {
+        let mut ready = true;
+        for fragment in 0..fragments {
+            for (position, node) in nodes.iter().enumerate().skip(1) {
+                ready &= nodes[0]
+                    .sender_report(FragmentId(fragment), &ids[position])
+                    .await
+                    .is_some_and(|report| report.reconcile_rounds > 0);
+                ready &= node
+                    .sender_report(FragmentId(fragment), &ids[0])
+                    .await
+                    .is_some_and(|report| report.reconcile_rounds > 0);
+            }
+        }
+        if ready {
+            break;
+        }
+        if Instant::now() >= deadline {
+            return Err("initial reconciliation did not settle".into());
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
     let idle_rss = rss()?;
     let start = Instant::now();
     let cpu = cpu_seconds();
@@ -199,6 +223,94 @@ async fn case(
             mixed_query_failures += 1;
         }
     }
+    let mut visibility_lag = Vec::new();
+    let mut recovery_seconds = None;
+    let mut recovery_cpu_us = None;
+    if replicas > 1 {
+        for i in 0..samples {
+            let key = format!("capacity-key-{:010}", i % records);
+            nodes[0].put(key.clone(), vec![4; value_bytes]).await?;
+            let local_done = Instant::now();
+            let expected = nodes[0]
+                .get(key.clone())
+                .await?
+                .expect("applied source value");
+            loop {
+                let mut visible = true;
+                for node in nodes.iter().skip(1) {
+                    visible &= node
+                        .get(key.clone())
+                        .await?
+                        .is_some_and(|value| value == expected);
+                }
+                if visible {
+                    break;
+                }
+                if local_done.elapsed() > Duration::from_secs(30) {
+                    return Err("replica visibility timed out".into());
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            visibility_lag.push(local_done.elapsed().as_secs_f64() * 1_000_000.0);
+        }
+        // Restart one storeless replica with the same identity. Recovery must
+        // reconstruct the entire copy from the still-serving source, then
+        // finish a verified reconciliation pass for every fragment.
+        let target = nodes.pop().expect("replica exists");
+        target.shutdown().await?;
+        let disconnected = Instant::now();
+        while nodes[0].peer_count().await != replicas - 2 {
+            if disconnected.elapsed() > Duration::from_secs(30) {
+                return Err("old replica connection did not retire".into());
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let started = Instant::now();
+        let cpu = cpu_seconds();
+        let replacement = Node::start(
+            ids[replicas - 1].clone(),
+            "127.0.0.1:0".parse()?,
+            NodeConfig::builder()
+                .fragment_count(fragments as usize)
+                .fragment_map(map.clone())
+                .build(),
+        )
+        .await?;
+        replacement.connect(nodes[0].addr()).await?;
+        loop {
+            let count_ready = replacement
+                .query("SELECT COUNT(*) FROM kv")
+                .await
+                .is_ok_and(|result| {
+                    result.rows == vec![vec![actordb_query::QueryValue::Integer(records as i128)]]
+                });
+            let mut rounds_ready = true;
+            for fragment in 0..fragments {
+                rounds_ready &= replacement
+                    .sender_report(FragmentId(fragment), &ids[0])
+                    .await
+                    .is_some_and(|report| report.reconcile_rounds > 0);
+            }
+            if count_ready && rounds_ready {
+                break;
+            }
+            if started.elapsed() > Duration::from_secs(30) {
+                return Err("restarted replica did not recover every fragment".into());
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        recovery_seconds = Some(started.elapsed().as_secs_f64());
+        recovery_cpu_us = Some((cpu_seconds() - cpu) * 1_000_000.0);
+        // Verify payload/version equality at representative endpoints as well
+        // as record count and completed revision-stable rounds.
+        for index in [0, records - 1] {
+            let key = format!("capacity-key-{index:010}");
+            if replacement.get(key.clone()).await? != nodes[0].get(key).await? {
+                return Err("recovered replica differs from the source version".into());
+            }
+        }
+        nodes.push(replacement);
+    }
     let result = json!({
         "fragments_per_host":fragments,"replicas":replicas,"records_per_copy":records,"value_bytes":value_bytes,
         "rss_baseline_bytes":baseline,"rss_idle_bytes":idle_rss,"rss_loaded_bytes":loaded_rss,
@@ -213,6 +325,10 @@ async fn case(
         "mixed_read_p99_us":percentile(&mut mixed_reads,0.99),
         "mixed_write_p99_us":percentile(&mut mixed_writes,0.99),
         "mixed_query_failures":mixed_query_failures,
+        "replica_visibility_p50_us":if visibility_lag.is_empty() { None } else { Some(percentile(&mut visibility_lag,0.50)) },
+        "replica_visibility_p99_us":if visibility_lag.is_empty() { None } else { Some(percentile(&mut visibility_lag,0.99)) },
+        "restarted_replica_recovery_seconds":recovery_seconds,
+        "restarted_replica_recovery_cpu_us":recovery_cpu_us,
     });
     for node in nodes {
         node.shutdown().await?;
@@ -276,7 +392,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut profile = HostProfile {
         calibration:format!("partial local calibration: {} / {}; {} replicas, {} records, {} B values, {} samples; disk/stable costs and unmeasured overhead remain assumptions",
             std::env::consts::OS,std::env::consts::ARCH,replicas,records,value_bytes,samples),
-        point_read_cpu_us:max("point_read_cpu_us"),write_cpu_us:max("write_cpu_us_per_replica"),
+        point_read_cpu_us:max("point_read_cpu_us").max(HostProfile::default().point_read_cpu_us),
+        write_cpu_us:max("write_cpu_us_per_replica").max(HostProfile::default().write_cpu_us),
         ..HostProfile::default()
     };
     // Conservative upper envelopes avoid treating allocator/noise floors as
