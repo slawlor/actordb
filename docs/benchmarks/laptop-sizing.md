@@ -65,6 +65,30 @@ concurrency with `gRPC receive admission full`; these reservations are logical
 limits, not eagerly allocated buffers. Production admission settings remain
 unchanged.
 
+## Longer point-operation checks
+
+Follow-up checks ran each workload separately for 30 seconds, with 32 fragments,
+20,000 hot keys, 1 KiB values, 16 concurrent callers and four runtime threads.
+[Raw throughput data](laptop-sizing/sustained-qps.json). There was no replica
+fanout and no rejected operation. RPC client and server share this laptop.
+
+| Operation | Total operations/s | Average per fragment/s |
+|---|---:|---:|
+| Embedded point reads | 1,149,024 | 35,907 |
+| Embedded in-memory writes | 585,382 | 18,293 |
+| Loopback RPC reads | 55,634 | 1,739 |
+| Loopback RPC writes | 55,127 | 1,723 |
+| RocksDB buffered/applied writes | 531,837 | 16,620 |
+| RocksDB StoreCommitted writes | 28,168 | 880 |
+| RocksDB StableCommitted writes | 25,309 | 791 |
+
+Per-fragment values divide the total by 32; CPU, the WAL and the storage
+executor are shared. These are observed limits of the tested configuration,
+not independent per-fragment capacities or the full laptop CPU ceiling. Buffered
+writes do not force a new stable fence per operation. The synced 1 KiB template
+obeys the minimum of its 25,000 store and 28,000 stable limits, which remains
+conservative relative to this longer stable-write run before 30% headroom.
+
 ## Durable writes and backend reserves
 
 The probes exercise the offered RocksDB backend, real WAL synchronization and
